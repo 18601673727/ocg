@@ -1,5 +1,10 @@
-import { OperatorConsole } from "@/components/ocg/session/operator-console";
+import type { Metadata } from "next";
+import { StaticEntry } from "@/components/ocg/bootstrap/static-entry";
+
+export const metadata: Metadata = {
+  title: "Home - OCG Workspace",
+};
 
 export default function Home() {
-  return <OperatorConsole />;
+  return <StaticEntry route="home" />;
 }

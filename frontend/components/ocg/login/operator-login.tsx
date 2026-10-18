@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import {
   ControlTransportError,
   type HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/canonical-client";
+} from "@/components/ocg/runtime/control-client";
 import { ContractError } from "@/components/ocg/contracts";
 
 export type OperatorSession = {

@@ -7,9 +7,11 @@ import {
   ControlTransportError,
   createHttpCanonicalControlClient,
   type HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/canonical-client";
+} from "@/components/ocg/runtime/control-client";
 import { decodeHealth } from "@/components/ocg/contracts";
 import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
+import { OcgRuntimeProvider } from "../runtime/runtime-context";
+import { SessionActions } from "../login/access-boundary";
 import { AppShell } from "@/components/ocg/layout/app-shell";
 
 type Phase = "checking" | "out" | "in" | "unreachable";
@@ -138,13 +140,13 @@ export function OperatorConsole() {
   }
 
   return (
-    <AppShell
+    <SessionActions onSignOut={signOut}><OcgRuntimeProvider scenario="local-ready" controlClient={client}><AppShell
       client={client}
       health={health}
       sessionExpiresAtUs={session?.expiresAtUs ?? null}
       signingOut={signingOut}
       signOutError={signOutError}
       onSignOut={() => void signOut()}
-    />
+    /></OcgRuntimeProvider></SessionActions>
   );
 }

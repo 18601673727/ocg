@@ -1,41 +1,31 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { ChatScreen } from "../chat/chat-screen";
+import { OcgSidebar } from "../sidebar/ocg-sidebar";
+import { OcgTopbar } from "../topbar/ocg-topbar";
+import { JobsSurface } from "../job/jobs-surface";
+import { ObservationsSurface } from "../dashboard/observations-surface";
+import { LogsSurface } from "../dashboard/logs-surface";
+import { SettingsSurface } from "../settings/control-settings-surface";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { decodeHealth } from "../contracts";
+import type { ComposerIntent } from "../composer/domain";
+import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
+import { useI18n } from "../i18n";
 
-import type { HttpCanonicalControlClient } from "@/components/ocg/runtime/canonical-client";
-import { JobsSurface } from "@/components/ocg/job/jobs-surface";
-import { ChatSurface } from "@/components/ocg/chat/chat-surface";
-import { OcgSidebar } from "@/components/ocg/sidebar/ocg-sidebar";
-import { OcgTopbar } from "@/components/ocg/topbar/ocg-topbar";
-import { SettingsSurface } from "@/components/ocg/settings/settings-surface";
-import { LogsSurface } from "@/components/ocg/dashboard/logs-surface";
-import { ObservationsSurface } from "@/components/ocg/dashboard/observations-surface";
-import type { decodeHealth } from "@/components/ocg/contracts";
-import {
-  parseWorkspaceLocation,
-  workspaceLocationHref,
-  type WorkspaceLocation,
-  type WorkspaceView,
-} from "./view-domain";
+export type { WorkspaceView } from "./view-domain";
 
 type Health = ReturnType<typeof decodeHealth>;
+function currentLocation() {
+  const url = new URL(window.location.href);
+  const requested = url.searchParams.get("view") ?? url.pathname.slice(1).replace(/\.html$/, "");
+  const job = url.searchParams.get("job");
+  return { view: isReachableView(requested) ? requested : "chat" as WorkspaceView, job: isJobIdentity(job) ? job : null };
+}
 
-/** Jobs this tab remembers having opened; the Control Plane has no Job list to ask. */
-const OPENED_JOBS_LIMIT = 20;
-
-/**
- * The signed-in console: the 0.4.5 sidebar / topbar / view layout over the
- * 0.5 operator session. Every view is either backed by a real Control Plane
- * route or says that it is not available.
- */
-export function AppShell({
-  client,
-  health,
-  sessionExpiresAtUs,
-  signingOut,
-  signOutError,
-  onSignOut,
-}: {
+export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signOutError, onSignOut }: {
   client: HttpCanonicalControlClient;
   health: Health | null;
   sessionExpiresAtUs: number | null;
@@ -43,112 +33,94 @@ export function AppShell({
   signOutError: string | null;
   onSignOut: () => void;
 }) {
-  // The shell mounts only after the browser has read its session, so the
-  // address is always available here.
-  const [initial] = useState(() => parseWorkspaceLocation(window.location.search));
-  const [location, setLocation] = useState<WorkspaceLocation>(initial);
-  const [opened, setOpened] = useState<string[]>(initial.job ? [initial.job] : []);
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const runtime = useOcgRuntime();
+  const { t } = useI18n();
+  const [location, setLocation] = useState(currentLocation);
+  const [sessionId, setSessionId] = useState("");
   const [collapsed, setCollapsed] = useState(false);
+  const [mobile, setMobile] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const session = runtime.snapshot.sessions.find(session => session.id === sessionId);
 
   useEffect(() => {
-    const onPopState = () => {
-      const next = parseWorkspaceLocation(window.location.search);
-      setLocation(next);
-      const job = next.job;
-      if (job) setOpened((current) => [job, ...current.filter((entry) => entry !== job)].slice(0, OPENED_JOBS_LIMIT));
-    };
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
+    const pop = () => { setLocation(currentLocation()); setSessionId(""); };
+    window.addEventListener("popstate", pop);
+    return () => window.removeEventListener("popstate", pop);
   }, []);
 
-  function go(next: WorkspaceLocation) {
-    const href = workspaceLocationHref(next);
-    if (href !== window.location.pathname + window.location.search) {
-      window.history.pushState(null, "", href);
+  useEffect(() => {
+    if (!location.job || location.view !== "chat" || !runtime.client.openConversation) return;
+    let alive = true;
+    setOpening(true);
+    void runtime.client.openConversation(location.job).then(id => {
+      if (alive) { setSessionId(id); setError(null); }
+    }).catch(cause => { if (alive) setError(cause instanceof Error ? cause.message : String(cause)); })
+      .finally(() => { if (alive) setOpening(false); });
+    return () => { alive = false; };
+  }, [location.job, location.view, runtime.client, attempt]);
+
+  // Runtime actions such as Retry also admit successors, so their addresses must recover on reload.
+  useEffect(() => {
+    if (location.view === "chat" && !opening && session?.sessionId) {
+      window.history.replaceState(null, "", `/?job=${session.sessionId}`);
     }
-    setLocation(next);
+  }, [location.view, opening, session?.sessionId]);
+
+  const go = useCallback((view: WorkspaceView, job: string | null = null) => {
+    if (!isReachableView(view)) return;
+    const query = new URLSearchParams();
+    if (job) query.set("job", job);
+    const path = view === "chat" ? "/" : `/${view}`;
+    const href = `${path}${query.size ? `?${query}` : ""}`;
+    window.history.pushState(null, "", href);
+    setLocation({ view, job });
+    setMobile(false);
+  }, []);
+
+  const newChat = useCallback(async () => {
+    const session = await runtime.createSession({ workType: "research" });
+    setSessionId(session.id);
+    setError(null);
+    go("chat");
+  }, [runtime, go]);
+
+  async function intent(intent: ComposerIntent) {
+    if (intent.kind !== "chat") throw new Error("Job launch is not available in this view.");
+    if (!session) throw new Error("Create or open a conversation first.");
+    await runtime.sendMessage(session.id, { content: intent.text, selection: intent.selection, images: intent.images, mode: intent.mode });
+    const updated = runtime.client.getSnapshot().sessions.find(item => item.id === session.id);
+    if (updated?.sessionId) {
+      // Admission already installed the turn in the store; this only makes reload recover it.
+      window.history.replaceState(null, "", `/?job=${updated.sessionId}`);
+    }
   }
 
-  // A Job opens in the surface that asked for it, so sending a Chat message stays in Chat.
-  function openJob(job: string, surface: "chat" | "jobs") {
-    setOpened((current) => [job, ...current.filter((entry) => entry !== job)].slice(0, OPENED_JOBS_LIMIT));
-    go({ view: surface, job });
-  }
+  const sidebar = <OcgSidebar sessions={[...runtime.snapshot.sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))}
+    activeSessionId={sessionId} collapsed={collapsed} onToggle={() => setCollapsed(value => !value)}
+    onSelect={id => { const selected = runtime.snapshot.sessions.find(session => session.id === id); setSessionId(id); setError(null); go("chat", selected?.sessionId ?? null); }}
+    onNewChat={() => void newChat()} runtimeStatus={runtime.snapshot.status} runtimeAuthority="canonical"
+    activeView={location.view} onNavigate={view => go(view)} onSettingsClick={() => go("settings")} />;
 
-  function navigate(view: WorkspaceView) {
-    go({ view, job: location.job });
-  }
-
-  const { view } = location;
-  return (
-    <div className="flex h-dvh min-h-0 w-full bg-background">
-      <OcgSidebar
-        mobileOpen={mobileOpen}
-        collapsed={collapsed}
-        onCollapse={() => setCollapsed((current) => !current)}
-        onCloseMobile={() => setMobileOpen(false)}
-        activeView={view}
-        onNavigate={navigate}
-        openedJobs={opened}
-        activeJob={location.job}
-        onOpenJob={(job) => openJob(job, view === "chat" ? "chat" : "jobs")}
-        onOpenChat={(job) => openJob(job, "chat")}
-        client={client}
-        signingOut={signingOut}
-        onSignOut={onSignOut}
-      />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <OcgTopbar
-          activeView={view}
-          job={location.job}
-          collapsed={collapsed}
-          onOpenNavigation={() => {
-            setCollapsed(false);
-            setMobileOpen(true);
-          }}
-          health={health}
-        />
-        {signOutError ? (
-          <p role="alert" className="px-4 pb-2 text-sm text-destructive">
-            {signOutError}
-          </p>
-        ) : null}
-        <main className="ocg-subtle-scrollbar min-h-0 flex-1 overflow-y-auto">
-          {/* Kept mounted while another view is open: a pending submission keeps its
-              Idempotency-Key and its lookup, and a watched Job keeps its stream. */}
-          <div hidden={view !== "chat"}>
-            {/* Only the visible view watches the Job: a Job has one event stream per client. */}
-            <ChatSurface
-              client={client}
-              job={view === "chat" ? location.job : null}
-              onJob={(job) => openJob(job, "chat")}
-              onNewConversation={() => go({ view: "chat", job: null })}
-              onInspectJob={(targetJob) => openJob(targetJob, "jobs")}
-            />
-          </div>
-          <div hidden={view !== "jobs"}>
-            <JobsSurface
-              client={client}
-              active={view === "jobs"}
-              job={view === "jobs" ? location.job : null}
-              onJob={(job) => openJob(job, "jobs")}
-              onOpenChat={(job) => openJob(job, "chat")}
-            />
-          </div>
-          {view === "settings" ? (
-            <SettingsSurface
-              client={client}
-              health={health}
-              sessionExpiresAtUs={sessionExpiresAtUs}
-              signingOut={signingOut}
-              onSignOut={onSignOut}
-            />
-          ) : null}
-          {view === "usage" || view === "health" ? <ObservationsSurface key={view} client={client} kind={view} health={health} onJob={(job) => openJob(job, "jobs")} /> : null}
-          {view === "logs" ? <LogsSurface client={client} /> : null}
-        </main>
-      </div>
+  return <div className="flex h-dvh min-h-0 w-full bg-background">
+    <aside className="hidden shrink-0 lg:flex">{sidebar}</aside>
+    {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label="Close navigation" className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full">{sidebar}</aside></div>}
+    <div className="flex min-w-0 flex-1 flex-col">
+      <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view} inspectorOpen={false} inspectorControls={false}
+        onToggleInspector={() => {}} onOpenMobileSidebar={() => setMobile(true)} onOpenMobileInspector={() => {}} syncStatus={runtime.sync?.status} />
+      {signOutError && <p role="alert" className="px-5 text-sm text-destructive">{signOutError}</p>}
+      <main className="flex min-h-0 flex-1 flex-col overflow-auto">
+        {location.view === "chat" ? <>
+          {runtime.snapshot.status.state === "failed" && <p role="alert" className="px-5 py-2 text-sm text-destructive">{runtime.snapshot.status.detail} <button className="underline" onClick={() => void runtime.client.refreshConversations?.().catch(cause => setError(String(cause)))}>Refresh conversations</button></p>}
+          {error && <p role="alert" className="px-5 py-2 text-sm text-destructive">{error} <button className="underline" onClick={() => setAttempt(value => value + 1)}>Retry loading</button></p>}
+          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">Loading conversation…</p> : session ? <ChatScreen key={session.id} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /> : <div className="m-auto flex flex-col items-center gap-4 p-6"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
+        </> : null}
+        {location.view === "jobs" && <JobsSurface client={client} active job={location.job} onJob={job => go("jobs", job)} onOpenChat={job => { setSessionId(""); go("chat", job); }} />}
+        {(location.view === "usage" || location.view === "health") && <ObservationsSurface client={client} kind={location.view} health={health} onJob={job => go("jobs", job)} />}
+        {location.view === "logs" && <LogsSurface client={client} />}
+        {location.view === "settings" && <SettingsSurface client={client} health={health} sessionExpiresAtUs={sessionExpiresAtUs} signingOut={signingOut} onSignOut={onSignOut} />}
+      </main>
     </div>
-  );
+  </div>;
 }

@@ -10,7 +10,7 @@ import {
   type HttpCanonicalControlClient,
   type JobStreamEvent,
   type JobStreamSubscription,
-} from "@/components/ocg/runtime/canonical-client";
+} from "@/components/ocg/runtime/control-client";
 import {
   ContractError,
   type ControlJob,

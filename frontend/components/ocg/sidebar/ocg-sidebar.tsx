@@ -1,242 +1,484 @@
 "use client";
 
-import { useCallback, useEffect, useRef } from "react";
-import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
-import { Pill } from "@/components/ocg/primitives";
-import type { HttpCanonicalControlClient } from "../runtime/canonical-client";
-import { useControlPage } from "../runtime/use-control-page";
+import { useRef, useState } from "react";
 import {
-  VIEW_AVAILABILITY,
-  VIEW_TITLE,
-  WORKSPACE_VIEWS,
-  type WorkspaceView,
-} from "../layout/view-domain";
+  ChevronsLeft,
+  ChevronDown,
+  Activity,
+  BarChart3,
+  LayoutGrid,
+  MessageSquare,
+  Plus,
+  Search,
+  ScrollText,
+  Workflow,
+  LoaderCircle,
+  MoreVertical,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { STATUS_TEXT } from "../primitives/tone";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import type { ChatSession, RuntimeStatus } from "../types";
+import type { RuntimeAuthority } from "../runtime/runtime-types";
+import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
+import { AccountMenu } from "./account-menu";
+import { ConversationSearch } from "./conversation-search";
+import { useI18n } from "../i18n";
+import type { WorkspaceView } from "../layout/view-domain";
+
+const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.health" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
+  { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
+  { target: "jobs", labelKey: "nav.jobExecution", icon: Workflow },
+  { target: "usage", labelKey: "nav.usage", icon: BarChart3 },
+  { target: "logs", labelKey: "nav.logs", icon: ScrollText },
+  { target: "health", labelKey: "nav.health", icon: Activity },
+];
 
 type OcgSidebarProps = {
-  /** Whether the drawer is open below the `lg` breakpoint. */
-  mobileOpen: boolean;
-  /** Whether the rail is hidden at and above the `lg` breakpoint. */
+  sessions: ChatSession[];
+  activeSessionId: string;
   collapsed: boolean;
-  onCollapse: () => void;
-  onCloseMobile: () => void;
-  activeView: WorkspaceView;
-  onNavigate: (view: WorkspaceView) => void;
-  /** Jobs this browser tab opened, newest first. The Control Plane has no Job list. */
-  openedJobs: readonly string[];
-  activeJob: string | null;
-  onOpenJob: (job: string) => void;
-  onOpenChat: (job: string) => void;
-  client: HttpCanonicalControlClient;
-  signingOut: boolean;
-  onSignOut: () => void;
+  onToggle: () => void;
+  onSelect: (id: string) => void;
+  onNewChat: () => void;
+  onDelete?: (id: string) => Promise<void>;
+  busySessionIds?: readonly string[];
+  runtimeStatus: RuntimeStatus;
+  /** Which runtime answers Chat, so the footer never claims a fixture runtime. */
+  runtimeAuthority: RuntimeAuthority;
+  /** Active top-level workspace, used to highlight the navigation group. */
+  activeView?: WorkspaceView;
+  /** Name of the active Project, shown as the conversation search's scope line. */
+  projectName?: string;
+  /** Unresolved attention count shown as a quiet badge next to Attention. */
+  attentionCount?: number;
+  /**
+   * Opens a workspace, or closes it back to the chat root when it is already
+   * open. Omitting it hides the workspace navigation group entirely, which is
+   * how a page renders the sidebar without shell navigation.
+   */
+  onNavigate?: (view: WorkspaceView) => void;
+  /** Opens Settings from the account menu. Omitting it hides that item. */
+  onSettingsClick?: () => void;
 };
 
-/**
- * The shell's navigation. The 0.4.5 sidebar's conversation list, search and
- * delete flows have no 0.5 contract behind them, so they are not here: the
- * Jobs group lists only what this tab itself opened.
- */
-export function OcgSidebar({
-  mobileOpen,
-  collapsed,
-  onCollapse,
-  onCloseMobile,
-  activeView,
-  onNavigate,
-  openedJobs,
-  activeJob,
-  onOpenJob,
-  onOpenChat,
-  client,
-  signingOut,
-  onSignOut,
-}: OcgSidebarProps) {
-  const loadConversations = useCallback(
-    async (before: string | undefined, signal: AbortSignal) => {
-      const page = await client.readConversations({ before, limit: 50, signal });
-      return { items: page.conversations, next: page.next_before };
-    },
-    [client],
-  );
-  const conversationsPage = useControlPage(loadConversations, true);
-
-  const refreshConversations = useRef(conversationsPage.refresh);
-  useEffect(() => {
-    refreshConversations.current = conversationsPage.refresh;
-  });
-
-  useEffect(() => {
-    return client.onConversationsChanged(() => {
-      refreshConversations.current();
-    });
-  }, [client]);
-
+function RailButton({
+  label,
+  onClick,
+  children,
+  active = false,
+}: {
+  label: string;
+  onClick?: () => void;
+  children: React.ReactNode;
+  active?: boolean;
+}) {
   return (
-    <>
-      {mobileOpen ? (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            aria-label={label}
+            title={label}
+            onClick={onClick}
+            className={cn(
+              "flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+              active && "bg-muted text-foreground",
+            )}
+          >
+            {children}
+          </button>
+        }
+      />
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
+export function OcgSidebar({
+  sessions,
+  activeSessionId,
+  collapsed,
+  onToggle,
+  onSelect,
+  onNewChat,
+  onDelete,
+  busySessionIds = [],
+  runtimeAuthority,
+  activeView = "chat",
+  projectName,
+  attentionCount = 0,
+  onNavigate,
+  onSettingsClick,
+}: OcgSidebarProps) {
+  const { t } = useI18n();
+  const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const cancelDeleteRef = useRef<HTMLButtonElement>(null);
+  const targetBusy = deleteTarget !== null && busySessionIds.includes(deleteTarget.id);
+  // The signed Access email, when the request carried one. Local mode has no
+  // signed identity, so the account menu names that state instead.
+  const email = useAccountEmail();
+  const logout = useRemoteLogout();
+  const confirmDelete = async () => {
+    if (!deleteTarget || !onDelete || deleting || targetBusy) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await onDelete(deleteTarget.id);
+      setDeleteTarget(null);
+    } catch (cause: unknown) {
+      setDeleteError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDeleting(false);
+    }
+  };
+  const canonicalMode = runtimeAuthority === "canonical";
+  const workspaceNav = canonicalMode
+    ? WORKSPACE_NAV
+    : WORKSPACE_NAV;
+  // In canonical mode every non-Chat destination lives in the Workbench menu
+  // while the conversation list and New chat serve Chat directly.
+  const workbenchNav = canonicalMode ? workspaceNav.filter(item => item.target !== "chat") : [];
+  const hasNav = Boolean(onNavigate);
+  const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => (item.target === "jobs" ? "Jobs" : t(item.labelKey));
+
+  const renderWorkspaceItem = (item: (typeof WORKSPACE_NAV)[number]) => {
+    const Icon = item.icon;
+    if (!onNavigate) return null;
+    const active = activeView === item.target;
+    const label = navLabel(item);
+    return (
+      <li key={item.target}>
         <button
           type="button"
-          aria-label="Close navigation"
-          className="fixed inset-0 z-30 bg-black/40 lg:hidden"
-          onClick={onCloseMobile}
-        />
-      ) : null}
-      <aside
-        aria-label="Navigation"
-        className={cn(
-          "fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-transform",
-          "lg:static lg:z-auto lg:translate-x-0",
-          mobileOpen ? "translate-x-0" : "-translate-x-full",
-          collapsed && "lg:hidden",
-        )}
-      >
-        <div className="flex h-12 shrink-0 items-center justify-between px-3">
-          <span className="font-heading text-lg tracking-tight">OCG</span>
-          <Button
-            variant="ghost"
-            size="xs"
-            className="tracking-normal normal-case"
-            onClick={() => {
-              onCollapse();
-              onCloseMobile();
-            }}
-          >
-            Hide
-          </Button>
-        </div>
-        <nav aria-label="Views" className="flex flex-col gap-0.5 px-2 py-1">
-          {WORKSPACE_VIEWS.map((view) => {
-            const availability = VIEW_AVAILABILITY[view];
-            const active = view === activeView;
-            return (
-              <button
-                key={view}
-                type="button"
-                aria-current={active ? "page" : undefined}
-                onClick={() => {
-                  onNavigate(view);
-                  onCloseMobile();
-                }}
-                className={cn(
-                  "flex min-h-9 items-center justify-between gap-2 rounded-md px-2.5 text-left text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/30",
-                  active
-                    ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-                    : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-foreground",
-                )}
-              >
-                {VIEW_TITLE[view]}
-                {availability.available ? null : (
-                  <Pill variant="quiet" className="text-[10px] normal-case">
-                    unavailable
-                  </Pill>
-                )}
-              </button>
-            );
-          })}
-        </nav>
-        <div className="ocg-subtle-scrollbar mt-2 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-2">
-          <div className="flex flex-col gap-1">
-            <h2 className="px-2.5 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Chats
-            </h2>
-            {conversationsPage.error ? (
-              <p role="alert" className="px-2.5 text-xs text-destructive">
-                {conversationsPage.error}
-              </p>
-            ) : null}
-            {!conversationsPage.ready && conversationsPage.loading ? (
-              <p className="px-2.5 text-xs text-muted-foreground">Loading chats…</p>
-            ) : null}
-            {conversationsPage.ready && conversationsPage.items.length === 0 ? (
-              <p className="px-2.5 text-xs text-muted-foreground">No conversations yet.</p>
-            ) : (
-              <ul className="flex flex-col gap-0.5">
-                {conversationsPage.items.map((entry) => {
-                  const active = activeView === "chat" && activeJob === entry.tip_job;
-                  return (
-                    <li key={entry.root_job}>
-                      <button
-                        type="button"
-                        aria-current={active ? "true" : undefined}
-                        onClick={() => {
-                          onOpenChat(entry.tip_job);
-                          onCloseMobile();
-                        }}
-                        title={entry.title}
-                        className={cn(
-                          "flex min-h-8 w-full items-center rounded-md px-2.5 text-left text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/30",
-                          active
-                            ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-                            : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-foreground",
-                        )}
-                      >
-                        <span className="truncate">{entry.title || "Untitled chat"}</span>
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-            )}
-            {conversationsPage.next ? (
-              <Button
-                variant="ghost"
-                size="xs"
-                className="mx-2.5 mt-1 justify-start text-xs text-muted-foreground hover:text-foreground"
-                disabled={conversationsPage.loading}
-                onClick={conversationsPage.loadMore}
-              >
-                {conversationsPage.loading ? "Loading…" : "Load more"}
-              </Button>
-            ) : null}
-          </div>
+          onClick={() => onNavigate(item.target)}
+          aria-current={active ? "page" : undefined}
+          className={cn(
+            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left", TYPOGRAPHY_SCALE.body_sm, "leading-5 transition-colors",
+            active
+              ? "bg-muted font-medium text-foreground"
+              : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+          )}
+        >
+          <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">{label}</span>
+          {item.target === "attention" && attentionCount > 0 && (
+            <span
+              aria-label={t("sidebar.attentionBadge", { count: attentionCount })}
+              className={cn("shrink-0 rounded-md bg-muted px-1.5", TYPOGRAPHY_SCALE.caption, "font-semibold tabular-nums text-muted-foreground")}
+            >
+              {attentionCount > 99 ? "99+" : attentionCount}
+            </span>
+          )}
+        </button>
+      </li>
+    );
+  };
 
-          <div className="flex flex-col gap-1">
-            <h2 className="px-2.5 text-xs font-semibold tracking-wider text-muted-foreground uppercase">
-              Opened in this tab
-            </h2>
-            {openedJobs.length === 0 ? (
-              <p className="px-2.5 text-xs text-muted-foreground">
-                No Job opened yet. Submit one, or inspect a Job by its identity.
-              </p>
-            ) : (
-              <ul className="flex flex-col gap-0.5">
-                {openedJobs.map((job) => (
-                  <li key={job}>
-                    <button
-                      type="button"
-                      aria-current={activeView === "jobs" && job === activeJob ? "true" : undefined}
-                      onClick={() => {
-                        onOpenJob(job);
-                        onCloseMobile();
-                      }}
-                      className={cn(
-                        "flex min-h-8 w-full items-center rounded-md px-2.5 text-left font-mono text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/30",
-                        activeView === "jobs" && job === activeJob
-                          ? "bg-sidebar-accent text-sidebar-accent-foreground"
-                          : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-sidebar-foreground",
+  // The primary controls sit directly under the wordmark: New chat, the
+  // conversation search, and (in canonical mode) the Workbench menu that holds
+  // every destination other than Chat.
+  const primaryControls = (
+    <>
+      <div className="flex items-center gap-1 px-2 pb-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="min-w-0 flex-1 justify-start"
+          onClick={onNewChat}
+        >
+          <Plus className="size-3.5" data-icon="inline-start" />
+          {t("sidebar.newChat")}
+        </Button>
+        {/*
+          The search button opens the full-screen conversation overlay. It keeps
+          its own accessible name and tooltip title rather than a Tooltip
+          wrapper, because the overlay owns the trigger's props.
+        */}
+        <ConversationSearch
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          projectName={projectName}
+          onSelect={onSelect}
+          trigger={
+            <Button variant="outline" size="icon-sm" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
+              <Search className="size-4" aria-hidden="true" />
+            </Button>
+          }
+        />
+      </div>
+
+      {hasNav && workbenchNav.length > 0 && (
+        /*
+          Canonical mode keeps Chat as the single primary destination and folds
+          every other destination into this compact Workbench menu. Each item
+          keeps its icon, label, attention badge and active state.
+        */
+        <details
+          className="px-2 pb-2"
+          open={workbenchNav.some((item) => item.target === activeView) || undefined}
+          data-workbench-menu=""
+        >
+          <summary className={cn("group flex cursor-pointer items-center gap-2 rounded-md border border-border px-2 py-1.5 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
+            <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
+            <ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+          </summary>
+          <ul className="mt-1 flex flex-col gap-px pl-2">
+            {workbenchNav.map(renderWorkspaceItem)}
+          </ul>
+        </details>
+      )}
+    </>
+  );
+
+  if (collapsed) {
+    return (
+      <TooltipProvider delay={100}>
+        <div className="flex h-full w-full flex-col items-center gap-1 px-2 py-3">
+          <span aria-label="OCG" className="mb-2 scale-y-75 text-[18px] leading-none font-black tracking-[-0.06em]">OCG</span>
+          <RailButton label={t("sidebar.expand")} onClick={onToggle}>
+            <ChevronsLeft className="size-4 rotate-180" />
+          </RailButton>
+          <RailButton label={t("sidebar.newChat")} onClick={onNewChat}>
+            <Plus className="size-4" />
+          </RailButton>
+          <ConversationSearch
+            sessions={sessions}
+            activeSessionId={activeSessionId}
+            projectName={projectName}
+            onSelect={onSelect}
+            trigger={
+              <button
+                type="button"
+                aria-label={t("sidebar.searchConversations")}
+                title={t("sidebar.searchConversations")}
+                className="flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              >
+                <Search className="size-4" aria-hidden="true" />
+              </button>
+            }
+          />
+          {hasNav && (
+            <>
+              <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
+              {workspaceNav.map((item) => {
+                const Icon = item.icon;
+                if (!onNavigate) return null;
+                const label = navLabel(item);
+                return (
+                  <RailButton
+                    key={item.target}
+                    label={item.target === "attention" && attentionCount > 0 ? t("sidebar.attentionBadgeShort", { label, count: attentionCount }) : label}
+                    active={activeView === item.target}
+                    onClick={() => onNavigate(item.target)}
+                  >
+                    <span className="relative">
+                      <Icon className="size-4" />
+                      {item.target === "attention" && attentionCount > 0 && (
+                        <span
+                          aria-hidden="true"
+                          className="absolute -top-1 -right-1.5 min-w-[14px] rounded-full bg-muted-foreground/80 px-0.5 text-center text-[9px] leading-[14px] font-semibold text-background"
+                        >
+                          {attentionCount > 9 ? "9+" : attentionCount}
+                        </span>
                       )}
-                    >
-                      {job}
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+                    </span>
+                  </RailButton>
+                );
+              })}
+            </>
+          )}
+          <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
+          <div className="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto">
+            {sessions.map((session) => (
+              <RailButton
+                key={session.id}
+                label={session.title || t("sidebar.newChat")}
+                active={session.id === activeSessionId}
+                onClick={() => onSelect(session.id)}
+              >
+                <MessageSquare className="size-4" />
+              </RailButton>
+            ))}
+          </div>
+          {/*
+            The collapsed rail keeps the account menu: same identity, same
+            actions, same order as the expanded footer, from the same component.
+          */}
+          <div className="mt-2 w-full border-t border-border pt-2">
+            <div className="flex w-full justify-center">
+              <AccountMenu
+                variant="rail"
+                email={email}
+                onLogout={logout ? () => { void logout(); } : undefined}
+                onSettingsClick={onSettingsClick}
+              />
+            </div>
           </div>
         </div>
-        <div className="shrink-0 border-t border-sidebar-border p-2">
-          <Button
-            variant="outline"
-            size="sm"
-            className="w-full tracking-normal normal-case"
-            disabled={signingOut}
-            onClick={onSignOut}
-          >
-            {signingOut ? "Signing out…" : "Sign out"}
-          </Button>
+      </TooltipProvider>
+    );
+  }
+
+  return (
+    <TooltipProvider delay={100}>
+      <div className="flex h-full w-full flex-col">
+        <div className="flex items-center gap-2 px-3 pt-3 pb-2">
+          <span aria-label="OCG" className="min-w-0 flex-1 origin-left scale-y-75 text-[28px] leading-none font-black tracking-[-0.06em]">
+            OCG
+          </span>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={onToggle}
+                  aria-label={t("sidebar.collapse")}
+                  aria-expanded="true"
+                  title={t("sidebar.collapse")}
+                >
+                  <ChevronsLeft className="size-4" />
+                </Button>
+              }
+            />
+            <TooltipContent side="right">{t("sidebar.collapse")}</TooltipContent>
+          </Tooltip>
         </div>
-      </aside>
-    </>
+
+        {primaryControls}
+
+        {hasNav && !canonicalMode && (
+          <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
+            <ul className="flex flex-col gap-px">
+              {workspaceNav.slice(0, 4).map(renderWorkspaceItem)}
+            </ul>
+            {runtimeAuthority === "mock" && <details open={workspaceNav.slice(4).some((item) => item.target === activeView) || undefined} className="mt-1">
+              <summary className={cn("cursor-pointer rounded-md px-2 py-1.5", TYPOGRAPHY_SCALE.caption, "text-muted-foreground hover:bg-muted/60")}>{t("nav.tools")}</summary>
+              <ul className="flex flex-col gap-px pl-2">
+                {workspaceNav.slice(4).map(renderWorkspaceItem)}
+              </ul>
+            </details>}
+          </nav>
+        )}
+
+        <nav
+          aria-label={t("nav.chatSessions")}
+          className="min-h-0 flex-1 overflow-y-auto px-2 pb-2"
+        >
+          <ul className="flex flex-col gap-px">
+            {sessions.map((session) => {
+              const active = session.id === activeSessionId;
+              const isMenuOpen = openMenuId === session.id;
+              return (
+                <li key={session.id} className={cn("group/session relative flex min-w-0 items-center rounded-md transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
+                  <button
+                    type="button"
+                    onClick={() => onSelect(session.id)}
+                    aria-current={active ? "true" : undefined}
+                    className={cn(
+                      "group flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left", TYPOGRAPHY_SCALE.body_sm, "leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
+                      active
+                        ? "bg-muted font-medium text-foreground"
+                        : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                    )}
+                  >
+                    <span
+                      aria-hidden="true"
+                      className={cn(
+                        "h-4 w-0.5 shrink-0 rounded-full",
+                        active ? "bg-foreground" : "bg-transparent group-hover:bg-border",
+                      )}
+                    />
+                    <span className="min-w-0 flex-1 truncate">
+                      {session.title || t("sidebar.newChat")}
+                    </span>
+                  </button>
+                  {onDelete && (
+                    <DropdownMenu open={isMenuOpen} onOpenChange={(open) => setOpenMenuId(open ? session.id : null)}>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label={t("sidebar.deleteChatNamed", { title: session.title || t("sidebar.newChat") })}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                          }}
+                          className={cn(
+                            "mr-1 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 outline-none transition-opacity hover:bg-muted hover:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/30",
+                            // On hover-capable devices: hide by default, show on hover/focus/menu-open
+                            // On touch devices: always visible
+                            isMenuOpen
+                              ? "opacity-100"
+                              : "[@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/session:opacity-100 [@media(hover:hover)]:group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100",
+                          )}
+                        >
+                          <MoreVertical className="size-3.5" aria-hidden="true" />
+                        </button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem
+                          disabled={busySessionIds.includes(session.id) || deleting}
+                          onSelect={() => {
+                            setDeleteError(null);
+                            setDeleteTarget(session);
+                          }}
+                          className="text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive"
+                        >
+                          {t("sidebar.deleteChat")}
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </nav>
+
+        {/*
+          The account menu holds who is signed in and what they can do here.
+          Local mode has no signed identity and no logout to run, so it names
+          that state and offers Settings only.
+        */}
+        <div className="relative border-t border-border px-2 py-2">
+          <AccountMenu
+            email={email}
+            onLogout={logout ? () => { void logout(); } : undefined}
+            onSettingsClick={onSettingsClick}
+          />
+        </div>
+      </div>
+      <Dialog open={deleteTarget !== null} onOpenChange={open => { if (!open && !deleting) setDeleteTarget(null); }}>
+        <DialogContent initialFocus={cancelDeleteRef} showCloseButton={!deleting} className="rounded-lg">
+          <DialogHeader>
+            <DialogTitle className="normal-case tracking-normal">{t("sidebar.deleteChatTitle")}</DialogTitle>
+            <DialogDescription>{t("sidebar.deleteChatBody", { title: deleteTarget?.title || t("sidebar.newChat") })}</DialogDescription>
+          </DialogHeader>
+          {targetBusy && <p role="status" className={`text-xs ${STATUS_TEXT['warning']}`}>{t("sidebar.deleteRunning")}</p>}
+          {deleteError && <p role="alert" className="break-words text-xs text-destructive">{t("sidebar.deleteFailed", { error: deleteError })}</p>}
+          <DialogFooter>
+            <Button ref={cancelDeleteRef} variant="outline" disabled={deleting} onClick={() => setDeleteTarget(null)}>{t("common.cancel")}</Button>
+            <Button variant="destructive" disabled={deleting || targetBusy} onClick={() => void confirmDelete()}>
+              {deleting && <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />}
+              {t(deleting ? "sidebar.deletingChat" : "sidebar.deleteChat")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </TooltipProvider>
   );
 }

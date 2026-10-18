@@ -9,7 +9,7 @@ import {
   ControlTransportError,
   type ControlSubmission,
   type HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/canonical-client";
+} from "@/components/ocg/runtime/control-client";
 import { ContractError, type ControlCapability } from "@/components/ocg/contracts";
 
 type Phase = "editing" | "submitting" | "pending" | "uncertain" | "admitted" | "refused";

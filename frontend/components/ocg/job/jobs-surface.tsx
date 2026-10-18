@@ -4,9 +4,8 @@ import { useCallback, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import type { HttpCanonicalControlClient } from "../runtime/canonical-client";
+import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useControlPage } from "../runtime/use-control-page";
-import { JobSubmissionForm } from "./job-submission-form";
 import { JobWatch } from "./job-watch";
 import { isJobIdentity } from "../layout/view-domain";
 
@@ -94,7 +93,6 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
         </form>
       </section>
       {job ? <JobWatch key={job} client={client} jobId={job} /> : null}
-      <JobSubmissionForm client={client} onJob={(created) => { page.refresh(); onJob(created); }} />
     </div>
   );
 }

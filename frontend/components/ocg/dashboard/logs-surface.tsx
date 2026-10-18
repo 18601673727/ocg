@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import type { HttpCanonicalControlClient } from "../runtime/canonical-client";
+import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import type { decodeLogs } from "../contracts";
 
 export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {

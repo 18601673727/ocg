@@ -1,735 +1,149 @@
-import { ContractError, isRecord } from "./decode";
+/**
+ * The generated wire contract and its runtime decoders.
+ *
+ * Rust owns the control protocol: `src/contracts.rs` declares every struct
+ * that crosses the loopback boundary and `cargo run --bin ocg-rs-ts` projects
+ * it into `./generated`. Nothing in the PWA hand-maintains a mirror of a Rust
+ * struct, and `tests/contracts.rs` fails if the projection drifts.
+ *
+ * Frontend code should import from here rather than from `./generated`
+ * directly, so the types and the decoders that check them stay together.
+ */
 
-export { ContractError } from "./decode";
+export type {
+  AuthenticationMode,
+  AuthenticationSession,
+  ChatSendRequest,
+  ChatImage,
+  ChatImageUploadRequest,
+  ChatConversationView,
+  ChatConversationsResponse,
+  ChatMessageView,
+  ChatMessagesResponse,
+  ApiErrorBody,
+  ApiErrorEnvelope,
+  CanonicalApiVersion,
+  CanonicalConfigurationEnvelope,
+  CanonicalConfigurationResponse,
+  CanonicalDashboardResponse,
+  CanonicalEventsEnvelope,
+  CanonicalJobConfigEnvelope,
+  CanonicalJobConfigResponse,
+  CanonicalJobEvent,
+  CanonicalJobRelations,
+  CanonicalJobSpawnRequest,
+  CanonicalJobSpawnResponse,
+  ChildPolicy,
+  JobOrigin,
+  JobSpec,
+  CanonicalJobOperations,
+  CanonicalJobOperationRequest,
+  CanonicalJobOperationResponse,
+  Failure,
+  FailureClass,
+  CanonicalJobSnapshot,
+  CanonicalJobSummary,
+  CanonicalProjectResponse,
+  CanonicalProjectsResponse,
+  GlobalConfiguration,
+  JobLaunchRequest,
+  JobLaunchResponse,
+  JsonValue,
+  Model,
+  ModelMetadata,
+  SetupModelSelection,
+  SetupRefreshRequest,
+  Origin,
+  Profile,
+  ProfileApiVersion,
+  ProfileBootstrapRequest,
+  ProfileReplaceRequest,
+  ProfileView,
+  ProjectConfiguration,
+  ProjectConfigurationView,
+  ProjectRecord,
+  Provider,
+  ProviderProtocol,
+  RecursiveLimits,
+} from "./generated";
 
-function record(value: unknown, path: string): Record<string, unknown> {
-  if (!isRecord(value)) throw new ContractError(path, "an object");
-  return value;
-}
+export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./generated";
 
-function string(value: unknown, path: string): string {
-  if (typeof value !== "string") throw new ContractError(path, "a string");
-  return value;
-}
+export { ContractError, decode } from "./decode";
+export type { DecodeResult, Decoder } from "./decode";
 
-function integer(value: unknown, path: string): number {
-  // Fail closed rather than round Rust i64 cursors into another output.
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new ContractError(path, "a non-negative safe integer");
-  }
-  return value;
-}
+export {
+  decodeProfile,
+  decodeProfileView,
+  decodeProvider,
+  tryProfileView,
+} from "./profile-decode";
 
-function timestamp(value: unknown, path: string): number | null {
-  return value === null ? null : integer(value, path);
-}
+export {
+  decodeSetupConnectResponse,
+  decodeSetupModelsResponse,
+  decodeSetupBrowseResponse,
+  decodeSetupProjectResponse,
+} from "./setup-decode";
+export type {
+  SetupModel,
+  SetupConnectResponse,
+  SetupModelsResponse,
+  SetupDirectoryEntry,
+  SetupBrowseResponse,
+  SetupProjectResponse,
+} from "./setup-decode";
 
-function boolean(value: unknown, path: string): boolean {
-  if (typeof value !== "boolean") throw new ContractError(path, "a boolean");
-  return value;
-}
+export {
+  decodeConfigurationAck,
+  decodeChatConversationsResponse,
+  decodeChatMessagesResponse,
+  decodeChatImage,
+  decodeConfigurationEnvelope,
+  decodeConfigurationView,
+  decodeDashboardResponse,
+  decodeJobOperationResponse,
+  decodeJobSpawnResponse,
+  decodeEventsEnvelope,
+  decodeExecutionState,
+  decodeJobConfigEnvelope,
+  decodeJobConfigResponse,
+  decodeJobLaunchResponse,
+  decodeJobSnapshot,
+  decodeProjectRecord,
+  decodeProjectResponse,
+  decodeProjectsResponse,
+  tryEventsEnvelope,
+} from "./canonical-decode";
+export type {
+  ATTEMPT_STATES,
+  CanonicalAttempt,
+  CanonicalAttemptState,
+  CanonicalCall,
+  CanonicalDispatchIntent,
+  CanonicalEffectKind,
+  CanonicalExecutor,
+  CanonicalExecutionState,
+  CanonicalWatchdogAction,
+  CanonicalJob,
+  CanonicalJobLaunchAck,
+  CanonicalJobLaunchOutcome,
+  CanonicalJobState,
+  ConfigurationAck,
+  EFFECT_KINDS,
+  JOB_LAUNCH_OUTCOMES,
+  JOB_STATES,
+} from "./canonical-decode";
 
-function settlement(input: unknown): {
-  state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown";
-  settled_at_us: number | null;
-} {
-  const value = record(input, "settlement");
-  const state = value.state;
-  if (state !== "unsettled" && state !== "completed" && state !== "failed" &&
-    state !== "cancelled" && state !== "unknown") {
-    throw new ContractError("settlement.state", "a Control Plane settlement state");
-  }
-  const at = timestamp(value.settled_at_us, "settlement.settled_at_us");
-  if ((state === "unsettled") !== (at === null)) {
-    throw new ContractError("settlement.settled_at_us", "a timestamp only for an outcome");
-  }
-  return { state, settled_at_us: at };
-}
+export type { UsageQuantity, UsageTokenTotals, UsageCurrencyCost, UsageCost, ContextCostTotals, UsageTotals, UsageBreakdown, UsageConversationRow, ProjectUsageResponse, ConversationUsageResponse, JobUsageResponse, UsageCompleteness, UsageWindow, UsageCostSource } from "./generated";
+export { decodeProjectUsageResponse, decodeConversationUsageResponse, decodeJobUsageResponse } from "./usage-decode";
 
-export function decodeControlError(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const value = record(envelope.error, "error");
-  return { code: string(value.code, "error.code"), message: string(value.message, "error.message") };
-}
+export { decodeAuthenticationSession } from "./authentication-decode";
 
-function identity(value: unknown, path: string, prefix: string): string {
-  const text = string(value, path);
-  const number = text.slice(prefix.length);
-  if (!text.startsWith(prefix) || !/^(0|[1-9][0-9]*)$/.test(number)) {
-    throw new ContractError(path, `a canonical ${prefix.slice(0, -1)} identity`);
-  }
-  return text;
-}
+export * from "./control-plane";
 
-// These are checked projections of the JSON emitted by control_plane.rs,
-// not the incompatible 0.4.5 Job/Attempt/Call DTOs or a second lifecycle.
-function jobRecord(input: unknown) {
-  const job = record(input, "job");
-  const mode = job.execution_mode;
-  if (mode !== "once" && mode !== "continuous" && mode !== "periodic" && mode !== "container") {
-    throw new ContractError("job.execution_mode", "a Control Plane execution mode");
-  }
-  return {
-    id: identity(job.id, "job.id", "job:"),
-    name: job.name === null ? null : string(job.name, "job.name"),
-    title: job.title === undefined || job.title === null ? null : string(job.title, "job.title"),
-    is_chat: typeof job.is_chat === "boolean" ? job.is_chat : false,
-    execution_mode: mode,
-    input: string(job.input, "job.input"),
-    previous: job.previous === undefined || job.previous === null
-      ? null
-      : identity(job.previous, "job.previous", "job:"),
-    assigned_executor: job.assigned_executor === null
-      ? null
-      : identity(job.assigned_executor, "job.assigned_executor", "executor:"),
-    created_at_us: integer(job.created_at_us, "job.created_at_us"),
-    updated_at_us: integer(job.updated_at_us, "job.updated_at_us"),
-    started_at_us: timestamp(job.started_at_us, "job.started_at_us"),
-    paused_at_us: timestamp(job.paused_at_us, "job.paused_at_us"),
-    sterilized_at_us: timestamp(job.sterilized_at_us, "job.sterilized_at_us"),
-    settlement: settlement(job.settlement),
-    stop_confirmed_at_us: timestamp(job.stop_confirmed_at_us, "job.stop_confirmed_at_us"),
-  };
-}
-
-function outputRecord(input: unknown) {
-  const output = record(input, "output");
-  const seq = integer(output.seq, "output.seq");
-  if (seq === 0) throw new ContractError("output.seq", "a positive stored sequence");
-  const kind = output.kind;
-  if (kind !== "progress" && kind !== "evaluation" && kind !== "result") {
-    throw new ContractError("output.kind", "progress, evaluation or result");
-  }
-  if (output.goal_reached !== null && typeof output.goal_reached !== "boolean") {
-    throw new ContractError("output.goal_reached", "a boolean or null");
-  }
-  if (!("value" in output)) throw new ContractError("output.value", "a JSON value");
-  return {
-    id: string(output.id, "output.id"), seq, kind,
-    summary: output.summary === null ? null : string(output.summary, "output.summary"),
-    code: output.code === null ? null : string(output.code, "output.code"),
-    goal_reached: output.goal_reached,
-    value: output.value,
-    created_at_us: integer(output.created_at_us, "output.created_at_us"),
-  };
-}
-
-export function decodeJobEvent(name: string, input: unknown, jobId: string, id: string | null) {
-  const value = record(input, "event");
-  if (value.api_version !== 1) throw new ContractError("api_version", "1");
-  if (name !== "output" && id !== null) throw new ContractError("id", "an id only on output");
-  if (name === "stream_error") {
-    return { type: "stream_error" as const, error: decodeControlError(value) };
-  }
-  if (name === "job") {
-    const job = jobRecord(value.job);
-    if (job.id !== jobId) throw new ContractError("job.id", "the requested Job");
-    return { type: "job" as const, job: { ...job, id: jobId } };
-  }
-  if (value.job !== jobId) throw new ContractError("job", "the requested Job");
-  if (name === "settlement") {
-    const outcome = settlement(value.settlement);
-    const stopped = timestamp(value.stop_confirmed_at_us, "stop_confirmed_at_us");
-    if (outcome.state === "unsettled" || (outcome.state === "unknown" && stopped === null)) {
-      throw new ContractError("settlement", "a concluded outcome, with stop confirmation for unknown");
-    }
-    return { type: "settlement" as const, job: jobId, settlement: outcome, stop_confirmed_at_us: stopped };
-  }
-  if (name !== "output") throw new ContractError("event", "job, output, settlement or stream_error");
-  const output = outputRecord(value.output);
-  if (id !== String(output.seq)) throw new ContractError("id", "the output's positive stored seq");
-  return { type: "output" as const, job: jobId, output };
-}
-
-export type ControlJobEvent = ReturnType<typeof decodeJobEvent>;
-export type ControlJob = ReturnType<typeof jobRecord>;
-export type ControlOutput = ReturnType<typeof outputRecord>;
-
-/** What the host establishes about itself and its database, now. */
-export function decodeHealth(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const host = string(envelope.host, "host");
-  const database = record(envelope.database, "database");
-  const status = database.status;
-  if (status !== "open" && status !== "protected" && status !== "shutting_down" &&
-    status !== "stopped" && status !== "closed") {
-    throw new ContractError("database.status", "a Control Plane database status");
-  }
-  const quarantined = listOf(envelope.quarantined, "quarantined", (entry, path) => {
-    const item = record(entry, path);
-    return {
-      job: identity(item.job, `${path}.job`, "job:"),
-      pool: item.pool === null ? null : identity(item.pool, `${path}.pool`, "execution_pool:"),
-      since: integer(item.since, `${path}.since`),
-    };
-  });
-  return {
-    host,
-    workspace_root: envelope.workspace_root === null
-      ? null
-      : string(envelope.workspace_root, "workspace_root"),
-    database: {
-      status,
-      accepting_commands: boolean(database.accepting_commands, "database.accepting_commands"),
-      readable: boolean(database.readable, "database.readable"),
-    },
-    quarantined,
-  };
-}
-
-/** The Job's persisted record, as `GET /api/v1/jobs/{job}` reports it. */
-export function decodeJob(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  return jobRecord(envelope.job);
-}
-
-export function decodeJobs(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  return {
-    jobs: listOf(envelope.jobs, "jobs", (job) => jobRecord(job)),
-    next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:"),
-    has_more: boolean(envelope.has_more, "has_more"),
-  };
-}
-
-function conversationRecord(input: unknown) {
-  const c = record(input, "conversation");
-  return {
-    root_job: identity(c.root_job, "conversation.root_job", "job:"),
-    tip_job: identity(c.tip_job, "conversation.tip_job", "job:"),
-    agent: identity(c.agent, "conversation.agent", "profile:"),
-    title: string(c.title, "conversation.title"),
-    turn_count: integer(c.turn_count, "conversation.turn_count"),
-    tip_settlement_state: string(c.tip_settlement_state, "conversation.tip_settlement_state"),
-    tip_created_at_us: integer(c.tip_created_at_us, "conversation.tip_created_at_us"),
-  };
-}
-
-export type ControlConversationEntry = ReturnType<typeof conversationRecord>;
-
-export function decodeConversations(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  return {
-    conversations: listOf(envelope.conversations, "conversations", (conversation) => conversationRecord(conversation)),
-    next_before: envelope.next_before === null || envelope.next_before === undefined
-      ? null
-      : identity(envelope.next_before, "next_before", "job:"),
-    has_more: boolean(envelope.has_more, "has_more"),
-  };
-}
-
-export type ControlConversations = ReturnType<typeof decodeConversations>;
-
-function observationPage(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const next = envelope.next_after;
-  if (next !== null && (typeof next !== "string" || !/^[A-Za-z0-9_-]{1,400}$/.test(next))) {
-    throw new ContractError("next_after", "an observation cursor or null");
-  }
-  return { envelope, next_after: next as string | null };
-}
-
-function observation(input: unknown, path: string) {
-  const value = record(input, path);
-  return {
-    value,
-    common: {
-      id: string(value.id, `${path}.id`),
-      job: identity(value.job, `${path}.job`, "job:"),
-      request: integer(value.request, `${path}.request`),
-      observed_at_us: integer(value.observed_at_us, `${path}.observed_at_us`),
-      model: optionalString(value.model, `${path}.model`),
-      provider: optionalString(value.provider, `${path}.provider`),
-    },
-  };
-}
-
-export function decodeUsage(input: unknown) {
-  const { envelope, next_after } = observationPage(input);
-  return {
-    next_after,
-    observations: listOf(envelope.observations, "observations", (input, path) => {
-      const { value, common } = observation(input, path);
-      if (value.finality !== null && value.finality !== "final" && value.finality !== "cumulative") {
-        throw new ContractError(`${path}.finality`, "final, cumulative or null");
-      }
-      if (value.eligibility !== null && value.eligibility !== "eligible" && value.eligibility !== "excluded") {
-        throw new ContractError(`${path}.eligibility`, "eligible, excluded or null");
-      }
-      return {
-        ...common,
-        llm_profile: value.llm_profile === null ? null : identity(value.llm_profile, `${path}.llm_profile`, "profile:"),
-        input_tokens: timestamp(value.input_tokens, `${path}.input_tokens`),
-        output_tokens: timestamp(value.output_tokens, `${path}.output_tokens`),
-        cache_read_tokens: timestamp(value.cache_read_tokens, `${path}.cache_read_tokens`),
-        cache_write_tokens: timestamp(value.cache_write_tokens, `${path}.cache_write_tokens`),
-        reasoning_tokens: timestamp(value.reasoning_tokens, `${path}.reasoning_tokens`),
-        ttfb_ms: timestamp(value.ttfb_ms, `${path}.ttfb_ms`),
-        finished_in_ms: timestamp(value.finished_in_ms, `${path}.finished_in_ms`),
-        finality: value.finality,
-        eligibility: value.eligibility,
-      };
-    }),
-  };
-}
-
-export function decodeAvailability(input: unknown) {
-  const { envelope, next_after } = observationPage(input);
-  return {
-    next_after,
-    observations: listOf(envelope.observations, "observations", (input, path) => {
-      const { value, common } = observation(input, path);
-      const classification = string(value.classification, `${path}.classification`);
-      if (!["available", "unavailable", "rejected", "unconfirmed"].includes(classification)) {
-        throw new ContractError(`${path}.classification`, "a provider observation classification");
-      }
-      return {
-        ...common,
-        status_code: timestamp(value.status_code, `${path}.status_code`),
-        finish_reason: optionalString(value.finish_reason, `${path}.finish_reason`),
-        classification,
-      };
-    }),
-  };
-}
-
-export function decodeLogs(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  return {
-    file: optionalString(envelope.file, "file"),
-    files: listOf(envelope.files, "files", string),
-    lines: listOf(envelope.lines, "lines", string),
-    truncated: boolean(envelope.truncated, "truncated"),
-    files_truncated: boolean(envelope.files_truncated, "files_truncated"),
-  };
-}
-
-/** One stored page of a Job's outputs, in `seq` order. */
-export function decodeOutputsPage(input: unknown, jobId: string) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
-  const after = timestamp(envelope.after_seq, "after_seq");
-  const listed = envelope.outputs;
-  if (!Array.isArray(listed)) throw new ContractError("outputs", "an array");
-  const outputs = listed.map((output) => outputRecord(output));
-  let previous = after ?? 0;
-  for (const output of outputs) {
-    // The stored order is the processing order; a page that breaks it is
-    // refused rather than reordered.
-    if (output.seq <= previous) throw new ContractError("output.seq", "the page's outputs in stored order");
-    previous = output.seq;
-  }
-  return {
-    job: jobId,
-    after_seq: after,
-    outputs,
-    next_after_seq: timestamp(envelope.next_after_seq, "next_after_seq"),
-    has_more: boolean(envelope.has_more, "has_more"),
-  };
-}
-
-export type ControlToolOutcomeKind =
-  | "completed"
-  | "completed_withheld"
-  | "not_applied"
-  | "not_invoked"
-  | "uncertain";
-
-export type ControlToolCall = {
-  tool_call_id: string;
-  request: number;
-  index: number;
-  name: string;
-  decision: string;
-  outcome_kind: ControlToolOutcomeKind | null;
-  arguments: string | null;
-  arguments_cut: boolean;
-  result: string | null;
-  result_cut: boolean;
+export type ChatModelSelection = import("./generated").ChatModelSelection & {
+  agentProfile?: string;
+  llmProfile?: string;
+  executor?: string;
 };
-
-export type ControlJobToolsPage = {
-  job: string;
-  after: string | null;
-  tools: ControlToolCall[];
-  next_after: string | null;
-  has_more: boolean;
-};
-
-function toolOutcomeKind(value: unknown, path: string): ControlToolOutcomeKind | null {
-  if (value === null || value === undefined) return null;
-  if (
-    value === "completed" ||
-    value === "completed_withheld" ||
-    value === "not_applied" ||
-    value === "not_invoked" ||
-    value === "uncertain"
-  ) {
-    return value;
-  }
-  throw new ContractError(path, "a tool outcome kind or null");
-}
-
-function toolCallRecord(value: unknown, path: string): ControlToolCall {
-  const item = record(value, path);
-  return {
-    tool_call_id: string(item.tool_call_id, `${path}.tool_call_id`),
-    request: integer(item.request, `${path}.request`),
-    index: integer(item.index, `${path}.index`),
-    name: string(item.name, `${path}.name`),
-    decision: string(item.decision, `${path}.decision`),
-    outcome_kind: toolOutcomeKind(item.outcome_kind, `${path}.outcome_kind`),
-    arguments:
-      item.arguments === null || item.arguments === undefined
-        ? null
-        : string(item.arguments, `${path}.arguments`),
-    arguments_cut: boolean(item.arguments_cut, `${path}.arguments_cut`),
-    result:
-      item.result === null || item.result === undefined
-        ? null
-        : string(item.result, `${path}.result`),
-    result_cut: boolean(item.result_cut, `${path}.result_cut`),
-  };
-}
-
-/** One stored page of a Job's tool evidence. */
-export function decodeJobTools(input: unknown, jobId: string): ControlJobToolsPage {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
-  const after =
-    envelope.after === null || envelope.after === undefined
-      ? null
-      : string(envelope.after, "after");
-  const nextAfter =
-    envelope.next_after === null || envelope.next_after === undefined
-      ? null
-      : string(envelope.next_after, "next_after");
-  const listed = envelope.tools;
-  if (!Array.isArray(listed)) throw new ContractError("tools", "an array");
-  const tools = listed.map((tool, index) => toolCallRecord(tool, `tools[${index}]`));
-  return {
-    job: jobId,
-    after,
-    tools,
-    next_after: nextAfter,
-    has_more: boolean(envelope.has_more, "has_more"),
-  };
-}
-
-/** What one `Idempotency-Key` created, from submission or lookup. */
-export function decodeAdmission(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const admission = record(envelope.admission, "admission");
-  const status = admission.status;
-  if (status !== "admitted" && status !== "pending" && status !== "uncertain" && status !== "not_found") {
-    throw new ContractError("admission.status", "a Control Plane admission status");
-  }
-  const job = admission.job === null ? null : identity(admission.job, "admission.job", "job:");
-  if ((status === "admitted") !== (job !== null)) {
-    throw new ContractError("admission.job", "a Job exactly when the key was admitted");
-  }
-  return { status, job };
-}
-
-/** What a stop request reached: never how the Job will settle. */
-export function decodeStop(input: unknown, jobId: string) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const stop = record(envelope.stop, "stop");
-  if (stop.job !== jobId) throw new ContractError("stop.job", "the requested Job");
-  const status = stop.status;
-  if (status !== "requested" && status !== "already_settled") {
-    throw new ContractError("stop.status", "requested or already_settled");
-  }
-  return { job: jobId, status };
-}
-
-/** The browser's own session: its CSRF token while signed in. */
-export function decodeSession(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const session = record(envelope.session, "session");
-  if (session.authenticated === false) return { authenticated: false as const };
-  if (session.authenticated !== true) throw new ContractError("session.authenticated", "a boolean");
-  return {
-    authenticated: true as const,
-    csrf_token: string(session.csrf_token, "session.csrf_token"),
-    expires_at_us: integer(session.expires_at_us, "session.expires_at_us"),
-  };
-}
-
-function jobInputRecord(input: unknown, path: string, jobId: string) {
-  const value = record(input, path);
-  const attachments = value.attachments;
-  if (!Array.isArray(attachments)) throw new ContractError(`${path}.attachments`, "an array");
-  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
-  if (value.configuration !== null) {
-    const frozen = record(value.configuration, `${path}.configuration`);
-    configuration = {
-      agent_profile: frozen.agent_profile === null
-        ? null
-        : identity(frozen.agent_profile, `${path}.configuration.agent_profile`, "profile:"),
-      llm_profile: identity(frozen.llm_profile, `${path}.configuration.llm_profile`, "profile:"),
-      model: string(frozen.model, `${path}.configuration.model`),
-    };
-  }
-  return {
-    job: jobId,
-    id: identity(value.id, `${path}.id`, "job_input:"),
-    objective: value.objective === null ? null : string(value.objective, `${path}.objective`),
-    submitted_at_us: timestamp(value.submitted_at_us, `${path}.submitted_at_us`),
-    attachments: attachments.map((attachment, index) =>
-      identity(attachment, `${path}.attachments[${index}]`, "attachment:")),
-    configuration,
-  };
-}
-
-/**
- * A Job's frozen input as `GET /api/v1/jobs/{job}/input` reports it: the
- * objective as text (the Job record names its input only by identity), its
- * Attachments by identity, and the Profiles and model it was frozen with.
- */
-export function decodeJobInput(input: unknown, jobId: string) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
-  return jobInputRecord(envelope.input, "input", jobId);
-}
-
-/**
- * Reconstructs the bounded conversation ending at `jobId` from
- * `GET /api/v1/jobs/{job}/conversation`, ordered from oldest turn to `jobId`.
- */
-export function decodeJobConversation(input: unknown, jobId: string) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
-  const turns = listOf(envelope.turns, "turns", (entry, path) => {
-    const turn = record(entry, path);
-    const job = jobRecord(turn.job);
-    const frozenInput = jobInputRecord(turn.input, `${path}.input`, job.id);
-    const outputs = listOf(turn.outputs, `${path}.outputs`, (output) => outputRecord(output));
-    return { job, input: frozenInput, outputs };
-  });
-  if (turns.length === 0 || turns[turns.length - 1].job.id !== jobId) {
-    throw new ContractError("turns", "a non-empty conversation ending at the requested Job");
-  }
-  return {
-    job: jobId,
-    turns,
-  };
-}
-
-export type ControlConversation = ReturnType<typeof decodeJobConversation>;
-export type ControlConversationTurn = ControlConversation["turns"][number];
-
-export type ControlToolGrant = "read" | "edit" | "code" | null;
-
-function toolGrant(value: unknown, path: string): ControlToolGrant {
-  if (value === null || value === undefined) return null;
-  if (value === "read" || value === "edit" || value === "code") return value;
-  throw new ContractError(path, "null, read, edit or code");
-}
-
-const CAPABILITIES = ["chat", "tools", "vision", "reasoning"] as const;
-export type ControlCapability = (typeof CAPABILITIES)[number];
-
-function listOf<T>(value: unknown, path: string, item: (entry: unknown, path: string) => T): T[] {
-  if (!Array.isArray(value)) throw new ContractError(path, "an array");
-  return value.map((entry, index) => item(entry, `${path}[${index}]`));
-}
-
-/**
- * One page of Agent Profiles from `GET /api/v1/agent-profiles`, each with the
- * LLM Profiles it may run with and the Executors that can run each now.
- */
-export function decodeAgentProfiles(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const nextBefore = envelope.next_before === null
-    ? null
-    : identity(envelope.next_before, "next_before", "profile:");
-  const hasMore = boolean(envelope.has_more, "has_more");
-  if (hasMore !== (nextBefore !== null)) {
-    throw new ContractError("next_before", "a cursor exactly when more Profiles remain");
-  }
-  return {
-    agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
-      const agent = record(entry, path);
-      return {
-        id: identity(agent.id, `${path}.id`, "profile:"),
-        name: string(agent.name, `${path}.name`),
-        tool_grant: toolGrant(agent.tool_grant, `${path}.tool_grant`),
-        llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`, (target, targetPath) => {
-          const llm = record(target, targetPath);
-          return {
-            id: identity(llm.id, `${targetPath}.id`, "profile:"),
-            name: string(llm.name, `${targetPath}.name`),
-            model: string(llm.model, `${targetPath}.model`),
-            declared_capabilities: listOf(llm.declared_capabilities, `${targetPath}.declared_capabilities`,
-              (capability, capabilityPath) => {
-                const named = string(capability, capabilityPath);
-                const known = CAPABILITIES.find((candidate) => candidate === named);
-                if (!known) throw new ContractError(capabilityPath, "a declared model capability");
-                return known;
-              }),
-            executors: listOf(llm.executors, `${targetPath}.executors`,
-              (executor, executorPath) => identity(executor, executorPath, "executor:")),
-          };
-        }),
-      };
-    }),
-    has_more: hasMore,
-    next_before: nextBefore,
-  };
-}
-
-export type ControlJobInput = ReturnType<typeof decodeJobInput>;
-export type ControlAgentProfiles = ReturnType<typeof decodeAgentProfiles>;
-export type ControlAgentProfile = ControlAgentProfiles["agent_profiles"][number];
-
-function optionalString(value: unknown, path: string): string | null {
-  return value === null ? null : string(value, path);
-}
-
-function optionalFiniteNumber(value: unknown, path: string): number | null {
-  if (value === null) return null;
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new ContractError(path, "a finite number or null");
-  }
-  return value;
-}
-
-/**
- * Full Profile management snapshot from `GET /api/v1/profiles`,
- * `POST /api/v1/profiles`, and `POST /api/v1/profiles/{profile}`, including
- * LLM Profiles, Agent Profiles, and the computed Provider projection.
- */
-export function decodeProfiles(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const profileId = envelope.profile_id === undefined || envelope.profile_id === null
-    ? null
-    : identity(envelope.profile_id, "profile_id", "profile:");
-  return {
-    profile_id: profileId,
-    llm_profiles: listOf(envelope.llm_profiles, "llm_profiles", (entry, path) => {
-      const llm = record(entry, path);
-      const protocol = string(llm.protocol, `${path}.protocol`);
-      if (protocol !== "openai_chat_completions") {
-        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
-      }
-      const params = record(llm.parameters, `${path}.parameters`);
-      return {
-        id: identity(llm.id, `${path}.id`, "profile:"),
-        name: string(llm.name, `${path}.name`),
-        model: string(llm.model, `${path}.model`),
-        protocol,
-        endpoint: optionalString(llm.endpoint, `${path}.endpoint`),
-        credential_ref: optionalString(llm.credential_ref, `${path}.credential_ref`),
-        has_credential: boolean(llm.has_credential, `${path}.has_credential`),
-        declared_capabilities: listOf(llm.declared_capabilities, `${path}.declared_capabilities`,
-          (capability, capabilityPath) => {
-            const named = string(capability, capabilityPath);
-            const known = CAPABILITIES.find((candidate) => candidate === named);
-            if (!known) throw new ContractError(capabilityPath, "a declared model capability");
-            return known;
-          }),
-        parameters: {
-          temperature: optionalFiniteNumber(params.temperature, `${path}.parameters.temperature`),
-          top_p: optionalFiniteNumber(params.top_p, `${path}.parameters.top_p`),
-          max_tokens: timestamp(params.max_tokens, `${path}.parameters.max_tokens`),
-          presence_penalty: optionalFiniteNumber(params.presence_penalty, `${path}.parameters.presence_penalty`),
-          frequency_penalty: optionalFiniteNumber(params.frequency_penalty, `${path}.parameters.frequency_penalty`),
-        },
-        executors: listOf(llm.executors, `${path}.executors`,
-          (executor, executorPath) => identity(executor, executorPath, "executor:")),
-        editable: boolean(llm.editable, `${path}.editable`),
-        blocking_jobs: listOf(llm.blocking_jobs, `${path}.blocking_jobs`,
-          (job, jobPath) => identity(job, jobPath, "job:")),
-        more_blocking_jobs: boolean(llm.more_blocking_jobs, `${path}.more_blocking_jobs`),
-        created_at_us: integer(llm.created_at_us, `${path}.created_at_us`),
-        updated_at_us: integer(llm.updated_at_us, `${path}.updated_at_us`),
-      };
-    }),
-    agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
-      const agent = record(entry, path);
-      const rawBehavior = string(agent.behavior, `${path}.behavior`);
-      if (rawBehavior !== "chat" && rawBehavior !== "general") {
-        throw new ContractError(`${path}.behavior`, "chat or general");
-      }
-      return {
-        id: identity(agent.id, `${path}.id`, "profile:"),
-        name: string(agent.name, `${path}.name`),
-        tool_grant: toolGrant(agent.tool_grant, `${path}.tool_grant`),
-        instructions: optionalString(agent.instructions, `${path}.instructions`),
-        behavior: rawBehavior as ControlAgentBehavior,
-        llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,
-          (target, targetPath) => identity(target, targetPath, "profile:")),
-        editable: boolean(agent.editable, `${path}.editable`),
-        blocking_jobs: listOf(agent.blocking_jobs, `${path}.blocking_jobs`,
-          (job, jobPath) => identity(job, jobPath, "job:")),
-        more_blocking_jobs: boolean(agent.more_blocking_jobs, `${path}.more_blocking_jobs`),
-        created_at_us: integer(agent.created_at_us, `${path}.created_at_us`),
-        updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`),
-      };
-    }),
-    providers: listOf(envelope.providers, "providers", (entry, path) => {
-      const provider = record(entry, path);
-      const protocol = string(provider.protocol, `${path}.protocol`);
-      if (protocol !== "openai_chat_completions") {
-        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
-      }
-      return {
-        protocol,
-        endpoint: optionalString(provider.endpoint, `${path}.endpoint`),
-        credential_ref: optionalString(provider.credential_ref, `${path}.credential_ref`),
-        has_credential: boolean(provider.has_credential, `${path}.has_credential`),
-        profile_ids: listOf(provider.profile_ids, `${path}.profile_ids`,
-          (id, idPath) => identity(id, idPath, "profile:")),
-        models: listOf(provider.models, `${path}.models`,
-          (model, modelPath) => string(model, modelPath)),
-      };
-    }),
-  };
-}
-
-export type ControlAgentBehavior = "chat" | "general";
-export type ControlProfilesSnapshot = ReturnType<typeof decodeProfiles>;
-export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
-export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
-export type ControlProviderProjection = ControlProfilesSnapshot["providers"][number];
-
-/**
- * An image Attachment as `POST /api/v1/attachments` and
- * `GET /api/v1/attachments/{attachment}` report it.
- */
-export function decodeAttachment(input: unknown) {
-  const envelope = record(input, "response");
-  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const attachment = record(envelope.attachment, "attachment");
-  return {
-    id: identity(attachment.id, "attachment.id", "attachment:"),
-    mime: string(attachment.mime, "attachment.mime"),
-    byte_length: integer(attachment.byte_length, "attachment.byte_length"),
-    sha256: string(attachment.sha256, "attachment.sha256"),
-    display_name:
-      attachment.display_name === null ? null : string(attachment.display_name, "attachment.display_name"),
-    created_at_us: timestamp(attachment.created_at_us, "attachment.created_at_us"),
-    available: typeof attachment.available === "boolean" ? attachment.available : true,
-    data_url: typeof attachment.data_url === "string" ? attachment.data_url : undefined,
-  };
-}
-
-export type ControlAttachment = ReturnType<typeof decodeAttachment>;
-

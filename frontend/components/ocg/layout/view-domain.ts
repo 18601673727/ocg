@@ -1,73 +1,108 @@
 /**
- * Pure Workspace view resolution for the 0.5 operator console.
+ * Pure Workspace view resolution for the root route.
  *
- * Adapted from the 0.4.5 shell's `?view=` routing. Only views the Control
- * Plane can actually back are `available`; the others are named so the
- * navigation states what is missing instead of pretending.
+ * An explicit `view` search param wins, which is how shell navigation moves
+ * between surfaces without renaming the scenario behind it. When no explicit
+ * view is present, the scenario-derived default is used.
  */
 
-export type WorkspaceView = "chat" | "jobs" | "usage" | "health" | "logs" | "settings";
+import type { ScenarioId } from "../runtime/runtime-types";
 
-export type ViewAvailability =
-  | { available: true }
-  | {
-      available: false;
-      /** The Control Plane contract this view would read, which does not exist. */
-      missing: string;
-    };
+export type WorkspaceView =
+  | "jobs"
+  | "chat"
+  | "home"
+  | "usage"
+  | "attention"
+  | "ledger"
+  | "control-center"
+  | "job-execution"
+  | "health"
+  | "logs"
+  | "settings"
+  | "canonical";
 
-export const WORKSPACE_VIEWS: readonly WorkspaceView[] = ["chat", "jobs", "usage", "health", "logs", "settings"];
-
-export const VIEW_AVAILABILITY: Record<WorkspaceView, ViewAvailability> = {
-  chat: { available: true },
-  jobs: { available: true },
-  settings: { available: true },
-  usage: { available: true },
-  health: { available: true },
-  logs: { available: true },
-};
-
-export const VIEW_TITLE: Record<WorkspaceView, string> = {
-  chat: "Chat",
-  jobs: "Jobs",
-  usage: "Usage",
-  health: "Health",
-  logs: "Logs",
-  settings: "Settings",
-};
+export const WORKSPACE_VIEWS: readonly WorkspaceView[] = [
+  "jobs",
+  "chat",
+  "home",
+  "attention",
+  "usage",
+  "ledger",
+  "control-center",
+  "job-execution",
+  "health",
+  "logs",
+  "settings",
+  "canonical",
+];
 
 export function isWorkspaceView(value: unknown): value is WorkspaceView {
   return typeof value === "string" && (WORKSPACE_VIEWS as readonly string[]).includes(value);
 }
 
-const JOB_IDENTITY = /^job:(0|[1-9][0-9]*)$/;
-
-export function isJobIdentity(value: unknown): value is string {
-  return typeof value === "string" && JOB_IDENTITY.test(value);
+/** Existing scenario-derived defaults, unchanged. */
+export function deriveScenarioWorkspaceView(scenario: ScenarioId): WorkspaceView {
+  void scenario;
+  return "chat";
 }
 
-export type WorkspaceLocation = {
-  view: WorkspaceView;
-  /** The Job the Jobs view watches, when the address names one. */
-  job: string | null;
+export function resolveWorkspaceView(scenario: ScenarioId, requestedView: unknown): WorkspaceView {
+  return isReachableView(requestedView) ? requestedView : deriveScenarioWorkspaceView(scenario);
+}
+
+/** How a workspace is opened from the shell's navigation controls. */
+export type WorkspaceTarget = {
+  /** Address the view is opened at, relative to the app root. */
+  readonly href: string;
+  /**
+   * Whether selecting a view that is already on screen closes back to the chat
+   * root. Surfaces on their own route and the scenario surfaces do; the chat,
+   * home and attention views are states you are either in or not.
+   */
+  readonly toggles: boolean;
 };
 
-/** Reads a location's query. Anything it does not recognize falls back to the Jobs view. */
-export function parseWorkspaceLocation(search: string): WorkspaceLocation {
-  const params = new URLSearchParams(search);
-  const view = params.get("view");
-  const job = params.get("job");
-  return {
-    view: isWorkspaceView(view) ? view : "jobs",
-    job: isJobIdentity(job) ? job : null,
-  };
+/**
+ * Where each workspace lives.
+ *
+ * Every root-route view is opened with `?view=` rather than `?scenario=`, so
+ * navigating inside the workspace keeps the active scenario — and therefore the
+ * one in-memory runtime instance and its authority — untouched. Naming a
+ * scenario selects a fixture, so it is left to whoever opened the URL to do it
+ * deliberately. Standalone routes remain direct entrypoints, while shell
+ * navigation switches the root workspace view.
+ */
+const WORKSPACE_TARGETS: Record<WorkspaceView, WorkspaceTarget> = {
+  jobs: { href: "/jobs", toggles: false },
+  chat: { href: "/?view=chat", toggles: false },
+  home: { href: "/?view=home", toggles: false },
+  usage: { href: "/?view=usage", toggles: false },
+  attention: { href: "/?view=attention", toggles: false },
+  "control-center": { href: "/?view=control-center", toggles: true },
+  ledger: { href: "/?view=ledger", toggles: true },
+  "job-execution": { href: "/?view=job-execution", toggles: true },
+  health: { href: "/?view=health", toggles: true },
+  logs: { href: "/?view=logs", toggles: true },
+  settings: { href: "/?view=settings", toggles: true },
+  canonical: { href: "/?view=canonical", toggles: false },
+};
+
+/**
+ * The address a navigation resolves to, or `null` when it would not change
+ * anything on screen. Callers push it with the active Project parameter
+ * attached.
+ */
+export function workspaceViewHref(current: WorkspaceView, target: WorkspaceView): string | null {
+  const destination = WORKSPACE_TARGETS[target];
+  if (current === target) return destination.toggles ? WORKSPACE_TARGETS.chat.href : null;
+  return destination.href;
 }
 
-/** The query that names `location`; the default view with no Job is the bare root. */
-export function workspaceLocationHref(location: WorkspaceLocation): string {
-  const params = new URLSearchParams();
-  if (location.view !== "jobs") params.set("view", location.view);
-  if ((location.view === "jobs" || location.view === "chat") && location.job) params.set("job", location.job);
-  const query = params.toString();
-  return query ? `/?${query}` : "/";
+export function isJobIdentity(value: unknown): value is string {
+  return typeof value === "string" && /^job:(0|[1-9][0-9]*)$/.test(value);
+}
+
+export function isReachableView(value: unknown): value is WorkspaceView {
+  return typeof value === "string" && ["chat", "jobs", "usage", "logs", "health", "settings"].includes(value);
 }
