@@ -346,6 +346,11 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
         }
         Ok(states)
     })?;
+    let pending: Vec<_> = states
+        .iter()
+        .filter(|state| state.claim.is_none() && state.outcome.is_none())
+        .map(|state| state.job_id)
+        .collect();
     let mut abandoned = Vec::new();
     let mut unconfirmed = Vec::new();
     for mut state in states {
@@ -371,6 +376,17 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
             unconfirmed.push(state);
         } else if is_unknown && state.stop_confirmed_at.is_none() {
             unconfirmed.push(state);
+        }
+    }
+    // Newer waiters cancel first, so all receive Abandoned rather than a dependency failure.
+    for job in pending.into_iter().rev() {
+        if batch.require_job_state(job)?.outcome.is_none() {
+            batch.finalize(
+                job,
+                OutcomeKind::Cancelled,
+                Some(OutcomeCause::Abandoned),
+                None,
+            )?;
         }
     }
     let (host, boot) = (batch.host_id.clone(), batch.boot_id.clone());
@@ -407,4 +423,88 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
         batch.settle(job)?;
     }
     Ok(abandoned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::persistence::{DependencyCondition, JobInputDraft, NewJob};
+    use crate::test_support::{data_directory, execution_configuration, wait};
+    use redb::ReadableTableMetadata;
+
+    #[test]
+    fn open_cancels_every_previous_pending_readiness_state_and_settles_the_graph() {
+        for clean in [true, false] {
+            let (_root, directory) =
+                data_directory("open-pending", if clean { "clean" } else { "unclean" });
+            let worker = DatabaseWorker::start(&directory).expect("database");
+            let database = worker.handle();
+            let spec = NewJob {
+                name: None,
+                eligible_at: None,
+                parent: database.genesis(),
+                projects: Vec::new(),
+                dependencies: Vec::new(),
+                input: JobInputDraft::default(),
+                configuration: Some(execution_configuration(&database)),
+                previous: None,
+            };
+            let parent = wait(database.create_job(spec.clone())).expect("ready parent");
+            let child = wait(database.create_job(NewJob {
+                parent,
+                ..spec.clone()
+            }))
+            .expect("child");
+            let waiter = wait(database.create_job(NewJob {
+                dependencies: vec![(child, DependencyCondition::Success)],
+                ..spec.clone()
+            }))
+            .expect("blocked root");
+            let delayed = wait(database.create_job(NewJob {
+                eligible_at: Some(Timestamp::from_unix_micros(
+                    Timestamp::now().as_unix_micros() + 3_600_000_000,
+                )),
+                ..spec
+            }))
+            .expect("delayed root");
+            worker.shutdown().expect("shutdown");
+            if !clean {
+                let database =
+                    Database::open(database_file(directory.database_path())).expect("raw file");
+                let tx = database.begin_write().expect("write");
+                tx.open_table(META)
+                    .expect("meta")
+                    .insert("clean_shutdown", [0u8].as_slice())
+                    .expect("unclean marker");
+                tx.commit().expect("marker committed");
+            }
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            let database = worker.handle();
+            for job in [parent, child, waiter, delayed] {
+                let record = wait(database.job(job)).expect("read").expect("Job");
+                let outcome = record.outcome.expect("abandoned pending Job");
+                assert_eq!(
+                    (outcome.kind, outcome.cause),
+                    (OutcomeKind::Cancelled, Some(OutcomeCause::Abandoned))
+                );
+                assert!(
+                    record.claim.is_none()
+                        && record.children_closed_at.is_some()
+                        && record.subtree_settled
+                );
+            }
+            wait(database.with_database(|database| {
+                let tx = database.begin_read()?;
+                assert_eq!(tx.open_table(PENDING)?.len()?, 0);
+                assert_eq!(tx.open_table(READY)?.len()?, 0);
+                assert_eq!(tx.open_table(DELAYED)?.len()?, 0);
+                assert_eq!(tx.open_table(DEPENDENCY_WAITERS)?.len()?, 0);
+                assert_eq!(tx.open_table(UNSETTLED)?.len()?, 0);
+                Ok(())
+            }))
+            .expect("pending indexes and settlement counts are empty");
+            worker.shutdown().expect("shutdown");
+        }
+    }
 }

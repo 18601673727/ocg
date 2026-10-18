@@ -476,6 +476,10 @@ fn nodes_and_relationships_round_trip_through_reopening() {
             wait(handle.job_outputs(check, None, 100)).expect("read check outputs"),
         )
     };
+    for job in [dependent, child, parent] {
+        wait(handle.finalize_job(job, JobFinalization::Cancelled(result("finished fixture"))))
+            .expect("settle before the round trip");
+    }
     let before = read_all(&handle);
     worker.shutdown().expect("shutdown");
     assert_relationships_consistent(&directory);
@@ -510,7 +514,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
         (genesis, vec![alpha, beta])
     );
     assert_eq!(parent_record.assigned_executor, None, "nothing claimed it");
-    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs.len(), 2);
     assert_eq!(projects.len(), 2);
     assert_eq!(beta_jobs, [parent, dependent]);
     assert_eq!(
@@ -3187,7 +3191,7 @@ mod control_plane {
                 })
             );
             let states = [
-                "unsettled",
+                "cancelled",
                 "unknown",
                 "completed",
                 "failed",
@@ -3206,7 +3210,7 @@ mod control_plane {
                 assert_eq!(job["id"], record.id.to_string());
                 assert_eq!(job["input"], record.input.to_string());
                 assert_eq!(job["settlement"]["state"], state, "{}", record.id);
-                let settled_at = if record.id == expected[1].id {
+                let settled_at = if record.id == expected[0].id || record.id == expected[1].id {
                     job["settlement"]["settled_at_us"].as_i64()
                 } else {
                     [
@@ -9743,7 +9747,7 @@ mod requests_and_tool_loop {
                     (id, workspace_command::TOOL_NAME)
                 );
                 let admission = record.admission().expect("admitted");
-                assert_eq!(admission.handler_version, "workspace_run_command-3");
+                assert_eq!(admission.handler_version, "workspace_run_command-4");
                 assert_eq!(admission.effect, ToolEffect::NonIdempotent);
                 assert_eq!(admission.arguments.as_str(), r#"{"command":"cargo_test"}"#);
                 assert_eq!(
@@ -9914,7 +9918,12 @@ mod requests_and_tool_loop {
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert!(matches!(
                 outcome_of(&record),
-                Some(ToolOutcome::NotApplied { .. })
+                Some(
+                    ToolOutcome::NotApplied { .. }
+                        | ToolOutcome::NotInvoked {
+                            reason: NotInvokedReason::Cancelled
+                        }
+                )
             ));
             assert!(!record.is_unresolved());
             assert_eq!(
@@ -10810,6 +10819,45 @@ mod requests_and_tool_loop {
         }
 
         #[test]
+        fn dispatcher_finalizes_a_panicking_job_and_keeps_dispatching() {
+            let (_root, directory) = data_directory("dispatcher-panic");
+            let worker = DatabaseWorker::start(&directory).expect("database");
+            let handle = worker.handle();
+            let (target, _) = scripted(&handle, "dispatcher-panic", Vec::new());
+            let mut panic_once = true;
+            provider_seam::install("https://dispatcher-panic.invalid/v1", move |_| {
+                if std::mem::take(&mut panic_once) {
+                    panic!("injected Job task panic");
+                }
+                now(answering("dispatcher continued", (2, 1)))
+            });
+            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let first = admitted(wait(
+                runtime
+                    .scheduler()
+                    .admit_provider(plan(&handle, &target, "panics", None)),
+            ));
+            let id = first.job();
+            assert!(matches!(
+                wait(first.settled()),
+                Err(ExecutionRuntimeError::WorkerPanicked)
+            ));
+            assert!(job_record(&handle, id).unknown_at.is_some());
+            assert!(wait(handle.occupancy()).expect("capacity").is_empty());
+            let second = admitted(wait(runtime.scheduler().admit_provider(plan(
+                &handle,
+                &target,
+                "continues",
+                None,
+            ))));
+            let id = second.job();
+            wait(second.settled()).expect("still dispatching");
+            assert!(job_record(&handle, id).completed_at.is_some());
+            wait(runtime.shutdown()).expect("shutdown");
+            worker.shutdown().expect("shutdown database");
+        }
+
+        #[test]
         fn dispatcher_admission_commits_before_capacity_and_preserves_submission_identity() {
             use crate::persistence::{NewSubmission, RequestFingerprint, SubmissionKey};
             let (_root, directory) = data_directory("dispatcher-admission");
@@ -10932,7 +10980,19 @@ mod requests_and_tool_loop {
             first.request_stop();
             wait(first.settled()).expect("first stopped");
             let id = waiter.job();
-            wait(waiter.settled()).expect("cancelled by dependency");
+            let mut settlement = std::pin::pin!(waiter.settled());
+            let deadline = Instant::now() + Duration::from_secs(35);
+            loop {
+                if let Some(result) = poll_once(settlement.as_mut()) {
+                    result.expect("cancelled by dependency, found on the reconcile tick");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reconciliation must answer the waiter"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
             assert!(job_record(&handle, id).cancelled_at.is_some());
             assert!(job_record(&handle, id).claim.is_none());
             assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -10941,7 +11001,7 @@ mod requests_and_tool_loop {
         }
 
         #[test]
-        fn dispatcher_runs_a_durable_pending_job_after_reopening() {
+        fn dispatcher_cancels_a_durable_pending_job_after_reopening() {
             let (_root, directory) = data_directory("dispatcher-reopen");
             let worker = DatabaseWorker::start(&directory).expect("database");
             let handle = worker.handle();
@@ -10956,8 +11016,13 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start(&directory).expect("reopen");
             let handle = worker.handle();
             let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
-            until(|| job_record(&handle, job).completed_at.is_some());
-            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            let record = job_record(&handle, job);
+            assert!(record.cancelled_at.is_some() && record.claim.is_none());
+            assert_eq!(
+                record.outcome.expect("abandoned").cause,
+                Some(crate::persistence::OutcomeCause::Abandoned)
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
             wait(runtime.shutdown()).expect("shutdown");
             worker.shutdown().expect("shutdown");
         }
@@ -10984,13 +11049,7 @@ mod requests_and_tool_loop {
             let child = wait(handle.create_job(child)).expect("child");
             let mut depends_on_child = plan(&handle, &target, "root waiter", None).job;
             depends_on_child.dependencies = vec![(child, DependencyCondition::Settled)];
-            assert!(matches!(
-                wait(handle.create_job(depends_on_child)),
-                Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "dependencies",
-                    _
-                )))
-            ));
+            wait(handle.create_job(depends_on_child)).expect("a root can wait on an older child");
             let mut child_waiter = plan(&handle, &target, "child waiter", None).job;
             child_waiter.parent = root;
             child_waiter.dependencies = vec![(root, DependencyCondition::Settled)];
@@ -11001,7 +11060,7 @@ mod requests_and_tool_loop {
                     _
                 )))
             ));
-            assert_eq!(wait(handle.jobs(None, 100)).expect("jobs").len(), 2);
+            assert_eq!(wait(handle.jobs(None, 100)).expect("jobs").len(), 3);
             worker.shutdown().expect("shutdown");
         }
 
@@ -11264,7 +11323,11 @@ mod requests_and_tool_loop {
                     let [record] = jobs.try_into().expect("the one Job");
                     // The recovery reopened the file, which settled the Job
                     // the earlier opening started as abandoned.
-                    assert!(record.started_at.is_none() && record.outcome.is_none());
+                    assert!(record.started_at.is_none() && record.cancelled_at.is_some());
+                    assert_eq!(
+                        record.outcome.expect("abandoned pending Job").cause,
+                        Some(crate::persistence::OutcomeCause::Abandoned)
+                    );
                     worker.shutdown().expect("shutdown");
                     let worker = DatabaseWorker::start(&directory).expect("restart");
                     assert!(worker.handle().abandoned_at_open().is_empty());
@@ -12775,8 +12838,8 @@ mod requests_and_tool_loop {
                     // the lost opening as unknown; nothing executes it again.
                     let replay = submit(address, key, &body);
                     assert_eq!((replay.status, replay.job()), (200, record.id));
-                    until(|| state(address, record.id) == "completed");
-                    assert_eq!(target.requests(), 1);
+                    until(|| state(address, record.id) == "cancelled");
+                    assert_eq!(target.requests(), 0);
                 }
                 "not_found" => {
                     assert!(jobs.is_empty(), "no Job: {jobs:?}");

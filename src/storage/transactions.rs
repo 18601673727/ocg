@@ -102,12 +102,7 @@ impl Batch {
                 ));
             }
             previous = Some(*dependency);
-            if self.require_job(*dependency)?.parent_id.is_some() {
-                return self.reject(Violation::InvalidValue(
-                    "dependencies",
-                    "a dependency must name a Job without a parent",
-                ));
-            }
+            self.require_job(*dependency)?;
             if self.is_subtree_settled(*dependency)? {
                 let completed = self
                     .require_job_state(*dependency)?

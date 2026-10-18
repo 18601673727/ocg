@@ -133,6 +133,11 @@ const CONFIGURATION_REFUSED: Refusal = Refusal::new(
     "the selected configuration cannot run this Job; nothing was admitted",
 );
 
+const RUNTIME_BUSY: Refusal = Refusal::new(
+    StatusCode::SERVICE_UNAVAILABLE,
+    "runtime_busy",
+    "OCG has too much work queued; nothing was admitted; retry later",
+);
 const PENDING_LIMIT_REACHED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
     "pending_limit_reached",
@@ -1053,6 +1058,7 @@ pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderEx
 /// failed inside.
 fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
     match error {
+        ExecutionRuntimeError::SchedulerQueueFull => RUNTIME_BUSY,
         ExecutionRuntimeError::ShuttingDown | ExecutionRuntimeError::SchedulerStopped => {
             SHUTTING_DOWN
         }

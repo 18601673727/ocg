@@ -1,10 +1,11 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ntex::util::{Either, select};
 
@@ -280,6 +281,12 @@ pub struct ExecutionReceipt {
 pub enum ExecutionRuntimeError {
     #[error("scheduler worker stopped")]
     SchedulerStopped,
+    #[error("scheduler admission queue is full")]
+    SchedulerQueueFull,
+    #[error("claimed Job {0} has no frozen pool binding")]
+    MissingPoolBinding(JobId),
+    #[error("claimed Job {0} has no execution plan in this opening")]
+    MissingExecutionPlan(JobId),
     #[error("database operation failed: {0}")]
     Database(#[from] DatabaseError),
     #[error("executor {0} is not registered")]
@@ -436,6 +443,7 @@ enum SchedulerMessage {
     Grant(JobId),
     Stop(JobId),
     Finished(JobId),
+    Reconcile,
 }
 
 #[derive(Default)]
@@ -483,7 +491,7 @@ fn lock(state: &SharedState) -> std::sync::MutexGuard<'_, RuntimeState> {
 /// A cloneable endpoint for scheduler submissions.
 #[derive(Clone)]
 pub struct SchedulerHandle {
-    sender: flume::Sender<SchedulerMessage>,
+    sender: flume::Sender<Box<Submission>>,
     state: SharedState,
 }
 
@@ -610,8 +618,11 @@ impl SchedulerHandle {
             return Err(ExecutionRuntimeError::SchedulerStopped);
         }
         self.sender
-            .send(SchedulerMessage::Schedule(Box::new(submission)))
-            .map_err(|_| ExecutionRuntimeError::SchedulerStopped)
+            .try_send(Box::new(submission))
+            .map_err(|error| match error {
+                flume::TrySendError::Full(_) => ExecutionRuntimeError::SchedulerQueueFull,
+                flume::TrySendError::Disconnected(_) => ExecutionRuntimeError::SchedulerStopped,
+            })
     }
 }
 
@@ -712,6 +723,7 @@ impl ExecutionRuntime {
             .take_scheduler_wake()
             .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
         let (sender, receiver) = flume::unbounded();
+        let (admission, admissions) = flume::bounded(64);
         let state = SharedState::default();
         let shutdown = CancellationToken::default();
         let finished = ntex::rt::spawn(dispatch_runtime(
@@ -719,11 +731,15 @@ impl ExecutionRuntime {
             wake,
             sender.clone(),
             receiver,
+            admissions,
             state.clone(),
             shutdown.clone(),
         ));
         Ok(Self {
-            scheduler: SchedulerHandle { sender, state },
+            scheduler: SchedulerHandle {
+                sender: admission,
+                state,
+            },
             shutdown,
             finished: Some(finished),
         })
@@ -764,6 +780,7 @@ async fn dispatch_runtime(
     wake: crate::database::SchedulerWakeSubscription,
     sender: flume::Sender<SchedulerMessage>,
     receiver: flume::Receiver<SchedulerMessage>,
+    admissions: flume::Receiver<Box<Submission>>,
     state: SharedState,
     shutdown: CancellationToken,
 ) -> Result<(), ExecutionRuntimeError> {
@@ -796,8 +813,31 @@ async fn dispatch_runtime(
     });
     let mut pending = BTreeMap::new();
     let mut running = BTreeMap::new();
-    while let Either::Right(Ok(message)) = select(shutdown.cancelled(), receiver.recv_async()).await
-    {
+    let mut reconcile_at = Instant::now() + Duration::from_secs(30);
+    loop {
+        let incoming = async {
+            if Instant::now() >= reconcile_at {
+                return Ok(SchedulerMessage::Reconcile);
+            }
+            match select(
+                receiver.recv_async(),
+                select(
+                    admissions.recv_async(),
+                    ntex::time::sleep(reconcile_at.saturating_duration_since(Instant::now())),
+                ),
+            )
+            .await
+            {
+                Either::Left(message) => message,
+                Either::Right(Either::Left(submission)) => {
+                    submission.map(SchedulerMessage::Schedule)
+                }
+                Either::Right(Either::Right(())) => Ok(SchedulerMessage::Reconcile),
+            }
+        };
+        let Either::Right(Ok(message)) = select(shutdown.cancelled(), incoming).await else {
+            break;
+        };
         match message {
             SchedulerMessage::Schedule(submission) => {
                 if lock(&state).stopping {
@@ -889,7 +929,8 @@ async fn dispatch_runtime(
                     pending.insert(job, admitted);
                 }
             }
-            SchedulerMessage::Claim(reply) => {
+            SchedulerMessage::Reconcile => {
+                reconcile_at = Instant::now() + Duration::from_secs(30);
                 match database
                     .terminal_jobs(pending.keys().copied().collect())
                     .await
@@ -914,6 +955,8 @@ async fn dispatch_runtime(
                     }
                     Err(error) => log::warn!("pending settlement read failed: {error}"),
                 }
+            }
+            SchedulerMessage::Claim(reply) => {
                 // Admission and claim requests share this task so a committed
                 // grant cannot overtake registration of its execution context.
                 let batch = match database.claim_batch().await {
@@ -942,23 +985,20 @@ async fn dispatch_runtime(
                 );
             }
             SchedulerMessage::Stop(job) => {
-                if matches!(database.frozen_pool_binding(job).await, Ok(None))
-                    && let Some(execution) = pending.remove(&job)
-                {
-                    cancel_pending(&database, execution).await;
-                    lock(&state).current.remove(&job);
-                }
+                stop_pending(&database, job, &mut pending, &state).await;
             }
             SchedulerMessage::Finished(job) => {
-                lock(&state).current.remove(&job);
                 if let Some(task) = running.remove(&job) {
-                    task.await
-                        .map_err(|_| ExecutionRuntimeError::WorkerPanicked)?;
+                    finish_grant(&database, job, task).await;
                 }
+                lock(&state).current.remove(&job);
             }
         }
     }
     lock(&state).closed = true;
+    for submission in admissions.drain() {
+        submission.refuse();
+    }
     for message in receiver.drain() {
         match message {
             SchedulerMessage::Claim(reply) => {
@@ -973,7 +1013,9 @@ async fn dispatch_runtime(
                 &state,
                 &mut running,
             ),
-            SchedulerMessage::Stop(_) | SchedulerMessage::Finished(_) => {}
+            SchedulerMessage::Stop(_)
+            | SchedulerMessage::Finished(_)
+            | SchedulerMessage::Reconcile => {}
         }
     }
     dispatcher
@@ -993,25 +1035,45 @@ async fn dispatch_runtime(
                 &state,
                 &mut running,
             ),
-            SchedulerMessage::Stop(_) | SchedulerMessage::Finished(_) => {}
+            SchedulerMessage::Stop(_)
+            | SchedulerMessage::Finished(_)
+            | SchedulerMessage::Reconcile => {}
         }
     }
     for execution in pending.into_values() {
-        cancel_pending(&database, execution).await;
+        cancel_pending(&database, &execution).await;
     }
-    let mut failure = None;
-    for task in running.into_values() {
-        if task.await.is_err() {
-            failure = Some(ExecutionRuntimeError::WorkerPanicked);
-        }
+    for (job, task) in running {
+        finish_grant(&database, job, task).await;
     }
     lock(&state).current.clear();
-    failure.map_or(Ok(()), Err)
+    Ok(())
 }
 
-async fn cancel_pending(database: &DatabaseHandle, execution: PendingExecution) {
+async fn stop_pending(
+    database: &DatabaseHandle,
+    job: JobId,
+    pending: &mut BTreeMap<JobId, PendingExecution>,
+    state: &SharedState,
+) {
+    if let Some(execution) = pending.get(&job) {
+        execution.cancellation.cancel();
+        match database.frozen_pool_binding(job).await {
+            Ok(None) => {
+                if cancel_pending(database, execution).await {
+                    pending.remove(&job);
+                    lock(state).current.remove(&job);
+                }
+            }
+            Ok(Some(_)) => {} // Its grant will observe the cancelled token.
+            Err(error) => log::error!("pending Job {job} stop read failed: {error}"),
+        }
+    }
+}
+
+async fn cancel_pending(database: &DatabaseHandle, execution: &PendingExecution) -> bool {
     let started = execution.started;
-    let result = database
+    match database
         .finalize_job(
             started.job,
             JobFinalization::Cancelled(FinalResult {
@@ -1022,80 +1084,162 @@ async fn cancel_pending(database: &DatabaseHandle, execution: PendingExecution) 
             }),
         )
         .await
-        .map(|result| ExecutionReceipt {
-            executor: started.executor,
-            input: started.input,
-            job: started.job,
-            result,
-        })
-        .map_err(ExecutionRuntimeError::from);
-    execution.done.cancel();
-    if let Some(reply) = execution.reply {
+    {
+        Ok(result) => {
+            execution.done.cancel();
+            if let Some(reply) = &execution.reply {
+                reply
+                    .send(Ok(ExecutionReceipt {
+                        executor: started.executor,
+                        input: started.input,
+                        job: started.job,
+                        result,
+                    }))
+                    .ok();
+            }
+            true
+        }
+        Err(error) => {
+            log::error!("pending Job {} could not settle: {error}", started.job);
+            false
+        }
+    }
+}
+
+struct RunningExecution {
+    task: ntex::rt::JoinHandle<Result<ExecutionReceipt, ExecutionRuntimeError>>,
+    reply: Option<ExecutionReply>,
+}
+
+struct NotifyFinished {
+    job: JobId,
+    sender: flume::Sender<SchedulerMessage>,
+}
+
+impl Drop for NotifyFinished {
+    fn drop(&mut self) {
+        self.sender.send(SchedulerMessage::Finished(self.job)).ok();
+    }
+}
+
+struct JobTask<F>(Pin<Box<F>>);
+
+impl<F: Future<Output = Result<ExecutionReceipt, ExecutionRuntimeError>>> Future for JobTask<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match catch_unwind(AssertUnwindSafe(|| self.0.as_mut().poll(context))) {
+            Ok(polled) => polled,
+            Err(_) => Poll::Ready(Err(ExecutionRuntimeError::WorkerPanicked)),
+        }
+    }
+}
+
+async fn finish_grant(database: &DatabaseHandle, job: JobId, running: RunningExecution) {
+    let result = match running.task.await {
+        Ok(Err(ExecutionRuntimeError::WorkerPanicked)) | Err(_) => {
+            log::error!("Job {job} task panicked");
+            finalize_claim_error(database, job, &ExecutionRuntimeError::WorkerPanicked, true).await;
+            Err(ExecutionRuntimeError::WorkerPanicked)
+        }
+        Ok(result) => result,
+    };
+    if let Some(reply) = running.reply {
         reply.send(result).ok();
     } else if let Err(error) = result {
-        log::error!("pending Job {} could not settle: {error}", started.job);
+        log::error!("granted Job {job} failed: {error}");
+    }
+}
+
+async fn finalize_claim_error(
+    database: &DatabaseHandle,
+    job: JobId,
+    error: &ExecutionRuntimeError,
+    tool_may_have_run: bool,
+) {
+    if matches!(
+        error,
+        ExecutionRuntimeError::ObservationsNotRecorded { .. }
+            | ExecutionRuntimeError::CompletionRefused { .. }
+            | ExecutionRuntimeError::ToolLoopStopped { .. }
+    ) {
+        return;
+    }
+    let outcome = if tool_may_have_run {
+        JobFinalization::Unknown
+    } else {
+        JobFinalization::Failed(FinalResult {
+            summary: Some(error.to_string()),
+            code: None,
+            goal_reached: Some(false),
+            value: None,
+        })
+    };
+    match database.finalize_job(job, outcome).await {
+        Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
+        Err(failure) => log::error!(
+            "Job {job} error ({error}) could not be finalized: {failure}; open reconcile will recover it"
+        ),
     }
 }
 
 fn spawn_grant(
     job: JobId,
-    execution: Option<PendingExecution>,
+    mut execution: Option<PendingExecution>,
     database: &DatabaseHandle,
     sender: &flume::Sender<SchedulerMessage>,
     state: &SharedState,
-    running: &mut BTreeMap<JobId, ntex::rt::JoinHandle<()>>,
+    running: &mut BTreeMap<JobId, RunningExecution>,
 ) {
     let database = database.clone();
-    let sender = sender.clone();
-    let state = state.clone();
+    let notify = NotifyFinished {
+        job,
+        sender: sender.clone(),
+    };
+    let reply = execution
+        .as_mut()
+        .and_then(|execution| execution.reply.take());
     if let Some(execution) = &execution {
         execution.done.cancel();
-    }
-    let cancellation = execution
-        .as_ref()
-        .map(|execution| execution.cancellation.clone())
-        .unwrap_or_default();
-    {
-        let mut state = lock(&state);
-        if state.stopping {
-            cancellation.cancel();
+        if lock(state).stopping {
+            execution.cancellation.cancel();
         }
-        state.current.insert(job, cancellation.clone());
     }
-    running.insert(
-        job,
-        ntex::rt::spawn(async move {
-            let execution = execution.unwrap_or_else(|| PendingExecution {
-                started: StartedJob {
-                    job,
-                    input: JobInputId::new(job.get()),
-                    executor: ExecutorId::new(0),
-                },
-                execution: PendingPlan::Provider(
-                    ProviderTask {
-                        credential_resolver: database.credential_resolver(),
-                        provider_config: ProviderExecutionConfig {
-                            cancellation,
-                            ..ProviderExecutionConfig::default()
-                        },
-                        tools: None,
-                    },
-                    None,
-                ),
-                cancellation: CancellationToken::default(),
-                done: CancellationToken::default(),
-                reply: None,
-            });
+    let task = ntex::rt::spawn(async move {
+        let _notify = notify;
+        JobTask(Box::pin(async move {
+            let tool_may_have_run = Cell::new(false);
             let result = async {
+                let execution =
+                    execution.ok_or(ExecutionRuntimeError::MissingExecutionPlan(job))?;
                 let binding = database
                     .frozen_pool_binding(job)
                     .await?
-                    .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
+                    .ok_or(ExecutionRuntimeError::MissingPoolBinding(job))?;
                 let started = StartedJob {
                     job,
                     input: JobInputId::new(job.get()),
                     executor: binding.pool.into(),
                 };
+                if execution.cancellation.is_cancelled() {
+                    let result = database
+                        .finalize_job(
+                            job,
+                            JobFinalization::Cancelled(FinalResult {
+                                summary: Some("stopped before execution".into()),
+                                code: None,
+                                goal_reached: None,
+                                value: None,
+                            }),
+                        )
+                        .await?;
+                    return Ok(ExecutionReceipt {
+                        job,
+                        executor: started.executor,
+                        input: started.input,
+                        result,
+                    });
+                }
                 match execution.execution {
                     PendingPlan::Plan(outcome, result) => {
                         let result = database
@@ -1109,21 +1253,25 @@ fn spawn_grant(
                         })
                     }
                     PendingPlan::Provider(plan, offered) => {
-                        run_started_provider_job(database.clone(), plan, (started, offered)).await
+                        run_started_provider_job(
+                            database.clone(),
+                            plan,
+                            (started, offered),
+                            &tool_may_have_run,
+                        )
+                        .await
                     }
                 }
             }
             .await;
-            lock(&state).current.remove(&job);
-            execution.done.cancel();
-            if let Some(reply) = execution.reply {
-                reply.send(result).ok();
-            } else if let Err(error) = result {
-                log::error!("granted Job {job} failed: {error}");
+            if let Err(error) = &result {
+                finalize_claim_error(&database, job, error, tool_may_have_run.get()).await;
             }
-            sender.send(SchedulerMessage::Finished(job)).ok();
-        }),
-    );
+            result
+        }))
+        .await
+    });
+    running.insert(job, RunningExecution { task, reply });
 }
 
 /// Admits the pending Job of a provider plan through T1, once the plan is
@@ -1190,6 +1338,7 @@ async fn run_started_provider_job(
     database: DatabaseHandle,
     plan: ProviderTask,
     (started, offered): (StartedJob, Option<Vec<ToolWire>>),
+    tool_may_have_run: &Cell<bool>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let StartedJob {
         executor,
@@ -1334,7 +1483,7 @@ async fn run_started_provider_job(
     let frozen = &configuration.frozen;
     let resolver = plan.credential_resolver.as_ref();
     let config = &plan.provider_config;
-    run_provider_job(
+    run_provider_job_inner(
         ProviderRun {
             database,
             executor,
@@ -1344,6 +1493,7 @@ async fn run_started_provider_job(
         conversation,
         plan.tools.as_ref(),
         &config.cancellation,
+        tool_may_have_run,
         async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
             #[cfg(test)]
             if provider_seam::is_scripted(frozen) {
@@ -1566,11 +1716,41 @@ pub(crate) struct ProviderRun {
 /// with every result is sent back as the next request, until a response
 /// requests none or the loop stops, see [`ToolLoopStop`]. Each request is
 /// numbered, and its observations are recorded as its own.
+#[cfg(test)]
 pub(crate) async fn run_provider_job(
+    run: ProviderRun,
+    conversation: ChatConversation,
+    tools: Option<&ToolExecution>,
+    cancellation: &CancellationToken,
+    exchange: impl AsyncFnMut(
+        &ChatConversation,
+        &mut DatabaseOutputSink,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let database = run.database.clone();
+    let job = run.job;
+    let tool_may_have_run = Cell::new(false);
+    let result = run_provider_job_inner(
+        run,
+        conversation,
+        tools,
+        cancellation,
+        &tool_may_have_run,
+        exchange,
+    )
+    .await;
+    if let Err(error) = &result {
+        finalize_claim_error(&database, job, error, tool_may_have_run.get()).await;
+    }
+    result
+}
+
+async fn run_provider_job_inner(
     run: ProviderRun,
     mut conversation: ChatConversation,
     tools: Option<&ToolExecution>,
     cancellation: &CancellationToken,
+    tool_may_have_run: &Cell<bool>,
     mut exchange: impl AsyncFnMut(
         &ChatConversation,
         &mut DatabaseOutputSink,
@@ -1620,6 +1800,7 @@ pub(crate) async fn run_provider_job(
                     &result.tool_calls,
                     &mut budget,
                     cancellation,
+                    tool_may_have_run,
                 )
                 .await
             }
@@ -1758,6 +1939,7 @@ async fn answer_calls(
     calls: &[CompletedToolCall],
     budget: &mut ToolBudget,
     cancellation: &CancellationToken,
+    tool_may_have_run: &Cell<bool>,
 ) -> Result<Vec<String>, Stopped> {
     let limits = &tools.limits;
     if cancellation.is_cancelled() {
@@ -1873,6 +2055,7 @@ async fn answer_calls(
         if cancellation.is_cancelled() {
             return Err(cancelled_before_invocation(site, reference).await);
         }
+        tool_may_have_run.set(true);
         let handler = dispatch.handler;
         let spawns = dispatch.spawns;
         let arguments = dispatch.arguments;
@@ -2411,5 +2594,291 @@ pub(crate) async fn settle_provider_error(
             source,
         }),
         None => Ok(receipt),
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+    use crate::database::{DatabaseWorker, READ_QUEUE_CAPACITY, READ_WORKERS};
+    use crate::persistence::{LlmTransport, NewExecutor};
+    use crate::test_support::{
+        data_directory, execution_configuration, on_system, poll_once, wait,
+    };
+
+    fn spec(database: &DatabaseHandle) -> NewJob {
+        NewJob {
+            name: Some("failure fixture".into()),
+            eligible_at: None,
+            parent: database.genesis(),
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            input: JobInputDraft::default(),
+            configuration: Some(execution_configuration(database)),
+            previous: None,
+        }
+    }
+
+    fn pending(job: JobId, executor: ExecutorId) -> PendingExecution {
+        PendingExecution {
+            started: StartedJob {
+                job,
+                input: JobInputId::new(job.get()),
+                executor,
+            },
+            execution: PendingPlan::Plan(
+                JobOutcome::Completed,
+                FinalResult {
+                    summary: Some("done".into()),
+                    code: None,
+                    goal_reached: None,
+                    value: None,
+                },
+            ),
+            cancellation: CancellationToken::default(),
+            done: CancellationToken::default(),
+            reply: None,
+        }
+    }
+
+    fn executor(database: &DatabaseHandle) -> ExecutorId {
+        wait(database.create_executor(NewExecutor {
+            name: "failure worker".into(),
+            concurrency_limit: std::num::NonZeroU32::new(1).expect("one"),
+            llm_transports: std::collections::BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .expect("executor")
+    }
+
+    #[test]
+    fn a_full_read_queue_after_claim_finalizes_failed_and_releases_capacity() {
+        let (_root, directory) = data_directory("dispatcher-errors", "read-queue");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let executor = executor(&database);
+        let job = wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+        let stopped = wait(database.create_job(spec(&database))).expect("pending Job");
+        on_system(move || async move {
+            let (entered, started) = flume::unbounded();
+            let (release, released) = flume::unbounded();
+            let mut reads = Vec::new();
+            for index in 0..READ_WORKERS + READ_QUEUE_CAPACITY {
+                let entered = entered.clone();
+                let released = released.clone();
+                let mut read = Box::pin(database.with_database(move |_| {
+                    if index < READ_WORKERS {
+                        entered.send(()).expect("entered");
+                        released
+                            .recv_timeout(crate::test_support::WAIT)
+                            .expect("release");
+                    }
+                    Ok(())
+                }));
+                assert!(poll_once(read.as_mut()).is_none());
+                reads.push(read);
+                if index + 1 == READ_WORKERS {
+                    for _ in 0..READ_WORKERS {
+                        started.recv_async().await.expect("held readers");
+                    }
+                }
+            }
+            let state = SharedState::default();
+            let mut pending_jobs = BTreeMap::from([(stopped, pending(stopped, executor))]);
+            stop_pending(&database, stopped, &mut pending_jobs, &state).await;
+            let retained = pending_jobs
+                .get(&stopped)
+                .expect("failed read keeps the pending stop");
+            assert!(retained.cancellation.is_cancelled());
+            assert!(!retained.done.is_cancelled());
+            let (sender, messages) = flume::unbounded();
+            let mut running = BTreeMap::new();
+            let (reply, response) = flume::bounded(1);
+            let mut execution = pending(job, executor);
+            execution.reply = Some(reply);
+            spawn_grant(
+                job,
+                Some(execution),
+                &database,
+                &sender,
+                &SharedState::default(),
+                &mut running,
+            );
+            assert!(
+                matches!(messages.recv_async().await, Ok(SchedulerMessage::Finished(id)) if id == job)
+            );
+            finish_grant(&database, job, running.remove(&job).expect("task")).await;
+            assert!(matches!(
+                response.recv_async().await,
+                Ok(Err(ExecutionRuntimeError::Database(
+                    DatabaseError::ReadQueueFull
+                )))
+            ));
+            for _ in 0..READ_WORKERS {
+                release.send(()).expect("release");
+            }
+            for read in reads {
+                read.await.expect("read drained");
+            }
+            assert!(
+                database
+                    .job(job)
+                    .await
+                    .expect("read")
+                    .expect("Job")
+                    .failed_at
+                    .is_some()
+            );
+            assert!(database.occupancy().await.expect("slots").is_empty());
+            assert_eq!(
+                database.claim_batch().await.expect("later claim"),
+                vec![stopped]
+            );
+            spawn_grant(
+                stopped,
+                pending_jobs.remove(&stopped),
+                &database,
+                &sender,
+                &state,
+                &mut running,
+            );
+            messages.recv_async().await.expect("stopped task finished");
+            finish_grant(&database, stopped, running.remove(&stopped).expect("task")).await;
+            assert!(
+                database
+                    .job(stopped)
+                    .await
+                    .expect("read")
+                    .expect("Job")
+                    .cancelled_at
+                    .is_some()
+            );
+            assert!(database.occupancy().await.expect("slots").is_empty());
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_failed_pending_cancel_commit_keeps_its_context_and_cancelled_token() {
+        use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+        let (_root, directory) = data_directory("dispatcher-errors", "cancel-commit");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let executor = executor(&database);
+        let job = wait(database.create_job(spec(&database))).expect("pending Job");
+        assert!(
+            database.activate_filesystem_protection(ProtectionReason::InsufficientSpace(
+                SpaceShortage {
+                    area: ProtectedArea::Database,
+                    path: directory.database_path().to_path_buf(),
+                    available_bytes: 0,
+                    expected_write_bytes: 0,
+                    threshold_bytes: 1,
+                }
+            ))
+        );
+        on_system(move || async move {
+            let state = SharedState::default();
+            let (reply, response) = flume::bounded(1);
+            let mut execution = pending(job, executor);
+            execution.reply = Some(reply);
+            lock(&state)
+                .current
+                .insert(job, execution.cancellation.clone());
+            let mut pending_jobs = BTreeMap::from([(job, execution)]);
+            stop_pending(&database, job, &mut pending_jobs, &state).await;
+            let retained = pending_jobs
+                .get(&job)
+                .expect("failed commit keeps its execution");
+            assert!(retained.cancellation.is_cancelled());
+            assert!(!retained.done.is_cancelled());
+            assert!(response.try_recv().is_err());
+            assert!(lock(&state).current.contains_key(&job));
+            assert!(
+                database
+                    .job(job)
+                    .await
+                    .expect("read")
+                    .expect("Job")
+                    .outcome
+                    .is_none()
+            );
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_grant_without_its_admitting_process_plan_is_failed_without_execution() {
+        let (_root, directory) = data_directory("dispatcher-errors", "missing-plan");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let executor = executor(&database);
+        let job = wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+        on_system(move || async move {
+            let (sender, messages) = flume::unbounded();
+            let mut running = BTreeMap::new();
+            spawn_grant(
+                job,
+                None,
+                &database,
+                &sender,
+                &SharedState::default(),
+                &mut running,
+            );
+            messages.recv_async().await.expect("finished");
+            finish_grant(&database, job, running.remove(&job).expect("task")).await;
+            assert!(
+                database
+                    .job(job)
+                    .await
+                    .expect("read")
+                    .expect("Job")
+                    .failed_at
+                    .is_some()
+            );
+            assert!(database.occupancy().await.expect("slots").is_empty());
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn admission_refuses_the_sixty_fifth_queued_plan_as_busy() {
+        let (_root, directory) = data_directory("dispatcher-errors", "admission-bound");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let job = spec(&database);
+        let (sender, receiver) = flume::bounded(64);
+        let scheduler = SchedulerHandle {
+            sender,
+            state: SharedState::default(),
+        };
+        for index in 0..65 {
+            let (reply, _) = flume::bounded(1);
+            let submitted = scheduler.submit(Submission::Plan(
+                ExecutionPlan {
+                    executor_id: ExecutorId::new(1),
+                    input: JobInputDraft::default(),
+                    job: job.clone(),
+                    outcome: JobOutcome::Completed,
+                    result: FinalResult {
+                        summary: None,
+                        code: None,
+                        goal_reached: None,
+                        value: None,
+                    },
+                },
+                reply,
+            ));
+            if index < 64 {
+                submitted.expect("queue space");
+            } else {
+                assert!(matches!(
+                    submitted,
+                    Err(ExecutionRuntimeError::SchedulerQueueFull)
+                ));
+            }
+        }
+        assert_eq!(receiver.len(), 64);
+        assert!(wait(database.jobs(None, 100)).expect("jobs").is_empty());
+        worker.shutdown().expect("shutdown");
     }
 }

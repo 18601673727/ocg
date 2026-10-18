@@ -543,12 +543,13 @@ fn a_supervisor_that_claims_a_slot_and_leaves_a_running_child() {
         return;
     };
     let (_worker, handle) = open_root(std::path::Path::new(&root));
-    let job = JobId::new(
-        std::env::var("OCG_STOP_CERTAINTY_JOB")
-            .expect("the Job to claim")
+    let llm = ProfileId::new(
+        std::env::var("OCG_STOP_CERTAINTY_LLM")
+            .expect("Model")
             .parse()
-            .expect("a Job number"),
+            .expect("Model ID"),
     );
+    let job = pending(&handle, llm);
     let pool = ExecutionPoolId::new(
         std::env::var("OCG_STOP_CERTAINTY_POOL")
             .expect("the Pool to claim")
@@ -602,14 +603,12 @@ fn a_sigkilled_supervisor_quarantines_the_capacity_its_surviving_child_uses() {
     let (_unused, llm) = provision(&handle);
     let held = narrow_pool(&handle, "held");
     let independent = narrow_pool(&handle, "independent");
-    let job = pending(&handle, llm);
-    let spare = pending(&handle, llm);
     worker.shutdown().expect("close the database");
 
     // ---- a supervisor that holds the slot and leaves a child running --------
     let mut supervisor = Command::new(std::env::current_exe().expect("this test binary"))
         .env(SUPERVISOR, &root)
-        .env("OCG_STOP_CERTAINTY_JOB", job.get().to_string())
+        .env("OCG_STOP_CERTAINTY_LLM", llm.get().to_string())
         .env("OCG_STOP_CERTAINTY_POOL", held.get().to_string())
         .args([
             "--exact",
@@ -631,6 +630,7 @@ fn a_sigkilled_supervisor_quarantines_the_capacity_its_surviving_child_uses() {
     });
     let deadline = Instant::now() + WAIT;
     let mut child_pid = None;
+    let mut supervisor_job = None;
     let mut seen = Vec::new();
     while child_pid.is_none() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -641,12 +641,18 @@ fn a_sigkilled_supervisor_quarantines_the_capacity_its_surviving_child_uses() {
         };
         seen.push(line.clone());
         if let Some(rest) = line.trim().strip_prefix("OCG_SUPERVISOR_READY") {
+            supervisor_job = rest
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("job=job:"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(JobId::new);
             child_pid = rest
                 .split_whitespace()
                 .find_map(|field| field.strip_prefix("child="))
                 .and_then(|value| value.parse().ok());
         }
     }
+    let job = supervisor_job.expect("the supervisor named its Job");
     let child_pid: u32 = child_pid.expect("the supervisor named its child");
     assert!(
         alive(child_pid),
@@ -707,6 +713,7 @@ fn a_sigkilled_supervisor_quarantines_the_capacity_its_surviving_child_uses() {
     );
 
     // ---- the quarantined domain refuses; an independent one admits --------
+    let spare = pending(&handle, llm);
     assert_eq!(
         wait(handle.claim_execution(ClaimRequest {
             job: spare,

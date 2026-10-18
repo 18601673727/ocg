@@ -89,7 +89,7 @@ use crate::persistence::{JobId, ToolCallRef, ToolEffect};
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-3";
+const HANDLER_VERSION: &str = "workspace_run_command-4";
 
 /// Longest a command may run before it is stopped.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -165,6 +165,8 @@ enum Refusal {
     ProgramNotFound,
     #[error("the command could not be started")]
     NotStarted,
+    #[error("another command is still running")]
+    CommandBusy,
 }
 
 /// Why a started command's effect is not known. Its message never repeats
@@ -575,8 +577,13 @@ fn supervise(invocation: Invocation, stop: StopSignal, start: ToolStart) -> Resu
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut process =
-        Process::spawn(command, Kind::Command, stop.clone()).map_err(|_| Refusal::NotStarted)?;
+    let mut process = Process::spawn(command, Kind::Command, stop.clone()).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            Refusal::CommandBusy
+        } else {
+            Refusal::NotStarted
+        }
+    })?;
     start.mark_started();
     let (stdout_pipe, stderr_pipe) = process.take_output();
     let readers = match (stdout_pipe, stderr_pipe) {
@@ -1179,7 +1186,7 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-3");
+        assert_eq!(handler.version(), "workspace_run_command-4");
         assert!(
             crate::persistence::ToolAdmission {
                 handler_version: handler.version().to_owned(),

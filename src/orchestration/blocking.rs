@@ -13,6 +13,7 @@ use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
 const TOTAL: usize = 4;
 const COMMANDS: usize = 1;
+const COMMAND_WAIT: Duration = Duration::from_secs(10 * 60);
 const CPU: usize = 2;
 const FILES: usize = 4;
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -49,23 +50,45 @@ pub(crate) struct Permit {
 
 impl Permit {
     pub(crate) fn acquire(kind: Kind) -> Self {
-        match Self::acquire_until_stopped(kind, None) {
-            Some(permit) => permit,
-            None => unreachable!("a permit without cancellation cannot be stopped"),
+        match Self::acquire_until_stopped(kind, None, None) {
+            Ok(permit) => permit,
+            Err(_) => unreachable!("a permit without cancellation cannot be stopped"),
         }
     }
 
-    fn acquire_until_stopped(kind: Kind, stop: Option<&StopSignal>) -> Option<Self> {
+    fn acquire_until_stopped(
+        kind: Kind,
+        stop: Option<&StopSignal>,
+        deadline: Option<Instant>,
+    ) -> std::io::Result<Self> {
         let governor = GOVERNOR
             .get_or_init(|| Arc::new(Governor::default()))
             .clone();
+        Self::acquire_from(governor, kind, stop, deadline)
+    }
+
+    fn acquire_from(
+        governor: Arc<Governor>,
+        kind: Kind,
+        stop: Option<&StopSignal>,
+        deadline: Option<Instant>,
+    ) -> std::io::Result<Self> {
         let mut counts = governor
             .counts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         loop {
             if stop.is_some_and(StopSignal::requested) {
-                return None;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "command cancelled before it started",
+                ));
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "another command is still running",
+                ));
             }
             let category = match kind {
                 Kind::Command => counts.commands < COMMANDS,
@@ -80,15 +103,23 @@ impl Permit {
                     Kind::File => counts.files += 1,
                 }
                 drop(counts);
-                return Some(Self {
+                return Ok(Self {
                     governor: governor.clone(),
                     kind,
                 });
             }
-            counts = governor
-                .changed
-                .wait(counts)
-                .unwrap_or_else(PoisonError::into_inner);
+            counts = if let Some(deadline) = deadline {
+                governor
+                    .changed
+                    .wait_timeout(counts, deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            } else {
+                governor
+                    .changed
+                    .wait(counts)
+                    .unwrap_or_else(PoisonError::into_inner)
+            };
         }
     }
 }
@@ -199,12 +230,8 @@ impl Process {
         command.process_group(0);
         let sentinel = Sentinel::new()?;
         sentinel.configure_child(&mut command)?;
-        let permit = Permit::acquire_until_stopped(kind, Some(&stop_signal)).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "command cancelled before it started",
-            )
-        })?;
+        let deadline = matches!(kind, Kind::Command).then(|| Instant::now() + COMMAND_WAIT);
+        let permit = Permit::acquire_until_stopped(kind, Some(&stop_signal), deadline)?;
         if stop_signal.requested() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -408,6 +435,35 @@ fn read_process_stat(path: &std::path::Path) -> std::io::Result<Option<String>> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_command_permit_wait_expires_without_taking_capacity() {
+        use super::*;
+        let governor = Arc::new(Governor::default());
+        let held = Permit::acquire_from(governor.clone(), Kind::Command, None, None)
+            .expect("first command");
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = Permit::acquire_from(
+            governor.clone(),
+            Kind::Command,
+            Some(&StopSignal::new()),
+            Some(deadline),
+        )
+        .err()
+        .expect("bounded wait");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "another command is still running");
+        assert!(Instant::now() >= deadline);
+        assert_eq!(governor.counts.lock().expect("counts").commands, 1);
+        drop(held);
+        let _next = Permit::acquire_from(
+            governor,
+            Kind::Command,
+            None,
+            Some(Instant::now() + Duration::from_secs(1)),
+        )
+        .expect("capacity returned");
+    }
+
     #[test]
     fn a_process_entry_that_vanishes_before_reading_stat_is_gone() {
         let directory =
