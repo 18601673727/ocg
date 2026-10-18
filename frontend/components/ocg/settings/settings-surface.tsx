@@ -324,6 +324,12 @@ export function SettingsSurface({
       setLlmNotice(`${savedId} ${wasEditing ? "updated" : "created"}.`);
     } catch (error) {
       setLlmError(describeError(error));
+      if (error instanceof ControlTransportError && error.code === "credential_not_saved") {
+        // The Profile was committed even though its key was not; refresh so
+        // the catalog shows the saved Profile, and keep the form open so the
+        // key can be saved again.
+        await refreshProfiles();
+      }
     } finally {
       setLlmSaving(false);
     }

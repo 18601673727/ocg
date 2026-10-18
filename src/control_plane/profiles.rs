@@ -75,6 +75,11 @@ const INVALID_CREDENTIAL: Refusal = Refusal::new(
     "invalid_credential",
     "credential secret must be 1..=4096 bytes and a valid HTTP Bearer token",
 );
+const CREDENTIAL_NOT_SAVED: Refusal = Refusal::new(
+    StatusCode::INTERNAL_SERVER_ERROR,
+    "credential_not_saved",
+    "the profile was saved but its API key was not; save again",
+);
 const INVALID_CAPABILITIES: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_capabilities",
@@ -752,9 +757,12 @@ pub(super) async fn save_profile(
         }
     };
     if let Some((target_ref, secret_value)) = credential_to_save {
+        // The Profile change is already committed. A key that cannot be
+        // written leaves it with the old key, or none, so never answer as if
+        // the whole save succeeded.
         database
             .set_credential(&target_ref, &secret_value)
-            .map_err(|_| INVALID_CREDENTIAL)?;
+            .map_err(|_| CREDENTIAL_NOT_SAVED)?;
     }
     let snapshot = build_profiles_snapshot(database, Some(profile_id)).await?;
     Ok(Reply::new(status, snapshot))
