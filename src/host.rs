@@ -214,11 +214,18 @@ where
             return report;
         }
     };
+    let workspace_tools =
+        crate::orchestration::execution_runtime::WorkspaceTools::from_environment(data_directory);
     let served = ntex::rt::System::build()
         .name("ocg")
         .signals(signals)
         .build(ntex::rt::DefaultRuntime)
-        .block_on(serve(database.handle(), control, until_stopped));
+        .block_on(serve(
+            database.handle(),
+            control,
+            workspace_tools,
+            until_stopped,
+        ));
     report.attempted.extend(served.attempted);
     report.failures.extend(served.failures);
     report.attempt(Phase::Database, database.shutdown());
@@ -266,6 +273,7 @@ fn protection_notice(
 async fn serve<F>(
     handle: DatabaseHandle,
     control: Option<ControlPlaneConfig>,
+    workspace_tools: crate::orchestration::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
 where
@@ -331,7 +339,12 @@ where
             None => Some(None),
             Some(config) => {
                 report.attempted.push(Phase::ControlPlane);
-                match ControlPlane::start(config, handle.clone(), execution.scheduler()) {
+                match ControlPlane::start_with_workspace(
+                    config,
+                    handle.clone(),
+                    execution.scheduler(),
+                    workspace_tools,
+                ) {
                     Ok(listener) => Some(Some(listener)),
                     Err(error) => {
                         log::error!("{error}");

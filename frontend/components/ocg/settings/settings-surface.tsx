@@ -7,6 +7,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { PageSurface, Pill } from "@/components/ocg/primitives";
 import type {
   ControlAgentBehavior,
+  ControlToolGrant,
   ControlCapability,
   ControlLlmProfile,
   ControlManagedAgentProfile,
@@ -171,6 +172,7 @@ export function SettingsSurface({
   const [agentName, setAgentName] = useState("");
   const [agentInstructions, setAgentInstructions] = useState("");
   const [agentBehavior, setAgentBehavior] = useState<ControlAgentBehavior>("chat");
+  const [agentToolGrant, setAgentToolGrant] = useState<Exclude<ControlToolGrant, null> | "none">("none");
   const [agentTargets, setAgentTargets] = useState<string[]>([]);
   const [agentSaving, setAgentSaving] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
@@ -332,6 +334,7 @@ export function SettingsSurface({
     setAgentName("");
     setAgentInstructions("");
     setAgentBehavior("chat");
+    setAgentToolGrant("none");
     setAgentTargets([]);
     setAgentError(null);
   }
@@ -341,6 +344,7 @@ export function SettingsSurface({
     setAgentName(agent.name);
     setAgentInstructions(agent.instructions ?? "");
     setAgentBehavior(agent.behavior);
+    setAgentToolGrant(agent.tool_grant ?? "none");
     setAgentTargets([...agent.llm_targets]);
     setAgentError(null);
     setAgentNotice(null);
@@ -377,6 +381,7 @@ export function SettingsSurface({
         name: trimmedName,
         instructions: agentInstructions.trim() ? agentInstructions.trim() : null,
         behavior: agentBehavior,
+        tool_grant: agentToolGrant === "none" ? null : agentToolGrant,
         llm_targets: agentTargets,
       };
       const updated = editingAgentId
@@ -642,6 +647,9 @@ export function SettingsSurface({
                           <span className="text-sm font-semibold">{agent.name}</span>
                           <Pill tone="slate" className="text-xs normal-case">{agent.id}</Pill>
                           <Pill tone="sky" className="text-xs capitalize">{agent.behavior}</Pill>
+                          {agent.tool_grant ? (
+                            <Pill tone="sky" className="text-xs capitalize">Workspace: {agent.tool_grant}</Pill>
+                          ) : null}
                           {!agent.editable ? (
                             <Pill tone="amber" className="text-xs normal-case">
                               Locked ({agent.blocking_jobs.join(", ")})
@@ -704,6 +712,20 @@ export function SettingsSurface({
                     options={[
                       { value: "chat", label: "Chat" },
                       { value: "general", label: "General" },
+                    ]}
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <span className="text-xs font-medium text-muted-foreground">Workspace access</span>
+                  <ChoiceGroup
+                    label="Workspace access"
+                    value={agentToolGrant}
+                    onChange={setAgentToolGrant}
+                    options={[
+                      { value: "none", label: "None" },
+                      { value: "read", label: "Read" },
+                      { value: "edit", label: "Edit" },
+                      { value: "code", label: "Code" },
                     ]}
                   />
                 </div>

@@ -105,6 +105,11 @@ const INVALID_BEHAVIOR: Refusal = Refusal::new(
     "invalid_behavior",
     "behavior must be chat or general",
 );
+const INVALID_TOOL_GRANT: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_tool_grant",
+    "tool_grant must be null, read, edit or code",
+);
 const WRONG_PROFILE_KIND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "wrong_profile_kind",
@@ -184,6 +189,8 @@ enum WireProfileRequest {
         instructions: Option<String>,
         #[serde(default)]
         behavior: Option<String>,
+        #[serde(default)]
+        tool_grant: Option<String>,
         #[serde(default)]
         llm_targets: Vec<String>,
     },
@@ -413,6 +420,7 @@ async fn build_profiles_snapshot(
                     "id": id.to_string(),
                     "name": record.name,
                     "instructions": agent.instructions,
+                    "tool_grant": agent.tool_grant,
                     "behavior": match agent.behavior {
                         AgentBehavior::Chat => "chat",
                         AgentBehavior::General => "general",
@@ -663,6 +671,7 @@ pub(super) async fn save_profile(
             name,
             instructions,
             behavior,
+            tool_grant,
             llm_targets,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
@@ -687,6 +696,9 @@ pub(super) async fn save_profile(
                 Some("general") => AgentBehavior::General,
                 Some(_) => return Err(INVALID_BEHAVIOR),
             };
+            if !matches!(tool_grant.as_deref(), None | Some("read" | "edit" | "code")) {
+                return Err(INVALID_TOOL_GRANT);
+            }
             if llm_targets.is_empty() {
                 return Err(MISSING_LLM_TARGETS);
             }
@@ -717,7 +729,7 @@ pub(super) async fn save_profile(
                     behavior,
                     models: parsed_targets,
                     default_model: None,
-                    tool_grant: None,
+                    tool_grant,
                 }),
             }
         }

@@ -55,15 +55,25 @@ fn join_projects(batch: &mut Batch, job: JobId, projects: &[ProjectId]) -> Resul
 /// T1: submits a Job, or the next turn of a conversation when it continues a
 /// predecessor. The Job is pending; the claim batch grants it later.
 pub(crate) fn create_job(batch: &mut Batch, job: NewJob) -> OpResult<JobId> {
-    submit(batch, job, None)
+    submit(batch, job, None, None)
 }
 
 fn submit(
     batch: &mut Batch,
     job: NewJob,
     submission: Option<NewSubmission>,
+    workspace_available: Option<bool>,
 ) -> Result<JobId, BatchError> {
     let spec = spec_of(batch, &job)?;
+    if workspace_available == Some(false)
+        && spec
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.agent.as_ref())
+            .is_some_and(|agent| agent.tool_grant.is_some())
+    {
+        return batch.reject(Violation::WorkspaceNotConfigured);
+    }
     for project in &job.projects {
         batch.require_project(*project)?;
     }
@@ -80,8 +90,9 @@ pub(crate) fn create_submitted_job(
     batch: &mut Batch,
     job: NewJob,
     submission: NewSubmission,
+    workspace_available: Option<bool>,
 ) -> OpResult<JobId> {
-    submit(batch, job, Some(submission))
+    submit(batch, job, Some(submission), workspace_available)
 }
 
 /// Creates a new Job that retries `retry.original`. The original Job is not

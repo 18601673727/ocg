@@ -401,6 +401,14 @@ export function decodeJobConversation(input: unknown, jobId: string) {
 export type ControlConversation = ReturnType<typeof decodeJobConversation>;
 export type ControlConversationTurn = ControlConversation["turns"][number];
 
+export type ControlToolGrant = "read" | "edit" | "code" | null;
+
+function toolGrant(value: unknown, path: string): ControlToolGrant {
+  if (value === null || value === undefined) return null;
+  if (value === "read" || value === "edit" || value === "code") return value;
+  throw new ContractError(path, "null, read, edit or code");
+}
+
 const CAPABILITIES = ["chat", "tools", "vision", "reasoning"] as const;
 export type ControlCapability = (typeof CAPABILITIES)[number];
 
@@ -429,6 +437,7 @@ export function decodeAgentProfiles(input: unknown) {
       return {
         id: identity(agent.id, `${path}.id`, "profile:"),
         name: string(agent.name, `${path}.name`),
+        tool_grant: toolGrant(agent.tool_grant, `${path}.tool_grant`),
         llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`, (target, targetPath) => {
           const llm = record(target, targetPath);
           return {
@@ -530,6 +539,7 @@ export function decodeProfiles(input: unknown) {
       return {
         id: identity(agent.id, `${path}.id`, "profile:"),
         name: string(agent.name, `${path}.name`),
+        tool_grant: toolGrant(agent.tool_grant, `${path}.tool_grant`),
         instructions: optionalString(agent.instructions, `${path}.instructions`),
         behavior: rawBehavior as ControlAgentBehavior,
         llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,

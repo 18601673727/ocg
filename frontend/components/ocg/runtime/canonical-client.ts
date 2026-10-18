@@ -89,6 +89,7 @@ export type ControlProfileWriteRequest =
       name: string;
       instructions?: string | null;
       behavior?: "chat" | "general" | null;
+      tool_grant?: "read" | "edit" | "code" | null;
       llm_targets: string[];
     };
 

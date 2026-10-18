@@ -73,9 +73,9 @@ pub const CODE_COMMAND: &str = "workspace-code";
 /// The command that selects the mode that sends one image with the
 /// objective.
 pub const VISION_COMMAND: &str = "workspace-vision";
-/// The Workspace the Job may read from: an absolute path to a directory.
-pub const WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 pub use crate::llm_target::{CREDENTIAL_REF_VARIABLE, ENDPOINT_VARIABLE, MODEL_VARIABLE};
+/// The Workspace the Job may read from: an absolute path to a directory.
+pub use workspace_read::WORKSPACE_ROOT_VARIABLE;
 
 /// What the one Job may do in its Workspace, as its command chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

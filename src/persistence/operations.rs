@@ -77,6 +77,8 @@ pub enum OperationKind {
 /// A business rule refused the command; nothing it did was committed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
+    #[error("the Agent requires Workspace access but the host has no authorized Workspace")]
+    WorkspaceNotConfigured,
     #[error("{0} not found")]
     NotFound(RecordRef),
     #[error("{config} is a {found:?} config, not a {expected:?} config")]

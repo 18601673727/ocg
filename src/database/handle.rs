@@ -766,6 +766,22 @@ impl DatabaseHandle {
         self.submit(|reply| Command::CreateSubmittedJob {
             job,
             submission,
+            workspace_available: None,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn create_workspace_submitted_job(
+        &self,
+        job: NewJob,
+        submission: NewSubmission,
+        workspace_available: bool,
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateSubmittedJob {
+            job,
+            submission,
+            workspace_available: Some(workspace_available),
             reply,
         })
         .await

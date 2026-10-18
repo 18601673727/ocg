@@ -127,6 +127,11 @@ const EXECUTOR_INCOMPATIBLE: Refusal = Refusal::new(
     "executor_incompatible",
     "the Executor cannot run the LLM Profile; nothing was submitted",
 );
+const WORKSPACE_NOT_CONFIGURED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "workspace_not_configured",
+    "the selected Agent has Workspace access, but the host has no authorized Workspace; configure OCG_WORKSPACE_ROOT and restart the host; nothing was submitted",
+);
 const CONFIGURATION_REFUSED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "configuration_refused",
@@ -211,7 +216,7 @@ pub(crate) const MAX_CONVERSATION_TURNS: usize = 64;
 /// persisted identities, an objective and, optionally, an Agent Profile
 /// that targets the LLM Profile, a Job name, and a completed predecessor Job.
 /// Nothing else can be submitted: the Provider, its credential and the model
-/// come from the Profile, and no tool is offered.
+/// come from the Profile; Workspace tools come from the frozen Agent grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct JobRequest {
     agent_profile: Option<ProfileId>,
@@ -872,7 +877,11 @@ async fn admit(
     let plan = plan(&shared.database, request);
     let admitted = shared
         .scheduler
-        .admit_submitted_provider(plan, NewSubmission { key, fingerprint })
+        .admit_workspace_provider(
+            plan,
+            NewSubmission { key, fingerprint },
+            shared.workspace_tools.clone(),
+        )
         .await;
     match admitted {
         Ok(admitted) => {
@@ -1024,10 +1033,11 @@ pub(super) async fn check_configuration(
     }
 }
 
-/// The no-tool Provider plan of a checked request, a child of the Genesis
+/// The Provider plan of a checked request, a child of the Genesis
 /// Job, with the credential resolved as the Profile's Provider names it.
 /// Its images are referenced by Attachment identity; their bytes stay in the
-/// attachment store.
+/// attachment store. Workspace tools are selected after T1 from the frozen
+/// grant, so an Agent edit racing admission cannot change the Job's access.
 pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
     let mut plan = ProviderExecutionPlan::environment_credentials(
         request.executor,
@@ -1064,6 +1074,7 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
         }
         ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
         ExecutionRuntimeError::Database(error) => match error {
+            DatabaseError::Rejected(Violation::WorkspaceNotConfigured) => WORKSPACE_NOT_CONFIGURED,
             DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,
             DatabaseError::Rejected(_) => CONFIGURATION_REFUSED,
             DatabaseError::ShuttingDown => SHUTTING_DOWN,

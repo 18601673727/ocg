@@ -103,6 +103,7 @@ pub(super) enum Command {
     CreateSubmittedJob {
         job: NewJob,
         submission: NewSubmission,
+        workspace_available: Option<bool>,
         reply: Reply<JobId>,
     },
     RetryJob {
@@ -302,6 +303,7 @@ impl Command {
             Self::CreateSubmittedJob {
                 job,
                 submission,
+                workspace_available,
                 reply,
             } => run(
                 database,
@@ -309,7 +311,9 @@ impl Command {
                 commit,
                 Kind::CreateJobWithInput,
                 reply,
-                |batch| persistence::create_submitted_job(batch, job, submission),
+                |batch| {
+                    persistence::create_submitted_job(batch, job, submission, workspace_available)
+                },
             ),
             Self::RetryJob { retry, reply } => run(
                 database,

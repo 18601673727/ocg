@@ -70,7 +70,7 @@
 //!   "profile:<n>"}`, `name` and `agent_profile` optional: an existing LLM
 //!   Profile and an Executor that can run it, and an Agent Profile that
 //!   targets that LLM Profile, all checked here and again when the Job is
-//!   created. No tool is offered, and
+//!   created. Workspace tools follow the frozen Agent grant;
 //!   nothing of a Provider, credential or command is accepted. The answer
 //!   is `{"admission": {"status", "job"}}`: `201` when this request created
 //!   the Job, `200` when the key already named it, `202` with `pending`
@@ -235,6 +235,7 @@ struct Shared {
     database: DatabaseHandle,
     scheduler: SchedulerHandle,
     submissions: submissions::Registry,
+    workspace_tools: crate::orchestration::execution_runtime::WorkspaceTools,
     token: Token,
     port: u16,
     response_bytes: usize,

@@ -279,6 +279,8 @@ pub struct ExecutionReceipt {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionRuntimeError {
+    #[error("the frozen Workspace tool grant is unsupported on this host")]
+    WorkspaceGrantUnsupported,
     #[error("scheduler worker stopped")]
     SchedulerStopped,
     #[error("scheduler admission queue is full")]
@@ -412,7 +414,12 @@ struct ProviderReply {
 /// the submission to record with its Job.
 enum Submission {
     Plan(ExecutionPlan, ExecutionReply),
-    Provider(ProviderExecutionPlan, Option<NewSubmission>, ProviderReply),
+    Provider(
+        ProviderExecutionPlan,
+        Option<NewSubmission>,
+        Option<WorkspaceTools>,
+        ProviderReply,
+    ),
 }
 
 impl Submission {
@@ -427,7 +434,7 @@ impl Submission {
             Self::Plan(_, reply) => {
                 reply.send(Err(error)).ok();
             }
-            Self::Provider(_, _, reply) => {
+            Self::Provider(_, _, _, reply) => {
                 reply
                     .started
                     .send(Err(AdmissionError::NotAdmitted(error)))
@@ -466,7 +473,81 @@ enum PendingPlan {
     Provider(ProviderTask, Option<Vec<ToolWire>>),
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkspaceTools {
+    #[cfg(unix)]
+    workspace: Option<crate::orchestration::workspace_read::Workspace>,
+}
+
+impl WorkspaceTools {
+    pub(crate) fn from_environment(data_directory: &crate::data_directory::DataDirectory) -> Self {
+        #[cfg(unix)]
+        {
+            use crate::orchestration::workspace_read::{WORKSPACE_ROOT_VARIABLE, Workspace};
+            let workspace = std::env::var_os(WORKSPACE_ROOT_VARIABLE)
+                .filter(|root| !root.is_empty())
+                .and_then(|root| {
+                    match Workspace::authorize(std::path::Path::new(&root), data_directory) {
+                        Ok(workspace) => Some(workspace),
+                        Err(error) => {
+                            eprintln!("OCG Workspace is not configured: {error}");
+                            None
+                        }
+                    }
+                });
+            Self { workspace }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = data_directory;
+            Self::default()
+        }
+    }
+
+    fn available(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.workspace.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    fn build(&self, grant: Option<&str>) -> Result<Option<ToolExecution>, ExecutionRuntimeError> {
+        let Some(grant) = grant else {
+            return Ok(None);
+        };
+        #[cfg(unix)]
+        {
+            use crate::orchestration::workspace_read;
+            let workspace = self.workspace.clone().ok_or_else(|| {
+                ExecutionRuntimeError::Database(DatabaseError::Rejected(
+                    Violation::WorkspaceNotConfigured,
+                ))
+            })?;
+            let tools = match grant {
+                "read" => workspace_read::read_file_tools(workspace),
+                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+                "edit" => crate::orchestration::workspace_write::edit_file_tools(workspace),
+                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+                "code" => crate::orchestration::workspace_command::code_tools(workspace),
+                _ => return Err(ExecutionRuntimeError::WorkspaceGrantUnsupported),
+            }
+            .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
+            Ok(Some(tools))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = grant;
+            Err(ExecutionRuntimeError::WorkspaceGrantUnsupported)
+        }
+    }
+}
+
 struct ProviderTask {
+    workspace_tools: Option<WorkspaceTools>,
     credential_resolver: Arc<dyn CredentialResolver>,
     provider_config: ProviderExecutionConfig,
     tools: Option<ToolExecution>,
@@ -475,6 +556,7 @@ struct ProviderTask {
 impl From<ProviderExecutionPlan> for ProviderTask {
     fn from(plan: ProviderExecutionPlan) -> Self {
         Self {
+            workspace_tools: None,
             credential_resolver: plan.credential_resolver,
             provider_config: plan.provider_config,
             tools: plan.tools,
@@ -549,7 +631,7 @@ impl SchedulerHandle {
         &self,
         plan: ProviderExecutionPlan,
     ) -> Result<AdmittedJob, AdmissionError> {
-        self.admit(plan, None).await
+        self.admit(plan, None, None).await
     }
 
     /// Like [`Self::admit_provider`], and records `submission` with the
@@ -568,13 +650,24 @@ impl SchedulerHandle {
         plan: ProviderExecutionPlan,
         submission: NewSubmission,
     ) -> Result<AdmittedJob, AdmissionError> {
-        self.admit(plan, Some(submission)).await
+        self.admit(plan, Some(submission), None).await
+    }
+
+    pub(crate) async fn admit_workspace_provider(
+        &self,
+        plan: ProviderExecutionPlan,
+        submission: NewSubmission,
+        workspace_tools: WorkspaceTools,
+    ) -> Result<AdmittedJob, AdmissionError> {
+        self.admit(plan, Some(submission), Some(workspace_tools))
+            .await
     }
 
     async fn admit(
         &self,
         mut plan: ProviderExecutionPlan,
         submission: Option<NewSubmission>,
+        workspace_tools: Option<WorkspaceTools>,
     ) -> Result<AdmittedJob, AdmissionError> {
         // The execution observes a cancellation of its own, which the
         // plan's token, however widely it is shared, still cancels.
@@ -585,6 +678,7 @@ impl SchedulerHandle {
         self.submit(Submission::Provider(
             plan,
             submission,
+            workspace_tools,
             ProviderReply { started, settled },
         ))
         .map_err(AdmissionError::NotAdmitted)?;
@@ -885,14 +979,23 @@ async fn dispatch_runtime(
                             }
                         }
                     }
-                    Submission::Provider(mut plan, submission, reply) => {
-                        match admit_provider_job(&database, &mut plan, submission).await {
+                    Submission::Provider(mut plan, submission, workspace_tools, reply) => {
+                        match admit_provider_job(
+                            &database,
+                            &mut plan,
+                            submission,
+                            workspace_tools.as_ref(),
+                        )
+                        .await
+                        {
                             Ok((started, offered)) => {
                                 let cancellation = plan.provider_config.cancellation.clone();
                                 reply.started.send(Ok(started)).ok();
+                                let mut task = ProviderTask::from(plan);
+                                task.workspace_tools = workspace_tools;
                                 Some(PendingExecution {
                                     started,
-                                    execution: PendingPlan::Provider(plan.into(), offered),
+                                    execution: PendingPlan::Provider(task, offered),
                                     reply: Some(reply.settled),
                                     cancellation,
                                     done: CancellationToken::default(),
@@ -1283,6 +1386,7 @@ async fn admit_provider_job(
     database: &DatabaseHandle,
     plan: &mut ProviderExecutionPlan,
     submission: Option<NewSubmission>,
+    workspace_tools: Option<&WorkspaceTools>,
 ) -> Result<(StartedJob, Option<Vec<ToolWire>>), AdmissionError> {
     let refused = AdmissionError::NotAdmitted;
     let executor = plan.executor_id;
@@ -1313,11 +1417,18 @@ async fn admit_provider_job(
     provider_seam::before_creation(plan.job.name.as_deref());
     let created = match submission {
         None => database.create_job(plan.job.clone()).await,
-        Some(submission) => {
-            database
-                .create_submitted_job(plan.job.clone(), submission)
-                .await
-        }
+        Some(submission) => match workspace_tools {
+            Some(tools) => {
+                database
+                    .create_workspace_submitted_job(plan.job.clone(), submission, tools.available())
+                    .await
+            }
+            None => {
+                database
+                    .create_submitted_job(plan.job.clone(), submission)
+                    .await
+            }
+        },
     };
     let job = created.map_err(|error| match error.command_outcome() {
         Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted) => refused(error.into()),
@@ -1336,8 +1447,8 @@ async fn admit_provider_job(
 /// Runs a provider plan whose Job was started to its settlement.
 async fn run_started_provider_job(
     database: DatabaseHandle,
-    plan: ProviderTask,
-    (started, offered): (StartedJob, Option<Vec<ToolWire>>),
+    mut plan: ProviderTask,
+    (started, mut offered): (StartedJob, Option<Vec<ToolWire>>),
     tool_may_have_run: &Cell<bool>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let StartedJob {
@@ -1370,6 +1481,26 @@ async fn run_started_provider_job(
     let Some(configuration) = database.job_configuration(job).await? else {
         return refused("provider execution requires frozen LLM configuration".to_owned()).await;
     };
+    if let Some(tools) = &plan.workspace_tools {
+        let grant = configuration
+            .frozen
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.tool_grant.as_deref());
+        plan.tools = match tools.build(grant) {
+            Ok(tools) => tools,
+            Err(error) => return refused(error.to_string()).await,
+        };
+        offered = match plan
+            .tools
+            .as_ref()
+            .map(|tools| tools.offer.wires())
+            .transpose()
+        {
+            Ok(offered) => offered,
+            Err(error) => return refused(error.to_string()).await,
+        };
+    }
     let Some(input_record) = database.job_input(input).await? else {
         return refused("submitted Job input disappeared".to_owned()).await;
     };
@@ -1430,15 +1561,10 @@ async fn run_started_provider_job(
                     }
                 };
             let assistant_text = match database.latest_output(current).await? {
-                Some(output) if output.summary.is_some() => output.summary.unwrap_or_default(),
-                _ => {
-                    let outputs = database.job_outputs(current, None, 1_000).await?;
-                    outputs
-                        .into_iter()
-                        .filter(|output| output.kind == crate::persistence::OutputKind::Progress)
-                        .filter_map(|output| output.summary)
-                        .collect::<String>()
+                Some(output) if output.kind == crate::persistence::OutputKind::Result => {
+                    output.summary.unwrap_or_default()
                 }
+                _ => return refused(format!("previous Job {current} has no final answer")).await,
             };
             prior_turns.push((ancestor_input.objective, ancestor_images, assistant_text));
             cursor = ancestor.previous;

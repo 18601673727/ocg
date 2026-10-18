@@ -64,6 +64,8 @@ use crate::persistence::ToolEffect;
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_read_file";
 
+pub const WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
+
 /// The largest file the tool reads whole. A larger one is refused, never
 /// truncated; it may be read in ranges. Also the most a ranged read returns.
 pub const MAX_FILE_BYTES: usize = 8 * 1024;

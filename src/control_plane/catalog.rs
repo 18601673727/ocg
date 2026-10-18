@@ -211,6 +211,7 @@ pub(super) async fn agent_profiles(
         agent_profiles.push(json!({
             "id": ProfileId::from(record.id).to_string(),
             "name": record.name,
+            "tool_grant": agent.tool_grant,
             "llm_targets": llm_targets,
         }));
     }

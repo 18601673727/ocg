@@ -51,10 +51,24 @@ impl ControlPlane {
         database: DatabaseHandle,
         scheduler: SchedulerHandle,
     ) -> Result<Self, StartError> {
+        Self::start_with_workspace(
+            config,
+            database,
+            scheduler,
+            crate::orchestration::execution_runtime::WorkspaceTools::default(),
+        )
+    }
+
+    pub(crate) fn start_with_workspace(
+        config: ControlPlaneConfig,
+        database: DatabaseHandle,
+        scheduler: SchedulerHandle,
+        workspace_tools: crate::orchestration::execution_runtime::WorkspaceTools,
+    ) -> Result<Self, StartError> {
         #[cfg(test)]
         if ntex::rt::System::try_current().is_none() {
             return crate::test_support::on_system(move || async move {
-                Self::start(config, database, scheduler)
+                Self::start_with_workspace(config, database, scheduler, workspace_tools)
             });
         }
 
@@ -81,6 +95,7 @@ impl ControlPlane {
             database,
             scheduler,
             submissions: submissions::Registry::default(),
+            workspace_tools,
             token: config.token,
             port: address.port(),
             response_bytes: config.response_bytes,

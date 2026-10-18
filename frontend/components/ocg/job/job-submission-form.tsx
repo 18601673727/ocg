@@ -346,9 +346,11 @@ export function JobSubmissionForm({
             ? "contract"
             : "unreachable";
       setMessage(
-        outcome === "uncertain"
-          ? `The submission did not finish (${code}). Whether it created a Job is unknown; this key is not submitted again under another.`
-          : `Nothing was submitted (${code}).`,
+        error instanceof ControlTransportError && error.code === "workspace_not_configured"
+          ? "The selected Agent has Workspace access, but this host has no authorized Workspace. Configure OCG_WORKSPACE_ROOT and restart the host, or select an Agent with Workspace access set to None. Nothing was submitted (workspace_not_configured)."
+          : outcome === "uncertain"
+            ? `The submission did not finish (${code}). Whether it created a Job is unknown; this key is not submitted again under another.`
+            : `Nothing was submitted (${code}).`,
       );
       if (outcome === "uncertain") {
         reconciliation.current = setTimeout(() => reconcile(held), 4000);

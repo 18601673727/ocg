@@ -206,6 +206,11 @@ export function AgentSelector({
           </label>
         </fieldset>
       ) : null}
+      {agent?.tool_grant ? (
+        <p className="text-xs text-muted-foreground">
+          Workspace access: <span className="capitalize">{agent.tool_grant}</span>
+        </p>
+      ) : null}
       {unusable > 0 ? (
         <p className="text-xs text-muted-foreground">
           {unusable} Agent Profile{unusable === 1 ? "" : "s"} not offered: no LLM target declares Chat with a compatible Executor.
