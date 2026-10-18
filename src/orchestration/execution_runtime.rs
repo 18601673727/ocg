@@ -2896,7 +2896,7 @@ impl ProviderOutputSink for DatabaseOutputSink {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OutputSinkError>> + 'a>>
     {
         Box::pin(async move {
-            if text.trim().is_empty() {
+            if text.is_empty() {
                 return Ok(());
             }
             self.database
@@ -3031,6 +3031,39 @@ mod failure_tests {
     use crate::test_support::{
         data_directory, execution_configuration, on_system, poll_once, wait,
     };
+
+    #[test]
+    fn provider_network_database_output_preserves_whitespace_flushes() {
+        use crate::provider_execution::scripted::{Step, payload};
+        let (_root, directory) = data_directory("provider-network", "whitespace");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let executor = executor(&database);
+        let job = wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+        on_system(move || async move {
+            let config = ProviderExecutionConfig::default();
+            let prefix = "x".repeat(4096);
+            let first = Box::leak(
+                format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{prefix}\"}}}}]}}\n\n")
+                    .into_boxed_str(),
+            );
+            let mut sink = output_sink(database.clone(), job);
+            provider_execution::read_response(
+                payload(vec![
+                    Step::Chunk(first),
+                    Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\" \\n\\n\"},\"finish_reason\":\"stop\"}]}\n\n"),
+                ], config.cancellation.clone()),
+                200, Instant::now(), None, &config, Some(&mut sink),
+                &ChatConversation { messages: vec![ChatMessage::user("hi")], ..Default::default() },
+            ).await.expect("stream persisted");
+            sink.append("").await.expect("skip empty");
+            let outputs = database.job_outputs(job, None, 10).await.expect("outputs");
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(outputs[0].summary.as_deref(), Some(prefix.as_str()));
+            assert_eq!(outputs[1].summary.as_deref(), Some(" \n\n"));
+        });
+        worker.shutdown().expect("shutdown");
+    }
 
     fn spec(database: &DatabaseHandle) -> NewJob {
         NewJob {

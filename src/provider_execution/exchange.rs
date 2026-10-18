@@ -221,7 +221,12 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
     let url = format!("{base}/{resource}");
     let uri = url.parse::<ntex::http::Uri>().ok();
     if uri.as_ref().is_none_or(|uri| {
-        uri.scheme_str() != Some("https")
+        !(uri.scheme_str() == Some("https")
+            || (uri.scheme_str() == Some("http")
+                && matches!(
+                    uri.host(),
+                    Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+                )))
             || uri.host().is_none_or(str::is_empty)
             || uri
                 .authority()
@@ -231,7 +236,7 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
     {
         return Err(ProviderExecutionError::Build {
             message:
-                "provider endpoint must be an https URL without credentials, query or fragment"
+                "provider endpoint must use https (or http on localhost, 127.0.0.1 or ::1) without credentials, query or fragment"
                     .to_owned(),
         });
     }

@@ -233,6 +233,8 @@ pub struct ToolCallAssembler {
     /// Ordered by `index`. An empty id or name has not been sent yet.
     calls: Vec<CompletedToolCall>,
     bytes: usize,
+    inferred_index: bool,
+    empty_arguments: Vec<u32>,
 }
 
 impl ToolCallAssembler {
@@ -253,6 +255,12 @@ impl ToolCallAssembler {
                 ));
             }
         };
+        if deltas.len() > 1 && deltas.iter().any(|delta| delta.get("index").is_none()) {
+            return Err(InvalidToolCall::new(
+                ToolCallRefusal::Malformed,
+                "a tool call delta has no valid `index` in a multiple-call response",
+            ));
+        }
         for delta in deltas {
             self.apply_one(delta)?;
         }
@@ -266,10 +274,18 @@ impl ToolCallAssembler {
                 "a tool call delta is not an object",
             )
         })?;
+        let inferred = match fields.get("index") {
+            None if self.calls.len() <= 1 => {
+                self.inferred_index = true;
+                Some(self.calls.first().map_or(0, |call| call.index))
+            }
+            _ => None,
+        };
         let index = fields
             .get("index")
             .and_then(Value::as_u64)
             .and_then(|index| u32::try_from(index).ok())
+            .or(inferred)
             .ok_or_else(|| {
                 InvalidToolCall::new(
                     ToolCallRefusal::Malformed,
@@ -306,6 +322,12 @@ impl ToolCallAssembler {
             .transpose()?
             .flatten();
 
+        if function
+            .is_some_and(|function| function.get("arguments").and_then(Value::as_str) == Some(""))
+            && !self.empty_arguments.contains(&index)
+        {
+            self.empty_arguments.push(index);
+        }
         if let Some(id) = id
             && self
                 .calls
@@ -344,9 +366,7 @@ impl ToolCallAssembler {
                 ));
             }
         }
-        if let Some(name) = name {
-            // `ab` then `ab` may mean `ab` echoed or `abab` fragmented; no
-            // second name is taken, so neither is guessed.
+        if let Some(name) = name.filter(|name| *name != call.name) {
             if !call.name.is_empty() {
                 return Err(InvalidToolCall::at(
                     ToolCallRefusal::AmbiguousIdentity,
@@ -389,6 +409,12 @@ impl ToolCallAssembler {
         let position = match self.calls.binary_search_by_key(&index, |call| call.index) {
             Ok(position) => position,
             Err(position) => {
+                if self.inferred_index && !self.calls.is_empty() {
+                    return Err(InvalidToolCall::new(
+                        ToolCallRefusal::Malformed,
+                        "a tool call delta has no valid `index` in a multiple-call response",
+                    ));
+                }
                 if self.calls.len() >= MAX_TOOL_CALLS {
                     return Err(InvalidToolCall::new(
                         ToolCallRefusal::LimitExceeded,
@@ -432,7 +458,7 @@ impl ToolCallAssembler {
     /// Returns [`InvalidToolCall`] when any call, or the finish, is not
     /// complete. Nothing partial is returned.
     pub fn finish(
-        self,
+        mut self,
         finish: Option<ChatFinishReason>,
     ) -> Result<Vec<CompletedToolCall>, InvalidToolCall> {
         if self.calls.is_empty() {
@@ -456,7 +482,7 @@ impl ToolCallAssembler {
                 ),
             ));
         }
-        for call in &self.calls {
+        for call in &mut self.calls {
             let index = call.index;
             if call.id.trim().is_empty() {
                 return Err(InvalidToolCall::at(
@@ -476,6 +502,9 @@ impl ToolCallAssembler {
                     index,
                     format!("tool call {index} has no valid function name"),
                 ));
+            }
+            if call.arguments.is_empty() && self.empty_arguments.contains(&index) {
+                call.arguments.push_str("{}");
             }
             if !is_json_object(&call.arguments) {
                 return Err(InvalidToolCall::at(

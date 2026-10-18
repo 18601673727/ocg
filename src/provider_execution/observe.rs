@@ -93,15 +93,21 @@ fn provider_failure(
     }
 }
 
-fn parse_provider_error(body: &str) -> Option<(String, Option<String>)> {
+pub(super) fn parse_provider_error(body: &str) -> Option<(String, Option<String>)> {
     let value: Value = serde_json::from_str(body).ok()?;
-    let error = value.get("error")?;
+    let error = value.get("error").unwrap_or(&value);
     let message = error
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("provider request failed")
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("detail").and_then(Value::as_str))
+        .or_else(|| value.get("error").map(|_| "provider request failed"))?
         .to_owned();
-    let code = error.get("code").and_then(Value::as_str).map(str::to_owned);
+    let code = error.get("code").and_then(|code| match code {
+        Value::String(code) => Some(code.clone()),
+        Value::Number(code) => Some(code.to_string()),
+        _ => None,
+    });
     Some((message, code))
 }
 

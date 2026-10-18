@@ -63,7 +63,7 @@ const UNSUPPORTED_PROTOCOL: Refusal = Refusal::new(
 const INVALID_ENDPOINT: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_endpoint",
-    "endpoint must be an https:// URL of at most 512 characters without whitespace",
+    "endpoint must use https:// (or http:// on localhost, 127.0.0.1 or ::1), at most 512 characters without whitespace",
 );
 const INVALID_CREDENTIAL_REF: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -522,8 +522,7 @@ pub(super) async fn save_profile(
                 None => None,
                 Some(url) => {
                     if url.len() > MAX_ENDPOINT_BYTES
-                        || !url.starts_with("https://")
-                        || url["https://".len()..].is_empty()
+                        || crate::provider_execution::model_endpoint(url).is_err()
                         || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
                     {
                         return Err(INVALID_ENDPOINT);
@@ -964,6 +963,58 @@ mod provider_network_tests {
     use crate::database::DatabaseWorker;
     use crate::provider_execution::scripted;
     use crate::test_support::{data_directory, on_system};
+
+    #[test]
+    fn provider_network_http_is_local_only_at_save_and_send_without_credentials() {
+        let (_root, directory) = data_directory("provider-network", "local");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        on_system(move || async move {
+            for (host, allowed) in [
+                ("localhost", true),
+                ("127.0.0.1", true),
+                ("[::1]", true),
+                ("example.com", false),
+                ("localhost.example.com", false),
+                ("127.0.0.2", false),
+                ("[::2]", false),
+                ("localhost@example.com", false),
+            ] {
+                let endpoint = format!("http://{host}:1234/v1");
+                assert_eq!(
+                    crate::provider_execution::model_endpoint(&endpoint).is_ok(),
+                    allowed,
+                    "{endpoint}"
+                );
+                let body = serde_json::to_vec(&json!({
+                    "kind":"llm", "name":format!("local {host}"), "model":"local-model",
+                    "endpoint":endpoint, "declared_capabilities":["chat"], "parameters":{},
+                }))
+                .expect("JSON");
+                let saved = save_profile(&database, None, &body).await;
+                if allowed {
+                    saved.expect("save local profile");
+                    let models_endpoint = crate::provider_execution::model_endpoint(&endpoint)
+                        .expect("local endpoint");
+                    scripted::install_http(&models_endpoint, |authorization| {
+                        assert!(authorization.is_none());
+                        Ok((200, br#"{"data":[{"id":"local-model"}]}"#.to_vec()))
+                    });
+                    let reply = provider_models(
+                        &database,
+                        &serde_json::to_vec(&json!({"endpoint":endpoint})).expect("JSON"),
+                    )
+                    .await
+                    .expect("local models");
+                    assert_eq!(reply.body["models"][0]["id"], "local-model");
+                } else {
+                    assert!(saved.is_err(), "remote HTTP refused at save");
+                }
+            }
+            assert!(crate::provider_execution::model_endpoint("https://example.com/v1").is_ok());
+        });
+        worker.shutdown().expect("shutdown");
+    }
 
     #[test]
     fn provider_network_models_saved_credentials_refusals_and_redaction() {

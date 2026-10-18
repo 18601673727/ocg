@@ -56,7 +56,7 @@ fn create_job(handle: &DatabaseHandle, job: NewJob) -> JobId {
 }
 
 #[test]
-fn provider_progress_skips_blank_text_and_preserves_nonblank_text() {
+fn provider_progress_skips_empty_text_and_preserves_whitespace() {
     use crate::provider_execution::ProviderOutputSink;
 
     let (_root, directory) = data_directory("blank-progress");
@@ -72,9 +72,11 @@ fn provider_progress_skips_blank_text_and_preserves_nonblank_text() {
         wait(sink.append(text)).expect("append");
     }
     let outputs = wait(handle.job_outputs(job, None, 10)).expect("outputs");
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].seq, 1);
-    assert_eq!(outputs[0].summary.as_deref(), Some(" answer \n"));
+    assert_eq!(outputs.len(), 3);
+    for (output, (seq, text)) in outputs.iter().zip([(1, " \t\n"), (2, "\u{2003}"), (3, " answer \n")]) {
+        assert_eq!(output.seq, seq);
+        assert_eq!(output.summary.as_deref(), Some(text));
+    }
     worker.shutdown().expect("shutdown");
 }
 
@@ -5644,7 +5646,7 @@ mod requests_and_tool_loop {
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
         let (_provider, llm) = llm_setup(&handle, "model-a");
-        let ambiguous = r#"{"index":0,"id":"c","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"}},{"index":0,"function":{"name":"add"}}"#;
+        let ambiguous = r#"{"index":0,"id":"c","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"}},{"index":0,"function":{"name":"subtract"}}"#;
         for (case, calls_sent) in [
             (
                 "an unregistered tool",

@@ -321,6 +321,27 @@ async fn parse_stream_body(
                 response.usage = reported.usage.clone();
                 capture.record(Some(output), reported).await;
             }
+            if let Some(error) = event.get("error").filter(|error| error.is_object()) {
+                let (message, provider_code) = observe::parse_provider_error(&event.to_string())
+                    .unwrap_or_else(|| ("provider request failed".to_owned(), None));
+                let rejected_status = ["status", "status_code", "code"]
+                    .iter()
+                    .filter_map(|key| error.get(key))
+                    .filter_map(|status| status.as_u64().or_else(|| status.as_str()?.parse().ok()))
+                    .find(|status| (400..500).contains(status));
+                return Err(match rejected_status {
+                    Some(status) => ProviderExecutionError::Rejected {
+                        failure: ProviderFailure {
+                            message,
+                            status_code: Some(status as u16),
+                            provider_code,
+                            request_id: request_id.clone(),
+                            ..ProviderFailure::default()
+                        },
+                    },
+                    None => response.unknown(message, status_code),
+                });
+            }
             let delta = consume_event(&event, &mut response, config.max_output_bytes).map_err(
                 |refused| match refused {
                     Refused::ToolCall(error) => {
@@ -340,15 +361,18 @@ async fn parse_stream_body(
                 .and_then(|choices| choices.first())
                 .and_then(|choice| choice.get("delta"))
                 .is_some_and(|delta| {
-                    ["content", "reasoning_content"].iter().any(|key| {
-                        delta
-                            .get(key)
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.is_empty())
-                    }) || delta
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .is_some_and(|calls| !calls.is_empty())
+                    ["content", "reasoning_content", "reasoning"]
+                        .iter()
+                        .any(|key| {
+                            delta
+                                .get(key)
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                        || delta
+                            .get("tool_calls")
+                            .and_then(Value::as_array)
+                            .is_some_and(|calls| !calls.is_empty())
                 })
             {
                 saw_delta = true;
@@ -514,7 +538,10 @@ fn consume_event(
                 return Err(Refused::OutputLimit);
             }
         }
-        if let Some(value) = delta.get("reasoning_content").and_then(Value::as_str) {
+        for value in ["reasoning_content", "reasoning"]
+            .iter()
+            .filter_map(|key| delta.get(key).and_then(Value::as_str))
+        {
             if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
                 return Err(Refused::OutputLimit);
             }

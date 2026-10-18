@@ -205,6 +205,151 @@ pub(crate) mod tests {
     use crate::persistence::{AvailabilityClassification, AvailabilityObservation};
     use crate::test_support::wait;
 
+    #[test]
+    fn provider_network_reasoning_alias_is_private_and_counts_as_first_delta() {
+        crate::test_support::on_system(|| async {
+            let config = ProviderExecutionConfig {
+                timeout: Duration::from_millis(20),
+                first_delta_timeout: Some(Duration::from_secs(1)),
+                ..Default::default()
+            };
+            let alias = "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think\"}}]}\n\n";
+            let mut sink = RecordingSink::default();
+            let result = parse_stream(
+                payload(
+                    vec![Step::Chunk(alias), Step::Chunk(STOP)],
+                    config.cancellation.clone(),
+                ),
+                200,
+                Instant::now(),
+                None,
+                &config,
+                Some(&mut sink),
+                &mut UsageCapture::default(),
+            )
+            .await
+            .expect("reasoning stream");
+            assert_eq!(result.reasoning, "think");
+            assert!(sink.deltas.is_empty());
+            let error = parse_stream(
+                payload(
+                    vec![
+                        Step::Chunk(alias),
+                        Step::Quiet(Duration::from_millis(100)),
+                        Step::Chunk(STOP),
+                    ],
+                    config.cancellation.clone(),
+                ),
+                200,
+                Instant::now(),
+                None,
+                &config,
+                None,
+                &mut UsageCapture::default(),
+            )
+            .await
+            .expect_err("later chunks use the idle timeout");
+            assert!(matches!(error, ProviderExecutionError::Unknown { .. }));
+        });
+    }
+
+    #[test]
+    fn provider_network_stream_errors_end_immediately_with_provider_message() {
+        for (error, rejected) in [
+            (json!({"message":"bad key", "status":401}), true),
+            (json!({"message":"bad key", "status_code":"403"}), true),
+            (json!({"message":"bad key", "code":429}), true),
+            (json!({"message":"bad key", "code":"400"}), true),
+            (json!({"message":"bad key", "code":500}), false),
+            (json!({"message":"bad key", "code":"overloaded"}), false),
+        ] {
+            let event = leaked(format!("data: {}\n\n", json!({"error":error})));
+            let mut sink = RecordingSink::default();
+            let result = parse(
+                vec![Step::Chunk(CONTENT), Step::Chunk(event), Step::Stall],
+                Some(&mut sink),
+            );
+            match result.expect_err("provider error ends the stream") {
+                ProviderExecutionError::Rejected { failure } if rejected => {
+                    assert_eq!(failure.message, "bad key");
+                    assert!(!failure.retryable, "streamed output must not be replayed");
+                }
+                ProviderExecutionError::Unknown { message, .. } if !rejected => {
+                    assert_eq!(message, "bad key")
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            assert_eq!(sink.deltas.concat(), "hi");
+        }
+    }
+
+    #[test]
+    fn provider_network_error_body_variants_preserve_message_and_code() {
+        for (body, message, code) in [
+            (
+                r#"{"error":{"message":"bad key","code":401}}"#,
+                "bad key",
+                Some("401"),
+            ),
+            (
+                r#"{"error":{"message":"bad key","code":"auth"}}"#,
+                "bad key",
+                Some("auth"),
+            ),
+            (r#"{"message":"gateway failed"}"#, "gateway failed", None),
+            (r#"{"detail":"gateway detail"}"#, "gateway detail", None),
+            (
+                r#"{"error":{"code":429},"message":"busy"}"#,
+                "busy",
+                Some("429"),
+            ),
+        ] {
+            assert_eq!(
+                observe::parse_provider_error(body),
+                Some((message.to_owned(), code.map(str::to_owned)))
+            );
+        }
+        assert!(observe::parse_provider_error("{}").is_none());
+    }
+
+    #[test]
+    fn provider_network_single_tool_call_variants_remain_unambiguous() {
+        for index in [None, Some(7)] {
+            let mut start = json!({"id":"call", "function":{"name":"f", "arguments":""}});
+            if let Some(index) = index {
+                start["index"] = json!(index);
+            }
+            let result = read(
+                vec![
+                    Step::Chunk(tool_delta(leaked(json!([start]).to_string()))),
+                    Step::Chunk(tool_delta(r#"[{"function":{"name":"f","arguments":""}}]"#)),
+                    Step::Chunk(TOOL_CALLS),
+                ],
+                &offering(&["f"]),
+                None,
+            )
+            .expect("single call accepts missing index and echoed name");
+            assert_eq!(
+                result.tool_calls,
+                [call(index.unwrap_or(0), "call", "f", "{}")]
+            );
+        }
+        let message = incomplete_message(read(
+            vec![
+                Step::Chunk(tool_delta(
+                    r#"[{"id":"a","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(tool_delta(
+                    r#"[{"index":1,"id":"b","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            None,
+        ));
+        assert!(message.contains("no valid `index`"));
+    }
+
     const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
     const STOP: &str = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
 
@@ -1837,28 +1982,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_second_name_field_is_an_ambiguous_identity_and_admits_nothing() {
+    fn a_different_name_field_is_an_ambiguous_identity_and_admits_nothing() {
         let named = |name: &str, arguments: &str| {
             tool_delta(leaked(format!(
                 r#"[{{"index":0,"id":"call_1","function":{{"name":"{name}","arguments":{}}}}}]"#,
                 serde_json::to_string(arguments).expect("JSON string")
             )))
         };
-        let cases: [(&str, Vec<Step>, &[&str]); 5] = [
-            (
-                "`ab` then `ab`, with `ab` and `abab` both offered",
-                vec![Step::Chunk(named("ab", "")), Step::Chunk(named("ab", "{}"))],
-                &["ab", "abab"],
-            ),
-            (
-                "a complete name echoed beside every argument fragment",
-                vec![
-                    Step::Chunk(named("get_weather", "")),
-                    Step::Chunk(named("get_weather", "{\"city\":")),
-                    Step::Chunk(named("get_weather", "\"Paris\"}")),
-                ],
-                &["get_weather"],
-            ),
+        let cases: [(&str, Vec<Step>, &[&str]); 2] = [
             (
                 "a name sent in two fragments",
                 vec![
@@ -1874,13 +2005,6 @@ pub(crate) mod tests {
                     Step::Chunk(named("get_time", "")),
                 ],
                 &["get_weather", "get_time"],
-            ),
-            (
-                "two name fields for one index in one delta",
-                vec![Step::Chunk(tool_delta(
-                    r#"[{"index":0,"id":"c","function":{"name":"f","arguments":"{}"}},{"index":0,"function":{"name":"f"}}]"#,
-                ))],
-                &["f"],
             ),
         ];
         for (case, mut steps, offered) in cases {
@@ -2517,8 +2641,8 @@ pub(crate) mod tests {
                 "two different indexes",
             ),
             (
-                "no index",
-                r#"[{"id":"call_a","function":{"name":"f","arguments":"{}"}}]"#,
+                "no index in multiple calls",
+                r#"[{"id":"call_a","function":{"name":"f","arguments":"{}"}},{"index":1,"id":"call_b"}]"#,
                 "no valid `index`",
             ),
             (
