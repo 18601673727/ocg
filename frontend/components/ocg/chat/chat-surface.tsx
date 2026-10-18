@@ -46,6 +46,8 @@ export function ChatSurface({
   const [turns, setTurns] = useState<ControlConversationTurn[]>([]);
   const [toolsByJob, setToolsByJob] = useState<Record<string, ControlToolCall[]>>({});
   const loadedToolsJobs = useRef<Set<string>>(new Set());
+  const toolsAbortController = useRef<AbortController>(new AbortController());
+  const conversationEpoch = useRef(0);
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [headState, setHeadState] = useState<SettlementState | null>(null);
 
@@ -88,28 +90,41 @@ export function ChatSurface({
   }, [client, job]);
 
   useEffect(() => {
+    return () => {
+      toolsAbortController.current.abort();
+    };
+  }, []);
+
+  useEffect(() => {
     if (turns.length === 0) return;
-    const controller = new AbortController();
+    if (toolsAbortController.current.signal.aborted) {
+      toolsAbortController.current = new AbortController();
+    }
+    const signal = toolsAbortController.current.signal;
+    const epoch = conversationEpoch.current;
     const earlierTurns = job ? turns.filter((turn) => turn.job.id !== job) : turns;
     for (const turn of earlierTurns) {
       const jobId = turn.job.id;
       if (loadedToolsJobs.current.has(jobId)) continue;
       loadedToolsJobs.current.add(jobId);
       client
-        .readAllJobTools(jobId, controller.signal)
+        .readAllJobTools(jobId, signal)
         .then((tools) => {
+          if (signal.aborted || conversationEpoch.current !== epoch) return;
           setToolsByJob((prev) => ({ ...prev, [jobId]: tools }));
         })
         .catch(() => {
-          loadedToolsJobs.current.delete(jobId);
+          if (!signal.aborted && conversationEpoch.current === epoch) {
+            loadedToolsJobs.current.delete(jobId);
+          }
         });
     }
-    return () => {
-      controller.abort();
-    };
   }, [client, job, turns]);
 
   const handleNewConversation = useCallback(() => {
+    toolsAbortController.current.abort();
+    toolsAbortController.current = new AbortController();
+    conversationEpoch.current += 1;
     setTurns([]);
     setToolsByJob({});
     loadedToolsJobs.current.clear();
