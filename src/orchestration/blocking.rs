@@ -204,6 +204,7 @@ pub(crate) fn record_unproven_group(group: UnprovenGroup) {
         .push(group);
 }
 
+#[cfg(test)]
 pub(crate) fn drop_unproven_groups() {
     UNPROVEN_GROUPS
         .lock()

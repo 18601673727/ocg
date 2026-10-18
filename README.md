@@ -105,6 +105,10 @@ platforms; the other two are available on Unix.
 
 - `ocg register-llm` — find or register the Control Plane's chat Pool, Connection, LLM Profile and Agent Profile from `OCG_PROVIDER_ENDPOINT`, `OCG_PROVIDER_MODEL` and `OCG_PROVIDER_CREDENTIAL_REF`, then print their identities as JSON.
 
+### Slot recovery
+
+- `ocg release-slot <job> [--yes]` — confirm that a quarantined Job's processes have terminated and release its held slot.
+
 ## Data and logs
 
 Everything is kept under `OCG_DATA_DIR`:

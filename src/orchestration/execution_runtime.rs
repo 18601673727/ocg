@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -851,7 +851,6 @@ impl ExecutionRuntime {
                 .await
                 .map_err(|_| ExecutionRuntimeError::WorkerPanicked)??;
         }
-        blocking::drop_unproven_groups();
         Ok(())
     }
 
@@ -910,6 +909,7 @@ async fn dispatch_runtime(
     let mut pending = BTreeMap::new();
     let mut running = BTreeMap::new();
     let mut reconcile_at = Instant::now() + Duration::from_secs(30);
+    let mut unconfirmed_stopped = BTreeSet::new();
     loop {
         let incoming = async {
             if Instant::now() >= reconcile_at {
@@ -1036,11 +1036,26 @@ async fn dispatch_runtime(
             }
             SchedulerMessage::Reconcile => {
                 reconcile_at = Instant::now() + Duration::from_secs(30);
-                for job in blocking::retry_unproven_groups() {
-                    if let Err(error) = database.confirm_job_stopped(job).await {
-                        log::warn!("failed to confirm job stop after process group cleanup: {error}");
+                match ntex::rt::spawn_blocking(blocking::retry_unproven_groups).await {
+                    Ok(recovered) => unconfirmed_stopped.extend(recovered),
+                    Err(error) => {
+                        log::warn!("failed to retry unproven groups on blocking worker: {error}");
                     }
                 }
+                let mut retry_next = BTreeSet::new();
+                for job in std::mem::take(&mut unconfirmed_stopped) {
+                    match database.confirm_job_stopped(job).await {
+                        Ok(())
+                        | Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => {}
+                        Err(DatabaseError::Rejected(Violation::StopNeedsUnknownOutcome(_))) => {
+                            retry_next.insert(job);
+                        }
+                        Err(error) => {
+                            log::warn!("failed to confirm job stop after process group cleanup: {error}");
+                        }
+                    }
+                }
+                unconfirmed_stopped = retry_next;
                 match database
                     .terminal_jobs(pending.keys().copied().collect())
                     .await
@@ -1157,7 +1172,6 @@ async fn dispatch_runtime(
         finish_grant(&database, job, task).await;
     }
     lock(&state).current.clear();
-    blocking::drop_unproven_groups();
     Ok(())
 }
 
