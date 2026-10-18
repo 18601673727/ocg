@@ -2,7 +2,10 @@ use super::*;
 
 /// What the host can establish: it runs, as the listener answers only
 /// while it does, and what the database says of itself now.
-pub(super) async fn health(database: &DatabaseHandle) -> Value {
+pub(super) async fn health(
+    database: &DatabaseHandle,
+    workspace_root: Option<&std::path::Path>,
+) -> Value {
     let status = match database.status() {
         DatabaseStatus::Open => "open",
         DatabaseStatus::Protected => "protected",
@@ -30,6 +33,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
     json!({
         "api_version": API_VERSION,
         "host": "running",
+        "workspace_root": workspace_root.map(|root| root.to_string_lossy()),
         "database": {
             "status": status,
             "accepting_commands": status == "open",
@@ -319,6 +323,25 @@ pub(super) async fn tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_exposes_the_resolved_workspace_root_or_null() {
+        use crate::database::DatabaseWorker;
+        use crate::test_support::{data_directory, temporary_directory, wait};
+
+        let (_data, directory) = data_directory("health", "workspace-root");
+        let (_workspace, root) = temporary_directory("health", "workspace");
+        let worker = DatabaseWorker::start(&directory).expect("start");
+        let handle = worker.handle();
+        let root = root.canonicalize().expect("resolve");
+        assert_eq!(
+            wait(health(&handle, Some(&root)))["workspace_root"],
+            root.to_string_lossy().as_ref()
+        );
+        let unconfigured = wait(health(&handle, None));
+        assert_eq!(unconfigured.get("workspace_root"), Some(&Value::Null));
+        worker.shutdown().expect("shutdown");
+    }
 
     #[test]
     fn tools_query_parsing() {

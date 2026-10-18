@@ -63,6 +63,9 @@ The Control Plane binds `127.0.0.1:<OCG_CONTROL_PORT>` and prints
 When a Profile's API key is not in the data directory's credential store, OCG
 reads the environment variable named by that Profile's `credential_ref`.
 
+Chat tools need an Agent with Workspace access and an LLM Profile that declares
+Tools. Tools can reach only `OCG_WORKSPACE_ROOT`.
+
 ## Sign a browser in
 
 1. Start the host with `OCG_CONTROL_PORT`, `OCG_CONTROL_TOKEN` and

@@ -65,6 +65,20 @@ fn submit(
     workspace_available: Option<bool>,
 ) -> Result<JobId, BatchError> {
     let spec = spec_of(batch, &job)?;
+    if submission.is_some()
+        && let Some(execution) = &spec.execution
+        && execution
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.tool_grant.is_some())
+        && !execution
+            .llm
+            .config
+            .declared_capabilities
+            .contains(&ModelCapability::Tools)
+    {
+        return batch.reject(Violation::ToolsNotSupported);
+    }
     if workspace_available == Some(false)
         && spec
             .execution

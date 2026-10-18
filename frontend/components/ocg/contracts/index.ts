@@ -167,6 +167,9 @@ export function decodeHealth(input: unknown) {
   });
   return {
     host,
+    workspace_root: envelope.workspace_root === null
+      ? null
+      : string(envelope.workspace_root, "workspace_root"),
     database: {
       status,
       accepting_commands: boolean(database.accepting_commands, "database.accepting_commands"),

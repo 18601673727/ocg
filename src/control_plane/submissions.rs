@@ -183,6 +183,11 @@ const VISION_NOT_SUPPORTED: Refusal = Refusal::new(
     "vision_not_supported",
     "the selected LLM Profile does not declare the vision capability, but the conversation carries images; nothing was submitted",
 );
+const TOOLS_NOT_SUPPORTED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "tools_not_supported",
+    "the selected LLM Profile does not declare the tools capability, but the Agent has a Workspace tool grant; nothing was submitted",
+);
 const TOO_MANY_IMAGES: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "too_many_images",
@@ -937,6 +942,7 @@ pub(super) async fn check_configuration(
         _ => return Err(PROFILE_NOT_FOUND),
     };
     let mut chat = false;
+    let mut tool_grant = false;
     if let Some(agent_profile) = request.agent_profile {
         match database.config(agent_profile.into()).await? {
             Some(ConfigRecord {
@@ -947,6 +953,7 @@ pub(super) async fn check_configuration(
                     return Err(AGENT_TARGET_MISMATCH);
                 }
                 chat = agent.behavior == crate::persistence::AgentBehavior::Chat;
+                tool_grant = agent.tool_grant.is_some();
             }
             _ => return Err(AGENT_PROFILE_NOT_FOUND),
         }
@@ -1005,6 +1012,9 @@ pub(super) async fn check_configuration(
             }
             cursor = record.previous;
         }
+    }
+    if tool_grant && !llm.declared_capabilities.contains(&ModelCapability::Tools) {
+        return Err(TOOLS_NOT_SUPPORTED);
     }
     images.extend(request.attachments.iter().copied());
     if images.is_empty() {
@@ -1076,6 +1086,7 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
         }
         ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
         ExecutionRuntimeError::Database(error) => match error {
+            DatabaseError::Rejected(Violation::ToolsNotSupported) => TOOLS_NOT_SUPPORTED,
             DatabaseError::Rejected(Violation::WorkspaceNotConfigured) => WORKSPACE_NOT_CONFIGURED,
             DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,
             DatabaseError::Rejected(_) => CONFIGURATION_REFUSED,
@@ -1241,6 +1252,98 @@ mod tests {
                 String::from_utf8_lossy(&refused[..refused.len().min(120)])
             );
         }
+    }
+
+    #[test]
+    fn tools_capability_is_required_at_preflight_and_t1() {
+        use crate::database::DatabaseWorker;
+        use crate::persistence::{AgentBehavior, AgentConfig, NewConfig, NewExecutor};
+        use crate::test_support::{data_directory, execution_configuration, wait};
+
+        let (_root, directory) = data_directory("submissions", "tools-capability");
+        let worker = DatabaseWorker::start(&directory).expect("start");
+        let handle = worker.handle();
+        let configuration = execution_configuration(&handle);
+        let model_id = configuration.llm_profile.into();
+        let model = wait(handle.config(model_id)).expect("read").expect("model");
+        let ConfigBody::Model(mut body) = model.body else {
+            panic!("model")
+        };
+        body.declared_capabilities = [ModelCapability::Chat, ModelCapability::Tools].into();
+        wait(handle.update_config(
+            model_id,
+            NewConfig {
+                name: model.name.clone(),
+                body: ConfigBody::Model(body.clone()),
+            },
+        ))
+        .expect("enable tools");
+        let agent = wait(handle.create_config(NewConfig {
+            name: "chat".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                behavior: AgentBehavior::Chat,
+                models: vec![model_id],
+                tool_grant: Some("read".into()),
+                ..Default::default()
+            }),
+        }))
+        .expect("agent");
+        let executor = wait(handle.create_executor(NewExecutor {
+            name: "local".into(),
+            concurrency_limit: std::num::NonZeroU32::MIN,
+            llm_transports: [crate::persistence::LlmTransport::OpenAiChatCompletions].into(),
+        }))
+        .expect("executor");
+        let request = JobRequest::parse(
+            &serde_json::to_vec(&json!({
+                "agent_profile": ProfileId::from(agent).to_string(),
+                "llm_profile": configuration.llm_profile.to_string(),
+                "executor": executor.to_string(), "objective": "read a file",
+            }))
+            .expect("json"),
+        )
+        .expect("request");
+        wait(check_configuration(&handle, &request)).expect("tools supported");
+        body.declared_capabilities = [ModelCapability::Chat].into();
+        wait(handle.update_config(
+            model_id,
+            NewConfig {
+                name: model.name,
+                body: ConfigBody::Model(body),
+            },
+        ))
+        .expect("remove tools after preflight");
+        assert_eq!(
+            wait(check_configuration(&handle, &request)),
+            Err(TOOLS_NOT_SUPPORTED)
+        );
+        let mut plan = plan(&handle, request.clone());
+        plan.job.input = plan.input;
+        let key = digest_key(b"tools-capability-test");
+        let before = wait(handle.jobs(None, 100)).expect("jobs").len();
+        let error = wait(handle.create_workspace_submitted_job(
+            plan.job,
+            NewSubmission {
+                key,
+                fingerprint: request.fingerprint(),
+            },
+            true,
+        ))
+        .expect_err("T1 refuses the changed profile");
+        assert!(matches!(
+            error,
+            DatabaseError::Rejected(Violation::ToolsNotSupported)
+        ));
+        assert_eq!(
+            not_admitted(&ExecutionRuntimeError::Database(error)),
+            TOOLS_NOT_SUPPORTED
+        );
+        assert!(wait(handle.submission(key)).expect("submission").is_none());
+        assert_eq!(wait(handle.jobs(None, 100)).expect("jobs").len(), before);
+        let mut without_grant = request;
+        without_grant.agent_profile = None;
+        wait(check_configuration(&handle, &without_grant)).expect("no grant needs no Tools");
+        worker.shutdown().expect("shutdown");
     }
 
     #[test]

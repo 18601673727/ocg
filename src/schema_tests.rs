@@ -55,6 +55,29 @@ fn create_job(handle: &DatabaseHandle, job: NewJob) -> JobId {
     wait(handle.create_job(job)).expect("create job")
 }
 
+#[test]
+fn provider_progress_skips_blank_text_and_preserves_nonblank_text() {
+    use crate::provider_execution::ProviderOutputSink;
+
+    let (_root, directory) = data_directory("blank-progress");
+    let worker = DatabaseWorker::start(&directory).expect("start");
+    let handle = worker.handle();
+    let job = create_job(
+        &handle,
+        new_job(&handle, "progress", handle.genesis(), vec![]),
+    );
+    wait(handle.claim_fixture(job, test_executor(&handle))).expect("claim");
+    let mut sink = crate::orchestration::execution_runtime::output_sink(handle.clone(), job);
+    for text in ["", " \t\n", "\u{2003}", " answer \n"] {
+        wait(sink.append(text)).expect("append");
+    }
+    let outputs = wait(handle.job_outputs(job, None, 10)).expect("outputs");
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].seq, 1);
+    assert_eq!(outputs[0].summary.as_deref(), Some(" answer \n"));
+    worker.shutdown().expect("shutdown");
+}
+
 /// The Pool that runs the plain Jobs of these tests: it offers no work to the
 /// claim batch.
 fn test_executor(handle: &DatabaseHandle) -> ExecutorId {
@@ -3187,6 +3210,7 @@ mod control_plane {
                 json!({
                     "api_version": 1,
                     "host": "running",
+                    "workspace_root": null,
                     "database": {"status": "open", "accepting_commands": true, "readable": true},
                     "quarantined": [],
                 })

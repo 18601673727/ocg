@@ -239,7 +239,9 @@ pub(super) async fn respond(
 ) -> Result<Reply, Refusal> {
     let database = &shared.database;
     match route {
-        Route::Health => Ok(Reply::ok(health(database).await)),
+        Route::Health => Ok(Reply::ok(
+            health(database, shared.workspace_tools.root()).await,
+        )),
         Route::Jobs { before, limit } => dashboard::jobs(shared, before, limit).await,
         Route::Conversations { before, limit } => {
             catalog::conversations(database, before, limit).await

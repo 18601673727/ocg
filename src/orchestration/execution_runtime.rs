@@ -481,6 +481,17 @@ pub(crate) struct WorkspaceTools {
 }
 
 impl WorkspaceTools {
+    pub(crate) fn root(&self) -> Option<&std::path::Path> {
+        #[cfg(unix)]
+        {
+            self.workspace.as_ref().map(|workspace| workspace.root())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     pub(crate) fn from_environment(data_directory: &crate::data_directory::DataDirectory) -> Self {
         #[cfg(unix)]
         {
@@ -552,6 +563,164 @@ struct ProviderTask {
     credential_resolver: Arc<dyn CredentialResolver>,
     provider_config: ProviderExecutionConfig,
     tools: Option<ToolExecution>,
+}
+
+#[cfg(all(test, unix))]
+mod grounding_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::orchestration::workspace_read::Workspace;
+    use crate::persistence::{AgentBehavior, AgentConfig, ConfigBody, NewConfig, NewExecutor};
+    use crate::test_support::{
+        data_directory, execution_configuration, on_system, temporary_directory, wait,
+    };
+
+    #[test]
+    fn frozen_workspace_grants_ground_first_and_continued_chat_turns() {
+        let (_data, directory) = data_directory("chat", "grounding");
+        let (_root, root) = temporary_directory("chat", "grounding-workspace");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        let workspace_tools = WorkspaceTools {
+            workspace: Some(workspace),
+        };
+        let worker = DatabaseWorker::start(&directory).expect("start");
+        let handle = worker.handle();
+        let mut configuration = execution_configuration(&handle);
+        let model = wait(handle.config(configuration.llm_profile.into()))
+            .expect("read")
+            .expect("model");
+        let ConfigBody::Model(model) = model.body else {
+            panic!("model")
+        };
+        let endpoint = "https://chat-grounding.invalid/v1";
+        wait(handle.update_config(
+            model.connection_id,
+            NewConfig {
+                name: "grounding provider".into(),
+                body: ConfigBody::Connection(crate::persistence::ConnectionConfig {
+                    protocol: crate::persistence::LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(endpoint.into()),
+                    credential_ref: None,
+                }),
+            },
+        ))
+        .expect("provider endpoint");
+        let agent_body = AgentConfig {
+            instructions: Some("Agent instructions".into()),
+            behavior: AgentBehavior::Chat,
+            models: vec![configuration.llm_profile.into()],
+            tool_grant: Some("read".into()),
+            ..Default::default()
+        };
+        let agent = wait(handle.create_config(NewConfig {
+            name: "chat".into(),
+            body: ConfigBody::Agent(agent_body.clone()),
+        }))
+        .expect("agent");
+        configuration.agent_profile = Some(agent.into());
+        let executor = wait(handle.create_executor(NewExecutor {
+            name: "local".into(),
+            concurrency_limit: std::num::NonZeroU32::MIN,
+            llm_transports: [crate::persistence::LlmTransport::OpenAiChatCompletions].into(),
+        }))
+        .expect("executor");
+        let mut previous = None;
+        for (index, granted) in [true, true, false].into_iter().enumerate() {
+            let job = wait(handle.create_claimed_fixture(
+                NewJob {
+                    name: None,
+                    eligible_at: None,
+                    parent: handle.genesis(),
+                    projects: vec![],
+                    dependencies: vec![],
+                    input: JobInputDraft {
+                        objective: Some("objective".into()),
+                        ..Default::default()
+                    },
+                    configuration: Some(configuration),
+                    previous,
+                },
+                executor,
+            ))
+            .expect("claim");
+            // Change the live grant after T1; execution must use the frozen one.
+            let mut edited = agent_body.clone();
+            edited.tool_grant = if granted { None } else { Some("read".into()) };
+            wait(handle.update_config(
+                agent,
+                NewConfig {
+                    name: "chat".into(),
+                    body: ConfigBody::Agent(edited),
+                },
+            ))
+            .expect("edit live agent");
+            let tools = workspace_tools.clone();
+            let run_handle = handle.clone();
+            let expected_root = tools.root().expect("root").to_string_lossy().into_owned();
+            provider_seam::install(endpoint, move |conversation| {
+                let sent = serde_json::to_value(conversation).expect("json");
+                let messages = sent["messages"].as_array().expect("messages");
+                if granted {
+                    assert_eq!(messages[0]["role"], "system");
+                    let text = messages[0]["content"].as_str().expect("grounding");
+                    assert!(text.contains(&expected_root));
+                    assert!(text.contains("Every tool path is relative to this root"));
+                    assert!(text.contains("cannot be reached"));
+                    assert!(text.contains("instead of claiming you acted there"));
+                    assert_eq!(messages[1]["content"], "Agent instructions");
+                    assert!(!conversation.tools.is_empty());
+                } else {
+                    assert_eq!(messages[0]["content"], "Agent instructions");
+                    assert!(conversation.tools.is_empty());
+                }
+                provider_seam::Response {
+                    gate: None,
+                    steps: vec![crate::provider_execution::scripted::Step::Chunk(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )],
+                }
+            });
+            on_system(move || async move {
+                run_started_provider_job(
+                    run_handle,
+                    ProviderTask {
+                        workspace_tools: Some(tools),
+                        tools: None,
+                        credential_resolver: Arc::new(EnvironmentCredentialResolver),
+                        provider_config: ProviderExecutionConfig::default(),
+                    },
+                    (
+                        StartedJob {
+                            executor,
+                            input: JobInputId::new(job.get()),
+                            job,
+                        },
+                        None,
+                    ),
+                    &Cell::new(false),
+                )
+                .await
+            })
+            .expect("settled");
+            previous = if index == 0 { Some(job) } else { None };
+            wait(handle.update_config(
+                agent,
+                NewConfig {
+                    name: "chat".into(),
+                    body: ConfigBody::Agent(AgentConfig {
+                        tool_grant: if index == 0 {
+                            Some("read".into())
+                        } else {
+                            None
+                        },
+                        ..agent_body.clone()
+                    }),
+                },
+            ))
+            .expect("configure next turn");
+        }
+        worker.shutdown().expect("shutdown");
+    }
 }
 
 impl From<ProviderExecutionPlan> for ProviderTask {
@@ -1517,6 +1686,7 @@ async fn run_started_provider_job(
     let Some(configuration) = database.job_configuration(job).await? else {
         return refused("provider execution requires frozen LLM configuration".to_owned()).await;
     };
+    let mut workspace_root = None;
     if let Some(tools) = &plan.workspace_tools {
         let grant = configuration
             .frozen
@@ -1527,6 +1697,9 @@ async fn run_started_provider_job(
             Ok(tools) => tools,
             Err(error) => return refused(error.to_string()).await,
         };
+        if plan.tools.is_some() {
+            workspace_root = tools.root();
+        }
         offered = match plan
             .tools
             .as_ref()
@@ -1644,6 +1817,9 @@ async fn run_started_provider_job(
             &images,
         )
     };
+    if let Some(root) = workspace_root {
+        provider_execution::ground_workspace(&mut conversation, root);
+    }
     conversation.tools = offered.unwrap_or_default();
     let frozen = &configuration.frozen;
     let resolver = plan.credential_resolver.as_ref();
@@ -2638,6 +2814,9 @@ impl ProviderOutputSink for DatabaseOutputSink {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OutputSinkError>> + 'a>>
     {
         Box::pin(async move {
+            if text.trim().is_empty() {
+                return Ok(());
+            }
             self.database
                 .append_job_output(
                     self.job,
