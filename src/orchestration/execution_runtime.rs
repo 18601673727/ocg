@@ -1558,7 +1558,7 @@ async fn run_started_provider_job(
         let mut prior_turns = Vec::new();
         let mut cursor = Some(first_previous);
         while let Some(current) = cursor {
-            if prior_turns.len() + 1 >= MAX_CONVERSATION_TURNS {
+            if visited.len() >= MAX_CONVERSATION_TURNS {
                 return refused("conversation exceeds the maximum number of turns".to_owned())
                     .await;
             }
@@ -1577,8 +1577,12 @@ async fn run_started_provider_job(
                 ))
                 .await;
             }
+            if !ancestor.settled() {
+                return refused(format!("previous Job {current} has not finished")).await;
+            }
+            cursor = ancestor.previous;
             if ancestor.completed_at.is_none() {
-                return refused(format!("previous Job {current} has not completed")).await;
+                continue;
             }
             let Some(ancestor_input) = database.job_input_for_job(current).await? else {
                 return refused(format!("previous Job {current} input disappeared")).await;
@@ -1603,7 +1607,6 @@ async fn run_started_provider_job(
                 _ => return refused(format!("previous Job {current} has no final answer")).await,
             };
             prior_turns.push((ancestor_input.objective, ancestor_images, assistant_text));
-            cursor = ancestor.previous;
         }
         prior_turns.reverse();
         let mut built = provider_execution::objective_conversation(&configuration.frozen, None);

@@ -171,7 +171,7 @@ const INVALID_PREVIOUS_JOB: Refusal = Refusal::new(
 const PREVIOUS_JOB_NOT_COMPLETED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "previous_job_not_completed",
-    "the previous Job has not completed; nothing was submitted",
+    "the previous turn has not finished",
 );
 const CONVERSATION_TOO_LONG: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -995,10 +995,12 @@ pub(super) async fn check_configuration(
             {
                 return Err(INVALID_PREVIOUS_JOB);
             }
-            if record.completed_at.is_none() {
+            if !record.settled() {
                 return Err(PREVIOUS_JOB_NOT_COMPLETED);
             }
-            if let Some(input) = database.job_input(record.input).await? {
+            if record.completed_at.is_some()
+                && let Some(input) = database.job_input(record.input).await?
+            {
                 images.extend(input.attachments);
             }
             cursor = record.previous;

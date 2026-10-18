@@ -5,7 +5,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ocg/primitives";
 import type { ControlConversationTurn, ControlToolCall } from "@/components/ocg/contracts";
-import type { HttpCanonicalControlClient } from "@/components/ocg/runtime/canonical-client";
+import {
+  ControlTransportError,
+  type HttpCanonicalControlClient,
+} from "@/components/ocg/runtime/canonical-client";
 import { JobSubmissionForm, type SubmissionTarget } from "@/components/ocg/job/job-submission-form";
 import { JobWatch } from "@/components/ocg/job/job-watch";
 import { AgentSelector } from "./agent-selector";
@@ -21,6 +24,122 @@ const SETTLEMENT_BADGE: Record<SettlementState, string> = {
   cancelled: "bg-muted text-muted-foreground",
   unknown: "bg-destructive/10 text-destructive",
 };
+
+function RetryTurn({
+  client,
+  turn,
+  target,
+  onJob,
+  onBusyChange,
+}: {
+  client: HttpCanonicalControlClient;
+  turn: ControlConversationTurn;
+  target: SubmissionTarget | null;
+  onJob: (job: string) => void;
+  onBusyChange: (busy: boolean) => void;
+}) {
+  const [key, setKey] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const busy = useRef(false);
+  const mounted = useRef(false);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      onBusyChange(false);
+    };
+  }, [onBusyChange]);
+
+  useEffect(() => {
+    if (!key) return;
+    const heldKey = key;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function reconcile() {
+      try {
+        const admission = await client.readAdmission(heldKey, controller.signal);
+        if (controller.signal.aborted) return;
+        if (admission.status === "admitted" && admission.job) {
+          onJob(admission.job);
+          return;
+        }
+        if (admission.status === "not_found") {
+          busy.current = false;
+          onBusyChange(false);
+          setKey(null);
+          setSubmitting(false);
+          setMessage("The retry created no turn. You can retry again.");
+          return;
+        }
+        setMessage("Checking whether the retry was admitted. This submission keeps the same key.");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setMessage(error instanceof Error ? error.message : "Could not check retry admission.");
+      }
+      timer = setTimeout(() => void reconcile(), 4000);
+    }
+    void reconcile();
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+    };
+  }, [client, key, onBusyChange, onJob]);
+
+  async function retry() {
+    if (busy.current || !target || target.agentProfile !== turn.input.configuration?.agent_profile) return;
+    busy.current = true;
+    onBusyChange(true);
+    setSubmitting(true);
+    setMessage("Submitting retry…");
+    const key = crypto.randomUUID();
+    try {
+      const result = await client.submitJob({
+        agent_profile: target.agentProfile,
+        llm_profile: target.llmProfile,
+        executor: target.executor,
+        previous: turn.job.id,
+        objective: turn.input.objective ?? "",
+        attachments: turn.input.attachments,
+      }, key);
+      if (!mounted.current) return;
+      if (result.status === "admitted" && result.job) {
+        onJob(result.job);
+      } else {
+        setKey(key);
+      }
+    } catch (error) {
+      if (!mounted.current) return;
+      if (error instanceof ControlTransportError
+        && ((error.status >= 400 && error.status < 500) || error.status === 503)) {
+        busy.current = false;
+        onBusyChange(false);
+        setSubmitting(false);
+        setMessage(error.message);
+      } else {
+        // A lost response may already have created the successor. Resolve
+        // this key before allowing another submission intent.
+        setKey(key);
+      }
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={submitting || !target || target.agentProfile !== turn.input.configuration?.agent_profile}
+        onClick={() => void retry()}
+      >
+        Retry
+      </Button>
+      {message ? <span role="status">{message}</span> : null}
+    </div>
+  );
+}
 
 /**
  * Chat over the Job-only substrate: each turn is one Job submitted as the
@@ -49,7 +168,11 @@ export function ChatSurface({
   const toolsAbortController = useRef<AbortController>(new AbortController());
   const conversationEpoch = useRef(0);
   const [conversationError, setConversationError] = useState<string | null>(null);
-  const [headState, setHeadState] = useState<SettlementState | null>(null);
+  const [headState, setHeadState] = useState<{ job: string; state: SettlementState } | null>(null);
+  const [retryingJob, setRetryingJob] = useState<string | null>(null);
+  const handleRetryBusyChange = useCallback((busy: boolean) => {
+    setRetryingJob(busy ? job : null);
+  }, [job]);
 
   const loadConversation = useCallback(
     async (targetJob: string, signal?: AbortSignal) => {
@@ -135,7 +258,7 @@ export function ChatSurface({
 
   const handleHeadStateChange = useCallback(
     (state: SettlementState) => {
-      setHeadState(state);
+      if (job) setHeadState({ job, state });
       if (job && state !== "unsettled") {
         void loadConversation(job);
       }
@@ -146,9 +269,7 @@ export function ChatSurface({
   const priorTurns = job ? turns.filter((turn) => turn.job.id !== job) : [];
   const headTurn = job ? turns.find((turn) => turn.job.id === job) ?? null : null;
   const effectiveHeadState: SettlementState | null =
-    headState ?? headTurn?.job.settlement.state ?? null;
-  const lastCompletedAncestor =
-    [...priorTurns].reverse().find((turn) => turn.job.settlement.state === "completed")?.job.id ?? null;
+    (headState?.job === job ? headState.state : null) ?? headTurn?.job.settlement.state ?? null;
 
   const preferredAgentProfile =
     headTurn?.input?.configuration
@@ -161,7 +282,7 @@ export function ChatSurface({
 
   const previousJobForNextTurn = !job
     ? null
-    : effectiveHeadState === "completed"
+    : effectiveHeadState && effectiveHeadState !== "unsettled"
       ? job
       : null;
 
@@ -169,8 +290,8 @@ export function ChatSurface({
     ? null
     : effectiveHeadState === null || effectiveHeadState === "unsettled"
       ? `Waiting for ${job} to finish before sending the next turn…`
-      : effectiveHeadState !== "completed"
-        ? `${job} ended in state "${effectiveHeadState}". Inspect the Job record, continue from an earlier completed turn, or start a new conversation.`
+      : retryingJob === job
+        ? "Waiting for retry admission before sending another turn…"
         : null;
 
   return (
@@ -303,18 +424,19 @@ export function ChatSurface({
           className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/30 px-4 py-3 text-xs text-muted-foreground"
         >
           <span>
-            Turn <code className="font-mono text-foreground">{job}</code> did not complete ({effectiveHeadState}).
+            Turn <code className="font-mono text-foreground">{job}</code> ended {effectiveHeadState}.
+            Retry this message or send a follow-up. Only completed turns are included as context.
           </span>
           <div className="flex flex-wrap items-center gap-2">
-            {lastCompletedAncestor ? (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => onJob(lastCompletedAncestor)}
-              >
-                Return to {lastCompletedAncestor}
-              </Button>
+            {headTurn ? (
+              <RetryTurn
+                key={job}
+                client={client}
+                turn={headTurn}
+                target={target}
+                onJob={onJob}
+                onBusyChange={handleRetryBusyChange}
+              />
             ) : null}
             {onNewConversation ? (
               <Button type="button" size="sm" variant="outline" onClick={handleNewConversation}>
