@@ -18,6 +18,10 @@ path = "src/ocg.rs"
 name = "database_writes"
 harness = false
 
+[[bench]]
+name = "backend"
+harness = false
+
 [dependencies]
 redb = { version = "=4.3.0", default-features = false, features = ["std"] }
 petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
