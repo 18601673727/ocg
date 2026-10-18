@@ -3047,15 +3047,23 @@ mod control_plane {
         let report = std::thread::scope(|scope| {
             scope
                 .spawn(move || {
-                    run_controlled_reporting(directory, false, control, move |context: HostContext| {
-                        let address = context.control_plane();
-                        async move {
-                            let (returned, response) = flume::bounded(1);
-                            std::thread::spawn(move || returned.send(client(address)));
-                            let value = response.recv_async().await.expect("the client did not panic");
-                            *slot.lock().expect("lock") = Some(value);
-                        }
-                    })
+                    run_controlled_reporting(
+                        directory,
+                        false,
+                        control,
+                        move |context: HostContext| {
+                            let address = context.control_plane();
+                            async move {
+                                let (returned, response) = flume::bounded(1);
+                                std::thread::spawn(move || returned.send(client(address)));
+                                let value = response
+                                    .recv_async()
+                                    .await
+                                    .expect("the client did not panic");
+                                *slot.lock().expect("lock") = Some(value);
+                            }
+                        },
+                    )
                 })
                 .join()
                 .expect("the host did not panic")
@@ -12107,7 +12115,10 @@ mod requests_and_tool_loop {
                                 async move {
                                     let (returned, response) = flume::bounded(1);
                                     std::thread::spawn(move || returned.send(client(address)));
-                                    let value = response.recv_async().await.expect("the client did not panic");
+                                    let value = response
+                                        .recv_async()
+                                        .await
+                                        .expect("the client did not panic");
                                     *slot.lock().expect("lock") = Some(value);
                                 }
                             },

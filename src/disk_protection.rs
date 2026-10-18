@@ -8,8 +8,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::data_directory::DataDirectory;
@@ -28,7 +28,9 @@ pub struct CleanupConfig {
 
 impl Default for CleanupConfig {
     fn default() -> Self {
-        Self { max_log_files_per_run: 1000 }
+        Self {
+            max_log_files_per_run: 1000,
+        }
     }
 }
 
@@ -64,7 +66,9 @@ impl Default for FilesystemConfig {
 pub enum FilesystemConfigError {
     #[error("disk_lock_threshold_bytes must be greater than zero")]
     LockThresholdZero,
-    #[error("disk_resume_threshold_bytes ({resume}) must be greater than disk_lock_threshold_bytes ({lock})")]
+    #[error(
+        "disk_resume_threshold_bytes ({resume}) must be greater than disk_lock_threshold_bytes ({lock})"
+    )]
     ResumeNotAboveLock { lock: u64, resume: u64 },
     #[error("disk_check_interval_ms must be greater than zero")]
     CheckIntervalZero,
@@ -107,9 +111,18 @@ pub enum ProtectedArea {
 
 pub(crate) fn protected_paths(data_directory: &DataDirectory) -> [(ProtectedArea, PathBuf); 3] {
     [
-        (ProtectedArea::Database, data_directory.database_path().to_path_buf()),
-        (ProtectedArea::Attachments, data_directory.attachments_path().to_path_buf()),
-        (ProtectedArea::Logs, data_directory.logs_path().to_path_buf()),
+        (
+            ProtectedArea::Database,
+            data_directory.database_path().to_path_buf(),
+        ),
+        (
+            ProtectedArea::Attachments,
+            data_directory.attachments_path().to_path_buf(),
+        ),
+        (
+            ProtectedArea::Logs,
+            data_directory.logs_path().to_path_buf(),
+        ),
     ]
 }
 
@@ -241,7 +254,9 @@ pub enum ReopenFailure {
     Storage(StorageError),
     #[error("{} is not an OCG database", .0.display())]
     ForeignDatabase(PathBuf),
-    #[error("the database uses storage format {found}; this build supports only format {supported}")]
+    #[error(
+        "the database uses storage format {found}; this build supports only format {supported}"
+    )]
     UnsupportedFormat { found: u32, supported: u32 },
 }
 
@@ -255,7 +270,10 @@ pub enum RecoveryError {
     #[error("reopening the database failed: {0}")]
     Reopen(ReopenFailure),
     #[error("reconciling {operation} failed: {error}")]
-    Reconcile { operation: OperationId, error: StorageError },
+    Reconcile {
+        operation: OperationId,
+        error: StorageError,
+    },
     #[error("the database is shutting down")]
     ShuttingDown,
     #[error("the database worker stopped")]
@@ -274,7 +292,11 @@ fn measure(area: ProtectedArea, path: &Path) -> Result<u64, SpaceQueryFailure> {
 
 /// Whether `available_bytes` minus `expected_write_bytes` still reaches
 /// `threshold_bytes`; a write larger than the available space never does.
-pub(crate) fn leaves_threshold(available_bytes: u64, expected_write_bytes: u64, threshold_bytes: u64) -> bool {
+pub(crate) fn leaves_threshold(
+    available_bytes: u64,
+    expected_write_bytes: u64,
+    threshold_bytes: u64,
+) -> bool {
     available_bytes
         .checked_sub(expected_write_bytes)
         .is_some_and(|remaining| remaining >= threshold_bytes)
@@ -326,7 +348,10 @@ impl ProtectionCell {
     }
 
     pub(crate) fn status(&self) -> DiskProtectionStatus {
-        self.status.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn logging_state(&self) -> (bool, u64) {
@@ -345,7 +370,12 @@ impl ProtectionCell {
         let mut watchers = self.watchers.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(watchers) = watchers.as_mut() {
             // A full channel already holds an unread notification.
-            watchers.retain(|watcher| !matches!(watcher.try_send(()), Err(flume::TrySendError::Disconnected(()))));
+            watchers.retain(|watcher| {
+                !matches!(
+                    watcher.try_send(()),
+                    Err(flume::TrySendError::Disconnected(()))
+                )
+            });
         }
         value
     }
@@ -361,7 +391,11 @@ impl ProtectionCell {
                 locked_at: Timestamp::now(),
             });
             for reason in reasons {
-                match lock.reasons.iter_mut().find(|held| held.same_subject(&reason)) {
+                match lock
+                    .reasons
+                    .iter_mut()
+                    .find(|held| held.same_subject(&reason))
+                {
                     Some(held) => *held = reason,
                     None => lock.reasons.push(reason),
                 }
@@ -372,14 +406,25 @@ impl ProtectionCell {
 
     pub(crate) fn watch(self: &Arc<Self>) -> ProtectionWatch {
         let (sender, receiver) = flume::bounded(1);
-        if let Some(watchers) = self.watchers.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+        if let Some(watchers) = self
+            .watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
             watchers.push(sender);
         }
-        ProtectionWatch { receiver, cell: self.clone() }
+        ProtectionWatch {
+            receiver,
+            cell: self.clone(),
+        }
     }
 
     pub(crate) fn close(&self) {
-        self.watchers.lock().unwrap_or_else(PoisonError::into_inner).take();
+        self.watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -403,7 +448,11 @@ impl ProtectionWatch {
     /// once the database worker has stopped. Needs no particular async
     /// runtime.
     pub async fn changed(&self) -> Option<DiskProtectionStatus> {
-        self.receiver.recv_async().await.ok().map(|()| self.cell.status())
+        self.receiver
+            .recv_async()
+            .await
+            .ok()
+            .map(|()| self.cell.status())
     }
 }
 
@@ -415,13 +464,18 @@ pub(crate) struct SharedRequest<T> {
 
 impl<T: Clone> SharedRequest<T> {
     pub(crate) fn new() -> Self {
-        Self { waiters: Mutex::new(None) }
+        Self {
+            waiters: Mutex::new(None),
+        }
     }
 
     /// Joins the pending request, or starts one with `start` when none is
     /// pending. `start` runs under this request's lock, so a completion
     /// cannot slip between starting and registering.
-    pub(crate) fn join<E>(&self, start: impl FnOnce() -> Result<(), E>) -> Result<flume::Receiver<T>, E> {
+    pub(crate) fn join<E>(
+        &self,
+        start: impl FnOnce() -> Result<(), E>,
+    ) -> Result<flume::Receiver<T>, E> {
         let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
         let (sender, receiver) = flume::bounded(1);
         match waiters.as_mut() {
@@ -435,7 +489,11 @@ impl<T: Clone> SharedRequest<T> {
     }
 
     pub(crate) fn complete(&self, result: T) {
-        let waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         for waiter in waiters.into_iter().flatten() {
             waiter.send(result.clone()).ok();
         }
@@ -443,7 +501,10 @@ impl<T: Clone> SharedRequest<T> {
 
     /// Drops every waiter unanswered, which they observe as a stopped worker.
     pub(crate) fn abandon(&self) {
-        self.waiters.lock().unwrap_or_else(PoisonError::into_inner).take();
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 }
 

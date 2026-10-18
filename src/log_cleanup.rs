@@ -12,8 +12,7 @@ use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::disk_protection::{ProtectedArea, ProtectionReason};
 use crate::logger::is_runtime_file_name;
 use crate::persistence::{
-    ExecutorId, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewExecutor,
-    NewJobOutput,
+    ExecutorId, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewExecutor, NewJobOutput,
 };
 
 pub const CLEANUP_QUEUE_CAPACITY: usize = 8;
@@ -840,7 +839,8 @@ mod tests {
     #[test]
     fn logger_creates_and_rotates_runtime_files() {
         let (_root, directory) = data_directory("rotation");
-        let worker = DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let worker =
+            DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
         let database = worker.handle();
         let logger = RuntimeLogger::start(database).expect("start runtime logger");
         let handle = logger.handle();
@@ -849,7 +849,9 @@ mod tests {
             log::Log::log(
                 &handle,
                 &log::Record::builder()
-                    .args(format_args!("rotation record {index} with enough bytes to roll the file"))
+                    .args(format_args!(
+                        "rotation record {index} with enough bytes to roll the file"
+                    ))
                     .level(log::Level::Info)
                     .target("log-cleanup-test")
                     .build(),
@@ -866,14 +868,18 @@ mod tests {
             .filter(|entry| crate::logger::is_runtime_file_name(&entry.file_name()))
             .count();
         assert!(status.written_records >= 12, "logger status: {status:?}");
-        assert!(runtime_files >= 2, "expected rotation, found {runtime_files} runtime file(s)");
+        assert!(
+            runtime_files >= 2,
+            "expected rotation, found {runtime_files} runtime file(s)"
+        );
         worker.shutdown().expect("shutdown database");
     }
 
     #[test]
     fn housekeeping_executes_and_publishes_cleanup_result() {
         let (_root, directory) = data_directory("housekeeping");
-        let worker = DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
+        let worker =
+            DatabaseWorker::start_with_policy(&directory, policy()).expect("start database");
         let database = worker.handle();
         let executor = wait(database.create_executor(NewExecutor {
             name: "__CORE__".into(),

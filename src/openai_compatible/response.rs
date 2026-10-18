@@ -3,7 +3,7 @@
 //! SSE framing for the OpenAI Chat Completions wire format.
 
 use super::stream::NormalizedUsage;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A Chat Completion chunk for SSE streaming.
 #[derive(Debug, Clone)]

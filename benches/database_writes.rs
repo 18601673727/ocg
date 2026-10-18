@@ -64,7 +64,12 @@ fn report(label: &str, mut latencies: Vec<Duration>, elapsed: Duration) {
 
 /// Closed-loop writers: each submits its next command when the previous one
 /// is acknowledged, so the queue depth equals the number of writers.
-fn write_workload(handle: &DatabaseHandle, writers: usize, per_writer: usize, tag: &str) -> BenchResult<(Vec<Duration>, Duration)> {
+fn write_workload(
+    handle: &DatabaseHandle,
+    writers: usize,
+    per_writer: usize,
+    tag: &str,
+) -> BenchResult<(Vec<Duration>, Duration)> {
     let latencies = Arc::new(Mutex::new(Vec::new()));
     let start = Instant::now();
     let threads: Vec<_> = (0..writers)
@@ -82,7 +87,10 @@ fn write_workload(handle: &DatabaseHandle, writers: usize, per_writer: usize, ta
                     }))?;
                     local.push(began.elapsed());
                 }
-                latencies.lock().unwrap_or_else(PoisonError::into_inner).extend(local);
+                latencies
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(local);
                 Ok(())
             })
         })
@@ -110,7 +118,10 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
                     block_on(handle.projects(None, 20))?;
                     local.push(began.elapsed());
                 }
-                read_latencies.lock().unwrap_or_else(PoisonError::into_inner).extend(local);
+                read_latencies
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend(local);
                 Ok(())
             })
         })
@@ -122,7 +133,11 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
     }
     let (latencies, elapsed) = written?;
     report("mixed writes, 16 writers", latencies, elapsed);
-    let reads = std::mem::take(&mut *read_latencies.lock().unwrap_or_else(PoisonError::into_inner));
+    let reads = std::mem::take(
+        &mut *read_latencies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
     report("mixed reads,   2 readers", reads, elapsed);
 
     let began = Instant::now();
@@ -138,7 +153,10 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
 
 fn main() -> BenchResult<()> {
     // `cargo bench` appends `--bench`; the first plain argument selects a section.
-    let section = std::env::args().skip(1).find(|argument| !argument.starts_with("--")).unwrap_or_else(|| "all".to_string());
+    let section = std::env::args()
+        .skip(1)
+        .find(|argument| !argument.starts_with("--"))
+        .unwrap_or_else(|| "all".to_string());
     let selected = |name: &str| section == "all" || section == name;
 
     let root = std::env::temp_dir().join(format!("ocg-bench-{}", std::process::id()));
@@ -156,8 +174,13 @@ fn main() -> BenchResult<()> {
         if selected("concurrent") {
             for writers in [4usize, 16, 64] {
                 let per_writer = 600 / writers.min(60) + 20;
-                let (latencies, elapsed) = write_workload(&handle, writers, per_writer, &format!("c{writers}"))?;
-                report(&format!("concurrent, {writers:>2} writers"), latencies, elapsed);
+                let (latencies, elapsed) =
+                    write_workload(&handle, writers, per_writer, &format!("c{writers}"))?;
+                report(
+                    &format!("concurrent, {writers:>2} writers"),
+                    latencies,
+                    elapsed,
+                );
             }
         }
         if selected("reads") {
@@ -176,6 +199,9 @@ fn ocg_database_file(directory: &DataDirectory) -> BenchResult<std::path::PathBu
     let mut files = std::fs::read_dir(directory.database_path())?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "redb"));
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "redb")
+        });
     files.next().ok_or_else(|| "no database file found".into())
 }

@@ -838,5 +838,4 @@ mod tests {
         let _ = sample(&[(&record, Eligible, Final)]);
         assert_eq!(record, before);
     }
-
 }

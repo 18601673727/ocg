@@ -103,9 +103,9 @@ pub async fn targets(
         credential_ref: Some(target.credential_ref.clone()),
     };
     let configs = database.configs(None, None, 1_000).await?;
-    let connection_id = match configs.iter().find(|config| {
-        matches!(&config.body, ConfigBody::Connection(found) if *found == connection)
-    }) {
+    let connection_id = match configs.iter().find(
+        |config| matches!(&config.body, ConfigBody::Connection(found) if *found == connection),
+    ) {
         Some(found) => found.id,
         None => {
             database

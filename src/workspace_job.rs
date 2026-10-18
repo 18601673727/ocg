@@ -49,9 +49,9 @@ use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceErro
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write};
 use ocg::persistence::{
-    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, JobId,
-    JobInputDraft, MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind,
-    RequestNumber, ToolDecision, ToolOutcome,
+    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, JobId, JobInputDraft,
+    MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind, RequestNumber, ToolDecision,
+    ToolOutcome,
 };
 use ocg::provider_execution::{
     CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,

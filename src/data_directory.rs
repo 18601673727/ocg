@@ -48,10 +48,12 @@ impl DataDirectory {
     pub fn bootstrap(root: OsString) -> Result<Self, DataDirectoryError> {
         let root = PathBuf::from(root);
         create_directory(&root)?;
-        let root = root.canonicalize().map_err(|source| DataDirectoryError::Io {
-            path: root.clone(),
-            source,
-        })?;
+        let root = root
+            .canonicalize()
+            .map_err(|source| DataDirectoryError::Io {
+                path: root.clone(),
+                source,
+            })?;
         make_private(&root)?;
 
         let data_directory = Self {
