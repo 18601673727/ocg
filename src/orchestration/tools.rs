@@ -50,7 +50,7 @@ use crate::openai_compatible::{
     CompletedToolCall, FunctionDefinitionWire, InvalidToolCall, MAX_TOOL_DEFINITION_BYTES,
     ToolCallRefusal, ToolWire, is_function_name,
 };
-use crate::persistence::{ToolEffect, is_handler_version};
+use crate::persistence::{JobId, ToolCallRef, ToolEffect, is_handler_version};
 
 /// A tool call's result, or its handler's failure.
 pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;
@@ -80,10 +80,14 @@ pub(crate) trait ToolHandler: Send + Sync {
     /// handler stopped either way leaves its outcome uncertain.
     fn call(&self, arguments: Value) -> ToolFuture<'_>;
 
+    fn call_for(&self, _call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
+        self.call(arguments)
+    }
+
     /// Stops work started by this handler and waits until its supervisor has
     /// confirmed that no process group remains. Handlers without processes
     /// have nothing to stop.
-    fn stop(&self) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
+    fn stop(&self, _job: JobId) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
         Box::pin(async { Ok(()) })
     }
 }

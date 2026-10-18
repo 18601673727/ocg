@@ -139,6 +139,14 @@ pub(crate) struct Process {
     started_at: Instant,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum FinishError {
+    #[error("process cleanup was not proven: {0}")]
+    NotProven(std::io::Error),
+    #[error("process cleanup was proven, but waiting failed: {0}")]
+    Wait(std::io::Error),
+}
+
 #[derive(Clone)]
 pub(crate) struct StopSignal {
     stopped: Arc<AtomicBool>,
@@ -203,10 +211,19 @@ impl Process {
     pub(crate) fn finish(
         mut self,
         stop_requested: impl Fn() -> bool,
-    ) -> std::io::Result<ExitStatus> {
+    ) -> Result<ExitStatus, FinishError> {
         let mut term_sent = false;
         let mut deadline = None;
-        while !wait_leader(self.group)? {
+        let mut wait_error = None;
+        loop {
+            match wait_leader(self.group) {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    wait_error = Some(error);
+                    break;
+                }
+            }
             if (stop_requested() || self.stopped.load(Ordering::Acquire)) && !term_sent {
                 if let Some(remaining) = STARTUP_GRACE.checked_sub(self.started_at.elapsed()) {
                     thread::sleep(remaining);
@@ -222,13 +239,23 @@ impl Process {
             thread::sleep(POLL);
         }
         signal(self.group, Signal::KILL);
-        while !wait_leader(self.group)? {
-            thread::sleep(POLL);
+        loop {
+            match wait_leader(self.group) {
+                Ok(true) => break,
+                Ok(false) => thread::sleep(POLL),
+                Err(error) => {
+                    wait_error.get_or_insert(error);
+                    break;
+                }
+            }
         }
-        prove_empty(self.group, &self.sentinel)?;
-        let status = self.child.wait()?;
+        prove_empty(self.group, &self.sentinel).map_err(FinishError::NotProven)?;
+        let status = self.child.wait().map_err(FinishError::Wait)?;
         drop(self.permit);
-        Ok(status)
+        match wait_error {
+            Some(error) => Err(FinishError::Wait(error)),
+            None => Ok(status),
+        }
     }
 }
 
@@ -314,7 +341,9 @@ fn live_group_members(group: Pid) -> std::io::Result<bool> {
         else {
             continue;
         };
-        let stat = std::fs::read_to_string(entry.path().join("stat"))?;
+        let Some(stat) = read_process_stat(&entry.path().join("stat"))? else {
+            continue;
+        };
         let Some((_, fields)) = stat.rsplit_once(") ") else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -330,6 +359,42 @@ fn live_group_members(group: Pid) -> std::io::Result<bool> {
         }
     }
     Ok(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn read_process_stat(path: &std::path::Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(stat) => Ok(Some(stat)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_process_entry_that_vanishes_before_reading_stat_is_gone() {
+        let directory =
+            std::env::temp_dir().join(format!("ocg-vanished-proc-{}", std::process::id()));
+        let process = directory.join("123");
+        std::fs::create_dir_all(&process).expect("a process entry");
+        let entry = std::fs::read_dir(&directory)
+            .expect("process entries")
+            .next()
+            .expect("one entry")
+            .expect("a readable entry");
+        std::fs::remove_dir(&process).expect("the process exits");
+        assert_eq!(
+            super::read_process_stat(&entry.path().join("stat")).expect("a gone process"),
+            None
+        );
+        std::fs::remove_dir(directory).expect("remove the fixture");
+    }
 }
 
 #[cfg(target_os = "macos")]

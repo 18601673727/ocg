@@ -1469,6 +1469,7 @@ impl CallSite<'_> {
 struct Stopped {
     stop: ToolLoopStop,
     evidence: Option<DatabaseError>,
+    proven_stop: Option<ToolCallRef>,
 }
 
 impl From<ToolLoopStop> for Stopped {
@@ -1476,6 +1477,7 @@ impl From<ToolLoopStop> for Stopped {
         Self {
             stop,
             evidence: None,
+            proven_stop: None,
         }
     }
 }
@@ -1627,6 +1629,7 @@ async fn answer_calls(
                         outcome: None,
                     },
                     evidence: Some(error),
+                    proven_stop: Some(reference),
                 });
             }
         }
@@ -1660,7 +1663,9 @@ async fn answer_calls(
         let spawns = dispatch.spawns;
         let arguments = dispatch.arguments;
         let stopping_handler = handler.clone();
-        let invocation = CatchPanic(Box::pin(async move { handler.call(arguments).await }));
+        let invocation = CatchPanic(Box::pin(async move {
+            handler.call_for(reference, arguments).await
+        }));
         let ran = select(
             cancellation.cancelled(),
             ntex::time::timeout(limits.handler_timeout, invocation),
@@ -1670,7 +1675,7 @@ async fn answer_calls(
         dispatch_seam::reach(dispatch_seam::Point::Ran, reference);
         let stopped = match &ran {
             Either::Left(()) | Either::Right(Err(())) | Either::Right(Ok(Err(_))) if spawns => {
-                stopping_handler.stop().await
+                stopping_handler.stop(site.job).await
             }
             _ => Ok(()),
         };
@@ -1757,6 +1762,7 @@ async fn answer_calls(
                                     outcome: Some(ToolOutcomeKind::Completed),
                                 },
                                 evidence: Some(error),
+                                proven_stop: Some(reference),
                             });
                         }
                         budget.result_bytes = total;
@@ -1766,7 +1772,11 @@ async fn answer_calls(
                 }
             },
         };
-        return Err(conclude(site, reference, outcome, stop).await);
+        let mut stopped = conclude(site, reference, outcome, stop).await;
+        if spawns {
+            stopped.proven_stop = Some(reference);
+        }
+        return Err(stopped);
     }
     Ok(answers)
 }
@@ -1811,6 +1821,7 @@ async fn refuse(
     Stopped {
         stop: ToolLoopStop::Refused(refusal),
         evidence: recorded.err(),
+        proven_stop: None,
     }
 }
 
@@ -1834,11 +1845,13 @@ async fn conclude(
     stop: ToolLoopStop,
 ) -> Stopped {
     let kind = outcome.kind();
-    match site.database.record_tool_outcome(call, outcome).await {
+    let proven_stop = outcome.is_definite().then_some(call);
+    let mut stopped = match site.database.record_tool_outcome(call, outcome).await {
         Ok(()) => stop.into(),
         Err(error) if stop.is_unknown() => Stopped {
             stop,
             evidence: Some(error),
+            proven_stop: None,
         },
         Err(error) => Stopped {
             stop: ToolLoopStop::EvidenceNotRecorded {
@@ -1846,7 +1859,36 @@ async fn conclude(
                 outcome: Some(kind),
             },
             evidence: Some(error),
+            proven_stop: None,
         },
+    };
+    stopped.proven_stop = proven_stop;
+    stopped
+}
+
+async fn tool_processes_stopped(
+    database: &DatabaseHandle,
+    job: JobId,
+    proven_stop: Option<ToolCallRef>,
+) -> Result<bool, DatabaseError> {
+    let mut after = None;
+    loop {
+        let calls = database.tool_evidence(job, after, 1000).await?;
+        for record in &calls {
+            if record.spawns
+                && proven_stop != Some(record.call)
+                && !record
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.fact.is_definite())
+            {
+                return Ok(false);
+            }
+        }
+        let Some(last) = calls.last() else {
+            return Ok(true);
+        };
+        after = Some((last.call.request, last.call.index));
     }
 }
 
@@ -1863,7 +1905,11 @@ async fn stop_tool_loop(
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let database = run.database;
     let job = run.job;
-    let Stopped { stop, evidence } = stopped;
+    let Stopped {
+        stop,
+        evidence,
+        proven_stop,
+    } = stopped;
     let evidence = evidence.map(Box::new);
     let finalization = if stop.is_unknown() {
         JobFinalization::Unknown
@@ -1894,7 +1940,11 @@ async fn stop_tool_loop(
         result,
     });
     let stop_unconfirmed = if stop.is_unknown() {
-        confirm_stopped(&database, job).await.err().map(Box::new)
+        match tool_processes_stopped(&database, job, proven_stop).await {
+            Ok(true) => confirm_stopped(&database, job).await.err().map(Box::new),
+            Ok(false) => None,
+            Err(error) => Some(Box::new(error)),
+        }
     } else {
         None
     };

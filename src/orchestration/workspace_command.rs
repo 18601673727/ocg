@@ -76,14 +76,14 @@ use rustix::io::Errno;
 #[cfg(test)]
 use rustix::process::Pid;
 
-use crate::orchestration::blocking::{self, Kind, Process, StopSignal};
+use crate::orchestration::blocking::{self, FinishError, Kind, Process, StopSignal};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 use crate::orchestration::workspace_read::{self, Refusal as PathRefusal, Workspace};
 use crate::orchestration::{workspace_discovery, workspace_write};
-use crate::persistence::ToolEffect;
+use crate::persistence::{JobId, ToolCallRef, ToolEffect};
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_run_command";
@@ -175,6 +175,8 @@ enum Uncertainty {
     TimedOut(Duration),
     #[error("the command was started, but how it ended could not be observed")]
     NotObserved,
+    #[error("the command ended, but its exit status could not be observed")]
+    ExitNotObserved,
     #[error("the command was started, but its output could not be captured")]
     OutputNotCaptured,
 }
@@ -284,11 +286,19 @@ struct Invocation {
     variables: Vec<(OsString, OsString)>,
 }
 
-static ACTIVE: OnceLock<Mutex<std::collections::BTreeMap<u64, (PathBuf, StopSignal)>>> =
-    OnceLock::new();
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CommandCall {
+    Job(ToolCallRef),
+    Standalone(u64),
+}
+
+type ActiveCommands =
+    std::collections::BTreeMap<(PathBuf, CommandCall), (StopSignal, flume::Receiver<bool>)>;
+
+static ACTIVE: OnceLock<Mutex<ActiveCommands>> = OnceLock::new();
 static NEXT_ACTIVE: AtomicU64 = AtomicU64::new(1);
 
-fn active() -> &'static Mutex<std::collections::BTreeMap<u64, (PathBuf, StopSignal)>> {
+fn active() -> &'static Mutex<ActiveCommands> {
     ACTIVE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -576,12 +586,20 @@ fn supervise(invocation: Invocation, stop: StopSignal) -> Result<Ended, Failure>
     };
     let Some((stdout, stderr)) = readers else {
         stop.request();
-        let _ = process.finish(|| true);
+        if let Err(error) = process.finish(|| true) {
+            match error {
+                FinishError::NotProven(_) => return Err(Uncertainty::NotObserved.into()),
+                FinishError::Wait(error) => {
+                    log::debug!("command wait failed after cleanup: {error}")
+                }
+            }
+        }
         return Err(Uncertainty::OutputNotCaptured.into());
     };
     let status = match process.finish(|| stop.requested()) {
         Ok(status) => status,
-        Err(_) => return Err(Uncertainty::NotObserved.into()),
+        Err(FinishError::NotProven(_)) => return Err(Uncertainty::NotObserved.into()),
+        Err(FinishError::Wait(_)) => return Err(Uncertainty::ExitNotObserved.into()),
     };
     match (stdout.join(), stderr.join()) {
         (Ok(stdout), Ok(stderr)) => Ok(Ended {
@@ -659,31 +677,38 @@ impl ToolHandler for RunCommand {
 
     fn stop(
         &self,
+        job: JobId,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
         let root = self.workspace.root().to_path_buf();
         Box::pin(async move {
-            let signals = active()
+            let commands = active()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .values()
-                .filter(|(active_root, _)| active_root == &root)
-                .map(|(_, signal)| signal.clone())
+                .iter()
+                .filter(|((active_root, call), _)| {
+                    active_root == &root
+                        && matches!(call, CommandCall::Job(call) if call.job == job)
+                })
+                .map(|(call, command)| (call.clone(), command.clone()))
                 .collect::<Vec<_>>();
-            for signal in signals {
+            for (_, (signal, _)) in &commands {
                 signal.request();
             }
-            loop {
-                let running = active()
+            let mut proven = true;
+            for (call, (_, finished)) in commands {
+                proven &= finished.recv_async().await == Ok(true);
+                active()
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .values()
-                    .any(|(active_root, _)| active_root == &root);
-                if !running {
-                    break;
-                }
-                ntex::time::sleep(Duration::from_millis(10)).await;
+                    .remove(&call);
             }
-            Ok(())
+            if proven {
+                Ok(())
+            } else {
+                Err(ToolFailure::uncertain(
+                    "the command's process cleanup was not proven",
+                ))
+            }
         })
     }
 
@@ -691,6 +716,19 @@ impl ToolHandler for RunCommand {
     /// within the command's limit. Dropping the call, as its time limit or
     /// cancellation does, stops the command.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
+        self.invoke(
+            CommandCall::Standalone(NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed)),
+            arguments,
+        )
+    }
+
+    fn call_for(&self, call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
+        self.invoke(CommandCall::Job(call), arguments)
+    }
+}
+
+impl RunCommand {
+    fn invoke(&self, call: CommandCall, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let preset = parse(&arguments).map_err(Failure::from)?;
             let invocation = self.prepare(preset).map_err(Failure::from)?;
@@ -699,21 +737,26 @@ impl ToolHandler for RunCommand {
             let (report, reported) = flume::bounded(1);
             let supervised = stop.clone();
             let mutation = workspace_read::WorkspaceMutation::begin();
-            let root = self.workspace.root().to_path_buf();
-            let active_id = NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            let (proof, proven) = flume::bounded(1);
+            let active_id = (self.workspace.root().to_path_buf(), call);
             active()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .insert(active_id, (root.clone(), stop.clone()));
+                .insert(active_id.clone(), (stop.clone(), proven));
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
                     let _mutation = mutation;
                     let result = supervise(invocation, supervised);
-                    active()
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&active_id);
+                    if proof
+                        .send(
+                            result.as_ref().err()
+                                != Some(&Failure::Uncertain(Uncertainty::NotObserved)),
+                        )
+                        .is_err()
+                    {
+                        log::debug!("command cleanup proof receiver was dropped");
+                    }
                     if report.send(result).is_err() {
                         log::debug!("command report receiver was dropped after cleanup");
                     }
@@ -725,17 +768,28 @@ impl ToolHandler for RunCommand {
                         .remove(&active_id);
                     Failure::from(Refusal::NotStarted)
                 })?;
-            let ended = match ntex::time::timeout(self.timeout, reported.recv_async()).await {
-                Ok(Ok(ended)) => ended?,
-                Ok(Err(_)) => return Err(Failure::from(Uncertainty::NotObserved).into()),
-                Err(()) => {
-                    stop.request();
-                    if reported.recv_async().await.is_err() {
-                        return Err(Failure::from(Uncertainty::NotObserved).into());
+            let (ended, timed_out) =
+                match ntex::time::timeout(self.timeout, reported.recv_async()).await {
+                    Ok(Ok(ended)) => (ended, false),
+                    Ok(Err(_)) => return Err(Failure::from(Uncertainty::NotObserved).into()),
+                    Err(()) => {
+                        stop.request();
+                        let ended = reported.recv_async().await.map_err(|_| {
+                            ToolFailure::from(Failure::from(Uncertainty::NotObserved))
+                        })?;
+                        (ended, true)
                     }
-                    return Err(Failure::from(Uncertainty::TimedOut(self.timeout)).into());
-                }
-            };
+                };
+            if ended.as_ref().err() != Some(&Failure::Uncertain(Uncertainty::NotObserved)) {
+                active()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&active_id);
+            }
+            let ended = ended?;
+            if timed_out {
+                return Err(Failure::from(Uncertainty::TimedOut(self.timeout)).into());
+            }
             Ok(result(preset, &ended))
         })
     }
