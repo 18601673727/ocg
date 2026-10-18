@@ -750,14 +750,6 @@ mod tests {
         path
     }
 
-    fn cleanup_jobs(database: &DatabaseHandle) -> Vec<crate::persistence::JobRecord> {
-        wait(database.jobs(None, 1_000))
-            .expect("read jobs")
-            .into_iter()
-            .filter(|job| job.name.as_deref() == Some("__CORE__ log cleanup"))
-            .collect()
-    }
-
     fn await_removed(path: &Path) {
         let deadline = std::time::Instant::now() + crate::test_support::WAIT;
         while path.exists() {
@@ -814,7 +806,7 @@ mod tests {
             cleanup.shutdown().expect("shutdown cleanup worker");
         }
         assert!(
-            cleanup_jobs(&database).is_empty(),
+            wait(database.jobs(None, 100)).expect("jobs").is_empty(),
             "nothing expired, so no Job"
         );
         assert!(current.exists());
@@ -861,7 +853,10 @@ mod tests {
             expired.exists(),
             "nothing is deleted while storage is protected"
         );
-        assert!(cleanup_jobs(&database).is_empty(), "and no Job is created");
+        assert!(
+            wait(database.jobs(None, 100)).expect("jobs").is_empty(),
+            "and no Job is created"
+        );
 
         let started = std::time::Instant::now();
         cleanup.shutdown().expect("shutdown cleanup worker");
@@ -931,8 +926,7 @@ mod tests {
         let worker = DatabaseWorker::start(&directory).expect("reopen");
         let database = worker.handle();
         assert!(database.abandoned_at_open().is_empty());
-        let jobs = cleanup_jobs(&database);
-        assert!(jobs.is_empty());
+        assert!(wait(database.jobs(None, 100)).expect("jobs").is_empty());
         worker.shutdown().expect("shutdown database");
     }
 }
