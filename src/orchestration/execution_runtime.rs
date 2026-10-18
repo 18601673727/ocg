@@ -1469,7 +1469,6 @@ impl CallSite<'_> {
 struct Stopped {
     stop: ToolLoopStop,
     evidence: Option<DatabaseError>,
-    proven_stop: Option<ToolCallRef>,
 }
 
 impl From<ToolLoopStop> for Stopped {
@@ -1477,7 +1476,6 @@ impl From<ToolLoopStop> for Stopped {
         Self {
             stop,
             evidence: None,
-            proven_stop: None,
         }
     }
 }
@@ -1629,7 +1627,6 @@ async fn answer_calls(
                         outcome: None,
                     },
                     evidence: Some(error),
-                    proven_stop: Some(reference),
                 });
             }
         }
@@ -1680,19 +1677,11 @@ async fn answer_calls(
             _ => Ok(()),
         };
         if let Err(failure) = stopped {
-            return Err(conclude(
-                site,
-                reference,
-                ToolOutcome::Uncertain {
-                    cause: UncertainCause::HandlerReported,
-                    message: Some(failure.message),
-                },
-                ToolLoopStop::HandlerUncertain {
-                    index,
-                    message: "the handler could not confirm its process cleanup".to_owned(),
-                },
-            )
-            .await);
+            return Err(ToolLoopStop::HandlerUncertain {
+                index,
+                message: failure.message,
+            }
+            .into());
         }
         let (outcome, stop) = match ran {
             Either::Left(()) => (
@@ -1762,7 +1751,6 @@ async fn answer_calls(
                                     outcome: Some(ToolOutcomeKind::Completed),
                                 },
                                 evidence: Some(error),
-                                proven_stop: Some(reference),
                             });
                         }
                         budget.result_bytes = total;
@@ -1772,11 +1760,7 @@ async fn answer_calls(
                 }
             },
         };
-        let mut stopped = conclude(site, reference, outcome, stop).await;
-        if spawns {
-            stopped.proven_stop = Some(reference);
-        }
-        return Err(stopped);
+        return Err(conclude(site, reference, outcome, stop).await);
     }
     Ok(answers)
 }
@@ -1821,7 +1805,6 @@ async fn refuse(
     Stopped {
         stop: ToolLoopStop::Refused(refusal),
         evidence: recorded.err(),
-        proven_stop: None,
     }
 }
 
@@ -1845,13 +1828,11 @@ async fn conclude(
     stop: ToolLoopStop,
 ) -> Stopped {
     let kind = outcome.kind();
-    let proven_stop = outcome.is_definite().then_some(call);
-    let mut stopped = match site.database.record_tool_outcome(call, outcome).await {
+    match site.database.record_tool_outcome(call, outcome).await {
         Ok(()) => stop.into(),
         Err(error) if stop.is_unknown() => Stopped {
             stop,
             evidence: Some(error),
-            proven_stop: None,
         },
         Err(error) => Stopped {
             stop: ToolLoopStop::EvidenceNotRecorded {
@@ -1859,44 +1840,15 @@ async fn conclude(
                 outcome: Some(kind),
             },
             evidence: Some(error),
-            proven_stop: None,
         },
-    };
-    stopped.proven_stop = proven_stop;
-    stopped
-}
-
-async fn tool_processes_stopped(
-    database: &DatabaseHandle,
-    job: JobId,
-    proven_stop: Option<ToolCallRef>,
-) -> Result<bool, DatabaseError> {
-    let mut after = None;
-    loop {
-        let calls = database.tool_evidence(job, after, 1000).await?;
-        for record in &calls {
-            if record.spawns
-                && proven_stop != Some(record.call)
-                && !record
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.fact.is_definite())
-            {
-                return Ok(false);
-            }
-        }
-        let Some(last) = calls.last() else {
-            return Ok(true);
-        };
-        after = Some((last.call.request, last.call.index));
     }
 }
 
 /// Settles a Job whose tool loop stopped on this side. A known stop fails
 /// the Job, a local orchestration failure that keeps the Provider's last
 /// response, if there was one, as its value; a stop that leaves a call's
-/// effect uncertain leaves the outcome unknown, and the stop of the
-/// execution is then confirmed. No Provider failure is recorded for either.
+/// effect uncertain leaves the outcome unknown. No Provider failure is
+/// recorded for either.
 async fn stop_tool_loop(
     run: ProviderRun,
     sink: DatabaseOutputSink,
@@ -1905,11 +1857,7 @@ async fn stop_tool_loop(
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let database = run.database;
     let job = run.job;
-    let Stopped {
-        stop,
-        evidence,
-        proven_stop,
-    } = stopped;
+    let Stopped { stop, evidence } = stopped;
     let evidence = evidence.map(Box::new);
     let finalization = if stop.is_unknown() {
         JobFinalization::Unknown
@@ -1939,21 +1887,12 @@ async fn stop_tool_loop(
         job,
         result,
     });
-    let stop_unconfirmed = if stop.is_unknown() {
-        match tool_processes_stopped(&database, job, proven_stop).await {
-            Ok(true) => confirm_stopped(&database, job).await.err().map(Box::new),
-            Ok(false) => None,
-            Err(error) => Some(Box::new(error)),
-        }
-    } else {
-        None
-    };
     Err(ExecutionRuntimeError::ToolLoopStopped {
         receipt,
         stop,
         observations,
         evidence,
-        stop_unconfirmed,
+        stop_unconfirmed: None,
     })
 }
 

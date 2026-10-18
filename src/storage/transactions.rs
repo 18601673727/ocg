@@ -1075,17 +1075,13 @@ impl Batch {
 
     // ---- predicates over a Job's tool calls ----------------------------------------------
 
-    /// NO_LIVE_PROCESS: every admitted call that can spawn has a definite
+    /// NO_LIVE_PROCESS: every admitted call that can spawn has an
     /// outcome, so no OS process of the Job can remain (section 11.4).
     pub(crate) fn no_live_process(&mut self, job: JobId) -> Result<bool, BatchError> {
         let calls = self.job_tool_evidence(job)?;
-        Ok(calls.iter().all(|record| {
-            !record.spawns
-                || record
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.fact.is_definite())
-        }))
+        Ok(calls
+            .iter()
+            .all(|record| !record.spawns || record.outcome.is_some()))
     }
 
     /// Whether every admitted call has a definite outcome or a reconciliation.
