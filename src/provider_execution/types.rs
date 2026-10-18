@@ -90,14 +90,31 @@ impl CredentialResolver for EnvironmentCredentialResolver {
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionConfig {
     pub timeout: Duration,
+    pub first_delta_timeout: Option<Duration>,
     pub max_output_bytes: usize,
     pub cancellation: CancellationToken,
+}
+
+impl ProviderExecutionConfig {
+    pub(crate) fn for_profile(&self, frozen: &FrozenExecutionConfig) -> Self {
+        let mut config = self.clone();
+        if frozen
+            .llm
+            .config
+            .declared_capabilities
+            .contains(&crate::persistence::ModelCapability::Reasoning)
+        {
+            config.first_delta_timeout = Some(Duration::from_secs(600));
+        }
+        config
+    }
 }
 
 impl Default for ProviderExecutionConfig {
     fn default() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
+            first_delta_timeout: None,
             max_output_bytes: MAX_OUTPUT_BYTES,
             cancellation: CancellationToken::default(),
         }

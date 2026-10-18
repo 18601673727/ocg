@@ -888,3 +888,188 @@ mod tests {
         });
     }
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderModelsRequest {
+    endpoint: String,
+    credential: Option<String>,
+    credential_ref: Option<String>,
+}
+
+pub(super) async fn provider_models(
+    database: &DatabaseHandle,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    let request: ProviderModelsRequest =
+        serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
+    if request.endpoint.len() > MAX_ENDPOINT_BYTES
+        || crate::provider_execution::model_endpoint(&request.endpoint).is_err()
+    {
+        return Err(INVALID_ENDPOINT);
+    }
+    if request.credential.is_some() && request.credential_ref.is_some() {
+        return Err(INVALID_PROFILE_BODY);
+    }
+    let credential = match request.credential {
+        Some(credential) => Some(credential),
+        None => database
+            .credential_resolver()
+            .resolve(request.credential_ref.as_deref())
+            .map_err(|_| INVALID_CREDENTIAL_REF)?,
+    };
+    if credential.as_ref().is_some_and(|secret| {
+        secret.is_empty()
+            || secret.len() > 4096
+            || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err()
+    }) {
+        return Err(INVALID_CREDENTIAL);
+    }
+    use crate::provider_execution::ModelListError;
+    let (code, message, status_code) = match crate::provider_execution::list_models(
+        &request.endpoint,
+        credential.as_deref(),
+    )
+    .await
+    {
+        Ok(models) => return Ok(Reply::ok(json!({"models": models}))),
+        Err(ModelListError::Unreachable) => (
+            "provider_unreachable",
+            "could not connect to the provider".to_owned(),
+            None,
+        ),
+        Err(ModelListError::NotListed) => (
+            "models_not_listed",
+            "the provider does not list models".to_owned(),
+            None,
+        ),
+        Err(ModelListError::Rejected {
+            status_code,
+            message,
+        }) => ("provider_rejected", message, Some(status_code)),
+    };
+    let mut error = json!({"code": code, "message": message});
+    if let Some(status) = status_code {
+        error["status_code"] = json!(status);
+    }
+    Ok(Reply::new(
+        StatusCode::BAD_GATEWAY,
+        json!({"api_version": API_VERSION, "error": error}),
+    ))
+}
+
+#[cfg(test)]
+mod provider_network_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::provider_execution::scripted;
+    use crate::test_support::{data_directory, on_system};
+
+    #[test]
+    fn provider_network_models_saved_credentials_refusals_and_redaction() {
+        let (_root, directory) = data_directory("provider-network", "models");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        database
+            .set_credential("MODEL_TEST_KEY", "saved-secret")
+            .expect("save credential");
+        on_system(move || async move {
+            scripted::install_http("https://models.example/v1/models", |authorization| {
+                assert_eq!(
+                    authorization.expect("authorization").as_bytes(),
+                    b"Bearer saved-secret"
+                );
+                Ok((200, br#"{"data":[{"id":"z"},{"id":"a","context_length":8192},{"id":"a","context_window":16384},{"id":"b","max_context_length":4096}]}"#.to_vec()))
+            });
+            let request = serde_json::to_vec(&json!({"endpoint":"https://models.example/v1/chat/completions/", "credential_ref":"MODEL_TEST_KEY"})).expect("JSON");
+            let reply = provider_models(&database, &request).await.expect("models");
+            assert_eq!(
+                reply.body,
+                json!({"models":[{"id":"a","context_window":16384},{"id":"b","context_window":4096},{"id":"z","context_window":null}]})
+            );
+            for (status, body, code) in [
+                (
+                    401,
+                    r#"{"error":{"message":"bad key saved-secret"}}"#,
+                    "provider_rejected",
+                ),
+                (404, "missing", "models_not_listed"),
+                (200, r#"{"message":"not a list"}"#, "models_not_listed"),
+            ] {
+                scripted::install_http("https://models.example/v1/models", move |_| {
+                    Ok((status, body.as_bytes().to_vec()))
+                });
+                let reply = provider_models(&database, &request).await.expect("refusal");
+                assert_eq!(reply.body["error"]["code"], code);
+                if status == 401 {
+                    assert_eq!(reply.body["error"]["status_code"], 401);
+                    assert!(
+                        reply.body["error"]["message"]
+                            .as_str()
+                            .expect("message")
+                            .contains("bad key")
+                    );
+                }
+                assert!(!reply.body.to_string().contains("saved-secret"));
+            }
+            scripted::install_http("https://models.example/v1/models", |_| Err(()));
+            assert_eq!(
+                provider_models(&database, &request)
+                    .await
+                    .expect("unreachable")
+                    .body["error"]["code"],
+                "provider_unreachable"
+            );
+            scripted::install_http("https://models.example/v1/models", |_| {
+                Ok((200, vec![b' '; 1024 * 1024 + 1]))
+            });
+            assert_eq!(
+                provider_models(&database, &request)
+                    .await
+                    .expect("bounded")
+                    .body["error"]["code"],
+                "models_not_listed"
+            );
+            scripted::install_http("https://models.example/v1/models", |authorization| {
+                assert_eq!(
+                    authorization.expect("raw credential").as_bytes(),
+                    b"Bearer raw-secret"
+                );
+                Ok((
+                    200,
+                    br#"{"data":[{"id":"model"},{"id":"raw-secret"}]}"#.to_vec(),
+                ))
+            });
+            let raw = provider_models(
+                &database,
+                br#"{"endpoint":"https://models.example/v1", "credential":"raw-secret"}"#,
+            )
+            .await
+            .expect("raw credential");
+            assert!(!raw.body.to_string().contains("raw-secret"));
+            assert!(!database.has_credential("raw-secret"));
+            assert!(
+                provider_models(&database, br#"{"endpoint":"http://models.example"}"#)
+                    .await
+                    .is_err()
+            );
+            assert!(provider_models(&database, br#"{"endpoint":"https://models.example","credential":"raw-secret","credential_ref":"MODEL_TEST_KEY"}"#).await.is_err());
+            assert_eq!(
+                database
+                    .credential_resolver()
+                    .resolve(Some("MODEL_TEST_KEY"))
+                    .expect("saved credential")
+                    .as_deref(),
+                Some("saved-secret")
+            );
+            assert!(
+                super::super::routing::authorize(
+                    &super::super::security::Caller::Anonymous,
+                    super::super::routing::Route::ProviderModels
+                )
+                .is_err()
+            );
+        });
+        worker.shutdown().expect("shutdown");
+    }
+}

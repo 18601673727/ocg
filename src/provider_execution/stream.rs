@@ -219,51 +219,57 @@ async fn parse_stream_body(
     let mut saw_event = false;
     let mut first_byte = None;
     let mut idle_waited = Duration::ZERO;
+    let mut saw_delta = false;
 
     'stream: loop {
-        if idle_waited >= config.timeout {
+        let remaining = if !saw_delta {
+            config
+                .first_delta_timeout
+                .map(|timeout| timeout.saturating_sub(started.elapsed()))
+        } else {
+            None
+        }
+        .unwrap_or_else(|| config.timeout.saturating_sub(idle_waited));
+        if remaining.is_zero() {
             return Err(response.unknown(
                 "provider stream was idle after it may have been delivered",
                 status_code,
             ));
         }
         let wait_started = Instant::now();
-        let chunk =
-            match next_stream_event(&mut payload, config, output, config.timeout - idle_waited)
-                .await
-            {
-                StreamWait::Cancelled => {
-                    return Err(local_stop(
-                        "provider execution was cancelled while streaming",
+        let chunk = match next_stream_event(&mut payload, config, output, remaining).await {
+            StreamWait::Cancelled => {
+                return Err(local_stop(
+                    "provider execution was cancelled while streaming",
+                    status_code,
+                    response.finish_reason,
+                    response.raw_finish_reason.as_deref(),
+                ));
+            }
+            StreamWait::Flush => {
+                idle_waited = idle_waited.saturating_add(wait_started.elapsed());
+                output.flush().await.map_err(|error| {
+                    local_stop(
+                        &error.message,
                         status_code,
                         response.finish_reason,
                         response.raw_finish_reason.as_deref(),
-                    ));
-                }
-                StreamWait::Flush => {
-                    idle_waited = idle_waited.saturating_add(wait_started.elapsed());
-                    output.flush().await.map_err(|error| {
-                        local_stop(
-                            &error.message,
-                            status_code,
-                            response.finish_reason,
-                            response.raw_finish_reason.as_deref(),
-                        )
-                    })?;
-                    continue;
-                }
-                StreamWait::Idle => {
-                    return Err(response.unknown(
-                        "provider stream was idle after it may have been delivered",
-                        status_code,
-                    ));
-                }
-                StreamWait::Chunk(None) => break,
-                StreamWait::Chunk(Some(chunk)) => {
-                    idle_waited = Duration::ZERO;
-                    chunk
-                }
-            };
+                    )
+                })?;
+                continue;
+            }
+            StreamWait::Idle => {
+                return Err(response.unknown(
+                    "provider stream was idle after it may have been delivered",
+                    status_code,
+                ));
+            }
+            StreamWait::Chunk(None) => break,
+            StreamWait::Chunk(Some(chunk)) => {
+                idle_waited = Duration::ZERO;
+                chunk
+            }
+        };
         if config.cancellation.is_cancelled() {
             return Err(local_stop(
                 "provider execution was cancelled while streaming",
@@ -328,6 +334,25 @@ async fn parse_stream_body(
                     ),
                 },
             )?;
+            if event
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("delta"))
+                .is_some_and(|delta| {
+                    ["content", "reasoning_content"].iter().any(|key| {
+                        delta
+                            .get(key)
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                    }) || delta
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .is_some_and(|calls| !calls.is_empty())
+                })
+            {
+                saw_delta = true;
+            }
             if let Some(delta) = delta.as_deref() {
                 output.buffer(delta).await.map_err(|error| {
                     local_stop(

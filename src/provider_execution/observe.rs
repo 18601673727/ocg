@@ -4,7 +4,7 @@ use super::*;
 /// failure that positively happened before the request could leave is
 /// NotDelivered; anything that may have reached a Provider is Delivered,
 /// whatever the Job's outcome becomes.
-pub(super) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
+pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
     match error {
         ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => {
             ProviderFact::NotDelivered
@@ -230,4 +230,75 @@ pub fn result_value(result: &ProviderExecutionResult) -> Value {
         value.insert("finish_reason".to_owned(), Value::String(reason.to_owned()));
     }
     Value::Object(value)
+}
+
+pub(super) fn with_retry_after(
+    mut failure: ProviderFailure,
+    retry_after_ms: Option<u64>,
+) -> ProviderFailure {
+    failure.retry_after_ms = retry_after_ms;
+    failure
+}
+
+pub(crate) fn retry_after_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000),
+        );
+    }
+    let parts: Vec<_> = value
+        .split(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ',' | '-' | ':')
+        })
+        .filter(|part| !part.is_empty())
+        .collect();
+    let (day, month, year, hour, minute, second) = match parts.as_slice() {
+        [_, day, month, year, hour, minute, second, "GMT"] => {
+            (*day, *month, *year, *hour, *minute, *second)
+        }
+        [_, month, day, hour, minute, second, year] => {
+            (*day, *month, *year, *hour, *minute, *second)
+        }
+        _ => return None,
+    };
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|name| *name == month)?
+        + 1;
+    let mut parsed_year: i32 = year.parse().ok()?;
+    if year.len() == 2 {
+        let current = time::OffsetDateTime::from_unix_timestamp(
+            Timestamp::now().as_unix_micros() / 1_000_000,
+        )
+        .ok()?
+        .year();
+        parsed_year += current / 100 * 100;
+        if parsed_year > current + 50 {
+            parsed_year -= 100;
+        }
+    }
+    let date = time::Date::from_calendar_date(
+        parsed_year,
+        time::Month::try_from(month as u8).ok()?,
+        day.parse().ok()?,
+    )
+    .ok()?;
+    let deadline = date
+        .with_hms(
+            hour.parse().ok()?,
+            minute.parse().ok()?,
+            second.parse().ok()?,
+        )
+        .ok()?
+        .assume_utc()
+        .unix_timestamp_nanos()
+        / 1_000_000;
+    let now = i128::from(Timestamp::now().as_unix_micros()) / 1_000;
+    Some(u64::try_from((deadline - now).max(0)).unwrap_or(u64::MAX))
 }

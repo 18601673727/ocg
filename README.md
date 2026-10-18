@@ -79,6 +79,10 @@ The code is generated fresh for each run, is not the bearer token, and stops
 accepting sign-ins after 10 failed attempts. A browser session lasts eight
 hours, only one session exists at a time, and it ends with the OCG process.
 
+## API routes
+
+- `POST /api/v1/provider-models` — test a Provider connection and list its models. Uses the same authentication as `/api/v1/profiles` (browser session with CSRF, or bearer token). Send `{endpoint, credential?}` or `{endpoint, credential_ref?}` to use a saved credential. Returns `{models: [{id, context_window}]}` sorted by id, with `null` for unknown context windows. Refusals are `provider_unreachable`, `provider_rejected` (with `status_code` and the Provider's message), or `models_not_listed`; the latter allows manual model entry. HTTPS only, no redirects, 30 s timeout and a 1 MiB response limit. Credentials are never saved or returned.
+
 ## Commands
 
 Each command below also needs `OCG_DATA_DIR`.

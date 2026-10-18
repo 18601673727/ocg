@@ -200,6 +200,10 @@ where
     F: Future<Output = ()> + 'static,
 {
     let mut report = HostReport::default();
+    if let Err(error) = crate::provider_execution::initialize_proxy() {
+        report.fail(Phase::Startup, error);
+        return report;
+    }
     let policy = match SystemPolicy::load_for_startup(data_directory) {
         Ok(policy) => policy,
         Err(error) => {
@@ -323,6 +327,7 @@ where
         Err(error) => report.fail(Phase::Logger, error),
     }
 
+    crate::provider_execution::log_proxy_configuration();
     report.attempted.push(Phase::LogCleanup);
     let cleanup = match log_cleanup::start_retention(&handle).await {
         Ok(cleanup) => Some(cleanup),

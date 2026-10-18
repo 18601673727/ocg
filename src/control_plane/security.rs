@@ -4,7 +4,7 @@ use super::*;
 /// submission, a Job's stop, Profile creation/update, or an image upload.
 fn takes_post(path: &str) -> bool {
     match path.strip_prefix("/api/v1/") {
-        Some("jobs" | "profiles" | "attachments") => true,
+        Some("jobs" | "profiles" | "provider-models" | "attachments") => true,
         Some(rest) => {
             rest.strip_prefix("jobs/")
                 .and_then(|rest| rest.strip_suffix("/stop"))
@@ -22,7 +22,7 @@ fn takes_post(path: &str) -> bool {
 fn json_post_limit(path: &str) -> Option<usize> {
     match path.strip_prefix("/api/v1/") {
         Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
-        Some("jobs" | "profiles") => Some(MAX_SUBMISSION_BYTES),
+        Some("jobs" | "profiles" | "provider-models") => Some(MAX_SUBMISSION_BYTES),
         Some(rest) => rest
             .strip_prefix("profiles/")
             .is_some_and(|profile| !profile.is_empty() && !profile.contains('/'))

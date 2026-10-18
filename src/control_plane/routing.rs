@@ -23,6 +23,7 @@ pub(super) enum Route {
     },
     Profiles,
     ProfileCreate,
+    ProviderModels,
     ProfileUpdate(ProfileId),
     Outputs {
         job: JobId,
@@ -74,6 +75,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Tools { .. }
             | Route::AgentProfiles { .. }
             | Route::Profiles
+            | Route::ProviderModels
             | Route::ProfileCreate
             | Route::ProfileUpdate(_)
             | Route::Outputs { .. }
@@ -108,6 +110,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 no_query(query).map(|()| Route::Stop(job))
             }
             ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
+            ["provider-models"] => no_query(query).map(|()| Route::ProviderModels),
             ["profiles", profile] => {
                 let profile = profiles::profile_id(profile)?;
                 no_query(query).map(|()| Route::ProfileUpdate(profile))
@@ -261,6 +264,10 @@ pub(super) async fn respond(
             catalog::agent_profiles(database, before, limit).await
         }
         Route::Profiles => profiles::list_profiles(database).await,
+        Route::ProviderModels => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::provider_models(database, &body).await
+        }
         Route::ProfileCreate => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::save_profile(database, None, &body).await
@@ -274,9 +281,9 @@ pub(super) async fn respond(
             after_seq,
             limit,
         } => outputs(shared, job, after_seq, limit).await.map(Reply::ok),
-        Route::Tools { job, after, limit } => {
-            projection::tools(shared, job, after, limit).await.map(Reply::ok)
-        }
+        Route::Tools { job, after, limit } => projection::tools(shared, job, after, limit)
+            .await
+            .map(Reply::ok),
         Route::Submit => {
             let key = submissions::idempotency_key(request.headers())?;
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

@@ -13,12 +13,13 @@ pub async fn execute_conversation(
     config: &ProviderExecutionConfig,
     mut sink: Option<&mut dyn ProviderOutputSink>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
+    let config = config.for_profile(frozen);
     let mut announced = false;
     let result = exchange(
         frozen,
         conversation,
         resolver,
-        config,
+        &config,
         &mut sink,
         &mut announced,
     )
@@ -56,18 +57,10 @@ async fn exchange(
             message: error.to_string(),
         })?;
     let provider = &frozen.llm.provider;
-    let endpoint = provider.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT);
-    let endpoint = endpoint.trim_end_matches('/');
-    let endpoint = if endpoint.ends_with("/chat/completions") {
-        endpoint.to_owned()
-    } else {
-        format!("{endpoint}/chat/completions")
-    };
-    if !endpoint.starts_with("https://") {
-        return Err(ProviderExecutionError::Build {
-            message: "provider endpoint must use https".to_owned(),
-        });
-    }
+    let endpoint = endpoint(
+        provider.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT),
+        "chat/completions",
+    )?;
 
     let credential = resolver.resolve(provider.credential_ref.as_deref())?;
     let authorization = credential.as_deref().map(authorization).transpose()?;
@@ -81,19 +74,8 @@ async fn exchange(
         &frozen.llm.config.parameters,
         conversation,
     )?;
-    let client = Client::builder()
-        .disable_redirects()
-        .response_timeout(Millis(
-            config.timeout.as_millis().min(u128::from(u32::MAX)) as u32
-        ))
-        // The pinned client's payload timeout covers the whole body, not an
-        // idle interval. Streaming applies its own timeout to each chunk wait.
-        .response_payload_timeout(Millis::ZERO)
-        .build(ntex::SharedCfg::default())
-        .await
-        .map_err(|error| ProviderExecutionError::Build {
-            message: error.to_string(),
-        })?;
+    let head_timeout = config.first_delta_timeout.unwrap_or(config.timeout);
+    let client = provider_client(head_timeout).await?;
 
     let request = client
         .post(endpoint)
@@ -107,7 +89,7 @@ async fn exchange(
     let started = Instant::now();
     let sent = select(
         config.cancellation.cancelled(),
-        ntex::time::timeout(config.timeout, request.send_json(&body)),
+        ntex::time::timeout(head_timeout, request.send_json(&body)),
     )
     .await;
     let response = match sent {
@@ -133,12 +115,19 @@ async fn exchange(
         .header("x-request-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let retry_after_ms = response
+        .header("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(observe::retry_after_ms);
     if response.status() != StatusCode::OK {
         // Nothing of a refused image-bearing request's body is kept, so it is
         // not read; see `rejected_failure`.
         if conversation.carries_images() {
             return Err(ProviderExecutionError::Rejected {
-                failure: rejected_failure(conversation, status, request_id, None),
+                failure: observe::with_retry_after(
+                    rejected_failure(conversation, status, request_id, None),
+                    retry_after_ms,
+                ),
             });
         }
         // A cancelled read keeps the status the Provider answered with.
@@ -156,7 +145,10 @@ async fn exchange(
             Either::Right(Err(())) => None,
         };
         return Err(ProviderExecutionError::Rejected {
-            failure: rejected_failure(conversation, status, request_id, body),
+            failure: observe::with_retry_after(
+                rejected_failure(conversation, status, request_id, body),
+                retry_after_ms,
+            ),
         });
     }
 
@@ -206,4 +198,42 @@ pub(super) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExe
     })?;
     value.set_sensitive(true);
     Ok(value)
+}
+
+pub(super) async fn provider_client(timeout: Duration) -> Result<Client, ProviderExecutionError> {
+    Client::builder()
+        .connector::<()>(proxy::connector()?)
+        .disable_redirects()
+        .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
+        .response_payload_timeout(Millis::ZERO)
+        .build(ntex::SharedCfg::default())
+        .await
+        .map_err(|_| ProviderExecutionError::Build {
+            message: "provider HTTP client could not be initialized".to_owned(),
+        })
+}
+
+pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, ProviderExecutionError> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let base = endpoint
+        .strip_suffix("/chat/completions")
+        .unwrap_or(endpoint);
+    let url = format!("{base}/{resource}");
+    let uri = url.parse::<ntex::http::Uri>().ok();
+    if uri.as_ref().is_none_or(|uri| {
+        uri.scheme_str() != Some("https")
+            || uri.host().is_none_or(str::is_empty)
+            || uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+            || uri.query().is_some()
+    }) || url.contains('#')
+    {
+        return Err(ProviderExecutionError::Build {
+            message:
+                "provider endpoint must be an https URL without credentials, query or fragment"
+                    .to_owned(),
+        });
+    }
+    Ok(url)
 }

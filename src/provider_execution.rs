@@ -33,7 +33,9 @@ const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 mod cancellation;
 mod conversation;
 mod exchange;
+mod models;
 mod observe;
+mod proxy;
 mod stream;
 mod types;
 mod usage;
@@ -45,9 +47,19 @@ pub(crate) use conversation::{ground_workspace, request_body};
 use exchange::authorization;
 use exchange::incomplete_tool_calls;
 pub use exchange::{execute_chat_with_sink, execute_conversation};
+#[cfg(test)]
+pub(crate) use observe::retry_after_ms;
+pub(crate) use observe::unannounced_fact;
 pub(crate) use observe::{announce, rejected_failure};
-use observe::{announce_at, bounded_body, classify_client_error, trim_ascii, unannounced_fact};
+use observe::{announce_at, bounded_body, classify_client_error, trim_ascii};
+pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecutionError> {
+    exchange::endpoint(endpoint, "models")
+}
+pub(crate) use models::{ModelListError, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
+pub(crate) use proxy::{
+    initialize as initialize_proxy, log_configuration as log_proxy_configuration,
+};
 #[cfg(test)]
 use stream::parse_stream;
 pub(crate) use stream::read_response;
@@ -87,6 +99,30 @@ pub(crate) mod scripted {
     use ntex::util::{Bytes, Stream};
 
     use super::CancellationToken;
+
+    type HttpResult = Result<(u16, Vec<u8>), ()>;
+    type HttpScript = Box<dyn FnMut(Option<&ntex::http::header::HeaderValue>) -> HttpResult + Send>;
+    static HTTP: std::sync::Mutex<std::collections::BTreeMap<String, HttpScript>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    pub(crate) fn install_http(
+        endpoint: &str,
+        script: impl FnMut(Option<&ntex::http::header::HeaderValue>) -> HttpResult + Send + 'static,
+    ) {
+        HTTP.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(endpoint.to_owned(), Box::new(script));
+    }
+
+    pub(crate) fn http_response(
+        endpoint: &str,
+        authorization: Option<&ntex::http::header::HeaderValue>,
+    ) -> Option<HttpResult> {
+        HTTP.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(endpoint)
+            .map(|script| script(authorization))
+    }
 
     /// One scripted step of a response body.
     pub(crate) enum Step {
@@ -3381,6 +3417,115 @@ pub(crate) mod tests {
     }
 
     /// A frozen configuration whose endpoint nothing listens on.
+    #[test]
+    fn provider_network_reasoning_first_delta_deadline_and_stop() {
+        let mut frozen = unreachable_frozen();
+        let base = ProviderExecutionConfig::default();
+        assert_eq!(base.for_profile(&frozen).first_delta_timeout, None);
+        frozen
+            .llm
+            .config
+            .declared_capabilities
+            .insert(crate::persistence::ModelCapability::Reasoning);
+        assert_eq!(
+            base.for_profile(&frozen).first_delta_timeout,
+            Some(Duration::from_secs(600))
+        );
+        crate::test_support::on_system(move || async move {
+            let content = "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let role = "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n";
+            let reasoning =
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n";
+            let tool = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n";
+            for (steps, first, succeeds, stopped) in [
+                (
+                    vec![
+                        Step::Chunk(role),
+                        Step::Quiet(Duration::from_millis(250)),
+                        Step::Chunk(content),
+                    ],
+                    Some(Duration::from_secs(1)),
+                    true,
+                    false,
+                ),
+                (
+                    vec![
+                        Step::Quiet(Duration::from_millis(250)),
+                        Step::Chunk(content),
+                    ],
+                    None,
+                    false,
+                    false,
+                ),
+                (
+                    vec![
+                        Step::Quiet(Duration::from_millis(200)),
+                        Step::Chunk(role),
+                        Step::Quiet(Duration::from_millis(200)),
+                        Step::Chunk(content),
+                    ],
+                    Some(Duration::from_millis(300)),
+                    false,
+                    false,
+                ),
+                (
+                    vec![
+                        Step::Chunk(reasoning),
+                        Step::Quiet(Duration::from_millis(250)),
+                        Step::Chunk(content),
+                    ],
+                    Some(Duration::from_secs(1)),
+                    false,
+                    false,
+                ),
+                (
+                    vec![
+                        Step::Chunk(tool),
+                        Step::Quiet(Duration::from_millis(250)),
+                        Step::Chunk(content),
+                    ],
+                    Some(Duration::from_secs(1)),
+                    false,
+                    false,
+                ),
+                (
+                    vec![Step::Cancel, Step::Stall],
+                    Some(Duration::from_secs(600)),
+                    false,
+                    true,
+                ),
+            ] {
+                let config = ProviderExecutionConfig {
+                    timeout: Duration::from_millis(100),
+                    first_delta_timeout: first,
+                    ..ProviderExecutionConfig::default()
+                };
+                let result = parse_stream(
+                    payload(steps, config.cancellation.clone()),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    None,
+                    &mut UsageCapture::default(),
+                )
+                .await;
+                assert_eq!(result.is_ok(), succeeds);
+                if stopped {
+                    assert!(matches!(
+                        result,
+                        Err(ProviderExecutionError::Stopped { .. })
+                    ));
+                } else if !succeeds {
+                    assert!(matches!(
+                        result,
+                        Err(ProviderExecutionError::Unknown { .. })
+                    ));
+                }
+            }
+        });
+    }
+
     fn unreachable_frozen() -> FrozenExecutionConfig {
         FrozenExecutionConfig {
             agent: None,

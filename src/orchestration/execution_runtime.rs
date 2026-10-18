@@ -83,8 +83,8 @@ pub struct ToolExecution {
 /// truncation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolLoopLimits {
-    /// Provider requests one Job may send, its first included. Tools a
-    /// response requests when no further request is allowed are not run.
+    /// Provider rounds one Job may send, its first included; retries do not
+    /// consume rounds. Tools requested in the last round are not run.
     pub max_provider_requests: u32,
     /// Tool calls one Job may run. A response whose calls would exceed it
     /// runs none of them.
@@ -1220,7 +1220,9 @@ async fn dispatch_runtime(
                             retry_next.insert(job);
                         }
                         Err(error) => {
-                            log::warn!("failed to confirm job stop after process group cleanup: {error}");
+                            log::warn!(
+                                "failed to confirm job stop after process group cleanup: {error}"
+                            );
                         }
                     }
                 }
@@ -1881,7 +1883,8 @@ pub(crate) mod provider_seam {
         pub(crate) steps: Vec<Step>,
     }
 
-    type Script = Box<dyn FnMut(&ChatConversation) -> Response + Send>;
+    type Script =
+        Box<dyn FnMut(&ChatConversation) -> Result<Response, ProviderExecutionError> + Send>;
     type Hook = Box<dyn FnMut() + Send>;
 
     static SCRIPTS: Mutex<BTreeMap<String, Script>> = Mutex::new(BTreeMap::new());
@@ -1891,7 +1894,16 @@ pub(crate) mod provider_seam {
     /// of sending it.
     pub(crate) fn install(
         endpoint: &str,
-        script: impl FnMut(&ChatConversation) -> Response + Send + 'static,
+        mut script: impl FnMut(&ChatConversation) -> Response + Send + 'static,
+    ) {
+        install_result(endpoint, move |conversation| Ok(script(conversation)));
+    }
+
+    pub(crate) fn install_result(
+        endpoint: &str,
+        script: impl FnMut(&ChatConversation) -> Result<Response, ProviderExecutionError>
+        + Send
+        + 'static,
     ) {
         SCRIPTS
             .lock()
@@ -1953,16 +1965,28 @@ pub(crate) mod provider_seam {
                 .expect("a scripted Provider");
             script(conversation)
         };
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                provider_execution::announce(
+                    Some(&mut *sink),
+                    provider_execution::unannounced_fact(&error),
+                )
+                .await;
+                return Err(error);
+            }
+        };
         provider_execution::announce(Some(&mut *sink), ProviderFact::Delivered).await;
         if let Some(gate) = response.gate {
             select(config.cancellation.cancelled(), gate.recv_async()).await;
         }
+        let config = config.for_profile(frozen);
         provider_execution::read_response(
             payload(response.steps, config.cancellation.clone()),
             200,
             Instant::now(),
             None,
-            config,
+            &config,
             Some(sink),
             conversation,
         )
@@ -2104,8 +2128,46 @@ async fn run_provider_job_inner(
         return stop_tool_loop(run, sink, None, stopped).await;
     }
     let mut budget = ToolBudget::default();
+    let mut round = 1u32;
     loop {
-        let result = match exchange(&conversation, &mut sink).await {
+        let mut retries = 0;
+        let execution = loop {
+            let execution = exchange(&conversation, &mut sink).await;
+            let Err(error) = &execution else {
+                break execution;
+            };
+            let Some((delay, next)) =
+                retry_delay(error, retries, cancellation.is_cancelled()).zip(sink.request.next())
+            else {
+                break execution;
+            };
+            let observed_at = Timestamp::now();
+            for observation in provider_execution::error_observations(error) {
+                if let Err(error) = run
+                    .database
+                    .record_availability_stat(NewAvailabilityStat {
+                        job: run.job,
+                        request: sink.request,
+                        observed_at,
+                        observation,
+                    })
+                    .await
+                {
+                    sink.gap.get_or_insert(error);
+                }
+            }
+            sink.request = next;
+            retries += 1;
+            if let ntex::util::Either::Left(()) =
+                ntex::util::select(cancellation.cancelled(), ntex::time::sleep(delay)).await
+            {
+                provider_execution::announce(Some(&mut sink), ProviderFact::NotDelivered).await;
+                break Err(ProviderExecutionError::NotDelivered {
+                    message: "provider execution was cancelled before sending".to_owned(),
+                });
+            }
+        };
+        let result = match execution {
             Ok(result) if result.requests_tools() => result,
             execution => {
                 return finish_provider_job(
@@ -2124,9 +2186,10 @@ async fn run_provider_job_inner(
         if let Some(error) = record_answer(&run.database, run.job, sink.request, &result).await {
             sink.gap.get_or_insert(error);
         }
-        let next = sink.request.next().filter(|next| {
-            tools.is_some_and(|tools| next.get() <= tools.limits.max_provider_requests)
-        });
+        let next = sink
+            .request
+            .next()
+            .filter(|_| tools.is_some_and(|tools| round < tools.limits.max_provider_requests));
         let answered = match (tools, next) {
             (Some(tools), Some(_)) => {
                 let site = CallSite {
@@ -2174,7 +2237,26 @@ async fn run_provider_job_inner(
                 .push(ChatMessage::tool(call.id.clone(), content));
         }
         sink.request = next;
+        round += 1;
     }
+}
+
+fn retry_delay(
+    error: &ProviderExecutionError,
+    retries: u32,
+    cancelled: bool,
+) -> Option<std::time::Duration> {
+    if cancelled || retries >= 3 {
+        return None;
+    }
+    let milliseconds = match error {
+        ProviderExecutionError::Rejected { failure } if failure.retryable => {
+            failure.retry_after_ms.unwrap_or(1_000 << retries)
+        }
+        ProviderExecutionError::NotDelivered { .. } => 1_000 << retries,
+        _ => return None,
+    };
+    (milliseconds <= 30_000).then(|| std::time::Duration::from_millis(milliseconds))
 }
 
 /// What one Job's calls have used of their limits.
@@ -2992,6 +3074,202 @@ mod failure_tests {
             llm_transports: std::collections::BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
         }))
         .expect("executor")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_network_retries_preserve_requests_rounds_and_cancellation() {
+        use crate::openai_compatible::ProviderFailure;
+        use crate::provider_execution::scripted::Step;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let rejected = |delay| ProviderExecutionError::Rejected {
+            failure: ProviderFailure {
+                retryable: true,
+                retry_after_ms: delay,
+                ..Default::default()
+            },
+        };
+        for (retry, seconds) in [(0, 1), (1, 2), (2, 4)] {
+            assert_eq!(
+                retry_delay(&rejected(None), retry, false),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        assert!(retry_delay(&rejected(None), 3, false).is_none());
+        assert!(retry_delay(&rejected(Some(30_001)), 0, false).is_none());
+        assert!(retry_delay(&rejected(None), 0, true).is_none());
+        let facts = crate::provider_execution::ResponseFacts {
+            status_code: 200,
+            finish_reason: None,
+            raw_finish_reason: None,
+        };
+        for error in [
+            ProviderExecutionError::Rejected {
+                failure: ProviderFailure::default(),
+            },
+            ProviderExecutionError::Unknown {
+                message: "unknown".into(),
+                facts: None,
+                finished: false,
+            },
+            ProviderExecutionError::Incomplete {
+                message: "incomplete".into(),
+                facts: facts.clone(),
+            },
+            ProviderExecutionError::Interrupted {
+                message: "interrupted".into(),
+            },
+            ProviderExecutionError::Stopped {
+                message: "stopped".into(),
+                facts,
+            },
+            ProviderExecutionError::OutputPersistence {
+                message: "write".into(),
+                stream: Box::new(rejected(None)),
+            },
+        ] {
+            assert!(retry_delay(&error, 0, false).is_none());
+        }
+        assert_eq!(crate::provider_execution::retry_after_ms("2"), Some(2_000));
+        assert_eq!(
+            crate::provider_execution::retry_after_ms("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(0)
+        );
+        assert!(
+            crate::provider_execution::retry_after_ms("Fri, 01 Jan 2100 00:00:00 GMT")
+                .expect("date")
+                > 30_000
+        );
+        assert_eq!(crate::provider_execution::retry_after_ms("invalid"), None);
+
+        let (_root, directory) = data_directory("provider-network", "retries");
+        let (_workspace, root) =
+            crate::test_support::temporary_directory("provider-network", "retry-workspace");
+        std::fs::write(root.join("input"), "read me").expect("file");
+        let mut tools = crate::orchestration::workspace_read::read_file_tools(
+            crate::orchestration::workspace_read::Workspace::authorize(&root, &directory)
+                .expect("workspace"),
+        )
+        .expect("tools");
+        tools.limits.max_provider_requests = 2;
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        for (scenario, expected) in [(0, 6), (1, 4), (2, 1), (3, 1), (4, 1)] {
+            let executor = executor(&database);
+            let job =
+                wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+            let mut frozen = wait(database.job_configuration(job))
+                .expect("configuration")
+                .expect("frozen")
+                .frozen;
+            let endpoint = format!("https://retries-{scenario}.example/v1");
+            frozen.llm.provider.endpoint = Some(endpoint.clone());
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let sent = attempts.clone();
+            let cancellation = CancellationToken::default();
+            let stop = cancellation.clone();
+            provider_seam::install_result(&endpoint, move |conversation| {
+                let attempt = sent.fetch_add(1, Ordering::SeqCst);
+                if scenario == 3 {
+                    let stop = stop.clone();
+                    ntex::rt::spawn(async move {
+                        ntex::time::sleep(Duration::from_millis(50)).await;
+                        stop.cancel();
+                    });
+                }
+                if scenario == 4 {
+                    return Err(ProviderExecutionError::Unknown {
+                        message: "unknown".into(),
+                        facts: None,
+                        finished: false,
+                    });
+                }
+                if scenario == 0 && attempt == 1 {
+                    return Err(ProviderExecutionError::NotDelivered {
+                        message: "connection refused".into(),
+                    });
+                }
+                if scenario != 0 || matches!(attempt, 0 | 2 | 4) {
+                    return Err(ProviderExecutionError::Rejected {
+                        failure: ProviderFailure {
+                            status_code: Some(429),
+                            message: "busy".into(),
+                            retryable: true,
+                            retry_after_ms: Some(if scenario == 2 {
+                                31_000
+                            } else if scenario == 3 {
+                                30_000
+                            } else {
+                                0
+                            }),
+                            ..Default::default()
+                        },
+                    });
+                }
+                let chunk = if attempt == 3 {
+                    assert_eq!(conversation.messages.len(), 1);
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"read\",\"type\":\"function\",\"function\":{\"name\":\"workspace_read_file\",\"arguments\":\"{\\\"path\\\":\\\"input\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n"
+                } else {
+                    assert_eq!(conversation.messages.len(), 3);
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n"
+                };
+                Ok(provider_seam::Response {
+                    gate: None,
+                    steps: vec![Step::Chunk(chunk)],
+                })
+            });
+            let handle = database.clone();
+            let tools = tools.clone();
+            let elapsed = Instant::now();
+            on_system(move || async move {
+                let config = ProviderExecutionConfig {
+                    cancellation: cancellation.clone(),
+                    ..Default::default()
+                };
+                run_provider_job(
+                    ProviderRun {
+                        database: handle,
+                        executor,
+                        input: JobInputId::new(job.get()),
+                        job,
+                    },
+                    ChatConversation {
+                        messages: vec![ChatMessage::user("read")],
+                        tools: tools.offer.wires().expect("offer"),
+                        ..Default::default()
+                    },
+                    Some(&tools),
+                    &cancellation,
+                    async |conversation, sink| {
+                        provider_seam::exchange(&frozen, &config, conversation, sink).await
+                    },
+                )
+                .await
+                .expect("settled");
+            });
+            assert_eq!(attempts.load(Ordering::SeqCst), expected);
+            let availability =
+                wait(database.job_availability(job, None, 20)).expect("availability");
+            if scenario == 0 {
+                assert_eq!(
+                    availability
+                        .iter()
+                        .map(|stat| stat.request.get())
+                        .collect::<Vec<_>>(),
+                    [1, 3, 4, 5, 6]
+                );
+                let metrics = wait(database.job_metrics(job, None, 20)).expect("metrics");
+                assert!(metrics.iter().any(|metric| metric.request.get() == 2
+                    && metric.token == Some(TokenAnnotation::excluded())));
+            }
+            if scenario == 3 {
+                assert!(elapsed.elapsed() < Duration::from_secs(2));
+                assert_eq!(availability.len(), 1);
+                assert_eq!(availability[0].request.get(), 1);
+            }
+        }
+        worker.shutdown().expect("shutdown");
     }
 
     #[test]

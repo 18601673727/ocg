@@ -68,13 +68,6 @@ impl TransportError {
         }
     }
 
-    /// Whether the underlying provider error was marked retryable.
-    /// OCG owns the decision to act on this.
-    #[must_use]
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Provider(failure) if failure.retryable)
-    }
-
     /// The observed HTTP status, when one was seen.
     #[must_use]
     pub fn status_code(&self) -> Option<u16> {
