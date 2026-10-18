@@ -89,7 +89,7 @@ use crate::persistence::ToolEffect;
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-1";
+const HANDLER_VERSION: &str = "workspace_run_command-2";
 
 /// Longest a command may run before it is stopped.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -147,7 +147,7 @@ impl Preset {
 
     fn arguments(self) -> &'static [&'static str] {
         match self {
-            Self::CargoCheck => &["check", "--all-targets"],
+            Self::CargoCheck => &["check", "--all-targets", "--message-format=json"],
             Self::CargoTest => &["test", "--all-targets"],
         }
     }
@@ -312,6 +312,13 @@ struct Capture {
 }
 
 impl Capture {
+    fn text(&self) -> Option<String> {
+        if self.unread || self.total != self.head.len() + self.tail.len() {
+            return None;
+        }
+        String::from_utf8(self.head.iter().chain(&self.tail).copied().collect()).ok()
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         self.total = self.total.saturating_add(bytes.len());
         let room = OUTPUT_BYTES
@@ -379,15 +386,151 @@ struct Ended {
     stderr: Capture,
 }
 
+fn compact_check(stdout: &str) -> Option<String> {
+    let mut diagnostics = Vec::new();
+    let mut success = None;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line).ok()?;
+        match record["reason"].as_str()? {
+            "compiler-message" => {
+                let message = &record["message"];
+                let level = message["level"].as_str()?;
+                if !matches!(level, "error" | "warning") {
+                    continue;
+                }
+                let spans = message["spans"].as_array()?;
+                let span = spans
+                    .iter()
+                    .find(|span| span["is_primary"] == true)
+                    .or_else(|| spans.first());
+                let (path, line, column) = match span {
+                    Some(span) => (
+                        span["file_name"].as_str()?,
+                        span["line_start"].as_u64()?,
+                        span["column_start"].as_u64()?,
+                    ),
+                    None => ("<unknown>", 0, 0),
+                };
+                let code = message["code"]["code"]
+                    .as_str()
+                    .map(|code| format!("[{code}]"))
+                    .unwrap_or_default();
+                let text = message["message"]
+                    .as_str()?
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                diagnostics.push((
+                    level == "warning",
+                    format!("{path}:{line}:{column} {level}{code} {text}"),
+                ));
+            }
+            "compiler-artifact" | "build-script-executed" => {}
+            "build-finished" => success = record["success"].as_bool(),
+            _ => return None,
+        }
+    }
+    if !success? && !diagnostics.iter().any(|(warning, _)| !warning) {
+        return None;
+    }
+    diagnostics.sort_by_key(|(warning, _)| *warning);
+    Some(
+        diagnostics
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn compact_test(stdout: &str) -> Option<String> {
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let mut output = lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("test result: ok.") || line.starts_with("test result: FAILED.")
+        })
+        .map(|line| (*line).to_owned())
+        .collect::<Vec<_>>();
+    if output.is_empty() {
+        return None;
+    }
+    for line in &lines {
+        let Some(name) = line
+            .strip_prefix("test ")
+            .and_then(|line| line.strip_suffix(" ... FAILED"))
+        else {
+            continue;
+        };
+        output.push(name.to_owned());
+        let header = format!("---- {name} stdout ----");
+        let Some(index) = lines.iter().position(|line| *line == header) else {
+            continue;
+        };
+        let details = lines[index + 1..]
+            .iter()
+            .take_while(|line| {
+                !line.starts_with("---- ")
+                    && !line.starts_with("failures:")
+                    && !line.starts_with("test result:")
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let panic = details
+            .iter()
+            .position(|line| line.starts_with("thread '") && line.contains("panicked at"))
+            .unwrap_or(0);
+        output.extend(
+            details[panic..]
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .take(4)
+                .map(|line| (*line).to_owned()),
+        );
+    }
+    Some(output.join("\n"))
+}
+
+fn compact(preset: Preset, ended: &Ended) -> Option<Capture> {
+    ended.status.code()?;
+    let stdout = ended.stdout.text()?;
+    ended.stderr.text()?;
+    let text = match preset {
+        Preset::CargoCheck => compact_check(&stdout)?,
+        Preset::CargoTest => {
+            if !ended.status.success()
+                && !stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: FAILED."))
+            {
+                return None;
+            }
+            compact_test(&stdout)?
+        }
+    };
+    if !ended.status.success() && text.is_empty() {
+        return None;
+    }
+    let mut capture = Capture::default();
+    capture.push(text.as_bytes());
+    Some(capture)
+}
+
 /// The call's result: the command, its exit, and its output within the
 /// bounds. A process ended by a signal has no exit code, and its signal is
 /// given instead.
 fn result(preset: Preset, ended: &Ended) -> Value {
+    let compact = compact(preset, ended);
+    let empty = Capture::default();
+    let (stdout, stderr) = match &compact {
+        Some(stdout) => (stdout, &empty),
+        None => (&ended.stdout, &ended.stderr),
+    };
     let mut budget = OUTPUT_BYTES;
     loop {
-        let (stdout_share, stderr_share) = shares(ended.stdout.total, ended.stderr.total, budget);
-        let (stdout, stdout_cut) = ended.stdout.render("stdout", stdout_share);
-        let (stderr, stderr_cut) = ended.stderr.render("stderr", stderr_share);
+        let (stdout_share, stderr_share) = shares(stdout.total, stderr.total, budget);
+        let (stdout, stdout_cut) = stdout.render("stdout", stdout_share);
+        let (stderr, stderr_cut) = stderr.render("stderr", stderr_share);
         let mut value = json!({
             "command": preset.name(),
             "exit_code": ended.status.code(),
@@ -831,7 +974,10 @@ mod tests {
 
     #[test]
     fn only_the_exact_presets_are_accepted() {
-        assert_eq!(Preset::CargoCheck.arguments(), ["check", "--all-targets"]);
+        assert_eq!(
+            Preset::CargoCheck.arguments(),
+            ["check", "--all-targets", "--message-format=json"]
+        );
         assert_eq!(Preset::CargoTest.arguments(), ["test", "--all-targets"]);
         assert!(Preset::ALL.iter().all(|preset| preset.program() == "cargo"));
         let setup = setup("presets", "touch ran");
@@ -960,7 +1106,17 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-1");
+        assert_eq!(handler.version(), "workspace_run_command-2");
+        assert!(
+            crate::persistence::ToolAdmission {
+                handler_version: handler.version().to_owned(),
+                effect: handler.effect(),
+                parameters: parameters().to_string(),
+                arguments: crate::persistence::ToolPayload::new(test_command().to_string()),
+                authorization: crate::persistence::AuthorizationBasis::RegistryGrant,
+            }
+            .spawns()
+        );
         assert!(crate::persistence::is_handler_version(handler.version()));
         let registry = ToolRegistry::default();
         register(&registry, authorize(), setup.environment(), COMMAND_TIMEOUT).expect("register");
@@ -1085,7 +1241,11 @@ mod tests {
         for (command, arguments, code) in [
             ("cargo_test", "test --all-targets", 0),
             ("cargo_test", "test --all-targets", 101),
-            ("cargo_check", "check --all-targets", 1),
+            (
+                "cargo_check",
+                "check --all-targets --message-format=json",
+                1,
+            ),
         ] {
             std::fs::write(setup.root.join("code"), code.to_string()).expect("write");
             assert_eq!(
@@ -1100,6 +1260,127 @@ mod tests {
                 "a nonzero exit is a result, not a failure of the call"
             );
             assert!(gone(setup.pid("leader.pid")), "the process was reaped");
+        }
+    }
+
+    #[test]
+    fn check_output_keeps_diagnostics_in_error_order() {
+        let diagnostic = |level, code: Value, message, spans: Value| {
+            json!({
+                "reason": "compiler-message",
+                "message": {
+                    "level": level,
+                    "code": code,
+                    "message": message,
+                    "spans": spans,
+                    "rendered": "a long rendered diagnostic",
+                },
+            })
+        };
+        let spans = json!([
+            {"file_name": "other.rs", "line_start": 1, "column_start": 1, "is_primary": false},
+            {"file_name": "src/main.rs", "line_start": 12, "column_start": 8, "is_primary": true},
+        ]);
+        let stdout = [
+            json!({"reason": "compiler-artifact"}),
+            diagnostic("warning", Value::Null, "unused variable", spans.clone()),
+            diagnostic(
+                "error",
+                json!({"code": "E0308"}),
+                "mismatched\ntypes",
+                spans,
+            ),
+            diagnostic("warning", Value::Null, "no location", json!([])),
+            diagnostic("note", Value::Null, "an explanation", json!([])),
+            json!({"reason": "build-script-executed"}),
+            json!({"reason": "build-finished", "success": false}),
+        ]
+        .map(|record| record.to_string())
+        .join("\n");
+        let result = captured_result(Preset::CargoCheck, &stdout, "Checking example\n", 101);
+        assert_eq!(result["exit_code"], 101);
+        assert_eq!(
+            result["stdout"],
+            "src/main.rs:12:8 error[E0308] mismatched types\nsrc/main.rs:12:8 warning unused variable\n<unknown>:0:0 warning no location"
+        );
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["truncated"], false);
+        assert_eq!(
+            captured_result(
+                Preset::CargoCheck,
+                "{\"reason\":\"build-finished\",\"success\":true}\n",
+                "Finished dev profile\n",
+                0,
+            )["stdout"],
+            ""
+        );
+    }
+
+    fn captured_result(preset: Preset, stdout: &str, stderr: &str, code: i32) -> Value {
+        let mut ended = Ended {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Capture::default(),
+            stderr: Capture::default(),
+        };
+        ended.stdout.push(stdout.as_bytes());
+        ended.stderr.push(stderr.as_bytes());
+        result(preset, &ended)
+    }
+
+    #[test]
+    fn test_output_keeps_summaries_and_the_start_of_each_failure() {
+        let passed = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
+        let failed = "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+        let stdout = format!(
+            "running 1 test\ntest passing ... ok\n{passed}\n\n\
+             running 3 tests\ntest passing_again ... ok\ntest first ... FAILED\ntest second ... FAILED\n\n\
+             failures:\n\n---- first stdout ----\nnoise before the panic\n\n\
+             thread 'first' (123) panicked at src/lib.rs:4:5:\nassertion failed\n  left: 1\n right: 2\nstack backtrace:\nlong backtrace\n\n\
+             ---- second stdout ----\nthread 'second' (124) panicked at src/lib.rs:8:9:\nsomething broke\n\n\
+             failures:\n    first\n    second\n\n{failed}\n"
+        );
+        let result = captured_result(Preset::CargoTest, &stdout, "error: test failed\n", 101);
+        assert_eq!(
+            result["stdout"],
+            format!(
+                "{passed}\n{failed}\nfirst\nthread 'first' (123) panicked at src/lib.rs:4:5:\nassertion failed\n  left: 1\n right: 2\nsecond\nthread 'second' (124) panicked at src/lib.rs:8:9:\nsomething broke"
+            )
+        );
+        assert_eq!(result["exit_code"], 101);
+        assert_eq!(result["stderr"], "");
+        assert_eq!(
+            captured_result(
+                Preset::CargoTest,
+                &format!("test passing ... ok\n{passed}\n"),
+                "",
+                0
+            )["stdout"],
+            passed
+        );
+    }
+
+    #[test]
+    fn unparseable_command_output_uses_the_raw_result() {
+        for (preset, stdout) in [
+            (Preset::CargoCheck, "{broken json}\n"),
+            (Preset::CargoCheck, "{\"reason\":\"compiler-message\"}\n"),
+            (Preset::CargoTest, "a custom test harness failed\n"),
+            (
+                Preset::CargoTest,
+                "test result: ok. 1 passed; 0 failed\nsecond test binary aborted\n",
+            ),
+            (Preset::CargoTest, ""),
+        ] {
+            assert_eq!(
+                captured_result(preset, stdout, "failure details\n", 101),
+                json!({
+                    "command": preset.name(),
+                    "exit_code": 101,
+                    "stdout": stdout,
+                    "stderr": "failure details\n",
+                    "truncated": false,
+                })
+            );
         }
     }
 

@@ -18195,7 +18195,7 @@ mod requests_and_tool_loop {
                 json!({
                     "command": "cargo_test",
                     "exit_code": 0,
-                    "stdout": "test tests::adds_two_numbers ... ok\ntest result: ok. 1 passed; 0 failed\n",
+                    "stdout": "test result: ok. 1 passed; 0 failed",
                     "stderr": "",
                     "truncated": false,
                 })
@@ -18203,8 +18203,8 @@ mod requests_and_tool_loop {
                 json!({
                     "command": "cargo_test",
                     "exit_code": 101,
-                    "stdout": "test tests::adds_two_numbers ... FAILED\ntest result: FAILED. 0 passed; 1 failed\n",
-                    "stderr": "error: test failed, to rerun pass `--lib`\n",
+                    "stdout": "test result: FAILED. 0 passed; 1 failed\ntests::adds_two_numbers",
+                    "stderr": "",
                     "truncated": false,
                 })
             }
@@ -18367,7 +18367,7 @@ mod requests_and_tool_loop {
                     (id, workspace_command::TOOL_NAME)
                 );
                 let admission = record.admission().expect("admitted");
-                assert_eq!(admission.handler_version, "workspace_run_command-1");
+                assert_eq!(admission.handler_version, "workspace_run_command-2");
                 assert_eq!(admission.effect, ToolEffect::NonIdempotent);
                 assert_eq!(admission.arguments.as_str(), r#"{"command":"cargo_test"}"#);
                 assert_eq!(
