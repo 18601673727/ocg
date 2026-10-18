@@ -443,8 +443,7 @@ fn settled_job(error: &ExecutionRuntimeError) -> Option<JobId> {
     match error {
         ExecutionRuntimeError::ObservationsNotRecorded { receipt, .. }
         | ExecutionRuntimeError::CompletionRefused { receipt, .. }
-        | ExecutionRuntimeError::ToolLoopStopped { receipt, .. }
-        | ExecutionRuntimeError::StopNotConfirmed { receipt, .. } => Some(receipt.job),
+        | ExecutionRuntimeError::ToolLoopStopped { receipt, .. } => Some(receipt.job),
         _ => None,
     }
 }

@@ -100,7 +100,6 @@ pub(super) fn settle<T: Send + 'static>(
 /// a time on a dedicated write thread, in admission order, each in its own
 /// write transaction. Reads run on [`READ_WORKERS`] dedicated read threads.
 pub struct DatabaseWorker {
-    scheduler_wake: Option<SchedulerWakeSubscription>,
     pub(super) handle: DatabaseHandle,
     pub(super) thread: JoinHandle<Result<(), DatabaseError>>,
     pub(super) readers: Vec<JoinHandle<()>>,
@@ -219,6 +218,7 @@ impl DatabaseWorker {
                 let credentials = load_credentials_file(&credentials_path);
                 let shared = Arc::new(Shared {
                     scheduler_wake,
+                    scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
                     active_policy: policy,
                     log_directory,
                     log_files: Arc::new(crate::logger::LogFiles::default()),
@@ -286,7 +286,6 @@ impl DatabaseWorker {
         };
         let (read_sender, read_receiver) = flume::bounded(READ_QUEUE_CAPACITY);
         let mut worker = Self {
-            scheduler_wake: Some(scheduler_subscription),
             handle: DatabaseHandle {
                 sender,
                 read_sender,
@@ -322,7 +321,7 @@ impl DatabaseWorker {
     }
 
     pub fn take_scheduler_wake(&mut self) -> Option<SchedulerWakeSubscription> {
-        self.scheduler_wake.take()
+        self.handle.take_scheduler_wake()
     }
 
     /// Closes admission, lets the worker finish every command accepted before

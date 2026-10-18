@@ -76,11 +76,6 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::CreateJobWithInput
         | OperationKind::RetryJob
         | OperationKind::AssignJobExecutor
-        // Starts consume capacity; they do not announce a released slot.
-        | OperationKind::StartJob
-        | OperationKind::StartLocalJob
-        // Combined creation/start still changes the parent and execution set.
-        | OperationKind::BeginCoreLogCleanup
         | OperationKind::FinalizeJob
         | OperationKind::ConfirmJobStopped
         | OperationKind::QuarantineAbandonedJob
@@ -128,9 +123,6 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::CreateJobWithInput
         | OperationKind::RetryJob
         | OperationKind::AssignJobExecutor
-        | OperationKind::StartJob
-        | OperationKind::StartLocalJob
-        | OperationKind::BeginCoreLogCleanup
         | OperationKind::CreateExecutor
         | OperationKind::CreateLlmProvider
         | OperationKind::CreateProfile

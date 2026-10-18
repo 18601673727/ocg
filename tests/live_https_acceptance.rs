@@ -570,7 +570,13 @@ fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
         objective: Some("offline fixture".into()),
         ..JobInputDraft::default()
     };
-    let job = wait(handle.create_local_job(job, targets.executor)).expect("create the Job");
+    let job = wait(handle.create_job(job)).expect("create the Job");
+    wait(handle.claim_execution(ocg::persistence::ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([targets.executor.into()]),
+    }))
+    .expect("claim transaction")
+    .expect("grant");
     let anchor = TokenAnnotation::eligible(UsageFinality::Cumulative);
     wait(handle.record_metrics(NewMetrics {
         job,

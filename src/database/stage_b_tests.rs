@@ -355,7 +355,7 @@ fn local_job_with_a_spawning_call(
     pool: ExecutionPoolId,
     llm: ProfileId,
 ) -> JobId {
-    let job = wait(database.create_local_job(
+    let job = wait(database.create_claimed_fixture(
         NewJob {
             name: None,
             eligible_at: None,
@@ -387,8 +387,8 @@ fn local_job_with_a_spawning_call(
 #[test]
 fn repeated_unclean_exits_saturate_the_global_domain_without_refusing_to_start() {
     let (_root, directory) = data_directory("ocg-stage-b-worker", "unclean-exits");
-    // One more than the limit, so the last cycle is past it.
-    let cycles = usize::from(GLOBAL_EXECUTION_LIMIT) + 1;
+    // Fill the global limit; the next claim must remain pending.
+    let cycles = usize::from(GLOBAL_EXECUTION_LIMIT);
     let mut abandoned = Vec::new();
 
     for cycle in 1..=cycles {
@@ -415,7 +415,7 @@ fn repeated_unclean_exits_saturate_the_global_domain_without_refusing_to_start()
         worker.shutdown().unwrap();
     }
 
-    // Past the limit, everything is quarantined and held.
+    // At the limit, every slot is quarantined and held.
     let worker = DatabaseWorker::start(&directory).unwrap();
     let database = worker.handle();
     let held = wait(database.unresolved_executions()).unwrap();
@@ -451,7 +451,7 @@ fn repeated_unclean_exits_saturate_the_global_domain_without_refusing_to_start()
         }))
         .unwrap(),
         Err(ClaimRefusal::NoCapacity(CapacityScope::Global)),
-        "the global domain is held past its limit"
+        "the global domain is held at its limit"
     );
     assert!(
         wait(database.claim_batch()).unwrap().is_empty(),

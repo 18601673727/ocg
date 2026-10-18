@@ -3,7 +3,7 @@
 //! A submission is idempotent under the client's `Idempotency-Key`. The key
 //! is recorded, as a SHA-256 digest with the fingerprint of its normalized
 //! request, by the transaction that creates and locally starts its Job; see
-//! [`DatabaseHandle::create_submitted_local_job`]. That record is the only
+//! [`DatabaseHandle::create_submitted_job`]. That record is the only
 //! authority on whether a key created a Job: a key names at most one Job,
 //! and only a committed one, in this process and after any restart.
 //!
@@ -132,11 +132,7 @@ const CONFIGURATION_REFUSED: Refusal = Refusal::new(
     "configuration_refused",
     "the selected configuration cannot run this Job; nothing was admitted",
 );
-const RUNTIME_BUSY: Refusal = Refusal::new(
-    StatusCode::SERVICE_UNAVAILABLE,
-    "runtime_busy",
-    "OCG has too much work queued; nothing was admitted; retry later",
-);
+
 const PENDING_LIMIT_REACHED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
     "pending_limit_reached",
@@ -1057,12 +1053,9 @@ pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderEx
 /// failed inside.
 fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
     match error {
-        ExecutionRuntimeError::SchedulerQueueFull | ExecutionRuntimeError::ExecutorQueueFull => {
-            RUNTIME_BUSY
+        ExecutionRuntimeError::ShuttingDown | ExecutionRuntimeError::SchedulerStopped => {
+            SHUTTING_DOWN
         }
-        ExecutionRuntimeError::ShuttingDown
-        | ExecutionRuntimeError::SchedulerStopped
-        | ExecutionRuntimeError::ExecutorStopped => SHUTTING_DOWN,
         ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
         ExecutionRuntimeError::Database(error) => match error {
             DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,

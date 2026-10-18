@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseHandle, DatabaseWorker};
 use ocg::persistence::{
-    ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
-    NewExecutor, NewJob, NewJobOutput,
+    ConfigBody, ConnectionConfig, ExecutionConfiguration, ExecutorId, FinalResult,
+    IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, LlmTransport, ModelConfig,
+    NewConfig, NewExecutor, NewJob, NewJobOutput,
 };
 use serde_json::{Value, json};
 
@@ -236,15 +237,60 @@ fn database_bytes(directory: &DataDirectory) -> Result<u64> {
     Ok(total)
 }
 
-fn executor(handle: &DatabaseHandle) -> Result<ExecutorId> {
-    Ok(block_on(handle.create_executor(NewExecutor {
-        name: "benchmark".into(),
-        concurrency_limit: NonZeroU32::new(8).ok_or("invalid concurrency")?,
-        llm_transports: BTreeSet::new(),
-    }))?)
+#[derive(Clone, Copy)]
+struct Target {
+    executor: ExecutorId,
+    configuration: ExecutionConfiguration,
 }
 
-fn job(handle: &DatabaseHandle) -> NewJob {
+fn executor(handle: &DatabaseHandle) -> Result<Target> {
+    let connection = block_on(handle.create_config(NewConfig {
+        name: "benchmark connection".into(),
+        body: ConfigBody::Connection(ConnectionConfig {
+            protocol: LlmTransport::OpenAiChatCompletions,
+            endpoint: None,
+            credential_ref: None,
+        }),
+    }))?;
+    let model = block_on(handle.create_config(NewConfig {
+        name: "benchmark model".into(),
+        body: ConfigBody::Model(ModelConfig {
+            connection_id: connection,
+            model: "benchmark".into(),
+            parameters: Default::default(),
+            declared_capabilities: Default::default(),
+        }),
+    }))?;
+    let executor = block_on(handle.create_executor(NewExecutor {
+        name: "benchmark".into(),
+        concurrency_limit: NonZeroU32::new(8).ok_or("invalid concurrency")?,
+        llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+    }))?;
+    Ok(Target {
+        executor,
+        configuration: ExecutionConfiguration {
+            agent_profile: None,
+            llm_profile: model.into(),
+        },
+    })
+}
+
+fn claim(handle: &DatabaseHandle, job: JobId, target: Target) -> Result<()> {
+    block_on(handle.claim_execution(ocg::persistence::ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([target.executor.into()]),
+    }))?
+    .map_err(|refusal| format!("benchmark claim refused: {refusal:?}"))?;
+    Ok(())
+}
+
+fn create_claimed(handle: &DatabaseHandle, target: Target) -> Result<JobId> {
+    let id = block_on(handle.create_job(job(handle, target)))?;
+    claim(handle, id, target)?;
+    Ok(id)
+}
+
+fn job(handle: &DatabaseHandle, target: Target) -> NewJob {
     NewJob {
         name: Some("benchmark".into()),
         eligible_at: None,
@@ -255,7 +301,7 @@ fn job(handle: &DatabaseHandle) -> NewJob {
             objective: Some("measure backend overhead".into()),
             ..JobInputDraft::default()
         },
-        configuration: None,
+        configuration: Some(target.configuration),
         previous: None,
     }
 }
@@ -288,14 +334,14 @@ type Timings = BTreeMap<&'static str, Vec<Duration>>;
 
 fn lifecycle(
     handle: &DatabaseHandle,
-    executor: ExecutorId,
+    executor: Target,
     payload: &str,
     outputs: usize,
     timings: &mut Timings,
 ) -> Result<()> {
     let started = Instant::now();
     let began = Instant::now();
-    let id = block_on(handle.create_local_job(job(handle), executor))?;
+    let id = create_claimed(handle, executor)?;
     timings
         .entry("job.create_and_claim")
         .or_default()
@@ -398,7 +444,7 @@ fn mixed(options: &Options) -> Result<()> {
             let executor = executor(handle)?;
             let mut ids = Vec::with_capacity(options.jobs);
             for _ in 0..options.jobs {
-                ids.push(block_on(handle.create_job(job(handle)))?);
+                ids.push(block_on(handle.create_job(job(handle, executor)))?);
             }
             let payload = "x".repeat(payload_bytes);
             let stop = AtomicBool::new(false);
@@ -504,12 +550,13 @@ fn mixed(options: &Options) -> Result<()> {
 fn reads(options: &Options) -> Result<()> {
     for count in BTreeSet::from([100.min(options.jobs), options.jobs]) {
         with_database(|handle, _directory| {
+            let executor = executor(handle)?;
             let mut ids = Vec::with_capacity(count);
             for _ in 0..count {
-                ids.push(block_on(handle.create_job(job(handle)))?);
+                ids.push(block_on(handle.create_job(job(handle, executor)))?);
             }
             let first = ids.first().copied().ok_or("empty job fixture")?;
-            block_on(handle.start_job(first, executor(handle)?))?;
+            claim(handle, first, executor)?;
             for _ in 0..100 {
                 block_on(handle.append_job_output(first, output(&"x".repeat(1_024))))?;
             }
@@ -845,7 +892,7 @@ fn maintenance(_options: &Options) -> Result<()> {
             Some(elapsed),
         );
 
-        let observed = block_on(handle.create_local_job(job(handle), executor))?;
+        let observed = create_claimed(handle, executor)?;
         let stop = AtomicBool::new(false);
         let refused = AtomicUsize::new(0);
         let first_refusal = Mutex::new(None);

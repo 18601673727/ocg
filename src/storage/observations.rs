@@ -281,7 +281,8 @@ fn walk_scope(
                 if key.0 > max_provider {
                     break 'outer;
                 }
-                next_bound = Bound::Included((min_provider, model.unwrap_or([0; 32]), from_micros, 0, 0, 0));
+                next_bound =
+                    Bound::Included((min_provider, model.unwrap_or([0; 32]), from_micros, 0, 0, 0));
                 break;
             }
 
@@ -309,7 +310,8 @@ fn walk_scope(
             }
 
             if observed_at >= until_micros {
-                next_bound = Bound::Excluded((key.0, key.1, i64::MAX, u64::MAX, u32::MAX, u32::MAX));
+                next_bound =
+                    Bound::Excluded((key.0, key.1, i64::MAX, u64::MAX, u32::MAX, u32::MAX));
                 break;
             }
 

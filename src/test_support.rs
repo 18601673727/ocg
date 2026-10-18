@@ -107,3 +107,79 @@ where
         .detach();
     wait(finished.recv_async()).expect("System task completed")
 }
+
+pub(crate) fn execution_configuration(
+    database: &crate::database::DatabaseHandle,
+) -> crate::persistence::ExecutionConfiguration {
+    use crate::persistence::*;
+    let model = wait(database.configs(Some(ConfigKind::Model), None, 1_000))
+        .expect("models")
+        .into_iter()
+        .find(|config| config.name == "fixture-model")
+        .map(|config| config.id)
+        .unwrap_or_else(|| {
+            let connection = wait(database.create_config(NewConfig {
+                name: "fixture-connection".into(),
+                body: ConfigBody::Connection(ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: None,
+                    credential_ref: None,
+                }),
+            }))
+            .expect("fixture connection");
+            wait(database.create_config(NewConfig {
+                name: "fixture-model".into(),
+                body: ConfigBody::Model(ModelConfig {
+                    connection_id: connection,
+                    model: "fixture".into(),
+                    parameters: Default::default(),
+                    declared_capabilities: Default::default(),
+                }),
+            }))
+            .expect("fixture model")
+        });
+    ExecutionConfiguration {
+        agent_profile: None,
+        llm_profile: model.into(),
+    }
+}
+
+impl crate::database::DatabaseHandle {
+    pub(crate) async fn claim_fixture(
+        &self,
+        job: crate::persistence::JobId,
+        executor: crate::persistence::ExecutorId,
+    ) -> Result<(), crate::database::DatabaseError> {
+        use crate::database::DatabaseError;
+        use crate::persistence::*;
+        match self
+            .claim_execution(ClaimRequest {
+                job,
+                allowed_pools: std::collections::BTreeSet::from([executor.into()]),
+            })
+            .await?
+        {
+            Ok(_) => Ok(()),
+            Err(ClaimRefusal::DependencyUnsatisfied {
+                prerequisite,
+                state,
+            }) => Err(DatabaseError::Rejected(Violation::UnsatisfiedDependency {
+                job,
+                prerequisite,
+                state,
+            })),
+            Err(_) => Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "claim",
+                "fixture Job could not be claimed",
+            ))),
+        }
+    }
+
+    pub(crate) async fn create_claimed_fixture(
+        &self,
+        job: crate::persistence::NewJob,
+        executor: crate::persistence::ExecutorId,
+    ) -> Result<crate::persistence::JobId, crate::database::DatabaseError> {
+        self.submit_fixture(job, executor).await
+    }
+}

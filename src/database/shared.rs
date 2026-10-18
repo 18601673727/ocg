@@ -37,6 +37,7 @@ pub(super) fn admitted(admission: &Admission) -> Result<(), DatabaseError> {
 
 pub(super) struct Shared {
     pub(super) scheduler_wake: SchedulerWake,
+    pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) active_policy: SystemPolicy,
     pub(super) log_directory: PathBuf,
     pub(super) log_files: Arc<crate::logger::LogFiles>,

@@ -49,6 +49,13 @@ pub(crate) struct Permit {
 
 impl Permit {
     pub(crate) fn acquire(kind: Kind) -> Self {
+        match Self::acquire_until_stopped(kind, None) {
+            Some(permit) => permit,
+            None => unreachable!("a permit without cancellation cannot be stopped"),
+        }
+    }
+
+    fn acquire_until_stopped(kind: Kind, stop: Option<&StopSignal>) -> Option<Self> {
         let governor = GOVERNOR
             .get_or_init(|| Arc::new(Governor::default()))
             .clone();
@@ -57,6 +64,9 @@ impl Permit {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         loop {
+            if stop.is_some_and(StopSignal::requested) {
+                return None;
+            }
             let category = match kind {
                 Kind::Command => counts.commands < COMMANDS,
                 Kind::Cpu => counts.cpu < CPU,
@@ -70,10 +80,10 @@ impl Permit {
                     Kind::File => counts.files += 1,
                 }
                 drop(counts);
-                return Self {
+                return Some(Self {
                     governor: governor.clone(),
                     kind,
-                };
+                });
             }
             counts = governor
                 .changed
@@ -160,7 +170,17 @@ impl StopSignal {
     }
 
     pub(crate) fn request(&self) {
-        self.stopped.store(true, Ordering::Release);
+        if let Some(governor) = GOVERNOR.get() {
+            // The same lock as the permit wait closes the check/wait race.
+            let _counts = governor
+                .counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.stopped.store(true, Ordering::Release);
+            governor.changed.notify_all();
+        } else {
+            self.stopped.store(true, Ordering::Release);
+        }
     }
 
     pub(crate) fn requested(&self) -> bool {
@@ -179,7 +199,18 @@ impl Process {
         command.process_group(0);
         let sentinel = Sentinel::new()?;
         sentinel.configure_child(&mut command)?;
-        let permit = Permit::acquire(kind);
+        let permit = Permit::acquire_until_stopped(kind, Some(&stop_signal)).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "command cancelled before it started",
+            )
+        })?;
+        if stop_signal.requested() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "command cancelled before it started",
+            ));
+        }
         let child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

@@ -30,8 +30,8 @@ use crate::persistence::{
     ToolOutcome, ToolReconciliation, Violation,
 };
 use crate::persistence::{
-    ClaimGrant, ClaimRefusal, ClaimRequest, EvalPage, EvalRequest, FrozenPoolBinding,
-    PendingCapturePage, PendingReadFault, PendingSnapshot,
+    ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding, PendingCapturePage,
+    PendingReadFault, PendingSnapshot,
 };
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, OpenError, OpenedFile, Probe,

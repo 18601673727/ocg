@@ -81,6 +81,12 @@ impl Batch {
             });
         }
         self.check_spec_references(&spec)?;
+        if spec.parent_id.is_some() && !spec.dependencies.is_empty() {
+            return self.reject(Violation::InvalidValue(
+                "dependencies",
+                "only a Job without a parent may have dependencies",
+            ));
+        }
         if let Some(parent) = spec.parent_id {
             let state = self.require_job_state(parent)?;
             if state.outcome.is_some() || state.children_closed_at.is_some() {
@@ -96,7 +102,12 @@ impl Batch {
                 ));
             }
             previous = Some(*dependency);
-            self.require_job(*dependency)?;
+            if self.require_job(*dependency)?.parent_id.is_some() {
+                return self.reject(Violation::InvalidValue(
+                    "dependencies",
+                    "a dependency must name a Job without a parent",
+                ));
+            }
             if self.is_subtree_settled(*dependency)? {
                 let completed = self
                     .require_job_state(*dependency)?
@@ -119,6 +130,12 @@ impl Batch {
         for lineage in [spec.retry_of, spec.continues].into_iter().flatten() {
             self.require_job(lineage)?;
         }
+        if spec.execution.is_none() {
+            return self.reject(Violation::InvalidValue(
+                "execution",
+                "a Job must have an execution",
+            ));
+        }
         let pending = self.step(|tx| Ok(tx.open_table(PENDING)?.len()?))?;
         if pending + 1 > P_MAX {
             return self.reject(Violation::PendingJobsLimit {
@@ -131,6 +148,7 @@ impl Batch {
         spec.created_at = self.now;
         spec.submission = submission.map(|(key, _)| key);
         self.insert_job(&spec)?;
+        self.probe = Some(Probe::Job(job));
         self.put_job_state(job, &JobStateRow::new(job))?;
 
         let mut open_dependencies = 0u32;
@@ -634,99 +652,6 @@ impl Batch {
             }
         }
         Ok(None)
-    }
-
-    /// Starts a Job in `pool` without the claim batch's limits, as this
-    /// process's own execution. The Job must be ready now; one still waiting
-    /// on a dependency is refused. The Job holds a slot in `pool` until it is
-    /// finalized or its stop is confirmed.
-    pub(crate) fn claim_local(&mut self, job: JobId, pool: ConfigId) -> Result<(), BatchError> {
-        let row = self.require_job(job)?;
-        let state = self.require_job_state(job)?;
-        if state.outcome.is_some() {
-            return self.reject(Violation::JobHasTerminalOutcome(job));
-        }
-        if state.claim.is_some() {
-            return self.reject(Violation::InvalidValue("job", "is already started"));
-        }
-        if let Some(prerequisite) = self.first_open_dependency(&row)? {
-            return self.reject(Violation::UnsatisfiedDependency {
-                job,
-                prerequisite,
-                state: DependencyState::Waiting,
-            });
-        }
-        let config = self.require_config_kind(pool, ConfigKind::Pool)?;
-        let ConfigBody::Pool(body) = config.body else {
-            return self.reject(Violation::NotFound(RecordRef::ExecutionPool(pool.into())));
-        };
-        self.promote()?;
-        // A delayed Job starts when it is asked to: the caller states the time.
-        let requirement_key = job_requirement(&row);
-        if let Some(eligible_at) = row.eligible_at.map(Timestamp::as_unix_micros) {
-            self.step(|tx| {
-                tx.open_table(DELAYED)?.remove((eligible_at, job.get()))?;
-                Ok(())
-            })?;
-        }
-        self.write_claim(
-            job,
-            requirement_key,
-            pool,
-            config.edit_seq,
-            body.capabilities,
-        )?;
-        self.probe = Some(Probe::Claim(job));
-        Ok(())
-    }
-
-    /// Creates a system Job that this process runs itself, claimed into
-    /// `pool` in the same transaction. It never goes through T1 or the claim
-    /// batch: it is never pending, never ready and has no dependency.
-    pub(crate) fn start_system_job(
-        &mut self,
-        mut spec: JobRow,
-        pool: ConfigId,
-    ) -> Result<JobId, BatchError> {
-        let config = self.require_config_kind(pool, ConfigKind::Pool)?;
-        let ConfigBody::Pool(body) = config.body else {
-            return self.reject(Violation::NotFound(RecordRef::ExecutionPool(pool.into())));
-        };
-        if let Some(parent) = spec.parent_id {
-            let state = self.require_job_state(parent)?;
-            if state.outcome.is_some() || state.children_closed_at.is_some() {
-                return self.reject(Violation::ParentClosed(parent));
-            }
-        }
-        let job = JobId::new(self.next_id(Sequence::Job)?);
-        spec.id = job;
-        spec.created_at = self.now;
-        self.insert_job(&spec)?;
-        let mut state = JobStateRow::new(job);
-        state.claim = Some(ClaimRecord {
-            started_at: self.now,
-            pool_id: pool,
-            pool_edit_seq: config.edit_seq,
-            capabilities: body.capabilities,
-            epoch: self.epoch,
-            host_id: self.host_id.clone(),
-            boot_id: self.boot_id.clone(),
-        });
-        self.put_job_state(job, &state)?;
-        let epoch = self.epoch;
-        let parent_key = spec.parent_id.map_or(0, JobId::get);
-        self.step(|tx| {
-            tx.open_table(UNSETTLED)?.insert(job.get(), (0, 0))?;
-            tx.open_table(CHILDREN)?
-                .insert((parent_key, job.get()), ())?;
-            tx.open_table(HELD_SLOTS)?
-                .insert((pool.get(), job.get()), (epoch, false))?;
-            Ok(())
-        })?;
-        if let Some(parent) = spec.parent_id {
-            self.adjust_open_children(parent, 1)?;
-        }
-        Ok(job)
     }
 
     fn adjust_open_children(&mut self, job: JobId, delta: i64) -> Result<(), BatchError> {

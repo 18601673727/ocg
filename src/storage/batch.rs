@@ -35,6 +35,7 @@ pub(crate) enum BatchFailure {
 /// the command writes, never a marker written for the purpose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Probe {
+    Job(JobId),
     /// `submission[key]` exists.
     Submission(SubmissionKey),
     /// The Job has a claim.

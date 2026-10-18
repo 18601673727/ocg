@@ -48,7 +48,6 @@ use crate::token_usage::RequestEligibility;
 mod batch;
 mod codec;
 mod derived;
-mod evaluation;
 mod observations;
 mod open;
 mod pending;
@@ -72,7 +71,6 @@ use codec::{
 };
 #[cfg(test)]
 pub(crate) use derived::{relationship_inconsistencies, remove_job_row};
-pub(crate) use evaluation::evaluate_pending;
 pub(crate) use observations::{
     read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
     read_observed_models,
@@ -185,3 +183,32 @@ storage_from!(
     redb::SetDurabilityError,
     CommitError
 );
+
+pub(crate) fn next_scheduled_delay(
+    database: &Database,
+) -> Result<Option<std::time::Duration>, StorageError> {
+    let tx = read(database)?;
+    let delayed = tx.open_table(DELAYED)?;
+    Ok(delayed.first()?.map(|(key, _)| {
+        std::time::Duration::from_micros(
+            key.value().0.saturating_sub(open::promotion_clock()).max(0) as u64,
+        )
+    }))
+}
+
+pub(crate) fn terminal_jobs(
+    database: &Database,
+    jobs: &[JobId],
+) -> Result<Vec<JobId>, StorageError> {
+    let tx = read(database)?;
+    let states = tx.open_table(JOB_STATES)?;
+    let mut terminal = Vec::new();
+    for &job in jobs {
+        if let Some(state) = states.get(job.get())?
+            && JobStateRow::decode(state.value())?.outcome.is_some()
+        {
+            terminal.push(job);
+        }
+    }
+    Ok(terminal)
+}

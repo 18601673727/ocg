@@ -5,7 +5,6 @@ use ntex::util::{Either, select};
 
 use crate::database::{DatabaseError, DatabaseHandle, SchedulerWakeSubscription};
 use crate::disk_protection::ProtectionWatch;
-use crate::persistence::Timestamp;
 use crate::provider_execution::CancellationToken;
 
 const BATCH_FLOOR: Duration = Duration::from_millis(5);
@@ -13,7 +12,7 @@ const RECONCILE: Duration = Duration::from_secs(30);
 
 pub(crate) struct DispatchBatch<G> {
     pub(crate) grants: Vec<G>,
-    pub(crate) next_due: Option<Timestamp>,
+    pub(crate) next_due: Option<Duration>,
 }
 
 pub(crate) struct Scheduler {
@@ -100,15 +99,9 @@ impl Scheduler {
     }
 }
 
-fn batch_delay(previous: Instant, next_due: Option<Timestamp>) -> Duration {
+fn batch_delay(previous: Instant, next_due: Option<Duration>) -> Duration {
     let due = next_due
-        .map(|due| {
-            Duration::from_micros(
-                due.as_unix_micros()
-                    .saturating_sub(Timestamp::now().as_unix_micros())
-                    .max(0) as u64,
-            )
-        })
+        .map(|due| due.saturating_sub(previous.elapsed()))
         .unwrap_or(RECONCILE)
         .min(RECONCILE);
     due.max(BATCH_FLOOR.saturating_sub(previous.elapsed()))

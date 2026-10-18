@@ -37,8 +37,6 @@ pub enum OperationKind {
     AppendJobOutput,
     FinalizeJob,
     CreateExecutor,
-    BeginCoreLogCleanup,
-    StartJob,
     RetryJob,
     AssociateJobProject,
     CreateProject,
@@ -55,9 +53,6 @@ pub enum OperationKind {
     /// One bounded batch of Token aggregation. Its marker's subject is the
     /// last Metrics record the batch consumed.
     ConsumeTokenUsage,
-    /// A start by this process's own runtime, which claims the Job's
-    /// execution for the current opening of the database.
-    StartLocalJob,
     /// The quarantine, when the database is opened, of a Job that an earlier
     /// opening started locally, never settled, and left with external work
     /// whose termination nothing established. The Job takes an unknown outcome

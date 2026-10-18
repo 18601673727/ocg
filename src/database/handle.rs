@@ -1,27 +1,46 @@
 use super::*;
 
 impl DatabaseHandle {
+    #[cfg(test)]
+    pub(crate) async fn submit_fixture(
+        &self,
+        job: NewJob,
+        executor: ExecutorId,
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateClaimedFixture {
+            job,
+            executor,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn terminal_jobs(
+        &self,
+        jobs: Vec<JobId>,
+    ) -> Result<Vec<JobId>, DatabaseError> {
+        self.read(move |database| storage::terminal_jobs(database, &jobs))
+            .await
+    }
+
+    pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
+        self.shared
+            .scheduler_subscription
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    pub(crate) async fn next_scheduled_delay(&self) -> Result<Option<Duration>, DatabaseError> {
+        self.read(storage::next_scheduled_delay).await
+    }
+
     pub(crate) fn log_files(&self) -> Arc<crate::logger::LogFiles> {
         self.shared.log_files.clone()
     }
 
     pub(crate) fn cleanup_worker(&self) -> Arc<AtomicBool> {
         self.shared.cleanup_worker.clone()
-    }
-
-    pub(crate) async fn begin_core_log_cleanup(
-        &self,
-        owner: JobId,
-        executor: ExecutorId,
-        started: NewJobOutput,
-    ) -> Result<crate::log_cleanup::CleanupRecords, DatabaseError> {
-        self.submit(|reply| Command::BeginCoreLogCleanup {
-            owner,
-            executor,
-            started,
-            reply,
-        })
-        .await
     }
 
     pub(crate) fn log_directory(&self) -> &std::path::Path {
@@ -417,11 +436,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn evaluate_pending(&self, request: EvalRequest) -> Result<EvalPage, DatabaseError> {
-        self.read(move |database| storage::evaluate_pending(database, request))
-            .await
-    }
-
     pub async fn claim_execution(
         &self,
         request: ClaimRequest,
@@ -744,51 +758,14 @@ impl DatabaseHandle {
         self.submit(|reply| Command::CreateJob { job, reply }).await
     }
 
-    /// T1, and the Job starts at once as this process's own execution in the
-    /// Pool `executor`, in the same transaction, so the Job exists only with
-    /// its claim. If this opening closes first, as it does when the process
-    /// dies, the next open settles the Job as abandoned; see
-    /// [`DatabaseHandle::abandoned_at_open`].
-    pub async fn create_local_job(
+    pub async fn create_submitted_job(
         &self,
         job: NewJob,
-        executor: ExecutorId,
-    ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateLocalJob {
-            job,
-            executor,
-            submission: None,
-            reply,
-        })
-        .await
-    }
-
-    /// Like [`DatabaseHandle::create_local_job`], and records `submission`
-    /// with the Job in the same transaction. A key already recorded refuses
-    /// the creation with [`Violation::SubmissionKeyUsed`], which names the Job
-    /// the key created; nothing of the refused creation is committed.
-    pub async fn create_submitted_local_job(
-        &self,
-        job: NewJob,
-        executor: ExecutorId,
         submission: NewSubmission,
     ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateLocalJob {
+        self.submit(|reply| Command::CreateSubmittedJob {
             job,
-            executor,
-            submission: Some(submission),
-            reply,
-        })
-        .await
-    }
-
-    /// Starts a pending Job as this process's own execution in the Pool
-    /// `executor`, claiming it for the current opening. A Job still waiting on
-    /// a dependency is refused.
-    pub async fn start_job(&self, job: JobId, executor: ExecutorId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::StartJob {
-            job,
-            executor,
+            submission,
             reply,
         })
         .await

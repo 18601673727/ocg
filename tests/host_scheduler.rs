@@ -14,7 +14,7 @@ use ocg::host::{self, HostContext};
 use ocg::orchestration::execution_runtime::{
     ExecutionPlan, ExecutionReceipt, ExecutionRuntimeError, SchedulerHandle,
 };
-use ocg::persistence::{FinalResult, JobInputDraft, JobOutcome, NewExecutor, NewJob, OutputKind};
+use ocg::persistence::{FinalResult, JobInputDraft, JobOutcome, NewJob, OutputKind};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -39,7 +39,11 @@ fn wait<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn plan(context: &HostContext, executor: ocg::persistence::ExecutorId) -> ExecutionPlan {
+fn plan(
+    context: &HostContext,
+    executor: ocg::persistence::ExecutorId,
+    configuration: ocg::persistence::ExecutionConfiguration,
+) -> ExecutionPlan {
     ExecutionPlan {
         executor_id: executor,
         input: JobInputDraft {
@@ -53,7 +57,7 @@ fn plan(context: &HostContext, executor: ocg::persistence::ExecutorId) -> Execut
             projects: Vec::new(),
             dependencies: Vec::new(),
             input: JobInputDraft::default(),
-            configuration: None,
+            configuration: Some(configuration),
             previous: None,
         },
         outcome: JobOutcome::Completed,
@@ -83,15 +87,59 @@ fn a_host_level_caller_submits_through_the_host_owned_scheduler() {
             .create_executor(NewExecutor {
                 name: "host worker".into(),
                 concurrency_limit: NonZeroU32::MIN,
-                llm_transports: Default::default(),
+                llm_transports: std::collections::BTreeSet::from([
+                    ocg::persistence::LlmTransport::OpenAiChatCompletions,
+                ]),
             })
             .await
             .expect("register an Executor");
+        use ocg::persistence::*;
+        let connection = context
+            .database()
+            .create_config(NewConfig {
+                name: "host connection".into(),
+                body: ConfigBody::Connection(ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: None,
+                    credential_ref: None,
+                }),
+            })
+            .await
+            .expect("connection");
+        let model = context
+            .database()
+            .create_config(NewConfig {
+                name: "host model".into(),
+                body: ConfigBody::Model(ModelConfig {
+                    connection_id: connection,
+                    model: "fixture".into(),
+                    parameters: Default::default(),
+                    declared_capabilities: Default::default(),
+                }),
+            })
+            .await
+            .expect("model");
+        let configuration = ExecutionConfiguration {
+            agent_profile: None,
+            llm_profile: model.into(),
+        };
         let receipt = context
             .scheduler()
-            .schedule(plan(&context, executor))
+            .schedule(plan(&context, executor, configuration))
             .await
             .expect("the host's runtime executes the Job");
+        let deadline = Instant::now() + WAIT;
+        while !context
+            .database()
+            .job(receipt.job)
+            .await
+            .expect("job")
+            .expect("exists")
+            .any_terminal()
+        {
+            assert!(Instant::now() < deadline);
+            ntex::time::sleep(Duration::from_millis(5)).await;
+        }
         kept.send((context.scheduler().clone(), receipt, executor))
             .expect("keep the scheduler");
     })
@@ -145,8 +193,8 @@ fn a_host_level_caller_submits_through_the_host_owned_scheduler() {
     assert_eq!(outputs[0].kind, OutputKind::Result);
     assert_eq!(outputs[0].summary.as_deref(), Some("done"));
     assert_eq!(
-        receipt.result.map(|appended| appended.output),
-        Some(outputs[0].id)
+        receipt.result, None,
+        "schedule acknowledges admission before finalization"
     );
     let input = wait(handle.job_input(receipt.input))
         .expect("read input")

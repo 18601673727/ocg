@@ -72,6 +72,7 @@ fn closed_port() -> u16 {
 struct Held {
     port: u16,
     released: Arc<AtomicBool>,
+    accepted: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -82,11 +83,16 @@ impl Held {
         let port = listener.local_addr().expect("address").port();
         let released = Arc::new(AtomicBool::new(false));
         let releasing = released.clone();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let observed = accepted.clone();
         let thread = std::thread::spawn(move || {
             let mut held = Vec::new();
             while !releasing.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => held.push(stream),
+                    Ok((stream, _)) => {
+                        observed.store(true, Ordering::SeqCst);
+                        held.push(stream);
+                    }
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
@@ -94,6 +100,7 @@ impl Held {
         Self {
             port,
             released,
+            accepted,
             thread: Some(thread),
         }
     }
@@ -427,6 +434,14 @@ fn the_executable_streams_job_outputs_live_and_replays_them() {
     let running = admit(address, "c3-acceptance-running-01", &executor, &silent_llm);
     let mut stopping = events(address, &running, None);
     stopping.event();
+    let deadline = Instant::now() + WAIT;
+    while !silent.accepted.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "the Job never reached its Provider"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let stop = request(
         address,
         &format!("POST /api/v1/jobs/{running}/stop"),

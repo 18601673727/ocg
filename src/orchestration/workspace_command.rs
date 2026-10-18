@@ -79,7 +79,7 @@ use rustix::process::Pid;
 use crate::orchestration::blocking::{self, FinishError, Kind, Process, StopSignal};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
+    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, ToolStart,
 };
 use crate::orchestration::workspace_read::{self, Refusal as PathRefusal, Workspace};
 use crate::orchestration::{workspace_discovery, workspace_write};
@@ -89,7 +89,7 @@ use crate::persistence::{JobId, ToolCallRef, ToolEffect};
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-2";
+const HANDLER_VERSION: &str = "workspace_run_command-3";
 
 /// Longest a command may run before it is stopped.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -560,7 +560,7 @@ fn result(preset: Preset, ended: &Ended) -> Value {
 
 /// Starts the command and supervises it to its end, on the calling thread,
 /// which is never the executor's.
-fn supervise(invocation: Invocation, stop: StopSignal) -> Result<Ended, Failure> {
+fn supervise(invocation: Invocation, stop: StopSignal, start: ToolStart) -> Result<Ended, Failure> {
     let mut command = Command::new(&invocation.program);
     command
         .args(invocation.arguments)
@@ -577,6 +577,7 @@ fn supervise(invocation: Invocation, stop: StopSignal) -> Result<Ended, Failure>
         .stderr(Stdio::piped());
     let mut process =
         Process::spawn(command, Kind::Command, stop.clone()).map_err(|_| Refusal::NotStarted)?;
+    start.mark_started();
     let (stdout_pipe, stderr_pipe) = process.take_output();
     let readers = match (stdout_pipe, stderr_pipe) {
         (Some(stdout), Some(stderr)) => {
@@ -719,16 +720,26 @@ impl ToolHandler for RunCommand {
         self.invoke(
             CommandCall::Standalone(NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed)),
             arguments,
+            ToolStart::default(),
         )
     }
 
     fn call_for(&self, call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
-        self.invoke(CommandCall::Job(call), arguments)
+        self.invoke(CommandCall::Job(call), arguments, ToolStart::default())
+    }
+
+    fn call_with_start(
+        &self,
+        call: ToolCallRef,
+        arguments: Value,
+        start: ToolStart,
+    ) -> ToolFuture<'_> {
+        self.invoke(CommandCall::Job(call), arguments, start)
     }
 }
 
 impl RunCommand {
-    fn invoke(&self, call: CommandCall, arguments: Value) -> ToolFuture<'_> {
+    fn invoke(&self, call: CommandCall, arguments: Value, start: ToolStart) -> ToolFuture<'_> {
         Box::pin(async move {
             let preset = parse(&arguments).map_err(Failure::from)?;
             let invocation = self.prepare(preset).map_err(Failure::from)?;
@@ -743,11 +754,12 @@ impl RunCommand {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(active_id.clone(), (stop.clone(), proven));
+            let process_start = start.clone();
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
                     let _mutation = mutation;
-                    let result = supervise(invocation, supervised);
+                    let result = supervise(invocation, supervised, process_start);
                     if proof
                         .send(
                             result.as_ref().err()
@@ -768,11 +780,17 @@ impl RunCommand {
                         .remove(&active_id);
                     Failure::from(Refusal::NotStarted)
                 })?;
+            let expires = async {
+                start.wait().await;
+                ntex::time::sleep(start.remaining(self.timeout)).await;
+            };
             let (ended, timed_out) =
-                match ntex::time::timeout(self.timeout, reported.recv_async()).await {
-                    Ok(Ok(ended)) => (ended, false),
-                    Ok(Err(_)) => return Err(Failure::from(Uncertainty::NotObserved).into()),
-                    Err(()) => {
+                match ntex::util::select(reported.recv_async(), expires).await {
+                    ntex::util::Either::Left(Ok(ended)) => (ended, false),
+                    ntex::util::Either::Left(Err(_)) => {
+                        return Err(Failure::from(Uncertainty::NotObserved).into());
+                    }
+                    ntex::util::Either::Right(()) => {
                         stop.request();
                         let ended = reported.recv_async().await.map_err(|_| {
                             ToolFailure::from(Failure::from(Uncertainty::NotObserved))
@@ -1161,7 +1179,7 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-2");
+        assert_eq!(handler.version(), "workspace_run_command-3");
         assert!(
             crate::persistence::ToolAdmission {
                 handler_version: handler.version().to_owned(),

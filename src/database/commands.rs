@@ -69,6 +69,12 @@ pub(super) struct Envelope {
 }
 
 pub(super) enum Command {
+    #[cfg(test)]
+    CreateClaimedFixture {
+        job: NewJob,
+        executor: ExecutorId,
+        reply: Reply<JobId>,
+    },
     ClaimExecution {
         request: ClaimRequest,
         reply: Reply<Result<ClaimGrant, ClaimRefusal>>,
@@ -90,31 +96,18 @@ pub(super) enum Command {
         config: ExecutionPoolConfig,
         reply: Reply<()>,
     },
-    BeginCoreLogCleanup {
-        owner: JobId,
-        executor: ExecutorId,
-        started: NewJobOutput,
-        reply: Reply<crate::log_cleanup::CleanupRecords>,
-    },
     CreateJob {
         job: NewJob,
         reply: Reply<JobId>,
     },
-    CreateLocalJob {
+    CreateSubmittedJob {
         job: NewJob,
-        executor: ExecutorId,
-        /// Recorded with the Job, in the same transaction, when given.
-        submission: Option<NewSubmission>,
+        submission: NewSubmission,
         reply: Reply<JobId>,
     },
     RetryJob {
         retry: JobRetry,
         reply: Reply<JobId>,
-    },
-    StartJob {
-        job: JobId,
-        executor: ExecutorId,
-        reply: Reply<()>,
     },
     AssociateJobProject {
         job: JobId,
@@ -206,6 +199,34 @@ impl Command {
     ) -> Executed {
         use OperationKind as Kind;
         match self {
+            #[cfg(test)]
+            Self::CreateClaimedFixture {
+                job,
+                executor,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateJobWithInput,
+                reply,
+                |batch| {
+                    let job = persistence::create_job(batch, job)?;
+                    match persistence::claim_execution(
+                        batch,
+                        ClaimRequest {
+                            job,
+                            allowed_pools: std::collections::BTreeSet::from([executor.into()]),
+                        },
+                    )? {
+                        Ok(_) => Ok(job),
+                        Err(_) => batch.reject(Violation::InvalidValue(
+                            "claim",
+                            "fixture Job could not be claimed",
+                        )),
+                    }
+                },
+            ),
             Self::ClaimExecution { request, reply } => {
                 let mut refusal = ClaimRefusal::RecipeInvalid;
                 let outcome =
@@ -270,19 +291,6 @@ impl Command {
                 reply,
                 |batch| persistence::update_execution_pool(batch, id, config),
             ),
-            Self::BeginCoreLogCleanup {
-                owner,
-                executor,
-                started,
-                reply,
-            } => run(
-                database,
-                operation,
-                commit,
-                Kind::BeginCoreLogCleanup,
-                reply,
-                |batch| persistence::begin_core_log_cleanup(batch, owner, executor, started),
-            ),
             Self::CreateJob { job, reply } => run(
                 database,
                 operation,
@@ -291,10 +299,8 @@ impl Command {
                 reply,
                 |batch| persistence::create_job(batch, job),
             ),
-            // The start is part of the creation.
-            Self::CreateLocalJob {
+            Self::CreateSubmittedJob {
                 job,
-                executor,
                 submission,
                 reply,
             } => run(
@@ -303,12 +309,7 @@ impl Command {
                 commit,
                 Kind::CreateJobWithInput,
                 reply,
-                |batch| match submission {
-                    None => persistence::create_local_job(batch, job, executor),
-                    Some(submission) => {
-                        persistence::create_submitted_local_job(batch, job, executor, submission)
-                    }
-                },
+                |batch| persistence::create_submitted_job(batch, job, submission),
             ),
             Self::RetryJob { retry, reply } => run(
                 database,
@@ -317,18 +318,6 @@ impl Command {
                 Kind::RetryJob,
                 reply,
                 |batch| persistence::retry_job(batch, retry),
-            ),
-            Self::StartJob {
-                job,
-                executor,
-                reply,
-            } => run(
-                database,
-                operation,
-                commit,
-                Kind::StartLocalJob,
-                reply,
-                |batch| persistence::start_job(batch, job, executor),
             ),
             Self::AssociateJobProject {
                 job,
@@ -474,22 +463,21 @@ impl Command {
     /// rather than wraps, so an absurd payload fails the space check.
     pub(super) fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
+            #[cfg(test)]
+            Self::CreateClaimedFixture { job, .. } => {
+                text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
+            }
             Self::ClaimExecution { request, .. } => {
                 byte_count(request.allowed_pools.len()).saturating_mul(8)
             }
             Self::ClaimBatch { .. } => 4096,
             Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
             Self::SetExecutionPoolEnabled { .. } | Self::UpdateExecutionPool { .. } => 64,
-            Self::BeginCoreLogCleanup { started, .. } => {
-                output_bytes(&started.summary, &started.code, &started.value).saturating_add(256)
-            }
-            Self::CreateJob { job, .. } | Self::CreateLocalJob { job, .. } => {
+            Self::CreateJob { job, .. } | Self::CreateSubmittedJob { job, .. } => {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
-            Self::StartJob { .. }
-            | Self::AssociateJobProject { .. }
-            | Self::ConfirmJobStopped { .. } => 0,
+            Self::AssociateJobProject { .. } | Self::ConfirmJobStopped { .. } => 0,
             // The record rewritten keeps its length; the allowance covers it.
             Self::CleanupAttachment { .. } => 0,
             Self::AppendJobOutput { output, .. } => {
@@ -562,18 +550,17 @@ impl Command {
     /// waiting and knows nothing was applied.
     pub(super) fn refuse(self, error: impl Fn() -> DatabaseError) {
         match self {
+            #[cfg(test)]
+            Self::CreateClaimedFixture { reply, .. } => refuse(reply, error),
             Self::ClaimExecution { reply, .. } => refuse(reply, error),
             Self::ClaimBatch { reply, .. } => refuse(reply, error),
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
             Self::SetExecutionPoolEnabled { reply, .. }
             | Self::UpdateExecutionPool { reply, .. } => refuse(reply, error),
-            Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
             Self::CreateJob { reply, .. }
-            | Self::CreateLocalJob { reply, .. }
+            | Self::CreateSubmittedJob { reply, .. }
             | Self::RetryJob { reply, .. } => refuse(reply, error),
-            Self::StartJob { reply, .. } | Self::AssociateJobProject { reply, .. } => {
-                refuse(reply, error)
-            }
+            Self::AssociateJobProject { reply, .. } => refuse(reply, error),
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
             Self::FinalizeJob { reply, .. } => refuse(reply, error),
             Self::CreateExecutor { reply, .. } => refuse(reply, error),

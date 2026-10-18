@@ -40,7 +40,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use jsonschema::Validator;
 use serde_json::Value;
@@ -54,6 +55,34 @@ use crate::persistence::{JobId, ToolCallRef, ToolEffect, is_handler_version};
 
 /// A tool call's result, or its handler's failure.
 pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct ToolStart {
+    at: Arc<OnceLock<Instant>>,
+    ready: crate::provider_execution::CancellationToken,
+}
+
+impl ToolStart {
+    pub(crate) fn mark_started(&self) {
+        if self.at.set(Instant::now()).is_ok() {
+            self.ready.cancel();
+        }
+    }
+
+    pub(crate) fn has_started(&self) -> bool {
+        self.at.get().is_some()
+    }
+
+    pub(crate) async fn wait(&self) {
+        self.ready.cancelled().await;
+    }
+
+    pub(crate) fn remaining(&self, limit: Duration) -> Duration {
+        self.at
+            .get()
+            .map_or(limit, |at| limit.saturating_sub(at.elapsed()))
+    }
+}
 
 /// Runs the calls of one registered tool. Only OCG's own code implements and
 /// registers it, and only when its arguments and results may be recorded:
@@ -82,6 +111,18 @@ pub(crate) trait ToolHandler: Send + Sync {
 
     fn call_for(&self, _call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
         self.call(arguments)
+    }
+
+    /// Process handlers signal `start` after spawning, so capacity waits
+    /// consume neither execution limit. Other handlers start at invocation.
+    fn call_with_start(
+        &self,
+        call: ToolCallRef,
+        arguments: Value,
+        start: ToolStart,
+    ) -> ToolFuture<'_> {
+        start.mark_started();
+        self.call_for(call, arguments)
     }
 
     /// Stops work started by this handler and waits until its supervisor has

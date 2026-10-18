@@ -72,6 +72,7 @@ fn closed_port() -> u16 {
 struct Silent {
     port: u16,
     stopped: Arc<AtomicBool>,
+    accepted: Arc<AtomicBool>,
 }
 
 impl Silent {
@@ -81,16 +82,25 @@ impl Silent {
         let port = listener.local_addr().expect("address").port();
         let stopped = Arc::new(AtomicBool::new(false));
         let stopping = stopped.clone();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let observed = accepted.clone();
         std::thread::spawn(move || {
             let mut held = Vec::new();
             while !stopping.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((stream, _)) => held.push(stream),
+                    Ok((stream, _)) => {
+                        observed.store(true, Ordering::SeqCst);
+                        held.push(stream);
+                    }
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             }
         });
-        Self { port, stopped }
+        Self {
+            port,
+            stopped,
+            accepted,
+        }
     }
 }
 
@@ -327,6 +337,7 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
     });
     let running = admitted(&submit(address, running_key, &running_body));
     assert_eq!(job(address, &running)["settlement"]["state"], "unsettled");
+    until(|| silent.accepted.load(Ordering::SeqCst));
     let stop = request(
         address,
         &format!("POST /api/v1/jobs/{running}/stop"),

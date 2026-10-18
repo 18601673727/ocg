@@ -76,32 +76,12 @@ fn submit(
     Ok(id)
 }
 
-/// T1, and the Job starts at once as this process's own execution in the
-/// Pool named by `executor`, in the same transaction, so the Job exists only
-/// with its claim. The claim batch is for work that waits for capacity; this
-/// is for work the caller runs itself.
-pub(crate) fn create_local_job(
+pub(crate) fn create_submitted_job(
     batch: &mut Batch,
     job: NewJob,
-    executor: ExecutorId,
-) -> OpResult<JobId> {
-    let id = submit(batch, job, None)?;
-    batch.claim_local(id, executor.into())?;
-    Ok(id)
-}
-
-/// Like [`create_local_job`], and records `submission` as the one submission
-/// that created the Job, in the same transaction. A key that is already
-/// recorded refuses the whole creation, so a key never names two Jobs.
-pub(crate) fn create_submitted_local_job(
-    batch: &mut Batch,
-    job: NewJob,
-    executor: ExecutorId,
     submission: NewSubmission,
 ) -> OpResult<JobId> {
-    let id = submit(batch, job, Some(submission))?;
-    batch.claim_local(id, executor.into())?;
-    Ok(id)
+    submit(batch, job, Some(submission))
 }
 
 /// Creates a new Job that retries `retry.original`. The original Job is not
@@ -144,53 +124,6 @@ pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
     let id = batch.t1_submit(None, spec)?;
     join_projects(batch, id, &retry.projects)?;
     Ok(id)
-}
-
-/// Starts a pending Job as this process's own execution in the Pool named
-/// by `executor`. A Job still waiting on a dependency is refused.
-pub(crate) fn start_job(batch: &mut Batch, job: JobId, executor: ExecutorId) -> OpResult<()> {
-    batch.claim_local(job, executor.into())
-}
-
-/// Creates and starts one cleanup Job under `owner`, on its own start
-/// transaction: a system Job never goes through T1 or the claim batch. The
-/// cleanup runs in this process, so the Job is claimed by this opening; if
-/// the process ends before the Job is finalized, the next open settles it
-/// like any abandoned work.
-pub(crate) fn begin_core_log_cleanup(
-    batch: &mut Batch,
-    owner: JobId,
-    executor: ExecutorId,
-    started: NewJobOutput,
-) -> OpResult<crate::log_cleanup::CleanupRecords> {
-    let spec = JobRow {
-        id: JobId::new(0),
-        created_at: batch.now(),
-        eligible_at: None,
-        name: Some("__CORE__ log cleanup".into()),
-        parent_id: (owner.get() != 0).then_some(owner),
-        agent_id: None,
-        execution: None,
-        objective: Some("Remove expired OCG runtime logs".into()),
-        attachments: Vec::new(),
-        dependencies: Vec::new(),
-        max_depth: None,
-        max_children: None,
-        max_descendants: None,
-        retry_of: None,
-        continues: None,
-        submission: None,
-    };
-    let job = batch.start_system_job(spec, executor.into())?;
-    batch.append_output(
-        job,
-        started.kind.into(),
-        started.summary,
-        started.code,
-        started.goal_reached,
-        started.value,
-    )?;
-    Ok(crate::log_cleanup::CleanupRecords { job })
 }
 
 /// Adds one more Project to the Job's Project set.

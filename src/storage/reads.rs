@@ -740,6 +740,7 @@ pub(crate) fn read_unresolved_executions(
 pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool, StorageError> {
     let rx = read(database)?;
     Ok(match probe {
+        Probe::Job(job) => rx.open_table(JOBS)?.get(job.get())?.is_some(),
         Probe::Submission(key) => rx
             .open_table(SUBMISSIONS)?
             .get(key.as_bytes().as_slice())?

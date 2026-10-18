@@ -1,10 +1,8 @@
 use super::*;
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 pub const GLOBAL_EXECUTION_LIMIT: u8 = 16;
-pub const EVALUATION_BUDGET: u32 = 32_768;
-pub const EVALUATION_CANDIDATES: usize = 64;
 
 /// The Pool a Job was claimed into and what the Pool was when it was.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,56 +100,6 @@ pub struct PendingSnapshot {
     pub complete: bool,
     pub resume_after: Option<JobId>,
     pub service_time: Duration,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvalRequest {
-    pub candidates: Vec<JobId>,
-    pub budget: NonZeroU32,
-    pub continuation: Option<EvalContinuation>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EvalContinuation {
-    pub job: JobId,
-    pub after_prerequisite: JobId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvalPage {
-    pub verdicts: Vec<(JobId, Readiness)>,
-    pub continuation: Option<EvalContinuation>,
-    pub work_used: u32,
-    pub service_time: Duration,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Readiness {
-    Ready {
-        compatible_pools: BTreeSet<ExecutionPoolId>,
-    },
-    Blocked(Block),
-    Indeterminate(Why),
-    BudgetExhausted,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Block {
-    NotPending,
-    Genesis,
-    Paused,
-    NotYetEligible { eligible_at: Timestamp },
-    DependencyWaiting,
-    DependencyImpossible,
-    NoCompatiblePool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Why {
-    Unbounded,
-    MissingJob,
-    MissingPrerequisite(JobId),
-    Corrupt,
 }
 
 pub(crate) fn bounded_page(limit: NonZeroUsize) -> usize {
