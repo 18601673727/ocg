@@ -631,6 +631,9 @@ fn entry(directory: &std::fs::File, name: &str) -> Entry {
                 bytes: u64::try_from(stat.st_size).unwrap_or(u64::MAX),
                 seconds: stat.st_mtime as i64,
                 nanos: stat.st_mtime_nsec as u32,
+                ctime_seconds: stat.st_ctime as i64,
+                ctime_nanos: stat.st_ctime_nsec as u32,
+                inode: stat.st_ino as u64,
             },
         },
         FileType::Directory => Entry::Directory,
@@ -684,6 +687,9 @@ pub(super) struct FileStamp {
     pub bytes: u64,
     pub seconds: i64,
     pub nanos: u32,
+    pub ctime_seconds: i64,
+    pub ctime_nanos: u32,
+    pub inode: u64,
 }
 
 pub(super) trait WalkVisitor {
