@@ -13,10 +13,38 @@ use serde_json::{Value, json};
 
 use super::{
     API_VERSION, INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, Refusal, Reply, decimal,
-    micros,
+    micros, routing,
 };
 use crate::database::DatabaseHandle;
 use crate::persistence::{ConfigBody, ConfigKind, JobId, ModelCapability, ProfileId};
+
+/// The most Conversations one page of Conversations reads, and the default.
+pub(super) const MAX_CONVERSATION_PAGE: usize = 100;
+const DEFAULT_CONVERSATION_PAGE: usize = 50;
+
+/// `before` and `limit`, each at most once, and nothing else.
+pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize), Refusal> {
+    let (mut before, mut limit) = (None, None);
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+            match key {
+                "before" if before.is_none() => {
+                    before = Some(routing::job_id(value)?);
+                }
+                "limit" if limit.is_none() => {
+                    limit = Some(
+                        decimal::<usize>(value)
+                            .filter(|limit| (1..=MAX_CONVERSATION_PAGE).contains(limit))
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                _ => return Err(INVALID_REQUEST),
+            }
+        }
+    }
+    Ok((before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
+}
 
 /// The most Profiles one page of Agent Profiles reads, and the default.
 pub(super) const MAX_PROFILE_PAGE: usize = 100;
@@ -225,6 +253,36 @@ fn page(agent_profiles: Vec<Value>, next_before: Option<String>) -> Value {
         "has_more": next_before.is_some(),
         "next_before": next_before,
     })
+}
+
+/// One page of conversations, newest activity first, strictly before `before` when given.
+pub(super) async fn conversations(
+    database: &DatabaseHandle,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Reply, Refusal> {
+    let page = database.conversations(before, limit).await?;
+    let items = page
+        .conversations
+        .into_iter()
+        .map(|c| {
+            json!({
+                "root_job": c.root_job.to_string(),
+                "tip_job": c.tip_job.to_string(),
+                "agent": ProfileId::from(c.agent).to_string(),
+                "title": c.title,
+                "turn_count": c.turn_count,
+                "tip_settlement_state": c.tip_settlement_state,
+                "tip_created_at_us": c.tip_created_at.as_unix_micros(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Reply::ok(json!({
+        "api_version": API_VERSION,
+        "conversations": items,
+        "has_more": page.has_more,
+        "next_before": page.next_before.map(|j| j.to_string()),
+    })))
 }
 
 #[cfg(test)]

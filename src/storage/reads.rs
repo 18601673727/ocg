@@ -769,3 +769,125 @@ pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool,
             .is_some_and(|state| state.outcome.is_some()),
     })
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationEntry {
+    pub root_job: JobId,
+    pub tip_job: JobId,
+    pub agent: ConfigId,
+    pub title: String,
+    pub turn_count: u32,
+    pub tip_settlement_state: String,
+    pub tip_created_at: Timestamp,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationsPage {
+    pub conversations: Vec<ConversationEntry>,
+    pub next_before: Option<JobId>,
+    pub has_more: bool,
+}
+
+pub(crate) fn read_conversations(
+    database: &Database,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<ConversationsPage, StorageError> {
+    let rx = read(database)?;
+    let threads_table = rx.open_table(CHAT_THREADS)?;
+    let successors_table = rx.open_table(SUCCESSORS)?;
+
+    struct ThreadInfo {
+        root_job: JobId,
+        tip_job: JobId,
+        agent: ConfigId,
+        turn_count: u32,
+    }
+
+    let mut threads = Vec::new();
+    for entry in threads_table.iter()? {
+        let (key, _) = entry?;
+        let (agent_id, root_id) = key.value();
+        let root_job = JobId::new(root_id);
+        let agent = ConfigId::new(agent_id);
+        let mut tip = root_id;
+        let mut turn_count = 1u32;
+        while let Some(succ) = successors_table.get(tip)? {
+            tip = succ.value();
+            turn_count += 1;
+        }
+        let tip_job = JobId::new(tip);
+        if let Some(before_id) = before {
+            if tip_job >= before_id {
+                continue;
+            }
+        }
+        threads.push(ThreadInfo {
+            root_job,
+            tip_job,
+            agent,
+            turn_count,
+        });
+    }
+
+    // Newest activity first: sort descending by tip_job
+    threads.sort_by(|a, b| b.tip_job.cmp(&a.tip_job));
+
+    let limit = limit.clamp(1, 100);
+    let has_more = threads.len() > limit;
+    let slice = if has_more {
+        &threads[..limit]
+    } else {
+        &threads[..]
+    };
+    let next_before = if has_more {
+        slice.last().map(|t| t.tip_job)
+    } else {
+        None
+    };
+
+    let mut conversations = Vec::with_capacity(slice.len());
+    for t in slice {
+        let root_row = read_job_row(&rx, t.root_job)?;
+        let title = match root_row.as_ref().and_then(|r| r.objective.as_deref()) {
+            Some(obj) => match obj.char_indices().nth(80) {
+                Some((idx, _)) => obj[..idx].to_string(),
+                None => obj.to_string(),
+            },
+            None => String::new(),
+        };
+
+        let tip_row = read_job_row(&rx, t.tip_job)?;
+        let tip_created_at = tip_row
+            .as_ref()
+            .map(|r| r.created_at)
+            .unwrap_or_else(|| Timestamp::from_unix_micros(0));
+
+        let tip_state = read_state(&rx, t.tip_job)?;
+        let tip_settlement_state = match tip_state.outcome.as_ref() {
+            None => "unsettled".to_string(),
+            Some(outcome) => match outcome.kind {
+                OutcomeKind::Completed => "completed".to_string(),
+                OutcomeKind::Failed => "failed".to_string(),
+                OutcomeKind::Cancelled => "cancelled".to_string(),
+                OutcomeKind::Unknown => "unknown".to_string(),
+            },
+        };
+
+        conversations.push(ConversationEntry {
+            root_job: t.root_job,
+            tip_job: t.tip_job,
+            agent: t.agent,
+            title,
+            turn_count: t.turn_count,
+            tip_settlement_state,
+            tip_created_at,
+        });
+    }
+
+    Ok(ConversationsPage {
+        conversations,
+        next_before,
+        has_more,
+    })
+}

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::*;
-use crate::persistence::OutcomeKind;
+use crate::persistence::{AgentBehavior, OutcomeKind};
 
 /// What every derived table must hold, given the authoritative rows.
 #[derive(Default)]
@@ -104,6 +104,18 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
                     .chat_threads
                     .insert((agent.get(), previous.get()), ());
             }
+        }
+        if row.continues.is_none()
+            && let Some(agent) = row.agent_id
+            && row
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.agent.as_ref())
+                .is_some_and(|agent| agent.behavior == AgentBehavior::Chat)
+        {
+            derived
+                .chat_threads
+                .insert((agent.get(), *id), ());
         }
         let pending = state.claim.is_none() && state.outcome.is_none();
         let mut open_dependencies = 0u32;

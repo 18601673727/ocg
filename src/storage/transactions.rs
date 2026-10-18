@@ -184,6 +184,17 @@ impl Batch {
                 tx.open_table(RETRIES)?
                     .insert((original.get(), job.get()), ())?;
             }
+            if spec.continues.is_none()
+                && let Some(agent) = spec.agent_id
+                && spec
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| execution.agent.as_ref())
+                    .is_some_and(|agent| agent.behavior == AgentBehavior::Chat)
+            {
+                tx.open_table(CHAT_THREADS)?
+                    .insert((agent.get(), job.get()), ())?;
+            }
             Ok(())
         })?;
         if let Some((key, fingerprint)) = submission {

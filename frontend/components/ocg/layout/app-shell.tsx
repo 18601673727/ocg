@@ -93,6 +93,8 @@ export function AppShell({
         openedJobs={opened}
         activeJob={location.job}
         onOpenJob={(job) => openJob(job, view === "chat" ? "chat" : "jobs")}
+        onOpenChat={(job) => openJob(job, "chat")}
+        client={client}
         signingOut={signingOut}
         onSignOut={onSignOut}
       />
@@ -126,7 +128,13 @@ export function AppShell({
             />
           </div>
           <div hidden={view !== "jobs"}>
-            <JobsSurface client={client} active={view === "jobs"} job={view === "jobs" ? location.job : null} onJob={(job) => openJob(job, "jobs")} />
+            <JobsSurface
+              client={client}
+              active={view === "jobs"}
+              job={view === "jobs" ? location.job : null}
+              onJob={(job) => openJob(job, "jobs")}
+              onOpenChat={(job) => openJob(job, "chat")}
+            />
           </div>
           {view === "settings" ? (
             <SettingsSurface

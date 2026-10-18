@@ -397,6 +397,16 @@ impl DatabaseHandle {
             .await
     }
 
+    /// One page of conversations, newest activity first, strictly before `before` when given.
+    pub async fn conversations(
+        &self,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<storage::ConversationsPage, DatabaseError> {
+        self.read(move |database| storage::read_conversations(database, before, limit))
+            .await
+    }
+
     /// The Jobs that are submitted but neither started nor settled, oldest
     /// first by Job ID, strictly after `after` when given.
     /// At most `limit`, and never more than 1,000, index entries are

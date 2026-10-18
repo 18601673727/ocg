@@ -7,6 +7,10 @@ pub(super) enum Route {
         before: Option<JobId>,
         limit: usize,
     },
+    Conversations {
+        before: Option<JobId>,
+        limit: usize,
+    },
     Usage(dashboard::ObservationQuery),
     Availability(dashboard::ObservationQuery),
     Logs(dashboard::LogQuery),
@@ -60,6 +64,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             Caller::Operator(_),
             Route::Health
             | Route::Jobs { .. }
+            | Route::Conversations { .. }
             | Route::Usage(_)
             | Route::Availability(_)
             | Route::Logs(_)
@@ -123,6 +128,8 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["job-history"] => {
             dashboard::jobs_query(query).map(|(before, limit)| Route::Jobs { before, limit })
         }
+        ["conversations"] => catalog::conversations_query(query)
+            .map(|(before, limit)| Route::Conversations { before, limit }),
         ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
         ["availability"] => dashboard::ObservationQuery::parse(query).map(Route::Availability),
         ["logs"] => dashboard::LogQuery::parse(query).map(Route::Logs),
@@ -234,6 +241,9 @@ pub(super) async fn respond(
     match route {
         Route::Health => Ok(Reply::ok(health(database).await)),
         Route::Jobs { before, limit } => dashboard::jobs(shared, before, limit).await,
+        Route::Conversations { before, limit } => {
+            catalog::conversations(database, before, limit).await
+        }
         Route::Usage(query) => dashboard::usage(shared, query).await,
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,

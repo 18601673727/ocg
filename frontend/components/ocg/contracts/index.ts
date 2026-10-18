@@ -73,6 +73,8 @@ function jobRecord(input: unknown) {
   return {
     id: identity(job.id, "job.id", "job:"),
     name: job.name === null ? null : string(job.name, "job.name"),
+    title: job.title === undefined || job.title === null ? null : string(job.title, "job.title"),
+    is_chat: typeof job.is_chat === "boolean" ? job.is_chat : false,
     execution_mode: mode,
     input: string(job.input, "job.input"),
     previous: job.previous === undefined || job.previous === null
@@ -190,6 +192,35 @@ export function decodeJobs(input: unknown) {
     has_more: boolean(envelope.has_more, "has_more"),
   };
 }
+
+function conversationRecord(input: unknown) {
+  const c = record(input, "conversation");
+  return {
+    root_job: identity(c.root_job, "conversation.root_job", "job:"),
+    tip_job: identity(c.tip_job, "conversation.tip_job", "job:"),
+    agent: identity(c.agent, "conversation.agent", "profile:"),
+    title: string(c.title, "conversation.title"),
+    turn_count: integer(c.turn_count, "conversation.turn_count"),
+    tip_settlement_state: string(c.tip_settlement_state, "conversation.tip_settlement_state"),
+    tip_created_at_us: integer(c.tip_created_at_us, "conversation.tip_created_at_us"),
+  };
+}
+
+export type ControlConversationEntry = ReturnType<typeof conversationRecord>;
+
+export function decodeConversations(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return {
+    conversations: listOf(envelope.conversations, "conversations", (conversation) => conversationRecord(conversation)),
+    next_before: envelope.next_before === null || envelope.next_before === undefined
+      ? null
+      : identity(envelope.next_before, "next_before", "job:"),
+    has_more: boolean(envelope.has_more, "has_more"),
+  };
+}
+
+export type ControlConversations = ReturnType<typeof decodeConversations>;
 
 function observationPage(input: unknown) {
   const envelope = record(input, "response");

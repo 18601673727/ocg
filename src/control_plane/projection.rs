@@ -65,9 +65,18 @@ pub(super) fn settlement_json(record: &JobRecord) -> Result<Value, Refusal> {
 /// The Job's lifecycle as recorded, with its [`settlement_json`].
 pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
     let settlement = settlement_json(record)?;
+    let is_chat = record.previous.is_some()
+        || record.continues.is_some()
+        || record
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.agent.as_ref())
+            .is_some_and(|agent| agent.behavior == crate::persistence::AgentBehavior::Chat);
     Ok(json!({
         "id": record.id.to_string(),
         "name": record.name,
+        "title": record.objective.as_deref(),
+        "is_chat": is_chat,
         // Every Job runs once; recurrence is not part of this format.
         "execution_mode": "once",
         "input": record.input.to_string(),

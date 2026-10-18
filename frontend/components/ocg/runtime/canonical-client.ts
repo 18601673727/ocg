@@ -4,6 +4,7 @@ import {
   decodeAgentProfiles,
   decodeAttachment,
   decodeControlError,
+  decodeConversations,
   decodeHealth,
   decodeJobs,
   decodeUsage,
@@ -189,6 +190,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   const cursors = new Map<string, number>();
   const active = new Map<string, AbortController>();
   const profileListeners = new Set<() => void>();
+  const conversationListeners = new Set<() => void>();
   let closed = false;
 
   // The one credential this client sends: the bearer token of its caller,
@@ -274,7 +276,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           } else {
             await listener(event);
           }
-          if (event.type === "settlement") return "settled";
+          if (event.type === "settlement") {
+            conversationListeners.forEach((listener) => listener());
+            return "settled";
+          }
           if (event.type === "stream_error") return "stream_error";
         }
       }
@@ -359,6 +364,17 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     onProfilesChanged(listener: () => void) {
       profileListeners.add(listener);
       return () => { profileListeners.delete(listener); };
+    },
+
+    onConversationsChanged(listener: () => void) {
+      conversationListeners.add(listener);
+      return () => { conversationListeners.delete(listener); };
+    },
+
+    async readConversations(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {
+      const query = [`limit=${settings.limit ?? 50}`];
+      if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
+      return decodeConversations((await send("GET", `/api/v1/conversations?${query.join("&")}`, { signal: settings.signal })).input);
     },
 
     async readJobs(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {
@@ -526,6 +542,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (admission.status !== "admitted" && admission.status !== "pending") {
         throw new ContractError("admission.status", "admitted or pending from a submission");
       }
+      conversationListeners.forEach((listener) => listener());
       return {
         status: admission.status,
         job: admission.job,
@@ -653,6 +670,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     close(): void {
       closed = true;
       profileListeners.clear();
+      conversationListeners.clear();
       for (const controller of active.values()) controller.abort();
     },
   };

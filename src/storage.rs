@@ -81,15 +81,18 @@ pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pend
 use reads::read;
 #[cfg(test)]
 pub(crate) use reads::record_attachment_cleanup;
+#[allow(unused_imports)]
+pub(crate) use reads::ConversationEntry;
+pub(crate) use reads::ConversationsPage;
 pub(crate) use reads::{
     UnresolvedExecution, content_available, probe_committed, read_attachment,
     read_attachment_inputs, read_attachments, read_children, read_compatible_executors,
-    read_config, read_configs, read_execution_pool, read_execution_pools, read_executor,
-    read_executors, read_job, read_job_compatible_executors, read_job_configuration,
-    read_job_input, read_job_input_for_job, read_jobs, read_latest_output, read_occupancy,
-    read_outputs, read_pending_jobs, read_pool_binding, read_project, read_project_jobs,
-    read_projects, read_retries, read_submission, read_tool_evidence, read_unresolved_executions,
-    unneeded_content,
+    read_config, read_configs, read_conversations, read_execution_pool, read_execution_pools,
+    read_executor, read_executors, read_job, read_job_compatible_executors,
+    read_job_configuration, read_job_input, read_job_input_for_job, read_jobs,
+    read_latest_output, read_occupancy, read_outputs, read_pending_jobs, read_pool_binding,
+    read_project, read_project_jobs, read_projects, read_retries, read_submission,
+    read_tool_evidence, read_unresolved_executions, unneeded_content,
 };
 pub(crate) use rows::{ConfigRow, JobRow, JobStateRow};
 use rows::{
