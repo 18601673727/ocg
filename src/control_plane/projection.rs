@@ -1,6 +1,3 @@
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
 use super::*;
 
 /// What the host can establish: it runs, as the listener answers only
@@ -158,13 +155,6 @@ pub(super) fn parse_tool_cursor(text: &str) -> Result<(RequestNumber, u32), Refu
         let idx = decimal::<u32>(idx_str).ok_or(INVALID_REQUEST)?;
         return Ok((req, idx));
     }
-    if let Ok(bytes) = URL_SAFE_NO_PAD.decode(text) {
-        if let Ok((req, idx)) = serde_json::from_slice::<(u32, u32)>(&bytes) {
-            if let Some(req) = RequestNumber::new(req) {
-                return Ok((req, idx));
-            }
-        }
-    }
     Err(INVALID_REQUEST)
 }
 
@@ -247,13 +237,10 @@ pub(super) fn tool_json(record: &ToolEvidenceRecord) -> Value {
         "name": record.name,
         "decision": decision,
         "outcome_kind": outcome_kind,
-        "outcome": outcome_kind,
         "arguments": arguments,
         "arguments_cut": arguments_cut,
-        "arguments_truncated": arguments_cut,
         "result": result,
         "result_cut": result_cut,
-        "result_truncated": result_cut,
     })
 }
 
@@ -407,9 +394,10 @@ mod tests {
         assert_eq!(json["decision"], "admitted");
         assert_eq!(json["outcome_kind"], "completed");
         assert_eq!(json["arguments_cut"], true);
-        assert_eq!(json["arguments_truncated"], true);
         assert_eq!(json["result_cut"], true);
-        assert_eq!(json["result_truncated"], true);
+        assert!(json.get("outcome").is_none());
+        assert!(json.get("arguments_truncated").is_none());
+        assert!(json.get("result_truncated").is_none());
         assert_eq!(json["arguments"].as_str().unwrap().len(), 2048);
         assert_eq!(json["result"].as_str().unwrap().len(), 2048);
 

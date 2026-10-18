@@ -105,7 +105,10 @@ function TurnRow({
           {note ? <span className="mt-1 block text-xs text-muted-foreground">{note}</span> : null}
         </div>
         {!isUser && turn.tools && turn.tools.length > 0 ? (
-          <TurnToolCalls tools={turn.tools} />
+          <TurnToolCalls
+            tools={turn.tools}
+            isLive={turn.status === "streaming" || turn.status === "pending"}
+          />
         ) : null}
       </div>
     </div>
@@ -133,12 +136,18 @@ function argumentSummary(raw: string | null): string {
   return "";
 }
 
-function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined): string {
-  if (!kind || kind === "uncertain") return "uncertain";
+function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined, isLive: boolean): string {
+  if (!kind) return isLive ? "running" : "uncertain";
   return kind;
 }
 
-function TurnToolCalls({ tools }: { tools: readonly ControlToolCall[] }) {
+function TurnToolCalls({
+  tools,
+  isLive,
+}: {
+  tools: readonly ControlToolCall[];
+  isLive: boolean;
+}) {
   return (
     <details className="mt-2.5 rounded-md border border-border bg-muted/20 text-xs">
       <summary className="cursor-pointer select-none px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
@@ -147,8 +156,9 @@ function TurnToolCalls({ tools }: { tools: readonly ControlToolCall[] }) {
       <div className="flex flex-col gap-2 p-3 pt-0">
         {tools.map((tool) => {
           const summary = argumentSummary(tool.arguments);
-          const outcome = outcomeLabel(tool.outcome_kind);
+          const outcome = outcomeLabel(tool.outcome_kind, isLive);
           const isCompleted = outcome === "completed";
+          const isRunning = outcome === "running";
           const isUncertain = outcome === "uncertain";
           return (
             <details
@@ -169,9 +179,12 @@ function TurnToolCalls({ tools }: { tools: readonly ControlToolCall[] }) {
                     "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider",
                     isCompleted &&
                       "border border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+                    isRunning &&
+                      "border border-sky-500/20 bg-sky-500/10 text-sky-600 dark:text-sky-400",
                     isUncertain &&
                       "border border-amber-500/20 bg-amber-500/10 text-amber-600 dark:text-amber-400",
                     !isCompleted &&
+                      !isRunning &&
                       !isUncertain &&
                       "border border-border bg-muted text-muted-foreground",
                   )}
@@ -223,28 +236,23 @@ function TurnToolCalls({ tools }: { tools: readonly ControlToolCall[] }) {
 /** One Job as its objective and answer; see `jobTranscript` for what each is made of. */
 export function JobTranscript({
   turns,
-  tools,
   userLabel = "Objective",
   attachmentContentUrl,
 }: {
   turns: readonly TranscriptTurn[];
-  tools?: readonly ControlToolCall[];
   userLabel?: string;
   attachmentContentUrl?: (id: string) => string;
 }) {
   return (
     <div className="flex flex-col gap-4" aria-live="polite">
-      {turns.map((turn) => {
-        const turnTools = turn.tools ?? (turn.role === "assistant" ? tools : undefined);
-        return (
-          <TurnRow
-            key={turn.id}
-            turn={{ ...turn, tools: turnTools }}
-            userLabel={userLabel}
-            attachmentContentUrl={attachmentContentUrl}
-          />
-        );
-      })}
+      {turns.map((turn) => (
+        <TurnRow
+          key={turn.id}
+          turn={turn}
+          userLabel={userLabel}
+          attachmentContentUrl={attachmentContentUrl}
+        />
+      ))}
     </div>
   );
 }

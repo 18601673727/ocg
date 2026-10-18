@@ -111,19 +111,46 @@ function JobWatchBody({
 
     // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
     const fail = (error: unknown, scope: "read" | "stream") => {
+      stopPolling();
       if (error instanceof ControlTransportError) setFailure({ code: error.code, scope });
       else if (error instanceof ContractError) setFailure({ code: "contract", scope });
       else setFailure({ code: "unreachable", scope });
       setStream("closed");
     };
 
-    const refreshTools = () => {
-      client.readAllJobTools(jobId).then(
-        (loaded) => {
-          if (alive) setTools(loaded);
-        },
-        () => {},
-      );
+    let reloading = false;
+    let reloadQueued = false;
+    let pollInterval: ReturnType<typeof setInterval> | null = null;
+
+    const stopPolling = () => {
+      if (pollInterval !== null) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+    };
+
+    const requestReload = () => {
+      if (!alive) return;
+      if (reloading) {
+        reloadQueued = true;
+        return;
+      }
+      reloading = true;
+      client
+        .readAllJobTools(jobId)
+        .then(
+          (loaded) => {
+            if (alive) setTools(loaded);
+          },
+          () => {},
+        )
+        .finally(() => {
+          reloading = false;
+          if (reloadQueued && alive) {
+            reloadQueued = false;
+            requestReload();
+          }
+        });
     };
 
     const listener = (event: JobStreamEvent) => {
@@ -138,12 +165,14 @@ function JobWatchBody({
             settled_at_us: event.job.settlement.settled_at_us,
             stop_confirmed_at_us: event.job.stop_confirmed_at_us,
           });
+          stopPolling();
+          requestReload();
         }
       } else if (event.type === "output") {
         if (event.output.seq <= processed) return;
         processed = event.output.seq;
         setOutputs((existing) => [...existing, event.output]);
-        refreshTools();
+        requestReload();
       } else if (event.type === "settlement") {
         setSettlement({
           state: event.settlement.state,
@@ -151,10 +180,12 @@ function JobWatchBody({
           stop_confirmed_at_us: event.stop_confirmed_at_us,
         });
         setStream("settled");
-        refreshTools();
+        stopPolling();
+        requestReload();
       } else if (event.type === "stream_error") {
         setFailure({ code: event.error.code, scope: "stream" });
         setStream("stream_error");
+        stopPolling();
       }
     };
 
@@ -200,6 +231,8 @@ function JobWatchBody({
             settled_at_us: record.settlement.settled_at_us,
             stop_confirmed_at_us: record.stop_confirmed_at_us,
           });
+        } else if (pollInterval === null && alive) {
+          pollInterval = setInterval(requestReload, 3000);
         }
       } catch (error) {
         if (alive) fail(error, "read");
@@ -213,7 +246,7 @@ function JobWatchBody({
           if (alive) setInput({ error: error instanceof ControlTransportError ? error.code : "unreachable" });
         },
       );
-      refreshTools();
+      requestReload();
       // The stored history first, in pages and in order; the stream then
       // continues after the last output this view processed.
       try {
@@ -242,9 +275,15 @@ function JobWatchBody({
         subscription.closed.then(
           (end) => {
             if (!alive) return;
-            if (end === "settled") setStream("settled");
-            else if (end === "stream_error") setStream("stream_error");
-            else setStream("closed");
+            stopPolling();
+            if (end === "settled") {
+              setStream("settled");
+              requestReload();
+            } else if (end === "stream_error") {
+              setStream("stream_error");
+            } else {
+              setStream("closed");
+            }
           },
           // A stream that cannot go on, such as an ended session, is a failure to show, not a lost rejection.
           (error: unknown) => {
@@ -258,6 +297,7 @@ function JobWatchBody({
 
     return () => {
       alive = false;
+      stopPolling();
       subscription?.close();
     };
   }, [client, jobId]);
@@ -384,7 +424,6 @@ function JobWatchBody({
           input !== null && "attachments" in input ? input.attachments : undefined,
           tools,
         )}
-        tools={tools}
         userLabel={presentation === "chat" ? "You" : "Objective"}
         attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
       />

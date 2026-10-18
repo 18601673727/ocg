@@ -343,23 +343,17 @@ function toolCallRecord(value: unknown, path: string): ControlToolCall {
     index: integer(item.index, `${path}.index`),
     name: string(item.name, `${path}.name`),
     decision: string(item.decision, `${path}.decision`),
-    outcome_kind: toolOutcomeKind(item.outcome_kind ?? item.outcome, `${path}.outcome_kind`),
+    outcome_kind: toolOutcomeKind(item.outcome_kind, `${path}.outcome_kind`),
     arguments:
       item.arguments === null || item.arguments === undefined
         ? null
         : string(item.arguments, `${path}.arguments`),
-    arguments_cut: boolean(
-      item.arguments_cut ?? item.arguments_truncated ?? false,
-      `${path}.arguments_cut`,
-    ),
+    arguments_cut: boolean(item.arguments_cut, `${path}.arguments_cut`),
     result:
       item.result === null || item.result === undefined
         ? null
         : string(item.result, `${path}.result`),
-    result_cut: boolean(
-      item.result_cut ?? item.result_truncated ?? false,
-      `${path}.result_cut`,
-    ),
+    result_cut: boolean(item.result_cut, `${path}.result_cut`),
   };
 }
 

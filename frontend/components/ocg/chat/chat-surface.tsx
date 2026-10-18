@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/ocg/primitives";
@@ -45,6 +45,7 @@ export function ChatSurface({
   const [target, setTarget] = useState<SubmissionTarget | null>(null);
   const [turns, setTurns] = useState<ControlConversationTurn[]>([]);
   const [toolsByJob, setToolsByJob] = useState<Record<string, ControlToolCall[]>>({});
+  const loadedToolsJobs = useRef<Set<string>>(new Set());
   const [conversationError, setConversationError] = useState<string | null>(null);
   const [headState, setHeadState] = useState<SettlementState | null>(null);
 
@@ -89,22 +90,29 @@ export function ChatSurface({
   useEffect(() => {
     if (turns.length === 0) return;
     const controller = new AbortController();
-    turns.forEach((turn) => {
+    const earlierTurns = job ? turns.filter((turn) => turn.job.id !== job) : turns;
+    for (const turn of earlierTurns) {
+      const jobId = turn.job.id;
+      if (loadedToolsJobs.current.has(jobId)) continue;
+      loadedToolsJobs.current.add(jobId);
       client
-        .readAllJobTools(turn.job.id, controller.signal)
+        .readAllJobTools(jobId, controller.signal)
         .then((tools) => {
-          setToolsByJob((prev) => ({ ...prev, [turn.job.id]: tools }));
+          setToolsByJob((prev) => ({ ...prev, [jobId]: tools }));
         })
-        .catch(() => {});
-    });
+        .catch(() => {
+          loadedToolsJobs.current.delete(jobId);
+        });
+    }
     return () => {
       controller.abort();
     };
-  }, [client, turns]);
+  }, [client, job, turns]);
 
   const handleNewConversation = useCallback(() => {
     setTurns([]);
     setToolsByJob({});
+    loadedToolsJobs.current.clear();
     setConversationError(null);
     setHeadState(null);
     onNewConversation?.();
@@ -243,7 +251,6 @@ export function ChatSurface({
             </div>
             <JobTranscript
               turns={transcript}
-              tools={turnTools}
               userLabel="You"
               attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
             />
