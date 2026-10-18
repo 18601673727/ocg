@@ -112,6 +112,17 @@ pub struct ToolAdmission {
     pub authorization: AuthorizationBasis,
 }
 
+impl ToolAdmission {
+    /// Whether the handler registered under this version can start an OS
+    /// process. The caller of a tool decision passes this as `spawns`.
+    pub fn spawns(&self) -> bool {
+        matches!(
+            self.handler_version.as_str(),
+            "workspace_run_command-1" | "workspace_run_command-2"
+        )
+    }
+}
+
 /// A call the Provider requested, as OCG identified it, with OCG's decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewToolEvidence {
@@ -121,6 +132,10 @@ pub struct NewToolEvidence {
     /// The tool the call named.
     pub name: String,
     pub decision: ToolDecision,
+    /// Whether the handler can start an OS process; see
+    /// [`ToolAdmission::spawns`]. It decides whether a crash leaves the call's
+    /// slot quarantined.
+    pub spawns: bool,
 }
 
 /// Why a completed handler's result was not sent to the Provider.
@@ -233,6 +248,9 @@ pub struct ToolEvidenceRecord {
     pub call: ToolCallRef,
     pub tool_call_id: String,
     pub name: String,
+    /// Whether the admitted handler can start an OS process, as the caller of
+    /// the decision stated it. `false` for a refusal.
+    pub spawns: bool,
     pub decision: Recorded<ToolDecision>,
     pub outcome: Option<Recorded<ToolOutcome>>,
     pub reconciliation: Option<Recorded<ToolReconciliation>>,

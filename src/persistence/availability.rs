@@ -249,101 +249,6 @@ impl RequestEvidence {
     }
 }
 
-/// Microseconds in one aggregation minute.
-pub(super) const MICROS_PER_MINUTE: i64 = 60_000_000;
-
-/// The one-minute bucket `at` falls in: whole minutes since the Unix epoch,
-/// so a negative time has a negative bucket. A sample's bucket is fixed by
-/// its first record's `observed_at`.
-#[must_use]
-pub fn minute_of(at: Timestamp) -> i64 {
-    at.as_unix_micros().div_euclid(MICROS_PER_MINUTE)
-}
-
-/// Requests per classification in one (Provider, model, minute) bucket.
-/// Every count is of Provider requests, each counted once whichever Job sent
-/// it, never of raw observations.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AvailabilityCounts {
-    pub available: u64,
-    pub provider_server_error: u64,
-    pub rate_limited: u64,
-    pub auth_or_permission: u64,
-    pub request_or_target: u64,
-    pub unconfirmed: u64,
-}
-
-impl AvailabilityCounts {
-    /// The counter a classification is counted in.
-    pub(crate) fn counter(&mut self, class: AvailabilityClassification) -> &mut u64 {
-        use AvailabilityClassification::{Available, Rejected, Unavailable, Unconfirmed};
-        match class {
-            Available => &mut self.available,
-            Unavailable(UnavailableCause::ProviderServerError) => &mut self.provider_server_error,
-            Rejected(RejectionCause::RateLimited) => &mut self.rate_limited,
-            Rejected(RejectionCause::AuthOrPermission) => &mut self.auth_or_permission,
-            Rejected(RejectionCause::RequestOrTarget) => &mut self.request_or_target,
-            Unconfirmed => &mut self.unconfirmed,
-        }
-    }
-}
-
-/// One request sample as materialized: its Job's frozen target and the
-/// sample it reduces to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequestSampleRecord {
-    pub job: JobId,
-    pub request: RequestNumber,
-    pub llm_profile: ProfileId,
-    pub provider: LlmProviderId,
-    pub model: String,
-    pub sample: AvailabilityRequestSample,
-}
-
-/// How far aggregation has consumed AvailabilityStat records.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct AvailabilityAggregationProgress {
-    /// The last committed AvailabilityStat ID consumed. `None` before any.
-    pub consumed_through: Option<AvailabilityStatId>,
-    /// Wall-clock time of the last committed batch. It is activity metadata,
-    /// not progress, and it covers no observed time.
-    pub updated_at: Option<Timestamp>,
-}
-
-/// A read together with the aggregation progress of the same snapshot.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadSnapshot<T> {
-    pub progress: AvailabilityAggregationProgress,
-    pub value: T,
-}
-
-/// What one committed aggregation batch consumed and wrote.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AvailabilityBatchReport {
-    pub consumed_records: usize,
-    pub consumed_through: AvailabilityStatId,
-    /// Request samples whose stored state changed.
-    pub samples_written: usize,
-    /// Minute buckets whose stored counts changed.
-    pub buckets_written: usize,
-    /// Preparations this call made, including the one that committed.
-    pub attempts: u8,
-}
-
-/// The result of one bounded aggregation step.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AvailabilityBatch {
-    /// No committed record was unconsumed, so nothing was written.
-    Idle {
-        consumed_through: Option<AvailabilityStatId>,
-    },
-    Consumed(AvailabilityBatchReport),
-    /// Every preparation was overtaken by another commit, so none was applied.
-    Contended {
-        attempts: u8,
-    },
-}
-
 /// One availability observation of an LLM request made by a Job. The LLM it
 /// concerns is the one the Job froze at submission, never a caller-supplied
 /// target. The Job's outcome is neither consulted nor changed, so an
@@ -384,12 +289,13 @@ pub struct TimeRange {
     pub until: Timestamp,
 }
 
-/// Selects Metrics or AvailabilityStats. Each `Some` field must match; a
-/// record without an LLM matches only when every LLM field is `None`.
+/// Selects Metrics or AvailabilityStats. Each `Some` field must match.
 /// Provider and model are compared with the target its Job froze, never with
-/// the current contents of any Profile, so records from before a Profile
-/// edit stay selectable by what they actually ran. Choosing records this way
-/// decides nothing about grouping, current validity or availability.
+/// the current contents of any config, so records from before an edit stay
+/// selectable by what they actually ran. Only the records of Jobs that froze
+/// an LLM are indexed by scope, so only those can be selected. Choosing
+/// records this way decides nothing about grouping, current validity or
+/// availability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationFilter {
     /// Compared with the producer's observation time; the time a record was
@@ -401,13 +307,18 @@ pub struct ObservationFilter {
     pub model: Option<String>,
 }
 
-/// A position in observation order, which is `observed_at` and then record
-/// ID, so records with equal times keep a stable order. A page continues
-/// strictly after it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservationCursor<I> {
+/// A position in the order of an observation query: its scope (the Provider
+/// and a hash of the model name), then the producer's observation time, then
+/// the request event itself. A page continues strictly after it. Within one
+/// Provider and model the order is the order of observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ObservationCursor {
+    pub provider: LlmProviderId,
+    pub model_hash: [u8; 32],
     pub observed_at: Timestamp,
-    pub record: I,
+    pub job: JobId,
+    pub request: RequestNumber,
+    pub seq: u32,
 }
 
 /// One page of an observation query. `next` is `None` once nothing in the
@@ -415,9 +326,9 @@ pub struct ObservationCursor<I> {
 /// `next` is set: the bounded scan behind it found no match, and the query
 /// continues from `next`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ObservationPage<T, I> {
+pub struct ObservationPage<T> {
     pub records: Vec<T>,
-    pub next: Option<ObservationCursor<I>>,
+    pub next: Option<ObservationCursor>,
 }
 
 /// Selects historical (Provider, model) choices: the frozen targets of LLM

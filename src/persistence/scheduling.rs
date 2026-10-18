@@ -6,10 +6,12 @@ pub const GLOBAL_EXECUTION_LIMIT: u8 = 16;
 pub const EVALUATION_BUDGET: u32 = 32_768;
 pub const EVALUATION_CANDIDATES: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The Pool a Job was claimed into and what the Pool was when it was.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrozenPoolBinding {
     pub pool: ExecutionPoolId,
-    pub pool_profile: ProfileId,
+    pub edit_seq: u32,
+    pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

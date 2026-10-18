@@ -52,6 +52,11 @@ export function AgentSelector({
   const [targetChoice, setTargetChoice] = useState("");
   const [executorChoice, setExecutorChoice] = useState("");
 
+  useEffect(() => client.onProfilesChanged(() => {
+    setLoaded(null);
+    setAttempt((current) => current + 1);
+  }), [client]);
+
   useEffect(() => {
     const controller = new AbortController();
     (async () => {

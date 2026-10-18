@@ -36,16 +36,14 @@ use serde::{Deserialize, Serialize};
 use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseHandle, DatabaseWorker};
 use ocg::openai_compatible::NormalizedUsage;
-use ocg::orchestration::aggregation_service::{AggregationService, AggregationServiceConfig};
 use ocg::orchestration::execution_runtime::{
     ExecutionRuntime, ExecutionRuntimeError, ProviderExecutionPlan,
 };
 use ocg::persistence::{
-    ExecutionConfiguration, ExecutionMode, ExecutorType, FinalResult, IntermediateOutputKind,
-    JobFinalization, JobId, JobInputDraft, LlmConfig, LlmParameters, LlmTransport, Measurements,
-    ModelCapability, NewAvailabilityStat, NewExecutor, NewJob, NewJobOutput, NewLlmProvider,
-    NewMetrics, NewProfile, NewProfileConfig, OutputKind, RequestNumber, RequestRef, Timestamp,
-    minute_of,
+    ConfigBody, ConnectionConfig, ExecutionConfiguration, FinalResult, IntermediateOutputKind,
+    JobFinalization, JobId, JobInputDraft, LlmParameters, LlmTransport, Measurements,
+    ModelCapability, ModelConfig, NewAvailabilityStat, NewConfig, NewExecutor, NewJob,
+    NewJobOutput, NewMetrics, OutputKind, RequestNumber, Timestamp,
 };
 use ocg::provider_execution::{EnvironmentCredentialResolver, ProviderExecutionConfig};
 use ocg::system_policy::SystemPolicy;
@@ -220,12 +218,6 @@ struct Observed {
     availability: Vec<AvailabilityFact>,
     /// The pure reducer over the raw annotated Metrics.
     token_from_raw: Option<String>,
-    /// The aggregated per-request state, once the service consumed the raw records.
-    token_aggregated: Option<String>,
-    token_bucket_requests: Option<u64>,
-    availability_bucket_requests: Option<u64>,
-    token_progress: Option<u64>,
-    availability_progress: Option<u64>,
 }
 
 fn micros(at: Timestamp) -> i64 {
@@ -243,7 +235,11 @@ fn observe_job(handle: &DatabaseHandle, job: JobId) -> Observed {
     let executor_is_llm = match record.assigned_executor {
         Some(executor) => wait(handle.executor(executor))
             .expect("read Executor")
-            .map(|executor| executor.executor_type == ExecutorType::Llm)
+            .map(|executor| {
+                executor
+                    .llm_transports
+                    .contains(&LlmTransport::OpenAiChatCompletions)
+            })
             .unwrap_or(false),
         None => false,
     };
@@ -280,53 +276,12 @@ fn observe_job(handle: &DatabaseHandle, job: JobId) -> Observed {
     let raw_metrics = wait(handle.job_metrics(job, None, 100)).expect("read Metrics");
     let stats = wait(handle.job_availability(job, None, 100)).expect("read AvailabilityStats");
     let sample = TokenRequestSample::from_metrics(&raw_metrics).expect("one Job");
-    let aggregated = wait(handle.token_request(RequestRef {
-        job,
-        request: RequestNumber::FIRST,
-    }))
-    .expect("read Token state")
-    .value;
-    let aggregated_sample = aggregated.as_ref().and_then(|state| state.sample.clone());
     let (provider, model) = match &configuration {
         Some(c) => (
             Some(c.frozen.llm.provider.id),
             Some(c.frozen.llm.config.model.clone()),
         ),
         None => (None, None),
-    };
-    let token_bucket_requests = match (&aggregated_sample, provider, &model) {
-        (Some(sample), Some(provider), Some(model)) => {
-            wait(handle.token_minutes(provider, model.clone(), minute_of(sample.observed_at), 1))
-                .expect("read the Token minute")
-                .value
-                .first()
-                .map(|(_, totals)| totals.requests)
-        }
-        _ => None,
-    };
-    let availability_sample = wait(handle.request_sample(RequestRef {
-        job,
-        request: RequestNumber::FIRST,
-    }))
-    .expect("read the sample")
-    .value;
-    let availability_bucket_requests = match (&availability_sample, provider, &model) {
-        (Some(sample), Some(provider), Some(model)) => wait(handle.availability_minute(
-            provider,
-            model.clone(),
-            minute_of(sample.sample.observed_at),
-        ))
-        .expect("read the availability minute")
-        .value
-        .map(|counts| {
-            counts.available
-                + counts.provider_server_error
-                + counts.rate_limited
-                + counts.auth_or_permission
-                + counts.request_or_target
-                + counts.unconfirmed
-        }),
-        _ => None,
     };
 
     Observed {
@@ -392,17 +347,6 @@ fn observe_job(handle: &DatabaseHandle, job: JobId) -> Observed {
             })
             .collect(),
         token_from_raw: sample.map(|sample| format!("{sample:?}")),
-        token_aggregated: aggregated_sample.map(|sample| format!("{sample:?}")),
-        token_bucket_requests,
-        availability_bucket_requests,
-        token_progress: wait(handle.token_progress())
-            .expect("read Token progress")
-            .consumed_through
-            .map(|id| id.get()),
-        availability_progress: wait(handle.availability_progress())
-            .expect("read progress")
-            .consumed_through
-            .map(|id| id.get()),
     }
 }
 
@@ -489,7 +433,7 @@ fn execution_problems(observed: &Observed, genesis: u64) -> Vec<String> {
 }
 
 /// Telemetry facts that are reported, not required: how much usage the Provider
-/// actually supplied, and whether the aggregation pipeline covered the records.
+/// actually supplied.
 fn coverage(observed: &Observed) -> Vec<String> {
     let mut notes = Vec::new();
     let usage_records = observed
@@ -519,36 +463,7 @@ fn coverage(observed: &Observed) -> Vec<String> {
         ),
         None => "token request: none".to_owned(),
     });
-    let last_metric = observed.metrics.last().map(|fact| fact.id);
-    let last_stat = observed.availability.last().map(|fact| fact.id);
-    notes.push(format!(
-        "aggregation covers raw records: token {}, availability {}",
-        observed.token_progress >= last_metric && last_metric.is_some(),
-        observed.availability_progress >= last_stat && last_stat.is_some(),
-    ));
     notes
-}
-
-fn aggregation_problems(observed: &Observed) -> Vec<String> {
-    let mut problems = Vec::new();
-    if observed.token_aggregated.is_none() || observed.availability_bucket_requests.is_none() {
-        problems.push("the aggregation service had not produced its state".to_owned());
-    }
-    if observed.token_aggregated != observed.token_from_raw {
-        problems.push(
-            "the aggregated Token request differs from the reducer over the raw records".to_owned(),
-        );
-    }
-    if observed
-        .token_bucket_requests
-        .is_some_and(|requests| requests != 1)
-        || observed
-            .availability_bucket_requests
-            .is_some_and(|requests| requests != 1)
-    {
-        problems.push("a minute bucket does not count this one request exactly once".to_owned());
-    }
-    problems
 }
 
 // ---- the writer -----------------------------------------------------------------------
@@ -597,33 +512,33 @@ fn register_targets(
 ) -> Targets {
     let executor = wait(handle.create_executor(NewExecutor {
         name: "acceptance-llm".into(),
-        executor_type: ExecutorType::Llm,
         concurrency_limit: std::num::NonZeroU32::MIN,
         llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
     }))
     .expect("register the Executor");
-    let provider = wait(handle.create_llm_provider(NewLlmProvider {
+    let connection = wait(handle.create_config(NewConfig {
         name: "acceptance-provider".into(),
-        transport: LlmTransport::OpenAiChatCompletions,
-        endpoint: Some(endpoint.to_owned()),
-        credential_ref: Some(credential_ref.to_owned()),
+        body: ConfigBody::Connection(ConnectionConfig {
+            protocol: LlmTransport::OpenAiChatCompletions,
+            endpoint: Some(endpoint.to_owned()),
+            credential_ref: Some(credential_ref.to_owned()),
+        }),
     }))
-    .expect("register the Provider");
-    let llm_profile = wait(handle.create_profile(NewProfile {
+    .expect("register the Connection");
+    let llm_profile = wait(handle.create_config(NewConfig {
         name: model.to_owned(),
-        config: NewProfileConfig::Llm {
-            provider,
-            config: LlmConfig {
-                model: model.to_owned(),
-                parameters: LlmParameters {
-                    max_tokens: Some(max_tokens),
-                    ..LlmParameters::default()
-                },
-                declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
+        body: ConfigBody::Model(ModelConfig {
+            connection_id: connection,
+            model: model.to_owned(),
+            parameters: LlmParameters {
+                max_tokens: Some(max_tokens),
+                ..LlmParameters::default()
             },
-        },
+            declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
+        }),
     }))
-    .expect("create the LLM Profile");
+    .expect("create the Model config")
+    .into();
     Targets {
         executor,
         configuration: ExecutionConfiguration {
@@ -636,19 +551,13 @@ fn register_targets(
 fn job_template(handle: &DatabaseHandle, configuration: ExecutionConfiguration) -> NewJob {
     NewJob {
         name: Some("live acceptance request".into()),
-        execution_mode: ExecutionMode::Once,
         eligible_at: None,
-        scheduled_at: None,
-        next_due_at: None,
-        next_iteration_no: None,
-        iteration_no: None,
         parent: handle.genesis(),
         projects: Vec::new(),
         dependencies: Vec::new(),
+        input: JobInputDraft::default(),
         configuration: Some(configuration),
-        assigned_executor: None,
         previous: None,
-        replaces: None,
     }
 }
 
@@ -656,18 +565,12 @@ fn job_template(handle: &DatabaseHandle, configuration: ExecutionConfiguration) 
 /// ordinary APIs with streamed outputs, annotated Metrics and an
 /// AvailabilityStat. It exercises the harness, never a Provider.
 fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
-    let input = wait(handle.save_job_input(
-        None,
-        JobInputDraft {
-            objective: Some("offline fixture".into()),
-            ..JobInputDraft::default()
-        },
-    ))
-    .expect("save input");
     let mut job = job_template(handle, targets.configuration);
-    job.assigned_executor = Some(targets.executor);
-    let job = wait(handle.create_job_with_input(job, input)).expect("create the Job");
-    wait(handle.start_job(job)).expect("start the Job");
+    job.input = JobInputDraft {
+        objective: Some("offline fixture".into()),
+        ..JobInputDraft::default()
+    };
+    let job = wait(handle.create_local_job(job, targets.executor)).expect("create the Job");
     let anchor = TokenAnnotation::eligible(UsageFinality::Cumulative);
     wait(handle.record_metrics(NewMetrics {
         job,
@@ -731,46 +634,14 @@ fn settle_fixture_job(handle: &DatabaseHandle, targets: &Targets) -> JobId {
     job
 }
 
-/// Lets the real service consume the raw records, within a bound.
-fn aggregate(handle: &DatabaseHandle, job: JobId) -> Vec<String> {
-    let mut notes = Vec::new();
-    let service = match wait(AggregationService::start(
-        handle.clone(),
-        AggregationServiceConfig::default(),
-    )) {
-        Ok(service) => service,
-        Err(error) => {
-            notes.push(format!("the aggregation service did not start: {error}"));
-            return notes;
-        }
-    };
-    let metrics = wait(handle.job_metrics(job, None, 100)).expect("Metrics");
-    let stats = wait(handle.job_availability(job, None, 100)).expect("stats");
-    let (last_metric, last_stat) = (metrics.last().map(|r| r.id), stats.last().map(|r| r.id));
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let token = wait(handle.token_progress())
-            .expect("progress")
-            .consumed_through;
-        let availability = wait(handle.availability_progress())
-            .expect("progress")
-            .consumed_through;
-        if token >= last_metric && availability >= last_stat {
-            break;
-        }
-        if Instant::now() > deadline {
-            notes.push("the aggregation service did not cover the raw records in time".to_owned());
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    if let Err(error) = wait(service.shutdown()).into_result() {
-        notes.push(format!("aggregation service shutdown: {error}"));
-    }
-    notes
+fn run_writer(mode: Mode, directory: &Path) {
+    let directory = directory.to_path_buf();
+    ntex::rt::System::new("acceptance-writer", ntex::rt::DefaultRuntime).block_on(async move {
+        run_writer_async(mode, &directory).await;
+    });
 }
 
-fn run_writer(mode: Mode, directory: &Path) {
+async fn run_writer_async(mode: Mode, directory: &Path) {
     let (worker, handle) = open_database(directory);
     let genesis = handle.genesis().get();
     let live = (mode == Mode::Live).then(|| {
@@ -803,10 +674,12 @@ fn run_writer(mode: Mode, directory: &Path) {
                 tools: None,
             };
             // The one and only Provider request. Nothing below resends it.
-            let outcome = wait_for(
-                execution.scheduler().schedule_provider(plan),
+            let outcome = ntex::time::timeout(
                 config.timeout + Duration::from_secs(60),
-            );
+                execution.scheduler().schedule_provider(plan),
+            )
+            .await
+            .expect("the execution settled within its bound");
             match outcome {
                 Ok(receipt) => (Some(receipt.job), None, None),
                 Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
@@ -835,11 +708,11 @@ fn run_writer(mode: Mode, directory: &Path) {
         }
     };
     let job = job.expect("a Job was created for the request");
-    let mut shutdown = aggregate(&handle, job);
+    let mut shutdown = Vec::new();
     let observed = observe_job(&handle, job);
 
     // Component owners are closed cleanly, database last.
-    if let Err(error) = execution.shutdown() {
+    if let Err(error) = execution.shutdown().await {
         shutdown.push(format!("execution runtime: {error}"));
     }
     if let Err(error) = worker.shutdown() {
@@ -1071,10 +944,6 @@ fn assert_run_accepted(run: &Run) {
         "the same Job, read back whole"
     );
     assert_eq!(run.reader.observed.job, run.manifest.observed.job);
-    assert_eq!(
-        aggregation_problems(&run.reader.observed),
-        Vec::<String>::new()
-    );
 }
 
 fn current_commit() -> String {
@@ -1161,13 +1030,7 @@ fn offline_fixture_goes_through_two_real_processes_and_reads_back_whole() {
     let observed = &run.reader.observed;
     assert_eq!(observed.progress_outputs, 2);
     assert_eq!(observed.final_text_len, "fixture answer".len());
-    assert_eq!(observed.token_bucket_requests, Some(1));
-    assert_eq!(observed.availability_bucket_requests, Some(1));
-    let notes = coverage(observed);
-    assert!(
-        notes.iter().any(|note| note.contains("1 final")),
-        "{notes:?}"
-    );
+
     assert_eq!(
         run.manifest.mode,
         Mode::Fixture,

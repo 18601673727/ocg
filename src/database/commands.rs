@@ -73,11 +73,8 @@ pub(super) enum Command {
         request: ClaimRequest,
         reply: Reply<Result<ClaimGrant, ClaimRefusal>>,
     },
-    #[allow(dead_code, reason = "M2 keeps Scheduler dispatch dormant")]
-    ReconcileUnexecutedClaim {
-        job: JobId,
-        claim: OperationId,
-        reply: Reply<()>,
+    ClaimBatch {
+        reply: Reply<Vec<JobId>>,
     },
     CreateExecutionPool {
         pool: NewExecutionPool,
@@ -88,9 +85,9 @@ pub(super) enum Command {
         enabled: bool,
         reply: Reply<()>,
     },
-    SetExecutionPoolProfile {
+    UpdateExecutionPool {
         id: ExecutionPoolId,
-        profile: ProfileId,
+        config: ExecutionPoolConfig,
         reply: Reply<()>,
     },
     BeginCoreLogCleanup {
@@ -99,19 +96,13 @@ pub(super) enum Command {
         started: NewJobOutput,
         reply: Reply<crate::log_cleanup::CleanupRecords>,
     },
-    SaveJobInput {
-        existing: Option<JobInputId>,
-        draft: JobInputDraft,
-        reply: Reply<JobInputId>,
-    },
-    CreateJobWithInput {
+    CreateJob {
         job: NewJob,
-        input: JobInputId,
         reply: Reply<JobId>,
     },
-    CreateLocalJobWithInput {
+    CreateLocalJob {
         job: NewJob,
-        input: JobInputId,
+        executor: ExecutorId,
         /// Recorded with the Job, in the same transaction, when given.
         submission: Option<NewSubmission>,
         reply: Reply<JobId>,
@@ -121,14 +112,6 @@ pub(super) enum Command {
         reply: Reply<JobId>,
     },
     StartJob {
-        job: JobId,
-        reply: Reply<()>,
-    },
-    StartLocalJob {
-        job: JobId,
-        reply: Reply<()>,
-    },
-    AssignJobExecutor {
         job: JobId,
         executor: ExecutorId,
         reply: Reply<()>,
@@ -156,22 +139,14 @@ pub(super) enum Command {
         project: NewProject,
         reply: Reply<ProjectId>,
     },
-    CreateLlmProvider {
-        provider: NewLlmProvider,
-        reply: Reply<LlmProviderId>,
+    CreateConfig {
+        config: NewConfig,
+        reply: Reply<ConfigId>,
     },
-    CreateProfile {
-        profile: NewProfile,
-        reply: Reply<ProfileId>,
-    },
-    UpdateProfile {
-        id: ProfileId,
-        profile: NewProfile,
+    UpdateConfig {
+        id: ConfigId,
+        config: NewConfig,
         reply: Reply<()>,
-    },
-    CreateAgent {
-        agent: NewAgent,
-        reply: Reply<AgentId>,
     },
     CreateAttachment {
         attachment: Box<PublishedAttachment>,
@@ -216,18 +191,6 @@ pub(super) enum Command {
         reconciliation: Box<ToolReconciliation>,
         reply: Reply<()>,
     },
-    /// Commits one prepared AvailabilityStat aggregation batch. Its reply is
-    /// `None` when the preparation was stale and nothing was applied.
-    CommitAvailabilityAggregation {
-        plan: Box<storage::AvailabilityPlan>,
-        reply: Reply<Option<Timestamp>>,
-    },
-    /// Commits one prepared Token aggregation batch, like
-    /// [`Self::CommitAvailabilityAggregation`].
-    CommitTokenAggregation {
-        plan: Box<storage::TokenPlan>,
-        reply: Reply<Option<Timestamp>>,
-    },
 }
 
 impl Command {
@@ -244,24 +207,17 @@ impl Command {
         use OperationKind as Kind;
         match self {
             Self::ClaimExecution { request, reply } => {
-                let job = request.job;
                 let mut refusal = ClaimRefusal::RecipeInvalid;
-                let outcome = storage::run_batch_declinable(
-                    database,
-                    operation,
-                    Kind::ClaimExecution,
-                    commit,
-                    |batch| match batch.claim_execution(request, operation.epoch())? {
-                        Ok(grant) => Ok(Some((
-                            grant,
-                            MarkerSubjects::addressed(persistence::RecordRef::Job(job)),
-                        ))),
-                        Err(reason) => {
-                            refusal = reason;
-                            Ok(None)
+                let outcome =
+                    storage::run_batch_declinable(database, operation.epoch, commit, |batch| {
+                        match persistence::claim_execution(batch, request)? {
+                            Ok(grant) => Ok(Some(grant)),
+                            Err(reason) => {
+                                refusal = reason;
+                                Ok(None)
+                            }
                         }
-                    },
-                );
+                    });
                 let declined = matches!(outcome.result, Ok(None));
                 let outcome = storage::BatchOutcome {
                     result: outcome.result.map(|grant| match grant {
@@ -269,6 +225,9 @@ impl Command {
                         None => Err(refusal),
                     }),
                     storage_failure: outcome.storage_failure,
+                    scheduling_wake: outcome.scheduling_wake,
+                    capacity_freed: outcome.capacity_freed,
+                    probe: outcome.probe,
                 };
                 settle(
                     operation,
@@ -279,28 +238,14 @@ impl Command {
                     declined,
                 )
             }
-            Self::ReconcileUnexecutedClaim { job, claim, reply } => {
-                let outcome = storage::run_batch_declinable(
-                    database,
-                    operation,
-                    Kind::QuarantineAbandonedJob,
-                    commit,
-                    |batch| batch.reconcile_unexecuted_claim(job, claim),
-                );
-                let declined = matches!(outcome.result, Ok(None));
-                let outcome = storage::BatchOutcome {
-                    result: outcome.result.map(|_| ()),
-                    storage_failure: outcome.storage_failure,
-                };
-                settle(
-                    operation,
-                    commit,
-                    Kind::QuarantineAbandonedJob,
-                    reply,
-                    outcome,
-                    declined,
-                )
-            }
+            Self::ClaimBatch { reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::ClaimExecution,
+                reply,
+                |batch| batch.claim_batch(),
+            ),
             Self::CreateExecutionPool { pool, reply } => run(
                 database,
                 operation,
@@ -317,13 +262,13 @@ impl Command {
                 reply,
                 |batch| persistence::set_execution_pool_enabled(batch, id, enabled),
             ),
-            Self::SetExecutionPoolProfile { id, profile, reply } => run(
+            Self::UpdateExecutionPool { id, config, reply } => run(
                 database,
                 operation,
                 commit,
                 Kind::SetExecutionPoolProfile,
                 reply,
-                |batch| persistence::set_execution_pool_profile(batch, id, profile),
+                |batch| persistence::update_execution_pool(batch, id, config),
             ),
             Self::BeginCoreLogCleanup {
                 owner,
@@ -336,40 +281,20 @@ impl Command {
                 commit,
                 Kind::BeginCoreLogCleanup,
                 reply,
-                |batch| {
-                    persistence::begin_core_log_cleanup(
-                        batch,
-                        owner,
-                        executor,
-                        started,
-                        operation.epoch,
-                    )
-                },
+                |batch| persistence::begin_core_log_cleanup(batch, owner, executor, started),
             ),
-            Self::SaveJobInput {
-                existing,
-                draft,
-                reply,
-            } => run(
-                database,
-                operation,
-                commit,
-                Kind::SaveJobInput,
-                reply,
-                |batch| persistence::save_job_input(batch, existing, draft),
-            ),
-            Self::CreateJobWithInput { job, input, reply } => run(
+            Self::CreateJob { job, reply } => run(
                 database,
                 operation,
                 commit,
                 Kind::CreateJobWithInput,
                 reply,
-                |batch| persistence::create_job_with_input(batch, job, input),
+                |batch| persistence::create_job(batch, job),
             ),
-            // Its marker is that of the creation; the start is part of it.
-            Self::CreateLocalJobWithInput {
+            // The start is part of the creation.
+            Self::CreateLocalJob {
                 job,
-                input,
+                executor,
                 submission,
                 reply,
             } => run(
@@ -379,16 +304,10 @@ impl Command {
                 Kind::CreateJobWithInput,
                 reply,
                 |batch| match submission {
-                    None => {
-                        persistence::create_local_job_with_input(batch, job, input, operation.epoch)
+                    None => persistence::create_local_job(batch, job, executor),
+                    Some(submission) => {
+                        persistence::create_submitted_local_job(batch, job, executor, submission)
                     }
-                    Some(submission) => persistence::create_submitted_local_job(
-                        batch,
-                        job,
-                        input,
-                        operation.epoch,
-                        submission,
-                    ),
                 },
             ),
             Self::RetryJob { retry, reply } => run(
@@ -399,23 +318,7 @@ impl Command {
                 reply,
                 |batch| persistence::retry_job(batch, retry),
             ),
-            Self::StartJob { job, reply } => run(
-                database,
-                operation,
-                commit,
-                Kind::StartJob,
-                reply,
-                |batch| persistence::start_job(batch, job),
-            ),
-            Self::StartLocalJob { job, reply } => run(
-                database,
-                operation,
-                commit,
-                Kind::StartLocalJob,
-                reply,
-                |batch| persistence::start_local_job(batch, job, operation.epoch),
-            ),
-            Self::AssignJobExecutor {
+            Self::StartJob {
                 job,
                 executor,
                 reply,
@@ -423,9 +326,9 @@ impl Command {
                 database,
                 operation,
                 commit,
-                Kind::AssignJobExecutor,
+                Kind::StartLocalJob,
                 reply,
-                |batch| persistence::assign_job_executor(batch, job, executor),
+                |batch| persistence::start_job(batch, job, executor),
             ),
             Self::AssociateJobProject {
                 job,
@@ -475,37 +378,21 @@ impl Command {
                 reply,
                 |batch| persistence::create_project(batch, project),
             ),
-            Self::CreateLlmProvider { provider, reply } => run(
-                database,
-                operation,
-                commit,
-                Kind::CreateLlmProvider,
-                reply,
-                |batch| persistence::create_llm_provider(batch, provider),
-            ),
-            Self::CreateProfile { profile, reply } => run(
+            Self::CreateConfig { config, reply } => run(
                 database,
                 operation,
                 commit,
                 Kind::CreateProfile,
                 reply,
-                |batch| persistence::create_profile(batch, profile),
+                |batch| persistence::create_config(batch, config),
             ),
-            Self::UpdateProfile { id, profile, reply } => run(
+            Self::UpdateConfig { id, config, reply } => run(
                 database,
                 operation,
                 commit,
                 Kind::UpdateProfile,
                 reply,
-                |batch| persistence::update_profile(batch, id, profile),
-            ),
-            Self::CreateAgent { agent, reply } => run(
-                database,
-                operation,
-                commit,
-                Kind::CreateAgent,
-                reply,
-                |batch| persistence::create_agent(batch, agent),
+                |batch| persistence::update_config(batch, id, config),
             ),
             Self::CreateAttachment { attachment, reply } => run(
                 database,
@@ -579,34 +466,6 @@ impl Command {
                 reply,
                 |batch| persistence::reconcile_tool_effect(batch, call, *reconciliation),
             ),
-            Self::CommitAvailabilityAggregation { plan, reply } => {
-                let outcome =
-                    storage::commit_availability_aggregation(database, operation, commit, *plan);
-                // Only this command can decline: `Ok(None)` is its explicit
-                // statement that nothing was committed, not a reply value.
-                let declined = matches!(outcome.result, Ok(None));
-                settle(
-                    operation,
-                    commit,
-                    Kind::ConsumeAvailability,
-                    reply,
-                    outcome,
-                    declined,
-                )
-            }
-            Self::CommitTokenAggregation { plan, reply } => {
-                let outcome = storage::commit_token_aggregation(database, operation, commit, *plan);
-                // The same explicit decline as the availability commit.
-                let declined = matches!(outcome.result, Ok(None));
-                settle(
-                    operation,
-                    commit,
-                    Kind::ConsumeTokenUsage,
-                    reply,
-                    outcome,
-                    declined,
-                )
-            }
         }
     }
 
@@ -618,22 +477,17 @@ impl Command {
             Self::ClaimExecution { request, .. } => {
                 byte_count(request.allowed_pools.len()).saturating_mul(8)
             }
-            Self::ReconcileUnexecutedClaim { .. } => 0,
+            Self::ClaimBatch { .. } => 4096,
             Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
-            Self::SetExecutionPoolEnabled { .. } | Self::SetExecutionPoolProfile { .. } => 0,
+            Self::SetExecutionPoolEnabled { .. } | Self::UpdateExecutionPool { .. } => 64,
             Self::BeginCoreLogCleanup { started, .. } => {
                 output_bytes(&started.summary, &started.code, &started.value).saturating_add(256)
             }
-            Self::SaveJobInput { draft, .. } => {
-                text_bytes(&draft.submission_id).saturating_add(text_bytes(&draft.objective))
-            }
-            Self::CreateJobWithInput { job, .. } | Self::CreateLocalJobWithInput { job, .. } => {
-                text_bytes(&job.name)
+            Self::CreateJob { job, .. } | Self::CreateLocalJob { job, .. } => {
+                text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
             Self::StartJob { .. }
-            | Self::StartLocalJob { .. }
-            | Self::AssignJobExecutor { .. }
             | Self::AssociateJobProject { .. }
             | Self::ConfirmJobStopped { .. } => 0,
             // The record rewritten keeps its length; the allowance covers it.
@@ -653,22 +507,19 @@ impl Command {
             Self::CreateProject { project, .. } => {
                 byte_count(project.name.len()).saturating_add(text_bytes(&project.description))
             }
-            Self::CreateLlmProvider { provider, .. } => byte_count(provider.name.len())
-                .saturating_add(text_bytes(&provider.endpoint))
-                .saturating_add(text_bytes(&provider.credential_ref)),
-            Self::CreateProfile { profile, .. } | Self::UpdateProfile { profile, .. } => {
-                byte_count(profile.name.len()).saturating_add(match &profile.config {
-                    NewProfileConfig::Agent { config, .. } => text_bytes(&config.instructions),
-                    NewProfileConfig::Llm { config, .. } => byte_count(config.model.len()),
-                    NewProfileConfig::ExecutionPool(_) => 32,
+            Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {
+                byte_count(config.name.len()).saturating_add(match &config.body {
+                    ConfigBody::Agent(agent) => text_bytes(&agent.instructions)
+                        .saturating_add(text_bytes(&agent.tool_grant)),
+                    ConfigBody::Model(model) => byte_count(model.model.len()),
+                    ConfigBody::Connection(connection) => text_bytes(&connection.endpoint)
+                        .saturating_add(text_bytes(&connection.credential_ref)),
+                    ConfigBody::Pool(_) => 32,
                 })
             }
-            Self::CreateAgent { agent, .. } => byte_count(agent.name.len()),
             Self::CreateAttachment { attachment, .. } => byte_count(attachment.mime.len())
                 .saturating_add(text_bytes(&attachment.display_name)),
             Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
-            Self::CommitAvailabilityAggregation { plan, .. } => plan.encoded_bytes(),
-            Self::CommitTokenAggregation { plan, .. } => plan.encoded_bytes(),
             Self::RecordAvailabilityStat { stat, .. } => {
                 let observation = &stat.observation;
                 let failure = observation.failure.as_ref().map_or(0, |failure| {
@@ -712,27 +563,23 @@ impl Command {
     pub(super) fn refuse(self, error: impl Fn() -> DatabaseError) {
         match self {
             Self::ClaimExecution { reply, .. } => refuse(reply, error),
-            Self::ReconcileUnexecutedClaim { reply, .. } => refuse(reply, error),
+            Self::ClaimBatch { reply, .. } => refuse(reply, error),
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
             Self::SetExecutionPoolEnabled { reply, .. }
-            | Self::SetExecutionPoolProfile { reply, .. } => refuse(reply, error),
+            | Self::UpdateExecutionPool { reply, .. } => refuse(reply, error),
             Self::BeginCoreLogCleanup { reply, .. } => refuse(reply, error),
-            Self::SaveJobInput { reply, .. } => refuse(reply, error),
-            Self::CreateJobWithInput { reply, .. }
-            | Self::CreateLocalJobWithInput { reply, .. }
+            Self::CreateJob { reply, .. }
+            | Self::CreateLocalJob { reply, .. }
             | Self::RetryJob { reply, .. } => refuse(reply, error),
-            Self::StartJob { reply, .. }
-            | Self::StartLocalJob { reply, .. }
-            | Self::AssignJobExecutor { reply, .. }
-            | Self::AssociateJobProject { reply, .. } => refuse(reply, error),
+            Self::StartJob { reply, .. } | Self::AssociateJobProject { reply, .. } => {
+                refuse(reply, error)
+            }
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
             Self::FinalizeJob { reply, .. } => refuse(reply, error),
             Self::CreateExecutor { reply, .. } => refuse(reply, error),
             Self::CreateProject { reply, .. } => refuse(reply, error),
-            Self::CreateLlmProvider { reply, .. } => refuse(reply, error),
-            Self::CreateProfile { reply, .. } => refuse(reply, error),
-            Self::UpdateProfile { reply, .. } => refuse(reply, error),
-            Self::CreateAgent { reply, .. } => refuse(reply, error),
+            Self::CreateConfig { reply, .. } => refuse(reply, error),
+            Self::UpdateConfig { reply, .. } => refuse(reply, error),
             Self::CreateAttachment { reply, .. } => refuse(reply, error),
             Self::CleanupAttachment { reply, .. } => refuse(reply, error),
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
@@ -741,8 +588,6 @@ impl Command {
             Self::RecordToolDecision { reply, .. }
             | Self::RecordToolOutcome { reply, .. }
             | Self::ReconcileToolEffect { reply, .. } => refuse(reply, error),
-            Self::CommitAvailabilityAggregation { reply, .. } => refuse(reply, error),
-            Self::CommitTokenAggregation { reply, .. } => refuse(reply, error),
         }
     }
 }

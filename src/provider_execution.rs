@@ -3309,14 +3309,20 @@ pub(crate) mod tests {
     fn an_invalid_conversation_is_never_sent_and_is_known_not_delivered() {
         let frozen = FrozenExecutionConfig {
             agent: None,
+            agent_ref: None,
             llm: crate::persistence::FrozenLlmConfig {
                 config: crate::persistence::LlmConfig {
                     model: "model-a".to_owned(),
                     parameters: LlmParameters::default(),
                     declared_capabilities: Default::default(),
                 },
+                model: crate::persistence::ConfigRef {
+                    id: crate::persistence::ConfigId::new(2),
+                    edit_seq: 1,
+                },
                 provider: crate::persistence::ProviderSnapshot {
                     id: crate::persistence::LlmProviderId::new(1),
+                    edit_seq: 1,
                     name: "local".to_owned(),
                     transport: crate::persistence::LlmTransport::OpenAiChatCompletions,
                     // Nothing listens here; validation must refuse first.
@@ -3355,6 +3361,7 @@ pub(crate) mod tests {
             &FrozenExecutionConfig {
                 agent: Some(crate::persistence::AgentConfig {
                     instructions: Some("be brief".to_owned()),
+                    ..Default::default()
                 }),
                 ..frozen
             },
@@ -3377,14 +3384,20 @@ pub(crate) mod tests {
     fn unreachable_frozen() -> FrozenExecutionConfig {
         FrozenExecutionConfig {
             agent: None,
+            agent_ref: None,
             llm: crate::persistence::FrozenLlmConfig {
                 config: crate::persistence::LlmConfig {
                     model: "model-v".to_owned(),
                     parameters: LlmParameters::default(),
                     declared_capabilities: Default::default(),
                 },
+                model: crate::persistence::ConfigRef {
+                    id: crate::persistence::ConfigId::new(2),
+                    edit_seq: 1,
+                },
                 provider: crate::persistence::ProviderSnapshot {
                     id: crate::persistence::LlmProviderId::new(1),
+                    edit_seq: 1,
                     name: "local".to_owned(),
                     transport: crate::persistence::LlmTransport::OpenAiChatCompletions,
                     endpoint: Some("https://127.0.0.1:9/v1".to_owned()),

@@ -3,11 +3,12 @@
 //! - `POST /api/v1/profiles`
 //! - `POST /api/v1/profiles/{profile}`
 //!
-//! Profiles are a persisted business authority. Providers are computed
-//! projections derived from LLM Profile configurations; the underlying
-//! technical `LlmProviderRecord` rows are resolved or created automatically
-//! from Profile-owned configuration. Raw credentials are write-only and never
-//! returned in any read response.
+//! A Profile is a config: an LLM Profile is a Model config and an Agent
+//! Profile an Agent config. Providers are computed projections derived from
+//! the LLM Profiles; the Connection configs they name are resolved or created
+//! automatically from Profile-owned configuration. Edits are always allowed
+//! and change no Job that froze the old values. Raw credentials are
+//! write-only and never returned in any read response.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
@@ -22,8 +23,8 @@ use super::{
 };
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
-    AgentConfig, ExecutorType, LlmConfig, LlmParameters, LlmProviderId, LlmTransport,
-    ModelCapability, NewExecutor, NewLlmProvider, NewProfile, NewProfileConfig, Profile, ProfileId,
+    AgentBehavior, AgentConfig, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig,
+    LlmParameters, LlmTransport, ModelCapability, ModelConfig, NewConfig, NewExecutor, ProfileId,
     RecordRef, Violation,
 };
 
@@ -99,15 +100,15 @@ const INVALID_LLM_TARGET: Refusal = Refusal::new(
     "invalid_llm_target",
     "every llm_target must be an existing LLM Profile without duplicates",
 );
+const INVALID_BEHAVIOR: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_behavior",
+    "behavior must be chat or general",
+);
 const WRONG_PROFILE_KIND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "wrong_profile_kind",
     "a Profile's kind cannot be changed after creation",
-);
-const PROFILE_LOCKED: Refusal = Refusal::new(
-    StatusCode::CONFLICT,
-    "profile_locked",
-    "the Profile cannot be edited while unfinished Jobs reference it",
 );
 const STORAGE_REFUSED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
@@ -182,6 +183,8 @@ enum WireProfileRequest {
         #[serde(default)]
         instructions: Option<String>,
         #[serde(default)]
+        behavior: Option<String>,
+        #[serde(default)]
         llm_targets: Vec<String>,
     },
 }
@@ -230,10 +233,8 @@ fn default_credential_ref(name: &str) -> String {
 
 fn map_mutation_error(error: DatabaseError) -> Refusal {
     match error {
-        DatabaseError::Rejected(Violation::ProfileLocked { .. }) => PROFILE_LOCKED,
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
-        DatabaseError::Rejected(Violation::WrongProfileKind(_))
-        | DatabaseError::WrongProfileKind(_) => WRONG_PROFILE_KIND,
+        DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
         DatabaseError::Rejected(Violation::DuplicateReference(_)) => INVALID_LLM_TARGET,
         DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
         DatabaseError::ShuttingDown | DatabaseError::ReadsClosed => SHUTTING_DOWN,
@@ -250,22 +251,20 @@ fn map_mutation_error(error: DatabaseError) -> Refusal {
     }
 }
 
-/// Ensures at least one compatible OpenAI Chat Completions Llm Executor exists
-/// so newly created LLM Profiles can be selected and executed immediately.
+/// Ensures at least one Pool offers OpenAI Chat Completions, so newly created
+/// LLM Profiles can be selected and executed immediately.
 async fn ensure_compatible_executor(database: &DatabaseHandle) -> Result<(), Refusal> {
     let executors = database.executors(None, PROFILE_SCAN_LIMIT).await?;
     let has_compatible = executors.iter().any(|executor| {
-        executor.executor_type == ExecutorType::Llm
-            && executor
-                .llm_transports
-                .contains(&LlmTransport::OpenAiChatCompletions)
+        executor
+            .llm_transports
+            .contains(&LlmTransport::OpenAiChatCompletions)
     });
     if !has_compatible {
         let concurrency_limit = NonZeroU32::new(4).ok_or(INTERNAL)?;
         database
             .create_executor(NewExecutor {
                 name: "local-openai-executor".to_owned(),
-                executor_type: ExecutorType::Llm,
                 concurrency_limit,
                 llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
             })
@@ -275,28 +274,31 @@ async fn ensure_compatible_executor(database: &DatabaseHandle) -> Result<(), Ref
     Ok(())
 }
 
-/// Resolves or creates the technical `LlmProviderRecord` matching the
-/// Profile-owned transport, endpoint, and credential reference.
-async fn resolve_or_create_provider(
+/// Resolves or creates the Connection config matching the Profile-owned
+/// protocol, endpoint and credential reference.
+async fn resolve_or_create_connection(
     database: &DatabaseHandle,
     profile_name: &str,
     endpoint: Option<String>,
     credential_ref: Option<String>,
-) -> Result<LlmProviderId, Refusal> {
-    let existing = database.llm_providers(None, PROFILE_SCAN_LIMIT).await?;
-    if let Some(found) = existing.into_iter().find(|provider| {
-        provider.transport == LlmTransport::OpenAiChatCompletions
-            && provider.endpoint == endpoint
-            && provider.credential_ref == credential_ref
-    }) {
+) -> Result<ConfigId, Refusal> {
+    let wanted = ConnectionConfig {
+        protocol: LlmTransport::OpenAiChatCompletions,
+        endpoint,
+        credential_ref,
+    };
+    let existing = database
+        .configs(Some(ConfigKind::Connection), None, PROFILE_SCAN_LIMIT)
+        .await?;
+    if let Some(found) = existing.into_iter().find(
+        |connection| matches!(&connection.body, ConfigBody::Connection(body) if *body == wanted),
+    ) {
         return Ok(found.id);
     }
     database
-        .create_llm_provider(NewLlmProvider {
+        .create_config(NewConfig {
             name: format!("{profile_name} provider"),
-            transport: LlmTransport::OpenAiChatCompletions,
-            endpoint,
-            credential_ref,
+            body: ConfigBody::Connection(wanted),
         })
         .await
         .map_err(map_mutation_error)
@@ -313,7 +315,7 @@ async fn build_profiles_snapshot(
     database: &DatabaseHandle,
     saved_profile: Option<ProfileId>,
 ) -> Result<Value, Refusal> {
-    let records = database.profiles(None, PROFILE_SCAN_LIMIT).await?;
+    let records = database.configs(None, None, PROFILE_SCAN_LIMIT).await?;
     let mut llm_profiles = Vec::new();
     let mut agent_profiles = Vec::new();
 
@@ -329,99 +331,110 @@ async fn build_profiles_snapshot(
         models: BTreeSet<String>,
     }
     let mut provider_groups: BTreeMap<ProviderKey, ProviderGroup> = BTreeMap::new();
+    let connections: BTreeMap<ConfigId, ConnectionConfig> = records
+        .iter()
+        .filter_map(|record| match &record.body {
+            ConfigBody::Connection(body) => Some((record.id, body.clone())),
+            _ => None,
+        })
+        .collect();
 
     for record in records {
-        let editability = database
-            .profile_editability(record.id)
-            .await?
-            .ok_or(INCONSISTENT_RECORD)?;
-        let blocking_jobs = editability
-            .blocking_jobs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        let editable = editability.editable();
-
-        if let Ok(llm) = Profile::<LlmConfig>::try_from(record.clone()) {
-            let provider = database
-                .llm_provider(llm.links)
-                .await?
-                .ok_or(INCONSISTENT_RECORD)?;
-            let executors = database
-                .compatible_executors(llm.id)
-                .await?
-                .into_iter()
-                .map(|executor| executor.to_string())
-                .collect::<Vec<_>>();
-            let protocol = match provider.transport {
-                LlmTransport::OpenAiChatCompletions => "openai_chat_completions",
-            };
-            let has_credential = provider
-                .credential_ref
-                .as_deref()
-                .is_some_and(|reference| database.has_credential(reference));
-            let capabilities = llm
-                .config
-                .declared_capabilities
-                .iter()
-                .map(|cap| capability_str(*cap))
-                .collect::<Vec<_>>();
-            let id_str = llm.id.to_string();
-
-            let key = ProviderKey {
-                protocol,
-                endpoint: provider.endpoint.clone(),
-                credential_ref: provider.credential_ref.clone(),
-            };
-            let group = provider_groups.entry(key).or_insert_with(|| ProviderGroup {
-                has_credential,
-                profile_ids: Vec::new(),
-                models: BTreeSet::new(),
-            });
-            group.profile_ids.push(id_str.clone());
-            group.models.insert(llm.config.model.clone());
-
-            llm_profiles.push(json!({
-                "id": id_str,
-                "name": llm.name,
-                "model": llm.config.model,
-                "protocol": protocol,
-                "endpoint": provider.endpoint,
-                "credential_ref": provider.credential_ref,
-                "has_credential": has_credential,
-                "declared_capabilities": capabilities,
-                "parameters": {
-                    "temperature": llm.config.parameters.temperature,
-                    "top_p": llm.config.parameters.top_p,
-                    "max_tokens": llm.config.parameters.max_tokens,
-                    "presence_penalty": llm.config.parameters.presence_penalty,
-                    "frequency_penalty": llm.config.parameters.frequency_penalty,
-                },
-                "executors": executors,
-                "editable": editable,
-                "blocking_jobs": blocking_jobs,
-                "more_blocking_jobs": editability.more_blocking_jobs,
-                "created_at_us": micros(Some(llm.created_at)),
-                "updated_at_us": micros(Some(llm.updated_at)),
-            }));
-        } else if let Ok(agent) = Profile::<AgentConfig>::try_from(record) {
-            agent_profiles.push(json!({
-                "id": agent.id.to_string(),
-                "name": agent.name,
-                "instructions": agent.config.instructions,
-                "llm_targets": agent
-                    .links
+        if record.archived_at.is_some() {
+            continue;
+        }
+        let id = ProfileId::from(record.id);
+        match record.body {
+            ConfigBody::Model(model) => {
+                let connection = connections
+                    .get(&model.connection_id)
+                    .ok_or(INCONSISTENT_RECORD)?;
+                let executors = database
+                    .compatible_executors(id)
+                    .await?
+                    .into_iter()
+                    .map(|executor| executor.to_string())
+                    .collect::<Vec<_>>();
+                let protocol = match connection.protocol {
+                    LlmTransport::OpenAiChatCompletions => "openai_chat_completions",
+                };
+                let has_credential = connection
+                    .credential_ref
+                    .as_deref()
+                    .is_some_and(|reference| database.has_credential(reference));
+                let capabilities = model
+                    .declared_capabilities
                     .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>(),
-                "editable": editable,
-                "blocking_jobs": blocking_jobs,
-                "more_blocking_jobs": editability.more_blocking_jobs,
-                "created_at_us": micros(Some(agent.created_at)),
-                "updated_at_us": micros(Some(agent.updated_at)),
-            }));
+                    .map(|cap| capability_str(*cap))
+                    .collect::<Vec<_>>();
+                let id_str = id.to_string();
+
+                let key = ProviderKey {
+                    protocol,
+                    endpoint: connection.endpoint.clone(),
+                    credential_ref: connection.credential_ref.clone(),
+                };
+                let group = provider_groups.entry(key).or_insert_with(|| ProviderGroup {
+                    has_credential,
+                    profile_ids: Vec::new(),
+                    models: BTreeSet::new(),
+                });
+                group.profile_ids.push(id_str.clone());
+                group.models.insert(model.model.clone());
+
+                llm_profiles.push(json!({
+                    "id": id_str,
+                    "name": record.name,
+                    "model": model.model,
+                    "protocol": protocol,
+                    "endpoint": connection.endpoint,
+                    "credential_ref": connection.credential_ref,
+                    "has_credential": has_credential,
+                    "declared_capabilities": capabilities,
+                    "parameters": {
+                        "temperature": model.parameters.temperature,
+                        "top_p": model.parameters.top_p,
+                        "max_tokens": model.parameters.max_tokens,
+                        "presence_penalty": model.parameters.presence_penalty,
+                        "frequency_penalty": model.parameters.frequency_penalty,
+                    },
+                    "executors": executors,
+                    // Edits are always allowed and change no Job that froze the
+                    // old values, so nothing locks a Profile.
+                    "editable": true,
+                    "blocking_jobs": Vec::<String>::new(),
+                    "more_blocking_jobs": false,
+                    "created_at_us": micros(Some(record.created_at)),
+                    "updated_at_us": micros(Some(record.updated_at)),
+                }));
+            }
+            ConfigBody::Agent(agent) => {
+                agent_profiles.push(json!({
+                    "id": id.to_string(),
+                    "name": record.name,
+                    "instructions": agent.instructions,
+                    "behavior": match agent.behavior {
+                        AgentBehavior::Chat => "chat",
+                        AgentBehavior::General => "general",
+                    },
+                    "llm_targets": agent
+                        .models
+                        .iter()
+                        .map(|model| ProfileId::from(*model).to_string())
+                        .collect::<Vec<_>>(),
+                    "editable": true,
+                    "blocking_jobs": Vec::<String>::new(),
+                    "more_blocking_jobs": false,
+                    "created_at_us": micros(Some(record.created_at)),
+                    "updated_at_us": micros(Some(record.updated_at)),
+                }));
+            }
+            ConfigBody::Connection(_) | ConfigBody::Pool(_) => {}
         }
     }
+    // Newest first, as Profiles have always been listed.
+    llm_profiles.sort_by_key(|profile| std::cmp::Reverse(profile_number(profile)));
+    agent_profiles.sort_by_key(|profile| std::cmp::Reverse(profile_number(profile)));
 
     let providers = provider_groups
         .into_iter()
@@ -449,6 +462,13 @@ async fn build_profiles_snapshot(
     Ok(body)
 }
 
+fn profile_number(profile: &Value) -> u64 {
+    profile["id"]
+        .as_str()
+        .and_then(|id| profile_id(id).ok())
+        .map_or(0, ProfileId::get)
+}
+
 pub(super) async fn save_profile(
     database: &DatabaseHandle,
     existing_id: Option<ProfileId>,
@@ -456,7 +476,7 @@ pub(super) async fn save_profile(
 ) -> Result<Reply, Refusal> {
     let request: WireProfileRequest =
         serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
-    let new_profile = match request {
+    let new_config = match request {
         WireProfileRequest::Llm {
             name,
             model,
@@ -526,19 +546,24 @@ pub(super) async fn save_profile(
                 return Err(INVALID_PARAMETERS);
             }
 
-            // If updating an existing LLM profile, inspect its current provider
-            // so we can preserve its credential_ref when none is supplied.
+            // If updating an existing LLM profile, inspect its current
+            // Connection so we can preserve its credential_ref when none is
+            // supplied.
             let prior_credential_ref = if let Some(id) = existing_id {
-                let Some(existing_record) = database.profile(id).await? else {
+                let Some(existing_record) = database.config(id.into()).await? else {
                     return Err(PROFILE_NOT_FOUND);
                 };
-                let existing_llm = Profile::<LlmConfig>::try_from(existing_record)
-                    .map_err(|_| WRONG_PROFILE_KIND)?;
-                let existing_provider = database
-                    .llm_provider(existing_llm.links)
+                let ConfigBody::Model(existing_model) = existing_record.body else {
+                    return Err(WRONG_PROFILE_KIND);
+                };
+                let existing_connection = database
+                    .config(existing_model.connection_id)
                     .await?
                     .ok_or(INCONSISTENT_RECORD)?;
-                existing_provider.credential_ref
+                match existing_connection.body {
+                    ConfigBody::Connection(connection) => connection.credential_ref,
+                    _ => return Err(INCONSISTENT_RECORD),
+                }
             } else {
                 None
             };
@@ -574,7 +599,7 @@ pub(super) async fn save_profile(
             };
 
             ensure_compatible_executor(database).await?;
-            let provider = resolve_or_create_provider(
+            let connection = resolve_or_create_connection(
                 database,
                 name.trim(),
                 normalized_endpoint,
@@ -582,27 +607,26 @@ pub(super) async fn save_profile(
             )
             .await?;
 
-            NewProfile {
+            NewConfig {
                 name: name.trim().to_owned(),
-                config: NewProfileConfig::Llm {
-                    provider,
-                    config: LlmConfig {
-                        model: model.trim().to_owned(),
-                        parameters: LlmParameters {
-                            temperature: parameters.temperature,
-                            top_p: parameters.top_p,
-                            max_tokens: parameters.max_tokens,
-                            presence_penalty: parameters.presence_penalty,
-                            frequency_penalty: parameters.frequency_penalty,
-                        },
-                        declared_capabilities: capabilities,
+                body: ConfigBody::Model(ModelConfig {
+                    connection_id: connection,
+                    model: model.trim().to_owned(),
+                    parameters: LlmParameters {
+                        temperature: parameters.temperature,
+                        top_p: parameters.top_p,
+                        max_tokens: parameters.max_tokens,
+                        presence_penalty: parameters.presence_penalty,
+                        frequency_penalty: parameters.frequency_penalty,
                     },
-                },
+                    declared_capabilities: capabilities,
+                }),
             }
         }
         WireProfileRequest::Agent {
             name,
             instructions,
+            behavior,
             llm_targets,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
@@ -621,36 +645,44 @@ pub(super) async fn save_profile(
                     Some(text.to_owned())
                 }
             };
+            // An Agent that does not say otherwise can hold a conversation.
+            let behavior = match behavior.as_deref().map(str::trim) {
+                None | Some("chat") => AgentBehavior::Chat,
+                Some("general") => AgentBehavior::General,
+                Some(_) => return Err(INVALID_BEHAVIOR),
+            };
             if llm_targets.is_empty() {
                 return Err(MISSING_LLM_TARGETS);
             }
-            let mut parsed_targets = Vec::with_capacity(llm_targets.len());
+            let mut parsed_targets: Vec<ConfigId> = Vec::with_capacity(llm_targets.len());
             for raw_target in &llm_targets {
                 let target_id = raw_target
                     .trim()
                     .strip_prefix("profile:")
                     .and_then(decimal::<u64>)
-                    .map(ProfileId::new)
+                    .map(ConfigId::new)
                     .ok_or(INVALID_LLM_TARGET)?;
                 if parsed_targets.contains(&target_id) {
                     return Err(INVALID_LLM_TARGET);
                 }
-                match database.llm_profile(target_id).await {
-                    Ok(Some(_)) => parsed_targets.push(target_id),
-                    Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => {
-                        return Err(INVALID_LLM_TARGET);
-                    }
-                    Err(error) => return Err(error.into()),
+                match database.config(target_id).await? {
+                    Some(ConfigRecord {
+                        body: ConfigBody::Model(_),
+                        ..
+                    }) => parsed_targets.push(target_id),
+                    _ => return Err(INVALID_LLM_TARGET),
                 }
             }
-            NewProfile {
+            parsed_targets.sort();
+            NewConfig {
                 name: name.trim().to_owned(),
-                config: NewProfileConfig::Agent {
-                    config: AgentConfig {
-                        instructions: normalized_instructions,
-                    },
-                    llm_targets: parsed_targets,
-                },
+                body: ConfigBody::Agent(AgentConfig {
+                    instructions: normalized_instructions,
+                    behavior,
+                    models: parsed_targets,
+                    default_model: None,
+                    tool_grant: None,
+                }),
             }
         }
     };
@@ -658,14 +690,14 @@ pub(super) async fn save_profile(
     let (status, profile_id) = match existing_id {
         None => {
             let created = database
-                .create_profile(new_profile)
+                .create_config(new_config)
                 .await
                 .map_err(map_mutation_error)?;
-            (StatusCode::CREATED, created)
+            (StatusCode::CREATED, ProfileId::from(created))
         }
         Some(id) => {
             database
-                .update_profile(id, new_profile)
+                .update_config(id.into(), new_config)
                 .await
                 .map_err(map_mutation_error)?;
             (StatusCode::OK, id)
@@ -679,11 +711,11 @@ pub(super) async fn save_profile(
 mod tests {
     use super::*;
     use crate::database::DatabaseWorker;
-    use crate::persistence::{ExecutionConfiguration, ExecutionMode, JobInputDraft, NewJob};
+    use crate::persistence::{ExecutionConfiguration, JobInputDraft, NewJob};
     use crate::test_support::data_directory;
 
     #[test]
-    fn profile_crud_computes_providers_redacts_secrets_and_enforces_locks() {
+    fn profile_crud_computes_providers_redacts_secrets_and_edits_leave_frozen_jobs_alone() {
         ntex::rt::System::new("profiles-test", ntex::rt::DefaultRuntime).block_on(async {
             let (_root, directory) = data_directory("profiles", "crud");
             let worker = DatabaseWorker::start(&directory).expect("start database");
@@ -704,14 +736,20 @@ mod tests {
                     "max_tokens": 2048
                 }
             });
-            let reply = save_profile(&handle, None, & serde_json::to_vec(&create_llm).unwrap())
+            let reply = save_profile(&handle, None, &serde_json::to_vec(&create_llm).unwrap())
                 .await
                 .expect("create llm profile");
             assert_eq!(reply.status, StatusCode::CREATED);
             let serialized = reply.body.to_string();
-            assert!(!serialized.contains(secret), "raw secret must never be returned");
+            assert!(
+                !serialized.contains(secret),
+                "raw secret must never be returned"
+            );
 
-            let llm_id_str = reply.body["profile_id"].as_str().expect("profile_id").to_owned();
+            let llm_id_str = reply.body["profile_id"]
+                .as_str()
+                .expect("profile_id")
+                .to_owned();
             let llm_id = profile_id(&llm_id_str).expect("valid profile id");
             assert_eq!(reply.body["llm_profiles"][0]["has_credential"], true);
             assert_eq!(reply.body["llm_profiles"][0]["editable"], true);
@@ -747,60 +785,46 @@ mod tests {
                 .to_owned();
             let agent_id = profile_id(&agent_id_str).expect("valid agent id");
 
-            // Submit an active Job referencing both Profiles, locking them.
-            let executor_id = handle
-                .compatible_executors(llm_id)
-                .await
-                .expect("compatible executors")[0];
-            let input_id = handle
-                .save_job_input(
-                    None,
-                    JobInputDraft {
-                        objective: Some("Hold lock".to_owned()),
+            // A Job submitted with both Profiles freezes what they hold.
+            let job = handle
+                .create_job(NewJob {
+                    name: None,
+                    eligible_at: None,
+                    parent: handle.genesis(),
+                    projects: Vec::new(),
+                    dependencies: Vec::new(),
+                    input: JobInputDraft {
+                        objective: Some("Hold the old model".to_owned()),
                         ..JobInputDraft::default()
                     },
-                )
+                    configuration: Some(ExecutionConfiguration {
+                        agent_profile: Some(agent_id),
+                        llm_profile: llm_id,
+                    }),
+                    previous: None,
+                })
                 .await
-                .expect("save input");
-            handle
-                .create_job_with_input(
-                    NewJob {
-                        name: None,
-                        execution_mode: ExecutionMode::Once,
-                        eligible_at: None,
-                        scheduled_at: None,
-                        next_due_at: None,
-                        next_iteration_no: None,
-                        iteration_no: None,
-                        parent: handle.genesis(),
-                        projects: Vec::new(),
-                        dependencies: Vec::new(),
-                        configuration: Some(ExecutionConfiguration {
-                            agent_profile: Some(agent_id),
-                            llm_profile: llm_id,
-                        }),
-                        assigned_executor: Some(executor_id),
-                        previous: None,
-                        replaces: None,
-                    },
-                    input_id,
-                )
-                .await
-                .expect("create active job");
+                .expect("create the Job");
 
-            let locked = save_profile(
-                &handle,
-                Some(llm_id),
-                &serde_json::to_vec(&create_llm).unwrap(),
-            )
-            .await
-            .err()
-            .expect("locked profile must refuse update");
-            assert_eq!(locked.status, StatusCode::CONFLICT);
-            assert_eq!(locked.code, "profile_locked");
+            // Nothing locks a Profile: the edit is made in place.
+            let mut edited = create_llm.clone();
+            edited["model"] = json!("gpt-4o-mini");
+            let edited_reply =
+                save_profile(&handle, Some(llm_id), &serde_json::to_vec(&edited).unwrap())
+                    .await
+                    .expect("an edit is always allowed");
+            assert_eq!(edited_reply.status, StatusCode::OK);
+            assert_eq!(edited_reply.body["llm_profiles"][0]["model"], "gpt-4o-mini");
+            assert_eq!(edited_reply.body["llm_profiles"][0]["editable"], true);
+            let config = handle.config(llm_id.into()).await.unwrap().unwrap();
+            assert_eq!(config.edit_seq, 2);
+
+            // The Job keeps the values it froze.
+            let frozen = handle.job_configuration(job).await.unwrap().unwrap();
+            assert_eq!(frozen.frozen.llm.config.model, "gpt-4o");
+            assert_eq!(frozen.frozen.llm.model.edit_seq, 1);
 
             worker.shutdown().expect("shutdown");
         });
     }
 }
-

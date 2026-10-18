@@ -49,7 +49,7 @@ use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceErro
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write};
 use ocg::persistence::{
-    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, ExecutionMode, JobId,
+    AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, JobId,
     JobInputDraft, MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind,
     RequestNumber, ToolDecision, ToolOutcome,
 };
@@ -284,9 +284,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
             eprintln!(
                 "OCG runs `cargo check` and `cargo test` in the Workspace with its own permissions; build scripts and tests run project code unsandboxed, so authorize only a Workspace you trust"
             );
-            eprintln!(
-                "OCG additionally offers lazy bounded FTS and semantic LSP queries; language servers run native project code with OCG permissions, without a sandbox. Missing servers are reported unavailable."
-            );
+            eprintln!("OCG additionally offers lazy bounded FTS.");
             Some(workspace_command::code_tools(workspace)?)
         }
         Mode::Vision => {
@@ -388,22 +386,16 @@ async fn submit(
         },
         job: NewJob {
             name: Some(format!("{command} one-shot")),
-            execution_mode: ExecutionMode::Once,
             eligible_at: None,
-            scheduled_at: None,
-            next_due_at: None,
-            next_iteration_no: None,
-            iteration_no: None,
             parent: database.genesis(),
             projects: Vec::new(),
             dependencies: Vec::new(),
+            input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: None,
                 llm_profile,
             }),
-            assigned_executor: None,
             previous: None,
-            replaces: None,
         },
         credential_resolver: Arc::new(EnvironmentCredentialResolver),
         provider_config: ProviderExecutionConfig {
@@ -675,9 +667,9 @@ impl std::fmt::Display for TokenDisplay {
 mod tests {
     use ocg::openai_compatible::NormalizedUsage;
     use ocg::persistence::{
-        AvailabilityObservation, AvailabilityStatId, FrozenLlmConfig, LlmConfig, LlmParameters,
-        LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsId, ProfileId,
-        ProviderSnapshot, Timestamp,
+        AvailabilityObservation, AvailabilityStatId, ConfigId, ConfigRef, FrozenLlmConfig,
+        LlmConfig, LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsId,
+        ProfileId, ProviderSnapshot, Timestamp,
     };
     use ocg::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
@@ -702,10 +694,15 @@ mod tests {
                 },
                 provider: ProviderSnapshot {
                     id: LlmProviderId::new(1),
+                    edit_seq: 1,
                     name: "provider".to_owned(),
                     transport: LlmTransport::OpenAiChatCompletions,
                     endpoint: None,
                     credential_ref: None,
+                },
+                model: ConfigRef {
+                    id: ConfigId::new(2),
+                    edit_seq: 1,
                 },
             },
         }

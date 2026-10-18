@@ -5,6 +5,10 @@ import {
   decodeAttachment,
   decodeControlError,
   decodeHealth,
+  decodeJobs,
+  decodeUsage,
+  decodeAvailability,
+  decodeLogs,
   decodeJob,
   decodeJobConversation,
   decodeJobInput,
@@ -94,10 +98,12 @@ export type ControlSubmissionResult = {
   created: boolean;
 };
 
-function controlOrigin(raw: string): string {
+function controlOrigin(raw: string, browserSession: boolean): string {
   const url = new URL(raw);
-  if (url.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(url.hostname) ||
-    !url.port || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+  const loopback = url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname) && Boolean(url.port);
+  const secureBrowser = browserSession && typeof window !== "undefined" &&
+    url.protocol === "https:" && window.location.origin === url.origin;
+  if ((!loopback && !secureBrowser) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
     throw new ControlTransportError("invalid_control_origin", 0, false);
   }
   if (typeof window !== "undefined" && window.location.origin !== url.origin) {
@@ -146,15 +152,38 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
 
 export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
 
+export type ObservationSettings = {
+  fromUs?: number;
+  untilUs?: number;
+  after?: string;
+  llmProfile?: string;
+  limit?: number;
+  signal?: AbortSignal;
+};
+
+function observationQuery(settings: ObservationSettings): string {
+  const query: string[] = [];
+  for (const [name, value] of [["from_us", settings.fromUs], ["until_us", settings.untilUs], ["limit", settings.limit]] as const) {
+    if (value !== undefined) query.push(`${name}=${sequence(value)}`);
+  }
+  if (settings.after) {
+    if (!/^[A-Za-z0-9_-]{1,400}$/.test(settings.after)) throw new ContractError("after", "an observation cursor");
+    query.push(`after=${settings.after}`);
+  }
+  if (settings.llmProfile) query.push(`llm_profile=${identity(settings.llmProfile, "llm_profile", "profile:")}`);
+  return query.length ? `?${query.join("&")}` : "";
+}
+
 // Retains the 0.4.5 canonical client's injected-fetch boundary and contracts
 // entrypoint. None of its legacy lifecycle, chat or fixture stores are needed.
 export function createHttpCanonicalControlClient(options: HttpCanonicalControlClientOptions) {
-  const base = controlOrigin(options.baseUrl);
-  const fetchImpl = options.fetch.bind(globalThis);
   const programmatic = options.bearerToken !== undefined;
+  const base = controlOrigin(options.baseUrl, !programmatic);
+  const fetchImpl = options.fetch.bind(globalThis);
   // Delivery acknowledgements only; output history and Job state live on server.
   const cursors = new Map<string, number>();
   const active = new Map<string, AbortController>();
+  const profileListeners = new Set<() => void>();
   let closed = false;
 
   // The one credential this client sends: the bearer token of its caller,
@@ -302,6 +331,34 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   }
 
   return {
+    onProfilesChanged(listener: () => void) {
+      profileListeners.add(listener);
+      return () => { profileListeners.delete(listener); };
+    },
+
+    async readJobs(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {
+      const query = [`limit=${settings.limit ?? 50}`];
+      if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
+      return decodeJobs((await send("GET", `/api/v1/job-history?${query.join("&")}`, { signal: settings.signal })).input);
+    },
+
+    async readUsage(settings: ObservationSettings = {}) {
+      return decodeUsage((await send("GET", `/api/v1/usage${observationQuery(settings)}`, { signal: settings.signal })).input);
+    },
+
+    async readAvailability(settings: ObservationSettings = {}) {
+      return decodeAvailability((await send("GET", `/api/v1/availability${observationQuery(settings)}`, { signal: settings.signal })).input);
+    },
+
+    async readLogs(settings: { file?: string; limit?: number; signal?: AbortSignal } = {}) {
+      const query = [`limit=${settings.limit ?? 100}`];
+      if (settings.file) {
+        if (!/^\d{14}Z_runtime_\d+\.log$/.test(settings.file)) throw new ContractError("file", "a runtime log file name");
+        query.push(`file=${settings.file}`);
+      }
+      return decodeLogs((await send("GET", `/api/v1/logs?${query.join("&")}`, { signal: settings.signal })).input);
+    },
+
     lastOutputSequence(jobId: string): number | undefined { return cursors.get(jobId); },
 
     /** What the host establishes about itself and its database, now. */
@@ -355,7 +412,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeProfiles(answer.input);
+      const snapshot = decodeProfiles(answer.input);
+      profileListeners.forEach((listener) => listener());
+      return snapshot;
     },
 
     /** Updates an existing LLM Profile or Agent Profile. */
@@ -366,7 +425,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeProfiles(answer.input);
+      const snapshot = decodeProfiles(answer.input);
+      profileListeners.forEach((listener) => listener());
+      return snapshot;
     },
 
     /** One stored page of the Job's outputs, in `seq` order. */
@@ -540,6 +601,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     close(): void {
       closed = true;
+      profileListeners.clear();
       for (const controller of active.values()) controller.abort();
     },
   };

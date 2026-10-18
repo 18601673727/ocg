@@ -34,7 +34,7 @@ pub(super) const DEFAULT_OUTPUT_PAGE: usize = 50;
 
 /// The longest path and query a request may have, in bytes.
 pub(super) const MAX_PATH_BYTES: usize = 256;
-pub(super) const MAX_QUERY_BYTES: usize = 128;
+pub(super) const MAX_QUERY_BYTES: usize = 512;
 /// The most headers, and header bytes, a request may have.
 pub(super) const MAX_HEADERS: usize = 32;
 pub(super) const MAX_HEADER_BYTES: usize = 8 * 1024;

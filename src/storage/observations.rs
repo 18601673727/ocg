@@ -1,329 +1,399 @@
-use super::*;
+//! Reads of the raw request events a Job recorded, and the queries over the
+//! `request_scope` index: events by Connection and model.
 
-/// The LLM target a stored Job froze, read from only the links and the input
-/// that define it: RUNS_LLM_PROFILE, APPLIES_PROFILE for its consistency,
-/// HAS_INPUT and the frozen input. `None` for a Job submitted without an
-/// LLM configuration. Unlike [`submitted_configuration`], it assembles no
-/// [`JobRecord`], so the Job's Projects, parent, assignment and lineage are
-/// never read.
+use std::collections::HashMap;
+
+use super::rows::decode_request_event;
+use super::*;
+use crate::persistence::{
+    AvailabilityObservation, AvailabilityStatRecord, MetricsRecord, ObservationCursor,
+    ObservationFilter, ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelFilter,
+    ObservedModelPage, RequestEventRecord, RequestPayload,
+};
+use crate::token_usage::TokenAnnotation;
+
+/// The identity of a record within its Job: the request number and the
+/// event's number in it.
+fn pair(request: RequestNumber, seq: u32) -> u64 {
+    (u64::from(request.get()) << 32) | u64::from(seq)
+}
+
 pub(super) fn frozen_llm_target(
     rx: &ReadTransaction,
     job: JobId,
 ) -> Result<Option<LlmTarget>, StorageError> {
-    if rx
+    let Some(row) = rx
         .open_table(JOBS)?
         .get(job.get())?
-        .map(|v| JobRow::decode(v.value()))
+        .map(|bytes| JobRow::decode(bytes.value()))
         .transpose()?
-        .is_none()
-    {
-        return Err(StorageError::corrupted(format!(
-            "an observation names missing {job}"
-        )));
-    }
-    let Some(llm_profile) = read_link(rx, RUNS_LLM_PROFILE, job.get())? else {
-        if read_link(rx, APPLIES_PROFILE, job.get())?.is_some() {
-            return Err(StorageError::corrupted(format!(
-                "{job} applies an Agent Profile without an LLM Profile"
-            )));
-        }
+    else {
         return Ok(None);
     };
-    let input = read_link(rx, HAS_INPUT, job.get())?
-        .map(JobInputId::new)
-        .ok_or_else(|| StorageError::corrupted(format!("{job} has no input")))?;
-    let row = rx
-        .open_table(JOB_INPUTS)?
-        .get(input.get())?
-        .map(|v| JobInputRow::decode(v.value()))
-        .transpose()?
-        .ok_or_else(|| StorageError::corrupted(format!("{job} names missing {input}")))?;
-    let frozen = row.configuration.ok_or_else(|| {
-        StorageError::corrupted(format!(
-            "the configured {job} has no frozen configuration in {input}"
-        ))
-    })?;
-    Ok(Some(LlmTarget {
-        llm_profile: ProfileId::new(llm_profile),
-        frozen: frozen.llm,
+    Ok(row.execution.map(|execution| LlmTarget {
+        llm_profile: execution.llm.model.id.into(),
+        frozen: execution.llm,
     }))
 }
 
-/// The LLM a Job ran, as its input froze it, cached per Job for one read.
-pub(super) fn job_target(
-    rx: &ReadTransaction,
-    cache: &mut HashMap<JobId, Option<LlmTarget>>,
-    job: JobId,
-) -> Result<Option<LlmTarget>, StorageError> {
-    if let Some(target) = cache.get(&job) {
-        return Ok(target.clone());
+fn job_events(rx: &ReadTransaction, job: JobId) -> Result<Vec<RequestEventRecord>, StorageError> {
+    let table = rx.open_table(REQUEST_EVENTS)?;
+    let mut events = Vec::new();
+    for entry in table.range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))? {
+        let (key, bytes) = entry?;
+        let (_, request, seq) = key.value();
+        let request = RequestNumber::new(request)
+            .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
+        events.push(decode_request_event(job, request, seq, bytes.value())?);
     }
-    let target = frozen_llm_target(rx, job)?;
-    cache.insert(job, target.clone());
-    Ok(target)
+    Ok(events)
 }
 
-/// A Metrics record whose Job and target the caller has read.
-pub(super) fn metrics_from(
-    rx: &ReadTransaction,
-    id: u64,
+/// The Metrics records of one Job's events. A Token event that directly
+/// follows the Measurement event written with it, in the same transaction,
+/// is that record's annotation; any other Token event is a record of its
+/// own, without measurements.
+fn metrics_of(
     job: JobId,
-    target: Option<LlmTarget>,
-) -> Result<MetricsRecord, StorageError> {
-    let bytes = rx
-        .open_table(METRICS)?
-        .get(id)?
-        .ok_or_else(|| StorageError::corrupted(format!("an index names missing metrics {id}")))?;
-    let row = MetricsRow::decode(bytes.value())?;
-    Ok(MetricsRecord {
-        id: row.id,
-        job,
-        request: row.request,
-        target,
-        observed_at: row.observed_at,
-        measurements: row.measurements,
-        token: row.token,
-        recorded_at: row.recorded_at,
-    })
-}
-
-/// An AvailabilityStat record whose Job and target the caller has read.
-pub(super) fn availability_from(
-    rx: &ReadTransaction,
-    id: u64,
-    job: JobId,
-    target: Option<LlmTarget>,
-) -> Result<AvailabilityStatRecord, StorageError> {
-    let bytes = rx.open_table(AVAILABILITY_STATS)?.get(id)?.ok_or_else(|| {
-        StorageError::corrupted(format!("an index names missing availability_stat {id}"))
-    })?;
-    let row = AvailabilityStatRow::decode(bytes.value())?;
-    let target = target.ok_or_else(|| {
-        StorageError::corrupted(format!(
-            "availability_stat {id} observes {job}, which ran no LLM"
-        ))
-    })?;
-    Ok(AvailabilityStatRecord {
-        id: row.id,
-        job,
-        request: row.request,
-        target,
-        observed_at: row.observed_at,
-        observation: row.observation,
-        recorded_at: row.recorded_at,
-    })
-}
-
-pub(super) type BuildObservation<T> =
-    fn(&ReadTransaction, u64, JobId, Option<LlmTarget>) -> Result<T, StorageError>;
-
-pub(super) fn observation_job(
-    rx: &ReadTransaction,
-    link: Link,
-    id: u64,
-) -> Result<JobId, StorageError> {
-    read_link(rx, link, id)?.map(JobId::new).ok_or_else(|| {
-        StorageError::corrupted(format!("observation record {id} is linked to no Job"))
-    })
-}
-
-/// Records a Job links to through `incoming`, in recording order. The page of
-/// linked IDs is read first, so a Job with no observations needs no frozen
-/// target: only a page with records resolves the Job's target, and a dangling
-/// link there is corrupted.
-pub(super) fn job_observations<T>(
-    rx: &ReadTransaction,
-    incoming: PairSet,
-    build: BuildObservation<T>,
-    job: JobId,
-    after: Option<u64>,
-    limit: usize,
-) -> Result<Vec<T>, StorageError> {
-    let ids = read_pairs(rx, incoming, job.get(), after, limit.min(MAX_PAGE))?;
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let target = frozen_llm_target(rx, job)?;
-    ids.into_iter()
-        .map(|id| build(rx, id, job, target.clone()))
-        .collect()
-}
-
-/// One page of an observation query. It range-reads the filter's scope from
-/// `index` within the observation time range, strictly after `after`, in
-/// (observed_at, record) order, and checks every entry against the whole
-/// filter. It reads at most `scan_limit` entries, matching or not, and
-/// returns at most `limit` records, each clamped to at least 1 and `limit`
-/// to [`MAX_PAGE`]. The cursor it returns is the last entry read, so a scan
-/// that found nothing still advances.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn scan_observations<T>(
-    rx: &ReadTransaction,
-    index: ScopeIndex,
-    link: Link,
-    build: BuildObservation<T>,
-    filter: &ObservationFilter,
-    after: Option<ObservationCursor<u64>>,
-    limit: usize,
-    scan_limit: usize,
-) -> Result<ObservationPage<T, u64>, StorageError> {
-    let done = |records| {
-        Ok(ObservationPage {
-            records,
-            next: None,
-        })
-    };
-    let (limit, scan_limit) = (limit.clamp(1, MAX_PAGE), scan_limit.max(1));
-    let until = filter.observed.until.as_unix_micros();
-    let mut start = (filter.observed.from.as_unix_micros(), 0);
-    if let Some(ObservationCursor {
-        observed_at,
-        record,
-    }) = after
-    {
-        let at = observed_at.as_unix_micros();
-        let next = match (record.checked_add(1), at.checked_add(1)) {
-            (Some(record), _) => (at, record),
-            (None, Some(later)) => (later, 0),
-            (None, None) => return done(Vec::new()),
-        };
-        start = start.max(next);
-    }
-    if start.0 >= until {
-        return done(Vec::new());
-    }
-    let scope = Scope::for_filter(filter).key();
-    let table = rx.open_table(index)?;
-    // Record IDs start at 1, so (time, 0) sorts before every entry at that time.
-    let mut entries =
-        table.range((scope.as_slice(), start.0, start.1)..(scope.as_slice(), until, 0))?;
-    let mut cache = HashMap::new();
-    let (mut records, mut scanned, mut last) = (Vec::new(), 0, None);
-    while records.len() < limit && scanned < scan_limit {
-        let Some(entry) = entries.next() else {
-            return done(records);
-        };
-        let key = entry?.0;
-        let (_, at, id) = key.value();
-        scanned += 1;
-        last = Some(ObservationCursor {
-            observed_at: Timestamp::from_unix_micros(at),
-            record: id,
-        });
-        let job = observation_job(rx, link, id)?;
-        let target = job_target(rx, &mut cache, job)?;
-        if filter_matches(filter, target.as_ref()) {
-            records.push(build(rx, id, job, target)?);
+    target: &Option<LlmTarget>,
+    events: Vec<RequestEventRecord>,
+) -> Vec<MetricsRecord> {
+    let mut records: Vec<MetricsRecord> = Vec::new();
+    let mut last_measurement: Option<(RequestNumber, u32, Timestamp, Timestamp)> = None;
+    for event in events {
+        match event.payload {
+            RequestPayload::Measurement { measurements } => {
+                last_measurement = Some((
+                    event.request,
+                    event.seq,
+                    event.observed_at,
+                    event.recorded_at,
+                ));
+                records.push(MetricsRecord {
+                    id: MetricsId::new(pair(event.request, event.seq)),
+                    job,
+                    request: event.request,
+                    target: target.clone(),
+                    observed_at: event.observed_at,
+                    measurements,
+                    token: None,
+                    recorded_at: event.recorded_at,
+                });
+            }
+            RequestPayload::Token {
+                eligibility,
+                finality,
+            } => {
+                let annotation = TokenAnnotation {
+                    eligibility,
+                    finality,
+                };
+                let pairs =
+                    last_measurement.is_some_and(|(request, seq, observed_at, recorded_at)| {
+                        request == event.request
+                            && seq + 1 == event.seq
+                            && observed_at == event.observed_at
+                            && recorded_at == event.recorded_at
+                    });
+                match records.last_mut() {
+                    Some(record) if pairs => record.token = Some(annotation),
+                    _ => records.push(MetricsRecord {
+                        id: MetricsId::new(pair(event.request, event.seq)),
+                        job,
+                        request: event.request,
+                        target: target.clone(),
+                        observed_at: event.observed_at,
+                        measurements: Measurements::default(),
+                        token: Some(annotation),
+                        recorded_at: event.recorded_at,
+                    }),
+                }
+                last_measurement = None;
+            }
+            RequestPayload::Availability { .. } => last_measurement = None,
         }
     }
-    let more = entries.next().transpose()?.is_some();
-    Ok(ObservationPage {
-        records,
-        next: if more { last } else { None },
+    records
+}
+
+fn availability_of(
+    job: JobId,
+    target: &LlmTarget,
+    event: RequestEventRecord,
+) -> Option<AvailabilityStatRecord> {
+    let RequestPayload::Availability {
+        status_code,
+        finish_reason,
+        raw_finish_reason,
+        failure,
+    } = event.payload
+    else {
+        return None;
+    };
+    Some(AvailabilityStatRecord {
+        id: AvailabilityStatId::new(pair(event.request, event.seq)),
+        job,
+        request: event.request,
+        target: target.clone(),
+        observed_at: event.observed_at,
+        observation: AvailabilityObservation {
+            status_code,
+            finish_reason,
+            raw_finish_reason,
+            failure,
+        },
+        recorded_at: event.recorded_at,
     })
 }
 
-/// A Job's Metrics in recording order, strictly after `after` when given.
 pub(crate) fn read_job_metrics(
     database: &Database,
     job: JobId,
     after: Option<MetricsId>,
     limit: usize,
 ) -> Result<Vec<MetricsRecord>, StorageError> {
-    job_observations(
-        &read(database)?,
-        JOB_METRICS,
-        metrics_from,
-        job,
-        after.map(MetricsId::get),
-        limit,
-    )
+    let rx = read(database)?;
+    let target = frozen_llm_target(&rx, job)?;
+    let records = metrics_of(job, &target, job_events(&rx, job)?);
+    Ok(records
+        .into_iter()
+        .filter(|record| after.is_none_or(|after| record.id > after))
+        .take(limit.min(MAX_PAGE))
+        .collect())
 }
 
-/// A Job's AvailabilityStats in recording order, strictly after `after` when given.
 pub(crate) fn read_job_availability(
     database: &Database,
     job: JobId,
     after: Option<AvailabilityStatId>,
     limit: usize,
 ) -> Result<Vec<AvailabilityStatRecord>, StorageError> {
-    job_observations(
-        &read(database)?,
-        JOB_AVAILABILITY,
-        availability_from,
-        job,
-        after.map(AvailabilityStatId::get),
-        limit,
+    let rx = read(database)?;
+    let Some(target) = frozen_llm_target(&rx, job)? else {
+        return Ok(Vec::new());
+    };
+    Ok(job_events(&rx, job)?
+        .into_iter()
+        .filter_map(|event| availability_of(job, &target, event))
+        .filter(|record| after.is_none_or(|after| record.id > after))
+        .take(limit.min(MAX_PAGE))
+        .collect())
+}
+
+// ---- queries over the scope index ---------------------------------------------------
+
+type ScopeKey = (u64, [u8; 32], i64, u64, u32, u32);
+
+fn model_hash(model: &str) -> [u8; 32] {
+    *ContentDigest::of(model.as_bytes()).as_bytes()
+}
+
+fn cursor_key(cursor: &ObservationCursor) -> ScopeKey {
+    (
+        cursor.provider.get(),
+        cursor.model_hash,
+        cursor.observed_at.as_unix_micros(),
+        cursor.job.get(),
+        cursor.request.get(),
+        cursor.seq,
     )
 }
 
-/// The tag of [`Scope::ProviderModel`] keys.
-pub(super) const PROVIDER_MODEL_TAG: u8 = 4;
-
-/// The (Provider, model) pair a [`Scope::ProviderModel`] key names.
-pub(super) fn observed_model(scope: &[u8]) -> Result<ObservedModel, StorageError> {
-    match scope {
-        [PROVIDER_MODEL_TAG, rest @ ..] if rest.len() >= 8 => {
-            let (provider, model) = rest.split_at(8);
-            let provider =
-                LlmProviderId::new(u64::from_be_bytes(provider.try_into().expect("8 bytes")));
-            let model = String::from_utf8(model.to_vec()).map_err(|_| {
-                StorageError::corrupted("a scope key names a model that is not UTF-8")
-            })?;
-            Ok(ObservedModel { provider, model })
-        }
-        _ => Err(StorageError::corrupted(
-            "expected a Provider and model scope key",
-        )),
+fn key_cursor((connection, hash, observed_at, job, request, seq): ScopeKey) -> ObservationCursor {
+    ObservationCursor {
+        provider: LlmProviderId::new(connection),
+        model_hash: hash,
+        observed_at: Timestamp::from_unix_micros(observed_at),
+        job: JobId::new(job),
+        request: RequestNumber::new(request).unwrap_or(RequestNumber::FIRST),
+        seq,
     }
 }
 
-/// The first [`Scope::ProviderModel`] key in `index` strictly after the
-/// `after` key, or from `lower` without one, and before `upper`. One seek:
-/// the entries of a skipped key are never read.
-pub(super) fn next_provider_model(
-    table: &impl ReadableTable<(&'static [u8], i64, u64), ()>,
-    after: Option<&[u8]>,
-    lower: &[u8],
-    upper: &[u8],
-) -> Result<Option<Vec<u8>>, StorageError> {
-    use std::ops::Bound;
+/// Walks the scope entries `filter` can select, in scope order, strictly
+/// after `after`. Examines at most `max_scan` entries and passes each
+/// entry the time range and the Provider and model constraints allow to
+/// `visit`, which returns whether it wants more. Returns the position to
+/// continue from, if the walk stopped before the end.
+fn walk_scope(
+    rx: &ReadTransaction,
+    filter: &ObservationFilter,
+    after: Option<&ObservationCursor>,
+    max_scan: usize,
+    mut visit: impl FnMut(ScopeKey) -> Result<bool, StorageError>,
+) -> Result<Option<ScopeKey>, StorageError> {
+    let table = rx.open_table(REQUEST_SCOPES)?;
+    let model = filter.model.as_deref().map(model_hash);
+    let low = (
+        filter.provider.map_or(0, |provider| provider.get()),
+        model.unwrap_or([0; 32]),
+        filter.observed.from.as_unix_micros(),
+        0,
+        0,
+        0,
+    );
+    let high = (
+        filter.provider.map_or(u64::MAX, |provider| provider.get()),
+        model.unwrap_or([0xff; 32]),
+        i64::MAX,
+        u64::MAX,
+        u32::MAX,
+        u32::MAX,
+    );
     let start = match after {
-        Some(after) if after >= upper => return Ok(None),
-        Some(after) if after >= lower => Bound::Excluded((after, i64::MAX, u64::MAX)),
-        _ => Bound::Included((lower, i64::MIN, 0)),
+        Some(after) => {
+            let key = cursor_key(after);
+            if key >= low { key } else { low }
+        }
+        None => low,
     };
-    let mut entries =
-        table.range::<(&[u8], i64, u64)>((start, Bound::Excluded((upper, i64::MIN, 0))))?;
-    Ok(match entries.next() {
-        Some(entry) => Some(entry?.0.value().0.to_vec()),
-        None => None,
+    let mut examined = 0usize;
+    let mut last = None;
+    for entry in table.range(start..=high)? {
+        let key = entry?.0.value();
+        if after.is_some_and(|after| key <= cursor_key(after)) {
+            continue;
+        }
+        if examined >= max_scan {
+            return Ok(last);
+        }
+        examined += 1;
+        last = Some(key);
+        let (_, _, observed_at, ..) = key;
+        if observed_at >= filter.observed.until.as_unix_micros()
+            || observed_at < filter.observed.from.as_unix_micros()
+        {
+            continue;
+        }
+        if !visit(key)? {
+            return Ok(last);
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a Job froze the target `filter` names (its Model config).
+fn target_matches(
+    rx: &ReadTransaction,
+    filter: &ObservationFilter,
+    job: JobId,
+    cache: &mut HashMap<JobId, Option<LlmTarget>>,
+) -> Result<Option<LlmTarget>, StorageError> {
+    let target = match cache.get(&job) {
+        Some(target) => target.clone(),
+        None => {
+            let target = frozen_llm_target(rx, job)?;
+            cache.insert(job, target.clone());
+            target
+        }
+    };
+    Ok(target.filter(|target| {
+        filter
+            .llm_profile
+            .is_none_or(|profile| profile == target.llm_profile)
+            && filter
+                .provider
+                .is_none_or(|provider| provider == target.frozen.provider.id)
+            && filter
+                .model
+                .as_deref()
+                .is_none_or(|model| model == target.frozen.config.model)
+    }))
+}
+
+fn event_at(
+    rx: &ReadTransaction,
+    key: ScopeKey,
+) -> Result<Option<RequestEventRecord>, StorageError> {
+    let (_, _, _, job, request, seq) = key;
+    let Some(bytes) = rx.open_table(REQUEST_EVENTS)?.get((job, request, seq))? else {
+        return Ok(None);
+    };
+    let request = RequestNumber::new(request)
+        .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
+    Ok(Some(decode_request_event(
+        JobId::new(job),
+        request,
+        seq,
+        bytes.value(),
+    )?))
+}
+
+pub(crate) fn read_metrics(
+    database: &Database,
+    filter: &ObservationFilter,
+    cursor: Option<ObservationCursor>,
+    limit: usize,
+    max_scan: usize,
+) -> Result<ObservationPage<MetricsRecord>, StorageError> {
+    let rx = read(database)?;
+    let limit = limit.clamp(1, MAX_PAGE);
+    let mut cache = HashMap::new();
+    let mut records = Vec::new();
+    let mut jobs: HashMap<JobId, Vec<MetricsRecord>> = HashMap::new();
+    let stopped = walk_scope(&rx, filter, cursor.as_ref(), max_scan, |key| {
+        let job = JobId::new(key.3);
+        if target_matches(&rx, filter, job, &mut cache)?.is_none() {
+            return Ok(true);
+        }
+        let Some(event) = event_at(&rx, key)? else {
+            return Ok(true);
+        };
+        if !matches!(
+            event.payload,
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. }
+        ) {
+            return Ok(true);
+        }
+        let all = match jobs.get(&job) {
+            Some(all) => all,
+            None => {
+                let target = cache.get(&job).cloned().flatten();
+                jobs.entry(job)
+                    .or_insert(metrics_of(job, &target, job_events(&rx, job)?))
+            }
+        };
+        let id = MetricsId::new(pair(event.request, event.seq));
+        if let Some(record) = all.iter().find(|record| record.id == id) {
+            records.push(record.clone());
+        }
+        Ok(records.len() < limit)
+    })?;
+    Ok(ObservationPage {
+        records,
+        next: stopped.map(key_cursor),
     })
 }
 
-/// Whether `index` has an entry of `scope` observed within [from, until).
-pub(super) fn observed_within(
-    table: &impl ReadableTable<(&'static [u8], i64, u64), ()>,
-    scope: &[u8],
-    from: i64,
-    until: i64,
-) -> Result<bool, StorageError> {
-    // An iteration error is a read failure, not evidence that an entry exists.
-    Ok(table
-        .range((scope, from, 0)..(scope, until, 0))?
-        .next()
-        .transpose()?
-        .is_some())
+pub(crate) fn read_availability_stats(
+    database: &Database,
+    filter: &ObservationFilter,
+    cursor: Option<ObservationCursor>,
+    limit: usize,
+    max_scan: usize,
+) -> Result<ObservationPage<AvailabilityStatRecord>, StorageError> {
+    let rx = read(database)?;
+    let limit = limit.clamp(1, MAX_PAGE);
+    let mut cache = HashMap::new();
+    let mut records = Vec::new();
+    let stopped = walk_scope(&rx, filter, cursor.as_ref(), max_scan, |key| {
+        let job = JobId::new(key.3);
+        let Some(target) = target_matches(&rx, filter, job, &mut cache)? else {
+            return Ok(true);
+        };
+        if let Some(event) = event_at(&rx, key)?
+            && let Some(record) = availability_of(job, &target, event)
+        {
+            records.push(record);
+        }
+        Ok(records.len() < limit)
+    })?;
+    Ok(ObservationPage {
+        records,
+        next: stopped.map(key_cursor),
+    })
 }
 
-/// One page of distinct historical (Provider, model) pairs from the
-/// Provider-and-model scope entries of both observation indexes, merged in
-/// key order, which is Provider ID and then model bytes. Each examined pair
-/// costs at most two seeks and two range checks, whatever its record count;
-/// at most `scan_limit` pairs are examined and `limit` returned, each
-/// clamped to at least 1 and `limit` to [`MAX_PAGE`]. The cursor is the
-/// last pair examined, so a page whose pairs all fell outside the time range
-/// still advances. One call reads one snapshot.
 pub(crate) fn read_observed_models(
     database: &Database,
     filter: &ObservedModelFilter,
@@ -331,131 +401,65 @@ pub(crate) fn read_observed_models(
     limit: usize,
     scan_limit: usize,
 ) -> Result<ObservedModelPage, StorageError> {
-    let (limit, scan_limit) = (limit.clamp(1, MAX_PAGE), scan_limit.max(1));
-    let (from, until) = (
-        filter.observed.from.as_unix_micros(),
-        filter.observed.until.as_unix_micros(),
-    );
-    let done = |choices| {
-        Ok(ObservedModelPage {
-            choices,
-            next: None,
-        })
-    };
-    if from >= until {
-        return done(Vec::new());
-    }
-    let (lower, upper) = match filter.provider {
-        Some(provider) => {
-            let lower = Scope::ProviderModel(provider, "").key();
-            let upper = match provider.get().checked_add(1) {
-                Some(following) => Scope::ProviderModel(LlmProviderId::new(following), "").key(),
-                None => vec![PROVIDER_MODEL_TAG + 1],
-            };
-            (lower, upper)
-        }
-        None => (vec![PROVIDER_MODEL_TAG], vec![PROVIDER_MODEL_TAG + 1]),
-    };
-    let after = after.map(|model| Scope::ProviderModel(model.provider, &model.model).key());
     let rx = read(database)?;
-    let tables = [
-        rx.open_table(METRICS_BY_SCOPE)?,
-        rx.open_table(AVAILABILITY_BY_SCOPE)?,
-    ];
-    let mut heads = [None, None];
-    for (head, table) in heads.iter_mut().zip(&tables) {
-        *head = next_provider_model(table, after.as_deref(), &lower, &upper)?;
-    }
-    let (mut choices, mut examined, mut last) = (Vec::new(), 0, None);
-    while choices.len() < limit && examined < scan_limit {
-        let Some(key) = heads.iter().flatten().min().cloned() else {
-            return done(choices);
+    let limit = limit.clamp(1, MAX_PAGE);
+    let range = ObservationFilter {
+        observed: filter.observed,
+        llm_profile: None,
+        provider: filter.provider,
+        model: None,
+    };
+    // One entry per (Provider, model) the range holds, with what it holds.
+    let mut choices: BTreeMap<ObservedModel, (bool, bool)> = BTreeMap::new();
+    let mut groups: HashMap<(u64, [u8; 32]), ObservedModel> = HashMap::new();
+    walk_scope(&rx, &range, None, usize::MAX, |key| {
+        if groups.len() >= scan_limit && !groups.contains_key(&(key.0, key.1)) {
+            return Ok(true);
+        }
+        let Some(event) = event_at(&rx, key)? else {
+            return Ok(true);
         };
-        examined += 1;
-        let mut present = [false, false];
-        for ((head, table), present) in heads.iter_mut().zip(&tables).zip(&mut present) {
-            if head.as_deref() == Some(key.as_slice()) {
-                *present = observed_within(table, &key, from, until)?;
-                *head = next_provider_model(table, Some(&key), &lower, &upper)?;
+        let observed = match groups.get(&(key.0, key.1)) {
+            Some(observed) => observed.clone(),
+            None => {
+                let Some(target) = frozen_llm_target(&rx, JobId::new(key.3))? else {
+                    return Ok(true);
+                };
+                let observed = ObservedModel {
+                    provider: target.frozen.provider.id,
+                    model: target.frozen.config.model,
+                };
+                groups.insert((key.0, key.1), observed.clone());
+                observed
             }
+        };
+        let flags = choices.entry(observed).or_default();
+        match event.payload {
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => flags.0 = true,
+            RequestPayload::Availability { .. } => flags.1 = true,
         }
-        let model = observed_model(&key)?;
-        if present.contains(&true) {
-            choices.push(ObservedModelChoice {
-                model: model.clone(),
-                has_metrics: present[0],
-                has_availability_stats: present[1],
-            });
+        Ok(true)
+    })?;
+    let mut page = Vec::new();
+    let mut next = None;
+    for (model, (has_metrics, has_availability_stats)) in choices {
+        if after.is_some_and(|after| model <= *after) {
+            continue;
         }
-        last = Some(model);
+        if page.len() >= limit {
+            next = page
+                .last()
+                .map(|choice: &ObservedModelChoice| choice.model.clone());
+            break;
+        }
+        page.push(ObservedModelChoice {
+            model,
+            has_metrics,
+            has_availability_stats,
+        });
     }
-    let more = heads.iter().any(Option::is_some);
     Ok(ObservedModelPage {
-        choices,
-        next: if more { last } else { None },
-    })
-}
-
-/// One page of the Metrics `filter` selects, see [`scan_observations`].
-pub(crate) fn read_metrics(
-    database: &Database,
-    filter: &ObservationFilter,
-    after: Option<ObservationCursor<MetricsId>>,
-    limit: usize,
-    scan_limit: usize,
-) -> Result<ObservationPage<MetricsRecord, MetricsId>, StorageError> {
-    let after = after.map(|cursor| ObservationCursor {
-        observed_at: cursor.observed_at,
-        record: cursor.record.get(),
-    });
-    let page = scan_observations(
-        &read(database)?,
-        METRICS_BY_SCOPE,
-        MEASURES,
-        metrics_from,
-        filter,
-        after,
-        limit,
-        scan_limit,
-    )?;
-    let next = page.next.map(|cursor| ObservationCursor {
-        observed_at: cursor.observed_at,
-        record: MetricsId::new(cursor.record),
-    });
-    Ok(ObservationPage {
-        records: page.records,
-        next,
-    })
-}
-
-/// One page of the AvailabilityStats `filter` selects, see [`scan_observations`].
-pub(crate) fn read_availability_stats(
-    database: &Database,
-    filter: &ObservationFilter,
-    after: Option<ObservationCursor<AvailabilityStatId>>,
-    limit: usize,
-    scan_limit: usize,
-) -> Result<ObservationPage<AvailabilityStatRecord, AvailabilityStatId>, StorageError> {
-    let after = after.map(|cursor| ObservationCursor {
-        observed_at: cursor.observed_at,
-        record: cursor.record.get(),
-    });
-    let page = scan_observations(
-        &read(database)?,
-        AVAILABILITY_BY_SCOPE,
-        OBSERVES,
-        availability_from,
-        filter,
-        after,
-        limit,
-        scan_limit,
-    )?;
-    let next = page.next.map(|cursor| ObservationCursor {
-        observed_at: cursor.observed_at,
-        record: AvailabilityStatId::new(cursor.record),
-    });
-    Ok(ObservationPage {
-        records: page.records,
+        choices: page,
         next,
     })
 }

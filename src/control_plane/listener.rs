@@ -26,13 +26,15 @@ pub enum StartError {
 pub enum StopError {
     #[error("the control plane thread panicked")]
     Panicked,
+    #[error("the control plane failed while serving: {0}")]
+    Serve(std::io::Error),
 }
 
 /// A running listener. Only [`ControlPlane::stop`] stops it.
 pub struct ControlPlane {
     address: SocketAddr,
     server: Server,
-    thread: std::thread::JoinHandle<()>,
+    finished: ntex::rt::JoinHandle<std::io::Result<()>>,
     pub(super) shared: Arc<Shared>,
 }
 
@@ -49,6 +51,13 @@ impl ControlPlane {
         database: DatabaseHandle,
         scheduler: SchedulerHandle,
     ) -> Result<Self, StartError> {
+        #[cfg(test)]
+        if ntex::rt::System::try_current().is_none() {
+            return crate::test_support::on_system(move || async move {
+                Self::start(config, database, scheduler)
+            });
+        }
+
         let bind = |source| StartError::Bind {
             port: config.port,
             source,
@@ -85,64 +94,33 @@ impl ControlPlane {
             fetched: AtomicUsize::new(0),
         });
         let kept = shared.clone();
-        let (started, starting) = flume::bounded(1);
-        let thread = std::thread::Builder::new()
-            .name("ocg-control-plane".to_owned())
-            .spawn(move || {
-                // A runtime of its own, without signals: the server's
-                // signal settings apply to this runtime only.
-                ntex::rt::System::new("ocg-control-plane", ntex::rt::DefaultRuntime).block_on(
-                    async move {
-                        let server = HttpServer::new(async move || {
-                            App::new()
-                                .state(shared.clone())
-                                .default_service(web::to(answer))
-                        })
-                        .workers(1)
-                        .maxconn(64)
-                        .backlog(64)
-                        .disable_signals()
-                        .shutdown_timeout(STOP_TIMEOUT)
-                        .config(
-                            SharedCfg::new("OCG-CONTROL").add(IoConfig::new()).add(
-                                HttpServiceConfig::new()
-                                    .set_max_headers(MAX_HEADERS)
-                                    .set_max_buf_size(16 * 1024),
-                            ),
-                        )
-                        .listen(listener);
-                        match server {
-                            Ok(server) => {
-                                let server = server.run();
-                                started.send(Ok(server.clone())).ok();
-                                // Resolves once the server has stopped.
-                                server.await.ok();
-                            }
-                            Err(error) => {
-                                started.send(Err(error)).ok();
-                            }
-                        }
-                    },
-                );
-            })
-            .map_err(StartError::Serve)?;
-        let server = match starting.recv() {
-            Ok(Ok(server)) => server,
-            Ok(Err(error)) => {
-                thread.join().ok();
-                return Err(StartError::Serve(error));
-            }
-            Err(_) => {
-                thread.join().ok();
-                return Err(StartError::Serve(std::io::Error::other(
-                    "the control plane thread stopped before serving",
-                )));
-            }
+        let server = HttpServer::new(async move || {
+            App::new()
+                .state(shared.clone())
+                .default_service(web::to(answer))
+        })
+        .workers(1)
+        .maxconn(64)
+        .backlog(64)
+        .shutdown_timeout(STOP_TIMEOUT)
+        .config(
+            SharedCfg::new("OCG-CONTROL").add(IoConfig::new()).add(
+                HttpServiceConfig::new()
+                    .set_max_headers(MAX_HEADERS)
+                    .set_max_buf_size(16 * 1024),
+            ),
+        );
+        let server = if ntex::rt::System::current().signals() {
+            server
+        } else {
+            server.disable_signals()
         };
+        let server = server.listen(listener).map_err(StartError::Serve)?.run();
+        let finished = ntex::rt::spawn(server.clone());
         Ok(Self {
             address,
             server,
-            thread,
+            finished,
             shared: kept,
         })
     }
@@ -176,6 +154,9 @@ impl ControlPlane {
     pub async fn stop(self) -> Result<(), StopError> {
         self.shared.closing.store(true, Ordering::SeqCst);
         self.server.stop(true).await;
-        self.thread.join().map_err(|_| StopError::Panicked)
+        self.finished
+            .await
+            .map_err(|_| StopError::Panicked)?
+            .map_err(StopError::Serve)
     }
 }

@@ -12,10 +12,9 @@ use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseError, DatabaseHandle};
 use ocg::host::{self, HostError};
 use ocg::persistence::{
-    AgentConfig, CapabilitySet, ExecutionOperation, ExecutionPoolConfig, ExecutionPoolId,
-    ExecutorId, ExecutorType, LlmConfig, LlmParameters, LlmTransport, ModelCapability,
-    NewExecutionPool, NewExecutor, NewLlmProvider, NewProfile, NewProfileConfig, ProfileConfig,
-    ProfileId,
+    AgentBehavior, AgentConfig, CapabilitySet, ConfigBody, ConfigKind, ConnectionConfig,
+    ExecutionOperation, ExecutionPoolConfig, ExecutionPoolId, ExecutorId, LlmParameters,
+    LlmTransport, ModelCapability, ModelConfig, NewConfig, NewExecutionPool, ProfileId,
 };
 
 /// The command that registers the Control Plane's LLM target.
@@ -46,10 +45,10 @@ pub enum Error {
     Host(#[from] HostError),
 }
 
-/// An LLM target: one Llm Executor for its transport, one Provider and one
-/// LLM Profile of the model, each found by what it is, or registered.
+/// An LLM target: one Pool for its transport, one Connection and one Model
+/// config of the model, each found by what it is, or registered.
 pub struct Target {
-    /// The name of the Executor and the Provider when they are registered.
+    /// The name of the Pool and the Connection when they are registered.
     pub name: String,
     pub endpoint: String,
     pub model: String,
@@ -89,111 +88,87 @@ impl Target {
     }
 }
 
-/// The Executor and LLM Profile of `target`, reusing those an earlier run
-/// registered under the same name, for the same endpoint, credential
-/// reference and model.
+/// The Pool and Model config of `target`, reusing those an earlier run
+/// registered for the same endpoint, credential reference and model. The Pool
+/// is the Executor that runs the target's work.
 pub async fn targets(
     database: &DatabaseHandle,
     target: &Target,
 ) -> Result<(ExecutorId, ProfileId, ExecutionPoolId), DatabaseError> {
     let transport = LlmTransport::OpenAiChatCompletions;
     let pool = provision_pool(database, &target.name, transport, None).await?;
-    let existing = database
-        .executors(None, 1_000)
-        .await?
-        .into_iter()
-        .find(|executor| {
-            executor.name == target.name
-                && executor.executor_type == ExecutorType::Llm
-                && executor.llm_transports.contains(&transport)
-        });
-    let executor = match existing {
-        Some(executor) => executor.id,
+    let connection = ConnectionConfig {
+        protocol: transport,
+        endpoint: Some(target.endpoint.clone()),
+        credential_ref: Some(target.credential_ref.clone()),
+    };
+    let configs = database.configs(None, None, 1_000).await?;
+    let connection_id = match configs.iter().find(|config| {
+        matches!(&config.body, ConfigBody::Connection(found) if *found == connection)
+    }) {
+        Some(found) => found.id,
         None => {
             database
-                .create_executor(NewExecutor {
+                .create_config(NewConfig {
                     name: target.name.clone(),
-                    executor_type: ExecutorType::Llm,
-                    concurrency_limit: NonZeroU32::MIN,
-                    llm_transports: BTreeSet::from([transport]),
+                    body: ConfigBody::Connection(connection),
                 })
                 .await?
         }
     };
-    let existing = database
-        .llm_providers(None, 1_000)
-        .await?
-        .into_iter()
-        .find(|provider| {
-            provider.transport == transport
-                && provider.endpoint.as_deref() == Some(target.endpoint.as_str())
-                && provider.credential_ref.as_deref() == Some(target.credential_ref.as_str())
-        });
-    let provider = match existing {
-        Some(provider) => provider.id,
-        None => {
-            database
-                .create_llm_provider(NewLlmProvider {
-                    name: target.name.clone(),
-                    transport,
-                    endpoint: Some(target.endpoint.clone()),
-                    credential_ref: Some(target.credential_ref.clone()),
-                })
-                .await?
-        }
-    };
-    let llm = LlmConfig {
+    let model = ModelConfig {
+        connection_id,
         model: target.model.clone(),
         parameters: LlmParameters::default(),
         declared_capabilities: target.capabilities.clone(),
     };
-    for profile in database.provider_profiles(provider).await? {
-        if let Some(record) = database.profile(profile).await?
-            && record.config == ProfileConfig::Llm(llm.clone())
-        {
-            return Ok((executor, profile, pool));
+    let profile = match configs
+        .iter()
+        .find(|config| matches!(&config.body, ConfigBody::Model(found) if *found == model))
+    {
+        Some(found) => found.id,
+        None => {
+            database
+                .create_config(NewConfig {
+                    name: target.model.clone(),
+                    body: ConfigBody::Model(model),
+                })
+                .await?
         }
-    }
-    let profile = database
-        .create_profile(NewProfile {
-            name: target.model.clone(),
-            config: NewProfileConfig::Llm {
-                provider,
-                config: llm,
-            },
-        })
-        .await?;
-    Ok((executor, profile, pool))
+    };
+    Ok((pool.into(), profile.into(), pool))
 }
 
-/// The Agent Profile that targets `llm_profile` with no instructions of its
-/// own, found by what it is, or registered, so a submission can name an
-/// Agent Profile without the operator configuring one first.
+/// The Agent that has Chat behavior and targets `llm_profile` with no
+/// instructions of its own, found by what it is, or registered, so a
+/// submission can name an Agent without the operator configuring one first.
 pub async fn agent_profile(
     database: &DatabaseHandle,
     llm_profile: ProfileId,
 ) -> Result<ProfileId, DatabaseError> {
+    let agent = AgentConfig {
+        behavior: AgentBehavior::Chat,
+        models: vec![llm_profile.into()],
+        default_model: Some(llm_profile.into()),
+        ..AgentConfig::default()
+    };
     let existing = database
-        .profiles(None, 1_000)
+        .configs(Some(ConfigKind::Agent), None, 1_000)
         .await?
         .into_iter()
-        .find(|record| {
-            record.name == CONTROL_PLANE
-                && record.config == ProfileConfig::Agent(AgentConfig::default())
-                && record.llm_targets == [llm_profile]
+        .find(|config| {
+            config.name == CONTROL_PLANE && config.body == ConfigBody::Agent(agent.clone())
         });
-    if let Some(record) = existing {
-        return Ok(record.id);
+    if let Some(config) = existing {
+        return Ok(config.id.into());
     }
     database
-        .create_profile(NewProfile {
+        .create_config(NewConfig {
             name: CONTROL_PLANE.to_owned(),
-            config: NewProfileConfig::Agent {
-                config: AgentConfig::default(),
-                llm_targets: vec![llm_profile],
-            },
+            body: ConfigBody::Agent(agent),
         })
         .await
+        .map(Into::into)
 }
 
 /// `ocg register-llm`: registers, or finds, the Control Plane's chat target
@@ -243,12 +218,11 @@ pub async fn provision_pool(
         let page = database.execution_pools(before, 1_000).await?;
         for pool in &page {
             if pool.enabled
-                && let Some(profile) = database.profile(pool.profile).await?
-                && let ProfileConfig::ExecutionPool(config) = profile.config
-                && config
+                && pool
+                    .config
                     .capabilities
                     .supports(ExecutionOperation::LlmRequest, Some(protocol))
-                && concurrency.is_none_or(|limit| config.concurrency_limit == limit)
+                && concurrency.is_none_or(|limit| pool.config.concurrency_limit == limit)
             {
                 return Ok(pool.id);
             }
@@ -258,16 +232,10 @@ pub async fn provision_pool(
         }
         before = page.last().map(|pool| pool.id);
     }
-    let profile = database
-        .create_profile(NewProfile {
-            name: name.to_owned(),
-            config: NewProfileConfig::ExecutionPool(pool_config(protocol, concurrency)),
-        })
-        .await?;
     database
         .create_execution_pool(NewExecutionPool {
             name: name.to_owned(),
-            profile,
+            config: pool_config(protocol, concurrency),
             enabled: true,
         })
         .await

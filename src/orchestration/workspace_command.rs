@@ -61,17 +61,22 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rustix::io::Errno;
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 use serde_json::{Value, json};
 
+#[cfg(test)]
+use rustix::io::Errno;
+#[cfg(test)]
+use rustix::process::Pid;
+
+use crate::orchestration::blocking::{self, Kind, Process, StopSignal};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
@@ -84,7 +89,7 @@ use crate::persistence::ToolEffect;
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-1";
+const HANDLER_VERSION: &str = "workspace_run_command-2";
 
 /// Longest a command may run before it is stopped.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -92,7 +97,7 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a stopped command is given to be reaped before the call returns
 /// without it, and how much longer than its command the tool loop gives a
 /// call, so the command's own limit stops it first.
-const STOP_GRACE: Duration = Duration::from_secs(5);
+const STOP_GRACE: Duration = blocking::STOP_GRACE;
 
 /// The most output, of stdout and stderr together, a result carries.
 pub const OUTPUT_BYTES: usize = 12 * 1024;
@@ -142,7 +147,7 @@ impl Preset {
 
     fn arguments(self) -> &'static [&'static str] {
         match self {
-            Self::CargoCheck => &["check", "--all-targets"],
+            Self::CargoCheck => &["check", "--all-targets", "--message-format=json"],
             Self::CargoTest => &["test", "--all-targets"],
         }
     }
@@ -279,42 +284,19 @@ struct Invocation {
     variables: Vec<(OsString, OsString)>,
 }
 
-/// What the call and the supervisor of its command share.
-#[derive(Default)]
-struct Control {
-    /// The command's process group, once it is started.
-    group: Option<Pid>,
-    /// Set once the command's process is reaped; its group is never
-    /// signalled after.
-    reaped: bool,
-    /// Set once the call stops the command. Nothing starts after it.
-    stopped: bool,
+static ACTIVE: OnceLock<Mutex<std::collections::BTreeMap<u64, (PathBuf, StopSignal)>>> =
+    OnceLock::new();
+static NEXT_ACTIVE: AtomicU64 = AtomicU64::new(1);
+
+fn active() -> &'static Mutex<std::collections::BTreeMap<u64, (PathBuf, StopSignal)>> {
+    ACTIVE.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
 }
 
-type SharedControl = Arc<Mutex<Control>>;
-
-fn lock(control: &SharedControl) -> MutexGuard<'_, Control> {
-    control.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Kills the command's process group, unless its process was reaped, and
-/// keeps a command not yet started from starting. It never waits for the
-/// process: the supervisor reaps it.
-fn stop(control: &SharedControl) {
-    let mut control = lock(control);
-    control.stopped = true;
-    if let (Some(group), false) = (control.group, control.reaped) {
-        rustix::process::kill_process_group(group, Signal::KILL).ok();
-    }
-}
-
-/// Stops the command when the call ends without its report, as when the
-/// call's limit or cancellation drops it.
-struct StopOnDrop(SharedControl);
+struct StopOnDrop(StopSignal);
 
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        stop(&self.0);
+        self.0.request();
     }
 }
 
@@ -330,6 +312,13 @@ struct Capture {
 }
 
 impl Capture {
+    fn text(&self) -> Option<String> {
+        if self.unread || self.total != self.head.len() + self.tail.len() {
+            return None;
+        }
+        String::from_utf8(self.head.iter().chain(&self.tail).copied().collect()).ok()
+    }
+
     fn push(&mut self, bytes: &[u8]) {
         self.total = self.total.saturating_add(bytes.len());
         let room = OUTPUT_BYTES
@@ -397,15 +386,151 @@ struct Ended {
     stderr: Capture,
 }
 
+fn compact_check(stdout: &str) -> Option<String> {
+    let mut diagnostics = Vec::new();
+    let mut success = None;
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line).ok()?;
+        match record["reason"].as_str()? {
+            "compiler-message" => {
+                let message = &record["message"];
+                let level = message["level"].as_str()?;
+                if !matches!(level, "error" | "warning") {
+                    continue;
+                }
+                let spans = message["spans"].as_array()?;
+                let span = spans
+                    .iter()
+                    .find(|span| span["is_primary"] == true)
+                    .or_else(|| spans.first());
+                let (path, line, column) = match span {
+                    Some(span) => (
+                        span["file_name"].as_str()?,
+                        span["line_start"].as_u64()?,
+                        span["column_start"].as_u64()?,
+                    ),
+                    None => ("<unknown>", 0, 0),
+                };
+                let code = message["code"]["code"]
+                    .as_str()
+                    .map(|code| format!("[{code}]"))
+                    .unwrap_or_default();
+                let text = message["message"]
+                    .as_str()?
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                diagnostics.push((
+                    level == "warning",
+                    format!("{path}:{line}:{column} {level}{code} {text}"),
+                ));
+            }
+            "compiler-artifact" | "build-script-executed" => {}
+            "build-finished" => success = record["success"].as_bool(),
+            _ => return None,
+        }
+    }
+    if !success? && !diagnostics.iter().any(|(warning, _)| !warning) {
+        return None;
+    }
+    diagnostics.sort_by_key(|(warning, _)| *warning);
+    Some(
+        diagnostics
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+fn compact_test(stdout: &str) -> Option<String> {
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let mut output = lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("test result: ok.") || line.starts_with("test result: FAILED.")
+        })
+        .map(|line| (*line).to_owned())
+        .collect::<Vec<_>>();
+    if output.is_empty() {
+        return None;
+    }
+    for line in &lines {
+        let Some(name) = line
+            .strip_prefix("test ")
+            .and_then(|line| line.strip_suffix(" ... FAILED"))
+        else {
+            continue;
+        };
+        output.push(name.to_owned());
+        let header = format!("---- {name} stdout ----");
+        let Some(index) = lines.iter().position(|line| *line == header) else {
+            continue;
+        };
+        let details = lines[index + 1..]
+            .iter()
+            .take_while(|line| {
+                !line.starts_with("---- ")
+                    && !line.starts_with("failures:")
+                    && !line.starts_with("test result:")
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let panic = details
+            .iter()
+            .position(|line| line.starts_with("thread '") && line.contains("panicked at"))
+            .unwrap_or(0);
+        output.extend(
+            details[panic..]
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .take(4)
+                .map(|line| (*line).to_owned()),
+        );
+    }
+    Some(output.join("\n"))
+}
+
+fn compact(preset: Preset, ended: &Ended) -> Option<Capture> {
+    ended.status.code()?;
+    let stdout = ended.stdout.text()?;
+    ended.stderr.text()?;
+    let text = match preset {
+        Preset::CargoCheck => compact_check(&stdout)?,
+        Preset::CargoTest => {
+            if !ended.status.success()
+                && !stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: FAILED."))
+            {
+                return None;
+            }
+            compact_test(&stdout)?
+        }
+    };
+    if !ended.status.success() && text.is_empty() {
+        return None;
+    }
+    let mut capture = Capture::default();
+    capture.push(text.as_bytes());
+    Some(capture)
+}
+
 /// The call's result: the command, its exit, and its output within the
 /// bounds. A process ended by a signal has no exit code, and its signal is
 /// given instead.
 fn result(preset: Preset, ended: &Ended) -> Value {
+    let compact = compact(preset, ended);
+    let empty = Capture::default();
+    let (stdout, stderr) = match &compact {
+        Some(stdout) => (stdout, &empty),
+        None => (&ended.stdout, &ended.stderr),
+    };
     let mut budget = OUTPUT_BYTES;
     loop {
-        let (stdout_share, stderr_share) = shares(ended.stdout.total, ended.stderr.total, budget);
-        let (stdout, stdout_cut) = ended.stdout.render("stdout", stdout_share);
-        let (stderr, stderr_cut) = ended.stderr.render("stderr", stderr_share);
+        let (stdout_share, stderr_share) = shares(stdout.total, stderr.total, budget);
+        let (stdout, stdout_cut) = stdout.render("stdout", stdout_share);
+        let (stderr, stderr_cut) = stderr.render("stderr", stderr_share);
         let mut value = json!({
             "command": preset.name(),
             "exit_code": ended.status.code(),
@@ -425,7 +550,7 @@ fn result(preset: Preset, ended: &Ended) -> Value {
 
 /// Starts the command and supervises it to its end, on the calling thread,
 /// which is never the executor's.
-fn supervise(invocation: Invocation, control: &SharedControl) -> Result<Ended, Failure> {
+fn supervise(invocation: Invocation, stop: StopSignal) -> Result<Ended, Failure> {
     let mut command = Command::new(&invocation.program);
     command
         .args(invocation.arguments)
@@ -439,48 +564,24 @@ fn supervise(invocation: Invocation, control: &SharedControl) -> Result<Ended, F
         )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    if lock(control).stopped {
-        return Err(Refusal::NotStarted.into());
-    }
-    // Started outside the lock, so a stop never waits for a slow start; a
-    // stop that came meanwhile kills the group as soon as it is known, while
-    // its leader is unreaped.
-    let mut child = command.spawn().map_err(|_| Refusal::NotStarted)?;
-    {
-        let mut state = lock(control);
-        let group = Pid::from_child(&child);
-        state.group = Some(group);
-        if state.stopped {
-            rustix::process::kill_process_group(group, Signal::KILL).ok();
-        }
-    }
-    let readers = match (child.stdout.take(), child.stderr.take()) {
+        .stderr(Stdio::piped());
+    let mut process =
+        Process::spawn(command, Kind::Command, stop.clone()).map_err(|_| Refusal::NotStarted)?;
+    let (stdout_pipe, stderr_pipe) = process.take_output();
+    let readers = match (stdout_pipe, stderr_pipe) {
         (Some(stdout), Some(stderr)) => {
             reader(stdout).and_then(|stdout| reader(stderr).map(|stderr| (stdout, stderr)))
         }
         _ => None,
     };
     let Some((stdout, stderr)) = readers else {
-        stop(control);
-        reap(&mut child, control);
+        stop.request();
+        let _ = process.finish(|| true);
         return Err(Uncertainty::OutputNotCaptured.into());
     };
-    let exited = await_exit(&child);
-    // The process has exited but is not reaped, so its group is still its
-    // own: whatever is left in it is killed before it is reaped.
-    let status = {
-        let mut state = lock(control);
-        if let Some(group) = state.group {
-            rustix::process::kill_process_group(group, Signal::KILL).ok();
-        }
-        let status = child.wait();
-        state.reaped = true;
-        status
-    };
-    let (Ok(()), Ok(status)) = (exited, status) else {
-        return Err(Uncertainty::NotObserved.into());
+    let status = match process.finish(|| stop.requested()) {
+        Ok(status) => status,
+        Err(_) => return Err(Uncertainty::NotObserved.into()),
     };
     match (stdout.join(), stderr.join()) {
         (Ok(stdout), Ok(stderr)) => Ok(Ended {
@@ -513,32 +614,6 @@ fn reader(mut pipe: impl Read + Send + 'static) -> Option<JoinHandle<Capture>> {
             capture
         })
         .ok()
-}
-
-/// Waits until the process has exited, leaving it unreaped. When that cannot
-/// be waited for, the process is killed, so reaping it never waits long.
-fn await_exit(child: &Child) -> Result<(), Errno> {
-    let pid = Pid::from_child(child);
-    loop {
-        match rustix::process::waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-        ) {
-            Ok(_) => return Ok(()),
-            Err(Errno::INTR) => {}
-            Err(errno) => {
-                rustix::process::kill_process_group(pid, Signal::KILL).ok();
-                return Err(errno);
-            }
-        }
-    }
-}
-
-/// Reaps a process whose group was killed.
-fn reap(child: &mut Child, control: &SharedControl) {
-    let mut state = lock(control);
-    child.wait().ok();
-    state.reaped = true;
 }
 
 /// The handler of `workspace_run_command`, bound to one authorized Workspace
@@ -578,6 +653,40 @@ impl ToolHandler for RunCommand {
         ToolEffect::NonIdempotent
     }
 
+    fn spawns(&self) -> bool {
+        true
+    }
+
+    fn stop(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
+        let root = self.workspace.root().to_path_buf();
+        Box::pin(async move {
+            let signals = active()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .values()
+                .filter(|(active_root, _)| active_root == &root)
+                .map(|(_, signal)| signal.clone())
+                .collect::<Vec<_>>();
+            for signal in signals {
+                signal.request();
+            }
+            loop {
+                let running = active()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .values()
+                    .any(|(active_root, _)| active_root == &root);
+                if !running {
+                    break;
+                }
+                ntex::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+    }
+
     /// Starts the command on a supervising thread and awaits its report
     /// within the command's limit. Dropping the call, as its time limit or
     /// cancellation does, stops the command.
@@ -585,30 +694,48 @@ impl ToolHandler for RunCommand {
         Box::pin(async move {
             let preset = parse(&arguments).map_err(Failure::from)?;
             let invocation = self.prepare(preset).map_err(Failure::from)?;
-            let control = SharedControl::default();
-            let stopping = StopOnDrop(control.clone());
+            let stop = StopSignal::new();
+            let _stop_on_drop = StopOnDrop(stop.clone());
             let (report, reported) = flume::bounded(1);
-            let supervised = control.clone();
+            let supervised = stop.clone();
             let mutation = workspace_read::WorkspaceMutation::begin();
+            let root = self.workspace.root().to_path_buf();
+            let active_id = NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            active()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(active_id, (root.clone(), stop.clone()));
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
                     let _mutation = mutation;
-                    report.send(supervise(invocation, &supervised)).ok();
+                    let result = supervise(invocation, supervised);
+                    active()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&active_id);
+                    if report.send(result).is_err() {
+                        log::debug!("command report receiver was dropped after cleanup");
+                    }
                 })
-                .map_err(|_| Failure::from(Refusal::NotStarted))?;
+                .map_err(|_| {
+                    active()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&active_id);
+                    Failure::from(Refusal::NotStarted)
+                })?;
             let ended = match ntex::time::timeout(self.timeout, reported.recv_async()).await {
                 Ok(Ok(ended)) => ended?,
                 Ok(Err(_)) => return Err(Failure::from(Uncertainty::NotObserved).into()),
                 Err(()) => {
-                    stop(&control);
-                    ntex::time::timeout(STOP_GRACE, reported.recv_async())
-                        .await
-                        .ok();
+                    stop.request();
+                    if reported.recv_async().await.is_err() {
+                        return Err(Failure::from(Uncertainty::NotObserved).into());
+                    }
                     return Err(Failure::from(Uncertainty::TimedOut(self.timeout)).into());
                 }
             };
-            drop(stopping);
             Ok(result(preset, &ended))
         })
     }
@@ -668,7 +795,7 @@ pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
 
 /// The tools of an execution that may read, write and build `workspace`:
 /// `workspace_read_file`, `workspace_write_file`, `workspace_run_command`,
-/// `workspace_list_directory`, `workspace_search`, `workspace_index_query` and
+/// `workspace_list_directory`, `workspace_search`, `workspace_code` and
 /// lazy `workspace_fts_search`, registered in a registry of their own and authorized
 /// there, with [`coding_limits`]. Commands get the environment
 /// OCG was started with, filtered, and run for at most [`COMMAND_TIMEOUT`].
@@ -693,10 +820,11 @@ pub(crate) fn code_tools_with(
     workspace_write::register(&registry, workspace.clone())?;
     register(&registry, workspace.clone(), environment, timeout)?;
     workspace_discovery::register(&registry, workspace.clone())?;
-    crate::orchestration::workspace_index_query::register(
+    crate::orchestration::workspace_code::register(
         &registry,
         workspace.clone(),
         limits.max_tool_result_bytes,
+        timeout,
     )?;
     let mut names = vec![
         workspace_read::TOOL_NAME,
@@ -704,16 +832,10 @@ pub(crate) fn code_tools_with(
         TOOL_NAME,
         workspace_discovery::LIST_TOOL_NAME,
         workspace_discovery::SEARCH_TOOL_NAME,
-        crate::orchestration::workspace_index_query::TOOL_NAME,
+        crate::orchestration::workspace_code::TOOL_NAME,
     ];
     super::workspace_fts::register(&registry, workspace.clone())?;
-    super::workspace_lsp::register(
-        &registry,
-        workspace,
-        super::workspace_lsp::Servers::from_environment(),
-    )?;
     names.push(super::workspace_fts::TOOL_NAME);
-    names.push(super::workspace_lsp::TOOL_NAME);
     for name in &names {
         registry.authorize(name)?;
     }
@@ -853,7 +975,10 @@ mod tests {
 
     #[test]
     fn only_the_exact_presets_are_accepted() {
-        assert_eq!(Preset::CargoCheck.arguments(), ["check", "--all-targets"]);
+        assert_eq!(
+            Preset::CargoCheck.arguments(),
+            ["check", "--all-targets", "--message-format=json"]
+        );
         assert_eq!(Preset::CargoTest.arguments(), ["test", "--all-targets"]);
         assert!(Preset::ALL.iter().all(|preset| preset.program() == "cargo"));
         let setup = setup("presets", "touch ran");
@@ -945,9 +1070,8 @@ mod tests {
                 TOOL_NAME,
                 workspace_discovery::LIST_TOOL_NAME,
                 workspace_discovery::SEARCH_TOOL_NAME,
-                crate::orchestration::workspace_index_query::TOOL_NAME,
+                crate::orchestration::workspace_code::TOOL_NAME,
                 super::super::workspace_fts::TOOL_NAME,
-                super::super::workspace_lsp::TOOL_NAME,
             ]
         );
         assert_eq!(
@@ -983,7 +1107,17 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-1");
+        assert_eq!(handler.version(), "workspace_run_command-2");
+        assert!(
+            crate::persistence::ToolAdmission {
+                handler_version: handler.version().to_owned(),
+                effect: handler.effect(),
+                parameters: parameters().to_string(),
+                arguments: crate::persistence::ToolPayload::new(test_command().to_string()),
+                authorization: crate::persistence::AuthorizationBasis::RegistryGrant,
+            }
+            .spawns()
+        );
         assert!(crate::persistence::is_handler_version(handler.version()));
         let registry = ToolRegistry::default();
         register(&registry, authorize(), setup.environment(), COMMAND_TIMEOUT).expect("register");
@@ -997,9 +1131,9 @@ mod tests {
     }
 
     #[test]
-    fn workspace_index_query_and_search_tools_coexist_with_default_fts() {
+    fn workspace_code_and_search_tools_coexist_with_default_fts() {
         use crate::openai_compatible::CompletedToolCall;
-        use crate::orchestration::{workspace_fts, workspace_index_query};
+        use crate::orchestration::{workspace_code, workspace_fts};
 
         const CHILD: &str = "OCG_TEST_FTS_REGISTRATION_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -1008,7 +1142,7 @@ mod tests {
                 command
                     .args([
                         "--exact",
-                        "orchestration::workspace_command::tests::workspace_index_query_and_search_tools_coexist_with_default_fts",
+                        "orchestration::workspace_command::tests::workspace_code_and_search_tools_coexist_with_default_fts",
                         "--nocapture",
                     ])
                     .env(CHILD, "1");
@@ -1043,13 +1177,9 @@ mod tests {
                 .iter()
                 .any(|name| name == workspace_discovery::SEARCH_TOOL_NAME)
         );
-        assert!(
-            names
-                .iter()
-                .any(|name| name == workspace_index_query::TOOL_NAME)
-        );
+        assert!(names.iter().any(|name| name == workspace_code::TOOL_NAME));
         assert!(names.iter().any(|name| name == workspace_fts::TOOL_NAME));
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 7);
         for (name, arguments, version) in [
             (
                 workspace_discovery::SEARCH_TOOL_NAME,
@@ -1057,14 +1187,14 @@ mod tests {
                 "workspace_search-1",
             ),
             (
-                workspace_index_query::TOOL_NAME,
-                json!({"path": "source.rs", "operation": "outline"}),
-                "workspace_index_query-1",
+                workspace_code::TOOL_NAME,
+                json!({"queries": [{"path": "source.rs", "op": "outline"}]}),
+                "workspace_code-1",
             ),
             (
-                workspace_index_query::TOOL_NAME,
-                json!({"path": "source.rs", "operation": "syntax_errors"}),
-                "workspace_index_query-1",
+                workspace_code::TOOL_NAME,
+                json!({"queries": [{"path": "source.rs", "op": "errors"}]}),
+                "workspace_code-1",
             ),
             (
                 workspace_fts::TOOL_NAME,
@@ -1084,11 +1214,13 @@ mod tests {
             assert_eq!(dispatch.effect, ToolEffect::ReadOnly);
             let result = on_ntex(async move { dispatch.handler.call(dispatch.arguments).await })
                 .expect("tool result");
-            if name == workspace_index_query::TOOL_NAME {
-                if result["operation"] == "outline" {
-                    assert_eq!(result["symbols"][0]["name"], "needle");
+            if name == workspace_code::TOOL_NAME {
+                if arguments["queries"][0]["op"] == "outline" {
+                    assert_eq!(result["counts"][0]["found"], 1);
+                    assert!(result["text"].as_str().expect("text").contains("needle"));
                 } else {
-                    assert!(result["errors"].as_array().expect("errors").is_empty());
+                    assert_eq!(result["counts"][0]["found"], 0);
+                    assert_eq!(result["counts"][0]["files"], 1);
                 }
             } else if name == workspace_discovery::SEARCH_TOOL_NAME {
                 assert_eq!(result["files"][0]["path"], "source.rs");
@@ -1108,7 +1240,11 @@ mod tests {
         for (command, arguments, code) in [
             ("cargo_test", "test --all-targets", 0),
             ("cargo_test", "test --all-targets", 101),
-            ("cargo_check", "check --all-targets", 1),
+            (
+                "cargo_check",
+                "check --all-targets --message-format=json",
+                1,
+            ),
         ] {
             std::fs::write(setup.root.join("code"), code.to_string()).expect("write");
             assert_eq!(
@@ -1123,6 +1259,127 @@ mod tests {
                 "a nonzero exit is a result, not a failure of the call"
             );
             assert!(gone(setup.pid("leader.pid")), "the process was reaped");
+        }
+    }
+
+    #[test]
+    fn check_output_keeps_diagnostics_in_error_order() {
+        let diagnostic = |level, code: Value, message, spans: Value| {
+            json!({
+                "reason": "compiler-message",
+                "message": {
+                    "level": level,
+                    "code": code,
+                    "message": message,
+                    "spans": spans,
+                    "rendered": "a long rendered diagnostic",
+                },
+            })
+        };
+        let spans = json!([
+            {"file_name": "other.rs", "line_start": 1, "column_start": 1, "is_primary": false},
+            {"file_name": "src/main.rs", "line_start": 12, "column_start": 8, "is_primary": true},
+        ]);
+        let stdout = [
+            json!({"reason": "compiler-artifact"}),
+            diagnostic("warning", Value::Null, "unused variable", spans.clone()),
+            diagnostic(
+                "error",
+                json!({"code": "E0308"}),
+                "mismatched\ntypes",
+                spans,
+            ),
+            diagnostic("warning", Value::Null, "no location", json!([])),
+            diagnostic("note", Value::Null, "an explanation", json!([])),
+            json!({"reason": "build-script-executed"}),
+            json!({"reason": "build-finished", "success": false}),
+        ]
+        .map(|record| record.to_string())
+        .join("\n");
+        let result = captured_result(Preset::CargoCheck, &stdout, "Checking example\n", 101);
+        assert_eq!(result["exit_code"], 101);
+        assert_eq!(
+            result["stdout"],
+            "src/main.rs:12:8 error[E0308] mismatched types\nsrc/main.rs:12:8 warning unused variable\n<unknown>:0:0 warning no location"
+        );
+        assert_eq!(result["stderr"], "");
+        assert_eq!(result["truncated"], false);
+        assert_eq!(
+            captured_result(
+                Preset::CargoCheck,
+                "{\"reason\":\"build-finished\",\"success\":true}\n",
+                "Finished dev profile\n",
+                0,
+            )["stdout"],
+            ""
+        );
+    }
+
+    fn captured_result(preset: Preset, stdout: &str, stderr: &str, code: i32) -> Value {
+        let mut ended = Ended {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Capture::default(),
+            stderr: Capture::default(),
+        };
+        ended.stdout.push(stdout.as_bytes());
+        ended.stderr.push(stderr.as_bytes());
+        result(preset, &ended)
+    }
+
+    #[test]
+    fn test_output_keeps_summaries_and_the_start_of_each_failure() {
+        let passed = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s";
+        let failed = "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s";
+        let stdout = format!(
+            "running 1 test\ntest passing ... ok\n{passed}\n\n\
+             running 3 tests\ntest passing_again ... ok\ntest first ... FAILED\ntest second ... FAILED\n\n\
+             failures:\n\n---- first stdout ----\nnoise before the panic\n\n\
+             thread 'first' (123) panicked at src/lib.rs:4:5:\nassertion failed\n  left: 1\n right: 2\nstack backtrace:\nlong backtrace\n\n\
+             ---- second stdout ----\nthread 'second' (124) panicked at src/lib.rs:8:9:\nsomething broke\n\n\
+             failures:\n    first\n    second\n\n{failed}\n"
+        );
+        let result = captured_result(Preset::CargoTest, &stdout, "error: test failed\n", 101);
+        assert_eq!(
+            result["stdout"],
+            format!(
+                "{passed}\n{failed}\nfirst\nthread 'first' (123) panicked at src/lib.rs:4:5:\nassertion failed\n  left: 1\n right: 2\nsecond\nthread 'second' (124) panicked at src/lib.rs:8:9:\nsomething broke"
+            )
+        );
+        assert_eq!(result["exit_code"], 101);
+        assert_eq!(result["stderr"], "");
+        assert_eq!(
+            captured_result(
+                Preset::CargoTest,
+                &format!("test passing ... ok\n{passed}\n"),
+                "",
+                0
+            )["stdout"],
+            passed
+        );
+    }
+
+    #[test]
+    fn unparseable_command_output_uses_the_raw_result() {
+        for (preset, stdout) in [
+            (Preset::CargoCheck, "{broken json}\n"),
+            (Preset::CargoCheck, "{\"reason\":\"compiler-message\"}\n"),
+            (Preset::CargoTest, "a custom test harness failed\n"),
+            (
+                Preset::CargoTest,
+                "test result: ok. 1 passed; 0 failed\nsecond test binary aborted\n",
+            ),
+            (Preset::CargoTest, ""),
+        ] {
+            assert_eq!(
+                captured_result(preset, stdout, "failure details\n", 101),
+                json!({
+                    "command": preset.name(),
+                    "exit_code": 101,
+                    "stdout": stdout,
+                    "stderr": "failure details\n",
+                    "truncated": false,
+                })
+            );
         }
     }
 

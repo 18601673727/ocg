@@ -14,10 +14,7 @@ use ocg::host::{self, HostContext};
 use ocg::orchestration::execution_runtime::{
     ExecutionPlan, ExecutionReceipt, ExecutionRuntimeError, SchedulerHandle,
 };
-use ocg::persistence::{
-    ExecutionMode, ExecutorType, FinalResult, JobInputDraft, JobOutcome, NewExecutor, NewJob,
-    OutputKind,
-};
+use ocg::persistence::{FinalResult, JobInputDraft, JobOutcome, NewExecutor, NewJob, OutputKind};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -51,19 +48,13 @@ fn plan(context: &HostContext, executor: ocg::persistence::ExecutorId) -> Execut
         },
         job: NewJob {
             name: Some("host-submitted work".into()),
-            execution_mode: ExecutionMode::Once,
             eligible_at: None,
-            scheduled_at: None,
-            next_due_at: None,
-            next_iteration_no: None,
-            iteration_no: None,
             parent: context.database().genesis(),
             projects: Vec::new(),
             dependencies: Vec::new(),
+            input: JobInputDraft::default(),
             configuration: None,
-            assigned_executor: None,
             previous: None,
-            replaces: None,
         },
         outcome: JobOutcome::Completed,
         result: FinalResult {
@@ -91,7 +82,6 @@ fn a_host_level_caller_submits_through_the_host_owned_scheduler() {
             .database()
             .create_executor(NewExecutor {
                 name: "host worker".into(),
-                executor_type: ExecutorType::System,
                 concurrency_limit: NonZeroU32::MIN,
                 llm_transports: Default::default(),
             })
@@ -114,19 +104,13 @@ fn a_host_level_caller_submits_through_the_host_owned_scheduler() {
         input: JobInputDraft::default(),
         job: NewJob {
             name: Some("too late".into()),
-            execution_mode: ExecutionMode::Once,
             eligible_at: None,
-            scheduled_at: None,
-            next_due_at: None,
-            next_iteration_no: None,
-            iteration_no: None,
             parent: receipt.job,
             projects: Vec::new(),
             dependencies: Vec::new(),
+            input: JobInputDraft::default(),
             configuration: None,
-            assigned_executor: None,
             previous: None,
-            replaces: None,
         },
         outcome: JobOutcome::Completed,
         result: FinalResult {

@@ -2,78 +2,26 @@
 
 import { useEffect, useState } from "react";
 
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import type { HttpCanonicalControlClient } from "@/components/ocg/runtime/canonical-client";
-import { JobSubmissionForm } from "@/components/ocg/job/job-submission-form";
-import { JobWatch } from "@/components/ocg/job/job-watch";
+import { JobsSurface } from "@/components/ocg/job/jobs-surface";
 import { ChatSurface } from "@/components/ocg/chat/chat-surface";
 import { OcgSidebar } from "@/components/ocg/sidebar/ocg-sidebar";
 import { OcgTopbar } from "@/components/ocg/topbar/ocg-topbar";
 import { SettingsSurface } from "@/components/ocg/settings/settings-surface";
-import { UnavailableSurface } from "./unavailable-surface";
+import { LogsSurface } from "@/components/ocg/dashboard/logs-surface";
+import { ObservationsSurface } from "@/components/ocg/dashboard/observations-surface";
+import type { decodeHealth } from "@/components/ocg/contracts";
 import {
-  VIEW_AVAILABILITY,
-  isJobIdentity,
   parseWorkspaceLocation,
   workspaceLocationHref,
   type WorkspaceLocation,
   type WorkspaceView,
 } from "./view-domain";
 
-type Health = {
-  host: string;
-  database: {
-    status: string;
-    accepting_commands: boolean;
-    readable: boolean;
-  };
-};
+type Health = ReturnType<typeof decodeHealth>;
 
 /** Jobs this tab remembers having opened; the Control Plane has no Job list to ask. */
 const OPENED_JOBS_LIMIT = 20;
-
-function JobsView({
-  client,
-  job,
-  onJob,
-}: {
-  client: HttpCanonicalControlClient;
-  job: string | null;
-  onJob: (job: string) => void;
-}) {
-  const [inspect, setInspect] = useState("");
-  return (
-    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6 sm:px-6">
-      <JobSubmissionForm client={client} onJob={onJob} />
-      <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-5 text-card-foreground">
-        <h2 className="font-heading text-lg">Inspect a Job</h2>
-        <form
-          className="flex flex-wrap items-end gap-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const target = inspect.trim();
-            if (isJobIdentity(target)) onJob(target);
-          }}
-        >
-          <label className="flex flex-1 flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-            Job
-            <Input
-              value={inspect}
-              onChange={(event) => setInspect(event.target.value)}
-              placeholder="job:<n>"
-              spellCheck={false}
-            />
-          </label>
-          <Button type="submit" variant="outline">
-            Watch
-          </Button>
-        </form>
-      </section>
-      {job ? <JobWatch key={job} client={client} jobId={job} /> : null}
-    </div>
-  );
-}
 
 /**
  * The signed-in console: the 0.4.5 sidebar / topbar / view layout over the
@@ -178,7 +126,7 @@ export function AppShell({
             />
           </div>
           <div hidden={view !== "jobs"}>
-            <JobsView client={client} job={view === "jobs" ? location.job : null} onJob={(job) => openJob(job, "jobs")} />
+            <JobsSurface client={client} active={view === "jobs"} job={view === "jobs" ? location.job : null} onJob={(job) => openJob(job, "jobs")} />
           </div>
           {view === "settings" ? (
             <SettingsSurface
@@ -189,7 +137,8 @@ export function AppShell({
               onSignOut={onSignOut}
             />
           ) : null}
-          {!VIEW_AVAILABILITY[view].available ? <UnavailableSurface view={view} /> : null}
+          {view === "usage" || view === "health" ? <ObservationsSurface key={view} client={client} kind={view} health={health} onJob={(job) => openJob(job, "jobs")} /> : null}
+          {view === "logs" ? <LogsSurface client={client} /> : null}
         </main>
       </div>
     </div>

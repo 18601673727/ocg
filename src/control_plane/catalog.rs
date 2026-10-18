@@ -16,7 +16,7 @@ use super::{
     micros,
 };
 use crate::database::DatabaseHandle;
-use crate::persistence::{AgentConfig, JobId, ModelCapability, Profile, ProfileId};
+use crate::persistence::{ConfigBody, ConfigKind, JobId, ModelCapability, ProfileId};
 
 /// The most Profiles one page of Agent Profiles reads, and the default.
 pub(super) const MAX_PROFILE_PAGE: usize = 100;
@@ -158,40 +158,46 @@ fn capability(capability: ModelCapability) -> &'static str {
 }
 
 /// One page of Agent Profiles, newest first, strictly before `before` when
-/// given. The page is `limit` Profiles of either kind as they are stored, of
-/// which the Agent Profiles are listed, so it may hold fewer than `limit`;
-/// `next_before` continues from the oldest Profile read.
+/// given. An Agent Profile is an Agent config; archived ones are not listed,
+/// so the page may hold fewer than `limit`; `next_before` continues from the
+/// oldest one read.
 pub(super) async fn agent_profiles(
     database: &DatabaseHandle,
     before: Option<ProfileId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    let mut records = database.profiles(before, limit + 1).await?;
+    let mut records = database
+        .configs(Some(ConfigKind::Agent), before.map(Into::into), limit + 1)
+        .await?;
     let has_more = records.len() > limit;
     records.truncate(limit);
     let next_before = if has_more {
-        records.last().map(|record| record.id.to_string())
+        records
+            .last()
+            .map(|record| ProfileId::from(record.id).to_string())
     } else {
         None
     };
     let mut agent_profiles = Vec::new();
     for record in records {
-        let Ok(agent) = Profile::<AgentConfig>::try_from(record) else {
-            continue;
+        let ConfigBody::Agent(agent) = record.body else {
+            return Err(INCONSISTENT_RECORD);
         };
-        let mut llm_targets = Vec::with_capacity(agent.links.len());
-        for target in &agent.links {
-            let llm = database
-                .llm_profile(*target)
-                .await?
-                .ok_or(INCONSISTENT_RECORD)?;
-            let executors = database.compatible_executors(*target).await?;
+        if record.archived_at.is_some() {
+            continue;
+        }
+        let mut llm_targets = Vec::with_capacity(agent.models.len());
+        for target in &agent.models {
+            let llm = database.config(*target).await?.ok_or(INCONSISTENT_RECORD)?;
+            let ConfigBody::Model(model) = llm.body else {
+                return Err(INCONSISTENT_RECORD);
+            };
+            let executors = database.compatible_executors((*target).into()).await?;
             llm_targets.push(json!({
-                "id": llm.id.to_string(),
+                "id": ProfileId::from(llm.id).to_string(),
                 "name": llm.name,
-                "model": llm.config.model,
-                "declared_capabilities": llm
-                    .config
+                "model": model.model,
+                "declared_capabilities": model
                     .declared_capabilities
                     .iter()
                     .map(|declared| capability(*declared))
@@ -203,8 +209,8 @@ pub(super) async fn agent_profiles(
             }));
         }
         agent_profiles.push(json!({
-            "id": agent.id.to_string(),
-            "name": agent.name,
+            "id": ProfileId::from(record.id).to_string(),
+            "name": record.name,
             "llm_targets": llm_targets,
         }));
     }

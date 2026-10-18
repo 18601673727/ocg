@@ -1,15 +1,14 @@
 use super::*;
 
-/// A stored Job with the related IDs assembled from its relationship tables.
+/// A Job assembled from its immutable `job` row, its mutable `job_state` row
+/// and the derived tables that describe it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobRecord {
     pub id: JobId,
     pub name: Option<String>,
-    pub execution_mode: ExecutionMode,
     pub eligible_at: Option<Timestamp>,
+    /// When the Job's claim was made.
     pub started_at: Option<Timestamp>,
-    pub paused_at: Option<Timestamp>,
-    pub sterilized_at: Option<Timestamp>,
     pub completed_at: Option<Timestamp>,
     pub failed_at: Option<Timestamp>,
     pub cancelled_at: Option<Timestamp>,
@@ -17,22 +16,111 @@ pub struct JobRecord {
     /// When the trusted execution path confirmed that an unknown-outcome
     /// Job's execution has actually stopped. The outcome stays unknown.
     pub stop_confirmed_at: Option<Timestamp>,
-    pub next_due_at: Option<Timestamp>,
-    pub next_iteration_no: Option<i64>,
-    pub iteration_no: Option<i64>,
-    pub scheduled_at: Option<Timestamp>,
     pub created_at: Timestamp,
+    /// The latest time one of the Job's lifecycle facts was recorded.
     pub updated_at: Timestamp,
+    /// The Job's own input, which its spec holds: the identity is the Job's.
     pub input: JobInputId,
-    /// The Genesis Job is its own parent; every other Job has a different one.
+    /// The parent Job; 0 for a top-level Job.
     pub parent: JobId,
+    pub parent_id: Option<JobId>,
+    pub agent_id: Option<ConfigId>,
+    pub execution: Option<FrozenExecutionConfig>,
+    pub objective: Option<String>,
+    pub attachments: Vec<AttachmentId>,
+    pub dependencies: Vec<(JobId, DependencyCondition)>,
+    pub max_depth: Option<u32>,
+    pub max_children: Option<u32>,
+    pub max_descendants: Option<u32>,
+    pub retry_of: Option<JobId>,
+    pub continues: Option<JobId>,
+    pub submission: Option<SubmissionKey>,
     pub projects: Vec<ProjectId>,
-    /// Assembled from RUNS_LLM_PROFILE and, when present, APPLIES_PROFILE.
+    /// The Agent and Model configs the Job was submitted with, as provenance.
     pub configuration: Option<ExecutionConfiguration>,
+    /// The Pool the Job was claimed into.
     pub assigned_executor: Option<ExecutorId>,
     pub previous: Option<JobId>,
-    pub replaces: Option<JobId>,
-    pub retry_of: Option<JobId>,
+    pub claim: Option<ClaimRecord>,
+    pub suspension: Option<SuspensionRecord>,
+    pub outcome: Option<OutcomeRecord>,
+    pub children_closed_at: Option<Timestamp>,
+    /// Whether the Job has no `unsettled` row: it and every Job below it
+    /// have stopped.
+    pub subtree_settled: bool,
+}
+
+impl JobRecord {
+    pub fn confirmed_terminal(&self) -> bool {
+        self.completed_at.is_some() || self.failed_at.is_some() || self.cancelled_at.is_some()
+    }
+
+    pub fn any_terminal(&self) -> bool {
+        self.confirmed_terminal() || self.unknown_at.is_some()
+    }
+
+    pub fn awaits_start(&self) -> bool {
+        self.started_at.is_none() && !self.any_terminal()
+    }
+
+    pub fn locally_stopped(&self) -> bool {
+        self.confirmed_terminal() || (self.unknown_at.is_some() && self.stop_confirmed_at.is_some())
+    }
+
+    pub fn settled(&self) -> bool {
+        self.subtree_settled
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OutcomeKind {
+    Completed = 1,
+    Failed = 2,
+    Cancelled = 3,
+    Unknown = 4,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutcomeCause {
+    Code(u8),
+    Text(String),
+    Abandoned,
+    DependencyImpossible,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutcomeRecord {
+    pub kind: OutcomeKind,
+    pub at: Timestamp,
+    pub cause: Option<OutcomeCause>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimRecord {
+    pub started_at: Timestamp,
+    pub pool_id: ConfigId,
+    pub pool_edit_seq: u32,
+    pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
+    pub epoch: u64,
+    pub host_id: Option<String>,
+    pub boot_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SuspensionRecord {
+    pub since: Timestamp,
+    pub wait_generation: u64,
+    pub owner_epoch: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobStateRecord {
+    pub job_id: JobId,
+    pub claim: Option<ClaimRecord>,
+    pub suspension: Option<SuspensionRecord>,
+    pub outcome: Option<OutcomeRecord>,
+    pub stop_confirmed_at: Option<Timestamp>,
+    pub children_closed_at: Option<Timestamp>,
 }
 
 /// A position in the order of Jobs that have been submitted but have not
@@ -58,11 +146,11 @@ pub struct PendingJobsPage {
     pub exhausted: bool,
 }
 
-/// A stored JobInput.
+/// A Job's input as its spec holds it: the objective, limits, Attachments and
+/// frozen configuration. Its identity is the Job's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobInputRecord {
     pub id: JobInputId,
-    pub submission_id: Option<String>,
     pub objective: Option<String>,
     pub max_depth: Option<u32>,
     pub max_children_per_job: Option<u32>,
@@ -143,6 +231,15 @@ impl fmt::Debug for SubmissionKey {
             .iter()
             .try_for_each(|byte| write!(f, "{byte:02x}"))?;
         f.write_str("…)")
+    }
+}
+
+impl fmt::Display for SubmissionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -279,18 +376,16 @@ pub const MAX_ATTACHMENT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
 pub const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 
-/// A stored Executor.
+/// A Pool config seen as the Executor that runs work.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutorRecord {
     pub id: ExecutorId,
     pub name: String,
-    pub executor_type: ExecutorType,
     pub concurrency_limit: u32,
-    pub latest_enabled_at: Option<Timestamp>,
-    pub latest_disabled_at: Option<Timestamp>,
+    /// The LLM transports the Pool offers `LlmRequest` for.
+    pub llm_transports: BTreeSet<LlmTransport>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    pub llm_transports: BTreeSet<LlmTransport>,
 }
 
 /// A published output. Outputs have no update path, so they carry no
@@ -333,25 +428,6 @@ pub enum LlmTransport {
     OpenAiChatCompletions,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewLlmProvider {
-    pub name: String,
-    pub transport: LlmTransport,
-    pub endpoint: Option<String>,
-    /// The name of a stored credential, never the secret itself.
-    pub credential_ref: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LlmProviderRecord {
-    pub id: LlmProviderId,
-    pub name: String,
-    pub transport: LlmTransport,
-    pub endpoint: Option<String>,
-    pub credential_ref: Option<String>,
-    pub created_at: Timestamp,
-}
-
 /// A capability a user declares for a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelCapability {
@@ -371,8 +447,8 @@ pub struct LlmParameters {
     pub frequency_penalty: Option<f64>,
 }
 
-/// The configuration of a Profile<LLM>. Its Provider is a relationship, not
-/// a field, see [`NewProfileConfig::Llm`].
+/// What a Model config holds of the model itself; its Connection is a
+/// reference, see [`ModelConfig::connection_id`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmConfig {
     pub model: String,
@@ -382,222 +458,185 @@ pub struct LlmConfig {
     pub declared_capabilities: BTreeSet<ModelCapability>,
 }
 
-/// The configuration of a Profile<Agent>.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AgentBehavior {
+    Chat = 1,
+    General = 2,
+}
+
+/// The body of an Agent config.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentConfig {
     pub instructions: Option<String>,
+    pub behavior: AgentBehavior,
+    pub models: Vec<ConfigId>,
+    pub default_model: Option<ConfigId>,
+    pub tool_grant: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProfileKind {
-    Agent,
-    Llm,
-    ExecutionPool,
-}
-
-impl fmt::Display for ProfileKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Agent => "Agent",
-            Self::Llm => "LLM",
-            Self::ExecutionPool => "ExecutionPool",
-        })
-    }
-}
-
-/// A Profile's configuration. The variant is the Profile's only kind tag.
-#[derive(Clone, Debug, PartialEq)]
-pub enum ProfileConfig {
-    Agent(AgentConfig),
-    Llm(LlmConfig),
-    ExecutionPool(ExecutionPoolConfig),
-}
-
-impl ProfileConfig {
-    pub fn kind(&self) -> ProfileKind {
-        match self {
-            Self::Agent(_) => ProfileKind::Agent,
-            Self::Llm(_) => ProfileKind::Llm,
-            Self::ExecutionPool(_) => ProfileKind::ExecutionPool,
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            instructions: None,
+            behavior: AgentBehavior::General,
+            models: Vec::new(),
+            default_model: None,
+            tool_grant: None,
         }
     }
 }
 
-/// A Profile's payload together with the references that define it. Both
-/// are fixed when the Profile is created.
-#[derive(Clone, Debug, PartialEq)]
-pub enum NewProfileConfig {
-    /// `llm_targets` are the LLM Profiles this Agent Profile may run with.
-    /// They form a set: no default or fallback order is implied.
-    Agent { config: AgentConfig, llm_targets: Vec<ProfileId> },
-    Llm { provider: LlmProviderId, config: LlmConfig },
-    ExecutionPool(ExecutionPoolConfig),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConfigKind {
+    Connection = 1,
+    Model = 2,
+    Agent = 3,
+    Pool = 4,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct NewProfile {
-    pub name: String,
-    pub config: NewProfileConfig,
-}
-
-/// A stored Profile of either kind, as currently configured. It can be
-/// edited while no submitted execution holds it; submitted Jobs keep their
-/// own frozen copies of what they used.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ProfileRecord {
-    pub id: ProfileId,
-    pub name: String,
-    pub config: ProfileConfig,
-    /// Assembled from USES_PROVIDER; present exactly for an LLM Profile.
-    pub llm_provider: Option<LlmProviderId>,
-    /// Assembled from TARGETS_LLM, in ID order; empty for an LLM Profile.
-    pub llm_targets: Vec<ProfileId>,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
-}
-
-/// Whether a Profile can be edited now. Every Job submitted with the
-/// Profile holds it until the Job is completed, failed or cancelled, or, for
-/// an unknown outcome, until its execution is confirmed stopped. Queued,
-/// started and paused Jobs hold it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProfileEditability {
-    /// The holding Jobs in ID order, at most 1,000 of them.
-    pub blocking_jobs: Vec<JobId>,
-    /// Set when more Jobs hold the Profile than `blocking_jobs` lists.
-    pub more_blocking_jobs: bool,
+pub struct ConnectionConfig {
+    pub protocol: LlmTransport,
+    pub endpoint: Option<String>,
+    pub credential_ref: Option<String>,
 }
 
-impl ProfileEditability {
-    pub fn editable(&self) -> bool {
-        self.blocking_jobs.is_empty()
-    }
-}
-
-/// A configuration type that one kind of Profile holds, with the related IDs
-/// that kind's typed form assembles.
-pub trait ProfileVariant: Sized {
-    const KIND: ProfileKind;
-    type Links: Clone + fmt::Debug + PartialEq;
-
-    fn split(record: ProfileRecord) -> Option<(Self, Self::Links)>;
-}
-
-impl ProfileVariant for AgentConfig {
-    const KIND: ProfileKind = ProfileKind::Agent;
-    /// The configured LLM targets.
-    type Links = Vec<ProfileId>;
-
-    fn split(record: ProfileRecord) -> Option<(Self, Vec<ProfileId>)> {
-        match record.config {
-            ProfileConfig::Agent(config) => Some((config, record.llm_targets)),
-            ProfileConfig::Llm(_) | ProfileConfig::ExecutionPool(_) => None,
-        }
-    }
-}
-
-impl ProfileVariant for LlmConfig {
-    const KIND: ProfileKind = ProfileKind::Llm;
-    type Links = LlmProviderId;
-
-    fn split(record: ProfileRecord) -> Option<(Self, LlmProviderId)> {
-        match (record.config, record.llm_provider) {
-            (ProfileConfig::Llm(config), Some(provider)) => Some((config, provider)),
-            _ => None,
-        }
-    }
-}
-
-/// A Profile in its typed form: `Profile<AgentConfig>` is an Agent Profile
-/// and `Profile<LlmConfig>` an LLM Profile.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Profile<C: ProfileVariant> {
-    pub id: ProfileId,
+pub struct ModelConfig {
+    pub connection_id: ConfigId,
+    pub model: String,
+    pub parameters: LlmParameters,
+    pub declared_capabilities: BTreeSet<ModelCapability>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PoolConfig {
+    pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
+    pub concurrency_limit: u32,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfigBody {
+    Connection(ConnectionConfig),
+    Model(ModelConfig),
+    Agent(AgentConfig),
+    Pool(PoolConfig),
+}
+
+impl ConfigBody {
+    pub fn kind(&self) -> ConfigKind {
+        match self {
+            Self::Connection(_) => ConfigKind::Connection,
+            Self::Model(_) => ConfigKind::Model,
+            Self::Agent(_) => ConfigKind::Agent,
+            Self::Pool(_) => ConfigKind::Pool,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigRecord {
+    pub id: ConfigId,
+    pub kind: ConfigKind,
     pub name: String,
-    pub config: C,
-    pub links: C::Links,
+    pub edit_seq: u32,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    pub archived_at: Option<Timestamp>,
+    pub body: ConfigBody,
 }
 
-pub type AgentProfile = Profile<AgentConfig>;
-pub type LlmProfile = Profile<LlmConfig>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{profile} is an {found} Profile, not an {expected} Profile")]
-pub struct WrongProfileKind {
-    pub profile: ProfileId,
-    pub expected: ProfileKind,
-    pub found: ProfileKind,
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewConfig {
+    pub name: String,
+    pub body: ConfigBody,
 }
 
-impl<C: ProfileVariant> TryFrom<ProfileRecord> for Profile<C> {
-    type Error = WrongProfileKind;
-
-    fn try_from(record: ProfileRecord) -> Result<Self, WrongProfileKind> {
-        let (id, name, created_at, updated_at, found) = (record.id, record.name.clone(), record.created_at, record.updated_at, record.config.kind());
-        let mismatch = WrongProfileKind { profile: id, expected: C::KIND, found };
-        if found != C::KIND {
-            return Err(mismatch);
-        }
-        let (config, links) = C::split(record).ok_or(mismatch)?;
-        Ok(Self { id, name, config, links, created_at, updated_at })
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RequestPayloadKind {
+    Measurement = 1,
+    Availability = 2,
+    Token = 3,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RequestPayload {
+    Measurement {
+        measurements: Measurements,
+    },
+    Availability {
+        status_code: Option<u16>,
+        finish_reason: Option<ChatFinishReason>,
+        raw_finish_reason: Option<String>,
+        failure: Option<ProviderFailure>,
+    },
+    Token {
+        eligibility: RequestEligibility,
+        finality: UsageFinality,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestEventRecord {
+    pub job_id: JobId,
+    pub request: RequestNumber,
+    pub seq: u32,
+    pub observed_at: Timestamp,
+    pub recorded_at: Timestamp,
+    pub payload: RequestPayload,
+}
+
+pub type ToolCallRecord = super::tool_evidence::ToolEvidenceRecord;
 
 /// The Provider facts needed to interpret a request. The credential is
 /// named, never copied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderSnapshot {
     pub id: LlmProviderId,
+    /// The Connection's edit counter when it was frozen.
+    pub edit_seq: u32,
     pub name: String,
     pub transport: LlmTransport,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
 }
 
-/// An LLM Profile's configuration as it was when frozen: model, request
-/// parameters, declared capabilities and the Provider that serves them.
+/// A config row and the edit counter it had when a Job froze its values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfigRef {
+    pub id: ConfigId,
+    pub edit_seq: u32,
+}
+
+/// A Model config as it was when frozen: model, request parameters,
+/// declared capabilities and the Connection that serves them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenLlmConfig {
     pub config: LlmConfig,
     pub provider: ProviderSnapshot,
+    /// The Model config the values came from.
+    pub model: ConfigRef,
 }
 
-/// What a submitted LLM execution child was configured to execute, frozen
-/// in its JobInput when it was submitted. `agent` is absent for work
-/// submitted without an Agent Profile.
+/// What a submitted Job was configured to execute, frozen in its spec when
+/// it was submitted. `agent` is absent for work submitted without an Agent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenExecutionConfig {
     pub agent: Option<AgentConfig>,
+    /// The Agent config `agent` came from.
+    pub agent_ref: Option<ConfigRef>,
     pub llm: FrozenLlmConfig,
 }
 
-/// A submitted Job's configuration: the Profiles it was submitted with, as
-/// provenance, and the values it was frozen with, as the authority for what
-/// it executes. Later Profile edits change neither.
+/// A submitted Job's configuration: the Agent and Model configs it was
+/// submitted with, as provenance, and the values it was frozen with, as the
+/// authority for what it executes. Later config edits change neither.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmittedConfiguration {
     pub agent_profile: Option<ProfileId>,
     pub llm_profile: ProfileId,
     pub frozen: FrozenExecutionConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewAgent {
-    pub name: String,
-    /// Each must be an Agent Profile.
-    pub profiles: Vec<ProfileId>,
-}
-
-/// Agents have no update path, so they carry no `updated_at`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AgentRecord {
-    pub id: AgentId,
-    pub name: String,
-    /// Assembled from USES_PROFILE.
-    pub profiles: Vec<ProfileId>,
-    pub created_at: Timestamp,
 }
 
 /// Measurements of one request. Every measurement is optional: one that was
@@ -614,10 +653,23 @@ pub struct Measurements {
 impl Measurements {
     pub(super) fn is_empty(&self) -> bool {
         let usage = &self.usage;
-        [self.ttfb_ms, self.reasoning_ttft_ms, self.output_ttft_ms, self.request_finished_in_ms].iter().all(Option::is_none)
-            && [usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens, usage.reasoning_tokens]
-                .iter()
-                .all(Option::is_none)
+        [
+            self.ttfb_ms,
+            self.reasoning_ttft_ms,
+            self.output_ttft_ms,
+            self.request_finished_in_ms,
+        ]
+        .iter()
+        .all(Option::is_none)
+            && [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.reasoning_tokens,
+            ]
+            .iter()
+            .all(Option::is_none)
             && usage.raw.is_none()
     }
 }
@@ -643,8 +695,8 @@ pub struct NewMetrics {
     pub token: Option<TokenAnnotation>,
 }
 
-/// The LLM a Job ran, as its submission froze it: the LLM Profile as
-/// provenance and the configuration the Job actually used. Later Profile
+/// The LLM a Job ran, as its submission froze it: the Model config as
+/// provenance and the configuration the Job actually used. Later config
 /// edits change neither.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmTarget {
@@ -696,33 +748,61 @@ pub struct ExecutionPoolConfig {
     pub capabilities: CapabilitySet,
 }
 
-impl ProfileVariant for ExecutionPoolConfig {
-    const KIND: ProfileKind = ProfileKind::ExecutionPool;
-    type Links = ();
-
-    fn split(record: ProfileRecord) -> Option<(Self, ())> {
-        match record.config {
-            ProfileConfig::ExecutionPool(config) => Some((config, ())),
-            _ => None,
+impl ExecutionPoolConfig {
+    /// The Pool body this configuration is stored as.
+    pub fn body(&self, enabled: bool) -> PoolConfig {
+        let mut capabilities = BTreeSet::new();
+        for operation in &self.capabilities.operations {
+            if self.capabilities.llm_protocols.is_empty() {
+                capabilities.insert((*operation, None));
+            }
+            for protocol in &self.capabilities.llm_protocols {
+                capabilities.insert((*operation, Some(*protocol)));
+            }
+        }
+        PoolConfig {
+            capabilities,
+            concurrency_limit: self.concurrency_limit.get(),
+            enabled,
         }
     }
 }
 
-pub type ExecutionPoolProfile = Profile<ExecutionPoolConfig>;
+impl PoolConfig {
+    /// The capabilities of this Pool as operations and protocols.
+    pub fn capability_set(&self) -> CapabilitySet {
+        let mut set = CapabilitySet::default();
+        for (operation, protocol) in &self.capabilities {
+            set.operations.insert(*operation);
+            if let Some(protocol) = protocol {
+                set.llm_protocols.insert(*protocol);
+            }
+        }
+        set
+    }
+
+    /// Whether this Pool offers `operation` for `protocol`. A capability
+    /// without a protocol offers only work that needs none.
+    pub fn offers(&self, operation: ExecutionOperation, protocol: Option<LlmTransport>) -> bool {
+        self.capabilities.contains(&(operation, protocol))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewExecutionPool {
     pub name: String,
-    pub profile: ProfileId,
+    pub config: ExecutionPoolConfig,
     pub enabled: bool,
 }
 
+/// A Pool config as the scheduler's callers see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionPool {
     pub id: ExecutionPoolId,
     pub name: String,
-    pub profile: ProfileId,
+    pub config: ExecutionPoolConfig,
     pub enabled: bool,
+    pub edit_seq: u32,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }

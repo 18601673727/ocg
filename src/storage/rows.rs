@@ -1,179 +1,529 @@
+use std::collections::BTreeSet;
+
 use super::*;
+use crate::openai_compatible::ChatFinishReason;
+use crate::persistence::{
+    AgentBehavior, AgentConfig, AttachmentCleanup, AttachmentId, AttachmentOrigin,
+    AttachmentRecord, AuthorizationBasis, ClaimRecord, CleanupKind, ConfigBody, ConfigId,
+    ConfigKind, ConnectionConfig, ContentDigest, DependencyCondition, EffectConclusion,
+    ExecutionOperation, FrozenExecutionConfig, JobId, JobOutputId, JobOutputRecord, LlmParameters,
+    LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause,
+    OutcomeKind, OutcomeRecord, PoolConfig, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
+    RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord,
+    SuspensionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
+    WithheldReason,
+};
+use crate::token_usage::{RequestEligibility, UsageFinality};
 
 // ---- rows ------------------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JobRow {
     pub(crate) id: JobId,
-    pub(crate) name: Option<String>,
-    pub(crate) execution_mode: ExecutionMode,
-    pub(crate) eligible_at: Option<Timestamp>,
-    pub(crate) started_at: Option<Timestamp>,
-    pub(crate) paused_at: Option<Timestamp>,
-    pub(crate) sterilized_at: Option<Timestamp>,
-    pub(crate) completed_at: Option<Timestamp>,
-    pub(crate) failed_at: Option<Timestamp>,
-    pub(crate) cancelled_at: Option<Timestamp>,
-    pub(crate) unknown_at: Option<Timestamp>,
-    pub(crate) stop_confirmed_at: Option<Timestamp>,
-    pub(crate) next_due_at: Option<Timestamp>,
-    pub(crate) next_iteration_no: Option<i64>,
-    pub(crate) iteration_no: Option<i64>,
-    pub(crate) scheduled_at: Option<Timestamp>,
     pub(crate) created_at: Timestamp,
-    pub(crate) updated_at: Timestamp,
+    pub(crate) eligible_at: Option<Timestamp>,
+    pub(crate) name: Option<String>,
+    pub(crate) parent_id: Option<JobId>,
+    pub(crate) agent_id: Option<ConfigId>,
+    pub(crate) execution: Option<FrozenExecutionConfig>,
+    pub(crate) objective: Option<String>,
+    pub(crate) attachments: Vec<AttachmentId>,
+    pub(crate) dependencies: Vec<(JobId, DependencyCondition)>,
+    pub(crate) max_depth: Option<u32>,
+    pub(crate) max_children: Option<u32>,
+    pub(crate) max_descendants: Option<u32>,
+    pub(crate) retry_of: Option<JobId>,
+    pub(crate) continues: Option<JobId>,
+    pub(crate) submission: Option<SubmissionKey>,
 }
 
 impl JobRow {
-    pub(crate) fn confirmed_terminal(&self) -> bool {
-        self.completed_at.is_some() || self.failed_at.is_some() || self.cancelled_at.is_some()
-    }
-
-    pub(crate) fn any_terminal(&self) -> bool {
-        self.confirmed_terminal() || self.unknown_at.is_some()
-    }
-
-    /// Whether the Job has neither started nor reached any outcome, unknown
-    /// included. Whether it is a member of [`PENDING_JOBS`] also depends on
-    /// it not being the Genesis Job, which the row does not say.
-    pub(super) fn awaits_start(&self) -> bool {
-        self.started_at.is_none() && !self.any_terminal()
-    }
-
-    /// The Job's [`PENDING_JOBS`] key.
-    pub(super) fn pending_key(&self) -> u64 {
-        self.id.get()
-    }
-
-    /// Whether the Job's own execution is over: it has a confirmed outcome,
-    /// or an unknown outcome whose execution the trusted path confirmed
-    /// stopped. An unknown outcome without that confirmation may still be
-    /// executing. This says nothing of the Job's children; whether they are
-    /// over too is its subtree settlement, read from the waiting tables.
-    pub(crate) fn locally_stopped(&self) -> bool {
-        self.confirmed_terminal() || (self.unknown_at.is_some() && self.stop_confirmed_at.is_some())
-    }
-
-    /// The row-only reading that predates the subtree distinction, kept so
-    /// the tests that pin it still compile. Production code asks
-    /// [`Self::locally_stopped`] or the graph-aware settlement instead.
-    #[cfg(test)]
-    pub(crate) fn settled(&self) -> bool {
-        self.locally_stopped()
-    }
-
-    /// Whether this Job holds the Profiles it was submitted with: until a
-    /// confirmed outcome, or, for an unknown outcome, until its execution is
-    /// confirmed stopped.
-    pub(crate) fn holds_profiles(&self) -> bool {
-        !self.confirmed_terminal() && self.stop_confirmed_at.is_none()
-    }
-
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);
         e.u64(self.id.get());
-        e.ostr(&self.name);
-        e.u8(self.execution_mode.code());
-        for at in [
-            self.eligible_at,
-            self.started_at,
-            self.paused_at,
-            self.sterilized_at,
-            self.completed_at,
-            self.failed_at,
-            self.cancelled_at,
-            self.unknown_at,
-            self.stop_confirmed_at,
-            self.next_due_at,
-        ] {
-            e.ots(at);
-        }
-        e.oi64(self.next_iteration_no);
-        e.oi64(self.iteration_no);
-        e.ots(self.scheduled_at);
         e.ts(self.created_at);
-        e.ts(self.updated_at);
+        e.ots(self.eligible_at);
+        e.ostr(&self.name);
+        e.ou64(self.parent_id.map(|p| p.get()));
+        e.ou64(self.agent_id.map(|a| a.get()));
+        e.opt(&self.execution, Enc::frozen_execution);
+        e.ostr(&self.objective);
+        e.u32(self.attachments.len() as u32);
+        for a in &self.attachments {
+            e.u64(a.get());
+        }
+        e.u32(self.dependencies.len() as u32);
+        for (d, cond) in &self.dependencies {
+            e.u64(d.get());
+            e.u8(match cond {
+                DependencyCondition::Success => 1,
+                DependencyCondition::Settled => 2,
+            });
+        }
+        e.ou32(self.max_depth);
+        e.ou32(self.max_children);
+        e.ou32(self.max_descendants);
+        e.ou64(self.retry_of.map(|r| r.get()));
+        e.ou64(self.continues.map(|c| c.get()));
+        e.opt(&self.submission, |e, s| e.0.extend_from_slice(s.as_bytes()));
         e.0
     }
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB)?;
-        let row = JobRow {
-            id: JobId::new(d.u64()?),
-            name: d.ostr()?,
-            execution_mode: d.code(ExecutionMode::from_code)?,
-            eligible_at: d.ots()?,
-            started_at: d.ots()?,
-            paused_at: d.ots()?,
-            sterilized_at: d.ots()?,
-            completed_at: d.ots()?,
-            failed_at: d.ots()?,
-            cancelled_at: d.ots()?,
-            unknown_at: d.ots()?,
-            stop_confirmed_at: d.ots()?,
-            next_due_at: d.ots()?,
-            next_iteration_no: d.oi64()?,
-            iteration_no: d.oi64()?,
-            scheduled_at: d.ots()?,
-            created_at: d.ts()?,
-            updated_at: d.ts()?,
-        };
+        let id = JobId::new(d.u64()?);
+        let created_at = d.ts()?;
+        let eligible_at = d.ots()?;
+        let name = d.ostr()?;
+        let parent_id = d.ou64()?.map(JobId::new);
+        let agent_id = d.ou64()?.map(ConfigId::new);
+        let execution = d.opt(Dec::frozen_execution)?;
+        let objective = d.ostr()?;
+        let att_len = d.u32()? as usize;
+        let mut attachments = Vec::with_capacity(att_len);
+        for _ in 0..att_len {
+            attachments.push(AttachmentId::new(d.u64()?));
+        }
+        let dep_len = d.u32()? as usize;
+        let mut dependencies = Vec::with_capacity(dep_len);
+        for _ in 0..dep_len {
+            let j = JobId::new(d.u64()?);
+            let c = match d.u8()? {
+                1 => DependencyCondition::Success,
+                2 => DependencyCondition::Settled,
+                code => {
+                    return Err(StorageError::corrupted(format!(
+                        "invalid dependency condition code {code}"
+                    )));
+                }
+            };
+            dependencies.push((j, c));
+        }
+        let max_depth = d.ou32()?;
+        let max_children = d.ou32()?;
+        let max_descendants = d.ou32()?;
+        let retry_of = d.ou64()?.map(JobId::new);
+        let continues = d.ou64()?.map(JobId::new);
+        let submission = d.opt(|d| {
+            let bytes = d.take(32)?;
+            let arr: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| StorageError::corrupted("invalid submission key"))?;
+            Ok(SubmissionKey::from_digest(arr))
+        })?;
         d.end()?;
-        Ok(row)
+        Ok(JobRow {
+            id,
+            created_at,
+            eligible_at,
+            name,
+            parent_id,
+            agent_id,
+            execution,
+            objective,
+            attachments,
+            dependencies,
+            max_depth,
+            max_children,
+            max_descendants,
+            retry_of,
+            continues,
+            submission,
+        })
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct JobInputRow {
-    pub(crate) id: JobInputId,
-    pub(crate) submission_id: Option<String>,
-    pub(crate) objective: Option<String>,
-    pub(crate) max_depth: Option<u32>,
-    pub(crate) max_children_per_job: Option<u32>,
-    pub(crate) max_total_descendants: Option<u32>,
-    pub(crate) submitted_at: Option<Timestamp>,
-    pub(crate) created_at: Timestamp,
-    pub(crate) updated_at: Timestamp,
-    pub(crate) configuration: Option<FrozenExecutionConfig>,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct JobStateRow {
+    pub(crate) job_id: JobId,
+    pub(crate) claim: Option<ClaimRecord>,
+    pub(crate) suspension: Option<SuspensionRecord>,
+    pub(crate) outcome: Option<OutcomeRecord>,
+    pub(crate) stop_confirmed_at: Option<Timestamp>,
+    pub(crate) children_closed_at: Option<Timestamp>,
 }
 
-impl JobInputRow {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_INPUT);
-        e.u64(self.id.get());
-        e.ostr(&self.submission_id);
-        e.ostr(&self.objective);
-        for limit in [
-            self.max_depth,
-            self.max_children_per_job,
-            self.max_total_descendants,
-        ] {
-            e.ou32(limit);
+impl JobStateRow {
+    /// The state of a Job that was just submitted: nothing has happened.
+    pub(crate) fn new(job_id: JobId) -> Self {
+        Self {
+            job_id,
+            ..Self::default()
         }
-        e.ots(self.submitted_at);
-        e.ts(self.created_at);
-        e.ts(self.updated_at);
-        e.opt(&self.configuration, Enc::frozen_execution);
+    }
+
+    pub(crate) fn locally_stopped(&self) -> bool {
+        match &self.outcome {
+            Some(o) => match o.kind {
+                OutcomeKind::Completed | OutcomeKind::Failed | OutcomeKind::Cancelled => true,
+                OutcomeKind::Unknown => self.stop_confirmed_at.is_some(),
+            },
+            None => false,
+        }
+    }
+
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_JOB_STATE);
+        e.u64(self.job_id.get());
+        e.opt(&self.claim, |e, c| {
+            e.ts(c.started_at);
+            e.u64(c.pool_id.get());
+            e.u32(c.pool_edit_seq);
+            e.u32(c.capabilities.len() as u32);
+            for (op, proto) in &c.capabilities {
+                e.u8(op.code());
+                e.opt(proto, |e, p| e.u8(p.code()));
+            }
+            e.u64(c.epoch);
+            e.ostr(&c.host_id);
+            e.ostr(&c.boot_id);
+        });
+        e.opt(&self.suspension, |e, s| {
+            e.ts(s.since);
+            e.u64(s.wait_generation);
+            e.u64(s.owner_epoch);
+        });
+        e.opt(&self.outcome, |e, o| {
+            e.u8(o.kind as u8);
+            e.ts(o.at);
+            e.opt(&o.cause, |e, cause| match cause {
+                OutcomeCause::Code(c) => {
+                    e.u8(1);
+                    e.u8(*c);
+                }
+                OutcomeCause::Text(t) => {
+                    e.u8(2);
+                    e.str(t);
+                }
+                OutcomeCause::Abandoned => {
+                    e.u8(3);
+                }
+                OutcomeCause::DependencyImpossible => {
+                    e.u8(4);
+                }
+            });
+        });
+        e.ots(self.stop_confirmed_at);
+        e.ots(self.children_closed_at);
         e.0
     }
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_INPUT)?;
-        let row = JobInputRow {
-            id: JobInputId::new(d.u64()?),
-            submission_id: d.ostr()?,
-            objective: d.ostr()?,
-            max_depth: d.ou32()?,
-            max_children_per_job: d.ou32()?,
-            max_total_descendants: d.ou32()?,
-            submitted_at: d.ots()?,
-            created_at: d.ts()?,
-            updated_at: d.ts()?,
-            configuration: d.opt(Dec::frozen_execution)?,
+        let mut d = Dec::new(bytes, TAG_JOB_STATE)?;
+        let job_id = JobId::new(d.u64()?);
+        let claim = d.opt(|d| {
+            let started_at = d.ts()?;
+            let pool_id = ConfigId::new(d.u64()?);
+            let pool_edit_seq = d.u32()?;
+            let cap_len = d.u32()? as usize;
+            let mut capabilities = BTreeSet::new();
+            for _ in 0..cap_len {
+                let op = d.code(ExecutionOperation::from_code)?;
+                let proto = d.opt(|d| d.code(LlmTransport::from_code))?;
+                capabilities.insert((op, proto));
+            }
+            let epoch = d.u64()?;
+            let host_id = d.ostr()?;
+            let boot_id = d.ostr()?;
+            Ok(ClaimRecord {
+                started_at,
+                pool_id,
+                pool_edit_seq,
+                capabilities,
+                epoch,
+                host_id,
+                boot_id,
+            })
+        })?;
+        let suspension = d.opt(|d| {
+            Ok(SuspensionRecord {
+                since: d.ts()?,
+                wait_generation: d.u64()?,
+                owner_epoch: d.u64()?,
+            })
+        })?;
+        let outcome = d.opt(|d| {
+            let kind = match d.u8()? {
+                1 => OutcomeKind::Completed,
+                2 => OutcomeKind::Failed,
+                3 => OutcomeKind::Cancelled,
+                4 => OutcomeKind::Unknown,
+                code => {
+                    return Err(StorageError::corrupted(format!(
+                        "invalid outcome kind {code}"
+                    )));
+                }
+            };
+            let at = d.ts()?;
+            let cause = d.opt(|d| match d.u8()? {
+                1 => Ok(OutcomeCause::Code(d.u8()?)),
+                2 => Ok(OutcomeCause::Text(d.str()?)),
+                3 => Ok(OutcomeCause::Abandoned),
+                4 => Ok(OutcomeCause::DependencyImpossible),
+                code => Err(StorageError::corrupted(format!(
+                    "invalid outcome cause {code}"
+                ))),
+            })?;
+            Ok(OutcomeRecord { kind, at, cause })
+        })?;
+        let stop_confirmed_at = d.ots()?;
+        let children_closed_at = d.ots()?;
+        d.end()?;
+        Ok(JobStateRow {
+            job_id,
+            claim,
+            suspension,
+            outcome,
+            stop_confirmed_at,
+            children_closed_at,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ConfigRow {
+    pub(crate) id: ConfigId,
+    pub(crate) kind: ConfigKind,
+    pub(crate) name: String,
+    pub(crate) edit_seq: u32,
+    pub(crate) created_at: Timestamp,
+    pub(crate) updated_at: Timestamp,
+    pub(crate) archived_at: Option<Timestamp>,
+    pub(crate) body: ConfigBody,
+}
+
+impl ConfigRow {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_CONFIG);
+        e.u64(self.id.get());
+        e.u8(self.kind as u8);
+        e.str(&self.name);
+        e.u32(self.edit_seq);
+        e.ts(self.created_at);
+        e.ts(self.updated_at);
+        e.ots(self.archived_at);
+        // CHECK: body tag equals kind
+        match &self.body {
+            ConfigBody::Connection(c) => {
+                e.u8(1);
+                e.u8(c.protocol.code());
+                e.ostr(&c.endpoint);
+                e.ostr(&c.credential_ref);
+            }
+            ConfigBody::Model(m) => {
+                e.u8(2);
+                e.u64(m.connection_id.get());
+                e.str(&m.model);
+                let p = &m.parameters;
+                e.of64(p.temperature);
+                e.of64(p.top_p);
+                e.ou32(p.max_tokens);
+                e.of64(p.presence_penalty);
+                e.of64(p.frequency_penalty);
+                e.u32(m.declared_capabilities.len() as u32);
+                for cap in &m.declared_capabilities {
+                    e.u8(cap.code());
+                }
+            }
+            ConfigBody::Agent(a) => {
+                e.u8(3);
+                e.ostr(&a.instructions);
+                e.u8(a.behavior as u8);
+                e.u32(a.models.len() as u32);
+                for m in &a.models {
+                    e.u64(m.get());
+                }
+                e.ou64(a.default_model.map(|m| m.get()));
+                e.ostr(&a.tool_grant);
+            }
+            ConfigBody::Pool(p) => {
+                e.u8(4);
+                e.u32(p.capabilities.len() as u32);
+                for (op, proto) in &p.capabilities {
+                    e.u8(op.code());
+                    e.opt(proto, |e, pr| e.u8(pr.code()));
+                }
+                e.u32(p.concurrency_limit);
+                e.bool(p.enabled);
+            }
+        }
+        e.0
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_CONFIG)?;
+        let id = ConfigId::new(d.u64()?);
+        let kind = match d.u8()? {
+            1 => ConfigKind::Connection,
+            2 => ConfigKind::Model,
+            3 => ConfigKind::Agent,
+            4 => ConfigKind::Pool,
+            code => {
+                return Err(StorageError::corrupted(format!(
+                    "invalid config kind {code}"
+                )));
+            }
+        };
+        let name = d.str()?;
+        let edit_seq = d.u32()?;
+        let created_at = d.ts()?;
+        let updated_at = d.ts()?;
+        let archived_at = d.ots()?;
+        let body_tag = d.u8()?;
+        if body_tag != (kind as u8) {
+            return Err(StorageError::corrupted(format!(
+                "config body tag {body_tag} mismatch with kind {kind:?}"
+            )));
+        }
+        let body = match kind {
+            ConfigKind::Connection => {
+                let protocol = d.code(LlmTransport::from_code)?;
+                let endpoint = d.ostr()?;
+                let credential_ref = d.ostr()?;
+                ConfigBody::Connection(ConnectionConfig {
+                    protocol,
+                    endpoint,
+                    credential_ref,
+                })
+            }
+            ConfigKind::Model => {
+                let connection_id = ConfigId::new(d.u64()?);
+                let model = d.str()?;
+                let parameters = LlmParameters {
+                    temperature: d.of64()?,
+                    top_p: d.of64()?,
+                    max_tokens: d.ou32()?,
+                    presence_penalty: d.of64()?,
+                    frequency_penalty: d.of64()?,
+                };
+                let cap_len = d.u32()? as usize;
+                let mut declared_capabilities = BTreeSet::new();
+                for _ in 0..cap_len {
+                    declared_capabilities.insert(d.code(ModelCapability::from_code)?);
+                }
+                ConfigBody::Model(ModelConfig {
+                    connection_id,
+                    model,
+                    parameters,
+                    declared_capabilities,
+                })
+            }
+            ConfigKind::Agent => {
+                let instructions = d.ostr()?;
+                let behavior = match d.u8()? {
+                    1 => AgentBehavior::Chat,
+                    2 => AgentBehavior::General,
+                    code => {
+                        return Err(StorageError::corrupted(format!(
+                            "invalid agent behavior {code}"
+                        )));
+                    }
+                };
+                let models_len = d.u32()? as usize;
+                let mut models = Vec::with_capacity(models_len);
+                for _ in 0..models_len {
+                    models.push(ConfigId::new(d.u64()?));
+                }
+                let default_model = d.ou64()?.map(ConfigId::new);
+                let tool_grant = d.ostr()?;
+                ConfigBody::Agent(AgentConfig {
+                    instructions,
+                    behavior,
+                    models,
+                    default_model,
+                    tool_grant,
+                })
+            }
+            ConfigKind::Pool => {
+                let cap_len = d.u32()? as usize;
+                let mut capabilities = BTreeSet::new();
+                for _ in 0..cap_len {
+                    let op = d.code(ExecutionOperation::from_code)?;
+                    let proto = d.opt(|d| d.code(LlmTransport::from_code))?;
+                    capabilities.insert((op, proto));
+                }
+                let concurrency_limit = d.u32()?;
+                let enabled = d.bool()?;
+                ConfigBody::Pool(PoolConfig {
+                    capabilities,
+                    concurrency_limit,
+                    enabled,
+                })
+            }
         };
         d.end()?;
-        Ok(row)
+        Ok(ConfigRow {
+            id,
+            kind,
+            name,
+            edit_seq,
+            created_at,
+            updated_at,
+            archived_at,
+            body,
+        })
     }
+}
+
+pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
+    let mut e = Enc::new(TAG_OUTPUT);
+    e.u8(o.kind.code());
+    e.ostr(&o.summary);
+    e.ostr(&o.code);
+    e.opt(&o.goal_reached, |e, v| e.bool(*v));
+    e.ojson(&o.value);
+    e.ts(o.created_at);
+    e.0
+}
+
+pub(super) fn decode_output(
+    (job_id, seq): (u64, u32),
+    bytes: &[u8],
+) -> DecodeResult<JobOutputRecord> {
+    let mut d = Dec::new(bytes, TAG_OUTPUT)?;
+    let kind = d.code(OutputKind::from_code)?;
+    let summary = d.ostr()?;
+    let code = d.ostr()?;
+    let goal_reached = d.opt(Dec::bool)?;
+    let value = d.ojson()?;
+    let created_at = d.ts()?;
+    d.end()?;
+    Ok(JobOutputRecord {
+        id: JobOutputId::new(seq as u64),
+        job: JobId::new(job_id),
+        seq: seq as i64,
+        kind,
+        summary,
+        code,
+        goal_reached,
+        value,
+        created_at,
+    })
+}
+
+pub(super) fn encode_submission(record: &SubmissionRecord) -> Vec<u8> {
+    let mut e = Enc::new(TAG_SUBMISSION);
+    e.0.extend_from_slice(record.fingerprint.as_bytes());
+    e.u64(record.job.get());
+    e.ts(record.recorded_at);
+    e.0
+}
+
+pub(super) fn decode_submission(key: &[u8], bytes: &[u8]) -> DecodeResult<SubmissionRecord> {
+    let key = <[u8; 32]>::try_from(key)
+        .map_err(|_| StorageError::corrupted("a submission key is not a 32-byte digest"))?;
+    let mut d = Dec::new(bytes, TAG_SUBMISSION)?;
+    let fingerprint = RequestFingerprint::from_digest(d.take(32)?.try_into().expect("32 bytes"));
+    let job = JobId::new(d.u64()?);
+    let recorded_at = d.ts()?;
+    d.end()?;
+    Ok(SubmissionRecord {
+        key: SubmissionKey::from_digest(key),
+        fingerprint,
+        job,
+        recorded_at,
+    })
 }
 
 pub(super) fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
@@ -185,7 +535,6 @@ pub(super) fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
     e.ostr(&a.display_name);
     e.u8(a.origin.code());
     e.ts(a.created_at);
-    // Kind and time, together or not at all.
     e.opt(&a.cleanup, |e, cleanup| {
         e.u8(cleanup.kind.code());
         e.ts(cleanup.cleaned_at);
@@ -214,106 +563,6 @@ pub(super) fn decode_attachment(bytes: &[u8]) -> DecodeResult<AttachmentRecord> 
     Ok(a)
 }
 
-pub(super) fn encode_submission(record: &SubmissionRecord) -> Vec<u8> {
-    let mut e = Enc::new(TAG_SUBMISSION);
-    e.u64(record.job.get());
-    e.0.extend_from_slice(record.fingerprint.as_bytes());
-    e.ts(record.recorded_at);
-    e.0
-}
-
-/// A submission record stored under `key`, which must be a 32-byte digest.
-pub(super) fn decode_submission(key: &[u8], bytes: &[u8]) -> DecodeResult<SubmissionRecord> {
-    let key = <[u8; 32]>::try_from(key)
-        .map_err(|_| StorageError::corrupted("a submission key is not a 32-byte digest"))?;
-    let mut d = Dec::new(bytes, TAG_SUBMISSION)?;
-    let record = SubmissionRecord {
-        key: SubmissionKey::from_digest(key),
-        job: JobId::new(d.u64()?),
-        fingerprint: RequestFingerprint::from_digest(d.take(32)?.try_into().expect("32 bytes")),
-        recorded_at: d.ts()?,
-    };
-    d.end()?;
-    Ok(record)
-}
-
-pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
-    let mut e = Enc::new(TAG_OUTPUT);
-    e.u64(o.id.get());
-    e.u64(o.job.get());
-    e.i64(o.seq);
-    e.u8(o.kind.code());
-    e.ostr(&o.summary);
-    e.ostr(&o.code);
-    e.opt(&o.goal_reached, |e, v| e.bool(*v));
-    e.ojson(&o.value);
-    e.ts(o.created_at);
-    e.0
-}
-
-pub(super) fn decode_output(bytes: &[u8]) -> DecodeResult<JobOutputRecord> {
-    let mut d = Dec::new(bytes, TAG_OUTPUT)?;
-    let o = JobOutputRecord {
-        id: JobOutputId::new(d.u64()?),
-        job: JobId::new(d.u64()?),
-        seq: d.i64()?,
-        kind: d.code(OutputKind::from_code)?,
-        summary: d.ostr()?,
-        code: d.ostr()?,
-        goal_reached: d.opt(Dec::bool)?,
-        value: d.ojson()?,
-        created_at: d.ts()?,
-    };
-    d.end()?;
-    Ok(o)
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ExecutorRow {
-    pub(crate) id: ExecutorId,
-    pub(crate) name: String,
-    pub(crate) executor_type: ExecutorType,
-    pub(crate) concurrency_limit: u32,
-    pub(crate) latest_enabled_at: Option<Timestamp>,
-    pub(crate) latest_disabled_at: Option<Timestamp>,
-    pub(crate) created_at: Timestamp,
-    pub(crate) updated_at: Timestamp,
-    pub(crate) llm_transports: BTreeSet<LlmTransport>,
-}
-
-impl ExecutorRow {
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut decoder = Dec::new(bytes, TAG_EXECUTOR)?;
-        let row = Self {
-            id: ExecutorId::new(decoder.u64()?),
-            name: decoder.str()?,
-            executor_type: decoder.code(ExecutorType::from_code)?,
-            concurrency_limit: decoder.u32()?,
-            latest_enabled_at: decoder.ots()?,
-            latest_disabled_at: decoder.ots()?,
-            created_at: decoder.ts()?,
-            updated_at: decoder.ts()?,
-            llm_transports: decoder.transports()?,
-        };
-        decoder.end()?;
-        Ok(row)
-    }
-
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_EXECUTOR);
-        e.u64(self.id.get());
-        e.str(&self.name);
-        e.u8(self.executor_type.code());
-        e.u32(self.concurrency_limit);
-        e.ots(self.latest_enabled_at);
-        e.ots(self.latest_disabled_at);
-        e.ts(self.created_at);
-        e.ts(self.updated_at);
-        e.transports(&self.llm_transports);
-        e.0
-    }
-}
-
 pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_PROJECT);
     e.u64(p.id.get());
@@ -335,256 +584,11 @@ pub(super) fn decode_project(bytes: &[u8]) -> DecodeResult<ProjectRecord> {
     Ok(p)
 }
 
-pub(super) fn encode_llm_provider(p: &LlmProviderRecord) -> Vec<u8> {
-    let mut e = Enc::new(TAG_LLM_PROVIDER);
-    e.u64(p.id.get());
-    e.str(&p.name);
-    e.u8(p.transport.code());
-    e.ostr(&p.endpoint);
-    e.ostr(&p.credential_ref);
-    e.ts(p.created_at);
-    e.0
-}
-
-pub(super) fn provider_snapshot(provider: LlmProviderRecord) -> ProviderSnapshot {
-    ProviderSnapshot {
-        id: provider.id,
-        name: provider.name,
-        transport: provider.transport,
-        endpoint: provider.endpoint,
-        credential_ref: provider.credential_ref,
-    }
-}
-
-pub(super) fn decode_llm_provider(bytes: &[u8]) -> DecodeResult<LlmProviderRecord> {
-    let mut d = Dec::new(bytes, TAG_LLM_PROVIDER)?;
-    let p = LlmProviderRecord {
-        id: LlmProviderId::new(d.u64()?),
-        name: d.str()?,
-        transport: d.code(LlmTransport::from_code)?,
-        endpoint: d.ostr()?,
-        credential_ref: d.ostr()?,
-        created_at: d.ts()?,
-    };
-    d.end()?;
-    Ok(p)
-}
-
-/// A Profile's own attributes; its Provider lives in USES_PROVIDER.
-#[derive(Clone, Debug)]
-pub(crate) struct ProfileRow {
-    pub(crate) id: ProfileId,
-    pub(crate) name: String,
-    pub(crate) config: ProfileConfig,
-    pub(crate) created_at: Timestamp,
-    pub(crate) updated_at: Timestamp,
-}
-
-impl ProfileRow {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_PROFILE);
-        e.u64(self.id.get());
-        e.str(&self.name);
-        e.profile_config(&self.config);
-        e.ts(self.created_at);
-        e.ts(self.updated_at);
-        e.0
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_PROFILE)?;
-        let row = Self {
-            id: ProfileId::new(d.u64()?),
-            name: d.str()?,
-            config: d.profile_config()?,
-            created_at: d.ts()?,
-            updated_at: d.ts()?,
-        };
-        d.end()?;
-        Ok(row)
-    }
-}
-
-/// The references that define a Profile, written with it and replaced only
-/// together with its payload.
-pub(crate) enum ProfileLinks {
-    ExecutionPool,
-    Agent { llm_targets: Vec<ProfileId> },
-    Llm { provider: LlmProviderId },
-}
-
-/// An Agent's own attributes; its Profiles live in USES_PROFILE.
-#[derive(Clone, Debug)]
-pub(crate) struct AgentRow {
-    pub(crate) id: AgentId,
-    pub(crate) name: String,
-    pub(crate) created_at: Timestamp,
-}
-
-impl AgentRow {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_AGENT);
-        e.u64(self.id.get());
-        e.str(&self.name);
-        e.ts(self.created_at);
-        e.0
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_AGENT)?;
-        let row = Self {
-            id: AgentId::new(d.u64()?),
-            name: d.str()?,
-            created_at: d.ts()?,
-        };
-        d.end()?;
-        Ok(row)
-    }
-}
-
-/// A Metrics record's own attributes; its Job lives in MEASURES.
-#[derive(Clone, Debug)]
-pub(crate) struct MetricsRow {
-    pub(crate) id: MetricsId,
-    pub(crate) request: RequestNumber,
-    pub(crate) observed_at: Timestamp,
-    pub(crate) measurements: Measurements,
-    pub(crate) token: Option<TokenAnnotation>,
-    pub(crate) recorded_at: Timestamp,
-}
-
-impl MetricsRow {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_METRICS);
-        e.u64(self.id.get());
-        e.u32(self.request.get());
-        e.ts(self.observed_at);
-        let m = &self.measurements;
-        for ms in [
-            m.ttfb_ms,
-            m.reasoning_ttft_ms,
-            m.output_ttft_ms,
-            m.request_finished_in_ms,
-        ] {
-            e.ou64(ms);
-        }
-        e.usage(&m.usage);
-        e.opt(&self.token, |e, token| {
-            e.u8(match token.eligibility {
-                RequestEligibility::Eligible => 1,
-                RequestEligibility::Excluded => 2,
-            });
-            e.u8(match token.finality {
-                UsageFinality::Cumulative => 1,
-                UsageFinality::Final => 2,
-            });
-        });
-        e.ts(self.recorded_at);
-        e.0
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_METRICS)?;
-        let row = Self {
-            id: MetricsId::new(d.u64()?),
-            request: d.request()?,
-            observed_at: d.ts()?,
-            measurements: Measurements {
-                ttfb_ms: d.ou64()?,
-                reasoning_ttft_ms: d.ou64()?,
-                output_ttft_ms: d.ou64()?,
-                request_finished_in_ms: d.ou64()?,
-                usage: d.usage()?,
-            },
-            token: d.opt(|d| {
-                let eligibility = match d.u8()? {
-                    1 => RequestEligibility::Eligible,
-                    2 => RequestEligibility::Excluded,
-                    other => {
-                        return Err(StorageError::corrupted(format!(
-                            "unknown Token eligibility code {other}"
-                        )));
-                    }
-                };
-                let finality = match d.u8()? {
-                    1 => UsageFinality::Cumulative,
-                    2 => UsageFinality::Final,
-                    other => {
-                        return Err(StorageError::corrupted(format!(
-                            "unknown Token finality code {other}"
-                        )));
-                    }
-                };
-                Ok(TokenAnnotation {
-                    eligibility,
-                    finality,
-                })
-            })?,
-            recorded_at: d.ts()?,
-        };
-        d.end()?;
-        Ok(row)
-    }
-}
-
-/// An AvailabilityStat's own attributes; its Job lives in OBSERVES.
-#[derive(Clone, Debug)]
-pub(crate) struct AvailabilityStatRow {
-    pub(crate) id: AvailabilityStatId,
-    pub(crate) request: RequestNumber,
-    pub(crate) observed_at: Timestamp,
-    pub(crate) observation: AvailabilityObservation,
-    pub(crate) recorded_at: Timestamp,
-}
-
-impl AvailabilityStatRow {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_AVAILABILITY_STAT);
-        e.u64(self.id.get());
-        e.u32(self.request.get());
-        e.ts(self.observed_at);
-        let o = &self.observation;
-        e.opt(&o.status_code, |e, v| e.u16(*v));
-        e.opt(&o.finish_reason, |e, v| e.u8(v.code()));
-        e.ostr(&o.raw_finish_reason);
-        e.opt(&o.failure, Enc::provider_failure);
-        e.ts(self.recorded_at);
-        e.0
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_AVAILABILITY_STAT)?;
-        let row = Self {
-            id: AvailabilityStatId::new(d.u64()?),
-            request: d.request()?,
-            observed_at: d.ts()?,
-            observation: AvailabilityObservation {
-                status_code: d.opt(Dec::u16)?,
-                finish_reason: d.opt(|d| d.code(ChatFinishReason::from_code))?,
-                raw_finish_reason: d.ostr()?,
-                failure: d.opt(Dec::provider_failure)?,
-            },
-            recorded_at: d.ts()?,
-        };
-        d.end()?;
-        Ok(row)
-    }
-}
-
-pub(super) fn encode_marker(m: &OperationMarker) -> Vec<u8> {
-    let mut e = Enc::new(TAG_OPERATION);
-    e.u8(m.kind.code());
-    e.record_ref(m.subject);
-    e.opt(&m.created, |e, r| e.record_ref(*r));
-    e.ts(m.committed_at);
-    e.0
-}
-
-/// The record without its call, which is its key.
 pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
-    let mut e = Enc::new(TAG_TOOL_EVIDENCE);
+    let mut e = Enc::new(TAG_TOOL_CALL);
     e.str(&record.tool_call_id);
     e.str(&record.name);
+    e.bool(record.spawns);
     e.ts(record.decision.at);
     match &record.decision.fact {
         ToolDecision::Refused(refusal) => {
@@ -646,12 +650,13 @@ pub(super) fn decode_tool_evidence(
     call: ToolCallRef,
     bytes: &[u8],
 ) -> DecodeResult<ToolEvidenceRecord> {
-    let mut d = Dec::new(bytes, TAG_TOOL_EVIDENCE)?;
+    let mut d = Dec::new(bytes, TAG_TOOL_CALL)?;
     let tool_call_id = d.str()?;
     let name = d.str()?;
+    let spawns = d.bool()?;
     let decided_at = d.ts()?;
     let decision = match d.u8()? {
-        1 => ToolDecision::Refused(d.code(ToolCallRefusal::from_code)?),
+        1 => ToolDecision::Refused(d.code(crate::openai_compatible::ToolCallRefusal::from_code)?),
         2 => ToolDecision::Admitted(ToolAdmission {
             handler_version: d.str()?,
             effect: d.code(ToolEffect::from_code)?,
@@ -672,7 +677,9 @@ pub(super) fn decode_tool_evidence(
             },
             3 => ToolOutcome::NotApplied { message: d.str()? },
             4 => ToolOutcome::NotInvoked {
-                reason: NotInvokedReason::Refused(d.code(ToolCallRefusal::from_code)?),
+                reason: NotInvokedReason::Refused(
+                    d.code(crate::openai_compatible::ToolCallRefusal::from_code)?,
+                ),
             },
             5 => ToolOutcome::Uncertain {
                 cause: d.code(UncertainCause::from_code)?,
@@ -700,6 +707,7 @@ pub(super) fn decode_tool_evidence(
         call,
         tool_call_id,
         name,
+        spawns,
         decision: Recorded {
             fact: decision,
             at: decided_at,
@@ -709,7 +717,6 @@ pub(super) fn decode_tool_evidence(
     })
 }
 
-/// Every tool evidence record of `job` in `table`, in call order.
 pub(super) fn job_tool_evidence(
     table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
     job: JobId,
@@ -738,15 +745,128 @@ pub(super) fn tool_call_key(call: ToolCallRef) -> (u64, u32, u32) {
     (call.job.get(), call.request.get(), call.index)
 }
 
-pub(super) fn decode_marker(operation: OperationId, bytes: &[u8]) -> DecodeResult<OperationMarker> {
-    let mut d = Dec::new(bytes, TAG_OPERATION)?;
-    let m = OperationMarker {
-        operation,
-        kind: d.code(OperationKind::from_code)?,
-        subject: d.record_ref()?,
-        created: d.opt(Dec::record_ref)?,
-        committed_at: d.ts()?,
+pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
+    let mut e = Enc::new(TAG_REQUEST_EVENT);
+    e.ts(r.observed_at);
+    e.ts(r.recorded_at);
+    match &r.payload {
+        RequestPayload::Measurement { measurements } => {
+            e.u8(1);
+            for ms in [
+                measurements.ttfb_ms,
+                measurements.reasoning_ttft_ms,
+                measurements.output_ttft_ms,
+                measurements.request_finished_in_ms,
+            ] {
+                e.ou64(ms);
+            }
+            e.usage(&measurements.usage);
+        }
+        RequestPayload::Availability {
+            status_code,
+            finish_reason,
+            raw_finish_reason,
+            failure,
+        } => {
+            e.u8(2);
+            e.opt(status_code, |e, v| e.u16(*v));
+            e.opt(finish_reason, |e, v| e.u8(v.code()));
+            e.ostr(raw_finish_reason);
+            e.opt(failure, Enc::provider_failure);
+        }
+        RequestPayload::Token {
+            eligibility,
+            finality,
+        } => {
+            e.u8(3);
+            e.u8(match eligibility {
+                RequestEligibility::Eligible => 1,
+                RequestEligibility::Excluded => 2,
+            });
+            e.u8(match finality {
+                UsageFinality::Cumulative => 1,
+                UsageFinality::Final => 2,
+            });
+        }
+    }
+    e.0
+}
+
+pub(super) fn decode_request_event(
+    job_id: JobId,
+    request: RequestNumber,
+    seq: u32,
+    bytes: &[u8],
+) -> DecodeResult<RequestEventRecord> {
+    let mut d = Dec::new(bytes, TAG_REQUEST_EVENT)?;
+    let observed_at = d.ts()?;
+    let recorded_at = d.ts()?;
+    let payload = match d.u8()? {
+        1 => {
+            let ttfb_ms = d.ou64()?;
+            let reasoning_ttft_ms = d.ou64()?;
+            let output_ttft_ms = d.ou64()?;
+            let request_finished_in_ms = d.ou64()?;
+            let usage = d.usage()?;
+            RequestPayload::Measurement {
+                measurements: Measurements {
+                    ttfb_ms,
+                    reasoning_ttft_ms,
+                    output_ttft_ms,
+                    request_finished_in_ms,
+                    usage,
+                },
+            }
+        }
+        2 => {
+            let status_code = d.opt(Dec::u16)?;
+            let finish_reason = d.opt(|d| d.code(ChatFinishReason::from_code))?;
+            let raw_finish_reason = d.ostr()?;
+            let failure = d.opt(Dec::provider_failure)?;
+            RequestPayload::Availability {
+                status_code,
+                finish_reason,
+                raw_finish_reason,
+                failure,
+            }
+        }
+        3 => {
+            let eligibility = match d.u8()? {
+                1 => RequestEligibility::Eligible,
+                2 => RequestEligibility::Excluded,
+                code => {
+                    return Err(StorageError::corrupted(format!(
+                        "invalid token eligibility {code}"
+                    )));
+                }
+            };
+            let finality = match d.u8()? {
+                1 => UsageFinality::Cumulative,
+                2 => UsageFinality::Final,
+                code => {
+                    return Err(StorageError::corrupted(format!(
+                        "invalid token finality {code}"
+                    )));
+                }
+            };
+            RequestPayload::Token {
+                eligibility,
+                finality,
+            }
+        }
+        code => {
+            return Err(StorageError::corrupted(format!(
+                "invalid request payload kind {code}"
+            )));
+        }
     };
     d.end()?;
-    Ok(m)
+    Ok(RequestEventRecord {
+        job_id,
+        request,
+        seq,
+        observed_at,
+        recorded_at,
+        payload,
+    })
 }

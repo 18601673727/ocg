@@ -1,13 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionMode {
-    Once,
-    Continuous,
-    Periodic,
-    Container,
-}
-
 /// `result` is deliberately absent: a final result output is only published
 /// by [`JobFinalization`], in the same transaction that finalizes the Job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,16 +25,6 @@ impl From<IntermediateOutputKind> for OutputKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutorType {
-    System,
-    Llm,
-    Agent,
-    Tool,
-    Database,
-    Frontend,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DependencyCondition {
     Success,
     Settled,
@@ -61,15 +43,16 @@ pub enum DependencyState {
     Impossible,
 }
 
+/// What a Job is asked to do: its objective, the Attachments it carries and
+/// its limits on descendants. It becomes part of the Job's spec.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobInputDraft {
-    pub submission_id: Option<String>,
     pub objective: Option<String>,
     pub max_depth: Option<u32>,
     pub max_children_per_job: Option<u32>,
     pub max_total_descendants: Option<u32>,
-    /// The Attachments the input carries, in order, each named once. Each
-    /// must exist and must not be cleaned up; see [`AttachmentRecord`].
+    /// The Attachments the input carries, in order. Each must exist and must
+    /// not be cleaned up; see [`AttachmentRecord`].
     pub attachments: Vec<AttachmentId>,
 }
 
@@ -79,65 +62,42 @@ pub struct JobInputDraft {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewJob {
     pub name: Option<String>,
-    pub execution_mode: ExecutionMode,
     pub eligible_at: Option<Timestamp>,
-    pub scheduled_at: Option<Timestamp>,
-    pub next_due_at: Option<Timestamp>,
-    pub next_iteration_no: Option<i64>,
-    pub iteration_no: Option<i64>,
-    /// Top-level work names the Genesis Job, see [`crate::database::DatabaseHandle::genesis`].
+    /// Top-level work names the Genesis Job (0), see
+    /// [`crate::database::DatabaseHandle::genesis`].
     pub parent: JobId,
     pub projects: Vec<ProjectId>,
     pub dependencies: Vec<(JobId, DependencyCondition)>,
+    pub input: JobInputDraft,
     /// Present for an LLM execution child; absent for orchestrating or
     /// system work.
     pub configuration: Option<ExecutionConfiguration>,
-    /// When `configuration` is given, must be an Llm Executor supporting the
-    /// transport of the LLM configuration frozen for it.
-    pub assigned_executor: Option<ExecutorId>,
+    /// The Chat turn this Job continues.
     pub previous: Option<JobId>,
-    pub replaces: Option<JobId>,
 }
 
 /// The configuration an LLM execution child Job is submitted with. Both
-/// references are fixed at submission. Work that runs an LLM directly, such
-/// as a fixed capability check, names no Agent Profile; when one is named,
-/// `llm_profile` must be one of its configured LLM targets. The values the
-/// Job executes with are frozen into its input at submission.
+/// references are fixed at submission. Work that runs an LLM directly names
+/// no Agent; when one is named, `llm_profile` must be one of its Models. The
+/// values the Job executes with are frozen into its spec at submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionConfiguration {
     pub agent_profile: Option<ProfileId>,
     pub llm_profile: ProfileId,
 }
 
-/// Which input an explicit retry runs with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RetryInput {
-    /// The original Job's frozen input, shared rather than copied.
-    Unchanged,
-    /// A different, not yet submitted input; it is submitted by the retry.
-    Changed(JobInputId),
-}
-
-/// An explicit retry creates a new Job. Its parent and its RETRY_OF edge are
-/// derived from `original`, which is left exactly as it was.
+/// An explicit retry creates a new Job that copies its original's spec
+/// (D-3), frozen execution included, so a retry cannot silently switch model
+/// or Provider. The original is left exactly as it was.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobRetry {
     pub original: JobId,
-    pub input: RetryInput,
+    /// The retry's parent; 0 for a top-level Job.
+    pub parent: JobId,
     pub name: Option<String>,
-    pub execution_mode: ExecutionMode,
     pub eligible_at: Option<Timestamp>,
-    pub scheduled_at: Option<Timestamp>,
-    pub next_due_at: Option<Timestamp>,
-    pub next_iteration_no: Option<i64>,
-    pub iteration_no: Option<i64>,
     pub projects: Vec<ProjectId>,
     pub dependencies: Vec<(JobId, DependencyCondition)>,
-    /// Stated explicitly for the retry; never taken from the original, so a
-    /// retry cannot silently switch model or Provider.
-    pub configuration: Option<ExecutionConfiguration>,
-    pub assigned_executor: Option<ExecutorId>,
     /// Accepts that the retry may repeat a non-idempotent tool effect the
     /// original, or any Job it retries in turn, is known to have had. It
     /// covers this retry only. It promises no deduplication, grants
@@ -198,13 +158,15 @@ impl JobOutcome {
     }
 }
 
+/// An Executor is a Pool config. It offers `LlmRequest` for each of the LLM
+/// transports its adapter implements and nothing else, so one without
+/// transports is never granted LLM work.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewExecutor {
     pub name: String,
-    pub executor_type: ExecutorType,
     pub concurrency_limit: NonZeroU32,
     /// The LLM transports this Executor's adapter implements, fixed at
-    /// registration. Only an `ExecutorType::Llm` Executor may name any.
+    /// registration.
     pub llm_transports: BTreeSet<LlmTransport>,
 }
 

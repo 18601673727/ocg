@@ -12,7 +12,7 @@ use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::disk_protection::{ProtectedArea, ProtectionReason};
 use crate::logger::is_runtime_file_name;
 use crate::persistence::{
-    ExecutorId, ExecutorType, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewExecutor,
+    ExecutorId, FinalResult, IntermediateOutputKind, JobId, JobOutcome, NewExecutor,
     NewJobOutput,
 };
 
@@ -205,9 +205,10 @@ pub async fn core_executor(database: &DatabaseHandle) -> Result<ExecutorId, Data
     let mut before = None;
     loop {
         let page = database.executors(before, 100).await?;
-        if let Some(found) = page.iter().find(|executor| {
-            executor.name == CORE_EXECUTOR_NAME && executor.executor_type == ExecutorType::System
-        }) {
+        if let Some(found) = page
+            .iter()
+            .find(|executor| executor.name == CORE_EXECUTOR_NAME)
+        {
             return Ok(found.id);
         }
         match page.last() {
@@ -218,7 +219,6 @@ pub async fn core_executor(database: &DatabaseHandle) -> Result<ExecutorId, Data
     database
         .create_executor(NewExecutor {
             name: CORE_EXECUTOR_NAME.into(),
-            executor_type: ExecutorType::System,
             concurrency_limit: std::num::NonZeroU32::MIN,
             llm_transports: Default::default(),
         })
@@ -814,9 +814,7 @@ mod tests {
     use crate::data_directory::DataDirectory;
     use crate::database::{DatabaseStatus, DatabaseWorker};
     use crate::logger::{LoggerLevel, RuntimeLogger};
-    use crate::persistence::{
-        ExecutionMode, ExecutorType, JobInputDraft, NewExecutor, NewJob, OutputKind,
-    };
+    use crate::persistence::{JobInputDraft, NewExecutor, NewJob, OutputKind};
     use crate::system_policy::SystemPolicy;
     use crate::test_support::{data_directory as test_data_directory, wait};
     use std::num::NonZeroU32;
@@ -879,31 +877,20 @@ mod tests {
         let database = worker.handle();
         let executor = wait(database.create_executor(NewExecutor {
             name: "__CORE__".into(),
-            executor_type: ExecutorType::System,
             concurrency_limit: NonZeroU32::new(1).expect("nonzero concurrency"),
             llm_transports: Default::default(),
         }))
         .expect("create core executor");
-        let input = wait(database.save_job_input(None, JobInputDraft::default())).expect("save owner input");
-        let owner = wait(database.create_job_with_input(
-            NewJob {
-                name: Some("cleanup owner".into()),
-                execution_mode: ExecutionMode::Once,
-                eligible_at: None,
-                scheduled_at: None,
-                next_due_at: None,
-                next_iteration_no: None,
-                iteration_no: None,
-                parent: database.genesis(),
-                projects: Vec::new(),
-                dependencies: Vec::new(),
-                configuration: None,
-                assigned_executor: Some(executor),
-                previous: None,
-                replaces: None,
-            },
-            input,
-        ))
+        let owner = wait(database.create_job(NewJob {
+            name: Some("cleanup owner".into()),
+            eligible_at: None,
+            parent: database.genesis(),
+            projects: Vec::new(),
+            dependencies: Vec::new(),
+            input: JobInputDraft::default(),
+            configuration: None,
+            previous: None,
+        }))
         .expect("create cleanup owner");
 
         let cleanup = CoreLogCleanup::start(database.clone()).expect("start cleanup worker");
@@ -1168,9 +1155,10 @@ mod tests {
         let job = wait(database.job(records.job))
             .expect("read job")
             .expect("job exists");
-        // The opening that ran it is gone, which settles its outcome as unknown
-        // but says nothing about whether its external work stopped.
-        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_none());
+        // The opening that ran it is gone, which settles its outcome as
+        // unknown; it admitted no call that spawns a process, so nothing of it
+        // can still run and its stop is confirmed at once.
+        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
         assert!(job.completed_at.is_none() && job.failed_at.is_none());
         worker.shutdown().expect("shutdown database");
     }

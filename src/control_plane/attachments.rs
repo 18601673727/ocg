@@ -158,14 +158,18 @@ async fn image_record(
     id: AttachmentId,
 ) -> Result<AttachmentRecord, Refusal> {
     let record = database.attachment(id).await?.ok_or(ATTACHMENT_NOT_FOUND)?;
-    if record.origin != AttachmentOrigin::UserProvided || ImageMime::from_mime(&record.mime).is_none()
+    if record.origin != AttachmentOrigin::UserProvided
+        || ImageMime::from_mime(&record.mime).is_none()
     {
         return Err(ATTACHMENT_NOT_FOUND);
     }
     Ok(record)
 }
 
-pub(super) async fn metadata(database: &DatabaseHandle, id: AttachmentId) -> Result<Reply, Refusal> {
+pub(super) async fn metadata(
+    database: &DatabaseHandle,
+    id: AttachmentId,
+) -> Result<Reply, Refusal> {
     let record = image_record(database, id).await?;
     Ok(Reply::ok(
         json!({"api_version": API_VERSION, "attachment": attachment_json(&record)}),
@@ -211,7 +215,7 @@ mod tests {
         ExecutionRuntime,
         provider_seam::{self, Response},
     };
-    use crate::persistence::{ExecutorType, LlmTransport, NewExecutor, NewSubmission, ProfileId};
+    use crate::persistence::{LlmTransport, NewExecutor, NewSubmission, ProfileId};
     use crate::provider_execution::scripted::Step;
     use crate::test_support::{data_directory, wait};
 
@@ -257,8 +261,8 @@ mod tests {
             "data_base64": PNG_BASE64,
             "display_name": "test-diagram.png",
         });
-        let upload_reply = wait(upload(&handle, &serde_json::to_vec(&valid_upload).unwrap()))
-            .expect("upload png");
+        let upload_reply =
+            wait(upload(&handle, &serde_json::to_vec(&valid_upload).unwrap())).expect("upload png");
         assert_eq!(upload_reply.status, StatusCode::CREATED);
         let attachment_id_str = upload_reply.body["attachment"]["id"]
             .as_str()
@@ -291,7 +295,6 @@ mod tests {
         // 5. Executor & Profiles
         let executor = wait(handle.create_executor(NewExecutor {
             name: "vision-executor".to_owned(),
-            executor_type: ExecutorType::Llm,
             concurrency_limit: NonZeroU32::MIN,
             llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
         }))
@@ -376,8 +379,12 @@ mod tests {
             Response {
                 gate: None,
                 steps: vec![
-                    Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\"I see a 1x1 PNG image with white pixels.\"}}]}\n\n"),
-                    Step::Chunk("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"),
+                    Step::Chunk(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"I see a 1x1 PNG image with white pixels.\"}}]}\n\n",
+                    ),
+                    Step::Chunk(
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    ),
                 ],
             }
         });
@@ -432,8 +439,7 @@ mod tests {
                 .contains("I see a 1x1 PNG image")
         }));
 
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");
     }
 }
-

@@ -50,6 +50,7 @@ use rustix::fs::{AtFlags, Dir, FileType};
 use rustix::io::Errno;
 use serde_json::{Value, json};
 
+use crate::orchestration::blocking::{self, Kind as BlockingKind, Permit};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -647,12 +648,16 @@ impl ToolHandler for ListDirectory {
         ToolEffect::ReadOnly
     }
 
-    /// Lists synchronously: one directory, read within its bound, so the
-    /// call does not yield while it reads.
+    /// Lists on a dedicated blocking worker while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
-            let path = directory_path(&arguments).map_err(refused)?;
-            list(&self.workspace, path, &self.limits).map_err(refused)
+            let path = directory_path(&arguments).map_err(refused)?.to_owned();
+            let workspace = self.workspace.clone();
+            let limits = self.limits;
+            blocking::run(BlockingKind::File, move || list(&workspace, &path, &limits))
+                .await
+                .map_err(ToolFailure::uncertain)?
+                .map_err(refused)
         })
     }
 }
@@ -689,6 +694,7 @@ impl ToolHandler for Search {
             thread::Builder::new()
                 .name("ocg-workspace-search".to_owned())
                 .spawn(move || {
+                    let _permit = Permit::acquire(BlockingKind::File);
                     let found = search(
                         &workspace,
                         &query,

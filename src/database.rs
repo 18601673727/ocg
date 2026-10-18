@@ -18,34 +18,27 @@ use crate::disk_protection::{
     RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
 };
 use crate::persistence::{
-    self, AgentId, AgentRecord, AppendedOutput, AttachmentId, AttachmentOrigin, AttachmentRecord,
-    AvailabilityAggregationProgress, AvailabilityBatch, AvailabilityCounts, AvailabilityStatId,
-    AvailabilityStatRecord, CleanupKind, ContentDigest, ExecutionPool, ExecutionPoolId, ExecutorId,
-    JobFinalization, JobId, JobInputDraft, JobInputId, JobOutputRecord, JobRecord, JobRetry,
-    LlmProviderId, LlmProviderRecord, MetricsId, MetricsRecord, NewAgent, NewAttachment,
-    NewAvailabilityStat, NewExecutionPool, NewExecutor, NewJob, NewJobOutput, NewLlmProvider,
-    NewMetrics, NewProfile, NewProfileConfig, NewProject, NewSubmission, NewToolEvidence,
+    self, AppendedOutput, AttachmentId, AttachmentOrigin, AttachmentRecord, AvailabilityStatId,
+    AvailabilityStatRecord, CleanupKind, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
+    ContentDigest, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId, ExecutorId,
+    JobFinalization, JobId, JobInputId, JobOutputRecord, JobRecord, JobRetry, MetricsId,
+    MetricsRecord, NewAttachment, NewAvailabilityStat, NewConfig, NewExecutionPool, NewExecutor,
+    NewJob, NewJobOutput, NewMetrics, NewProject, NewSubmission, NewToolEvidence,
     ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelFilter,
-    ObservedModelPage, OperationId, OperationKind, OperationMarker, Profile, ProfileId,
-    ProfileRecord, ProfileVariant, ProjectId, ProjectRecord, PublishedAttachment, ReadSnapshot,
-    RequestNumber, RequestRef, RequestSampleRecord, SubmissionKey, SubmissionRecord, Timestamp,
-    ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
-    WrongProfileKind,
+    ObservedModelPage, OperationId, OperationKind, ProjectId, ProjectRecord, PublishedAttachment,
+    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
+    ToolOutcome, ToolReconciliation, Violation,
 };
 use crate::persistence::{
     ClaimGrant, ClaimRefusal, ClaimRequest, EvalPage, EvalRequest, FrozenPoolBinding,
     PendingCapturePage, PendingReadFault, PendingSnapshot,
 };
 use crate::storage::{
-    self, BatchError, BatchFailure, Commit, CompactFailure, MarkerSubjects, OpenError, OpenedFile,
+    self, BatchError, BatchFailure, Commit, CompactFailure, OpenError, OpenedFile, Probe,
 };
 pub use crate::storage::{StorageError, StorageErrorKind};
 use crate::system_policy::{
     self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError,
-};
-use crate::token_usage::{
-    TokenAggregationProgress, TokenBatch, TokenEvidenceError, TokenMinuteTotals,
-    TokenRequestRecord, TokenSnapshot,
 };
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -108,11 +101,10 @@ use commands::{Command, Control, Envelope, Message, Reply, byte_count};
 use errors::operation_status;
 pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,
-    DatabaseStatus, MaintenanceError, OperationStatus, TokenConsumeError, UnknownCause,
+    DatabaseStatus, MaintenanceError, OperationStatus, UnknownCause,
 };
 pub use scheduler_wake::SchedulerWakeSubscription;
 use scheduler_wake::{SchedulerWake, affects_scheduling, releases_capacity};
-pub(crate) use shared::AggregationClaim;
 #[cfg(test)]
 pub(crate) use shared::GroupProbe;
 use shared::{
@@ -136,6 +128,14 @@ mod read_pool_tests {
     use crate::test_support::{WAIT, data_directory as test_data_directory, poll_once, wait};
 
     const SUITE: &str = "ocg-read-pool";
+
+    /// A command that always succeeds while commands are accepted.
+    fn project() -> crate::persistence::NewProject {
+        crate::persistence::NewProject {
+            name: "probe".to_owned(),
+            description: None,
+        }
+    }
     const QUEUED: usize = 5;
 
     type PendingRead<'a, T> = Pin<Box<dyn Future<Output = Result<T, DatabaseError>> + 'a>>;
@@ -276,7 +276,7 @@ mod read_pool_tests {
         }
         // A read-worker panic is not a storage failure: commands still run.
         assert_eq!(handle.status(), DatabaseStatus::Open);
-        assert!(wait(handle.save_job_input(None, JobInputDraft::default())).is_ok());
+        assert!(wait(handle.create_project(project())).is_ok());
 
         assert!(matches!(
             worker.shutdown(),
@@ -314,7 +314,7 @@ mod read_pool_tests {
             Err(DatabaseError::ReadsClosed)
         ));
         assert!(matches!(
-            wait(handle.save_job_input(None, JobInputDraft::default())),
+            wait(handle.create_project(project())),
             Err(DatabaseError::ShuttingDown)
         ));
 

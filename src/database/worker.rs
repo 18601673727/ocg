@@ -18,6 +18,9 @@ pub(super) struct Executed {
     staged: bool,
     scheduling_dirty: bool,
     capacity_released: bool,
+    /// The natural key that says whether the command committed, should its
+    /// commit turn out uncertain.
+    probe: Option<Probe>,
     answer: Answer,
     /// The storage failure that must release this opening of the database.
     failure: Option<StorageFailure>,
@@ -29,9 +32,9 @@ pub(super) fn run<T: Send + 'static>(
     commit: Commit,
     kind: OperationKind,
     reply: Reply<T>,
-    body: impl FnOnce(&mut storage::Batch) -> Result<(T, MarkerSubjects), BatchError>,
+    body: impl FnOnce(&mut storage::Batch) -> Result<T, BatchError>,
 ) -> Executed {
-    let outcome = storage::run_batch_with(database, operation, kind, commit, body);
+    let outcome = storage::run_batch_with(database, operation.epoch, commit, body);
     settle(operation, commit, kind, reply, outcome, false)
 }
 
@@ -59,8 +62,10 @@ pub(super) fn settle<T: Send + 'static>(
     });
     let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
     let staged = commit == Commit::Staged && result.is_ok() && !declined;
-    let scheduling_dirty = result.is_ok() && !declined && affects_scheduling(kind);
-    let capacity_released = result.is_ok() && !declined && releases_capacity(kind);
+    let scheduling_dirty =
+        result.is_ok() && !declined && (affects_scheduling(kind) || outcome.scheduling_wake);
+    let capacity_released =
+        result.is_ok() && !declined && (releases_capacity(kind) || outcome.capacity_freed);
     let answer: Answer = Box::new(move |lost| {
         let result = match (result, lost) {
             (Ok(_), Some(error)) if declined => Err(DatabaseError::RolledBack(error.clone())),
@@ -82,6 +87,7 @@ pub(super) fn settle<T: Send + 'static>(
         staged,
         scheduling_dirty,
         capacity_released,
+        probe: outcome.probe,
         answer,
         failure: outcome.storage_failure.map(|error| StorageFailure {
             error,
@@ -174,6 +180,7 @@ impl DatabaseWorker {
                     database,
                     epoch,
                     genesis,
+                    abandoned,
                 } = match storage::open(&directory) {
                     Ok(opened) => opened,
                     Err(error) => {
@@ -181,14 +188,8 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                let (abandoned_at_open, next_operation) =
-                    match quarantine_abandoned(&database, epoch) {
-                        Ok(quarantined) => quarantined,
-                        Err(error) => {
-                            ready_sender.send(Err(DatabaseError::Open(error))).ok();
-                            return Ok(());
-                        }
-                    };
+                let abandoned_at_open = abandoned;
+                let next_operation = 1;
                 // Opened only once the database file is known to be of this
                 // format and locked by this process, so no other OCG process
                 // publishes into the directory while it is cleaned up.
@@ -237,7 +238,7 @@ impl DatabaseWorker {
                     reclaimed_at_open,
                     space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
-                    aggregation_host: AtomicBool::new(false),
+                    probes: std::sync::Mutex::new(std::collections::HashMap::new()),
                     credentials_path,
                     credentials: RwLock::new(credentials),
                     #[cfg(test)]
@@ -415,56 +416,6 @@ fn load_credentials_file(path: &std::path::Path) -> std::collections::BTreeMap<S
         .unwrap_or_default()
 }
 
-/// Quarantines every Job that an earlier opening started as its own local
-/// execution and left unsettled, before this opening admits any command; see
-/// [`persistence::quarantine_abandoned_job`]. Only one opening of the file can
-/// exist at a time, so when a worker starts, every earlier opening is closed
-/// and nothing in this process can still drive its Jobs. That is not the same
-/// as its external work having stopped, so the Jobs are quarantined rather
-/// than settled: their outcomes become unknown, their claims and occupancy are
-/// retained, and no stop is confirmed. A reopen during recovery keeps its
-/// process's executions running and never comes here.
-///
-/// Each Job is quarantined in its own durable transaction, so a failure
-/// part-way leaves the rest claimed for the next start, and a quarantined Job
-/// is not touched again. A failure to reconstruct the quarantine refuses the
-/// open rather than admitting without it: there must be no window in which
-/// capacity is handed out before the protections over it are known.
-///
-/// Returns the quarantined Jobs and the next operation sequence number of this
-/// opening.
-pub(super) fn quarantine_abandoned(
-    database: &Database,
-    epoch: u64,
-) -> Result<(Vec<JobId>, u64), StorageError> {
-    let mut quarantined = Vec::new();
-    let mut seq = 1;
-    for (job, claimed) in storage::abandoned_local_executions(database, epoch)? {
-        let operation = OperationId::new(epoch, seq);
-        seq += 1;
-        let outcome = storage::run_batch_declinable(
-            database,
-            operation,
-            OperationKind::QuarantineAbandonedJob,
-            Commit::Durable,
-            |batch| persistence::quarantine_abandoned_job(batch, job, claimed),
-        );
-        match outcome.result {
-            Ok(Some(())) => quarantined.push(job),
-            Ok(None) => {}
-            Err(BatchFailure::Rejected(violation)) => {
-                return Err(StorageError::corrupted(format!(
-                    "{job}, abandoned by opening {claimed}, could not be quarantined: {violation}"
-                )));
-            }
-            Err(BatchFailure::NotCommitted(error) | BatchFailure::OutcomeUnknown(error)) => {
-                return Err(error);
-            }
-        }
-    }
-    Ok((quarantined, seq))
-}
-
 pub(super) fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseError> {
     thread.join().map_err(|_| DatabaseError::WorkerPanicked)?
 }
@@ -510,7 +461,7 @@ pub(super) struct WriteWorker {
     pub(super) next_check: Option<Instant>,
     /// Operations whose commit failed with an unknown outcome; the next
     /// successful recovery reconciles them.
-    pub(super) uncertain: Vec<OperationId>,
+    pub(super) uncertain: Vec<(OperationId, Option<Probe>)>,
     /// Set from a storage failure until a reopen replaces the failed handle.
     pub(super) storage_failure: Option<StorageError>,
     /// When the last successful compaction started, including one that moved
@@ -916,7 +867,7 @@ impl WriteWorker {
         if let Some(error) = &lost {
             for (ran, _) in &executed {
                 if ran.staged {
-                    self.uncertain.push(ran.operation);
+                    self.note_uncertain(ran.operation, ran.probe);
                 }
             }
             failure.get_or_insert(StorageFailure {
@@ -926,7 +877,7 @@ impl WriteWorker {
         }
         for (ran, outcome_unknown) in &executed {
             if *outcome_unknown {
-                self.uncertain.push(ran.operation);
+                self.note_uncertain(ran.operation, ran.probe);
             }
         }
         // The database guard is gone and the staging barrier still held, so
@@ -1151,7 +1102,7 @@ impl WriteWorker {
         }
         self.shared.protection.update(|status| {
             status.completed_checks += 1;
-            status.last_checked_at = Some(Timestamp::now());
+            status.last_checked_at = Some(persistence::Timestamp::now());
         });
         self.next_check = Instant::now().checked_add(self.check_interval());
     }
@@ -1263,6 +1214,7 @@ impl WriteWorker {
             database,
             epoch,
             genesis,
+            ..
         } = storage::open(&self.directory)
             .map_err(|error| RecoveryError::Reopen(reopen_failure(error, &self.directory)))?;
         if genesis != self.shared.genesis {
@@ -1285,8 +1237,19 @@ impl WriteWorker {
         Ok(epoch)
     }
 
-    /// Reads the marker of every operation whose outcome was unknown. A
-    /// failed read is a storage failure, so the handle is released again.
+    /// Remembers an operation whose commit has an unknown outcome, with the
+    /// natural key that will say whether it committed.
+    pub(super) fn note_uncertain(&mut self, operation: OperationId, probe: Option<Probe>) {
+        self.uncertain.push((operation, probe));
+        self.shared
+            .probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(operation, probe);
+    }
+
+    /// Probes the natural key of every operation whose outcome was unknown.
+    /// A failed read is a storage failure, so the handle is released again.
     pub(super) fn reconcile_uncertain(
         &mut self,
     ) -> Result<Vec<(OperationId, OperationStatus)>, RecoveryError> {
@@ -1300,11 +1263,9 @@ impl WriteWorker {
                 Some(opened) => self
                     .uncertain
                     .iter()
-                    .map(|&operation| {
-                        storage::read_marker(&opened.database, operation)
-                            .map(|marker| {
-                                (operation, operation_status(marker, operation, opened.epoch))
-                            })
+                    .map(|&(operation, probe)| {
+                        operation_status(&opened.database, operation, probe, opened.epoch)
+                            .map(|status| (operation, status))
                             .map_err(|error| (operation, error))
                     })
                     .collect::<Result<Vec<_>, _>>(),
@@ -1326,6 +1287,17 @@ impl WriteWorker {
     /// Closes admission for good, releases the database, and answers every
     /// queued command and pending request, so no caller is left waiting.
     pub(super) fn exit(self) -> Result<(), DatabaseError> {
+        if self.storage_failure.is_none() {
+            if let Some(opened) = self
+                .shared
+                .database
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                let _ = crate::storage::record_clean_shutdown(&opened.database);
+            }
+        }
         {
             let mut admission = self
                 .shared

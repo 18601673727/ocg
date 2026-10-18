@@ -6,7 +6,7 @@
  * navigation states what is missing instead of pretending.
  */
 
-export type WorkspaceView = "chat" | "jobs" | "usage" | "logs" | "settings";
+export type WorkspaceView = "chat" | "jobs" | "usage" | "health" | "logs" | "settings";
 
 export type ViewAvailability =
   | { available: true }
@@ -16,26 +16,22 @@ export type ViewAvailability =
       missing: string;
     };
 
-export const WORKSPACE_VIEWS: readonly WorkspaceView[] = ["chat", "jobs", "usage", "logs", "settings"];
+export const WORKSPACE_VIEWS: readonly WorkspaceView[] = ["chat", "jobs", "usage", "health", "logs", "settings"];
 
 export const VIEW_AVAILABILITY: Record<WorkspaceView, ViewAvailability> = {
   chat: { available: true },
   jobs: { available: true },
   settings: { available: true },
-  usage: {
-    available: false,
-    missing: "a usage / metrics read route (Metrics and AvailabilityStat are stored, but nothing serves them)",
-  },
-  logs: {
-    available: false,
-    missing: "a bounded log query route (the process logs to its own files; no route reads them)",
-  },
+  usage: { available: true },
+  health: { available: true },
+  logs: { available: true },
 };
 
 export const VIEW_TITLE: Record<WorkspaceView, string> = {
   chat: "Chat",
   jobs: "Jobs",
   usage: "Usage",
+  health: "Health",
   logs: "Logs",
   settings: "Settings",
 };

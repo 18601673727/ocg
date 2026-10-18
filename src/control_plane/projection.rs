@@ -48,24 +48,19 @@ pub(super) fn settlement_json(record: &JobRecord) -> Result<Value, Refusal> {
 /// The Job's lifecycle as recorded, with its [`settlement_json`].
 pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
     let settlement = settlement_json(record)?;
-    let execution_mode = match record.execution_mode {
-        ExecutionMode::Once => "once",
-        ExecutionMode::Continuous => "continuous",
-        ExecutionMode::Periodic => "periodic",
-        ExecutionMode::Container => "container",
-    };
     Ok(json!({
         "id": record.id.to_string(),
         "name": record.name,
-        "execution_mode": execution_mode,
+        // Every Job runs once; recurrence is not part of this format.
+        "execution_mode": "once",
         "input": record.input.to_string(),
         "previous": record.previous.map(|previous| previous.to_string()),
         "assigned_executor": record.assigned_executor.map(|executor| executor.to_string()),
         "created_at_us": record.created_at.as_unix_micros(),
         "updated_at_us": record.updated_at.as_unix_micros(),
         "started_at_us": micros(record.started_at),
-        "paused_at_us": micros(record.paused_at),
-        "sterilized_at_us": micros(record.sterilized_at),
+        "paused_at_us": null,
+        "sterilized_at_us": micros(record.children_closed_at),
         "settlement": settlement,
         // Recorded only for an Unknown Job whose local execution was
         // confirmed stopped; it says nothing about the Provider.

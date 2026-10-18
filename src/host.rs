@@ -14,9 +14,6 @@ use crate::database::{DatabaseHandle, DatabaseWorker};
 use crate::disk_protection::{ProtectionLock, ProtectionWatch};
 use crate::log_cleanup;
 use crate::logger::RuntimeLogger;
-use crate::orchestration::aggregation_service::{
-    AggregationService, AggregationServiceConfig, ServiceState,
-};
 use crate::orchestration::execution_runtime::{ExecutionRuntime, SchedulerHandle};
 use crate::system_policy::SystemPolicy;
 
@@ -25,7 +22,6 @@ use crate::system_policy::SystemPolicy;
 pub enum Phase {
     Startup,
     Logger,
-    AggregationService,
     LogCleanup,
     ExecutionRuntime,
     ControlPlane,
@@ -37,7 +33,6 @@ impl std::fmt::Display for Phase {
         f.write_str(match self {
             Self::Startup => "startup",
             Self::Logger => "logger",
-            Self::AggregationService => "aggregation service",
             Self::LogCleanup => "log cleanup",
             Self::ExecutionRuntime => "execution runtime",
             Self::ControlPlane => "control plane",
@@ -219,21 +214,11 @@ where
             return report;
         }
     };
-    let execution = match ExecutionRuntime::start(database.handle()) {
-        Ok(execution) => execution,
-        Err(error) => {
-            // The database still has to be closed, and its failure is kept
-            // beside the startup failure.
-            report.fail(Phase::Startup, error);
-            report.attempt(Phase::Database, database.shutdown());
-            return report;
-        }
-    };
     let served = ntex::rt::System::build()
         .name("ocg")
         .signals(signals)
         .build(ntex::rt::DefaultRuntime)
-        .block_on(serve(database.handle(), execution, control, until_stopped));
+        .block_on(serve(database.handle(), control, until_stopped));
     report.attempted.extend(served.attempted);
     report.failures.extend(served.failures);
     report.attempt(Phase::Database, database.shutdown());
@@ -276,11 +261,10 @@ fn protection_notice(
 /// `until_stopped`, then stops everything it was given, in this order: the
 /// Control Plane, if any, so no request reads or submits past this point;
 /// the execution runtime, so no submission starts once stopping begins; log
-/// cleanup; the aggregation service; the logger. The caller closes the
+/// cleanup; the logger. The caller closes the
 /// database after it.
 async fn serve<F>(
     handle: DatabaseHandle,
-    execution: ExecutionRuntime,
     control: Option<ControlPlaneConfig>,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
@@ -288,6 +272,13 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
+    let execution = match ExecutionRuntime::start(handle.clone()) {
+        Ok(execution) => execution,
+        Err(error) => {
+            report.fail(Phase::Startup, error);
+            return report;
+        }
+    };
     // Started first: a lock also blocks the file log, so it is reported on
     // standard error for as long as the process runs.
     ntex::rt::spawn(report_protection(handle.watch_disk_protection()));
@@ -300,7 +291,7 @@ where
         Ok(logger) => logger,
         Err(error) => {
             report.attempt::<(), _>(Phase::Logger, Err(error));
-            report.attempt(Phase::ExecutionRuntime, execution.shutdown());
+            report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
             return report;
         }
     };
@@ -324,58 +315,17 @@ where
         Err(error) => report.fail(Phase::Logger, error),
     }
 
-    report.attempted.push(Phase::AggregationService);
-    let service = match AggregationService::start(
-        handle.clone(),
-        AggregationServiceConfig::default(),
-    )
-    .await
-    {
-        Ok(service) => {
-            log::info!("aggregation service {} is running", service.job());
-            match service.state() {
-                ServiceState::Failed(reason) => {
-                    log::error!("aggregation service {} failed: {reason}", service.job());
-                }
-                ServiceState::Degraded(reason) => {
-                    eprintln!(
-                        "OCG aggregation service {} is degraded: {reason}",
-                        service.job()
-                    );
-                    log::error!(
-                        "aggregation service {} is degraded: {reason}",
-                        service.job()
-                    );
-                }
-                ServiceState::Running | ServiceState::Paused => {}
-            }
-            Some(service)
-        }
-        // A service that failed before it was ready is not reported as
-        // running, and the process does not wait for a stop signal.
+    report.attempted.push(Phase::LogCleanup);
+    let cleanup = match log_cleanup::start_retention(&handle).await {
+        Ok(cleanup) => Some(cleanup),
         Err(error) => {
-            report.fail(Phase::AggregationService, error);
+            log::error!("log retention did not start: {error}");
+            report.fail(Phase::LogCleanup, error);
             None
         }
     };
-    // Retention runs only beside a running service, and a retention that
-    // cannot start fails the run the same way.
-    let cleanup = match &service {
-        Some(_) => {
-            report.attempted.push(Phase::LogCleanup);
-            match log_cleanup::start_retention(&handle).await {
-                Ok(cleanup) => Some(cleanup),
-                Err(error) => {
-                    log::error!("log retention did not start: {error}");
-                    report.fail(Phase::LogCleanup, error);
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-    if let (Some(service), Some(_)) = (&service, &cleanup) {
-        // Started only beside the running services, and the run does not
+    if cleanup.is_some() {
+        // Started only beside the running retention, and the run does not
         // wait to be stopped when it cannot start.
         let listener = match control {
             None => Some(None),
@@ -405,7 +355,7 @@ where
                 log::info!("local browser pairing code: {pairing}");
                 eprintln!("OCG local browser pairing code: {pairing}");
             }
-            eprintln!("OCG aggregation service running as {}", service.job());
+            eprintln!("OCG host running");
             until_stopped(context).await;
             if let Some(listener) = listener
                 && let Err(error) = listener.stop().await
@@ -415,7 +365,7 @@ where
         }
     }
 
-    report.attempt(Phase::ExecutionRuntime, execution.shutdown());
+    report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
     // The cleanup worker is joined while the database and the logger it
     // uses are still open; a run in flight stops at its next file.
     if let Some(cleanup) = cleanup
@@ -423,14 +373,6 @@ where
     {
         report.fail(Phase::LogCleanup, error);
     }
-    // The loop is joined before its Job is ended, and both before the
-    // logger and the database are closed.
-    if let Some(service) = service
-        && let Err(error) = service.shutdown().await.into_result()
-    {
-        report.fail(Phase::AggregationService, error);
-    }
-
     log::info!("OCG foundation shutting down");
     report.attempted.push(Phase::Logger);
     match logger.shutdown() {

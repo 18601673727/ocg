@@ -172,6 +172,102 @@ export function decodeJob(input: unknown) {
   return jobRecord(envelope.job);
 }
 
+export function decodeJobs(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return {
+    jobs: listOf(envelope.jobs, "jobs", (job) => jobRecord(job)),
+    next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:"),
+    has_more: boolean(envelope.has_more, "has_more"),
+  };
+}
+
+function observationPage(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const next = envelope.next_after;
+  if (next !== null && (typeof next !== "string" || !/^[A-Za-z0-9_-]{1,400}$/.test(next))) {
+    throw new ContractError("next_after", "an observation cursor or null");
+  }
+  return { envelope, next_after: next as string | null };
+}
+
+function observation(input: unknown, path: string) {
+  const value = record(input, path);
+  return {
+    value,
+    common: {
+      id: string(value.id, `${path}.id`),
+      job: identity(value.job, `${path}.job`, "job:"),
+      request: integer(value.request, `${path}.request`),
+      observed_at_us: integer(value.observed_at_us, `${path}.observed_at_us`),
+      model: optionalString(value.model, `${path}.model`),
+      provider: optionalString(value.provider, `${path}.provider`),
+    },
+  };
+}
+
+export function decodeUsage(input: unknown) {
+  const { envelope, next_after } = observationPage(input);
+  return {
+    next_after,
+    observations: listOf(envelope.observations, "observations", (input, path) => {
+      const { value, common } = observation(input, path);
+      if (value.finality !== null && value.finality !== "final" && value.finality !== "cumulative") {
+        throw new ContractError(`${path}.finality`, "final, cumulative or null");
+      }
+      if (value.eligibility !== null && value.eligibility !== "eligible" && value.eligibility !== "excluded") {
+        throw new ContractError(`${path}.eligibility`, "eligible, excluded or null");
+      }
+      return {
+        ...common,
+        llm_profile: value.llm_profile === null ? null : identity(value.llm_profile, `${path}.llm_profile`, "profile:"),
+        input_tokens: timestamp(value.input_tokens, `${path}.input_tokens`),
+        output_tokens: timestamp(value.output_tokens, `${path}.output_tokens`),
+        cache_read_tokens: timestamp(value.cache_read_tokens, `${path}.cache_read_tokens`),
+        cache_write_tokens: timestamp(value.cache_write_tokens, `${path}.cache_write_tokens`),
+        reasoning_tokens: timestamp(value.reasoning_tokens, `${path}.reasoning_tokens`),
+        ttfb_ms: timestamp(value.ttfb_ms, `${path}.ttfb_ms`),
+        finished_in_ms: timestamp(value.finished_in_ms, `${path}.finished_in_ms`),
+        finality: value.finality,
+        eligibility: value.eligibility,
+      };
+    }),
+  };
+}
+
+export function decodeAvailability(input: unknown) {
+  const { envelope, next_after } = observationPage(input);
+  return {
+    next_after,
+    observations: listOf(envelope.observations, "observations", (input, path) => {
+      const { value, common } = observation(input, path);
+      const classification = string(value.classification, `${path}.classification`);
+      if (!["available", "unavailable", "rejected", "unconfirmed"].includes(classification)) {
+        throw new ContractError(`${path}.classification`, "a provider observation classification");
+      }
+      return {
+        ...common,
+        status_code: timestamp(value.status_code, `${path}.status_code`),
+        finish_reason: optionalString(value.finish_reason, `${path}.finish_reason`),
+        classification,
+      };
+    }),
+  };
+}
+
+export function decodeLogs(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return {
+    file: optionalString(envelope.file, "file"),
+    files: listOf(envelope.files, "files", string),
+    lines: listOf(envelope.lines, "lines", string),
+    truncated: boolean(envelope.truncated, "truncated"),
+    files_truncated: boolean(envelope.files_truncated, "files_truncated"),
+  };
+}
+
 /** One stored page of a Job's outputs, in `seq` order. */
 export function decodeOutputsPage(input: unknown, jobId: string) {
   const envelope = record(input, "response");

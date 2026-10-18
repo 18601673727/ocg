@@ -119,15 +119,14 @@ use serde_json::{Value, json};
 
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
-use crate::persistence::{
-    AttachmentId, ExecutionMode, JobId, JobOutputRecord, JobRecord, OutputKind, ProfileId,
-};
+use crate::persistence::{AttachmentId, JobId, JobOutputRecord, JobRecord, OutputKind, ProfileId};
 
 mod assets;
 mod attachments;
 mod browser;
 mod catalog;
 mod config;
+mod dashboard;
 mod events;
 mod listener;
 mod profiles;

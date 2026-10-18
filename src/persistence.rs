@@ -7,10 +7,7 @@ use crate::openai_compatible::{
     ChatFinishReason, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES, NormalizedUsage,
     ProviderFailure, ToolCallRefusal, is_function_name,
 };
-use crate::storage::{
-    AgentRow, AvailabilityStatRow, Batch, BatchError, ExecutorRow, JobInputRow, JobRow,
-    MarkerSubjects, MetricsRow, ProfileLinks, ProfileRow, dependency_state_with,
-};
+use crate::storage::{Batch, BatchError};
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
 mod availability;
@@ -22,51 +19,45 @@ mod records;
 mod scheduling;
 mod tool_evidence;
 
-pub(crate) use availability::RequestEvidence;
 pub use availability::{
-    AvailabilityAggregationProgress, AvailabilityBatch, AvailabilityBatchReport,
-    AvailabilityClassification, AvailabilityCounts, AvailabilityObservation,
-    AvailabilityRequestSample, AvailabilityStatRecord, MixedRequests, NewAvailabilityStat,
-    ObservationCursor, ObservationFilter, ObservationPage, ObservedModel, ObservedModelChoice,
-    ObservedModelFilter, ObservedModelPage, ReadSnapshot, RejectionCause, RequestSampleRecord,
-    TimeRange, UnavailableCause, minute_of,
+    AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,
+    AvailabilityStatRecord, MixedRequests, NewAvailabilityStat, ObservationCursor,
+    ObservationFilter, ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelFilter,
+    ObservedModelPage, RejectionCause, TimeRange, UnavailableCause,
 };
 pub use execution::{
-    AppendedOutput, DependencyCondition, DependencyState, ExecutionConfiguration, ExecutionMode,
-    ExecutorType, FinalResult, IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome,
-    JobRetry, NewExecutor, NewJob, NewJobOutput, OutputKind, RetryInput,
+    AppendedOutput, DependencyCondition, DependencyState, ExecutionConfiguration, FinalResult,
+    IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, JobRetry, NewExecutor,
+    NewJob, NewJobOutput, OutputKind,
 };
 pub use identity::{
-    AgentId, AttachmentId, AvailabilityStatId, ExecutionPoolId, ExecutorId, JobId, JobInputId,
+    AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,
     JobOutputId, LlmProviderId, MetricsId, ProfileId, ProjectId, RecordRef, RequestNumber,
     RequestRef, Timestamp,
 };
 pub(crate) use mutations::{
-    PublishedAttachment, append_job_output, assign_job_executor, associate_job_project,
-    begin_core_log_cleanup, check_new_attachment, cleanup_attachment, confirm_job_stopped,
-    create_agent, create_attachment, create_execution_pool, create_executor, create_job_with_input,
-    create_llm_provider, create_local_job_with_input, create_profile, create_project,
-    create_submitted_local_job, finalize_job, quarantine_abandoned_job, reconcile_tool_effect,
-    record_availability_stat, record_metrics, record_tool_decision, record_tool_outcome, retry_job,
-    save_job_input, set_execution_pool_enabled, set_execution_pool_profile, start_job,
-    start_local_job, update_profile,
+    PublishedAttachment, append_job_output, associate_job_project, begin_core_log_cleanup,
+    check_new_attachment, claim_execution, cleanup_attachment, confirm_job_stopped,
+    create_attachment, create_config, create_execution_pool, create_executor, create_job,
+    create_local_job, create_project, create_submitted_local_job, finalize_job,
+    reconcile_tool_effect, record_availability_stat, record_metrics, record_tool_decision,
+    record_tool_outcome, retry_job, set_execution_pool_enabled, start_job, update_config,
+    update_execution_pool,
 };
 pub use mutations::{is_handler_version, sanitize_display_name};
-#[cfg(test)]
-pub(crate) use mutations::{record_preexisting_metrics, start_preexisting_local_job};
-pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, OperationMarker, Violation};
+pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
 pub use records::{
-    AgentConfig, AgentProfile, AgentRecord, AttachmentCleanup, AttachmentOrigin, AttachmentRecord,
-    CapabilitySet, CleanupKind, ContentDigest, ExecutionOperation, ExecutionPool,
-    ExecutionPoolConfig, ExecutionPoolProfile, ExecutorRecord, FrozenExecutionConfig,
-    FrozenLlmConfig, JobInputRecord, JobOutputRecord, JobRecord, LlmConfig, LlmParameters,
-    LlmProfile, LlmProviderRecord, LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES,
-    MAX_ATTACHMENT_MIME_BYTES, MAX_ATTACHMENT_NAME_BYTES, Measurements, MetricsRecord,
-    ModelCapability, NewAgent, NewAttachment, NewExecutionPool, NewLlmProvider, NewMetrics,
-    NewProfile, NewProfileConfig, NewProject, NewSubmission, PendingJobKey, PendingJobsPage,
-    Profile, ProfileConfig, ProfileEditability, ProfileKind, ProfileRecord, ProfileVariant,
-    ProjectRecord, ProviderSnapshot, RequestFingerprint, SubmissionKey, SubmissionRecord,
-    SubmittedConfiguration, WrongProfileKind,
+    AgentBehavior, AgentConfig, AttachmentCleanup, AttachmentOrigin, AttachmentRecord,
+    CapabilitySet, ClaimRecord, CleanupKind, ConfigBody, ConfigKind, ConfigRecord, ConfigRef,
+    ConnectionConfig, ContentDigest, ExecutionOperation, ExecutionPool, ExecutionPoolConfig,
+    ExecutorRecord, FrozenExecutionConfig, FrozenLlmConfig, JobInputRecord, JobOutputRecord,
+    JobRecord, JobStateRecord, LlmConfig, LlmParameters, LlmTarget, LlmTransport,
+    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES, MAX_ATTACHMENT_NAME_BYTES, Measurements,
+    MetricsRecord, ModelCapability, ModelConfig, NewAttachment, NewConfig, NewExecutionPool,
+    NewMetrics, NewProject, NewSubmission, OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey,
+    PendingJobsPage, PoolConfig, ProjectRecord, ProviderSnapshot, RequestEventRecord,
+    RequestFingerprint, RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord,
+    SubmittedConfiguration, SuspensionRecord, ToolCallRecord,
 };
 pub use scheduling::*;
 pub use tool_evidence::{

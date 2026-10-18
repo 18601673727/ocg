@@ -8,7 +8,9 @@ impl Timestamp {
     pub fn now() -> Self {
         let micros = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(elapsed) => i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX),
-            Err(before) => i64::try_from(before.duration().as_micros()).map_or(i64::MIN, |micros| -micros),
+            Err(before) => {
+                i64::try_from(before.duration().as_micros()).map_or(i64::MIN, |micros| -micros)
+            }
         };
         Self(micros)
     }
@@ -27,7 +29,7 @@ macro_rules! record_id_type {
         /// A stable business identifier allocated by the database. A committed
         /// identifier is never reused; one allocated by a transaction that
         /// rolled back may be allocated again by a later transaction.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(pub(super) u64);
 
         impl $name {
@@ -51,15 +53,66 @@ macro_rules! record_id_type {
 record_id_type!(JobId, "job");
 record_id_type!(JobInputId, "job_input");
 record_id_type!(JobOutputId, "job_output");
+record_id_type!(ConfigId, "config");
 record_id_type!(ExecutorId, "executor");
 record_id_type!(ExecutionPoolId, "execution_pool");
 record_id_type!(ProjectId, "project");
 record_id_type!(ProfileId, "profile");
-record_id_type!(AgentId, "agent");
 record_id_type!(LlmProviderId, "llm_provider");
 record_id_type!(MetricsId, "metrics");
 record_id_type!(AvailabilityStatId, "availability_stat");
 record_id_type!(AttachmentId, "attachment");
+
+impl From<ConfigId> for ProfileId {
+    fn from(c: ConfigId) -> Self {
+        ProfileId(c.0)
+    }
+}
+impl From<ProfileId> for ConfigId {
+    fn from(p: ProfileId) -> Self {
+        ConfigId(p.0)
+    }
+}
+impl From<ConfigId> for ExecutorId {
+    fn from(c: ConfigId) -> Self {
+        ExecutorId(c.0)
+    }
+}
+impl From<ExecutorId> for ConfigId {
+    fn from(e: ExecutorId) -> Self {
+        ConfigId(e.0)
+    }
+}
+impl From<ConfigId> for LlmProviderId {
+    fn from(c: ConfigId) -> Self {
+        LlmProviderId(c.0)
+    }
+}
+impl From<LlmProviderId> for ConfigId {
+    fn from(p: LlmProviderId) -> Self {
+        ConfigId(p.0)
+    }
+}
+impl From<ExecutionPoolId> for ExecutorId {
+    fn from(p: ExecutionPoolId) -> Self {
+        ExecutorId(p.0)
+    }
+}
+impl From<ExecutorId> for ExecutionPoolId {
+    fn from(e: ExecutorId) -> Self {
+        ExecutionPoolId(e.0)
+    }
+}
+impl From<ConfigId> for ExecutionPoolId {
+    fn from(c: ConfigId) -> Self {
+        ExecutionPoolId(c.0)
+    }
+}
+impl From<ExecutionPoolId> for ConfigId {
+    fn from(p: ExecutionPoolId) -> Self {
+        ConfigId(p.0)
+    }
+}
 
 /// The number of one Provider request within the Job that sent it, from 1
 /// in the order the Job sent them. A Job may send several requests, such as
@@ -120,7 +173,6 @@ pub enum RecordRef {
     ExecutionPool(ExecutionPoolId),
     Project(ProjectId),
     Profile(ProfileId),
-    Agent(AgentId),
     LlmProvider(LlmProviderId),
     Metrics(MetricsId),
     AvailabilityStat(AvailabilityStatId),
@@ -137,7 +189,6 @@ impl fmt::Display for RecordRef {
             Self::ExecutionPool(id) => id.fmt(f),
             Self::Project(id) => id.fmt(f),
             Self::Profile(id) => id.fmt(f),
-            Self::Agent(id) => id.fmt(f),
             Self::LlmProvider(id) => id.fmt(f),
             Self::Metrics(id) => id.fmt(f),
             Self::AvailabilityStat(id) => id.fmt(f),

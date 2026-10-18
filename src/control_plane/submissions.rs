@@ -53,8 +53,8 @@ use crate::orchestration::execution_runtime::{
     attachment_images,
 };
 use crate::persistence::{
-    AttachmentId, AttachmentOrigin, ExecutionConfiguration, ExecutionMode, ExecutorId, JobId,
-    JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId,
+    AttachmentId, AttachmentOrigin, ConfigBody, ConfigRecord, ExecutionConfiguration, ExecutorId,
+    JobId, JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId,
     RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
 };
 
@@ -277,9 +277,8 @@ impl JobRequest {
         }
         let mut attachments = Vec::with_capacity(wire.attachments.len());
         for attachment in &wire.attachments {
-            let attachment = AttachmentId::new(
-                identity(attachment, "attachment:").ok_or(INVALID_BODY)?,
-            );
+            let attachment =
+                AttachmentId::new(identity(attachment, "attachment:").ok_or(INVALID_BODY)?);
             if attachments.contains(&attachment) {
                 return Err(INVALID_BODY);
             }
@@ -920,19 +919,26 @@ pub(super) async fn check_configuration(
     database: &DatabaseHandle,
     request: &JobRequest,
 ) -> Result<(), Refusal> {
-    let llm = match database.llm_profile(request.llm_profile).await {
-        Ok(Some(llm)) => llm,
-        Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => return Err(PROFILE_NOT_FOUND),
-        Err(error) => return Err(error.into()),
+    let llm = match database.config(request.llm_profile.into()).await? {
+        Some(ConfigRecord {
+            body: ConfigBody::Model(model),
+            ..
+        }) => model,
+        _ => return Err(PROFILE_NOT_FOUND),
     };
+    let mut chat = false;
     if let Some(agent_profile) = request.agent_profile {
-        match database.agent_profile(agent_profile).await {
-            Ok(Some(agent)) if agent.links.contains(&request.llm_profile) => {}
-            Ok(Some(_)) => return Err(AGENT_TARGET_MISMATCH),
-            Ok(None) | Err(DatabaseError::WrongProfileKind(_)) => {
-                return Err(AGENT_PROFILE_NOT_FOUND);
+        match database.config(agent_profile.into()).await? {
+            Some(ConfigRecord {
+                body: ConfigBody::Agent(agent),
+                ..
+            }) => {
+                if !agent.models.contains(&request.llm_profile.into()) {
+                    return Err(AGENT_TARGET_MISMATCH);
+                }
+                chat = agent.behavior == crate::persistence::AgentBehavior::Chat;
             }
-            Err(error) => return Err(error.into()),
+            _ => return Err(AGENT_PROFILE_NOT_FOUND),
         }
     }
     if database.executor(request.executor).await?.is_none() {
@@ -949,6 +955,11 @@ pub(super) async fn check_configuration(
     // earlier turns' first, then this one's.
     let mut images: Vec<AttachmentId> = Vec::new();
     if let Some(previous) = request.previous {
+        // A conversation continues with the Agent of its earlier turn, and
+        // that Agent holds conversations.
+        if !chat {
+            return Err(INVALID_PREVIOUS_JOB);
+        }
         let genesis = database.genesis();
         let mut visited = std::collections::BTreeSet::new();
         let mut cursor = Some(previous);
@@ -958,7 +969,7 @@ pub(super) async fn check_configuration(
             if prior_turns >= MAX_CONVERSATION_TURNS {
                 return Err(CONVERSATION_TOO_LONG);
             }
-            if !visited.insert(current) {
+            if current == genesis || !visited.insert(current) {
                 return Err(INVALID_PREVIOUS_JOB);
             }
             let Some(record) = database.job(current).await? else {
@@ -968,9 +979,9 @@ pub(super) async fn check_configuration(
                     INVALID_PREVIOUS_JOB
                 });
             };
-            if current == genesis
-                || record.parent != genesis
+            if record.parent != genesis
                 || database.job_configuration(current).await?.is_none()
+                || record.agent_id.map(Into::into) != request.agent_profile
             {
                 return Err(INVALID_PREVIOUS_JOB);
             }
@@ -987,11 +998,7 @@ pub(super) async fn check_configuration(
     if images.is_empty() {
         return Ok(());
     }
-    if !llm
-        .config
-        .declared_capabilities
-        .contains(&ModelCapability::Vision)
-    {
+    if !llm.declared_capabilities.contains(&ModelCapability::Vision) {
         return Err(VISION_NOT_SUPPORTED);
     }
     for &attachment in &request.attachments {
@@ -1030,22 +1037,16 @@ pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderEx
         },
         NewJob {
             name: request.name,
-            execution_mode: ExecutionMode::Once,
             eligible_at: None,
-            scheduled_at: None,
-            next_due_at: None,
-            next_iteration_no: None,
-            iteration_no: None,
             parent: database.genesis(),
             projects: Vec::new(),
             dependencies: Vec::new(),
+            input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: request.agent_profile,
                 llm_profile: request.llm_profile,
             }),
-            assigned_executor: None,
             previous: request.previous,
-            replaces: None,
         },
     );
     plan.credential_resolver = database.credential_resolver();
@@ -1241,7 +1242,7 @@ mod tests {
             ExecutionRuntime,
             provider_seam::{self, Response},
         };
-        use crate::persistence::{ExecutorType, LlmTransport, NewExecutor};
+        use crate::persistence::{LlmTransport, NewExecutor};
         use crate::provider_execution::scripted::Step;
         use crate::test_support::{data_directory, wait};
 
@@ -1253,7 +1254,6 @@ mod tests {
 
         let executor = wait(handle.create_executor(NewExecutor {
             name: "local-llm".to_owned(),
-            executor_type: ExecutorType::Llm,
             concurrency_limit: NonZeroU32::MIN,
             llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
         }))
@@ -1370,7 +1370,10 @@ mod tests {
         assert_eq!(sent.len(), 3);
         assert_eq!(sent[0]["messages"].as_array().expect("msgs").len(), 2);
         assert_eq!(sent[1]["messages"].as_array().expect("msgs").len(), 4);
-        assert_eq!(sent[1]["messages"][1]["content"], "My secret word is cobalt.");
+        assert_eq!(
+            sent[1]["messages"][1]["content"],
+            "My secret word is cobalt."
+        );
         assert_eq!(
             sent[1]["messages"][2]["content"],
             "Reply 1: Remembered cobalt."
@@ -1396,6 +1399,7 @@ mod tests {
         // Linking to Genesis or a non-existent Job is refused.
         let genesis_req = JobRequest::parse(
             serde_json::to_vec(&json!({
+                "agent_profile": agent_id.to_string(),
                 "llm_profile": llm_id.to_string(),
                 "executor": executor.to_string(),
                 "objective": "Bad link",
@@ -1411,6 +1415,7 @@ mod tests {
         );
         let missing_req = JobRequest::parse(
             serde_json::to_vec(&json!({
+                "agent_profile": agent_id.to_string(),
                 "llm_profile": llm_id.to_string(),
                 "executor": executor.to_string(),
                 "objective": "Missing link",
@@ -1425,7 +1430,7 @@ mod tests {
             Some(PREVIOUS_JOB_NOT_FOUND)
         );
 
-        runtime.shutdown().expect("shutdown runtime");
+        wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");
     }
 }

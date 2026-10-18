@@ -5,7 +5,7 @@ use super::*;
 pub(super) type ReadJob = Box<dyn FnOnce(Result<&Opened, DatabaseError>) + Send>;
 
 /// The database with the epoch of the opening that produced it, so a read
-/// always judges markers against the epoch of the data it saw.
+/// always judges an operation against the epoch of the data it saw.
 pub(super) struct Opened {
     pub(super) database: Database,
     pub(super) epoch: u64,
@@ -85,24 +85,13 @@ pub(super) struct Shared {
     /// `None` answers a check that the stopping worker will never run.
     pub(super) space_check: SharedRequest<Option<DiskProtectionStatus>>,
     pub(super) recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
-    /// Set while a host owns the background aggregation loop of this opening,
-    /// so one process run never has two.
-    pub(super) aggregation_host: AtomicBool,
+    /// The natural keys of the commands whose commit had an unknown outcome,
+    /// by operation, so [`DatabaseHandle::reconcile_operation`] can read them.
+    pub(super) probes: std::sync::Mutex<std::collections::HashMap<OperationId, Option<Probe>>>,
     pub(super) credentials_path: PathBuf,
     pub(super) credentials: RwLock<std::collections::BTreeMap<String, String>>,
     #[cfg(test)]
     pub(super) probe: GroupProbe,
-}
-
-/// Ownership of the one background aggregation loop. Dropping it releases it.
-pub(crate) struct AggregationClaim {
-    pub(super) shared: Arc<Shared>,
-}
-
-impl Drop for AggregationClaim {
-    fn drop(&mut self) {
-        self.shared.aggregation_host.store(false, Ordering::SeqCst);
-    }
 }
 
 /// Test seams of the write worker's group commit.
@@ -116,10 +105,6 @@ pub(crate) struct GroupProbe {
     pub(crate) flushes: AtomicUsize,
     /// Makes the next flush fail instead of running.
     pub(crate) fail_next_flush: AtomicBool,
-    /// Makes the next aggregation plan prepared through this handle fail its
-    /// commit before the progress is written, so storage latches as it does
-    /// for any failed commit.
-    pub(crate) fail_next_plan: AtomicBool,
 }
 
 #[cfg(test)]

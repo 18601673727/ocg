@@ -332,12 +332,11 @@ struct Feed {
 }
 
 /// What a `job` event is sent again for.
-type Lifecycle = [Option<Timestamp>; 7];
+type Lifecycle = [Option<Timestamp>; 6];
 
 fn lifecycle(record: &JobRecord) -> Lifecycle {
     [
         record.started_at,
-        record.paused_at,
         record.completed_at,
         record.failed_at,
         record.cancelled_at,

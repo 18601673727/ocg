@@ -1,7 +1,7 @@
 use std::num::NonZeroU32;
 
 use ocg::data_directory::DataDirectory;
-use ocg::persistence::{ExecutionPoolId, ProfileId};
+use ocg::persistence::ExecutionPoolId;
 
 pub fn run(
     directory: &DataDirectory,
@@ -11,7 +11,6 @@ pub fn run(
         List,
         Create(String, Option<NonZeroU32>),
         Enable(ExecutionPoolId, bool),
-        Profile(ExecutionPoolId, ProfileId),
         Limit(ExecutionPoolId, NonZeroU32),
     }
     let pool_id = |value: &str| -> Result<ExecutionPoolId, Box<dyn std::error::Error>> {
@@ -30,9 +29,7 @@ pub fn run(
         [command, pool] if command == "enable" || command == "disable" =>
             Action::Enable(pool_id(pool)?, command == "enable"),
         [command, pool, limit] if command == "set-limit" => Action::Limit(pool_id(pool)?, limit.parse()?),
-        [command, pool, profile] if command == "set-profile" =>
-            Action::Profile(pool_id(pool)?, ProfileId::new(profile.strip_prefix("profile:").unwrap_or(profile).parse()?)),
-        _ => return Err("usage: ocg pool list | create <name> [nonzero-concurrency] | enable <pool> | disable <pool> | set-profile <pool> <profile> | set-limit <pool> <nonzero-concurrency>".into()),
+        _ => return Err("usage: ocg pool list | create <name> [nonzero-concurrency] | enable <pool> | disable <pool> | set-limit <pool> <nonzero-concurrency>".into()),
     };
     let result = std::rc::Rc::new(std::cell::RefCell::new(None));
     let returned = result.clone();
@@ -50,7 +47,7 @@ pub fn run(
                                 "{}\t{}\t{}\t{}",
                                 pool.id,
                                 pool.name,
-                                pool.profile,
+                                pool.config.concurrency_limit,
                                 if pool.enabled { "enabled" } else { "disabled" }
                             ));
                         }
@@ -63,21 +60,13 @@ pub fn run(
                 }
                 Action::Create(name, concurrency) => {
                     use ocg::persistence::*;
-                    let profile = database
-                        .create_profile(NewProfile {
-                            name: name.clone(),
-                            config: NewProfileConfig::ExecutionPool(
-                                crate::llm_target::pool_config(
-                                    LlmTransport::OpenAiChatCompletions,
-                                    concurrency,
-                                ),
-                            ),
-                        })
-                        .await?;
                     let pool = database
                         .create_execution_pool(NewExecutionPool {
                             name,
-                            profile,
+                            config: crate::llm_target::pool_config(
+                                LlmTransport::OpenAiChatCompletions,
+                                concurrency,
+                            ),
                             enabled: true,
                         })
                         .await?;
@@ -90,32 +79,13 @@ pub fn run(
                             RecordRef::ExecutionPool(pool),
                         )),
                     )?;
-                    let profile = database.profile(record.profile).await?.ok_or(
-                        ocg::database::DatabaseError::Rejected(Violation::NotFound(
-                            RecordRef::Profile(record.profile),
-                        )),
-                    )?;
-                    let mut typed: ExecutionPoolProfile = profile.try_into().map_err(|error| {
-                        ocg::database::DatabaseError::Rejected(Violation::WrongProfileKind(error))
-                    })?;
-                    typed.config.concurrency_limit = concurrency_limit;
-                    let replacement = database
-                        .create_profile(NewProfile {
-                            name: typed.name,
-                            config: NewProfileConfig::ExecutionPool(typed.config),
-                        })
-                        .await?;
-                    database
-                        .set_execution_pool_profile(pool, replacement)
-                        .await?;
+                    let mut config = record.config;
+                    config.concurrency_limit = concurrency_limit;
+                    database.update_execution_pool(pool, config).await?;
                     Ok(vec![pool.to_string()])
                 }
                 Action::Enable(pool, enabled) => {
                     database.set_execution_pool_enabled(pool, enabled).await?;
-                    Ok(vec![pool.to_string()])
-                }
-                Action::Profile(pool, profile) => {
-                    database.set_execution_pool_profile(pool, profile).await?;
                     Ok(vec![pool.to_string()])
                 }
             }

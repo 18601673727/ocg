@@ -430,14 +430,12 @@ impl DatabaseHandle {
             .await
     }
 
-    #[allow(dead_code, reason = "M2 keeps Scheduler dispatch dormant")]
-    pub(crate) async fn reconcile_unexecuted_claim(
-        &self,
-        job: JobId,
-        claim: OperationId,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::ReconcileUnexecutedClaim { job, claim, reply })
-            .await
+    /// CLAIM_BATCH (section 8.3): one write transaction that promotes the due
+    /// Jobs and claims ready Jobs, smallest Job id first, while a global slot
+    /// and a compatible Pool with room are free. The Jobs it returns are
+    /// claimed once this returns; execution starts only after the commit.
+    pub async fn claim_batch(&self) -> Result<Vec<JobId>, DatabaseError> {
+        self.submit(|reply| Command::ClaimBatch { reply }).await
     }
 
     pub async fn frozen_pool_binding(
@@ -491,7 +489,7 @@ impl DatabaseHandle {
     /// any of them never changes the Provider, model or parameters.
     pub async fn compatible_executors(
         &self,
-        llm_profile: ProfileId,
+        llm_profile: crate::persistence::ProfileId,
     ) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(move |database| storage::read_compatible_executors(database, llm_profile))
             .await
@@ -505,35 +503,6 @@ impl DatabaseHandle {
         job: JobId,
     ) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(move |database| storage::read_job_compatible_executors(database, job))
-            .await
-    }
-
-    /// Whether a Profile can be edited now, with the unfinished Jobs that
-    /// hold it. `None` for a missing Profile.
-    pub async fn profile_editability(
-        &self,
-        profile: ProfileId,
-    ) -> Result<Option<persistence::ProfileEditability>, DatabaseError> {
-        self.read(move |database| storage::read_profile_editability(database, profile))
-            .await
-    }
-
-    /// The Jobs submitted with a Profile in ID order, strictly after `after`
-    /// when given; at most 1,000 per call.
-    pub async fn profile_jobs(
-        &self,
-        profile: ProfileId,
-        after: Option<JobId>,
-        limit: usize,
-    ) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_profile_jobs(database, profile, after, limit))
-            .await
-    }
-
-    /// The Jobs submitted with an input, oldest first: the Job that froze it
-    /// and every retry that reused it.
-    pub async fn input_jobs(&self, input: JobInputId) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_input_jobs(database, input))
             .await
     }
 
@@ -626,85 +595,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn llm_provider(
-        &self,
-        id: LlmProviderId,
-    ) -> Result<Option<LlmProviderRecord>, DatabaseError> {
-        self.read(move |database| storage::read_llm_provider(database, id))
-            .await
-    }
-
-    /// LLM Providers newest first, strictly before `before` when given; at
-    /// most 1,000 per call.
-    pub async fn llm_providers(
-        &self,
-        before: Option<LlmProviderId>,
-        limit: usize,
-    ) -> Result<Vec<LlmProviderRecord>, DatabaseError> {
-        self.read(move |database| storage::read_llm_providers(database, before, limit))
-            .await
-    }
-
-    /// The LLM Profiles that use a Provider, oldest first.
-    pub async fn provider_profiles(
-        &self,
-        provider: LlmProviderId,
-    ) -> Result<Vec<ProfileId>, DatabaseError> {
-        self.read(move |database| storage::read_provider_profiles(database, provider))
-            .await
-    }
-
-    /// A Profile of either kind.
-    pub async fn profile(&self, id: ProfileId) -> Result<Option<ProfileRecord>, DatabaseError> {
-        self.read(move |database| storage::read_profile(database, id))
-            .await
-    }
-
-    /// Profiles of both kinds newest first, strictly before `before` when
-    /// given; at most 1,000 per call.
-    pub async fn profiles(
-        &self,
-        before: Option<ProfileId>,
-        limit: usize,
-    ) -> Result<Vec<ProfileRecord>, DatabaseError> {
-        self.read(move |database| storage::read_profiles(database, before, limit))
-            .await
-    }
-
-    /// A Profile in its typed form, such as `typed_profile::<AgentConfig>`
-    /// for an Agent Profile. A Profile of the other kind is refused with
-    /// [`DatabaseError::WrongProfileKind`].
-    pub async fn typed_profile<C: ProfileVariant>(
-        &self,
-        id: ProfileId,
-    ) -> Result<Option<Profile<C>>, DatabaseError> {
-        let Some(record) = self.profile(id).await? else {
-            return Ok(None);
-        };
-        Profile::try_from(record)
-            .map(Some)
-            .map_err(DatabaseError::WrongProfileKind)
-    }
-
-    pub async fn agent_profile(
-        &self,
-        id: ProfileId,
-    ) -> Result<Option<persistence::AgentProfile>, DatabaseError> {
-        self.typed_profile(id).await
-    }
-
-    pub async fn llm_profile(
-        &self,
-        id: ProfileId,
-    ) -> Result<Option<persistence::LlmProfile>, DatabaseError> {
-        self.typed_profile(id).await
-    }
-
-    pub async fn agent(&self, id: AgentId) -> Result<Option<AgentRecord>, DatabaseError> {
-        self.read(move |database| storage::read_agent(database, id))
-            .await
-    }
-
     /// A Job's Metrics in recording order, strictly after `after` when
     /// given; at most 1,000 per call.
     pub async fn job_metrics(
@@ -739,9 +629,9 @@ impl DatabaseHandle {
     pub async fn metrics(
         &self,
         filter: ObservationFilter,
-        after: Option<ObservationCursor<MetricsId>>,
+        after: Option<ObservationCursor>,
         limit: usize,
-    ) -> Result<ObservationPage<MetricsRecord, MetricsId>, DatabaseError> {
+    ) -> Result<ObservationPage<MetricsRecord>, DatabaseError> {
         self.read(move |database| {
             storage::read_metrics(database, &filter, after, limit, MAX_OBSERVATION_SCAN)
         })
@@ -754,9 +644,9 @@ impl DatabaseHandle {
     pub async fn availability_stats(
         &self,
         filter: ObservationFilter,
-        after: Option<ObservationCursor<AvailabilityStatId>>,
+        after: Option<ObservationCursor>,
         limit: usize,
-    ) -> Result<ObservationPage<AvailabilityStatRecord, AvailabilityStatId>, DatabaseError> {
+    ) -> Result<ObservationPage<AvailabilityStatRecord>, DatabaseError> {
         self.read(move |database| {
             storage::read_availability_stats(database, &filter, after, limit, MAX_OBSERVATION_SCAN)
         })
@@ -794,63 +684,10 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Claims the background aggregation loop for one host, or `None` when
-    /// another host holds it.
-    pub(crate) fn claim_aggregation_host(&self) -> Option<AggregationClaim> {
-        self.shared
-            .aggregation_host
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()?;
-        Some(AggregationClaim {
-            shared: self.shared.clone(),
-        })
-    }
-
     /// The seams of the write worker's group commit.
     #[cfg(test)]
     pub(crate) fn group_probe(&self) -> &GroupProbe {
         &self.shared.probe
-    }
-
-    /// Writes Metrics as a database written before Token eligibility was
-    /// checked at ingest could hold them, contradictions included. Its
-    /// marker uses epoch 0, which no opening has.
-    #[cfg(test)]
-    pub(crate) async fn record_preexisting_metrics(
-        &self,
-        metrics: NewMetrics,
-    ) -> Result<MetricsId, DatabaseError> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        self.with_database(move |database| {
-            let operation = OperationId::new(0, NEXT.fetch_add(1, Ordering::SeqCst));
-            storage::run_batch(database, operation, OperationKind::RecordMetrics, |batch| {
-                persistence::record_preexisting_metrics(batch, metrics)
-            })
-            .result
-            .map_err(|failure| StorageError::corrupted(format!("{failure:?}")))
-        })
-        .await
-    }
-
-    /// Starts a Job locally as a database written before dependencies were
-    /// checked at the start could hold it, claimed by the current opening.
-    /// Its marker uses epoch 0, which no opening has.
-    #[cfg(test)]
-    pub(crate) async fn start_preexisting_local_job(
-        &self,
-        job: JobId,
-    ) -> Result<(), DatabaseError> {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let epoch = self.epoch();
-        self.with_database(move |database| {
-            let operation = OperationId::new(0, NEXT.fetch_add(1, Ordering::SeqCst));
-            storage::run_batch(database, operation, OperationKind::StartLocalJob, |batch| {
-                persistence::start_preexisting_local_job(batch, job, epoch)
-            })
-            .result
-            .map_err(|failure| StorageError::corrupted(format!("{failure:?}")))
-        })
-        .await
     }
 
     /// Runs `f` on a read worker with the open database, for tests that
@@ -861,94 +698,6 @@ impl DatabaseHandle {
         f: impl FnOnce(&Database) -> Result<T, StorageError> + Send + 'static,
     ) -> Result<T, DatabaseError> {
         self.read(f).await
-    }
-
-    /// Operation markers in identifier order, strictly after `after` when
-    /// given; at most 1,000 per call.
-    pub async fn operation_markers(
-        &self,
-        after: Option<OperationId>,
-        limit: usize,
-    ) -> Result<Vec<OperationMarker>, DatabaseError> {
-        self.read(move |database| storage::read_markers(database, after, limit))
-            .await
-    }
-
-    /// Resolves a command reported as [`DatabaseError::OutcomeUnknown`]. Call
-    /// it after reopening: for an operation of an earlier opening, a missing
-    /// marker proves the command did not commit.
-    pub async fn reconcile_operation(
-        &self,
-        operation: OperationId,
-    ) -> Result<OperationStatus, DatabaseError> {
-        if operation.epoch() > self.epoch() {
-            return Err(DatabaseError::UnknownOperation(operation));
-        }
-        self.read_opened(move |opened| {
-            storage::read_marker(&opened.database, operation)
-                .map(|marker| operation_status(marker, operation, opened.epoch))
-        })
-        .await
-    }
-
-    pub async fn save_job_input(
-        &self,
-        existing: Option<JobInputId>,
-        draft: JobInputDraft,
-    ) -> Result<JobInputId, DatabaseError> {
-        self.submit(|reply| Command::SaveJobInput {
-            existing,
-            draft,
-            reply,
-        })
-        .await
-    }
-
-    pub async fn create_job_with_input(
-        &self,
-        job: NewJob,
-        input: JobInputId,
-    ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateJobWithInput { job, input, reply })
-            .await
-    }
-
-    /// Like [`DatabaseHandle::create_job_with_input`], and starts the Job
-    /// like [`DatabaseHandle::start_local_job`] in the same transaction, so
-    /// the Job exists only with its local execution claimed. Either both
-    /// commit or neither does.
-    pub async fn create_local_job_with_input(
-        &self,
-        job: NewJob,
-        input: JobInputId,
-    ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateLocalJobWithInput {
-            job,
-            input,
-            submission: None,
-            reply,
-        })
-        .await
-    }
-
-    /// Like [`DatabaseHandle::create_local_job_with_input`], and records
-    /// `submission` with the Job in the same transaction. A key already
-    /// recorded refuses the creation with
-    /// [`Violation::SubmissionKeyUsed`], which names the Job the key
-    /// created; nothing of the refused creation is committed.
-    pub async fn create_submitted_local_job(
-        &self,
-        job: NewJob,
-        input: JobInputId,
-        submission: NewSubmission,
-    ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateLocalJobWithInput {
-            job,
-            input,
-            submission: Some(submission),
-            reply,
-        })
-        .await
     }
 
     /// The submission recorded under `key`: the Job it created and the
@@ -962,40 +711,131 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Creates a new Job that retries `retry.original`; see [`JobRetry`].
-    pub async fn retry_job(&self, retry: JobRetry) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::RetryJob { retry, reply })
-            .await
-    }
-
-    pub async fn start_job(&self, job: JobId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::StartJob { job, reply }).await
-    }
-
-    /// Starts a Job that this process executes itself, claiming its
-    /// execution for the current opening of the database. The claim ends
-    /// when the Job settles: with a confirmed outcome, or with a confirmed
-    /// stop after an unknown one. If this opening closes first, as it does
-    /// when the process dies, the next start of a database worker records
-    /// the Job's outcome as unknown and its stop as confirmed; see
-    /// [`DatabaseHandle::abandoned_at_open`]. Work executed outside this
-    /// process must use [`DatabaseHandle::start_job`] instead.
-    pub async fn start_local_job(&self, job: JobId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::StartLocalJob { job, reply })
-            .await
-    }
-
-    pub async fn assign_job_executor(
+    /// Resolves a command reported as [`DatabaseError::OutcomeUnknown`] by
+    /// reading the natural key it writes (section 11.2). Call it after
+    /// reopening: for an operation of an earlier opening, a missing key proves
+    /// the command did not commit. A command that writes no key to read is
+    /// [`OperationStatus::Unresolvable`].
+    pub async fn reconcile_operation(
         &self,
-        job: JobId,
+        operation: OperationId,
+    ) -> Result<OperationStatus, DatabaseError> {
+        if operation.epoch() > self.epoch() {
+            return Err(DatabaseError::UnknownOperation(operation));
+        }
+        let probe = self
+            .shared
+            .probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&operation)
+            .copied()
+            .flatten();
+        self.read_opened(move |opened| {
+            errors::operation_status(&opened.database, operation, probe, opened.epoch)
+        })
+        .await
+    }
+
+    /// T1: submits a Job, or the next turn of a conversation when it names a
+    /// predecessor in `previous`. The Job is pending; the claim batch grants
+    /// it when a compatible Pool has room.
+    pub async fn create_job(&self, job: NewJob) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateJob { job, reply }).await
+    }
+
+    /// T1, and the Job starts at once as this process's own execution in the
+    /// Pool `executor`, in the same transaction, so the Job exists only with
+    /// its claim. If this opening closes first, as it does when the process
+    /// dies, the next open settles the Job as abandoned; see
+    /// [`DatabaseHandle::abandoned_at_open`].
+    pub async fn create_local_job(
+        &self,
+        job: NewJob,
         executor: ExecutorId,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::AssignJobExecutor {
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateLocalJob {
+            job,
+            executor,
+            submission: None,
+            reply,
+        })
+        .await
+    }
+
+    /// Like [`DatabaseHandle::create_local_job`], and records `submission`
+    /// with the Job in the same transaction. A key already recorded refuses
+    /// the creation with [`Violation::SubmissionKeyUsed`], which names the Job
+    /// the key created; nothing of the refused creation is committed.
+    pub async fn create_submitted_local_job(
+        &self,
+        job: NewJob,
+        executor: ExecutorId,
+        submission: NewSubmission,
+    ) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::CreateLocalJob {
+            job,
+            executor,
+            submission: Some(submission),
+            reply,
+        })
+        .await
+    }
+
+    /// Starts a pending Job as this process's own execution in the Pool
+    /// `executor`, claiming it for the current opening. A Job still waiting on
+    /// a dependency is refused.
+    pub async fn start_job(&self, job: JobId, executor: ExecutorId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::StartJob {
             job,
             executor,
             reply,
         })
         .await
+    }
+
+    /// A config, whatever its kind.
+    pub async fn config(&self, id: ConfigId) -> Result<Option<ConfigRecord>, DatabaseError> {
+        self.read(move |database| storage::read_config(database, id))
+            .await
+    }
+
+    /// Configs of `kind` (every kind when `None`), newest first, strictly
+    /// before `before` when given; at most 1,000 per call. Archived configs
+    /// are included.
+    pub async fn configs(
+        &self,
+        kind: Option<ConfigKind>,
+        before: Option<ConfigId>,
+        limit: usize,
+    ) -> Result<Vec<ConfigRecord>, DatabaseError> {
+        self.read(move |database| storage::read_configs(database, kind, before, limit))
+            .await
+    }
+
+    /// Creates a Connection, Model, Agent or Pool config. Its references must
+    /// name configs of the kinds its body requires.
+    pub async fn create_config(&self, config: NewConfig) -> Result<ConfigId, DatabaseError> {
+        self.submit(|reply| Command::CreateConfig { config, reply })
+            .await
+    }
+
+    /// Edits a config in place: a new name and body of the same kind. Every
+    /// edit is allowed and raises the edit counter; Jobs that froze the old
+    /// values keep them.
+    pub async fn update_config(
+        &self,
+        id: ConfigId,
+        config: NewConfig,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::UpdateConfig { id, config, reply })
+            .await
+    }
+
+    /// Creates a new Job that retries `retry.original`; see [`JobRetry`].
+    pub async fn retry_job(&self, retry: JobRetry) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::RetryJob { retry, reply })
+            .await
     }
 
     pub async fn associate_job_project(
@@ -1043,36 +883,6 @@ impl DatabaseHandle {
 
     pub async fn create_project(&self, project: NewProject) -> Result<ProjectId, DatabaseError> {
         self.submit(|reply| Command::CreateProject { project, reply })
-            .await
-    }
-
-    pub async fn create_llm_provider(
-        &self,
-        provider: NewLlmProvider,
-    ) -> Result<LlmProviderId, DatabaseError> {
-        self.submit(|reply| Command::CreateLlmProvider { provider, reply })
-            .await
-    }
-
-    pub async fn create_profile(&self, profile: NewProfile) -> Result<ProfileId, DatabaseError> {
-        self.submit(|reply| Command::CreateProfile { profile, reply })
-            .await
-    }
-
-    /// Replaces a Profile's name, payload and defining references, keeping
-    /// its identity and kind. Refused with [`Violation::ProfileLocked`] while
-    /// unfinished work holds it; see [`Self::profile_editability`].
-    pub async fn update_profile(
-        &self,
-        id: ProfileId,
-        profile: NewProfile,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::UpdateProfile { id, profile, reply })
-            .await
-    }
-
-    pub async fn create_agent(&self, agent: NewAgent) -> Result<AgentId, DatabaseError> {
-        self.submit(|reply| Command::CreateAgent { agent, reply })
             .await
     }
 
@@ -1277,7 +1087,7 @@ impl DatabaseHandle {
     }
 
     /// Records that an unknown-outcome Job's execution has actually stopped,
-    /// releasing the Profiles it holds; the outcome stays unknown. Only the
+    /// releasing the slot it holds; the outcome stays unknown. Only the
     /// trusted execution path that observed the termination may call this,
     /// so it is not part of the public API.
     pub(crate) async fn confirm_job_stopped(&self, job: JobId) -> Result<(), DatabaseError> {
@@ -1375,198 +1185,6 @@ impl DatabaseHandle {
         self.read(move |database| storage::read_tool_evidence(database, job, after, limit))
             .await
     }
-
-    /// Aggregation progress: the last AvailabilityStat ID consumed and the
-    /// wall-clock time of the last batch, as of one read snapshot.
-    pub async fn availability_progress(
-        &self,
-    ) -> Result<AvailabilityAggregationProgress, DatabaseError> {
-        self.read(storage::read_availability_progress).await
-    }
-
-    /// The sample of one Provider request of a Job, with the progress of the
-    /// same snapshot.
-    pub async fn request_sample(
-        &self,
-        request: RequestRef,
-    ) -> Result<ReadSnapshot<Option<RequestSampleRecord>>, DatabaseError> {
-        self.read(move |database| storage::read_request_sample(database, request))
-            .await
-    }
-
-    /// The counts of one (Provider, model, minute) bucket, with the progress
-    /// of the same snapshot. `minute` is a value of [`minute_of`].
-    pub async fn availability_minute(
-        &self,
-        provider: LlmProviderId,
-        model: String,
-        minute: i64,
-    ) -> Result<ReadSnapshot<Option<AvailabilityCounts>>, DatabaseError> {
-        self.read(move |database| {
-            storage::read_availability_minute(database, provider, &model, minute)
-        })
-        .await
-    }
-
-    /// Consumes at most `limit` records (and never more than the batch
-    /// maximum) of the next committed AvailabilityStat records, in ID order.
-    /// One call prepares a batch from one snapshot and commits it only if the
-    /// rows it read are unchanged. A stale preparation is prepared again, at
-    /// most the attempt bound. It is an internal operation: nothing here
-    /// schedules it.
-    pub async fn consume_availability(
-        &self,
-        limit: usize,
-    ) -> Result<AvailabilityBatch, DatabaseError> {
-        for attempt in 1..=storage::MAX_AGGREGATION_ATTEMPTS {
-            let plan = self.prepare_availability(limit).await?;
-            let Some(report) = plan.report(attempt) else {
-                return Ok(AvailabilityBatch::Idle {
-                    consumed_through: plan.consumed_through(),
-                });
-            };
-            if self.commit_availability(plan).await?.is_some() {
-                return Ok(AvailabilityBatch::Consumed(report));
-            }
-        }
-        Ok(AvailabilityBatch::Contended {
-            attempts: storage::MAX_AGGREGATION_ATTEMPTS,
-        })
-    }
-
-    /// Prepares the next batch from one read snapshot. Nothing is written.
-    pub(crate) async fn prepare_availability(
-        &self,
-        limit: usize,
-    ) -> Result<storage::AvailabilityPlan, DatabaseError> {
-        #[allow(unused_mut)]
-        let mut plan = self
-            .read(move |database| storage::prepare_availability_aggregation(database, limit))
-            .await?;
-        #[cfg(test)]
-        if plan.report(1).is_some()
-            && self
-                .shared
-                .probe
-                .fail_next_plan
-                .swap(false, Ordering::SeqCst)
-        {
-            plan.inject_failure = true;
-        }
-        Ok(plan)
-    }
-
-    /// Commits a prepared batch if the rows it read still hold. `None` means
-    /// the preparation was stale, and nothing was applied.
-    pub(crate) async fn commit_availability(
-        &self,
-        plan: storage::AvailabilityPlan,
-    ) -> Result<Option<Timestamp>, DatabaseError> {
-        self.submit(|reply| Command::CommitAvailabilityAggregation {
-            plan: Box::new(plan),
-            reply,
-        })
-        .await
-    }
-
-    /// Token aggregation progress: the last Metrics ID consumed by the Token
-    /// stream, which is independent of the availability stream, and the
-    /// wall-clock time of its last batch, as of one read snapshot.
-    pub async fn token_progress(&self) -> Result<TokenAggregationProgress, DatabaseError> {
-        self.read(storage::read_token_progress).await
-    }
-
-    /// The Token state of one Provider request of a Job, with the progress
-    /// of the same snapshot. A request with no annotated record has none.
-    pub async fn token_request(
-        &self,
-        request: RequestRef,
-    ) -> Result<TokenSnapshot<Option<TokenRequestRecord>>, DatabaseError> {
-        self.read(move |database| storage::read_token_request(database, request))
-            .await
-    }
-
-    /// The (Provider, model) buckets that exist in the `count` minutes from
-    /// `from_minute` (a value of [`minute_of`]), in minute order, with the
-    /// progress of the same snapshot. `count` is clamped to 1..=1,000 and the
-    /// read does one lookup per minute, so its cost never depends on history.
-    pub async fn token_minutes(
-        &self,
-        provider: LlmProviderId,
-        model: String,
-        from_minute: i64,
-        count: usize,
-    ) -> Result<TokenSnapshot<Vec<(i64, TokenMinuteTotals)>>, DatabaseError> {
-        self.read(move |database| {
-            storage::read_token_minute_window(database, provider, &model, from_minute, count)
-        })
-        .await
-    }
-
-    /// Consumes at most `limit` of the next committed Metrics records (never
-    /// more than the batch maximum), in ID order, annotated or not. Like
-    /// [`Self::consume_availability`] it prepares from one snapshot, commits
-    /// only if the rows it read are unchanged, and prepares again at most the
-    /// attempt bound. Records that contradict each other refuse the batch
-    /// with nothing written. It is an internal operation: nothing here
-    /// schedules it.
-    pub async fn consume_token_usage(&self, limit: usize) -> Result<TokenBatch, TokenConsumeError> {
-        for attempt in 1..=storage::MAX_AGGREGATION_ATTEMPTS {
-            let plan = self.prepare_token(limit).await??;
-            let Some(report) = plan.report(attempt) else {
-                return Ok(TokenBatch::Idle {
-                    consumed_through: plan.consumed_through(),
-                });
-            };
-            if self.commit_token(plan).await?.is_some() {
-                return Ok(TokenBatch::Consumed(report));
-            }
-        }
-        Ok(TokenBatch::Contended {
-            attempts: storage::MAX_AGGREGATION_ATTEMPTS,
-        })
-    }
-
-    /// Prepares the next Token batch from one read snapshot. Nothing is written.
-    pub(crate) async fn prepare_token(
-        &self,
-        limit: usize,
-    ) -> Result<Result<storage::TokenPlan, TokenConsumeError>, DatabaseError> {
-        let prepared = self
-            .read(move |database| storage::prepare_token_aggregation(database, limit))
-            .await?;
-        #[allow(unused_mut)]
-        let mut prepared = prepared.map_err(|refusal| TokenConsumeError::Evidence {
-            metrics: refusal.metrics,
-            job: refusal.job,
-            error: refusal.error,
-        });
-        #[cfg(test)]
-        if let Ok(plan) = &mut prepared
-            && plan.report(1).is_some()
-            && self
-                .shared
-                .probe
-                .fail_next_plan
-                .swap(false, Ordering::SeqCst)
-        {
-            plan.inject_failure = true;
-        }
-        Ok(prepared)
-    }
-
-    /// Commits a prepared Token batch if the rows it read still hold. `None`
-    /// means the preparation was stale, and nothing was applied.
-    pub(crate) async fn commit_token(
-        &self,
-        plan: storage::TokenPlan,
-    ) -> Result<Option<Timestamp>, DatabaseError> {
-        self.submit(|reply| Command::CommitTokenAggregation {
-            plan: Box::new(plan),
-            reply,
-        })
-        .await
-    }
 }
 
 impl DatabaseHandle {
@@ -1587,12 +1205,13 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn set_execution_pool_profile(
+    /// Replaces a Pool's capabilities and concurrency limit.
+    pub async fn update_execution_pool(
         &self,
         id: ExecutionPoolId,
-        profile: ProfileId,
+        config: ExecutionPoolConfig,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::SetExecutionPoolProfile { id, profile, reply })
+        self.submit(|reply| Command::UpdateExecutionPool { id, config, reply })
             .await
     }
 
@@ -1668,9 +1287,7 @@ impl DatabaseHandle {
         in_store || std::env::var_os(reference).is_some_and(|value| !value.is_empty())
     }
 
-    pub fn credential_resolver(
-        &self,
-    ) -> Arc<dyn crate::provider_execution::CredentialResolver> {
+    pub fn credential_resolver(&self) -> Arc<dyn crate::provider_execution::CredentialResolver> {
         Arc::new(LocalCredentialResolver {
             shared: self.shared.clone(),
         })
@@ -1703,4 +1320,3 @@ impl crate::provider_execution::CredentialResolver for LocalCredentialResolver {
         crate::provider_execution::EnvironmentCredentialResolver.resolve(Some(name))
     }
 }
-

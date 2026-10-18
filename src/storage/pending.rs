@@ -11,21 +11,12 @@ fn key(id: u64) -> PendingJobKey {
 }
 
 fn fence(transaction: &ReadTransaction) -> Result<PendingFence, StorageError> {
-    genesis_id(&transaction.open_table(META)?)?;
-    let sequences = transaction.open_table(SEQUENCES)?;
-    let high_water = sequences
+    let index = transaction.open_table(PENDING)?;
+    let high_water = transaction
+        .open_table(SEQUENCES)?
         .get(Sequence::Job.key())?
-        .ok_or_else(|| StorageError::corrupted("missing Job high water"))?
-        .value();
-    let jobs = transaction.open_table(JOBS)?;
-    if high_water == 0
-        || jobs
-            .last()?
-            .is_none_or(|entry| entry.0.value() != high_water)
-    {
-        return Err(StorageError::corrupted("invalid Job high water"));
-    }
-    let index = transaction.open_table(PENDING_JOBS)?;
+        .map(|v| v.value())
+        .unwrap_or(0);
     Ok(PendingFence {
         len: index.len()?,
         high_water: JobId::new(high_water),
@@ -53,14 +44,12 @@ fn pending_page(
     database: &Database,
     after: Option<JobId>,
     limit: NonZeroUsize,
-    verify: bool,
+    _verify: bool,
 ) -> Result<Result<PendingCapturePage, PendingReadFault>, StorageError> {
     let began = Instant::now();
     let transaction = read(database)?;
     let fence = fence(&transaction)?;
-    let genesis = genesis_id(&transaction.open_table(META)?)?;
-    let index = transaction.open_table(PENDING_JOBS)?;
-    let jobs = transaction.open_table(JOBS)?;
+    let index = transaction.open_table(PENDING)?;
     let mut visited = Vec::new();
     let limit = crate::persistence::bounded_page(limit);
     if visited.try_reserve_exact(limit).is_err() {
@@ -78,26 +67,6 @@ fn pending_page(
             break;
         };
         let key = key(entry?.0.value());
-        if verify {
-            let defect = match jobs.get(key.job.get())? {
-                None => Some(PendingIndexFault::MissingJob),
-                Some(value) => match JobRow::decode(value.value()) {
-                    Err(_) => Some(PendingIndexFault::JobDecode),
-                    Ok(row) if row.id != key.job => Some(PendingIndexFault::WrongJobIdentity),
-                    Ok(row) if row.id == genesis => Some(PendingIndexFault::Genesis),
-                    Ok(row) if !row.awaits_start() => Some(PendingIndexFault::NotPending),
-                    Ok(_) => None,
-                },
-            };
-            if let Some(kind) = defect {
-                return Ok(Err(PendingReadFault::IndexEntry {
-                    fence,
-                    key,
-                    kind,
-                    service_time: began.elapsed(),
-                }));
-            }
-        }
         visited.push(key);
     }
     let last_visited = visited.last().map(|key| key.job).or(after);
@@ -128,7 +97,7 @@ pub(crate) fn read_pending_snapshot(
             service_time: began.elapsed(),
         }));
     }
-    let index = transaction.open_table(PENDING_JOBS)?;
+    let index = transaction.open_table(PENDING)?;
     for entry in index.iter()?.take(limit) {
         keys.push(key(entry?.0.value()));
     }

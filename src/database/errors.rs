@@ -14,23 +14,6 @@ use super::*;
 ///   A commit error is not a rollback. Do not retry the command; recover
 ///   storage with [`DatabaseHandle::recover_storage`], which reconciles it,
 ///   or call [`DatabaseHandle::reconcile_operation`] after reopening.
-///
-/// Why a Token aggregation step did not finish.
-#[derive(Debug, thiserror::Error)]
-pub enum TokenConsumeError {
-    #[error(transparent)]
-    Database(#[from] DatabaseError),
-    /// The records of one Job contradict each other. The whole batch was
-    /// refused: nothing was written, the progress did not move, and the raw
-    /// records are unchanged.
-    #[error("Token evidence of {job} (at {metrics}) cannot be reduced: {error}")]
-    Evidence {
-        metrics: MetricsId,
-        job: JobId,
-        error: TokenEvidenceError,
-    },
-}
-
 /// Read errors are separate and say nothing about any command.
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
@@ -101,9 +84,6 @@ pub enum DatabaseError {
     ReadPoolStopped,
     #[error("failed to read from the database: {0}")]
     Read(StorageError),
-    /// A typed Profile read named a Profile of the other kind.
-    #[error("{0}")]
-    WrongProfileKind(WrongProfileKind),
     #[error("failed to start the database worker: {0}")]
     Startup(#[source] std::io::Error),
     #[error("invalid filesystem configuration: {0}")]
@@ -165,15 +145,19 @@ impl DatabaseError {
     }
 }
 
-/// What a stored operation marker says about a command.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What the natural key of a command says about it (section 11.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationStatus {
-    Committed(OperationMarker),
-    /// Issued by an earlier opening and has no marker: it did not commit,
+    /// The key the command writes is present: it committed.
+    Committed,
+    /// Issued by an earlier opening and its key is absent: it did not commit,
     /// and the handle that ran it is gone, so it never will.
     NotCommitted,
     /// Issued by this opening and not committed so far.
     NotCommittedYet,
+    /// The command writes no key that could be read, so whether it committed
+    /// is not known.
+    Unresolvable,
 }
 
 /// Why [`DatabaseHandle::compact_storage`] left the file alone.
@@ -250,15 +234,21 @@ pub(super) fn describe_reasons(reasons: &[ProtectionReason]) -> String {
 }
 
 pub(super) fn operation_status(
-    marker: Option<OperationMarker>,
+    database: &redb::Database,
     operation: OperationId,
+    probe: Option<Probe>,
     epoch: u64,
-) -> OperationStatus {
-    match marker {
-        Some(marker) => OperationStatus::Committed(marker),
-        None if operation.epoch() < epoch => OperationStatus::NotCommitted,
-        None => OperationStatus::NotCommittedYet,
-    }
+) -> Result<OperationStatus, StorageError> {
+    let Some(probe) = probe else {
+        return Ok(OperationStatus::Unresolvable);
+    };
+    Ok(if storage::probe_committed(database, probe)? {
+        OperationStatus::Committed
+    } else if operation.epoch() < epoch {
+        OperationStatus::NotCommitted
+    } else {
+        OperationStatus::NotCommittedYet
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

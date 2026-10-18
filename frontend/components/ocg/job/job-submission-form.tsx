@@ -100,6 +100,7 @@ export function JobSubmissionForm({
   const [key, setKey] = useState<string | null>(null);
   const [availableLlms, setAvailableLlms] = useState<{ id: string; name: string; model: string; executors: string[]; declared_capabilities?: ControlCapability[] }[]>([]);
   const [availableAgents, setAvailableAgents] = useState<{ id: string; name: string; llm_targets: string[] }[]>([]);
+  const [catalogVersion, setCatalogVersion] = useState(0);
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -195,6 +196,8 @@ export function JobSubmissionForm({
     ? Boolean(target.declaredCapabilities?.includes("vision"))
     : availableLlms.find((l) => l.id === llmProfile)?.declared_capabilities?.includes("vision") ?? true;
 
+  useEffect(() => client.onProfilesChanged(() => setCatalogVersion((version) => version + 1)), [client]);
+
   useEffect(() => {
     if (chat) return;
     const controller = new AbortController();
@@ -209,7 +212,7 @@ export function JobSubmissionForm({
         // Manual identity entry remains available even if catalog read fails.
       });
     return () => controller.abort();
-  }, [chat, client]);
+  }, [chat, client, catalogVersion]);
 
   const settled = phase === "submitting" || phase === "pending" || phase === "uncertain";
 

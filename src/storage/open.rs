@@ -1,6 +1,94 @@
+use std::sync::OnceLock;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
 use super::*;
+use crate::persistence::{JobId, OutcomeCause, OutcomeKind, OutcomeRecord, Timestamp};
 
 // ---- open ----------------------------------------------------------------------
+
+static PROMOTION_CLOCK_BASE: OnceLock<(i64, Instant)> = OnceLock::new();
+
+/// Fixes the promotion clock: the wall time at open, plus the monotonic time
+/// elapsed since. A wall-clock step afterwards moves nothing.
+pub(crate) fn init_promotion_clock(wall_time_at_open: i64) {
+    let _ = PROMOTION_CLOCK_BASE.set((wall_time_at_open, Instant::now()));
+}
+
+pub(crate) fn promotion_clock() -> i64 {
+    if let Some((wall_base, instant_base)) = PROMOTION_CLOCK_BASE.get() {
+        *wall_base + i64::try_from(instant_base.elapsed().as_micros()).unwrap_or(i64::MAX)
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+}
+
+static IDENTIFIERS: OnceLock<(Option<String>, Option<String>)> = OnceLock::new();
+
+/// The host and boot identifiers, read once per process; either may be
+/// unreadable.
+fn identifiers() -> &'static (Option<String>, Option<String>) {
+    IDENTIFIERS.get_or_init(|| (read_host_id(), read_boot_id()))
+}
+
+pub(crate) fn current_host_id() -> Option<String> {
+    identifiers().0.clone()
+}
+
+pub(crate) fn current_boot_id() -> Option<String> {
+    identifiers().1.clone()
+}
+
+#[cfg(target_os = "macos")]
+fn read_host_id() -> Option<String> {
+    let output = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines()
+        .find(|line| line.contains("IOPlatformUUID"))
+        .and_then(|line| line.split('"').nth(3))
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "linux")]
+fn read_host_id() -> Option<String> {
+    std::fs::read_to_string("/etc/machine-id")
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_host_id() -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_boot_id() -> Option<String> {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", "kern.bootsessionuuid"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.trim().to_owned()).filter(|text| !text.is_empty())
+}
+
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn read_boot_id() -> Option<String> {
+    None
+}
 
 pub(crate) enum OpenError {
     Storage(StorageError),
@@ -23,43 +111,34 @@ pub(crate) fn database_file(directory: &Path) -> PathBuf {
 }
 
 /// An opened database file with this opening's operation epoch and the
-/// instance's Genesis Job.
+/// instance's Genesis Job (0 in format 16).
 pub(crate) struct OpenedFile {
     pub(crate) database: Database,
     pub(crate) epoch: u64,
     pub(crate) genesis: JobId,
+    pub(crate) abandoned: Vec<JobId>,
 }
 
-/// Opens or creates the database file, checks its storage format, creates
-/// the Genesis Job with a new file or verifies the recorded one, and durably
-/// allocates this opening's operation epoch, all in one transaction.
 pub(crate) fn open(directory: &Path) -> Result<OpenedFile, OpenError> {
     let path = database_file(directory);
     prepare_private_file(&path)?;
     let mut builder = Database::builder();
     builder.set_cache_size(CACHE_BYTES);
-    // A writable opening lets redb rewrite its own bookkeeping in the file,
-    // so an existing file is first checked through a read-only opening and a
-    // file of another format is refused without one. A file that cannot be
-    // opened read-only, such as one that needs repair, is checked again by
-    // `initialize` before anything is written to it.
     if path.metadata().is_ok_and(|metadata| metadata.len() > 0)
         && let Ok(existing) = builder.open_read_only(&path)
     {
         check_existing_format(&existing)?;
     }
     let database = builder.create(&path).map_err(StorageError::from)?;
-    let (epoch, genesis) = initialize(&database)?;
+    let (epoch, genesis, abandoned) = initialize(&database)?;
     Ok(OpenedFile {
         database,
         epoch,
         genesis,
+        abandoned,
     })
 }
 
-/// Creates the database file empty and private to its owner (0600 on Unix)
-/// when it is missing, so redb initializes a file nobody else can read, and
-/// makes an existing regular file private. A symbolic link is not followed.
 pub(super) fn prepare_private_file(path: &Path) -> Result<(), StorageError> {
     let io_error = |error: std::io::Error| StorageError {
         kind: StorageErrorKind::Io(error.kind()),
@@ -79,9 +158,7 @@ pub(super) fn prepare_private_file(path: &Path) -> Result<(), StorageError> {
     }
 }
 
-/// How a file's recorded format compares with this build's.
 pub(super) enum FormatVerdict {
-    /// A file with no tables, which this opening will initialize.
     New,
     Supported,
 }
@@ -124,22 +201,24 @@ pub(super) fn check_existing_format(database: &redb::ReadOnlyDatabase) -> Result
     format_verdict(format, version, existing_tables).map(|_| ())
 }
 
-/// Refuses a foreign or other-format file before writing anything to it.
-pub(super) fn initialize(database: &Database) -> Result<(u64, JobId), OpenError> {
+pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>), OpenError> {
     let mut tx = database.begin_write().map_err(StorageError::from)?;
     tx.set_durability(Durability::Immediate)
         .map_err(StorageError::from)?;
     let existing_tables = tx.list_tables().map_err(StorageError::from)?.count();
-    let opened = {
+    let now = Timestamp::now();
+    init_promotion_clock(now.as_unix_micros());
+
+    let (epoch, clean_shutdown) = {
         let mut meta = tx.open_table(META).map_err(StorageError::from)?;
         let format = meta
             .get("format")
             .map_err(StorageError::from)?
-            .map(|v| v.value().to_vec());
+            .map(|value| value.value().to_vec());
         let version = meta
             .get("format_version")
             .map_err(StorageError::from)?
-            .map(|v| v.value().to_vec());
+            .map(|value| value.value().to_vec());
         let verdict = match format_verdict(format, version, existing_tables) {
             Ok(verdict) => verdict,
             Err(refusal) => {
@@ -148,240 +227,184 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId), OpenError>
                 return Err(refusal);
             }
         };
-        let created = matches!(verdict, FormatVerdict::New);
-        if created {
+        if matches!(verdict, FormatVerdict::New) {
             meta.insert("format", FORMAT_NAME)
                 .map_err(StorageError::from)?;
             meta.insert("format_version", FORMAT_VERSION.to_le_bytes().as_slice())
                 .map_err(StorageError::from)?;
+            meta.insert("open_epoch", 0u64.to_le_bytes().as_slice())
+                .map_err(StorageError::from)?;
+            meta.insert("clean_shutdown", [1u8].as_slice())
+                .map_err(StorageError::from)?;
         }
-        drop(meta);
-        create_tables(&tx)?;
-        let genesis = if created {
-            create_genesis(&tx)?
-        } else {
-            verify_genesis(&tx)?
-        };
-        // A new file holds no Job below a confirmed outcome. An existing one
-        // is read again at every opening, because the version it carries does
-        // not say whether an earlier build wrote it or changed it since.
-        let certified = created || certify_subtree_closure(&tx)?;
-        record_closure(&tx, certified)?;
-        // Rebuilt even in a new file, which has no table yet, and whatever the
-        // table held: only this build maintains it.
-        rebuild_pending_jobs(&tx, genesis)?;
-        execution_claim::rebuild_execution_indexes(&tx)?;
-        pools::rebuild_compatibility(&tx)?;
-        let mut sequences = tx.open_table(SEQUENCES).map_err(StorageError::from)?;
-        let epoch = sequences
-            .get(OPEN_EPOCH)
+        let epoch = meta
+            .get("open_epoch")
             .map_err(StorageError::from)?
-            .map_or(0, |v| v.value())
+            .map_or(0, |value| {
+                <[u8; 8]>::try_from(value.value())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0)
+            })
             + 1;
-        sequences
-            .insert(OPEN_EPOCH, epoch)
+        meta.insert("open_epoch", epoch.to_le_bytes().as_slice())
             .map_err(StorageError::from)?;
-        (epoch, genesis)
+        let clean_shutdown = meta
+            .get("clean_shutdown")
+            .map_err(StorageError::from)?
+            .is_some_and(|value| value.value().first().is_some_and(|flag| *flag != 0));
+        meta.insert("clean_shutdown", [0u8].as_slice())
+            .map_err(StorageError::from)?;
+        (epoch, clean_shutdown)
     };
-    tx.commit().map_err(StorageError::from)?;
-    Ok(opened)
-}
-
-/// Replaces [`PENDING_JOBS`] with the Jobs that [`JobRow::awaits_start`]
-/// says wait, read from the Job table in the open transaction. It reads
-/// every Job once, in time linear in the Jobs, and writes only the entries
-/// of the Jobs that wait. A failure leaves the transaction to be abandoned
-/// with the table as it was.
-pub(super) fn rebuild_pending_jobs(
-    tx: &WriteTransaction,
-    genesis: JobId,
-) -> Result<(), StorageError> {
-    tx.delete_table(PENDING_JOBS)?;
-    let mut pending = tx.open_table(PENDING_JOBS)?;
-    let jobs = tx.open_table(JOBS)?;
-    for entry in jobs.iter()? {
-        let (id, bytes) = entry?;
-        let row = JobRow::decode(bytes.value())?;
-        if row.id.get() != id.value() {
-            return Err(StorageError::corrupted(format!(
-                "the Job record {} holds {}",
-                id.value(),
-                row.id
-            )));
-        }
-        if row.id != genesis && row.awaits_start() {
-            pending.insert(row.pending_key(), ())?;
-        }
+    create_tables(&tx)?;
+    if !clean_shutdown {
+        derived::rebuild(&tx, promotion_clock())?;
     }
-    Ok(())
+    let mut batch = Batch::new(tx, epoch);
+    let abandoned = reconcile(&mut batch);
+    let abandoned = match (abandoned, batch.failed.take()) {
+        (Ok(abandoned), None) => abandoned,
+        (_, Some(failure)) | (Err(BatchError(failure)), None) => {
+            let error = match failure {
+                Failure::Storage(error) => error,
+                Failure::Rejected(violation) => {
+                    StorageError::corrupted(format!("open reconcile refused: {violation}"))
+                }
+            };
+            batch.tx.abort().map_err(StorageError::from)?;
+            return Err(error.into());
+        }
+    };
+    batch.tx.commit().map_err(StorageError::from)?;
+    Ok((epoch, JobId::new(0), abandoned))
 }
 
 pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
-    for table in [
-        JOBS,
-        JOB_INPUTS,
-        JOB_OUTPUTS,
-        EXECUTORS,
-        EXECUTION_POOLS,
-        FROZEN_POOL_BINDINGS,
-        PROJECTS,
-        PROFILES,
-        AGENTS,
-        LLM_PROVIDERS,
-        METRICS,
-        AVAILABILITY_STATS,
-        ATTACHMENTS,
-    ] {
-        tx.open_table(table)?;
-    }
-    for table in [
-        HAS_INPUT,
-        LATEST_OUTPUT,
-        CHILD_OF,
-        ASSIGNED_TO,
-        PREVIOUS,
-        REPLACES,
-        RETRY_OF,
-        USES_PROVIDER,
-        APPLIES_PROFILE,
-        RUNS_LLM_PROFILE,
-        MEASURES,
-        OBSERVES,
-        LOCAL_EXECUTIONS,
-    ] {
-        tx.open_table(table)?;
-    }
-    for table in [
-        INPUT_JOBS,
-        CHILDREN,
-        RETRIES,
-        IN_PROJECT,
-        PROJECT_JOBS,
-        USES_PROFILE,
-        PROFILE_AGENTS,
-        PROVIDER_PROFILES,
-        TARGETS_LLM,
-        AGENT_PROFILE_JOBS,
-        LLM_PROFILE_JOBS,
-        POOL_PROFILE_JOBS,
-        JOB_METRICS,
-        JOB_AVAILABILITY,
-        ATTACHMENT_INPUTS,
-    ] {
-        tx.open_table(table)?;
-    }
-    for table in [METRICS_BY_SCOPE, AVAILABILITY_BY_SCOPE] {
-        tx.open_table(table)?;
-    }
-    tx.open_table(ASSIGNED_POOL)?;
-    tx.open_table(OCCUPANCY)?;
-    tx.open_table(UNRESOLVED_EXECUTIONS)?;
-    tx.open_table(COMPATIBLE_POOLS)?;
-    tx.open_table(AVAILABILITY_SAMPLES)?;
-    tx.open_table(AVAILABILITY_MINUTES)?;
-    tx.open_table(AGGREGATION_PROGRESS)?;
-    tx.open_table(TOKEN_REQUESTS)?;
-    tx.open_table(TOKEN_MINUTES)?;
-    tx.open_table(TOOL_EVIDENCE)?;
-    tx.open_table(TOOL_CALL_IDS)?;
-    tx.open_table(SUBMISSIONS)?;
-    tx.open_table(TRANSPORT_EXECUTORS)?;
-    tx.open_table(HAS_OUTPUT)?;
-    tx.open_table(HAS_ATTACHMENT)?;
-    tx.open_table(DEPENDS_ON)?;
-    tx.open_table(OPERATIONS)?;
+    tx.open_table(META)?;
     tx.open_table(SEQUENCES)?;
+    tx.open_table(CONFIGS)?;
+    tx.open_table(JOBS)?;
+    tx.open_table(JOB_STATES)?;
+    tx.open_table(JOB_OUTPUTS)?;
+    tx.open_table(SUBMISSIONS)?;
+    tx.open_table(ATTACHMENTS)?;
+    tx.open_table(TOOL_CALLS)?;
+    tx.open_table(REQUEST_EVENTS)?;
+    tx.open_table(PROJECTS)?;
+    tx.open_table(PROJECT_MEMBERS)?;
+    tx.open_table(PENDING)?;
+    tx.open_table(READY)?;
+    tx.open_table(DELAYED)?;
+    tx.open_table(DEPENDENCY_WAITERS)?;
+    tx.open_table(UNSETTLED)?;
+    tx.open_table(HELD_SLOTS)?;
+    tx.open_table(CHILDREN)?;
+    tx.open_table(SUCCESSORS)?;
+    tx.open_table(CHAT_THREADS)?;
+    tx.open_table(TOOL_CALL_IDS)?;
+    tx.open_table(RETRIES)?;
+    tx.open_table(ATTACHMENT_REFS)?;
+    tx.open_table(REQUEST_SCOPES)?;
+    tx.open_table(JOB_PROJECTS)?;
     Ok(())
 }
 
 pub(super) fn allocate(tx: &WriteTransaction, sequence: Sequence) -> Result<u64, StorageError> {
     let mut table = tx.open_table(SEQUENCES)?;
-    let next = table.get(sequence.key())?.map_or(0, |v| v.value()) + 1;
+    let next = table.get(sequence.key())?.map_or(0, |value| value.value()) + 1;
     table.insert(sequence.key(), next)?;
     Ok(next)
 }
 
-/// Creates the Genesis Job with its frozen input and its self-parent root
-/// marker, and records its identity. Runs only for a new file.
-pub(super) fn create_genesis(tx: &WriteTransaction) -> Result<JobId, StorageError> {
-    let now = Timestamp::now();
-    let input = JobInputId::new(allocate(tx, Sequence::JobInput)?);
-    let genesis = JobId::new(allocate(tx, Sequence::Job)?);
-    let input_row = JobInputRow {
-        id: input,
-        submission_id: None,
-        objective: None,
-        max_depth: None,
-        max_children_per_job: None,
-        max_total_descendants: None,
-        submitted_at: Some(now),
-        created_at: now,
-        updated_at: now,
-        configuration: None,
-    };
-    let job_row = JobRow {
-        id: genesis,
-        name: Some("Genesis".into()),
-        execution_mode: ExecutionMode::Continuous,
-        eligible_at: None,
-        started_at: None,
-        paused_at: None,
-        sterilized_at: None,
-        completed_at: None,
-        failed_at: None,
-        cancelled_at: None,
-        unknown_at: None,
-        stop_confirmed_at: None,
-        next_due_at: None,
-        next_iteration_no: None,
-        iteration_no: None,
-        scheduled_at: None,
-        created_at: now,
-        updated_at: now,
-    };
-    tx.open_table(JOB_INPUTS)?
-        .insert(input.get(), input_row.encode().as_slice())?;
-    tx.open_table(JOBS)?
-        .insert(genesis.get(), job_row.encode().as_slice())?;
-    tx.open_table(HAS_INPUT)?
-        .insert(genesis.get(), input.get())?;
-    tx.open_table(INPUT_JOBS)?
-        .insert((input.get(), genesis.get()), ())?;
-    tx.open_table(CHILD_OF)?
-        .insert(genesis.get(), genesis.get())?;
-    tx.open_table(META)?
-        .insert(GENESIS_KEY, genesis.get().to_le_bytes().as_slice())?;
-    Ok(genesis)
+/// Whether a claim made under `claim_host` and `claim_boot` was made before a
+/// reboot of this host. A file opened on another host, or with either
+/// identifier unreadable, never counts as rebooted.
+fn rebooted(
+    claim_host: Option<&str>,
+    claim_boot: Option<&str>,
+    host: Option<&str>,
+    boot: Option<&str>,
+) -> bool {
+    matches!(
+        (claim_host, host, claim_boot, boot),
+        (Some(claim_host), Some(host), Some(claim_boot), Some(boot))
+            if claim_host == host && claim_boot != boot
+    )
 }
 
-pub(super) fn genesis_id(
-    meta: &impl ReadableTable<&'static str, &'static [u8]>,
-) -> Result<JobId, StorageError> {
-    let bytes = meta
-        .get(GENESIS_KEY)?
-        .ok_or_else(|| StorageError::corrupted("the database records no Genesis Job"))?;
-    <[u8; 8]>::try_from(bytes.value())
-        .map(|id| JobId::new(u64::from_le_bytes(id)))
-        .map_err(|_| StorageError::corrupted("the recorded Genesis Job identity is malformed"))
-}
-
-/// The recorded Genesis Job must exist and carry its root marker.
-pub(super) fn verify_genesis(tx: &WriteTransaction) -> Result<JobId, StorageError> {
-    let genesis = genesis_id(&tx.open_table(META)?)?;
-    if tx.open_table(JOBS)?.get(genesis.get())?.is_none() {
-        return Err(StorageError::corrupted(format!(
-            "the Genesis Job {genesis} is missing"
-        )));
+/// OPEN (section 8.8): every Job running or suspended at the crash takes an
+/// Unknown outcome; its stop is confirmed and its slot freed when no OS
+/// process of it can remain or the host has rebooted since its claim, and its
+/// slot is quarantined otherwise. Returns the Jobs that were abandoned.
+fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
+    let epoch = batch.epoch;
+    let now = batch.now;
+    let states = batch.step(|tx| {
+        let mut states = Vec::new();
+        for entry in tx.open_table(JOB_STATES)?.iter()? {
+            states.push(JobStateRow::decode(entry?.1.value())?);
+        }
+        Ok(states)
+    })?;
+    let mut abandoned = Vec::new();
+    let mut unconfirmed = Vec::new();
+    for mut state in states {
+        let is_unknown = state
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown);
+        if state.outcome.is_none()
+            && state
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.epoch != epoch)
+        {
+            state.outcome = Some(OutcomeRecord {
+                kind: OutcomeKind::Unknown,
+                at: now,
+                cause: Some(OutcomeCause::Abandoned),
+            });
+            state.children_closed_at.get_or_insert(now);
+            state.suspension = None;
+            batch.put_job_state(state.job_id, &state)?;
+            abandoned.push(state.job_id);
+            unconfirmed.push(state);
+        } else if is_unknown && state.stop_confirmed_at.is_none() {
+            unconfirmed.push(state);
+        }
     }
-    if tx
-        .open_table(CHILD_OF)?
-        .get(genesis.get())?
-        .map(|v| v.value())
-        != Some(genesis.get())
-    {
-        return Err(StorageError::corrupted(format!(
-            "the Genesis Job {genesis} lost its root marker"
-        )));
+    let (host, boot) = (batch.host_id.clone(), batch.boot_id.clone());
+    for mut state in unconfirmed {
+        let job = state.job_id;
+        let confirmed = batch.no_live_process(job)?
+            || state.claim.as_ref().is_some_and(|claim| {
+                rebooted(
+                    claim.host_id.as_deref(),
+                    claim.boot_id.as_deref(),
+                    host.as_deref(),
+                    boot.as_deref(),
+                )
+            });
+        if let Some(claim) = state.claim.clone() {
+            let pool = claim.pool_id.get();
+            if confirmed {
+                batch.step(|tx| {
+                    tx.open_table(HELD_SLOTS)?.remove((pool, job.get()))?;
+                    Ok(())
+                })?;
+            } else {
+                batch.step(|tx| {
+                    tx.open_table(HELD_SLOTS)?
+                        .insert((pool, job.get()), (claim.epoch, true))?;
+                    Ok(())
+                })?;
+            }
+        }
+        if confirmed {
+            state.stop_confirmed_at = Some(now);
+            batch.put_job_state(job, &state)?;
+        }
+        batch.settle(job)?;
     }
-    Ok(genesis)
+    Ok(abandoned)
 }

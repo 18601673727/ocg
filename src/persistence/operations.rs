@@ -79,43 +79,27 @@ pub enum OperationKind {
     SetExecutionPoolProfile,
 }
 
-/// Written in the same transaction as every accepted mutation, so its
-/// presence proves the mutation committed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OperationMarker {
-    pub operation: OperationId,
-    pub kind: OperationKind,
-    /// The record the command addressed.
-    pub subject: RecordRef,
-    /// The record the command created, when it created one.
-    pub created: Option<RecordRef>,
-    /// The wall-clock time at which the command's write transaction began,
-    /// not when its commit completed; the same value as the timestamps the
-    /// command wrote. Wall-clock time is not monotonic.
-    pub committed_at: Timestamp,
-}
-
 /// A business rule refused the command; nothing it did was committed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
-    #[error("{0} must be the __CORE__ Executor with type System")]
-    NotCoreExecutor(ExecutorId),
     #[error("{0} not found")]
     NotFound(RecordRef),
+    #[error("{config} is a {found:?} config, not a {expected:?} config")]
+    WrongConfigKind {
+        config: ConfigId,
+        expected: ConfigKind,
+        found: ConfigKind,
+    },
     #[error("{0} already exists")]
     DuplicateId(RecordRef),
-    #[error("{0} is submitted and therefore immutable")]
-    InputAlreadySubmitted(JobInputId),
+    #[error("{predecessor} already has the successor {tip}; a conversation does not fork")]
+    ConversationForked { predecessor: JobId, tip: JobId },
     #[error("{0} is already finalized")]
     JobAlreadyFinalized(JobId),
     #[error("{0} has a terminal outcome and accepts no more outputs")]
     JobHasTerminalOutcome(JobId),
-    #[error("{0} has already started")]
-    JobAlreadyStarted(JobId),
     #[error("the parent {0} no longer accepts children")]
     ParentClosed(JobId),
-    #[error("ASSIGNED_TO cannot change after {0} starts")]
-    ExecutorChangeAfterStart(JobId),
     #[error("cannot finalize {0}: a child Job is not settled")]
     UnfinishedChild(JobId),
     #[error(
@@ -134,7 +118,9 @@ pub enum Violation {
     DuplicateDependency(JobId),
     #[error("the relationship would create a cycle in the waiting graph through {0:?}")]
     WaitingCycle(Vec<JobId>),
-    #[error("waiting-graph validation reached its traversal limit ({max_layers} layers or {max_jobs} Jobs); the relationship was not created")]
+    #[error(
+        "waiting-graph validation reached its traversal limit ({max_layers} layers or {max_jobs} Jobs); the relationship was not created"
+    )]
     WaitingGraphLimit { max_layers: usize, max_jobs: usize },
     #[error("{0} exceeds the storable range")]
     ValueOutOfRange(&'static str),
@@ -152,20 +138,20 @@ pub enum Violation {
     AlreadyInProject { job: JobId, project: ProjectId },
     #[error("{0} is listed more than once")]
     DuplicateReference(RecordRef),
-    #[error(transparent)]
-    WrongProfileKind(#[from] WrongProfileKind),
     #[error("{llm_profile} is not a configured LLM target of {agent_profile}")]
-    NotAConfiguredTarget { agent_profile: ProfileId, llm_profile: ProfileId },
+    NotAConfiguredTarget {
+        agent_profile: ProfileId,
+        llm_profile: ProfileId,
+    },
     #[error("the configuration of {0} was fixed when it was submitted")]
     ConfigurationFixed(JobId),
-    #[error("{executor} does not support the {transport:?} transport this work's LLM configuration uses")]
-    ExecutorLacksTransport { executor: ExecutorId, transport: LlmTransport },
-    #[error("{profile} is used by unfinished work, such as {blocking_jobs:?}, and cannot be edited")]
-    ProfileLocked { profile: ProfileId, blocking_jobs: Vec<JobId> },
-    #[error("the configuration frozen in {0} differs from the retry's; submit the retry with a new input")]
-    ConfigurationMismatch(JobInputId),
-    #[error("{executor} is a {found:?} Executor; running an LLM configuration needs an Llm Executor")]
-    IncompatibleExecutorKind { executor: ExecutorId, found: ExecutorType },
+    #[error(
+        "{executor} does not support the {transport:?} transport this work's LLM configuration uses"
+    )]
+    ExecutorLacksTransport {
+        executor: ExecutorId,
+        transport: LlmTransport,
+    },
     #[error("{0} has no unknown outcome, so it has no unresolved execution to confirm stopped")]
     StopNeedsUnknownOutcome(JobId),
     #[error("the execution of {0} was already confirmed stopped")]
