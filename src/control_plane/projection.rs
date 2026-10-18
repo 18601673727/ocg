@@ -11,6 +11,22 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         DatabaseStatus::Closed => "closed",
     };
     let readable = database.job(database.genesis()).await.is_ok();
+    let quarantined = match database.unresolved_executions().await {
+        Ok(unresolved) => unresolved
+            .into_iter()
+            .map(|(job, execution)| {
+                json!({
+                    "job": job.to_string(),
+                    "pool": execution.pool.map(|pool| pool.to_string()),
+                    "since": execution.unresolved_at.as_unix_micros(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            log::warn!("failed to read unresolved executions for health: {error}");
+            Vec::new()
+        }
+    };
     json!({
         "api_version": API_VERSION,
         "host": "running",
@@ -19,6 +35,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             "accepting_commands": status == "open",
             "readable": readable,
         },
+        "quarantined": quarantined,
     })
 }
 

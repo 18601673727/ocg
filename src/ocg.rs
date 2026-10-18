@@ -10,6 +10,7 @@ pub mod openai_compatible;
 pub mod orchestration;
 pub mod persistence;
 pub mod provider_execution;
+pub mod release_slot_cli;
 #[cfg(test)]
 mod schema_tests;
 mod storage;

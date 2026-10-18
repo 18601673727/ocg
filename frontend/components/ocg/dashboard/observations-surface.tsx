@@ -57,13 +57,54 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
         </div>
       </div>
       {kind === "health" ? (
-        <section aria-label="Runtime health" className="grid gap-3 sm:grid-cols-4">
-          {[["Host", health?.host ?? "unreachable"], ["Database", health?.database.status ?? "unknown"],
-            ["Reads", !health ? "unknown" : health.database.readable ? "available" : "unavailable"],
-            ["Commands", !health ? "unknown" : health.database.accepting_commands ? "accepting" : "not accepting"]].map(([label, value]) => (
-              <div className="rounded-lg border border-border bg-card p-4" key={label}><h3 className="text-xs text-muted-foreground">{label}</h3><p className="mt-2 text-lg font-medium">{value}</p></div>
-            ))}
-        </section>
+        <>
+          <section aria-label="Runtime health" className="grid gap-3 sm:grid-cols-4">
+            {[["Host", health?.host ?? "unreachable"], ["Database", health?.database.status ?? "unknown"],
+              ["Reads", !health ? "unknown" : health.database.readable ? "available" : "unavailable"],
+              ["Commands", !health ? "unknown" : health.database.accepting_commands ? "accepting" : "not accepting"]].map(([label, value]) => (
+                <div className="rounded-lg border border-border bg-card p-4" key={label}><h3 className="text-xs text-muted-foreground">{label}</h3><p className="mt-2 text-lg font-medium">{value}</p></div>
+              ))}
+          </section>
+          <section aria-label="Quarantined capacity" className="min-w-0 rounded-lg border border-border bg-card p-4">
+            <h3 className="font-medium">Quarantined capacity</h3>
+            <p className="my-2 text-sm text-muted-foreground">
+              These jobs hold capacity until stop is proven or machine reboots.
+            </p>
+            {!health || health.quarantined.length === 0 ? (
+              <p className="py-2 text-sm text-muted-foreground">No quarantined slots.</p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="border-b border-border text-xs text-muted-foreground">
+                    <tr>
+                      <th className={cell}>Job</th>
+                      <th className={cell}>Pool</th>
+                      <th className={cell}>Quarantined since</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-border">
+                    {health.quarantined.map((item) => (
+                      <tr key={item.job}>
+                        <td className={cell}>
+                          <button
+                            className="font-mono underline underline-offset-4"
+                            onClick={() => onJob(item.job)}
+                          >
+                            {item.job}
+                          </button>
+                        </td>
+                        <td className={`${cell} font-mono`}>{item.pool ?? "—"}</td>
+                        <td className={`${cell} whitespace-nowrap`}>
+                          {item.since ? new Date(item.since / 1000).toLocaleString() : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </>
       ) : null}
       <section className="min-w-0 rounded-lg border border-border bg-card p-4">
         <h3 className="font-medium">{kind === "usage" ? "Token and latency observations" : "Provider observations"}</h3>

@@ -38,6 +38,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let directory = DataDirectory::from_environment()?;
             return pool_cli::run(&directory, arguments.collect());
         }
+        if command == "release-slot" {
+            let directory = DataDirectory::from_environment()?;
+            return ocg::release_slot_cli::run(&directory, arguments.collect());
+        }
         #[cfg(unix)]
         if let Some(mode) = workspace_job::Mode::of(command) {
             let image = if mode.takes_image() {

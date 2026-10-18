@@ -11,6 +11,8 @@ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::pipe::pipe;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
+use crate::persistence::JobId;
+
 const TOTAL: usize = 4;
 const COMMANDS: usize = 1;
 const COMMAND_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -85,9 +87,14 @@ impl Permit {
                 ));
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                let message = if counts.commands >= COMMANDS {
+                    "another command is still running"
+                } else {
+                    "too many tool operations are running"
+                };
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "another command is still running",
+                    message,
                 ));
             }
             let category = match kind {
@@ -178,6 +185,60 @@ pub(crate) struct Process {
     group: Pid,
     stopped: Arc<AtomicBool>,
     started_at: Instant,
+    job: Option<JobId>,
+}
+
+pub(crate) struct UnprovenGroup {
+    pub(crate) job: JobId,
+    pub(crate) group: Pid,
+    pub(crate) sentinel: OwnedFd,
+    pub(crate) leader: Child,
+}
+
+static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
+
+pub(crate) fn record_unproven_group(group: UnprovenGroup) {
+    UNPROVEN_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(group);
+}
+
+pub(crate) fn drop_unproven_groups() {
+    UNPROVEN_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+pub(crate) fn retry_unproven_groups() -> Vec<JobId> {
+    let mut groups = UNPROVEN_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if groups.is_empty() {
+        return Vec::new();
+    }
+    let mut candidate_jobs = std::collections::BTreeSet::new();
+    let mut remaining = Vec::new();
+    for mut entry in groups.drain(..) {
+        signal(entry.group, Signal::KILL);
+        match prove_empty_timeout(entry.group, &entry.sentinel, Duration::from_millis(50)) {
+            Ok(()) => {
+                if let Err(error) = entry.leader.wait() {
+                    log::warn!("failed to reap unproven process leader: {error}");
+                }
+                candidate_jobs.insert(entry.job);
+            }
+            Err(_) => {
+                remaining.push(entry);
+            }
+        }
+    }
+    for entry in &remaining {
+        candidate_jobs.remove(&entry.job);
+    }
+    *groups = remaining;
+    candidate_jobs.into_iter().collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -224,6 +285,7 @@ impl Process {
         mut command: Command,
         kind: Kind,
         stop_signal: StopSignal,
+        job: Option<JobId>,
     ) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
 
@@ -254,6 +316,7 @@ impl Process {
             group,
             stopped: stop_signal.stopped,
             started_at: Instant::now(),
+            job,
         })
     }
 
@@ -264,6 +327,11 @@ impl Process {
         Option<std::process::ChildStderr>,
     ) {
         (self.child.stdout.take(), self.child.stderr.take())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group(&self) -> Pid {
+        self.group
     }
 
     pub(crate) fn finish(
@@ -307,7 +375,18 @@ impl Process {
                 }
             }
         }
-        prove_empty(self.group, &self.sentinel).map_err(FinishError::NotProven)?;
+        if let Err(error) = prove_empty(self.group, &self.sentinel) {
+            if let Some(job) = self.job {
+                record_unproven_group(UnprovenGroup {
+                    job,
+                    group: self.group,
+                    sentinel: self.sentinel,
+                    leader: self.child,
+                });
+            }
+            drop(self.permit);
+            return Err(FinishError::NotProven(error));
+        }
         let status = self.child.wait().map_err(FinishError::Wait)?;
         drop(self.permit);
         match wait_error {
@@ -362,7 +441,31 @@ fn wait_leader(pid: Pid) -> std::io::Result<bool> {
     }
 }
 
+#[cfg(test)]
+pub(crate) type ProofHook = Box<dyn Fn(Pid, &OwnedFd) -> Option<std::io::Result<()>> + Send + Sync>;
+
+#[cfg(test)]
+static PROOF_HOOK: std::sync::RwLock<Option<ProofHook>> = std::sync::RwLock::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_proof_hook(hook: Option<ProofHook>) {
+    *PROOF_HOOK.write().unwrap_or_else(PoisonError::into_inner) = hook;
+}
+
 fn prove_empty(pid: Pid, sentinel: &OwnedFd) -> std::io::Result<()> {
+    prove_empty_timeout(pid, sentinel, STOP_GRACE)
+}
+
+fn prove_empty_timeout(pid: Pid, sentinel: &OwnedFd, timeout: Duration) -> std::io::Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(hook) = PROOF_HOOK.read().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            if let Some(result) = hook(pid, sentinel) {
+                return result;
+            }
+        }
+    }
+    let deadline = Instant::now() + timeout;
     use std::io::Read;
     let mut pipe = std::fs::File::from(sentinel.try_clone()?);
     loop {
@@ -383,6 +486,12 @@ fn prove_empty(pid: Pid, sentinel: &OwnedFd) -> std::io::Result<()> {
         };
         if eof && !live_group_members(pid)? {
             return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process group did not empty in time",
+            ));
         }
         thread::sleep(POLL);
     }
@@ -462,6 +571,29 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(1)),
         )
         .expect("capacity returned");
+    }
+
+    #[test]
+    fn a_command_permit_wait_reports_too_many_tool_operations_when_total_filled() {
+        use super::*;
+        let governor = Arc::new(Governor::default());
+        let files = (0..TOTAL)
+            .map(|_| {
+                Permit::acquire_from(governor.clone(), Kind::File, None, None).expect("file permit")
+            })
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = Permit::acquire_from(
+            governor.clone(),
+            Kind::Command,
+            Some(&StopSignal::new()),
+            Some(deadline),
+        )
+        .err()
+        .expect("bounded wait");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "too many tool operations are running");
+        drop(files);
     }
 
     #[test]

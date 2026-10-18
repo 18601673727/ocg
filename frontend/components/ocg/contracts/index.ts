@@ -155,6 +155,14 @@ export function decodeHealth(input: unknown) {
     status !== "stopped" && status !== "closed") {
     throw new ContractError("database.status", "a Control Plane database status");
   }
+  const quarantined = listOf(envelope.quarantined, "quarantined", (entry, path) => {
+    const item = record(entry, path);
+    return {
+      job: identity(item.job, `${path}.job`, "job:"),
+      pool: item.pool === null ? null : identity(item.pool, `${path}.pool`, "execution_pool:"),
+      since: integer(item.since, `${path}.since`),
+    };
+  });
   return {
     host,
     database: {
@@ -162,6 +170,7 @@ export function decodeHealth(input: unknown) {
       accepting_commands: boolean(database.accepting_commands, "database.accepting_commands"),
       readable: boolean(database.readable, "database.readable"),
     },
+    quarantined,
   };
 }
 

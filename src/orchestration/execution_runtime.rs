@@ -18,6 +18,7 @@ use crate::openai_compatible::{
     ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, ImageError, ImageInput,
     ImageMime, InvalidToolCall, ToolCallRefusal, ToolWire,
 };
+use crate::orchestration::blocking;
 use crate::orchestration::tools::{
     FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolRegistryError, ToolStart,
 };
@@ -850,6 +851,7 @@ impl ExecutionRuntime {
                 .await
                 .map_err(|_| ExecutionRuntimeError::WorkerPanicked)??;
         }
+        blocking::drop_unproven_groups();
         Ok(())
     }
 
@@ -1034,6 +1036,11 @@ async fn dispatch_runtime(
             }
             SchedulerMessage::Reconcile => {
                 reconcile_at = Instant::now() + Duration::from_secs(30);
+                for job in blocking::retry_unproven_groups() {
+                    if let Err(error) = database.confirm_job_stopped(job).await {
+                        log::warn!("failed to confirm job stop after process group cleanup: {error}");
+                    }
+                }
                 match database
                     .terminal_jobs(pending.keys().copied().collect())
                     .await
@@ -1150,6 +1157,7 @@ async fn dispatch_runtime(
         finish_grant(&database, job, task).await;
     }
     lock(&state).current.clear();
+    blocking::drop_unproven_groups();
     Ok(())
 }
 
@@ -1197,6 +1205,20 @@ async fn cancel_pending(database: &DatabaseHandle, execution: &PendingExecution)
                         input: started.input,
                         job: started.job,
                         result,
+                    }))
+                    .ok();
+            }
+            true
+        }
+        Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {
+            execution.done.cancel();
+            if let Some(reply) = &execution.reply {
+                reply
+                    .send(Ok(ExecutionReceipt {
+                        executor: started.executor,
+                        input: started.input,
+                        job: started.job,
+                        result: None,
                     }))
                     .ok();
             }

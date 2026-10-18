@@ -562,7 +562,12 @@ fn result(preset: Preset, ended: &Ended) -> Value {
 
 /// Starts the command and supervises it to its end, on the calling thread,
 /// which is never the executor's.
-fn supervise(invocation: Invocation, stop: StopSignal, start: ToolStart) -> Result<Ended, Failure> {
+fn supervise(
+    invocation: Invocation,
+    stop: StopSignal,
+    start: ToolStart,
+    job: Option<JobId>,
+) -> Result<Ended, Failure> {
     let mut command = Command::new(&invocation.program);
     command
         .args(invocation.arguments)
@@ -577,7 +582,7 @@ fn supervise(invocation: Invocation, stop: StopSignal, start: ToolStart) -> Resu
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut process = Process::spawn(command, Kind::Command, stop.clone()).map_err(|error| {
+    let mut process = Process::spawn(command, Kind::Command, stop.clone(), job).map_err(|error| {
         if error.kind() == std::io::ErrorKind::TimedOut {
             Refusal::CommandBusy
         } else {
@@ -762,11 +767,15 @@ impl RunCommand {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(active_id.clone(), (stop.clone(), proven));
             let process_start = start.clone();
+            let job = match call {
+                CommandCall::Job(call_ref) => Some(call_ref.job),
+                CommandCall::Standalone(_) => None,
+            };
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
                     let _mutation = mutation;
-                    let result = supervise(invocation, supervised, process_start);
+                    let result = supervise(invocation, supervised, process_start, job);
                     if proof
                         .send(
                             result.as_ref().err()

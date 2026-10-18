@@ -3188,6 +3188,7 @@ mod control_plane {
                     "api_version": 1,
                     "host": "running",
                     "database": {"status": "open", "accepting_commands": true, "readable": true},
+                    "quarantined": [],
                 })
             );
             let states = [
@@ -10201,6 +10202,112 @@ mod requests_and_tool_loop {
             }
             assert_eq!(project.source().as_deref(), Some(BUGGY));
             assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn a_group_whose_proof_failed_is_proven_and_released_on_retry() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use crate::orchestration::blocking::{self, Kind, Process, StopSignal};
+
+            let (_root, directory) = data_directory("unproven-group-retry");
+            let policy =
+                crate::system_policy::SystemPolicy::load_for_startup(&directory).expect("policy");
+            let worker =
+                DatabaseWorker::start_with_policy(&directory, policy).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let job = run.job;
+
+            let request = RequestNumber::FIRST;
+            wait(handle.record_metrics(NewMetrics {
+                job,
+                request,
+                observed_at: Timestamp::now(),
+                measurements: Measurements {
+                    ttfb_ms: Some(1),
+                    ..Measurements::default()
+                },
+                token: None,
+            }))
+            .unwrap();
+            let call = ToolCallRef {
+                job,
+                request,
+                index: 0,
+            };
+            let admission = ToolAdmission {
+                handler_version: "workspace_run_command-4".into(),
+                effect: ToolEffect::NonIdempotent,
+                parameters: "{}".into(),
+                arguments: ToolPayload::new("{}"),
+                authorization: AuthorizationBasis::RegistryGrant,
+            };
+            wait(handle.record_tool_decision(NewToolEvidence {
+                call,
+                tool_call_id: "call-1".into(),
+                name: "workspace_run_command".into(),
+                spawns: true,
+                decision: ToolDecision::Admitted(admission),
+            }))
+            .unwrap();
+
+            wait(handle.finalize_job(job, JobFinalization::Unknown)).expect("finalize unknown");
+            let unresolved = wait(handle.unresolved_executions()).expect("unresolved");
+            assert_eq!(unresolved.len(), 1);
+            assert_eq!(unresolved[0].0, job);
+
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("10");
+            let stop = StopSignal::new();
+            let process = Process::spawn(cmd, Kind::Command, stop.clone(), Some(job))
+                .expect("spawn process");
+            let target_pid = process.group();
+
+            let should_succeed = Arc::new(AtomicBool::new(false));
+            let should_succeed_clone = should_succeed.clone();
+            blocking::set_proof_hook(Some(Box::new(move |pid, _sentinel| {
+                if pid == target_pid {
+                    if should_succeed_clone.load(Ordering::SeqCst) {
+                        Some(Ok(()))
+                    } else {
+                        Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "simulated proof failure",
+                        )))
+                    }
+                } else {
+                    None
+                }
+            })));
+
+            stop.request();
+            let finish_err = process.finish(|| true);
+            assert!(finish_err.is_err());
+
+            let released = blocking::retry_unproven_groups();
+            assert!(released.is_empty());
+            assert_eq!(wait(handle.unresolved_executions()).unwrap().len(), 1);
+
+            should_succeed.store(true, Ordering::SeqCst);
+            let released = blocking::retry_unproven_groups();
+            assert_eq!(released, vec![job]);
+
+            for job in released {
+                wait(handle.confirm_job_stopped(job)).expect("confirm stop");
+            }
+            assert!(wait(handle.unresolved_executions()).unwrap().is_empty());
+
+            blocking::set_proof_hook(None);
+            blocking::drop_unproven_groups();
+            worker.shutdown().expect("shutdown");
+
+            let unquarantined_err = crate::release_slot_cli::run(
+                &directory,
+                vec!["--yes".to_string(), job.to_string()],
+            );
+            assert!(unquarantined_err.is_err());
+            assert!(unquarantined_err.unwrap_err().to_string().contains("is not quarantined"));
         }
     }
 
