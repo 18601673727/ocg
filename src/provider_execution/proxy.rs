@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io;
 use std::sync::OnceLock;
 
@@ -12,10 +13,18 @@ use super::*;
 
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
 
+const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(super) struct Proxy {
     uri: Uri,
     authorization: Option<HeaderValue>,
-    exclusions: Vec<String>,
+    exclusions: Vec<Exclusion>,
+    tls: Arc<rustls::ClientConfig>,
+}
+
+struct Exclusion {
+    host: String,
+    port: Option<u16>,
 }
 
 impl Proxy {
@@ -63,22 +72,76 @@ impl Proxy {
             authorization,
             exclusions: exclusions
                 .split(',')
-                .map(|host| host.trim().trim_start_matches('.').to_ascii_lowercase())
-                .filter(|host| !host.is_empty())
+                .filter_map(parse_exclusion)
                 .collect(),
+            tls: tunnel_tls(),
         })
     }
 
-    fn bypasses(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        self.exclusions.iter().any(|suffix| {
-            suffix == "*"
-                || host == *suffix
-                || host
-                    .strip_suffix(suffix)
-                    .is_some_and(|prefix| prefix.ends_with('.'))
+    fn tls(&self) -> Arc<rustls::ClientConfig> {
+        self.tls.clone()
+    }
+
+    fn bypasses(&self, host: &str, port: u16) -> bool {
+        let host = bare_host(host);
+        self.exclusions.iter().any(|exclusion| {
+            exclusion.port.is_none_or(|only| only == port)
+                && (exclusion.host == "*"
+                    || host == exclusion.host
+                    || host
+                        .strip_suffix(&exclusion.host)
+                        .is_some_and(|prefix| prefix.ends_with('.')))
         })
     }
+}
+
+/// Reads one `NO_PROXY` entry: a host or IPv6 address, optionally followed by
+/// a port that the entry then applies to alone.
+fn parse_exclusion(value: &str) -> Option<Exclusion> {
+    let value = value
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        let port = match rest {
+            "" => None,
+            rest => Some(rest.strip_prefix(':')?.parse().ok()?),
+        };
+        (host, port)
+    } else if value.matches(':').count() == 1 {
+        let (host, port) = value.split_once(':')?;
+        (host, Some(port.parse().ok()?))
+    } else {
+        // No colon, or several (an unbracketed IPv6 address): no port.
+        (value.as_str(), None)
+    };
+    (!host.is_empty()).then(|| Exclusion {
+        host: host.to_owned(),
+        port,
+    })
+}
+
+fn bare_host(host: &str) -> String {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn tunnel_tls() -> Arc<rustls::ClientConfig> {
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(tls)
 }
 
 fn decode_credentials(value: &str) -> Option<String> {
@@ -97,9 +160,16 @@ fn decode_credentials(value: &str) -> Option<String> {
 }
 
 fn load() -> Result<Option<Proxy>, String> {
+    load_from(|name| std::env::var_os(name), system_proxy)
+}
+
+fn load_from(
+    lookup: impl Fn(&str) -> Option<OsString>,
+    system: impl FnOnce() -> Result<Option<String>, String>,
+) -> Result<Option<Proxy>, String> {
     let proxy = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
         .into_iter()
-        .find_map(std::env::var_os)
+        .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
         .map(|value| {
             value
                 .into_string()
@@ -108,10 +178,12 @@ fn load() -> Result<Option<Proxy>, String> {
         .transpose()?;
     let proxy = match proxy {
         Some(proxy) => Some(proxy),
-        None => system_proxy()?,
+        None => system()?,
     };
-    let exclusions = std::env::var("NO_PROXY")
-        .or_else(|_| std::env::var("no_proxy"))
+    let exclusions = ["NO_PROXY", "no_proxy"]
+        .into_iter()
+        .filter_map(|name| lookup(name).filter(|value| !value.is_empty()))
+        .find_map(|value| value.into_string().ok())
         .unwrap_or_default();
     proxy
         .map(|proxy| Proxy::parse(&proxy, &exclusions))
@@ -178,18 +250,14 @@ pub(super) fn connector() -> Result<Connector, ProviderExecutionError> {
     let Some(proxy) = proxy else {
         return Ok(Connector::default());
     };
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let tls = Arc::new(tls);
+    let tls = proxy.tls();
     Ok(Connector::default().secure_connector(apply_fn_factory(
         TcpConnector::<Uri>::new(),
         async move |request: Connect<Uri>, service| {
             let target = request.get_ref().clone();
             let host = target.host().ok_or(ConnectError::InvalidInput)?;
-            let tunnel = !proxy.bypasses(host);
+            let port = target.port_u16().unwrap_or(443);
+            let tunnel = !proxy.bypasses(host, port);
             let io = service
                 .call(if tunnel {
                     Connect::new(proxy.uri.clone())
@@ -198,11 +266,12 @@ pub(super) fn connector() -> Result<Connector, ProviderExecutionError> {
                 })
                 .await?;
             if tunnel {
-                connect_tunnel(
+                connect_tunnel_with_timeout(
                     &io,
                     host,
-                    target.port_u16().unwrap_or(443),
+                    port,
                     proxy.authorization.as_ref(),
+                    TUNNEL_TIMEOUT,
                 )
                 .await?;
             }
@@ -215,6 +284,22 @@ pub(super) fn connector() -> Result<Connector, ProviderExecutionError> {
                 .map_err(ConnectError::from)
         },
     )))
+}
+
+async fn connect_tunnel_with_timeout(
+    io: &Io,
+    host: &str,
+    port: u16,
+    authorization: Option<&HeaderValue>,
+    timeout: Duration,
+) -> io::Result<()> {
+    match ntex::time::timeout(timeout, connect_tunnel(io, host, port, authorization)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "provider proxy CONNECT timed out",
+        )),
+    }
 }
 
 async fn connect_tunnel(
@@ -272,14 +357,14 @@ mod tests {
         .expect("proxy");
         assert_eq!(proxy.uri.host(), Some("proxy.example"));
         assert_eq!(proxy.uri.port_u16(), Some(8080));
-        assert!(proxy.bypasses("api.internal.example"));
-        assert!(proxy.bypasses("internal.example"));
-        assert!(!proxy.bypasses("notinternal.example"));
-        assert!(!proxy.bypasses("provider.example"));
+        assert!(proxy.bypasses("api.internal.example", 443));
+        assert!(proxy.bypasses("internal.example", 443));
+        assert!(!proxy.bypasses("notinternal.example", 443));
+        assert!(!proxy.bypasses("provider.example", 443));
         assert!(
             Proxy::parse("http://proxy", "*")
                 .expect("proxy")
-                .bypasses("anything")
+                .bypasses("anything", 443)
         );
         for url in [
             "socks5://proxy:1080",
@@ -309,5 +394,88 @@ mod tests {
                 assert_eq!(request.as_ref(), b"CONNECT provider.example:443 HTTP/1.1\r\nHost: provider.example:443\r\nProxy-Authorization: Basic YWxpY2U6cEBzcw==\r\n\r\n");
             }
         });
+    }
+
+    #[test]
+    fn provider_network_proxy_load_skips_variables_that_are_set_but_empty() {
+        let vars = std::collections::BTreeMap::from([
+            ("HTTPS_PROXY", ""),
+            ("https_proxy", "http://lower.example:8080"),
+            ("NO_PROXY", ""),
+            ("no_proxy", "excluded.example"),
+        ]);
+        let proxy = load_from(
+            |name| vars.get(name).map(|value| OsString::from(*value)),
+            || panic!("a non-empty proxy variable must win over the system proxy"),
+        )
+        .expect("proxy")
+        .expect("configured proxy");
+        assert_eq!(proxy.uri.host(), Some("lower.example"));
+        assert!(proxy.bypasses("api.excluded.example", 443));
+
+        let called = std::cell::Cell::new(false);
+        let proxy = load_from(
+            |_| Some(OsString::new()),
+            || {
+                called.set(true);
+                Ok(Some("http://system.example:8080".to_owned()))
+            },
+        )
+        .expect("system proxy")
+        .expect("configured proxy");
+        assert!(
+            called.get(),
+            "empty proxy variables fall through to the system proxy"
+        );
+        assert_eq!(proxy.uri.host(), Some("system.example"));
+    }
+
+    #[test]
+    fn provider_network_proxy_exclusions_match_ports_and_unbracketed_ipv6() {
+        let proxy = Proxy::parse(
+            "http://proxy.example:8080",
+            "api.example:8443,example.com,[::1],::2",
+        )
+        .expect("proxy");
+        assert!(proxy.bypasses("api.example", 8443));
+        assert!(!proxy.bypasses("api.example", 443));
+        assert!(proxy.bypasses("example.com", 443));
+        assert!(proxy.bypasses("deep.example.com", 443));
+        assert!(proxy.bypasses("::1", 443));
+        assert!(proxy.bypasses("[::1]", 443));
+        assert!(proxy.bypasses("::2", 443));
+        assert!(!proxy.bypasses("::3", 443));
+    }
+
+    #[test]
+    fn provider_network_proxy_connect_has_its_own_timeout() {
+        assert_eq!(TUNNEL_TIMEOUT, Duration::from_secs(30));
+        crate::test_support::on_system(|| async {
+            let (client, _server) = ntex::testing::IoTest::create();
+            let io = Io::new(client, ntex::SharedCfg::default());
+            let error = connect_tunnel_with_timeout(
+                &io,
+                "provider.example",
+                443,
+                None,
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a silent proxy times out the tunnel");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        });
+    }
+
+    #[test]
+    fn provider_network_proxy_builds_tunnel_tls_at_initialization() {
+        let proxy = Proxy::parse("http://proxy.example:8080", "").expect("proxy");
+        assert!(
+            Arc::ptr_eq(&proxy.tls(), &proxy.tls()),
+            "the tunnel TLS config is built with the proxy and reused"
+        );
+        assert_eq!(
+            proxy.tls().alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 }

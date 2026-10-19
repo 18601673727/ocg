@@ -538,9 +538,10 @@ fn consume_event(
                 return Err(Refused::OutputLimit);
             }
         }
-        for value in ["reasoning_content", "reasoning"]
-            .iter()
-            .filter_map(|key| delta.get(key).and_then(Value::as_str))
+        if let Some(value) = delta
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .or_else(|| delta.get("reasoning").and_then(Value::as_str))
         {
             if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
                 return Err(Refused::OutputLimit);

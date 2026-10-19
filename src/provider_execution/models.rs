@@ -102,11 +102,13 @@ fn parse_models(
         .ok_or(ModelListError::NotListed)?;
     let mut models = BTreeMap::<String, Option<u64>>::new();
     for entry in entries {
-        let id = entry
+        let Some(id) = entry
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
-            .ok_or(ModelListError::NotListed)?;
+        else {
+            continue;
+        };
         if credential.is_some_and(|secret| !secret.is_empty() && id.contains(secret)) {
             continue;
         }
@@ -122,4 +124,28 @@ fn parse_models(
         .into_iter()
         .map(|(id, context_window)| ProviderModel { id, context_window })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_network_model_entries_without_an_id_are_skipped() {
+        let models = match parse_models(
+            200,
+            br#"{"data":[{"id":""},{"no_id":true},{"id":"kept","context_length":7},{"id":3}]}"#,
+            None,
+        ) {
+            Ok(models) => models,
+            Err(_) => panic!("the list is still usable"),
+        };
+        assert_eq!(
+            models,
+            [ProviderModel {
+                id: "kept".to_owned(),
+                context_window: Some(7),
+            }]
+        );
+    }
 }

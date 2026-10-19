@@ -32,6 +32,7 @@ const MAX_PROFILE_NAME_BYTES: usize = 128;
 const MAX_MODEL_BYTES: usize = 256;
 const MAX_ENDPOINT_BYTES: usize = 512;
 const MAX_CREDENTIAL_REF_BYTES: usize = 128;
+const MAX_PROVIDER_MESSAGE_BYTES: usize = 1024;
 const MAX_INSTRUCTIONS_BYTES: usize = 65_536;
 const PROFILE_SCAN_LIMIT: usize = 1_000;
 
@@ -219,6 +220,36 @@ fn valid_credential_ref(reference: &str) -> bool {
         && reference
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn bounded_provider_message(mut message: String) -> String {
+    if message.len() > MAX_PROVIDER_MESSAGE_BYTES {
+        let mut end = MAX_PROVIDER_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
+/// Whether some saved Connection names `reference`, so `/provider-models`
+/// cannot turn a `credential_ref` into an arbitrary environment lookup.
+async fn saved_connection_credential(
+    database: &DatabaseHandle,
+    reference: &str,
+) -> Result<bool, Refusal> {
+    Ok(database
+        .configs(Some(ConfigKind::Connection), None, PROFILE_SCAN_LIMIT)
+        .await?
+        .iter()
+        .any(|record| {
+            matches!(
+                &record.body,
+                ConfigBody::Connection(connection)
+                    if connection.credential_ref.as_deref() == Some(reference)
+            )
+        }))
 }
 
 fn default_credential_ref(name: &str) -> String {
@@ -912,10 +943,20 @@ pub(super) async fn provider_models(
     }
     let credential = match request.credential {
         Some(credential) => Some(credential),
-        None => database
-            .credential_resolver()
-            .resolve(request.credential_ref.as_deref())
-            .map_err(|_| INVALID_CREDENTIAL_REF)?,
+        None => match request.credential_ref.as_deref() {
+            Some(reference) => {
+                if !valid_credential_ref(reference)
+                    || !saved_connection_credential(database, reference).await?
+                {
+                    return Err(INVALID_CREDENTIAL_REF);
+                }
+                database
+                    .credential_resolver()
+                    .resolve(Some(reference))
+                    .map_err(|_| INVALID_CREDENTIAL_REF)?
+            }
+            None => None,
+        },
     };
     if credential.as_ref().is_some_and(|secret| {
         secret.is_empty()
@@ -945,7 +986,11 @@ pub(super) async fn provider_models(
         Err(ModelListError::Rejected {
             status_code,
             message,
-        }) => ("provider_rejected", message, Some(status_code)),
+        }) => (
+            "provider_rejected",
+            bounded_provider_message(message),
+            Some(status_code),
+        ),
     };
     let mut error = json!({"code": code, "message": message});
     if let Some(status) = status_code {
@@ -1025,6 +1070,17 @@ mod provider_network_tests {
             .set_credential("MODEL_TEST_KEY", "saved-secret")
             .expect("save credential");
         on_system(move || async move {
+            database
+                .create_config(NewConfig {
+                    name: "models provider".to_owned(),
+                    body: ConfigBody::Connection(ConnectionConfig {
+                        protocol: LlmTransport::OpenAiChatCompletions,
+                        endpoint: None,
+                        credential_ref: Some("MODEL_TEST_KEY".to_owned()),
+                    }),
+                })
+                .await
+                .expect("saved Connection");
             scripted::install_http("https://models.example/v1/models", |authorization| {
                 assert_eq!(
                     authorization.expect("authorization").as_bytes(),
@@ -1120,6 +1176,87 @@ mod provider_network_tests {
                 )
                 .is_err()
             );
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn provider_network_models_credential_ref_must_name_a_saved_connection() {
+        let (_root, directory) = data_directory("provider-network", "models-credential-ref");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        database
+            .set_credential("SAVED_REF", "saved-secret")
+            .expect("save credential");
+        on_system(move || async move {
+            scripted::install_http("https://credential-ref.example/v1/models", |_| {
+                panic!("a credential_ref that names no saved Connection is never sent")
+            });
+            for reference in ["not valid", "UNSAVED_REF"] {
+                let request = serde_json::to_vec(&json!({
+                    "endpoint": "https://credential-ref.example/v1",
+                    "credential_ref": reference,
+                }))
+                .expect("JSON");
+                let refusal = match provider_models(&database, &request).await {
+                    Err(refusal) => refusal,
+                    Ok(_) => panic!("refused before any resolution"),
+                };
+                assert_eq!(refusal.code, "invalid_credential_ref", "{reference}");
+            }
+            database
+                .create_config(NewConfig {
+                    name: "saved provider".to_owned(),
+                    body: ConfigBody::Connection(ConnectionConfig {
+                        protocol: LlmTransport::OpenAiChatCompletions,
+                        endpoint: None,
+                        credential_ref: Some("SAVED_REF".to_owned()),
+                    }),
+                })
+                .await
+                .expect("saved Connection");
+            scripted::install_http("https://credential-ref.example/v1/models", |authorization| {
+                assert_eq!(
+                    authorization.expect("authorization").as_bytes(),
+                    b"Bearer saved-secret"
+                );
+                Ok((200, br#"{"data":[{"id":"m"}]}"#.to_vec()))
+            });
+            let request = serde_json::to_vec(&json!({
+                "endpoint": "https://credential-ref.example/v1",
+                "credential_ref": "SAVED_REF",
+            }))
+            .expect("JSON");
+            let reply = provider_models(&database, &request).await.expect("models");
+            assert_eq!(reply.body["models"][0]["id"], "m");
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn provider_network_models_caps_the_provider_rejection_message() {
+        let (_root, directory) = data_directory("provider-network", "models-message-cap");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        on_system(move || async move {
+            let body = serde_json::to_vec(
+                &json!({"error": {"message": "x".repeat(4 * 1024)}}),
+            )
+            .expect("JSON");
+            scripted::install_http("https://cap.example/v1/models", move |_| {
+                Ok((401, body.clone()))
+            });
+            let reply = provider_models(
+                &database,
+                br#"{"endpoint":"https://cap.example/v1"}"#,
+            )
+            .await
+            .expect("refusal");
+            assert_eq!(reply.body["error"]["code"], "provider_rejected");
+            assert_eq!(reply.body["error"]["status_code"], 401);
+            let echoed = reply.body["error"]["message"].as_str().expect("message");
+            assert_eq!(echoed.len(), 1024);
+            assert!(echoed.bytes().all(|byte| byte == b'x'));
         });
         worker.shutdown().expect("shutdown");
     }

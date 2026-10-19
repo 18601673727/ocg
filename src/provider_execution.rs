@@ -254,6 +254,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn provider_network_reasoning_content_supersedes_the_reasoning_alias() {
+        let both = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\",\"reasoning\":\"think\"}}]}\n\n";
+        let result = parse(vec![Step::Chunk(both), Step::Chunk(STOP)], None)
+            .expect("reasoning stream");
+        assert_eq!(result.reasoning, "think");
+        // The alias is not read when `reasoning_content` is present, so the
+        // output limit is charged once, not twice.
+        let config = ProviderExecutionConfig {
+            max_output_bytes: "think".len(),
+            ..ProviderExecutionConfig::default()
+        };
+        let result = wait(parse_stream(
+            payload(
+                vec![Step::Chunk(both), Step::Chunk(STOP)],
+                config.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            None,
+            &mut UsageCapture::default(),
+        ))
+        .expect("reasoning_content fits the limit once");
+        assert_eq!(result.reasoning, "think");
+    }
+
+    #[test]
     fn provider_network_stream_errors_end_immediately_with_provider_message() {
         for (error, rejected) in [
             (json!({"message":"bad key", "status":401}), true),
