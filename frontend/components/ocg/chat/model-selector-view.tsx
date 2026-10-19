@@ -60,8 +60,13 @@ export function ModelSelectorView({
           <SlidersHorizontal className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           <span className="min-w-0 flex-1">
             <span className="block truncate text-xs font-medium" title={active ? t("chat.activeExecution") : undefined}>{title}</span>
-            <span className="block truncate text-xs text-muted-foreground">
-              {subtitle ?? status}
+            <span
+              id={id + "-status"}
+              role={error ? "alert" : undefined}
+              className={cn("block truncate text-xs", error ? "text-destructive" : "text-muted-foreground")}
+              title={error}
+            >
+              {error ?? subtitle ?? status}
             </span>
           </span>          {locked && <LockKeyhole className={`size-3.5 shrink-0 ${STATUS_TEXT['warning']}`} aria-hidden="true" />}
           <ChevronDown className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform", expanded && "rotate-180")} aria-hidden="true" />
@@ -104,7 +109,6 @@ export function ModelSelectorView({
         {modelId && <p className="truncate font-mono text-xs text-muted-foreground" title={modelId}>{modelId}</p>}
         {effortUnsupported && <p className="text-xs text-muted-foreground">{t("chat.effortUnsupportedHint")}</p>}
       </div>}
-      {error && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
     </div>
   );
 }
