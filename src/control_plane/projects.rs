@@ -73,16 +73,23 @@ struct WireNewProject {
     commands: Vec<WireCommand>,
 }
 
-/// The fields an update replaces. The root is not among them, so a body
-/// that names it is refused.
+/// The fields an update replaces, all required. The root is not among them,
+/// so a body that names it is refused.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireProjectUpdate {
     name: String,
-    #[serde(default)]
+    #[serde(deserialize_with = "present")]
     description: Option<String>,
-    #[serde(default)]
     commands: Vec<WireCommand>,
+}
+
+/// A field that must be in the body but may be `null`: `deserialize_with`
+/// turns off serde's default for a missing `Option`.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::deserialize(deserializer)
 }
 
 pub(super) fn project_id(text: &str) -> Result<ProjectId, Refusal> {

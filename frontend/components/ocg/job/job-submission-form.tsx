@@ -233,7 +233,7 @@ export function JobSubmissionForm({
   }, [chat, client, catalogVersion]);
 
   const granted = !chat && Boolean(availableAgents.find((agent) => agent.id === agentProfile.trim())?.tool_grant);
-  const chosenProject = projects.find((candidate) => candidate.id === project) ?? projects[0];
+  const chosenProject = projects.find((candidate) => candidate.id === project);
 
   const settled = phase === "submitting" || phase === "pending" || phase === "uncertain";
 
@@ -491,6 +491,7 @@ export function JobSubmissionForm({
                 onChange={(event) => setProject(event.target.value)}
                 disabled={settled}
               >
+                <option value="">Choose a Project</option>
                 {projects.map((candidate) => (
                   <option key={candidate.id} value={candidate.id}>
                     {candidate.name} ({candidate.id})
@@ -636,7 +637,7 @@ export function JobSubmissionForm({
         {phase === "editing" || phase === "refused" ? (
           <Button
             onClick={() => void submit()}
-            disabled={objective.trim().length === 0 || (chat && !target) || Boolean(disabledReason)}
+            disabled={objective.trim().length === 0 || (chat && !target) || (granted && !chosenProject) || Boolean(disabledReason)}
           >
             {phase === "editing" ? (chat ? "Send" : "Submit Job") : chat ? "Send again" : "Submit again"}
           </Button>

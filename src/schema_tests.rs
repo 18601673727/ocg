@@ -12758,6 +12758,24 @@ mod requests_and_tool_loop {
                     "invalid_request",
                 ),
                 (
+                    format!("/api/v1/projects/{id}"),
+                    json!({"name": "no-description", "commands": []}),
+                    400,
+                    "invalid_request",
+                ),
+                (
+                    format!("/api/v1/projects/{id}"),
+                    json!({"name": "no-commands", "description": null}),
+                    400,
+                    "invalid_request",
+                ),
+                (
+                    format!("/api/v1/projects/{id}"),
+                    json!({"description": null, "commands": []}),
+                    400,
+                    "invalid_request",
+                ),
+                (
                     "/api/v1/projects".to_owned(),
                     json!({"name": "again", "root": root}),
                     409,
@@ -12771,13 +12789,13 @@ mod requests_and_tool_loop {
                 ),
                 (
                     "/api/v1/projects/project:999".to_owned(),
-                    json!({"name": "missing", "commands": []}),
+                    json!({"name": "missing", "description": null, "commands": []}),
                     404,
                     "project_not_found",
                 ),
                 (
                     format!("/api/v1/projects/{id}"),
-                    json!({"name": "built-in", "commands": [{"name": "cargo_check", "argv": ["cargo"]}]}),
+                    json!({"name": "built-in", "description": null, "commands": [{"name": "cargo_check", "argv": ["cargo"]}]}),
                     422,
                     "invalid_commands",
                 ),

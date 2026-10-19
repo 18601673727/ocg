@@ -624,6 +624,15 @@ pub(super) fn decode_project(bytes: &[u8]) -> DecodeResult<ProjectRecord> {
     })
 }
 
+/// The id and root of a stored Project, without its commands.
+pub(super) fn decode_project_root(bytes: &[u8]) -> DecodeResult<(ProjectId, String)> {
+    let mut d = Dec::new(bytes, TAG_PROJECT)?;
+    let id = ProjectId::new(d.u64()?);
+    d.str()?;
+    d.ostr()?;
+    Ok((id, d.str()?))
+}
+
 /// What the owner changed about a conversation root.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversationRow {

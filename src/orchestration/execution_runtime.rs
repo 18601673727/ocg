@@ -2394,27 +2394,25 @@ async fn run_started_provider_job(
         .and_then(|agent| agent.tool_grant.as_deref());
     if let Some(tools) = &plan.workspace_tools {
         #[cfg(unix)]
-        {
+        if let Some(grant) = grant {
+            // A Job without a grant uses no root, so a removed root must not fail it.
             let resolved =
                 match resolve_project(&database, tools.data_directory(), &job_record).await {
                     Ok(resolved) => resolved,
                     Err(ProjectUnavailable::Database(error)) => return Err(error.into()),
                     Err(error) => return refused(error.to_string()).await,
                 };
-            plan.tools = match (grant, &resolved) {
-                (None, _) => None,
-                (Some(_), None) => return refused(ProjectUnavailable::Required.to_string()).await,
-                (Some(grant), Some((record, workspace))) => {
-                    match build_tools(workspace, grant, &record.commands) {
-                        Ok(tools) => Some(tools),
-                        Err(error) => return refused(error.to_string()).await,
-                    }
-                }
+            let Some((record, workspace)) = resolved else {
+                return refused(ProjectUnavailable::Required.to_string()).await;
             };
-            if let (Some(_), Some((record, workspace))) = (&plan.tools, resolved) {
-                agents_md = read_agents_md(&workspace).await;
-                project = Some(record);
+            match build_tools(&workspace, grant, &record.commands) {
+                Ok(built) => plan.tools = Some(built),
+                Err(error) => return refused(error.to_string()).await,
             }
+            agents_md = read_agents_md(&workspace).await;
+            project = Some(record);
+        } else {
+            plan.tools = None;
         }
         #[cfg(not(unix))]
         if grant.is_some() {

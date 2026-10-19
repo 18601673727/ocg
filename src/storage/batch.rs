@@ -639,8 +639,7 @@ impl Batch {
         self.step(|tx| {
             let mut roots = Vec::new();
             for entry in tx.open_table(PROJECTS)?.iter()? {
-                let record = decode_project(entry?.1.value())?;
-                roots.push((record.id, record.root));
+                roots.push(decode_project_root(entry?.1.value())?);
             }
             Ok(roots)
         })

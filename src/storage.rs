@@ -96,7 +96,7 @@ pub(crate) use reads::{
 };
 pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow};
 use rows::{
-    decode_attachment, decode_output, decode_project, decode_submission, decode_tool_evidence,
+    decode_attachment, decode_output, decode_project, decode_project_root, decode_submission, decode_tool_evidence,
     encode_attachment, encode_output, encode_project, encode_submission, encode_tool_evidence,
     job_tool_evidence, tool_call_key, tool_call_ref,
 };

@@ -7,7 +7,7 @@
 //! calls, which are one small transaction each.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
@@ -48,10 +48,20 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
     sorted.get(index.min(last)).copied().unwrap_or_default()
 }
 
-fn report(label: &str, mut latencies: Vec<Duration>, elapsed: Duration) {
+/// Projects created so far. `create_project` scans every root, so the count
+/// is part of what a case measures.
+static PROJECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// The count a case starts from, to pass to [`report`] once it has run.
+fn projects_now() -> usize {
+    PROJECTS.load(Ordering::Relaxed)
+}
+
+fn report(label: &str, projects_before: usize, mut latencies: Vec<Duration>, elapsed: Duration) {
     latencies.sort();
     println!(
-        "{label}: n={} elapsed={:.3}s throughput={:.0}/s p50={:?} p95={:?} p99={:?} max={:?}",
+        "{label}: projects={projects_before}..{} n={} elapsed={:.3}s throughput={:.0}/s p50={:?} p95={:?} p99={:?} max={:?}",
+        projects_now(),
         latencies.len(),
         elapsed.as_secs_f64(),
         latencies.len() as f64 / elapsed.as_secs_f64(),
@@ -88,6 +98,7 @@ fn write_workload(
                         commands: Vec::new(),
                     }))?;
                     local.push(began.elapsed());
+                    PROJECTS.fetch_add(1, Ordering::Relaxed);
                 }
                 latencies
                     .lock()
@@ -128,19 +139,20 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
             })
         })
         .collect();
+    let before = projects_now();
     let written = write_workload(handle, 16, 60, "mixed");
     stop.store(true, Ordering::Relaxed);
     for reader in readers {
         reader.join().map_err(|_| "a reader thread panicked")??;
     }
     let (latencies, elapsed) = written?;
-    report("mixed writes, 16 writers", latencies, elapsed);
+    report("mixed writes, 16 writers", before, latencies, elapsed);
     let reads = std::mem::take(
         &mut *read_latencies
             .lock()
             .unwrap_or_else(PoisonError::into_inner),
     );
-    report("mixed reads,   2 readers", reads, elapsed);
+    report("mixed reads,   2 readers", projects_now(), reads, elapsed);
 
     let began = Instant::now();
     let mut alone = Vec::new();
@@ -149,7 +161,7 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
         block_on(handle.projects(None, 20))?;
         alone.push(read_began.elapsed());
     }
-    report("reads alone,    1 reader ", alone, began.elapsed());
+    report("reads alone,    1 reader ", projects_now(), alone, began.elapsed());
     Ok(())
 }
 
@@ -170,16 +182,19 @@ fn main() -> BenchResult<()> {
     let outcome = (|| -> BenchResult<()> {
         write_workload(&handle, 1, 20, "warm")?;
         if selected("serial") {
+            let before = projects_now();
             let (latencies, elapsed) = write_workload(&handle, 1, 300, "serial")?;
-            report("serial,      1 writer ", latencies, elapsed);
+            report("serial,      1 writer ", before, latencies, elapsed);
         }
         if selected("concurrent") {
             for writers in [4usize, 16, 64] {
                 let per_writer = 600 / writers.min(60) + 20;
+                let before = projects_now();
                 let (latencies, elapsed) =
                     write_workload(&handle, writers, per_writer, &format!("c{writers}"))?;
                 report(
                     &format!("concurrent, {writers:>2} writers"),
+                    before,
                     latencies,
                     elapsed,
                 );

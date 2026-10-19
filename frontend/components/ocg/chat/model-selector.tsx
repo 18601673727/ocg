@@ -56,9 +56,10 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
   const llmId = llm?.id;
   const model = llm?.model;
   const disabled = busy || !catalog || !llm || !executor;
-  // A conversation keeps the Project of its first turn, so only a new one chooses.
+  // A conversation keeps the Project of its first turn, so only a new one chooses,
+  // and only the owner chooses: no Project is picked for them.
   const projects = agent?.tool_grant && !fixedAgent ? catalog?.projects ?? [] : [];
-  const projectId = (projects.find(project => project.id === selection?.project) ?? projects[0])?.id;
+  const projectId = projects.find(project => project.id === selection?.project)?.id;
 
   useEffect(() => {
     if (!agentId || !llmId || !executor || !model) return;
@@ -72,14 +73,14 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
     const choices = agent?.llm_targets.filter(target => target.declared_capabilities.includes("chat") && target.executors.length) ?? [];
     const llm = choices.find(target => target.id === llmProfile) ?? choices[0];
     if (!agent || !llm) return;
-    const next = { model: llm.model, effort: null, agentProfile, llmProfile: llm.id, executor: executor ?? llm.executors[0] };
+    const next = { model: llm.model, effort: null, agentProfile, llmProfile: llm.id, executor: executor ?? llm.executors[0], ...(selection?.project ? { project: selection.project } : {}) };
     onChange(next);
     onPreference?.(next);
   }
 
   function chooseProject(project: string) {
     if (!selection) return;
-    const next = { ...selection, project };
+    const next = { ...selection, project: project || undefined };
     onChange(next);
     onPreference?.(next);
   }
@@ -97,6 +98,7 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
       ? <label className="mt-1 flex items-center gap-2 px-1 text-xs text-muted-foreground">{t("chat.project")}
         <select className="h-7 min-w-0 rounded-md border border-input bg-background px-2 text-xs text-foreground" value={projectId ?? ""} disabled={busy}
           onChange={event => chooseProject(event.target.value)}>
+          <option value="">{t("chat.projectChoose")}</option>
           {projects.map(project => <option key={project.id} value={project.id}>{project.name} ({project.id})</option>)}
         </select>
       </label>
