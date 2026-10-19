@@ -16876,8 +16876,8 @@ mod requests_and_tool_loop {
         use super::*;
         use crate::openai_compatible::{ChatMessage, ContentPartWire, MessageContentWire};
         use crate::orchestration::execution_runtime::{
-            OMITTED_NOTICE, assemble_conversation, estimate_request_tokens,
-            run_provider_job_with_window,
+            ContextLimits, OMITTED_NOTICE, assemble_conversation, estimate_request_tokens,
+            fit_conversation, run_provider_job_with_window,
         };
         use crate::persistence::{
             MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES,
@@ -17072,6 +17072,162 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start(&directory).expect("restart");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
+        }
+
+        #[test]
+        fn round2_item_1_token_estimation_counts_tool_definitions_and_call_names() {
+            // 1. Tool call in message: function name and arguments are both counted
+            let call = crate::openai_compatible::ChatToolCallWire {
+                id: "call_abc".to_owned(),
+                tool_type: Some("function".to_owned()),
+                function: crate::openai_compatible::ChatFunctionCallWire {
+                    name: "lookup_data".to_owned(), // 11 bytes
+                    arguments: "{\"key\":\"val\"}".to_owned(), // 13 bytes
+                },
+            };
+            let mut asst_msg = ChatMessage::assistant(Some("call:".to_owned()), Vec::new()); // 5 bytes
+            asst_msg.tool_calls = Some(vec![call]);
+            let conv_with_call = ChatConversation {
+                messages: vec![asst_msg],
+                tools: Vec::new(),
+                ..Default::default()
+            };
+            // 5 + 11 + 13 = 29 bytes. ceil(29/3) = 10 tokens + 4096 = 4106
+            assert_eq!(estimate_request_tokens(&conv_with_call, None), 4106);
+
+            // 2. Offered tool whole definition: name, description, parameters are serialized and counted
+            let tool = crate::openai_compatible::ToolWire {
+                tool_type: "function".to_owned(),
+                function: crate::openai_compatible::FunctionDefinitionWire {
+                    name: "lookup_data".to_owned(),
+                    description: Some("Look up relevant data by key".to_owned()),
+                    parameters: Some(json!({
+                        "type": "object",
+                        "properties": {
+                            "key": {"type": "string"}
+                        }
+                    })),
+                    strict: None,
+                },
+            };
+            let tool_bytes = serde_json::to_vec(&tool).expect("serialize tool").len();
+            let conv_with_tool = ChatConversation {
+                messages: vec![ChatMessage::user("hi")], // 2 bytes
+                tools: vec![tool.clone()],
+                ..Default::default()
+            };
+            let expected_bytes = 2 + tool_bytes;
+            let expected_tokens = (expected_bytes.div_ceil(3) as u64) + 4096;
+            assert_eq!(estimate_request_tokens(&conv_with_tool, None), expected_tokens);
+
+            // Verify description specifically contributes to the tokens
+            let mut tool_without_desc = tool.clone();
+            tool_without_desc.function.description = None;
+            let conv_without_desc = ChatConversation {
+                messages: vec![ChatMessage::user("hi")],
+                tools: vec![tool_without_desc],
+                ..Default::default()
+            };
+            assert!(
+                estimate_request_tokens(&conv_with_tool, None)
+                    > estimate_request_tokens(&conv_without_desc, None)
+            );
+        }
+
+        #[test]
+        fn round2_item_2_linear_conversation_fitting_drops_turns_until_fit() {
+            let (_root, directory) = data_directory("round2-item2-fitting");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-round2-fitting");
+            let run = local_run(&handle, llm);
+            let frozen = wait(handle.job_configuration(run.job))
+                .expect("read configuration")
+                .expect("configured")
+                .frozen;
+
+            let turn0 = (Some("a".repeat(200)), Vec::new(), "b".repeat(200));
+            let turn1 = (Some("c".repeat(200)), Vec::new(), "d".repeat(200));
+            let turn2 = (Some("e".repeat(200)), Vec::new(), "f".repeat(200));
+            let prior_turns = vec![turn0, turn1, turn2];
+            let current_objective = "current turn question";
+
+            // 1. Fits completely without dropping any turns
+            let limits_all_fit = ContextLimits {
+                context_window: Some(10_000),
+                max_tokens: Some(10),
+            };
+            let conv_full = fit_conversation(
+                &frozen,
+                prior_turns.clone(),
+                Some(current_objective),
+                &[],
+                None,
+                Vec::new(),
+                limits_all_fit,
+            )
+            .expect("all turns fit");
+            let has_notice = conv_full.messages.iter().any(|m| {
+                m.role == crate::openai_compatible::ChatRole::System
+                    && m.content.as_ref().is_some_and(|c| match c {
+                        MessageContentWire::Text(t) => t.contains(OMITTED_NOTICE),
+                        _ => false,
+                    })
+            });
+            assert!(!has_notice, "omitted notice must not be included when all turns fit");
+
+            // Measure tokens required for full conversation and for dropped versions
+            let full_tokens = estimate_request_tokens(&conv_full, Some(10));
+
+            // 2. Set window so full doesn't fit, dropping oldest turn (turn 0)
+            let limits_drop_1 = ContextLimits {
+                context_window: Some((full_tokens - 1) as u32),
+                max_tokens: Some(10),
+            };
+            let conv_drop_1 = fit_conversation(
+                &frozen,
+                prior_turns.clone(),
+                Some(current_objective),
+                &[],
+                None,
+                Vec::new(),
+                limits_drop_1,
+            )
+            .expect("fits with turn 0 dropped");
+
+            let has_notice_drop_1 = conv_drop_1.messages.iter().any(|m| {
+                m.role == crate::openai_compatible::ChatRole::System
+                    && m.content.as_ref().is_some_and(|c| match c {
+                        MessageContentWire::Text(t) => t.contains(OMITTED_NOTICE),
+                        _ => false,
+                    })
+            });
+            assert!(has_notice_drop_1, "omitted notice must be included when turns are dropped");
+            // Verify turn 0 text is not present, but turn 1 and 2 are present
+            let all_text = format!("{:?}", conv_drop_1.messages);
+            assert!(!all_text.contains(&"a".repeat(200)));
+            assert!(all_text.contains(&"c".repeat(200)));
+            assert!(all_text.contains(&"e".repeat(200)));
+            assert!(all_text.contains("current turn question"));
+            assert!(estimate_request_tokens(&conv_drop_1, Some(10)) <= (full_tokens - 1));
+
+            // 3. Set window too small for current turn alone -> returns None
+            let limits_too_small = ContextLimits {
+                context_window: Some(10), // less than max_tokens(10) + current turn message
+                max_tokens: Some(10),
+            };
+            let conv_none = fit_conversation(
+                &frozen,
+                prior_turns,
+                Some(current_objective),
+                &[],
+                None,
+                Vec::new(),
+                limits_too_small,
+            );
+            assert!(conv_none.is_none(), "must return None when current turn alone exceeds window");
+
+            worker.shutdown().expect("shutdown");
         }
     }
 }

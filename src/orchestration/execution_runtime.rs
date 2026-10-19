@@ -1694,6 +1694,7 @@ fn append_omitted_notice(conversation: &mut ChatConversation) {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn assemble_conversation(
     frozen: &FrozenExecutionConfig,
     prior_turns: &[(Option<String>, Vec<ImageInput>, String)],
@@ -1744,10 +1745,51 @@ pub(crate) fn assemble_conversation(
     conversation
 }
 
+fn message_weights(message: &ChatMessage) -> (usize, usize) {
+    let mut bytes: usize = 0;
+    let mut images: usize = 0;
+
+    if let Some(content) = &message.content {
+        match content {
+            MessageContentWire::Text(text) => {
+                bytes = bytes.saturating_add(text.len());
+            }
+            MessageContentWire::Parts(parts) => {
+                for part in parts {
+                    match part {
+                        ContentPartWire::Text { text } => {
+                            bytes = bytes.saturating_add(text.len());
+                        }
+                        ContentPartWire::ImageUrl { .. } => {
+                            images = images.saturating_add(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(reasoning) = &message.reasoning_content {
+        bytes = bytes.saturating_add(reasoning.len());
+    }
+    if let Some(calls) = &message.tool_calls {
+        for call in calls {
+            bytes = bytes.saturating_add(call.function.name.len());
+            bytes = bytes.saturating_add(call.function.arguments.len());
+        }
+    }
+
+    (bytes, images)
+}
+
+fn tool_bytes(tool: &ToolWire) -> usize {
+    serde_json::to_vec(tool).map_or(0, |v| v.len())
+}
+
 /// Estimates the token count of a conversation request under conservative assumptions:
 /// `ceil(UTF-8 bytes / 3)` over all message text, tool arguments, tool results, and
-/// offered tool schemas, plus 1,600 tokens per image, plus `max_tokens` (or 4,096
-/// when unset).
+/// offered tool definitions (serializing each [`ToolWire`]: name, description, and
+/// parameters), plus each tool call's function name with its arguments, plus 1,600
+/// tokens per image, plus `max_tokens` (or 4,096 when unset).
 pub(crate) fn estimate_request_tokens(
     conversation: &ChatConversation,
     max_tokens: Option<u32>,
@@ -1756,39 +1798,13 @@ pub(crate) fn estimate_request_tokens(
     let mut images: usize = 0;
 
     for message in &conversation.messages {
-        if let Some(content) = &message.content {
-            match content {
-                MessageContentWire::Text(text) => {
-                    bytes = bytes.saturating_add(text.len());
-                }
-                MessageContentWire::Parts(parts) => {
-                    for part in parts {
-                        match part {
-                            ContentPartWire::Text { text } => {
-                                bytes = bytes.saturating_add(text.len());
-                            }
-                            ContentPartWire::ImageUrl { .. } => {
-                                images = images.saturating_add(1);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(reasoning) = &message.reasoning_content {
-            bytes = bytes.saturating_add(reasoning.len());
-        }
-        if let Some(calls) = &message.tool_calls {
-            for call in calls {
-                bytes = bytes.saturating_add(call.function.arguments.len());
-            }
-        }
+        let (m_bytes, m_images) = message_weights(message);
+        bytes = bytes.saturating_add(m_bytes);
+        images = images.saturating_add(m_images);
     }
 
     for tool in &conversation.tools {
-        if let Some(parameters) = &tool.function.parameters {
-            bytes = bytes.saturating_add(parameters.to_string().len());
-        }
+        bytes = bytes.saturating_add(tool_bytes(tool));
     }
 
     let text_tokens = bytes.div_ceil(3) as u64;
@@ -1797,6 +1813,184 @@ pub(crate) fn estimate_request_tokens(
     text_tokens
         .saturating_add(image_tokens)
         .saturating_add(output_tokens)
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ContextLimits {
+    pub(crate) context_window: Option<u32>,
+    pub(crate) max_tokens: Option<u32>,
+}
+
+pub(crate) struct PriorTurnMessages {
+    pub(crate) user: Option<ChatMessage>,
+    pub(crate) assistant: ChatMessage,
+}
+
+fn system_messages(
+    frozen: &FrozenExecutionConfig,
+    workspace_root: Option<&std::path::Path>,
+    omitted_notice: bool,
+) -> Vec<ChatMessage> {
+    let mut conversation = provider_execution::objective_conversation(frozen, None);
+    conversation.messages.pop();
+
+    if omitted_notice {
+        append_omitted_notice(&mut conversation);
+    }
+
+    if let Some(root) = workspace_root {
+        provider_execution::ground_workspace(&mut conversation, root);
+    }
+    conversation.messages
+}
+
+fn assemble_final_conversation(
+    system_messages: Vec<ChatMessage>,
+    prior_turns: Vec<PriorTurnMessages>,
+    current_message: Option<ChatMessage>,
+    tools: Vec<ToolWire>,
+) -> ChatConversation {
+    let mut messages = system_messages;
+    for turn in prior_turns {
+        if let Some(user) = turn.user {
+            messages.push(user);
+        }
+        messages.push(turn.assistant);
+    }
+    if let Some(current) = current_message {
+        messages.push(current);
+    }
+    ChatConversation {
+        messages,
+        tools,
+        ..Default::default()
+    }
+}
+
+pub(crate) fn fit_conversation(
+    frozen: &FrozenExecutionConfig,
+    prior_turns: Vec<(Option<String>, Vec<ImageInput>, String)>,
+    current_objective: Option<&str>,
+    current_images: &[ImageInput],
+    workspace_root: Option<&std::path::Path>,
+    tools: Vec<ToolWire>,
+    context_limits: ContextLimits,
+) -> Option<ChatConversation> {
+    // 1. Build messages once without per-attempt cloning.
+    let prior_messages: Vec<PriorTurnMessages> = prior_turns
+        .into_iter()
+        .map(|(objective, images, assistant_text)| {
+            let user = provider_execution::objective_conversation_with_images(
+                frozen,
+                objective.as_deref(),
+                &images,
+            )
+            .messages
+            .pop();
+            let assistant = ChatMessage::assistant(Some(assistant_text), Vec::new());
+            PriorTurnMessages { user, assistant }
+        })
+        .collect();
+
+    let current_user_message = provider_execution::objective_conversation_with_images(
+        frozen,
+        current_objective,
+        current_images,
+    )
+    .messages
+    .pop();
+
+    let Some(window) = context_limits.context_window else {
+        return Some(assemble_final_conversation(
+            system_messages(frozen, workspace_root, false),
+            prior_messages,
+            current_user_message,
+            tools,
+        ));
+    };
+
+    let system_without_notice = system_messages(frozen, workspace_root, false);
+    let system_with_notice = system_messages(frozen, workspace_root, true);
+
+    // 2. Estimate token weights once for prior turns and the rest (system, notice, current turn, tools, max_tokens).
+    let tools_bytes: usize = tools.iter().map(tool_bytes).sum();
+    let (current_bytes, current_images_count) =
+        current_user_message.as_ref().map_or((0, 0), message_weights);
+
+    let system_without_notice_bytes: usize =
+        system_without_notice.iter().map(|m| message_weights(m).0).sum();
+    let system_with_notice_bytes: usize =
+        system_with_notice.iter().map(|m| message_weights(m).0).sum();
+
+    let rest_without_notice_bytes =
+        system_without_notice_bytes.saturating_add(current_bytes).saturating_add(tools_bytes);
+    let rest_with_notice_bytes =
+        system_with_notice_bytes.saturating_add(current_bytes).saturating_add(tools_bytes);
+
+    let prior_weights: Vec<(usize, usize)> = prior_messages
+        .iter()
+        .map(|turn| {
+            let (user_b, user_img) = turn.user.as_ref().map_or((0, 0), message_weights);
+            let (asst_b, asst_img) = message_weights(&turn.assistant);
+            (user_b.saturating_add(asst_b), user_img.saturating_add(asst_img))
+        })
+        .collect();
+
+    let total_prior_bytes: usize = prior_weights.iter().map(|(b, _)| *b).sum();
+    let total_prior_images: usize = prior_weights.iter().map(|(_, img)| *img).sum();
+
+    let output_tokens = context_limits.max_tokens.map_or(4096, u64::from);
+
+    // 3. Check if full conversation (no turns dropped, no notice) fits.
+    let full_bytes = rest_without_notice_bytes.saturating_add(total_prior_bytes);
+    let full_images = current_images_count.saturating_add(total_prior_images);
+    let full_tokens = (full_bytes.div_ceil(3) as u64)
+        .saturating_add((full_images as u64).saturating_mul(1600))
+        .saturating_add(output_tokens);
+
+    if full_tokens <= window as u64 {
+        return Some(assemble_final_conversation(
+            system_without_notice,
+            prior_messages,
+            current_user_message,
+            tools,
+        ));
+    }
+
+    // 4. Drop oldest turns until the sum fits.
+    let total_priors = prior_messages.len();
+    let mut remaining_prior_bytes = total_prior_bytes;
+    let mut remaining_prior_images = total_prior_images;
+    let mut selected_drop = None;
+
+    for drop_count in 1..=total_priors {
+        let (dropped_b, dropped_img) = prior_weights[drop_count - 1];
+        remaining_prior_bytes = remaining_prior_bytes.saturating_sub(dropped_b);
+        remaining_prior_images = remaining_prior_images.saturating_sub(dropped_img);
+
+        let candidate_bytes = rest_with_notice_bytes.saturating_add(remaining_prior_bytes);
+        let candidate_images = current_images_count.saturating_add(remaining_prior_images);
+        let candidate_tokens = (candidate_bytes.div_ceil(3) as u64)
+            .saturating_add((candidate_images as u64).saturating_mul(1600))
+            .saturating_add(output_tokens);
+
+        if candidate_tokens <= window as u64 {
+            selected_drop = Some(drop_count);
+            break;
+        }
+    }
+
+    // 5. Assemble the final conversation once.
+    let drop_count = selected_drop?;
+    let mut kept_prior_messages = prior_messages;
+    kept_prior_messages.drain(0..drop_count);
+
+    Some(assemble_final_conversation(
+        system_with_notice,
+        kept_prior_messages,
+        current_user_message,
+        tools,
+    ))
 }
 
 /// Runs a provider plan whose Job was started to its settlement.
@@ -1934,73 +2128,39 @@ async fn run_started_provider_job(
         prior_turns.reverse();
     }
 
-    let context_window = configuration.frozen.llm.config.context_window;
-    let max_tokens = configuration.frozen.llm.config.parameters.max_tokens;
+    let context_limits = ContextLimits {
+        context_window: configuration.frozen.llm.config.context_window,
+        max_tokens: configuration.frozen.llm.config.parameters.max_tokens,
+    };
     let tools_wire = offered.unwrap_or_default();
 
-    let conversation = if let Some(window) = context_window {
-        let total_priors = prior_turns.len();
-        let mut selected = None;
-
-        let full = assemble_conversation(
-            &configuration.frozen,
-            &prior_turns,
-            false,
-            input_record.objective.as_deref(),
-            &images,
-            workspace_root,
-            tools_wire.clone(),
-        );
-        if estimate_request_tokens(&full, max_tokens) <= window as u64 {
-            selected = Some(full);
-        } else {
-            for drop_count in 1..=total_priors {
-                let candidate = assemble_conversation(
-                    &configuration.frozen,
-                    &prior_turns[drop_count..],
-                    true,
-                    input_record.objective.as_deref(),
-                    &images,
-                    workspace_root,
-                    tools_wire.clone(),
-                );
-                if estimate_request_tokens(&candidate, max_tokens) <= window as u64 {
-                    selected = Some(candidate);
-                    break;
-                }
-            }
+    let conversation = match fit_conversation(
+        &configuration.frozen,
+        prior_turns,
+        input_record.objective.as_deref(),
+        &images,
+        workspace_root,
+        tools_wire,
+        context_limits,
+    ) {
+        Some(conversation) => conversation,
+        None => {
+            let failed = FinalResult {
+                summary: Some("the request exceeds the model's context window".to_owned()),
+                code: Some("context_window_exceeded".to_owned()),
+                goal_reached: Some(false),
+                value: None,
+            };
+            let result = database
+                .finalize_job(job, JobFinalization::Failed(failed))
+                .await?;
+            return Ok(ExecutionReceipt {
+                executor,
+                input,
+                job,
+                result,
+            });
         }
-
-        match selected {
-            Some(conv) => conv,
-            None => {
-                let failed = FinalResult {
-                    summary: Some("the request exceeds the model's context window".to_owned()),
-                    code: Some("context_window_exceeded".to_owned()),
-                    goal_reached: Some(false),
-                    value: None,
-                };
-                let result = database
-                    .finalize_job(job, JobFinalization::Failed(failed))
-                    .await?;
-                return Ok(ExecutionReceipt {
-                    executor,
-                    input,
-                    job,
-                    result,
-                });
-            }
-        }
-    } else {
-        assemble_conversation(
-            &configuration.frozen,
-            &prior_turns,
-            false,
-            input_record.objective.as_deref(),
-            &images,
-            workspace_root,
-            tools_wire.clone(),
-        )
     };
 
     let frozen = &configuration.frozen;
@@ -2015,10 +2175,7 @@ async fn run_started_provider_job(
         },
         conversation,
         plan.tools.as_ref(),
-        ContextLimits {
-            context_window,
-            max_tokens,
-        },
+        context_limits,
         &config.cancellation,
         tool_may_have_run,
         async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
@@ -2321,12 +2478,6 @@ pub(crate) async fn run_provider_job_with_window(
         finalize_claim_error(&database, job, error, tool_may_have_run.get()).await;
     }
     result
-}
-
-#[derive(Clone, Copy, Default)]
-struct ContextLimits {
-    context_window: Option<u32>,
-    max_tokens: Option<u32>,
 }
 
 async fn run_provider_job_inner(
