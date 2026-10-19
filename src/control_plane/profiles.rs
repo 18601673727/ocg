@@ -175,6 +175,8 @@ enum WireProfileRequest {
         name: String,
         model: String,
         #[serde(default)]
+        context_window: Option<u32>,
+        #[serde(default)]
         protocol: Option<String>,
         #[serde(default)]
         endpoint: Option<String>,
@@ -429,6 +431,7 @@ async fn build_profiles_snapshot(
                     "id": id_str,
                     "name": record.name,
                     "model": model.model,
+                    "context_window": model.context_window,
                     "protocol": protocol,
                     "endpoint": connection.endpoint,
                     "credential_ref": connection.credential_ref,
@@ -525,6 +528,7 @@ pub(super) async fn save_profile(
         WireProfileRequest::Llm {
             name,
             model,
+            context_window,
             protocol,
             endpoint,
             credential_ref,
@@ -690,6 +694,7 @@ pub(super) async fn save_profile(
                 body: ConfigBody::Model(ModelConfig {
                     connection_id: connection,
                     model: model.trim().to_owned(),
+                    context_window,
                     parameters: LlmParameters {
                         temperature: parameters.temperature,
                         top_p: parameters.top_p,

@@ -3501,6 +3501,7 @@ pub(crate) mod tests {
             llm: crate::persistence::FrozenLlmConfig {
                 config: crate::persistence::LlmConfig {
                     model: "model-a".to_owned(),
+                    context_window: None,
                     parameters: LlmParameters::default(),
                     declared_capabilities: Default::default(),
                 },
@@ -3685,6 +3686,7 @@ pub(crate) mod tests {
             llm: crate::persistence::FrozenLlmConfig {
                 config: crate::persistence::LlmConfig {
                     model: "model-v".to_owned(),
+                    context_window: None,
                     parameters: LlmParameters::default(),
                     declared_capabilities: Default::default(),
                 },

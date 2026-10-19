@@ -530,6 +530,7 @@ fn register_targets(
         body: ConfigBody::Model(ModelConfig {
             connection_id: connection,
             model: model.to_owned(),
+            context_window: None,
             parameters: LlmParameters {
                 max_tokens: Some(max_tokens),
                 ..LlmParameters::default()

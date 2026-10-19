@@ -5,11 +5,11 @@ use super::*;
 /// [`crate::openai_compatible::MAX_TOOL_ARGUMENTS_BYTES`].
 pub const MAX_STORED_TOOL_ARGUMENTS_BYTES: usize = 64 * 1024;
 /// The largest sum of the recorded arguments of one Job's admitted calls.
-pub const MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES: usize = 256 * 1024;
+pub const MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES: usize = 4 * 1024 * 1024;
 /// The largest sum of the parameter schemas recorded with one Job's
 /// admitted calls. Each admission records the schema its arguments were
 /// checked against, so this bounds what repeated calls of a tool store.
-pub const MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES: usize = 1024 * 1024;
+pub const MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES: usize = 4 * 1024 * 1024;
 /// The longest handler version a tool may declare.
 pub const MAX_HANDLER_VERSION_BYTES: usize = 64;
 pub(super) const MAX_RECONCILER_BYTES: usize = 256;

@@ -452,6 +452,7 @@ pub struct LlmParameters {
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmConfig {
     pub model: String,
+    pub context_window: Option<u32>,
     pub parameters: LlmParameters,
     /// What the user states the model supports. Observed capability check
     /// results never change it.
@@ -505,6 +506,7 @@ pub struct ConnectionConfig {
 pub struct ModelConfig {
     pub connection_id: ConfigId,
     pub model: String,
+    pub context_window: Option<u32>,
     pub parameters: LlmParameters,
     pub declared_capabilities: BTreeSet<ModelCapability>,
 }

@@ -119,6 +119,7 @@ pub async fn targets(
     let model = ModelConfig {
         connection_id,
         model: target.model.clone(),
+        context_window: None,
         parameters: LlmParameters::default(),
         declared_capabilities: target.capabilities.clone(),
     };

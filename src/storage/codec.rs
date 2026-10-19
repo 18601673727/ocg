@@ -90,6 +90,7 @@ impl Enc {
     }
     pub(super) fn llm_config(&mut self, llm: &LlmConfig) {
         self.str(&llm.model);
+        self.ou32(llm.context_window);
         let parameters = &llm.parameters;
         self.of64(parameters.temperature);
         self.of64(parameters.top_p);
@@ -277,6 +278,7 @@ impl<'a> Dec<'a> {
     }
     pub(super) fn llm_config(&mut self) -> DecodeResult<LlmConfig> {
         let model = self.str()?;
+        let context_window = self.ou32()?;
         let parameters = LlmParameters {
             temperature: self.of64()?,
             top_p: self.of64()?,
@@ -292,6 +294,7 @@ impl<'a> Dec<'a> {
         }
         Ok(LlmConfig {
             model,
+            context_window,
             parameters,
             declared_capabilities,
         })

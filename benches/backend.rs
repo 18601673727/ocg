@@ -269,6 +269,7 @@ fn executor(handle: &DatabaseHandle) -> Result<Target> {
         body: ConfigBody::Model(ModelConfig {
             connection_id: connection,
             model: "benchmark".into(),
+            context_window: None,
             parameters: Default::default(),
             declared_capabilities: Default::default(),
         }),
@@ -457,6 +458,7 @@ fn setup_scheduler_pools(handle: &DatabaseHandle) -> Result<Target> {
         body: ConfigBody::Model(ModelConfig {
             connection_id: connection,
             model: "benchmark".into(),
+            context_window: None,
             parameters: Default::default(),
             declared_capabilities: Default::default(),
         }),

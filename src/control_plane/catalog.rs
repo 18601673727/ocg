@@ -94,6 +94,7 @@ pub(super) async fn job_input(database: &DatabaseHandle, job: JobId) -> Result<R
             "agent_profile": submitted.agent_profile.map(|profile| profile.to_string()),
             "llm_profile": submitted.llm_profile.to_string(),
             "model": submitted.frozen.llm.config.model,
+            "context_window": submitted.frozen.llm.config.context_window,
         })
     });
     Ok(Reply::ok(json!({
@@ -148,6 +149,7 @@ pub(super) async fn job_conversation(
                 "agent_profile": submitted.agent_profile.map(|profile| profile.to_string()),
                 "llm_profile": submitted.llm_profile.to_string(),
                 "model": submitted.frozen.llm.config.model,
+                "context_window": submitted.frozen.llm.config.context_window,
             })
         });
         let outputs = database.job_outputs(current, None, 1_000).await?;
@@ -225,6 +227,7 @@ pub(super) async fn agent_profiles(
                 "id": ProfileId::from(llm.id).to_string(),
                 "name": llm.name,
                 "model": model.model,
+                "context_window": model.context_window,
                 "declared_capabilities": model
                     .declared_capabilities
                     .iter()

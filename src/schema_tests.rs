@@ -157,6 +157,7 @@ fn provider(handle: &DatabaseHandle, name: &str) -> LlmProviderId {
 #[derive(Clone)]
 struct LlmConfig {
     model: String,
+    context_window: Option<u32>,
     parameters: LlmParameters,
     declared_capabilities: BTreeSet<ModelCapability>,
 }
@@ -178,6 +179,7 @@ fn connection(handle: &DatabaseHandle, name: &str, endpoint: Option<String>) -> 
 fn llm_config(model: &str, declared: &[ModelCapability]) -> LlmConfig {
     LlmConfig {
         model: model.into(),
+        context_window: None,
         parameters: LlmParameters {
             temperature: Some(0.2),
             max_tokens: Some(256),
@@ -193,6 +195,7 @@ fn llm_profile(handle: &DatabaseHandle, provider: LlmProviderId, config: LlmConf
         body: ConfigBody::Model(ModelConfig {
             connection_id: provider.into(),
             model: config.model,
+            context_window: config.context_window,
             parameters: config.parameters,
             declared_capabilities: config.declared_capabilities,
         }),
@@ -8009,17 +8012,27 @@ mod requests_and_tool_loop {
         let run = local_run(&handle, llm);
         let (registry, calls) = echo_registry(ToolEffect::NonIdempotent, json!({"echoed": true}));
         let sixty = || text_arguments("", 60 * 1024);
+        let calls_r1: Vec<_> = (0..66)
+            .map(|i| (i as u32, format!("r1_{i}"), "echo", sixty()))
+            .collect();
+        let calls_r2: Vec<_> = (0..3)
+            .map(|i| (i as u32, format!("r2_{i}"), "echo", sixty()))
+            .collect();
+        let calls_r1_refs: Vec<_> = calls_r1
+            .iter()
+            .map(|(i, id, name, args)| (*i, id.as_str(), *name, args.clone()))
+            .collect();
+        let calls_r2_refs: Vec<_> = calls_r2
+            .iter()
+            .map(|(i, id, name, args)| (*i, id.as_str(), *name, args.clone()))
+            .collect();
         let looped = run_loop(
             &handle,
             run,
             Some(execution(&registry, &["echo"], ToolLoopLimits::default())),
             vec![
-                calling_in_fragments(&[(0, "a", "echo", sixty()), (1, "b", "echo", sixty())]),
-                calling_in_fragments(&[
-                    (0, "c", "echo", sixty()),
-                    (1, "d", "echo", sixty()),
-                    (2, "e", "echo", sixty()),
-                ]),
+                calling_in_fragments(&calls_r1_refs),
+                calling_in_fragments(&calls_r2_refs),
             ],
             CancellationToken::default(),
             |_| {},
@@ -8032,28 +8045,16 @@ mod requests_and_tool_loop {
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
+            66,
             "no call of the response over the limit ran"
         );
         let records = evidence(&handle, run.job);
+        assert_eq!(records.len(), 67);
         assert_eq!(
-            records
-                .iter()
-                .map(|record| (
-                    record.call,
-                    record.outcome.as_ref().map(|outcome| outcome.fact.kind())
-                ))
-                .collect::<Vec<_>>(),
-            [
-                (tool_call(run.job, 1, 0), Some(ToolOutcomeKind::Completed)),
-                (tool_call(run.job, 1, 1), Some(ToolOutcomeKind::Completed)),
-                (tool_call(run.job, 2, 2), None),
-            ]
-        );
-        assert_eq!(
-            records[2].decision.fact,
+            records.last().unwrap().decision.fact,
             ToolDecision::Refused(ToolCallRefusal::LimitExceeded)
         );
+        assert_eq!(records.last().unwrap().call, tool_call(run.job, 2, 2));
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
     }
@@ -11814,6 +11815,7 @@ mod requests_and_tool_loop {
                             body: ConfigBody::Model(ModelConfig {
                                 connection_id: provider.into(),
                                 model: hosted.model,
+                                context_window: hosted.context_window,
                                 parameters: hosted.parameters,
                                 declared_capabilities: hosted.declared_capabilities,
                             }),
@@ -12424,6 +12426,7 @@ mod requests_and_tool_loop {
                     "agent_profile": configured.agent.to_string(),
                     "llm_profile": configured.targeted.to_string(),
                     "model": "c2-input",
+                    "context_window": Value::Null,
                 })
             );
             let record = wait(handle.job(with_agent)).expect("read").expect("a Job");
@@ -16864,6 +16867,209 @@ mod requests_and_tool_loop {
                 "it timed out"
             );
             wait(runtime.shutdown()).expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+    }
+
+    mod context_and_limits {
+        use super::*;
+        use crate::openai_compatible::{ChatMessage, ContentPartWire, MessageContentWire};
+        use crate::orchestration::execution_runtime::{
+            OMITTED_NOTICE, assemble_conversation, estimate_request_tokens,
+            run_provider_job_with_window,
+        };
+        use crate::persistence::{
+            MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES,
+        };
+
+        #[test]
+        fn item_1_context_window_profile_codec_and_freeze() {
+            let (_root, directory) = data_directory("item1-context-window-freeze");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let provider = connection(&handle, "cw-prov", None);
+            let mut config = llm_config("model-cw", &[ModelCapability::Chat]);
+            config.context_window = Some(32_768);
+            let llm = llm_profile(&handle, provider, config);
+
+            let run = local_run(&handle, llm);
+            let frozen = wait(handle.job_configuration(run.job))
+                .expect("read configuration")
+                .expect("configured")
+                .frozen;
+            assert_eq!(frozen.llm.config.context_window, Some(32_768));
+            assert_eq!(frozen.llm.config.model, "model-cw");
+
+            // Reopen database to verify storage codec decode
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            let handle = worker.handle();
+            let reopened = wait(handle.job_configuration(run.job))
+                .expect("read configuration")
+                .expect("configured")
+                .frozen;
+            assert_eq!(reopened.llm.config.context_window, Some(32_768));
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn item_2_token_estimation_and_context_window_enforcement() {
+            // 1. Estimation formula: ceil(UTF-8 bytes / 3) + 1600 * images + max_tokens (or 4096)
+            let conv = ChatConversation {
+                messages: vec![ChatMessage::user("1234567890")], // 10 bytes -> ceil(10/3) = 4 tokens
+                tools: Vec::new(),
+                ..Default::default()
+            };
+            assert_eq!(estimate_request_tokens(&conv, Some(100)), 104);
+            assert_eq!(estimate_request_tokens(&conv, None), 4100);
+
+            // With an image part (+1600 tokens)
+            let image_conv = ChatConversation {
+                messages: vec![ChatMessage::user_parts(vec![
+                    ContentPartWire::Text {
+                        text: "1234567890".to_owned(),
+                    },
+                    ContentPartWire::ImageUrl {
+                        image_url: crate::openai_compatible::ImageUrlWire {
+                            url: "data:image/png;base64,abc".to_owned(),
+                        },
+                    },
+                ])],
+                tools: Vec::new(),
+                ..Default::default()
+            };
+            assert_eq!(estimate_request_tokens(&image_conv, Some(100)), 104 + 1600);
+
+            // 2. In tool loop: stops with ToolLoopStop::ContextWindow when conversation exceeds window
+            let (_root, directory) = data_directory("item2-context-window-tool-loop");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-cw-loop");
+            let run = local_run(&handle, llm);
+            let (registry, _calls) = echo_registry(ToolEffect::NonIdempotent, json!({"ok": true}));
+
+            let provider_run = ProviderRun {
+                database: handle.clone(),
+                executor: run.executor,
+                input: run.input,
+                job: run.job,
+            };
+            let cancellation = CancellationToken::default();
+            // With context_window = 4099 and conv tokens = 4100, tool loop stops before sending
+            let receipt = on_ntex(async move {
+                run_provider_job_with_window(
+                    provider_run,
+                    conv,
+                    Some(&execution(&registry, &["echo"], ToolLoopLimits::default())),
+                    Some(4099),
+                    Some(4096),
+                    &cancellation,
+                    async |_conv: &ChatConversation, _sink: &mut DatabaseOutputSink| {
+                        panic!("provider exchange should not be called when context window exceeded");
+                    },
+                )
+                .await
+            });
+            match receipt {
+                Err(ExecutionRuntimeError::ToolLoopStopped { stop, .. }) => {
+                    assert_eq!(stop, ToolLoopStop::ContextWindow);
+                    assert_eq!(
+                        stop.to_string(),
+                        "the conversation exceeds the model's context window"
+                    );
+                }
+                other => panic!("expected ToolLoopStopped with ContextWindow, got: {other:?}"),
+            }
+            let job = job_record(&handle, run.job);
+            assert!(job.failed_at.is_some());
+
+            // 3. Assemble conversation with omitted notice
+            let frozen = wait(handle.job_configuration(run.job))
+                .expect("read")
+                .expect("configured")
+                .frozen;
+            let assembled = assemble_conversation(
+                &frozen,
+                &[(Some("prior".into()), Vec::new(), "prior answer".into())],
+                true,
+                Some("current"),
+                &[],
+                None,
+                Vec::new(),
+            );
+            let sys_text = assembled
+                .messages
+                .iter()
+                .find_map(|m| {
+                    if m.role == crate::openai_compatible::ChatRole::System {
+                        match &m.content {
+                            Some(MessageContentWire::Text(t)) => Some(t.as_str()),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .expect("system message");
+            assert!(
+                sys_text.contains(OMITTED_NOTICE),
+                "system message should contain omitted notice: {sys_text}"
+            );
+
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn item_3_unified_tool_loop_limits_and_running_totals() {
+            // Verify unified defaults
+            let limits = ToolLoopLimits::default();
+            assert_eq!(limits.max_provider_requests, 64);
+            assert_eq!(limits.max_tool_calls, 256);
+            assert_eq!(limits.max_tool_result_bytes, 16 * 1024);
+            assert_eq!(limits.max_tool_results_bytes, 1024 * 1024);
+            assert_eq!(MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, 4 * 1024 * 1024);
+            assert_eq!(MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES, 4 * 1024 * 1024);
+
+            // Verify running-counter TOOL_TOTALS enforces per-Job totals across multiple calls
+            let (_root, directory) = data_directory("item3-running-totals");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-limits");
+            let run = observed_run(&handle, llm, 1);
+            let call = |idx| tool_call(run.job, 1, idx);
+
+            // Admitting a call with large arguments (within single-call limit of 64 KiB, e.g. 60 KiB)
+            let args_chunk = text_arguments("", 60 * 1024);
+            // 4 MiB / 60 KiB = 68.26 chunks. First 68 succeed (68 * 60 KiB = 4080 KiB <= 4096 KiB)
+            for i in 0..68 {
+                wait(handle.record_tool_decision(admitted_with(
+                    call(i),
+                    &format!("call_{i}"),
+                    ToolEffect::ReadOnly,
+                    &args_chunk,
+                )))
+                .expect("fits within 4 MiB running total");
+            }
+
+            // 69th call (69 * 60 KiB = 4140 KiB > 4096 KiB) must be rejected by running total
+            let rejected = wait(handle.record_tool_decision(admitted_with(
+                call(68),
+                "call_68",
+                ToolEffect::ReadOnly,
+                &args_chunk,
+            )));
+            assert_eq!(
+                violation(rejected),
+                Violation::ToolEvidenceLimit {
+                    call: call(68),
+                    limit: "the arguments of one Job",
+                }
+            );
+
+            // Reopening database verifies running totals consistency in storage
+            worker.shutdown().expect("shutdown");
+            let worker = DatabaseWorker::start(&directory).expect("restart");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }

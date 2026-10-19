@@ -873,11 +873,8 @@ pub(crate) fn register(
 /// and a little more, so a command is stopped by its own limit first.
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     ToolLoopLimits {
-        max_provider_requests: 12,
-        max_tool_calls: 16,
-        max_tool_result_bytes: 16 * 1024,
-        max_tool_results_bytes: 64 * 1024,
         handler_timeout: timeout.saturating_add(STOP_GRACE),
+        ..ToolLoopLimits::default()
     }
 }
 
@@ -1171,10 +1168,10 @@ mod tests {
         assert_eq!(
             coding.limits,
             ToolLoopLimits {
-                max_provider_requests: 12,
-                max_tool_calls: 16,
+                max_provider_requests: 64,
+                max_tool_calls: 256,
                 max_tool_result_bytes: 16 * 1024,
-                max_tool_results_bytes: 64 * 1024,
+                max_tool_results_bytes: 1024 * 1024,
                 handler_timeout: COMMAND_TIMEOUT + STOP_GRACE,
             }
         );

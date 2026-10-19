@@ -132,6 +132,7 @@ pub(crate) fn execution_configuration(
                 body: ConfigBody::Model(ModelConfig {
                     connection_id: connection,
                     model: "fixture".into(),
+                    context_window: None,
                     parameters: Default::default(),
                     declared_capabilities: Default::default(),
                 }),

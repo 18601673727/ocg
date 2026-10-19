@@ -334,6 +334,7 @@ impl Batch {
             llm: FrozenLlmConfig {
                 config: LlmConfig {
                     model: model_body.model,
+                    context_window: model_body.context_window,
                     parameters: model_body.parameters,
                     declared_capabilities: model_body.declared_capabilities,
                 },
@@ -707,27 +708,30 @@ impl Batch {
                 .map_err(|error| BatchError(Failure::Storage(error)))?;
             return self.reject(Violation::DuplicateToolCallId { call, existing });
         }
+        let mut updated_totals = None;
         if let ToolDecision::Admitted(admission) = &decision {
-            let (mut arguments, mut schemas) =
-                (admission.arguments.len(), admission.parameters.len());
-            for record in self.job_tool_evidence(call.job)? {
-                if let Some(earlier) = record.admission() {
-                    arguments = arguments.saturating_add(earlier.arguments.len());
-                    schemas = schemas.saturating_add(earlier.parameters.len());
-                }
-            }
-            if arguments > MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES {
+            let current = self.step(|tx| {
+                Ok(tx
+                    .open_table(TOOL_TOTALS)?
+                    .get(call.job.get())?
+                    .map(|found| found.value())
+                    .unwrap_or((0, 0)))
+            })?;
+            let arguments = current.0.saturating_add(admission.arguments.len() as u64);
+            let schemas = current.1.saturating_add(admission.parameters.len() as u64);
+            if arguments > MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES as u64 {
                 return self.reject(Violation::ToolEvidenceLimit {
                     call,
                     limit: "the arguments of one Job",
                 });
             }
-            if schemas > MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES {
+            if schemas > MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES as u64 {
                 return self.reject(Violation::ToolEvidenceLimit {
                     call,
                     limit: "the schemas of one Job",
                 });
             }
+            updated_totals = Some((arguments, schemas));
         }
         let record = ToolEvidenceRecord {
             call,
@@ -748,6 +752,9 @@ impl Batch {
                 (call.job.get(), tool_call_id),
                 (call.request.get(), call.index),
             )?;
+            if let Some(totals) = updated_totals {
+                tx.open_table(TOOL_TOTALS)?.insert(call.job.get(), totals)?;
+            }
             Ok(())
         })?;
         self.probe = Some(Probe::ToolCall(call));

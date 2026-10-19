@@ -29,6 +29,7 @@ fn provision(database: &DatabaseHandle) -> (ExecutionPoolId, ProfileId) {
         body: ConfigBody::Model(ModelConfig {
             connection_id: connection,
             model: "m".into(),
+            context_window: None,
             parameters: Default::default(),
             declared_capabilities: Default::default(),
         }),

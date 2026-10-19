@@ -472,7 +472,7 @@ function jobInputRecord(input: unknown, path: string, jobId: string) {
   const value = record(input, path);
   const attachments = value.attachments;
   if (!Array.isArray(attachments)) throw new ContractError(`${path}.attachments`, "an array");
-  let configuration: { agent_profile: string | null; llm_profile: string; model: string } | null = null;
+  let configuration: { agent_profile: string | null; llm_profile: string; model: string; context_window: number | null } | null = null;
   if (value.configuration !== null) {
     const frozen = record(value.configuration, `${path}.configuration`);
     configuration = {
@@ -481,6 +481,7 @@ function jobInputRecord(input: unknown, path: string, jobId: string) {
         : identity(frozen.agent_profile, `${path}.configuration.agent_profile`, "profile:"),
       llm_profile: identity(frozen.llm_profile, `${path}.configuration.llm_profile`, "profile:"),
       model: string(frozen.model, `${path}.configuration.model`),
+      context_window: optionalInteger(frozen.context_window, `${path}.configuration.context_window`),
     };
   }
   return {
@@ -576,6 +577,7 @@ export function decodeAgentProfiles(input: unknown) {
             id: identity(llm.id, `${targetPath}.id`, "profile:"),
             name: string(llm.name, `${targetPath}.name`),
             model: string(llm.model, `${targetPath}.model`),
+            context_window: optionalInteger(llm.context_window, `${targetPath}.context_window`),
             declared_capabilities: listOf(llm.declared_capabilities, `${targetPath}.declared_capabilities`,
               (capability, capabilityPath) => {
                 const named = string(capability, capabilityPath);
@@ -610,6 +612,10 @@ function optionalFiniteNumber(value: unknown, path: string): number | null {
   return value;
 }
 
+function optionalInteger(value: unknown, path: string): number | null {
+  return value === null || value === undefined ? null : integer(value, path);
+}
+
 /**
  * Full Profile management snapshot from `GET /api/v1/profiles`,
  * `POST /api/v1/profiles`, and `POST /api/v1/profiles/{profile}`, including
@@ -634,6 +640,7 @@ export function decodeProfiles(input: unknown) {
         id: identity(llm.id, `${path}.id`, "profile:"),
         name: string(llm.name, `${path}.name`),
         model: string(llm.model, `${path}.model`),
+        context_window: optionalInteger(llm.context_window, `${path}.context_window`),
         protocol,
         endpoint: optionalString(llm.endpoint, `${path}.endpoint`),
         credential_ref: optionalString(llm.credential_ref, `${path}.credential_ref`),

@@ -315,6 +315,7 @@ impl ConfigRow {
                 e.u8(2);
                 e.u64(m.connection_id.get());
                 e.str(&m.model);
+                e.ou32(m.context_window);
                 let p = &m.parameters;
                 e.of64(p.temperature);
                 e.of64(p.top_p);
@@ -390,6 +391,7 @@ impl ConfigRow {
             ConfigKind::Model => {
                 let connection_id = ConfigId::new(d.u64()?);
                 let model = d.str()?;
+                let context_window = d.ou32()?;
                 let parameters = LlmParameters {
                     temperature: d.of64()?,
                     top_p: d.of64()?,
@@ -405,6 +407,7 @@ impl ConfigRow {
                 ConfigBody::Model(ModelConfig {
                     connection_id,
                     model,
+                    context_window,
                     parameters,
                     declared_capabilities,
                 })

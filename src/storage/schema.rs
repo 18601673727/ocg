@@ -45,6 +45,8 @@ pub(super) const CHAT_THREADS: TableDefinition<(u64, u64), ()> =
     TableDefinition::new("chat_thread");
 pub(super) const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
     TableDefinition::new("tool_call_id");
+pub(super) const TOOL_TOTALS: TableDefinition<u64, (u64, u64)> =
+    TableDefinition::new("tool_total");
 pub(super) const RETRIES: TableDefinition<(u64, u64), ()> = TableDefinition::new("retry");
 pub(super) const ATTACHMENT_REFS: TableDefinition<(u64, u64), ()> =
     TableDefinition::new("attachment_ref");

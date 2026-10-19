@@ -113,6 +113,7 @@ fn a_host_level_caller_submits_through_the_host_owned_scheduler() {
                 body: ConfigBody::Model(ModelConfig {
                     connection_id: connection,
                     model: "fixture".into(),
+                    context_window: None,
                     parameters: Default::default(),
                     declared_capabilities: Default::default(),
                 }),

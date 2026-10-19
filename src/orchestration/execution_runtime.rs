@@ -15,8 +15,9 @@ use crate::openai_compatible::image::{
     MAX_IMAGE_BYTES, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES,
 };
 use crate::openai_compatible::{
-    ChatConversation, ChatMessage, ChatToolCallWire, CompletedToolCall, ImageError, ImageInput,
-    ImageMime, InvalidToolCall, ToolCallRefusal, ToolWire,
+    ChatConversation, ChatMessage, ChatRole, ChatToolCallWire, CompletedToolCall, ContentPartWire,
+    ImageError, ImageInput, ImageMime, InvalidToolCall, MessageContentWire, ToolCallRefusal,
+    ToolWire,
 };
 use crate::orchestration::blocking;
 use crate::orchestration::tools::{
@@ -24,11 +25,12 @@ use crate::orchestration::tools::{
 };
 use crate::persistence::{
     AppendedOutput, AttachmentId, AuthorizationBasis, ExecutorId, FinalResult,
-    IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobInputId, JobOutcome,
-    MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements,
-    NewAvailabilityStat, NewJob, NewJobOutput, NewMetrics, NewSubmission, NewToolEvidence,
-    NotInvokedReason, RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
-    ToolOutcome, ToolOutcomeKind, ToolPayload, UncertainCause, Violation, WithheldReason,
+    FrozenExecutionConfig, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
+    JobInputId, JobOutcome, MAX_STORED_TOOL_ARGUMENTS_BYTES,
+    MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, NewAvailabilityStat, NewJob,
+    NewJobOutput, NewMetrics, NewSubmission, NewToolEvidence, NotInvokedReason, RequestNumber,
+    Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolOutcome, ToolOutcomeKind,
+    ToolPayload, UncertainCause, Violation, WithheldReason,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -131,10 +133,10 @@ impl ToolLoopLimits {
 impl Default for ToolLoopLimits {
     fn default() -> Self {
         Self {
-            max_provider_requests: 4,
-            max_tool_calls: 8,
+            max_provider_requests: 64,
+            max_tool_calls: 256,
             max_tool_result_bytes: 16 * 1024,
-            max_tool_results_bytes: 64 * 1024,
+            max_tool_results_bytes: 1024 * 1024,
             handler_timeout: Duration::from_secs(10),
         }
     }
@@ -185,6 +187,8 @@ pub enum ToolLoopStop {
         index: u32,
         outcome: Option<ToolOutcomeKind>,
     },
+    /// The conversation would exceed the model's context window.
+    ContextWindow,
 }
 
 impl ToolLoopStop {
@@ -247,6 +251,9 @@ impl std::fmt::Display for ToolLoopStop {
                     formatter,
                     "the evidence of tool call {index} could not be recorded"
                 )
+            }
+            Self::ContextWindow => {
+                formatter.write_str("the conversation exceeds the model's context window")
             }
         }
     }
@@ -1651,6 +1658,147 @@ async fn admit_provider_job(
     ))
 }
 
+pub(crate) const OMITTED_NOTICE: &str =
+    "Earlier turns of this conversation were omitted to fit the model's context window.";
+
+fn append_omitted_notice(conversation: &mut ChatConversation) {
+    if let Some(sys_msg) = conversation
+        .messages
+        .iter_mut()
+        .find(|m| m.role == ChatRole::System)
+    {
+        match &mut sys_msg.content {
+            Some(MessageContentWire::Text(text)) => {
+                if !text.is_empty() && !text.ends_with("\n\n") {
+                    if text.ends_with('\n') {
+                        text.push('\n');
+                    } else {
+                        text.push_str("\n\n");
+                    }
+                }
+                text.push_str(OMITTED_NOTICE);
+            }
+            Some(MessageContentWire::Parts(parts)) => {
+                parts.push(ContentPartWire::Text {
+                    text: format!("\n\n{OMITTED_NOTICE}"),
+                });
+            }
+            None => {
+                sys_msg.content = Some(MessageContentWire::Text(OMITTED_NOTICE.to_owned()));
+            }
+        }
+    } else {
+        conversation
+            .messages
+            .insert(0, ChatMessage::system(OMITTED_NOTICE));
+    }
+}
+
+pub(crate) fn assemble_conversation(
+    frozen: &FrozenExecutionConfig,
+    prior_turns: &[(Option<String>, Vec<ImageInput>, String)],
+    omitted_notice: bool,
+    current_objective: Option<&str>,
+    current_images: &[ImageInput],
+    workspace_root: Option<&std::path::Path>,
+    tools: Vec<ToolWire>,
+) -> ChatConversation {
+    let mut conversation = provider_execution::objective_conversation(frozen, None);
+    conversation.messages.pop();
+
+    if omitted_notice {
+        append_omitted_notice(&mut conversation);
+    }
+
+    for (turn_objective, turn_images, assistant_text) in prior_turns {
+        if let Some(user_msg) = provider_execution::objective_conversation_with_images(
+            frozen,
+            turn_objective.as_deref(),
+            turn_images,
+        )
+        .messages
+        .pop()
+        {
+            conversation.messages.push(user_msg);
+        }
+        conversation
+            .messages
+            .push(ChatMessage::assistant(Some(assistant_text.clone()), Vec::new()));
+    }
+
+    if let Some(user_msg) = provider_execution::objective_conversation_with_images(
+        frozen,
+        current_objective,
+        current_images,
+    )
+    .messages
+    .pop()
+    {
+        conversation.messages.push(user_msg);
+    }
+
+    if let Some(root) = workspace_root {
+        provider_execution::ground_workspace(&mut conversation, root);
+    }
+    conversation.tools = tools;
+    conversation
+}
+
+/// Estimates the token count of a conversation request under conservative assumptions:
+/// `ceil(UTF-8 bytes / 3)` over all message text, tool arguments, tool results, and
+/// offered tool schemas, plus 1,600 tokens per image, plus `max_tokens` (or 4,096
+/// when unset).
+pub(crate) fn estimate_request_tokens(
+    conversation: &ChatConversation,
+    max_tokens: Option<u32>,
+) -> u64 {
+    let mut bytes: usize = 0;
+    let mut images: usize = 0;
+
+    for message in &conversation.messages {
+        if let Some(content) = &message.content {
+            match content {
+                MessageContentWire::Text(text) => {
+                    bytes = bytes.saturating_add(text.len());
+                }
+                MessageContentWire::Parts(parts) => {
+                    for part in parts {
+                        match part {
+                            ContentPartWire::Text { text } => {
+                                bytes = bytes.saturating_add(text.len());
+                            }
+                            ContentPartWire::ImageUrl { .. } => {
+                                images = images.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(reasoning) = &message.reasoning_content {
+            bytes = bytes.saturating_add(reasoning.len());
+        }
+        if let Some(calls) = &message.tool_calls {
+            for call in calls {
+                bytes = bytes.saturating_add(call.function.arguments.len());
+            }
+        }
+    }
+
+    for tool in &conversation.tools {
+        if let Some(parameters) = &tool.function.parameters {
+            bytes = bytes.saturating_add(parameters.to_string().len());
+        }
+    }
+
+    let text_tokens = bytes.div_ceil(3) as u64;
+    let image_tokens = (images as u64).saturating_mul(1600);
+    let output_tokens = max_tokens.map_or(4096, u64::from);
+    text_tokens
+        .saturating_add(image_tokens)
+        .saturating_add(output_tokens)
+}
+
 /// Runs a provider plan whose Job was started to its settlement.
 async fn run_started_provider_job(
     database: DatabaseHandle,
@@ -1725,12 +1873,12 @@ async fn run_started_provider_job(
             return refused(format!("the input's attachments cannot be sent: {error}")).await;
         }
     };
-    let mut conversation = if let Some(first_previous) = job_record.previous {
+    let mut prior_turns = Vec::new();
+    if let Some(first_previous) = job_record.previous {
         const MAX_CONVERSATION_TURNS: usize = 64;
         let genesis = database.genesis();
         let mut visited = std::collections::BTreeSet::new();
         visited.insert(job);
-        let mut prior_turns = Vec::new();
         let mut cursor = Some(first_previous);
         while let Some(current) = cursor {
             if visited.len() >= MAX_CONVERSATION_TURNS {
@@ -1784,45 +1932,77 @@ async fn run_started_provider_job(
             prior_turns.push((ancestor_input.objective, ancestor_images, assistant_text));
         }
         prior_turns.reverse();
-        let mut built = provider_execution::objective_conversation(&configuration.frozen, None);
-        built.messages.pop();
-        for (turn_objective, turn_images, assistant_text) in prior_turns {
-            if let Some(user_msg) = provider_execution::objective_conversation_with_images(
-                &configuration.frozen,
-                turn_objective.as_deref(),
-                &turn_images,
-            )
-            .messages
-            .pop()
-            {
-                built.messages.push(user_msg);
+    }
+
+    let context_window = configuration.frozen.llm.config.context_window;
+    let max_tokens = configuration.frozen.llm.config.parameters.max_tokens;
+    let tools_wire = offered.unwrap_or_default();
+
+    let conversation = if let Some(window) = context_window {
+        let total_priors = prior_turns.len();
+        let mut selected = None;
+
+        let full = assemble_conversation(
+            &configuration.frozen,
+            &prior_turns,
+            false,
+            input_record.objective.as_deref(),
+            &images,
+            workspace_root,
+            tools_wire.clone(),
+        );
+        if estimate_request_tokens(&full, max_tokens) <= window as u64 {
+            selected = Some(full);
+        } else {
+            for drop_count in 1..=total_priors {
+                let candidate = assemble_conversation(
+                    &configuration.frozen,
+                    &prior_turns[drop_count..],
+                    true,
+                    input_record.objective.as_deref(),
+                    &images,
+                    workspace_root,
+                    tools_wire.clone(),
+                );
+                if estimate_request_tokens(&candidate, max_tokens) <= window as u64 {
+                    selected = Some(candidate);
+                    break;
+                }
             }
-            built
-                .messages
-                .push(ChatMessage::assistant(Some(assistant_text), Vec::new()));
         }
-        if let Some(user_msg) = provider_execution::objective_conversation_with_images(
-            &configuration.frozen,
-            input_record.objective.as_deref(),
-            &images,
-        )
-        .messages
-        .pop()
-        {
-            built.messages.push(user_msg);
+
+        match selected {
+            Some(conv) => conv,
+            None => {
+                let failed = FinalResult {
+                    summary: Some("the request exceeds the model's context window".to_owned()),
+                    code: Some("context_window_exceeded".to_owned()),
+                    goal_reached: Some(false),
+                    value: None,
+                };
+                let result = database
+                    .finalize_job(job, JobFinalization::Failed(failed))
+                    .await?;
+                return Ok(ExecutionReceipt {
+                    executor,
+                    input,
+                    job,
+                    result,
+                });
+            }
         }
-        built
     } else {
-        provider_execution::objective_conversation_with_images(
+        assemble_conversation(
             &configuration.frozen,
+            &prior_turns,
+            false,
             input_record.objective.as_deref(),
             &images,
+            workspace_root,
+            tools_wire.clone(),
         )
     };
-    if let Some(root) = workspace_root {
-        provider_execution::ground_workspace(&mut conversation, root);
-    }
-    conversation.tools = offered.unwrap_or_default();
+
     let frozen = &configuration.frozen;
     let resolver = plan.credential_resolver.as_ref();
     let config = &plan.provider_config;
@@ -1835,6 +2015,10 @@ async fn run_started_provider_job(
         },
         conversation,
         plan.tools.as_ref(),
+        ContextLimits {
+            context_window,
+            max_tokens,
+        },
         &config.cancellation,
         tool_may_have_run,
         async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
@@ -2092,6 +2276,31 @@ pub(crate) async fn run_provider_job(
         &mut DatabaseOutputSink,
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    run_provider_job_with_window(
+        run,
+        conversation,
+        tools,
+        None,
+        None,
+        cancellation,
+        exchange,
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_provider_job_with_window(
+    run: ProviderRun,
+    conversation: ChatConversation,
+    tools: Option<&ToolExecution>,
+    context_window: Option<u32>,
+    max_tokens: Option<u32>,
+    cancellation: &CancellationToken,
+    exchange: impl AsyncFnMut(
+        &ChatConversation,
+        &mut DatabaseOutputSink,
+    ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let database = run.database.clone();
     let job = run.job;
     let tool_may_have_run = Cell::new(false);
@@ -2099,6 +2308,10 @@ pub(crate) async fn run_provider_job(
         run,
         conversation,
         tools,
+        ContextLimits {
+            context_window,
+            max_tokens,
+        },
         cancellation,
         &tool_may_have_run,
         exchange,
@@ -2110,10 +2323,17 @@ pub(crate) async fn run_provider_job(
     result
 }
 
+#[derive(Clone, Copy, Default)]
+struct ContextLimits {
+    context_window: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
 async fn run_provider_job_inner(
     run: ProviderRun,
     mut conversation: ChatConversation,
     tools: Option<&ToolExecution>,
+    context_limits: ContextLimits,
     cancellation: &CancellationToken,
     tool_may_have_run: &Cell<bool>,
     mut exchange: impl AsyncFnMut(
@@ -2125,6 +2345,12 @@ async fn run_provider_job_inner(
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
         // Nothing was sent, so nothing of a Provider is recorded.
         let stopped = Stopped::from(ToolLoopStop::InvalidLimits(error));
+        return stop_tool_loop(run, sink, None, stopped).await;
+    }
+    if let Some(window) = context_limits.context_window
+        && estimate_request_tokens(&conversation, context_limits.max_tokens) > window as u64
+    {
+        let stopped = Stopped::from(ToolLoopStop::ContextWindow);
         return stop_tool_loop(run, sink, None, stopped).await;
     }
     let mut budget = ToolBudget::default();
@@ -2235,6 +2461,17 @@ async fn run_provider_job_inner(
             conversation
                 .messages
                 .push(ChatMessage::tool(call.id.clone(), content));
+        }
+        if let Some(window) = context_limits.context_window
+            && estimate_request_tokens(&conversation, context_limits.max_tokens) > window as u64
+        {
+            return stop_tool_loop(
+                run,
+                sink,
+                Some(&result),
+                Stopped::from(ToolLoopStop::ContextWindow),
+            )
+            .await;
         }
         sink.request = next;
         round += 1;

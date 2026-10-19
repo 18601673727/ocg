@@ -688,6 +688,7 @@ mod tests {
             frozen: FrozenLlmConfig {
                 config: LlmConfig {
                     model: "model".to_owned(),
+                    context_window: None,
                     parameters: LlmParameters::default(),
                     declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
                 },
