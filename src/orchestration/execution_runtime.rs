@@ -363,16 +363,17 @@ pub enum ExecutionRuntimeError {
         evidence: Option<Box<DatabaseError>>,
         observations: Option<Box<DatabaseError>>,
     },
-    /// The Provider answered, but the Job's outcome could not be recorded.
-    /// The Job is left as it was, started and unsettled, and keeps its Profiles
-    /// and its local execution claim until it is settled, at the latest by a
-    /// later start of the database; see [`DatabaseHandle::abandoned_at_open`].
+    /// The Job's outcome could not be recorded. The runtime retries the same
+    /// settlement once. If that also fails, open reconcile records
+    /// Unknown/Abandoned at the next start of the database; see
+    /// [`DatabaseHandle::abandoned_at_open`].
     /// What the Provider was observed to do is still recorded, apart from
     /// `observations`, the first observation that could not be written.
-    #[error("the Provider answered but the Job was not settled: {source}")]
+    #[error("the Job's outcome was not recorded: {source}")]
     NotSettled {
         source: DatabaseError,
         observations: Option<Box<DatabaseError>>,
+        settlement: Box<JobFinalization>,
     },
 }
 
@@ -1503,12 +1504,17 @@ async fn dispatch_runtime(
                 }
                 let mut retry_next = BTreeSet::new();
                 for job in std::mem::take(&mut unconfirmed_stopped) {
-                    match database.confirm_job_stopped(job).await {
+                    let result = database.confirm_job_stopped(job).await;
+                    if retry_stop_confirmation(&result) {
+                        retry_next.insert(job);
+                    }
+                    match result {
                         Ok(())
-                        | Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => {}
-                        Err(DatabaseError::Rejected(Violation::StopNeedsUnknownOutcome(_))) => {
-                            retry_next.insert(job);
-                        }
+                        | Err(DatabaseError::Rejected(
+                            Violation::StopAlreadyConfirmed(_)
+                            | Violation::StopNeedsUnknownOutcome(_)
+                            | Violation::StopNeedsOutcome(_),
+                        )) => {}
                         Err(error) => {
                             log::warn!(
                                 "failed to confirm job stop after process group cleanup: {error}"
@@ -1751,6 +1757,35 @@ async fn finish_grant(database: &DatabaseHandle, job: JobId, running: RunningExe
     }
 }
 
+fn retry_stop_confirmation(result: &Result<(), DatabaseError>) -> bool {
+    match result {
+        Ok(()) => false,
+        Err(DatabaseError::Rejected(violation)) => {
+            matches!(violation, Violation::StopNeedsOutcome(_))
+        }
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn claim_error_finalization(
+    error: &ExecutionRuntimeError,
+    tool_may_have_run: bool,
+) -> JobFinalization {
+    match error {
+        ExecutionRuntimeError::NotSettled { settlement, .. } => (**settlement).clone(),
+        _ if tool_may_have_run => JobFinalization::Unknown,
+        ExecutionRuntimeError::ToolLoopNotSettled { stop, .. } if stop.is_unknown() => {
+            JobFinalization::Unknown
+        }
+        _ => JobFinalization::Failed(FinalResult {
+            summary: Some(error.to_string()),
+            code: None,
+            goal_reached: Some(false),
+            value: None,
+        }),
+    }
+}
+
 async fn finalize_claim_error(
     database: &DatabaseHandle,
     job: JobId,
@@ -1765,16 +1800,7 @@ async fn finalize_claim_error(
     ) {
         return;
     }
-    let outcome = if tool_may_have_run {
-        JobFinalization::Unknown
-    } else {
-        JobFinalization::Failed(FinalResult {
-            summary: Some(error.to_string()),
-            code: None,
-            goal_reached: Some(false),
-            value: None,
-        })
-    };
+    let outcome = claim_error_finalization(error, tool_may_have_run);
     match database.finalize_job(job, outcome).await {
         Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
         Err(failure) => log::error!(
@@ -1822,17 +1848,20 @@ fn spawn_grant(
                     executor: binding.pool.into(),
                 };
                 if execution.cancellation.is_cancelled() {
+                    let settlement = JobFinalization::Cancelled(FinalResult {
+                        summary: Some("stopped before execution".into()),
+                        code: None,
+                        goal_reached: None,
+                        value: None,
+                    });
                     let result = database
-                        .finalize_job(
-                            job,
-                            JobFinalization::Cancelled(FinalResult {
-                                summary: Some("stopped before execution".into()),
-                                code: None,
-                                goal_reached: None,
-                                value: None,
-                            }),
-                        )
-                        .await?;
+                        .finalize_job(job, settlement.clone())
+                        .await
+                        .map_err(|source| ExecutionRuntimeError::NotSettled {
+                            source,
+                            observations: None,
+                            settlement: Box::new(settlement),
+                        })?;
                     return Ok(ExecutionReceipt {
                         job,
                         executor: started.executor,
@@ -1842,9 +1871,15 @@ fn spawn_grant(
                 }
                 match execution.execution {
                     PendingPlan::Plan(outcome, result) => {
+                        let settlement = outcome.finalization(result);
                         let result = database
-                            .finalize_job(job, outcome.finalization(result))
-                            .await?;
+                            .finalize_job(job, settlement.clone())
+                            .await
+                            .map_err(|source| ExecutionRuntimeError::NotSettled {
+                                source,
+                                observations: None,
+                                settlement: Box::new(settlement),
+                            })?;
                         Ok(ExecutionReceipt {
                             job,
                             executor: started.executor,
@@ -3585,34 +3620,25 @@ pub(crate) async fn finish_provider_job(
     let receipt = match execution {
         Ok(result) => {
             let mut refused = None;
-            let settled = match database
-                .finalize_job(
-                    job,
-                    JobFinalization::Completed(FinalResult {
-                        summary: Some(result.text.clone()),
-                        code: None,
-                        goal_reached: None,
-                        value: Some(provider_execution::result_value(&result)),
-                    }),
-                )
-                .await
-            {
+            let mut settlement = JobFinalization::Completed(FinalResult {
+                summary: Some(result.text.clone()),
+                code: None,
+                goal_reached: None,
+                value: Some(provider_execution::result_value(&result)),
+            });
+            let settled = match database.finalize_job(job, settlement.clone()).await {
                 Err(DatabaseError::Rejected(
                     violation @ Violation::UnsatisfiedDependency { .. },
                 )) => {
-                    let settled = database
-                        .finalize_job(
-                            job,
-                            JobFinalization::Failed(FinalResult {
-                                summary: Some(format!(
-                                    "the Provider answered, but the Job cannot complete: {violation}"
-                                )),
-                                code: None,
-                                goal_reached: Some(false),
-                                value: Some(provider_execution::result_value(&result)),
-                            }),
-                        )
-                        .await;
+                    settlement = JobFinalization::Failed(FinalResult {
+                        summary: Some(format!(
+                            "the Provider answered, but the Job cannot complete: {violation}"
+                        )),
+                        code: None,
+                        goal_reached: Some(false),
+                        value: Some(provider_execution::result_value(&result)),
+                    });
+                    let settled = database.finalize_job(job, settlement.clone()).await;
                     refused = Some(violation);
                     settled
                 }
@@ -3630,6 +3656,7 @@ pub(crate) async fn finish_provider_job(
                     return Err(ExecutionRuntimeError::NotSettled {
                         source,
                         observations: gap.map(Box::new),
+                        settlement: Box::new(settlement),
                     });
                 }
             };
@@ -3654,6 +3681,17 @@ pub(crate) async fn finish_provider_job(
                 Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
                     gap.get_or_insert(source);
                     *receipt
+                }
+                Err(ExecutionRuntimeError::NotSettled {
+                    source,
+                    observations: None,
+                    settlement,
+                }) => {
+                    return Err(ExecutionRuntimeError::NotSettled {
+                        source,
+                        observations: gap.map(Box::new),
+                        settlement,
+                    });
                 }
                 Err(error) => return Err(error),
             }
@@ -3804,20 +3842,25 @@ pub(crate) async fn settle_provider_error(
             | ProviderExecutionError::Stopped { .. }
             | ProviderExecutionError::OutputPersistence { .. }
     );
-    let result = if unknown {
-        database.finalize_job(job, JobFinalization::Unknown).await?
+    let settlement = if unknown {
+        JobFinalization::Unknown
     } else {
-        database
-            .finalize_job(
-                job,
-                JobFinalization::Failed(FinalResult {
-                    summary: Some(error.to_string()),
-                    code: None,
-                    goal_reached: Some(false),
-                    value: None,
-                }),
-            )
-            .await?
+        JobFinalization::Failed(FinalResult {
+            summary: Some(error.to_string()),
+            code: None,
+            goal_reached: Some(false),
+            value: None,
+        })
+    };
+    let result = match database.finalize_job(job, settlement.clone()).await {
+        Ok(result) => result,
+        Err(source) => {
+            return Err(ExecutionRuntimeError::NotSettled {
+                source,
+                observations: None,
+                settlement: Box::new(settlement),
+            });
+        }
     };
     let receipt = ExecutionReceipt {
         executor,
@@ -3857,6 +3900,40 @@ mod failure_tests {
     use crate::test_support::{
         data_directory, execution_configuration, on_system, poll_once, wait,
     };
+
+    #[test]
+    fn stop_confirmation_retries_only_pending_outcomes_and_database_failures() {
+        let job = JobId::new(1);
+        for (result, expected) in [
+            (Ok(()), false),
+            (
+                Err(DatabaseError::Rejected(Violation::StopNeedsOutcome(job))),
+                true,
+            ),
+            (
+                Err(DatabaseError::Rejected(Violation::StopNeedsUnknownOutcome(
+                    job,
+                ))),
+                false,
+            ),
+            (
+                Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(
+                    job,
+                ))),
+                false,
+            ),
+            (Err(DatabaseError::QueueFull), true),
+            (
+                Err(DatabaseError::OutcomeUnknown {
+                    operation: crate::persistence::OperationId::new(1, 1),
+                    cause: crate::database::UnknownCause::WorkerStopped,
+                }),
+                true,
+            ),
+        ] {
+            assert_eq!(retry_stop_confirmation(&result), expected, "{result:?}");
+        }
+    }
 
     #[test]
     fn provider_network_database_output_preserves_whitespace_flushes() {

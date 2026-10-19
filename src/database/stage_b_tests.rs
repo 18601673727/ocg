@@ -145,6 +145,40 @@ fn consuming_claim_emits_neither_generation_unknown_release_and_recovery_are_dur
 }
 
 #[test]
+fn stop_confirmation_distinguishes_unsettled_and_completed_jobs() {
+    let (_root, directory) = data_directory("ocg-stage-b-worker", "stop-outcome");
+    let worker = DatabaseWorker::start(&directory).unwrap();
+    let database = worker.handle();
+    let (pool, llm) = provision(&database);
+    let job = pending(&database, llm);
+    wait(database.claim_execution(ClaimRequest {
+        job,
+        allowed_pools: BTreeSet::from([pool]),
+    }))
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        wait(database.confirm_job_stopped(job)),
+        Err(DatabaseError::Rejected(Violation::StopNeedsOutcome(id))) if id == job
+    ));
+    wait(database.finalize_job(
+        job,
+        JobFinalization::Completed(FinalResult {
+            summary: Some("done".into()),
+            code: None,
+            goal_reached: None,
+            value: None,
+        }),
+    ))
+    .unwrap();
+    assert!(matches!(
+        wait(database.confirm_job_stopped(job)),
+        Err(DatabaseError::Rejected(Violation::StopNeedsUnknownOutcome(id))) if id == job
+    ));
+    worker.shutdown().unwrap();
+}
+
+#[test]
 fn an_unknown_job_without_a_spawning_call_frees_its_slot_at_once() {
     let (_root, directory) = data_directory("ocg-stage-b-worker", "no-spawn");
     let mut worker = DatabaseWorker::start(&directory).unwrap();

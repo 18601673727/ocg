@@ -156,6 +156,8 @@ pub enum Violation {
         executor: ExecutorId,
         transport: LlmTransport,
     },
+    #[error("{0} has no outcome yet, so its stop cannot be confirmed yet")]
+    StopNeedsOutcome(JobId),
     #[error("{0} has no unknown outcome, so it has no unresolved execution to confirm stopped")]
     StopNeedsUnknownOutcome(JobId),
     #[error("the execution of {0} was already confirmed stopped")]

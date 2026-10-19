@@ -4079,6 +4079,8 @@ mod lifecycle_closure {
 
     #[test]
     fn a_settlement_that_was_not_committed_confirms_no_stop() {
+        use crate::orchestration::execution_runtime::claim_error_finalization;
+
         let (_root, directory) = data_directory("uncommitted-stop");
         let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
         let handle = worker.handle();
@@ -4090,7 +4092,7 @@ mod lifecycle_closure {
         let input = record(&handle, job).input;
 
         assert!(handle.activate_filesystem_protection(space_only(&directory)));
-        match wait(settle_provider_error(
+        let error = wait(settle_provider_error(
             handle.clone(),
             executor,
             input,
@@ -4101,12 +4103,14 @@ mod lifecycle_closure {
                 facts: None,
                 finished: false,
             },
-        )) {
-            Err(ExecutionRuntimeError::Database(error)) => assert!(
-                error
+        ))
+        .expect_err("a refused settlement must fail");
+        match &error {
+            ExecutionRuntimeError::NotSettled { source, .. } => assert!(
+                source
                     .command_outcome()
                     .is_some_and(|outcome| outcome != crate::database::CommandOutcome::Unknown),
-                "the settlement was known not to commit: {error}"
+                "the settlement was known not to commit: {source}"
             ),
             other => panic!("a refused settlement must fail, got {other:?}"),
         }
@@ -4118,7 +4122,30 @@ mod lifecycle_closure {
             (None, None),
             "nothing was settled, so no stop is confirmed"
         );
-        // In format 16, profiles are always editable (no lock checks).
+        wait(handle.finalize_job(job, claim_error_finalization(&error, false)))
+            .expect("retry the same settlement");
+        let job_record = record(&handle, job);
+        assert!(job_record.unknown_at.is_some());
+        assert!(job_record.failed_at.is_none());
+        assert!(matches!(
+            claim_error_finalization(
+                &ExecutionRuntimeError::Database(DatabaseError::QueueFull),
+                false
+            ),
+            JobFinalization::Failed(_)
+        ));
+        let completed = JobFinalization::Completed(FinalResult {
+            summary: Some("done".into()),
+            code: None,
+            goal_reached: Some(true),
+            value: Some(serde_json::json!({"answer": 42})),
+        });
+        let error = ExecutionRuntimeError::NotSettled {
+            source: DatabaseError::QueueFull,
+            observations: None,
+            settlement: Box::new(completed.clone()),
+        };
+        assert_eq!(claim_error_finalization(&error, false), completed);
         worker.shutdown().expect("shutdown");
     }
 

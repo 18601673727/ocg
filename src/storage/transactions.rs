@@ -885,12 +885,12 @@ impl Batch {
     /// released.
     pub(crate) fn confirm_stop(&mut self, job: JobId) -> Result<(), BatchError> {
         let mut state = self.require_job_state(job)?;
-        if !state
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-        {
-            return self.reject(Violation::StopNeedsUnknownOutcome(job));
+        match &state.outcome {
+            None => return self.reject(Violation::StopNeedsOutcome(job)),
+            Some(outcome) if outcome.kind != OutcomeKind::Unknown => {
+                return self.reject(Violation::StopNeedsUnknownOutcome(job));
+            }
+            Some(_) => {}
         }
         if state.stop_confirmed_at.is_some() {
             return self.reject(Violation::StopAlreadyConfirmed(job));
