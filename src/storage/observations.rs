@@ -568,6 +568,7 @@ pub(crate) fn read_provider_request(
                         .into_iter()
                         .map(&value)
                         .collect::<Result<Vec<_>, _>>()?,
+                    #[allow(clippy::needless_borrows_for_generic_args)]
                     tools.map(&value).transpose()?,
                     value(parameters)?,
                 ));

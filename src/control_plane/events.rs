@@ -212,6 +212,7 @@ pub(super) async fn open(
 struct Slot(Arc<Shared>);
 
 impl Slot {
+    #[allow(deprecated)]
     fn take(shared: &Arc<Shared>) -> Result<Self, Refusal> {
         shared
             .streams
