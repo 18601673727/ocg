@@ -29,7 +29,7 @@ const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
 };
 
 export function ProjectsSection({ client }: { client: HttpCanonicalControlClient }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [projects, setProjects] = useState<ControlProject[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -44,49 +44,27 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
   const [notice, setNotice] = useState<string | null>(null);
 
   const refresh = useCallback(
-    async (signal?: AbortSignal) => {
-      setLoading(true);
-      setLoadError(null);
-      try {
-        const loaded = await client.readAllProjects(signal);
+    (signal?: AbortSignal) => client.readAllProjects(signal)
+      .then((loaded) => {
         if (!signal?.aborted) {
           setProjects(loaded);
+          setLoadError(null);
         }
-      } catch (err) {
-        if (!signal?.aborted) {
-          setLoadError(describeError(err));
-        }
-      } finally {
-        if (!signal?.aborted) {
-          setLoading(false);
-        }
-      }
-    },
+      })
+      .catch((err: unknown) => {
+        if (!signal?.aborted) setLoadError(describeError(err));
+      })
+      .finally(() => {
+        if (!signal?.aborted) setLoading(false);
+      }),
     [client]
   );
 
   useEffect(() => {
     const controller = new AbortController();
-    let aborted = false;
-    (async () => {
-      try {
-        const loaded = await client.readAllProjects(controller.signal);
-        if (!aborted) {
-          setProjects(loaded);
-          setLoading(false);
-        }
-      } catch (err) {
-        if (!aborted) {
-          setLoadError(describeError(err));
-          setLoading(false);
-        }
-      }
-    })();
-    return () => {
-      aborted = true;
-      controller.abort();
-    };
-  }, [client]);
+    void refresh(controller.signal);
+    return () => controller.abort();
+  }, [refresh]);
 
   function resetForm() {
     setEditingProject(null);
@@ -193,7 +171,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
           size="sm"
           className="h-9 rounded-md tracking-normal normal-case"
           disabled={loading}
-          onClick={() => void refresh()}
+          onClick={() => { setLoading(true); setLoadError(null); void refresh(); }}
         >
           {loading ? t("settings.projects.refreshing") : t("settings.projects.refresh")}
         </Button>
@@ -243,7 +221,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
                 )}
                 <p className="text-[11px] text-muted-foreground">
                   {t("settings.projects.updatedAt", {
-                    time: new Date(project.updated_at_us / 1000).toLocaleString(),
+                    time: new Date(project.updated_at_us / 1000).toLocaleString(locale),
                   })}
                 </p>
               </div>

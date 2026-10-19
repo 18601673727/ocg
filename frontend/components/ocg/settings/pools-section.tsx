@@ -108,49 +108,27 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
   const [updatingPoolId, setUpdatingPoolId] = useState<string | null>(null);
 
   const refresh = useCallback(
-    async (signal?: AbortSignal) => {
-      setLoading(true);
-      setLoadError(null);
-      try {
-        const loaded = await client.readPools(signal);
+    (signal?: AbortSignal) => client.readPools(signal)
+      .then((loaded) => {
         if (!signal?.aborted) {
           setPools(loaded.pools);
+          setLoadError(null);
         }
-      } catch (err) {
-        if (!signal?.aborted) {
-          setLoadError(describeError(err));
-        }
-      } finally {
-        if (!signal?.aborted) {
-          setLoading(false);
-        }
-      }
-    },
+      })
+      .catch((err: unknown) => {
+        if (!signal?.aborted) setLoadError(describeError(err));
+      })
+      .finally(() => {
+        if (!signal?.aborted) setLoading(false);
+      }),
     [client]
   );
 
   useEffect(() => {
     const controller = new AbortController();
-    let aborted = false;
-    (async () => {
-      try {
-        const loaded = await client.readPools(controller.signal);
-        if (!aborted) {
-          setPools(loaded.pools);
-          setLoading(false);
-        }
-      } catch (err) {
-        if (!aborted) {
-          setLoadError(describeError(err));
-          setLoading(false);
-        }
-      }
-    })();
-    return () => {
-      aborted = true;
-      controller.abort();
-    };
-  }, [client]);
+    void refresh(controller.signal);
+    return () => controller.abort();
+  }, [refresh]);
 
   async function handleUpdate(poolId: string, update: ControlPoolUpdate) {
     setActionError(null);
@@ -176,7 +154,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
           size="sm"
           className="h-9 rounded-md tracking-normal normal-case"
           disabled={loading}
-          onClick={() => void refresh()}
+          onClick={() => { setLoading(true); setLoadError(null); void refresh(); }}
         >
           {loading ? t("settings.pools.refreshing") : t("settings.pools.refresh")}
         </Button>

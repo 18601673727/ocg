@@ -5,9 +5,9 @@ import type { CreateSessionInput, ScenarioId } from "./runtime-types";
 import { createHttpCanonicalControlClient, ControlTransportError, type ControlSubmission, type HttpCanonicalControlClient, type JobStreamSubscription } from "./control-client";
 import { jobTranscript } from "../chat/job-transcript-model";
 
-type Turn = { sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string };
+type Turn = { sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string; toolError?: string };
 type Pending = { key: string; signature: string; submission: ControlSubmission; admittedJob?: string };
-type StreamEntry = { subscription: JobStreamSubscription; timer: ReturnType<typeof setTimeout> | null; stopped: boolean };
+type StreamEntry = { subscription: JobStreamSubscription | null; timer: ReturnType<typeof setTimeout> | null; stopped: boolean };
 
 /** Projects and sessions are presentation scope only: every backend turn is a Job. */
 export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
@@ -17,6 +17,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly lifetime = new AbortController();
   private readonly turns = new Map<string, Turn>();
   private readonly roots = new Map<string, string>();
+  private readonly hiddenRoots = new Set<string>();
+  private readonly hiding = new Set<string>();
   private readonly tips = new Map<string, string>();
   private readonly selections = new Map<string, ChatModelSelection>();
   private readonly pending = new Map<string, Pending>();
@@ -59,6 +61,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       const page = await this.control.readConversations({ before, limit: 100, signal: this.lifetime.signal });
       if (this.disposed) return;
       for (const item of page.conversations) {
+        if (this.hiddenRoots.has(item.root_job)) continue;
         const id = this.roots.get(item.root_job) ?? item.root_job;
         this.roots.set(item.root_job, id);
         const current = this.getSnapshot().sessions.find(session => session.id === id);
@@ -108,25 +111,40 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   async hideSession(sessionId: string): Promise<void> {
     const root = this.sessionRoot(sessionId);
-    await this.refresh?.catch(() => {});
-    await this.control.editConversation(root, { hidden: true }, this.lifetime.signal);
-    this.pending.delete(sessionId);
-    this.selections.delete(sessionId);
-    this.emit({ type: "conversation.session-deleted", sessionId });
-    for (const [jobId, turn] of this.turns.entries()) {
-      if (turn.sessionId === sessionId) {
+    if (this.hiding.has(sessionId)) throw new Error("This conversation is being hidden.");
+    if (this.sending.has(sessionId) || this.pending.has(sessionId)) throw new Error("Resolve the current submission before hiding this conversation.");
+    if ([...this.turns.values()].some(turn => turn.sessionId === sessionId && turn.job.settlement.state === "unsettled")) throw new Error("Stop the running turn or wait for settlement before hiding this conversation.");
+    this.hiding.add(sessionId);
+    try {
+      const tip = this.tips.get(sessionId) ?? root;
+      const job = await this.control.readJob(tip, this.lifetime.signal);
+      if (job.settlement.state === "unsettled") throw new Error("Stop the running turn or wait for settlement before hiding this conversation.");
+      await this.control.editConversation(root, { hidden: true }, this.lifetime.signal);
+      this.hiddenRoots.add(root);
+      this.pending.delete(sessionId);
+      this.selections.delete(sessionId);
+      this.emit({ type: "conversation.session-deleted", sessionId });
+      const attachments = new Set<string>();
+      for (const [jobId, turn] of this.turns.entries()) {
+        if (turn.sessionId !== sessionId) continue;
+        for (const id of turn.input.attachments) attachments.add(id);
         const stream = this.streams.get(jobId);
         if (stream) {
           stream.stopped = true;
           if (stream.timer) clearTimeout(stream.timer);
-          stream.subscription.close();
+          stream.subscription?.close();
           this.streams.delete(jobId);
         }
+        this.turns.delete(jobId);
       }
-    }
-    this.tips.delete(sessionId);
-    for (const [r, sid] of this.roots.entries()) {
-      if (sid === sessionId) this.roots.delete(r);
+      for (const turn of this.turns.values()) {
+        for (const id of turn.input.attachments) attachments.delete(id);
+      }
+      for (const id of attachments) this.images.delete(id);
+      this.tips.delete(sessionId);
+      this.roots.delete(root);
+    } finally {
+      this.hiding.delete(sessionId);
     }
   }
 
@@ -153,13 +171,15 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     await this.refresh?.catch(() => {});
     let conversation = await this.control.readJobConversation(job, this.lifetime.signal);
     const root = conversation.turns[0].job.id;
-    const id = this.roots.get(root) ?? root;
-    this.roots.set(root, id);
+    if (!this.roots.has(root) && !this.hiddenRoots.has(root)) await this.refreshConversations();
+    const id = this.roots.get(root);
+    if (!id || this.hiddenRoots.has(root)) throw new Error("This conversation is hidden. Its turns remain readable in Jobs.");
     const listedTip = this.tips.get(id);
     if (listedTip && !conversation.turns.some(t => t.job.id === listedTip)) {
       job = listedTip;
       conversation = await this.control.readJobConversation(job, this.lifetime.signal);
     }
+    if (this.hiddenRoots.has(root)) throw new Error("This conversation is hidden. Its turns remain readable in Jobs.");
     if (!this.getSnapshot().sessions.some(session => session.id === id)) {
       this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0].input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
     }
@@ -167,11 +187,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     await Promise.all(conversation.turns.map(async turn => {
       if (this.streams.has(turn.job.id)) return;
       const tools = await this.control.readAllJobTools(turn.job.id, this.lifetime.signal);
+      if (this.hiddenRoots.has(root) || this.disposed) return;
       const state: Turn = { sessionId: id, ...turn, tools };
-      await this.readImages(state);
+      const images = await this.readImages(state);
+      if (this.hiddenRoots.has(root) || this.disposed) return;
+      for (const image of images) this.images.set(image.id, image);
       this.turns.set(turn.job.id, state);
     }));
-    if (this.disposed) return id;
+    if (this.disposed || this.hiddenRoots.has(root)) return id;
     this.tips.set(id, job);
     const session = this.getSnapshot().sessions.find(session => session.id === id);
     if (!session) return id;
@@ -183,21 +206,22 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   private readonly images = new Map<string, ChatImage>();
   private async readImages(turn: Turn) {
-    await Promise.all(turn.input.attachments.map(async id => {
-      if (this.images.has(id)) return;
+    return Promise.all(turn.input.attachments.map(async id => {
+      const cached = this.images.get(id);
+      if (cached) return cached;
       const attachment = await this.control.readAttachment(id, this.lifetime.signal);
-      this.images.set(id, { id, name: attachment.display_name ?? id, media_type: attachment.mime, url: this.control.attachmentContentUrl(id) });
+      return { id, name: attachment.display_name ?? id, media_type: attachment.mime, url: this.control.attachmentContentUrl(id) };
     }));
   }
 
   private publish(sessionId: string) {
-    if (this.disposed) return;
+    if (this.disposed || !this.getSnapshot().sessions.some(session => session.id === sessionId)) return;
     const turns = [...this.turns.values()].filter(turn => turn.sessionId === sessionId).sort((a, b) => a.job.created_at_us - b.job.created_at_us || Number(a.job.id.slice(4)) - Number(b.job.id.slice(4)));
     const messages: ChatMessage[] = turns.flatMap(turn => jobTranscript(turn.job.id, turn.input.objective, turn.outputs, turn.job.settlement, turn.job.settlement.state === "unsettled").map(message => ({
       id: message.id, jobId: turn.job.id, commandId: turn.job.id, role: message.role, content: message.content,
       status: message.status,
       createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
-      ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, failureReason: turn.error ?? message.detail ?? (message.status === "unknown" ? (turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") : undefined) }),
+      ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, failureReason: turn.error ?? turn.toolError ?? message.detail ?? (message.status === "unknown" ? (turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") : undefined) }),
     })));
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
   }
@@ -205,24 +229,27 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private watch(jobId: string) {
     const turn = this.turns.get(jobId);
     if (!turn || this.streams.has(jobId) || this.disposed) return;
-    const entry: StreamEntry = { subscription: null as unknown as JobStreamSubscription, timer: null, stopped: false };
+    const entry: StreamEntry = { subscription: null, timer: null, stopped: false };
     let delay = 1500;
     let inFlight = false;
+    let outputVersion = 0;
     let lastToolsJson = JSON.stringify(turn.tools);
 
     const rearm = () => {
       if (entry.stopped || this.disposed) return;
+      if (entry.timer) clearTimeout(entry.timer);
       entry.timer = setTimeout(() => void tick(), delay);
     };
 
     const tick = async () => {
+      entry.timer = null;
       if (entry.stopped || this.disposed) return;
       if (typeof document !== "undefined" && document.hidden) {
         rearm();
         return;
       }
-      if (inFlight) return;
       inFlight = true;
+      const version = outputVersion;
       try {
         const fetched = await this.control.readAllJobTools(jobId, this.lifetime.signal);
         if (entry.stopped || this.disposed) return;
@@ -230,15 +257,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         const changed = currentJson !== lastToolsJson;
         lastToolsJson = currentJson;
         turn.tools = fetched;
-        if (changed) {
-          delay = 1500;
-          this.publish(turn.sessionId);
-        } else {
-          delay = Math.min(delay * 2, 12000);
-        }
+        const recovered = turn.toolError !== undefined;
+        turn.toolError = undefined;
+        delay = changed || version !== outputVersion ? 1500 : Math.min(delay * 2, 12000);
+        if (changed || recovered) this.publish(turn.sessionId);
       } catch (error) {
         if (!this.disposed && !entry.stopped) {
-          turn.error = `Tool evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
+          turn.toolError = `Tool evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
           this.publish(turn.sessionId);
         }
       } finally {
@@ -251,11 +276,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
     const afterSeq = this.control.lastOutputSequence(jobId) ?? turn.outputs.at(-1)?.seq ?? 0;
     const subscription = this.control.subscribeJobEvents(jobId, event => {
-      if (this.disposed) return;
+      if (this.disposed || entry.stopped) return;
       if (event.type === "job") turn.job = event.job;
       if (event.type === "output" && !turn.outputs.some(output => output.seq === event.output.seq)) {
         turn.outputs.push(event.output);
+        outputVersion += 1;
+        const backedOff = delay !== 1500;
         delay = 1500;
+        if (backedOff && !inFlight) rearm();
       }
       if (event.type === "settlement") turn.job = { ...turn.job, settlement: event.settlement, stop_confirmed_at_us: event.stop_confirmed_at_us };
       if (event.type === "stream_error") {
@@ -271,15 +299,25 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     rearm();
 
     void subscription.closed.then(async end => {
+      if (this.disposed || entry.stopped) return;
+      entry.stopped = true;
+      if (entry.timer) clearTimeout(entry.timer);
       if (end === "settled") {
         turn.error = undefined;
-        try { turn.tools = await this.control.readAllJobTools(jobId, this.lifetime.signal); } catch { /* ignore */ }
+        try {
+          turn.tools = await this.control.readAllJobTools(jobId, this.lifetime.signal);
+          turn.toolError = undefined;
+        } catch (error) {
+          turn.toolError = `Tool evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        if (this.disposed || this.turns.get(jobId) !== turn) return;
         this.publish(turn.sessionId);
         await this.refreshConversations();
       } else if (end === "stream_error") {
         this.publish(turn.sessionId);
       }
     }).catch(error => {
+      if (this.disposed || this.turns.get(jobId) !== turn) return;
       turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Reopen this conversation to recover persisted output.`;
       this.publish(turn.sessionId);
       this.report(error);
@@ -295,6 +333,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async submit(sessionId: string, input: SendMessageInput, previous?: string) {
+    if (this.hiding.has(sessionId)) throw new Error("Wait for this conversation to finish hiding before sending.");
+    if (!this.getSnapshot().sessions.some(session => session.id === sessionId)) throw new Error("Conversation presentation is no longer available.");
     if (this.sending.has(sessionId)) throw new Error("This turn is being submitted.");
     if ([...this.turns.values()].some(turn => turn.sessionId === sessionId && turn.job.settlement.state === "unsettled")) throw new Error("Stop the running turn or wait for settlement before sending a follow-up.");
     const selection = input.selection ?? this.selections.get(sessionId);
@@ -316,10 +356,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (!job) job = (await this.control.readAdmission(pending.key, this.lifetime.signal)).job ?? undefined;
       if (!job) throw new Error("Admission is pending. Resend this unchanged message to check it with the same Idempotency-Key.");
       pending.admittedJob = job;
-      this.tips.set(sessionId, job);
-      for (const image of input.images ?? []) this.images.set(image.id, image);
       const session = this.getSnapshot().sessions.find(session => session.id === sessionId);
       if (!session) throw new Error("Conversation presentation is no longer available.");
+      this.tips.set(sessionId, job);
+      for (const image of input.images ?? []) this.images.set(image.id, image);
       if (!previous) this.roots.set(job, sessionId);
       this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: selection.agentProfile, title: previous ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
       const [record, frozen, outputs, tools] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), this.control.readAllJobTools(job)]);
@@ -362,7 +402,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     for (const entry of this.streams.values()) {
       entry.stopped = true;
       if (entry.timer) clearTimeout(entry.timer);
-      entry.subscription.close();
+      entry.subscription?.close();
     }
     this.streams.clear();
     super.dispose();

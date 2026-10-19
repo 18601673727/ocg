@@ -138,10 +138,10 @@ export function OcgSidebar({
   const email = useAccountEmail();
   const logout = useRemoteLogout();
 
-  const conversationError = (error: unknown): string => {
+  const conversationError = (error: unknown, action: "rename" | "hide"): string => {
     if (error instanceof ControlTransportError) {
       if (error.code === "not_found") return t("sidebar.conversationNotFound");
-      if (error.code === "invalid_request") return t("sidebar.titleInvalid");
+      if (error.code === "invalid_request" && action === "rename") return t("sidebar.titleInvalid");
     }
     return error instanceof Error ? error.message : String(error);
   };
@@ -155,7 +155,7 @@ export function OcgSidebar({
       await onRename(renameTarget.id, renameTitle);
       setRenameTarget(null);
     } catch (cause: unknown) {
-      setRenameError(t("sidebar.renameFailed", { error: conversationError(cause) }));
+      setRenameError(t("sidebar.renameFailed", { error: conversationError(cause, "rename") }));
     } finally {
       setRenaming(false);
     }
@@ -169,7 +169,7 @@ export function OcgSidebar({
       await onHide(hideTarget.id);
       setHideTarget(null);
     } catch (cause: unknown) {
-      setHideError(t("sidebar.hideFailed", { error: conversationError(cause) }));
+      setHideError(t("sidebar.hideFailed", { error: conversationError(cause, "hide") }));
     } finally {
       setHiding(false);
     }
