@@ -1,5 +1,82 @@
 use super::*;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Vitals {
+    pub commits: u64,
+    pub durable_commits: u64,
+    pub commit_us_total: u64,
+    pub commit_us_max: u64,
+    pub claims: u64,
+    pub claim_us_total: u64,
+    pub claim_us_max: u64,
+    pub queue_pending: u64,
+    pub queue_ready: u64,
+    pub queue_delayed: u64,
+    pub memory_rss_bytes: u64,
+    pub memory_rss_peak_bytes: u64,
+}
+
+fn process_memory() -> (u64, u64) {
+    let mut peak = 0u64;
+    #[cfg(unix)]
+    {
+        let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) } == 0 {
+            #[cfg(target_os = "macos")]
+            {
+                peak = rusage.ru_maxrss.max(0) as u64;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                peak = (rusage.ru_maxrss.max(0) as u64).saturating_mul(1024);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            let mut current = 0u64;
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
+                        current = kb.saturating_mul(1024);
+                    }
+                }
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    let parts: Vec<&str> = rest.split_whitespace().collect();
+                    if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
+                        peak = kb.saturating_mul(1024);
+                    }
+                }
+            }
+            if current > 0 {
+                return (current, peak);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(deprecated)]
+    unsafe {
+        let mut info: libc::mach_task_basic_info = std::mem::zeroed();
+        let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
+            / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+        if libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            &mut info as *mut _ as *mut libc::integer_t,
+            &mut count,
+        ) == libc::KERN_SUCCESS
+        {
+            return (info.resident_size, peak);
+        }
+    }
+
+    (peak, peak)
+}
+
 impl DatabaseHandle {
     #[cfg(test)]
     pub(crate) async fn submit_fixture(
@@ -33,6 +110,42 @@ impl DatabaseHandle {
     /// commands are told their outcome is unknown.
     pub fn durable_commits(&self) -> u64 {
         self.shared.durable_commits.load(Ordering::SeqCst)
+    }
+
+    pub fn vitals(&self) -> Vitals {
+        let (queue_pending, queue_ready, queue_delayed) = match self.shared.database.read() {
+            Ok(guard) => match guard.as_ref() {
+                Some(opened) => storage::queue_counts(&opened.database),
+                None => (0, 0, 0),
+            },
+            Err(_) => (0, 0, 0),
+        };
+        let (memory_rss_bytes, memory_rss_peak_bytes) = process_memory();
+        Vitals {
+            commits: self.shared.commits.load(Ordering::SeqCst),
+            durable_commits: self.shared.durable_commits.load(Ordering::SeqCst),
+            commit_us_total: self.shared.commit_us_total.load(Ordering::Relaxed),
+            commit_us_max: self.shared.commit_us_max.load(Ordering::Relaxed),
+            claims: self.shared.claims.load(Ordering::SeqCst),
+            claim_us_total: self.shared.claim_us_total.load(Ordering::Relaxed),
+            claim_us_max: self.shared.claim_us_max.load(Ordering::Relaxed),
+            queue_pending,
+            queue_ready,
+            queue_delayed,
+            memory_rss_bytes,
+            memory_rss_peak_bytes,
+        }
+    }
+
+    pub async fn tool_stats(&self) -> Result<Vec<crate::persistence::ToolStatRecord>, DatabaseError> {
+        self.read(storage::read_tool_stats).await
+    }
+
+    pub async fn usage_summary(
+        &self,
+        filter: crate::token_usage::UsageSummaryFilter,
+    ) -> Result<crate::token_usage::UsageSummaryRecord, DatabaseError> {
+        self.read(move |database| storage::read_usage_summary(database, &filter)).await
     }
 
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
@@ -1153,7 +1266,7 @@ impl DatabaseHandle {
     /// execution path of the Job, while it executes it, may record it; a
     /// handler is invoked only once its admission is durable, which is when
     /// this returns `Ok`. See [`persistence::record_tool_decision`].
-    pub(crate) async fn record_tool_decision(
+    pub async fn record_tool_decision(
         &self,
         evidence: NewToolEvidence,
     ) -> Result<(), DatabaseError> {
@@ -1167,7 +1280,7 @@ impl DatabaseHandle {
     /// Records, once, what is known of an admitted call's execution. Only
     /// the trusted execution path of the Job, while it executes it, may
     /// record it.
-    pub(crate) async fn record_tool_outcome(
+    pub async fn record_tool_outcome(
         &self,
         call: ToolCallRef,
         outcome: ToolOutcome,

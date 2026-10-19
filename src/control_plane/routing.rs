@@ -12,6 +12,8 @@ pub(super) enum Route {
         limit: usize,
     },
     Usage(dashboard::ObservationQuery),
+    UsageSummary(crate::token_usage::UsageSummaryFilter),
+    ToolStats,
     Availability(dashboard::ObservationQuery),
     Logs(dashboard::LogQuery),
     Job(JobId),
@@ -77,6 +79,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Jobs { .. }
             | Route::Conversations { .. }
             | Route::Usage(_)
+            | Route::UsageSummary(_)
+            | Route::ToolStats
             | Route::Availability(_)
             | Route::Logs(_)
             | Route::Job(_)
@@ -164,6 +168,8 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["conversations"] => catalog::conversations_query(query)
             .map(|(before, limit)| Route::Conversations { before, limit }),
         ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
+        ["usage", "summary"] => dashboard::usage_summary_query(query).map(Route::UsageSummary),
+        ["tool-stats"] => no_query(query).map(|()| Route::ToolStats),
         ["availability"] => dashboard::ObservationQuery::parse(query).map(Route::Availability),
         ["logs"] => dashboard::LogQuery::parse(query).map(Route::Logs),
         ["admissions"] => no_query(query).map(|()| Route::Admission),
@@ -289,6 +295,14 @@ pub(super) async fn respond(
             catalog::conversations(database, before, limit).await
         }
         Route::Usage(query) => dashboard::usage(shared, query).await,
+        Route::UsageSummary(filter) => dashboard::usage_summary(shared, filter).await,
+        Route::ToolStats => {
+            let stats = database.tool_stats().await?;
+            Ok(Reply::ok(json!({
+                "api_version": API_VERSION,
+                "tool_stats": stats,
+            })))
+        }
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,
         Route::Job(job) => {

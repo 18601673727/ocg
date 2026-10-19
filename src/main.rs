@@ -34,6 +34,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
     if let Some(command) = command.as_deref() {
+        if command == "--version" || command == "-V" {
+            println!("ocg {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        if command == "help" || command == "--help" || command == "-h" {
+            println!("{}", usage());
+            return Ok(());
+        }
         if command == "pool" {
             let directory = DataDirectory::from_environment()?;
             return pool_cli::run(&directory, arguments.collect());
@@ -67,7 +75,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("OCG data directory: {}", data_directory.root().display());
             return Ok(llm_target::register(&data_directory, target)?);
         }
-        return Err(format!("unknown command `{command}`").into());
+        return Err(format!("unknown command `{command}`; see `ocg help`").into());
     }
     // Refused before anything starts when it is given but invalid.
     let control = ControlPlaneConfig::from_environment()?;
@@ -88,3 +96,47 @@ async fn until_signalled() {
     let signals = ntex::rt::signals::signal().await;
     log::info!("OCG received {signals:?}; shutting down");
 }
+
+fn usage() -> &'static str {
+    "usage: ocg [command] [arguments]\n\
+     \n\
+     Without command: run the OCG host (reads OCG_DATA_DIR, OCG_CONTROL_PORT, OCG_CONTROL_TOKEN, OCG_UI_DIR)\n\
+     \n\
+     Commands:\n\
+       pool list | create <name> [nonzero-concurrency] | enable <pool> | disable <pool> | set-limit <pool> <nonzero-concurrency>\n\
+       release-slot <job> [--yes]\n\
+       workspace-read <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
+       workspace-edit <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
+       workspace-code <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
+       workspace-vision <image-path> <objective> (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
+       register-llm\n\
+       help, --help, -h\n\
+       --version, -V"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_names_every_command() {
+        let text = usage();
+        for command in [
+            "pool",
+            "release-slot",
+            "workspace-read",
+            "workspace-edit",
+            "workspace-code",
+            "workspace-vision",
+            "register-llm",
+            "help",
+            "--version",
+        ] {
+            assert!(
+                text.contains(command),
+                "usage must name command `{command}`"
+            );
+        }
+    }
+}
+

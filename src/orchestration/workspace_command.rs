@@ -43,6 +43,11 @@
 //! that says how many bytes were omitted, and `truncated` says whether
 //! anything was. The serialized result stays within [`RESULT_BYTES`].
 //!
+//! Resource usage: `wall_ms`, `cpu_user_ms`, `cpu_system_ms`, and
+//! `peak_rss_bytes` describe the leader and the descendants it waited for
+//! (cargo waits for rustc). Nothing else stores them: the result is the
+//! evidence, once.
+//!
 //! What this is not: a sandbox. Build scripts, procedural macros and tests
 //! run arbitrary code with the permissions of the OCG process; they may read
 //! or write anything it may, outside the Workspace too, and use the network.
@@ -67,7 +72,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -80,7 +85,7 @@ use rustix::io::Errno;
 #[cfg(test)]
 use rustix::process::Pid;
 
-use crate::orchestration::blocking::{self, FinishError, Kind, Process, StopSignal};
+use crate::orchestration::blocking::{self, FinishError, Finished, Kind, Process, StopSignal};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, ToolStart,
@@ -93,7 +98,7 @@ use crate::persistence::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef, 
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-5";
+const HANDLER_VERSION: &str = "workspace_run_command-6";
 
 /// Longest a command may run before it is stopped.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -442,7 +447,7 @@ fn shares(stdout: usize, stderr: usize, budget: usize) -> (usize, usize) {
 
 /// What a command that ran to its end left.
 struct Ended {
-    status: ExitStatus,
+    finished: Finished,
     stdout: Capture,
     stderr: Capture,
 }
@@ -553,13 +558,13 @@ fn compact_test(stdout: &str) -> Option<String> {
 }
 
 fn compact(preset: Preset, ended: &Ended) -> Option<Capture> {
-    ended.status.code()?;
+    ended.finished.status.code()?;
     let stdout = ended.stdout.text()?;
     ended.stderr.text()?;
     let text = match preset {
         Preset::CargoCheck => compact_check(&stdout)?,
         Preset::CargoTest => {
-            if !ended.status.success()
+            if !ended.finished.status.success()
                 && !stdout
                     .lines()
                     .any(|line| line.starts_with("test result: FAILED."))
@@ -569,7 +574,7 @@ fn compact(preset: Preset, ended: &Ended) -> Option<Capture> {
             compact_test(&stdout)?
         }
     };
-    if !ended.status.success() && text.is_empty() {
+    if !ended.finished.status.success() && text.is_empty() {
         return None;
     }
     let mut capture = Capture::default();
@@ -590,6 +595,14 @@ fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
         Some(stdout) => (stdout, &empty),
         None => (&ended.stdout, &ended.stderr),
     };
+    let (cpu_user_ms, cpu_system_ms, peak_rss_bytes) = match &ended.finished.usage {
+        Some(usage) => (
+            json!(usage.user.as_millis() as u64),
+            json!(usage.system.as_millis() as u64),
+            json!(usage.peak_rss_bytes),
+        ),
+        None => (Value::Null, Value::Null, Value::Null),
+    };
     let mut budget = OUTPUT_BYTES;
     loop {
         let (stdout_share, stderr_share) = shares(stdout.total, stderr.total, budget);
@@ -598,12 +611,16 @@ fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
         let mut value = json!({
             "command": selected.name(),
             "argv": argv,
-            "exit_code": ended.status.code(),
+            "exit_code": ended.finished.status.code(),
             "stdout": stdout,
             "stderr": stderr,
             "truncated": stdout_cut || stderr_cut,
+            "wall_ms": ended.finished.wall.as_millis() as u64,
+            "cpu_user_ms": cpu_user_ms,
+            "cpu_system_ms": cpu_system_ms,
+            "peak_rss_bytes": peak_rss_bytes,
         });
-        if let Some(signal) = ended.status.signal() {
+        if let Some(signal) = ended.finished.status.signal() {
             value["signal"] = json!(signal);
         }
         if budget == 0 || value.to_string().len() <= RESULT_BYTES {
@@ -662,14 +679,14 @@ fn supervise(
         }
         return Err(Uncertainty::OutputNotCaptured.into());
     };
-    let status = match process.finish(|| stop.requested()) {
-        Ok(status) => status,
+    let finished = match process.finish(|| stop.requested()) {
+        Ok(finished) => finished,
         Err(FinishError::NotProven(_)) => return Err(Uncertainty::NotObserved.into()),
         Err(FinishError::Wait(_)) => return Err(Uncertainty::ExitNotObserved.into()),
     };
     match (stdout.join(), stderr.join()) {
         (Ok(stdout), Ok(stderr)) => Ok(Ended {
-            status,
+            finished,
             stdout,
             stderr,
         }),
@@ -929,7 +946,7 @@ pub(crate) fn register(
     registry.register(
         TOOL_NAME,
         Some(
-            "Run one of the Project's commands in the authorized Workspace root and return its argv, exit code, stdout and stderr. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. No other command, argument, directory or environment can be chosen.",
+            "Run one of the Project's commands in the authorized Workspace root and return its argv, exit code, stdout, stderr, wall_ms, cpu_user_ms, cpu_system_ms and peak_rss_bytes. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. No other command, argument, directory or environment can be chosen.",
         ),
         parameters(commands),
         Arc::new(RunCommand {
@@ -1073,10 +1090,41 @@ pub(crate) fn code_tools_with(
 }
 
 #[cfg(test)]
+pub(crate) fn strip_command_stats(mut value: Value) -> Value {
+    assert!(
+        value.get("wall_ms").is_some_and(|v| v.is_u64() || v.is_i64() || v.is_number()),
+        "wall_ms must be a number: {value:?}"
+    );
+    let cpu_user = &value["cpu_user_ms"];
+    assert!(
+        cpu_user.is_number() || cpu_user.is_null(),
+        "cpu_user_ms must be number or null: {value:?}"
+    );
+    let cpu_system = &value["cpu_system_ms"];
+    assert!(
+        cpu_system.is_number() || cpu_system.is_null(),
+        "cpu_system_ms must be number or null: {value:?}"
+    );
+    let peak_rss = &value["peak_rss_bytes"];
+    assert!(
+        peak_rss.is_number() || peak_rss.is_null(),
+        "peak_rss_bytes must be number or null: {value:?}"
+    );
+    if let Value::Object(ref mut map) = value {
+        map.remove("wall_ms");
+        map.remove("cpu_user_ms");
+        map.remove("cpu_system_ms");
+        map.remove("peak_rss_bytes");
+    }
+    value
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
     use std::path::Path;
+    use std::process::ExitStatus;
     use std::time::Instant;
 
     use ntex::util::{Either, select};
@@ -1360,7 +1408,7 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-5");
+        assert_eq!(handler.version(), "workspace_run_command-6");
         assert!(
             crate::persistence::ToolAdmission {
                 handler_version: handler.version().to_owned(),
@@ -1492,6 +1540,16 @@ mod tests {
 
     #[test]
     fn any_exit_is_a_completed_result_with_each_stream_apart() {
+        assert!(
+            crate::persistence::ToolAdmission {
+                handler_version: "workspace_run_command-6".into(),
+                effect: ToolEffect::NonIdempotent,
+                parameters: "{}".into(),
+                arguments: crate::persistence::ToolPayload::new("{}"),
+                authorization: crate::persistence::AuthorizationBasis::RegistryGrant,
+            }
+            .spawns()
+        );
         let setup = setup(
             "exit",
             "echo $$ > leader.pid\npwd -P\necho \"arguments: $*\"\necho 'to stderr' >&2\nexit $(cat code)",
@@ -1507,9 +1565,14 @@ mod tests {
             ),
         ] {
             std::fs::write(setup.root.join("code"), code.to_string()).expect("write");
+            let result = run(setup.handler(WAIT), json!({ "command": command })).expect("result");
+            assert!(result["wall_ms"].as_u64().is_some());
+            assert!(result["cpu_user_ms"].as_u64().is_some());
+            assert!(result["cpu_system_ms"].as_u64().is_some());
+            assert!(result["peak_rss_bytes"].as_u64().is_some_and(|b| b > 0));
             assert_eq!(
-                run(setup.handler(WAIT), json!({ "command": command })),
-                Ok(json!({
+                strip_command_stats(result),
+                json!({
                     "command": command,
                     "argv": std::iter::once(setup.bin.join("cargo").display().to_string())
                         .chain(arguments.split(' ').map(str::to_owned))
@@ -1518,7 +1581,7 @@ mod tests {
                     "stdout": format!("{root}\narguments: {arguments}\n"),
                     "stderr": "to stderr\n",
                     "truncated": false,
-                })),
+                }),
                 "a nonzero exit is a result, not a failure of the call"
             );
             assert!(gone(setup.pid("leader.pid")), "the process was reaped");
@@ -1558,16 +1621,17 @@ mod tests {
         assert!(!setup.ran(), "an unknown name starts nothing");
 
         let root = setup.root.display().to_string();
+        let result = run(handler(), json!({"command": "lint"})).expect("ran");
         assert_eq!(
-            run(handler(), json!({"command": "lint"})),
-            Ok(json!({
+            strip_command_stats(result),
+            json!({
                 "command": "lint",
                 "argv": [program, "--strict", "src"],
                 "exit_code": 3,
                 "stdout": format!("{root}\narguments: --strict src\n"),
                 "stderr": "to stderr\n",
                 "truncated": false,
-            }))
+            })
         );
         assert!(setup.ran());
     }
@@ -1627,7 +1691,11 @@ mod tests {
 
     fn captured_result(preset: Preset, stdout: &str, stderr: &str, code: i32) -> Value {
         let mut ended = Ended {
-            status: ExitStatus::from_raw(code << 8),
+            finished: Finished {
+                status: ExitStatus::from_raw(code << 8),
+                wall: Duration::ZERO,
+                usage: None,
+            },
             stdout: Capture::default(),
             stderr: Capture::default(),
         };
@@ -1682,7 +1750,7 @@ mod tests {
             (Preset::CargoTest, ""),
         ] {
             assert_eq!(
-                captured_result(preset, stdout, "failure details\n", 101),
+                strip_command_stats(captured_result(preset, stdout, "failure details\n", 101)),
                 json!({
                     "command": preset.name(),
                     "argv": Selected::Preset(preset).argv(),
@@ -1708,7 +1776,7 @@ mod tests {
         let result = run(setup.handler(WAIT), test_command()).expect("completed");
         let half = OUTPUT_BYTES / 2;
         assert_eq!(
-            result,
+            strip_command_stats(result),
             json!({
                 "command": "cargo_test",
                 "argv": [

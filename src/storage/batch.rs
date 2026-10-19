@@ -842,4 +842,88 @@ impl Batch {
         })?;
         Ok(seq)
     }
+
+    pub(crate) fn update_usage_total(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<(), BatchError> {
+        let row = self.require_job(job)?;
+        let Some(execution) = &row.execution else {
+            return Ok(());
+        };
+        let agent = usage_agent(&row);
+        let provider = execution.llm.provider.id.get();
+        let model_hash = *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes();
+        let target = Some(LlmTarget {
+            llm_profile: execution.llm.model.id.into(),
+            frozen: execution.llm.clone(),
+        });
+        let events = self.step(|tx| {
+            let table = tx.open_table(REQUEST_EVENTS)?;
+            let mut events = Vec::new();
+            for entry in table.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))? {
+                let (key, bytes) = entry?;
+                let (_, req, seq) = key.value();
+                if let Some(r) = RequestNumber::new(req) {
+                    events.push(decode_request_event(job, r, seq, bytes.value())?);
+                }
+            }
+            Ok(events)
+        })?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let records = observations::metrics_of(job, &target, events.clone());
+        let new_sample = crate::token_usage::TokenRequestSample::from_metrics(&records).ok().flatten();
+
+        let old_sample = if events.len() > 1 {
+            let old_records = observations::metrics_of(job, &target, events[..events.len() - 1].to_vec());
+            crate::token_usage::TokenRequestSample::from_metrics(&old_records).ok().flatten()
+        } else {
+            None
+        };
+
+        if old_sample == new_sample {
+            return Ok(());
+        }
+
+        self.step(|tx| {
+            let mut table = tx.open_table(USAGE_TOTALS)?;
+            if let Some(old) = old_sample {
+                let hour = (old.observed_at.as_unix_micros().max(0) as u64) / 3_600_000_000;
+                let key = (hour, agent, provider, model_hash);
+                let current_val = table.get(key)?.map(|c| c.value());
+                if let Some(val) = current_val {
+                    let updated = (
+                        val.0.saturating_sub(1),
+                        val.1.saturating_sub(old.input.value().unwrap_or(0) as u64),
+                        val.2.saturating_sub(old.output.value().unwrap_or(0) as u64),
+                        val.3.saturating_sub(old.cache_read.value().unwrap_or(0) as u64),
+                        val.4.saturating_sub(old.cache_write.value().unwrap_or(0) as u64),
+                        val.5.saturating_sub(old.reasoning.value().unwrap_or(0) as u64),
+                        val.6.saturating_sub(old.total.unwrap_or(0)),
+                    );
+                    table.insert(key, updated)?;
+                }
+            }
+            if let Some(new) = new_sample {
+                let hour = (new.observed_at.as_unix_micros().max(0) as u64) / 3_600_000_000;
+                let key = (hour, agent, provider, model_hash);
+                let current_val = table.get(key)?.map(|v| v.value()).unwrap_or((0, 0, 0, 0, 0, 0, 0));
+                let updated = (
+                    current_val.0.saturating_add(1),
+                    current_val.1.saturating_add(new.input.value().unwrap_or(0) as u64),
+                    current_val.2.saturating_add(new.output.value().unwrap_or(0) as u64),
+                    current_val.3.saturating_add(new.cache_read.value().unwrap_or(0) as u64),
+                    current_val.4.saturating_add(new.cache_write.value().unwrap_or(0) as u64),
+                    current_val.5.saturating_add(new.reasoning.value().unwrap_or(0) as u64),
+                    current_val.6.saturating_add(new.total.unwrap_or(0)),
+                );
+                table.insert(key, updated)?;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
 }

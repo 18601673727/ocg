@@ -304,6 +304,8 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(CHAT_THREADS)?;
     tx.open_table(TOOL_CALL_IDS)?;
     tx.open_table(TOOL_TOTALS)?;
+    tx.open_table(TOOL_STATS)?;
+    tx.open_table(USAGE_TOTALS)?;
     tx.open_table(RETRIES)?;
     tx.open_table(ATTACHMENT_REFS)?;
     tx.open_table(REQUEST_SCOPES)?;

@@ -127,11 +127,17 @@ hours, only one session exists at a time, and it ends with the OCG process.
 
 ## API routes
 
+- `GET /api/v1/health` — report host status, database readiness, vitals (database commits/timings, claims/timings, queue counts, process memory) and quarantined executions.
+- `GET /api/v1/tool-stats` — report aggregated tool execution statistics (admitted, refused_arguments, completed, failed, duration_us_total, duration_us_max) per tool name.
+- `GET /api/v1/usage/summary` — report total token usage and request count, optionally filtered by `from_us`, `until_us`, `agent`, or `model`.
 - `POST /api/v1/provider-models` — test a Provider connection and list its models. Uses the same authentication as `/api/v1/profiles` (browser session with CSRF, or bearer token). Send `{endpoint, credential?}` or `{endpoint, credential_ref?}` to use a saved credential. Returns `{models: [{id, context_window}]}` sorted by id, with `null` for unknown context windows. Refusals are `provider_unreachable`, `provider_rejected` (with `status_code` and the Provider's message), or `models_not_listed`; the latter allows manual model entry. HTTPS only, no redirects, 30 s timeout and a 1 MiB response limit. Credentials are never saved or returned.
 
 ## Commands
 
-Each command below also needs `OCG_DATA_DIR`.
+Each command below also needs `OCG_DATA_DIR`, except `--version` and `help`.
+
+- `ocg --version`, `ocg -V` — print the OCG version and exit.
+- `ocg help`, `ocg --help`, `ocg -h` — print command-line usage and exit.
 
 ### Pools
 

@@ -92,9 +92,10 @@ pub(crate) use reads::{
     read_job_configuration, read_job_input, read_job_input_for_job, read_jobs,
     read_latest_output, read_occupancy, read_outputs, read_pending_jobs, read_pool_binding,
     read_project, read_projects, read_retries, read_submission,
-    read_tool_evidence, read_unresolved_executions, unneeded_content,
+    read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_summary,
+    queue_counts, unneeded_content,
 };
-pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow};
+pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow, usage_agent};
 use rows::{
     decode_attachment, decode_output, decode_project, decode_project_root, decode_submission, decode_tool_evidence,
     encode_attachment, encode_output, encode_project, encode_submission, encode_tool_evidence,

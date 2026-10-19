@@ -185,6 +185,51 @@ pub(super) async fn usage(shared: &Shared, query: ObservationQuery) -> Result<Re
     )
 }
 
+pub(super) fn usage_summary_query(
+    query: &str,
+) -> Result<crate::token_usage::UsageSummaryFilter, Refusal> {
+    let mut values = pairs(query)?;
+    let from_us = values
+        .remove("from_us")
+        .map(|value| decimal::<i64>(value).ok_or(INVALID_REQUEST))
+        .transpose()?;
+    let until_us = values
+        .remove("until_us")
+        .map(|value| decimal::<i64>(value).ok_or(INVALID_REQUEST))
+        .transpose()?;
+    if let (Some(from), Some(until)) = (from_us, until_us)
+        && from >= until
+    {
+        return Err(INVALID_REQUEST);
+    }
+    let agent = values
+        .remove("agent")
+        .map(|value| decimal::<u64>(value).ok_or(INVALID_REQUEST))
+        .transpose()?;
+    let model = values.remove("model").map(str::to_owned);
+    if !values.is_empty() {
+        return Err(INVALID_REQUEST);
+    }
+    Ok(crate::token_usage::UsageSummaryFilter {
+        from_us,
+        until_us,
+        agent,
+        model,
+    })
+}
+
+pub(super) async fn usage_summary(
+    shared: &Shared,
+    filter: crate::token_usage::UsageSummaryFilter,
+) -> Result<Reply, Refusal> {
+    let summary = shared.database.usage_summary(filter).await?;
+    let mut val = serde_json::to_value(&summary).map_err(|_| INTERNAL)?;
+    val["api_version"] = json!(API_VERSION);
+    val["summary"] = json!(&summary);
+    val["usage_summary"] = json!(&summary);
+    bounded(shared, val)
+}
+
 pub(super) async fn availability(
     shared: &Shared,
     query: ObservationQuery,
@@ -329,4 +374,28 @@ fn log_tail(directory: &std::path::Path, query: LogQuery) -> Result<Value, Refus
         json!({"api_version": API_VERSION, "files": files.into_iter().rev().collect::<Vec<_>>(),
         "file": selected, "lines": lines, "truncated": truncated, "files_truncated": matched > 100}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_summary_query_parsing() {
+        let filter = usage_summary_query("").expect("empty query");
+        assert_eq!(filter.from_us, None);
+        assert_eq!(filter.until_us, None);
+        assert_eq!(filter.agent, None);
+        assert_eq!(filter.model, None);
+
+        let filter = usage_summary_query("from_us=100&until_us=200&agent=42&model=gpt-4o")
+            .expect("full query");
+        assert_eq!(filter.from_us, Some(100));
+        assert_eq!(filter.until_us, Some(200));
+        assert_eq!(filter.agent, Some(42));
+        assert_eq!(filter.model.as_deref(), Some("gpt-4o"));
+
+        assert!(usage_summary_query("from_us=200&until_us=100").is_err());
+        assert!(usage_summary_query("unknown=1").is_err());
+    }
 }

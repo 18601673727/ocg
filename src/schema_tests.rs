@@ -3336,8 +3336,28 @@ mod control_plane {
             assert!(address.ip().is_loopback());
             let health = get(address, "/api/v1/health");
             assert_eq!(health.status, 200);
+            let mut health_val = health.json();
+            assert!(health_val["database"]["commits"].is_u64());
+            assert!(health_val["database"]["durable_commits"].is_u64());
+            assert!(health_val["database"]["commit_us_total"].is_u64());
+            assert!(health_val["database"]["commit_us_max"].is_u64());
+            assert!(health_val["claims"]["claims"].is_u64());
+            assert!(health_val["claims"]["claim_us_total"].is_u64());
+            assert!(health_val["claims"]["claim_us_max"].is_u64());
+            assert!(health_val["queue"]["pending"].is_u64());
+            assert!(health_val["queue"]["ready"].is_u64());
+            assert!(health_val["queue"]["delayed"].is_u64());
+            assert!(health_val["process"]["memory_rss_bytes"].is_u64());
+            assert!(health_val["process"]["memory_rss_peak_bytes"].is_u64());
+            health_val["database"]
+                .as_object_mut()
+                .unwrap()
+                .retain(|k, _| ["status", "accepting_commands", "readable"].contains(&k.as_str()));
+            health_val.as_object_mut().unwrap().remove("claims");
+            health_val.as_object_mut().unwrap().remove("queue");
+            health_val.as_object_mut().unwrap().remove("process");
             assert_eq!(
-                health.json(),
+                health_val,
                 json!({
                     "api_version": 1,
                     "host": "running",
@@ -9913,12 +9933,12 @@ mod requests_and_tool_loop {
             );
             let failed = answer_to(third, "call_test_1").expect("answered");
             assert_eq!(
-                parsed(&failed),
+                workspace_command::strip_command_stats(parsed(&failed)),
                 test_result(&project.bin.join("cargo"), false)
             );
             let passed = answer_to(fifth, "call_test_2").expect("answered");
             assert_eq!(
-                parsed(&passed),
+                workspace_command::strip_command_stats(parsed(&passed)),
                 test_result(&project.bin.join("cargo"), true)
             );
 
@@ -9944,7 +9964,7 @@ mod requests_and_tool_loop {
                     (id, workspace_command::TOOL_NAME)
                 );
                 let admission = record.admission().expect("admitted");
-                assert_eq!(admission.handler_version, "workspace_run_command-5");
+                assert_eq!(admission.handler_version, "workspace_run_command-6");
                 assert_eq!(admission.effect, ToolEffect::NonIdempotent);
                 assert_eq!(admission.arguments.as_str(), r#"{"command":"cargo_test"}"#);
                 assert_eq!(
@@ -10434,7 +10454,7 @@ mod requests_and_tool_loop {
                 index: 0,
             };
             let admission = ToolAdmission {
-                handler_version: "workspace_run_command-5".into(),
+                handler_version: "workspace_run_command-6".into(),
                 effect: ToolEffect::NonIdempotent,
                 parameters: "{}".into(),
                 arguments: ToolPayload::new("{}"),
@@ -15779,7 +15799,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 18);
+            assert_eq!(crate::storage::FORMAT_VERSION, 19);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");

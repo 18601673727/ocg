@@ -2,7 +2,6 @@
 
 pub mod blocking;
 pub mod execution_runtime;
-pub mod governor;
 pub(crate) mod scheduler;
 pub(crate) mod tools;
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]

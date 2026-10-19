@@ -54,7 +54,7 @@ fn job_events(rx: &ReadTransaction, job: JobId) -> Result<Vec<RequestEventRecord
 /// follows the Measurement event written with it, in the same transaction,
 /// is that record's annotation; any other Token event is a record of its
 /// own, without measurements.
-fn metrics_of(
+pub(super) fn metrics_of(
     job: JobId,
     target: &Option<LlmTarget>,
     events: Vec<RequestEventRecord>,

@@ -736,6 +736,32 @@ impl Batch {
             }
             updated_totals = Some((arguments, schemas));
         }
+        let current_stats = self.step(|tx| {
+            Ok(tx
+                .open_table(TOOL_STATS)?
+                .get(name)?
+                .map(|found| found.value())
+                .unwrap_or((0, 0, 0, 0, 0, 0)))
+        })?;
+        let mut updated_stats = current_stats;
+        match &decision {
+            ToolDecision::Admitted(_) => {
+                updated_stats.0 = updated_stats.0.saturating_add(1);
+            }
+            ToolDecision::Refused(ToolCallRefusal::InvalidArguments) => {
+                updated_stats.1 = updated_stats.1.saturating_add(1);
+            }
+            ToolDecision::Refused(
+                ToolCallRefusal::Malformed
+                | ToolCallRefusal::ConflictingIdentity
+                | ToolCallRefusal::AmbiguousIdentity
+                | ToolCallRefusal::LimitExceeded
+                | ToolCallRefusal::Incomplete
+                | ToolCallRefusal::Unauthorized
+                | ToolCallRefusal::MissingSchema
+                | ToolCallRefusal::UnsupportedSchema,
+            ) => {}
+        }
         let record = ToolEvidenceRecord {
             call,
             tool_call_id: tool_call_id.to_owned(),
@@ -755,6 +781,7 @@ impl Batch {
                 (call.job.get(), tool_call_id),
                 (call.request.get(), call.index),
             )?;
+            tx.open_table(TOOL_STATS)?.insert(name, updated_stats)?;
             if let Some(totals) = updated_totals {
                 tx.open_table(TOOL_TOTALS)?.insert(call.job.get(), totals)?;
             }
@@ -781,11 +808,42 @@ impl Batch {
         if record.outcome.is_some() {
             return self.reject(Violation::ToolOutcomeAlreadyRecorded(call));
         }
+        let current_stats = self.step(|tx| {
+            Ok(tx
+                .open_table(TOOL_STATS)?
+                .get(record.name.as_str())?
+                .map(|found| found.value())
+                .unwrap_or((0, 0, 0, 0, 0, 0)))
+        })?;
+        let mut updated_stats = current_stats;
+        let duration_us = self
+            .now
+            .as_unix_micros()
+            .saturating_sub(record.decision.at.as_unix_micros())
+            .max(0) as u64;
+        updated_stats.4 = updated_stats.4.saturating_add(duration_us);
+        updated_stats.5 = updated_stats.5.max(duration_us);
+        match &outcome {
+            ToolOutcome::Completed { .. } => {
+                updated_stats.2 = updated_stats.2.saturating_add(1);
+            }
+            ToolOutcome::CompletedWithheld { .. }
+            | ToolOutcome::NotApplied { .. }
+            | ToolOutcome::NotInvoked { .. }
+            | ToolOutcome::Uncertain { .. } => {
+                updated_stats.3 = updated_stats.3.saturating_add(1);
+            }
+        }
         record.outcome = Some(Recorded {
             fact: outcome,
             at: self.now,
         });
         self.put_tool_evidence(&record)?;
+        self.step(|tx| {
+            tx.open_table(TOOL_STATS)?
+                .insert(record.name.as_str(), updated_stats)?;
+            Ok(())
+        })?;
         self.probe = Some(Probe::ToolOutcome(call));
         Ok(())
     }

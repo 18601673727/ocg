@@ -104,6 +104,7 @@ pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,
     DatabaseStatus, MaintenanceError, OperationStatus, UnknownCause,
 };
+pub use handle::Vitals;
 pub use scheduler_wake::SchedulerWakeSubscription;
 use scheduler_wake::{SchedulerWake, affects_scheduling, releases_capacity};
 #[cfg(test)]

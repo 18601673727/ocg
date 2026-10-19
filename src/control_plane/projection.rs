@@ -11,6 +11,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         DatabaseStatus::Closed => "closed",
     };
     let readable = database.job(database.genesis()).await.is_ok();
+    let vitals = database.vitals();
     let quarantined = match database.unresolved_executions().await {
         Ok(unresolved) => unresolved
             .into_iter()
@@ -34,6 +35,24 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             "status": status,
             "accepting_commands": status == "open",
             "readable": readable,
+            "commits": vitals.commits,
+            "durable_commits": vitals.durable_commits,
+            "commit_us_total": vitals.commit_us_total,
+            "commit_us_max": vitals.commit_us_max,
+        },
+        "claims": {
+            "claims": vitals.claims,
+            "claim_us_total": vitals.claim_us_total,
+            "claim_us_max": vitals.claim_us_max,
+        },
+        "queue": {
+            "pending": vitals.queue_pending,
+            "ready": vitals.queue_ready,
+            "delayed": vitals.queue_delayed,
+        },
+        "process": {
+            "memory_rss_bytes": vitals.memory_rss_bytes,
+            "memory_rss_peak_bytes": vitals.memory_rss_peak_bytes,
         },
         "quarantined": quarantined,
     })
@@ -331,6 +350,36 @@ mod tests {
         let worker = DatabaseWorker::start(&directory).expect("start");
         let handle = worker.handle();
         assert_eq!(wait(health(&handle)).get("workspace_root"), None);
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn health_includes_vitals() {
+        use crate::database::DatabaseWorker;
+        use crate::test_support::{data_directory, wait};
+
+        let (_data, directory) = data_directory("health", "vitals");
+        let worker = DatabaseWorker::start(&directory).expect("start");
+        let handle = worker.handle();
+        let value = wait(health(&handle));
+        assert_eq!(value["api_version"], 1);
+        assert_eq!(value["host"], "running");
+        assert_eq!(value["database"]["status"], "open");
+        assert_eq!(value["database"]["accepting_commands"], true);
+        assert_eq!(value["database"]["readable"], true);
+        assert!(value["database"]["commits"].is_u64());
+        assert!(value["database"]["durable_commits"].is_u64());
+        assert!(value["database"]["commit_us_total"].is_u64());
+        assert!(value["database"]["commit_us_max"].is_u64());
+        assert!(value["claims"]["claims"].is_u64());
+        assert!(value["claims"]["claim_us_total"].is_u64());
+        assert!(value["claims"]["claim_us_max"].is_u64());
+        assert!(value["queue"]["pending"].is_u64());
+        assert!(value["queue"]["ready"].is_u64());
+        assert!(value["queue"]["delayed"].is_u64());
+        assert!(value["process"]["memory_rss_bytes"].is_u64());
+        assert!(value["process"]["memory_rss_peak_bytes"].is_u64());
+        assert_eq!(value["quarantined"], json!([]));
         worker.shutdown().expect("shutdown");
     }
 

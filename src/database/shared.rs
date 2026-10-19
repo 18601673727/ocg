@@ -68,6 +68,12 @@ pub(super) struct Shared {
     /// exactly one, so this counts durable commits too, and dividing the
     /// commands submitted by it gives the mean group size.
     pub(super) durable_commits: AtomicU64,
+    pub(super) commits: AtomicU64,
+    pub(super) commit_us_total: AtomicU64,
+    pub(super) commit_us_max: AtomicU64,
+    pub(super) claims: AtomicU64,
+    pub(super) claim_us_total: AtomicU64,
+    pub(super) claim_us_max: AtomicU64,
     /// The Jobs this worker's start settled as abandoned by an earlier
     /// opening; see [`DatabaseHandle::abandoned_at_open`].
     pub(super) abandoned_at_open: Vec<JobId>,

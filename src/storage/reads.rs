@@ -1,5 +1,7 @@
 use std::ops::Bound;
 
+use redb::ReadableTableMetadata;
+
 use super::*;
 use crate::persistence::{
     ConfigBody, ConfigId, ConfigKind, ConfigRecord, ExecutionConfiguration, ExecutionOperation,
@@ -884,4 +886,86 @@ pub(crate) fn read_conversations(
         next_before,
         has_more,
     })
+}
+
+pub(crate) fn queue_counts(database: &Database) -> (u64, u64, u64) {
+    if let Ok(rx) = read(database) {
+        let p = rx.open_table(PENDING).ok().and_then(|t| t.len().ok()).unwrap_or(0);
+        let r = rx.open_table(READY).ok().and_then(|t| t.len().ok()).unwrap_or(0);
+        let d = rx.open_table(DELAYED).ok().and_then(|t| t.len().ok()).unwrap_or(0);
+        (p, r, d)
+    } else {
+        (0, 0, 0)
+    }
+}
+
+pub(crate) fn read_tool_stats(
+    database: &Database,
+) -> Result<Vec<crate::persistence::ToolStatRecord>, StorageError> {
+    let rx = read(database)?;
+    let table = rx.open_table(TOOL_STATS)?;
+    let mut stats = Vec::new();
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        let (admitted, refused_arguments, completed, failed, duration_us_total, duration_us_max) =
+            value.value();
+        stats.push(crate::persistence::ToolStatRecord {
+            name: key.value().to_owned(),
+            admitted,
+            refused_arguments,
+            completed,
+            failed,
+            duration_us_total,
+            duration_us_max,
+        });
+    }
+    Ok(stats)
+}
+
+pub(crate) fn read_usage_summary(
+    database: &Database,
+    filter: &crate::token_usage::UsageSummaryFilter,
+) -> Result<crate::token_usage::UsageSummaryRecord, StorageError> {
+    let rx = read(database)?;
+    let table = rx.open_table(USAGE_TOTALS)?;
+    let mut summary = crate::token_usage::UsageSummaryRecord::default();
+    let from_hour = filter
+        .from_us
+        .map(|us| (us.max(0) as u64) / 3_600_000_000)
+        .unwrap_or(0);
+    let until_hour = filter
+        .until_us
+        .map(|us| (us.max(0) as u64) / 3_600_000_000)
+        .unwrap_or(u64::MAX);
+    let target_hash = filter
+        .model
+        .as_deref()
+        .map(|m| *ContentDigest::of(m.as_bytes()).as_bytes());
+
+    let start = (from_hour, 0, 0, [0u8; 32]);
+    let end = (until_hour, u64::MAX, u64::MAX, [0xffu8; 32]);
+
+    for entry in table.range(start..=end)? {
+        let (key, value) = entry?;
+        let (_hour, agent, _provider, model_hash) = key.value();
+        if let Some(target_agent) = filter.agent
+            && agent != target_agent
+        {
+            continue;
+        }
+        if let Some(target_hash) = target_hash
+            && model_hash != target_hash
+        {
+            continue;
+        }
+        let (requests, input, output, cache_read, cache_write, reasoning, total) = value.value();
+        summary.requests = summary.requests.saturating_add(requests);
+        summary.input_tokens = summary.input_tokens.saturating_add(input);
+        summary.output_tokens = summary.output_tokens.saturating_add(output);
+        summary.cache_read_tokens = summary.cache_read_tokens.saturating_add(cache_read);
+        summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(cache_write);
+        summary.reasoning_tokens = summary.reasoning_tokens.saturating_add(reasoning);
+        summary.total_tokens = summary.total_tokens.saturating_add(total);
+    }
+    Ok(summary)
 }

@@ -123,6 +123,7 @@ impl ToolAdmission {
                 | "workspace_run_command-3"
                 | "workspace_run_command-4"
                 | "workspace_run_command-5"
+                | "workspace_run_command-6"
         )
     }
 }
@@ -292,4 +293,16 @@ impl ToolEvidenceRecord {
         });
         self.admission().is_some() && (completed || reconciled)
     }
+}
+
+/// Aggregated statistics of one tool's admissions and execution outcomes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolStatRecord {
+    pub name: String,
+    pub admitted: u64,
+    pub refused_arguments: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub duration_us_total: u64,
+    pub duration_us_max: u64,
 }

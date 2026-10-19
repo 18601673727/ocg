@@ -230,6 +230,12 @@ impl DatabaseWorker {
                     epoch: AtomicU64::new(epoch),
                     next_operation: AtomicU64::new(next_operation),
                     durable_commits: AtomicU64::new(0),
+                    commits: AtomicU64::new(0),
+                    commit_us_total: AtomicU64::new(0),
+                    commit_us_max: AtomicU64::new(0),
+                    claims: AtomicU64::new(0),
+                    claim_us_total: AtomicU64::new(0),
+                    claim_us_max: AtomicU64::new(0),
                     abandoned_at_open,
                     released: AtomicBool::new(false),
                     live_readers: AtomicUsize::new(0),
@@ -826,6 +832,7 @@ impl WriteWorker {
         let mut unrun = Vec::new();
         let mut failure: Option<StorageFailure> = None;
         let mut lost: Option<StorageError> = None;
+        let commit_started = Instant::now();
         {
             let guard = shared
                 .database
@@ -849,7 +856,7 @@ impl WriteWorker {
                 envelope.started.store(true, Ordering::SeqCst);
                 let mut ran = envelope
                     .command
-                    .execute(&opened.database, operation, commit);
+                    .execute(&opened.database, &shared, operation, commit);
                 failure = ran.failure.take();
                 executed.push((
                     ran,
@@ -877,8 +884,12 @@ impl WriteWorker {
         }
         // The group's durability is settled: a lone command committed its own
         // transaction, and a group of them made all of theirs durable together.
+        let commit_duration_us = commit_started.elapsed().as_micros() as u64;
         if !executed.is_empty() {
+            self.shared.commits.fetch_add(executed.len() as u64, Ordering::SeqCst);
             self.shared.durable_commits.fetch_add(1, Ordering::SeqCst);
+            self.shared.commit_us_total.fetch_add(commit_duration_us, Ordering::Relaxed);
+            self.shared.commit_us_max.fetch_max(commit_duration_us, Ordering::Relaxed);
         }
         for (ran, outcome_unknown) in &executed {
             if *outcome_unknown {

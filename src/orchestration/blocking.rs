@@ -1,6 +1,7 @@
 //! Limits and process supervision for blocking work started by tool calls.
 
 use std::os::fd::OwnedFd;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -175,6 +176,20 @@ impl Sentinel {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildUsage {
+    pub(crate) user: Duration,
+    pub(crate) system: Duration,
+    pub(crate) peak_rss_bytes: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct Finished {
+    pub(crate) status: ExitStatus,
+    pub(crate) wall: Duration,
+    pub(crate) usage: Option<ChildUsage>,
+}
+
 pub(crate) struct Process {
     child: Child,
     sentinel: OwnedFd,
@@ -333,15 +348,19 @@ impl Process {
     }
 
     pub(crate) fn finish(
-        mut self,
+        self,
         stop_requested: impl Fn() -> bool,
-    ) -> Result<ExitStatus, FinishError> {
+    ) -> Result<Finished, FinishError> {
         let mut term_sent = false;
         let mut deadline = None;
         let mut wait_error = None;
+        let mut wall = None;
         loop {
             match wait_leader(self.group) {
-                Ok(true) => break,
+                Ok(true) => {
+                    wall.get_or_insert_with(|| self.started_at.elapsed());
+                    break;
+                }
                 Ok(false) => {}
                 Err(error) => {
                     wait_error = Some(error);
@@ -365,7 +384,10 @@ impl Process {
         signal(self.group, Signal::KILL);
         loop {
             match wait_leader(self.group) {
-                Ok(true) => break,
+                Ok(true) => {
+                    wall.get_or_insert_with(|| self.started_at.elapsed());
+                    break;
+                }
                 Ok(false) => thread::sleep(POLL),
                 Err(error) => {
                     wait_error.get_or_insert(error);
@@ -385,12 +407,47 @@ impl Process {
             drop(self.permit);
             return Err(FinishError::NotProven(error));
         }
-        let status = self.child.wait().map_err(FinishError::Wait)?;
-        drop(self.permit);
-        match wait_error {
-            Some(error) => Err(FinishError::Wait(error)),
-            None => Ok(status),
+        let mut raw_status: libc::c_int = 0;
+        let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+        let pid = self.child.id() as libc::pid_t;
+        loop {
+            let res = unsafe { libc::wait4(pid, &mut raw_status, 0, &mut rusage) };
+            if res == -1 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                drop(self.permit);
+                return Err(FinishError::Wait(err));
+            }
+            break;
         }
+        drop(self.permit);
+        if let Some(error) = wait_error {
+            return Err(FinishError::Wait(error));
+        }
+        let status = ExitStatus::from_raw(raw_status);
+        let wall = wall.unwrap_or_else(|| self.started_at.elapsed());
+        #[cfg(target_os = "macos")]
+        let peak_rss_bytes = rusage.ru_maxrss.max(0) as u64;
+        #[cfg(not(target_os = "macos"))]
+        let peak_rss_bytes = (rusage.ru_maxrss.max(0) as u64).saturating_mul(1024);
+
+        let user = Duration::from_secs(rusage.ru_utime.tv_sec.max(0) as u64)
+            + Duration::from_micros(rusage.ru_utime.tv_usec.max(0) as u64);
+        let system = Duration::from_secs(rusage.ru_stime.tv_sec.max(0) as u64)
+            + Duration::from_micros(rusage.ru_stime.tv_usec.max(0) as u64);
+
+        let usage = Some(ChildUsage {
+            user,
+            system,
+            peak_rss_bytes,
+        });
+        Ok(Finished {
+            status,
+            wall,
+            usage,
+        })
     }
 }
 

@@ -24,6 +24,8 @@ pub(super) struct Derived {
     chat_threads: BTreeMap<(u64, u64), ()>,
     tool_call_ids: BTreeMap<(u64, String), (u32, u32)>,
     tool_totals: BTreeMap<u64, (u64, u64)>,
+    tool_stats: BTreeMap<String, schema::ToolStatValue>,
+    usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
     retries: BTreeMap<(u64, u64), ()>,
     attachment_refs: BTreeMap<(u64, u64), ()>,
 }
@@ -33,6 +35,8 @@ struct Authoritative {
     states: BTreeMap<u64, JobStateRow>,
     tool_call_ids: Vec<(u64, String, u32, u32)>,
     tool_totals: BTreeMap<u64, (u64, u64)>,
+    tool_stats: BTreeMap<String, schema::ToolStatValue>,
+    usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
 }
 
 fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageError> {
@@ -48,6 +52,7 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
     }
     let mut tool_call_ids = Vec::new();
     let mut tool_totals: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let mut tool_stats: BTreeMap<String, schema::ToolStatValue> = BTreeMap::new();
     for entry in tx.open_table(TOOL_CALLS)?.iter()? {
         let (key, bytes) = entry?;
         let (job, request, index) = key.value();
@@ -57,13 +62,94 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
             totals.0 = totals.0.saturating_add(admission.arguments.len() as u64);
             totals.1 = totals.1.saturating_add(admission.parameters.len() as u64);
         }
+        let stats = tool_stats.entry(record.name.clone()).or_insert((0, 0, 0, 0, 0, 0));
+        match &record.decision.fact {
+            crate::persistence::ToolDecision::Admitted(_) => stats.0 = stats.0.saturating_add(1),
+            crate::persistence::ToolDecision::Refused(crate::storage::ToolCallRefusal::InvalidArguments) => {
+                stats.1 = stats.1.saturating_add(1);
+            }
+            crate::persistence::ToolDecision::Refused(
+                crate::storage::ToolCallRefusal::Malformed
+                | crate::storage::ToolCallRefusal::ConflictingIdentity
+                | crate::storage::ToolCallRefusal::AmbiguousIdentity
+                | crate::storage::ToolCallRefusal::LimitExceeded
+                | crate::storage::ToolCallRefusal::Incomplete
+                | crate::storage::ToolCallRefusal::Unauthorized
+                | crate::storage::ToolCallRefusal::MissingSchema
+                | crate::storage::ToolCallRefusal::UnsupportedSchema,
+            ) => {}
+        }
+        if let Some(outcome) = &record.outcome {
+            let duration_us = outcome
+                .at
+                .as_unix_micros()
+                .saturating_sub(record.decision.at.as_unix_micros())
+                .max(0) as u64;
+            stats.4 = stats.4.saturating_add(duration_us);
+            stats.5 = stats.5.max(duration_us);
+            match &outcome.fact {
+                crate::persistence::ToolOutcome::Completed { .. } => {
+                    stats.2 = stats.2.saturating_add(1);
+                }
+                crate::persistence::ToolOutcome::CompletedWithheld { .. }
+                | crate::persistence::ToolOutcome::NotApplied { .. }
+                | crate::persistence::ToolOutcome::NotInvoked { .. }
+                | crate::persistence::ToolOutcome::Uncertain { .. } => {
+                    stats.3 = stats.3.saturating_add(1);
+                }
+            }
+        }
         tool_call_ids.push((job, record.tool_call_id, request, index));
+    }
+    let mut usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue> = BTreeMap::new();
+    let mut job_events_map: BTreeMap<u64, Vec<crate::persistence::RequestEventRecord>> = BTreeMap::new();
+    for entry in tx.open_table(REQUEST_EVENTS)?.iter()? {
+        let (key, bytes) = entry?;
+        let (job, request, seq) = key.value();
+        if let Some(req) = crate::persistence::RequestNumber::new(request) {
+            let event = rows::decode_request_event(JobId::new(job), req, seq, bytes.value())?;
+            job_events_map.entry(job).or_default().push(event);
+        }
+    }
+    for (job_id, events) in job_events_map {
+        let Some(job_row) = jobs.get(&job_id) else { continue };
+        let Some(execution) = &job_row.execution else { continue };
+        let agent = usage_agent(job_row);
+        let provider = execution.llm.provider.id.get();
+        let model_hash = *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes();
+        let target = Some(LlmTarget {
+            llm_profile: execution.llm.model.id.into(),
+            frozen: execution.llm.clone(),
+        });
+        let records = observations::metrics_of(JobId::new(job_id), &target, events);
+        if let Ok(samples) = crate::token_usage::TokenRequestSample::per_request(&records) {
+            for sample in samples {
+                let hour = (sample.observed_at.as_unix_micros().max(0) as u64) / 3_600_000_000;
+                let key = (hour, agent, provider, model_hash);
+                let entry = usage_totals.entry(key).or_insert((0, 0, 0, 0, 0, 0, 0));
+                let input = sample.input.value().unwrap_or(0) as u64;
+                let output = sample.output.value().unwrap_or(0) as u64;
+                let cache_read = sample.cache_read.value().unwrap_or(0) as u64;
+                let cache_write = sample.cache_write.value().unwrap_or(0) as u64;
+                let reasoning = sample.reasoning.value().unwrap_or(0) as u64;
+                let total = sample.total.unwrap_or(0);
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(input);
+                entry.2 = entry.2.saturating_add(output);
+                entry.3 = entry.3.saturating_add(cache_read);
+                entry.4 = entry.4.saturating_add(cache_write);
+                entry.5 = entry.5.saturating_add(reasoning);
+                entry.6 = entry.6.saturating_add(total);
+            }
+        }
     }
     Ok(Authoritative {
         jobs,
         states,
         tool_call_ids,
         tool_totals,
+        tool_stats,
+        usage_totals,
     })
 }
 
@@ -175,6 +261,8 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
             .insert((*job, id.clone()), (*request, *index));
     }
     derived.tool_totals = auth.tool_totals.clone();
+    derived.tool_stats = auth.tool_stats.clone();
+    derived.usage_totals = auth.usage_totals.clone();
     Ok(derived)
 }
 
@@ -258,6 +346,34 @@ pub(super) fn rebuild(
         }
     }
     note("tool_call_id", differs, true);
+    let mut current_tool_stats = BTreeMap::new();
+    for entry in tx.open_table(TOOL_STATS)?.iter()? {
+        let (key, value) = entry?;
+        current_tool_stats.insert(key.value().to_owned(), value.value());
+    }
+    let tool_stats_differs = current_tool_stats != derived.tool_stats;
+    if tool_stats_differs {
+        tx.delete_table(TOOL_STATS)?;
+        let mut table = tx.open_table(TOOL_STATS)?;
+        for (name, value) in &derived.tool_stats {
+            table.insert(name.as_str(), *value)?;
+        }
+    }
+    note("tool_stat", tool_stats_differs, true);
+    let mut current_usage_totals = BTreeMap::new();
+    for entry in tx.open_table(USAGE_TOTALS)?.iter()? {
+        let (key, value) = entry?;
+        current_usage_totals.insert(key.value(), value.value());
+    }
+    let usage_totals_differs = current_usage_totals != derived.usage_totals;
+    if usage_totals_differs {
+        tx.delete_table(USAGE_TOTALS)?;
+        let mut table = tx.open_table(USAGE_TOTALS)?;
+        for (key, value) in &derived.usage_totals {
+            table.insert(*key, *value)?;
+        }
+    }
+    note("usage_total", usage_totals_differs, true);
     Ok(changed)
 }
 
@@ -280,4 +396,82 @@ pub(crate) fn relationship_inconsistencies(
         .into_iter()
         .map(|table| format!("{table} differs from its definition"))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::data_directory;
+
+    #[test]
+    fn tool_stats_rebuild_detects_difference() {
+        let (_data, directory) = data_directory("derived", "tool-stats-rebuild");
+        let opened = crate::storage::open(directory.database_path())
+            .unwrap_or_else(|_| panic!("open"));
+
+        // Corrupt TOOL_STATS by adding an extra entry
+        let tx = opened.database.begin_write().expect("tx");
+        {
+            let mut table = tx.open_table(TOOL_STATS).expect("open");
+            table
+                .insert("phantom_tool", (1, 0, 0, 0, 0, 0))
+                .expect("insert");
+        }
+        tx.commit().expect("commit");
+
+        let problems = relationship_inconsistencies(&opened.database).expect("inconsistencies");
+        assert!(
+            problems.iter().any(|p| p.contains("tool_stat differs")),
+            "expected tool_stat difference, got: {problems:?}"
+        );
+
+        // Now run rebuild
+        let tx = opened.database.begin_write().expect("tx");
+        let changed = rebuild(&tx, open::promotion_clock()).expect("rebuild");
+        assert!(changed.contains(&"tool_stat"));
+        tx.commit().expect("commit");
+
+        // After rebuild, clean
+        let problems_after = relationship_inconsistencies(&opened.database).expect("clean");
+        assert!(
+            problems_after.is_empty(),
+            "expected clean, got: {problems_after:?}"
+        );
+    }
+
+    #[test]
+    fn usage_totals_rebuild_detects_difference() {
+        let (_data, directory) = data_directory("derived", "usage-totals-rebuild");
+        let opened = crate::storage::open(directory.database_path())
+            .unwrap_or_else(|_| panic!("open"));
+
+        // Corrupt USAGE_TOTALS by adding an extra entry
+        let tx = opened.database.begin_write().expect("tx");
+        {
+            let mut table = tx.open_table(USAGE_TOTALS).expect("open");
+            table
+                .insert((1, 1, 1, [0u8; 32]), (1, 10, 20, 0, 0, 0, 30))
+                .expect("insert");
+        }
+        tx.commit().expect("commit");
+
+        let problems = relationship_inconsistencies(&opened.database).expect("inconsistencies");
+        assert!(
+            problems.iter().any(|p| p.contains("usage_total differs")),
+            "expected usage_total difference, got: {problems:?}"
+        );
+
+        // Now run rebuild
+        let tx = opened.database.begin_write().expect("tx");
+        let changed = rebuild(&tx, open::promotion_clock()).expect("rebuild");
+        assert!(changed.contains(&"usage_total"));
+        tx.commit().expect("commit");
+
+        // After rebuild, clean
+        let problems_after = relationship_inconsistencies(&opened.database).expect("clean");
+        assert!(
+            problems_after.is_empty(),
+            "expected clean, got: {problems_after:?}"
+        );
+    }
 }

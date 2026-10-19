@@ -39,6 +39,10 @@ pub(crate) struct JobRow {
     pub(crate) project: Option<ProjectId>,
 }
 
+pub(crate) fn usage_agent(row: &JobRow) -> u64 {
+    row.agent_id.map_or(0, |id| id.get())
+}
+
 impl JobRow {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);

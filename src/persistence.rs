@@ -68,7 +68,8 @@ pub use tool_evidence::{
     MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES,
     MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES, NewToolEvidence, NotInvokedReason, Recorded,
     ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
-    ToolOutcomeKind, ToolPayload, ToolReconciliation, UncertainCause, WithheldReason,
+    ToolOutcomeKind, ToolPayload, ToolReconciliation, ToolStatRecord, UncertainCause,
+    WithheldReason,
 };
 use tool_evidence::{MAX_RECONCILER_BYTES, MAX_RECONCILIATION_TEXT_BYTES};
 

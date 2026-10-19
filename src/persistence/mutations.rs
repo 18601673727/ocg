@@ -722,6 +722,7 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
         )?;
         id.get_or_insert(request_record_id(metrics.request, seq));
     }
+    batch.update_usage_total(metrics.job, metrics.request)?;
     Ok(MetricsId::new(id.unwrap_or(0)))
 }
 
