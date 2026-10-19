@@ -543,7 +543,7 @@ impl WorkspaceTools {
         let Some(grant) = grant else {
             return Ok(None);
         };
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(unix)]
         {
             use crate::orchestration::workspace_command::{self, Grant};
             let workspace = self.workspace.clone().ok_or({
@@ -555,21 +555,6 @@ impl WorkspaceTools {
                 return Err(ExecutionRuntimeError::WorkspaceGrantUnsupported);
             };
             let tools = workspace_command::workspace_tools(workspace, grant)
-                .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
-            Ok(Some(tools))
-        }
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))))]
-        {
-            use crate::orchestration::workspace_read;
-            let workspace = self.workspace.clone().ok_or({
-                ExecutionRuntimeError::Database(DatabaseError::Rejected(
-                    Violation::WorkspaceNotConfigured,
-                ))
-            })?;
-            if grant != "read" {
-                return Err(ExecutionRuntimeError::WorkspaceGrantUnsupported);
-            }
-            let tools = workspace_read::read_file_tools(workspace)
                 .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
             Ok(Some(tools))
         }
@@ -781,8 +766,8 @@ mod grounding_tests {
 
         for (grant, allowed_text) in [
             ("read", "read"),
-            ("edit", "edit"),
-            ("code", "run commands"),
+            ("edit", "read and edit"),
+            ("code", "read, edit and run commands"),
         ] {
             let agent_body = AgentConfig {
                 instructions: Some("Agent instructions".into()),
@@ -889,11 +874,14 @@ mod grounding_tests {
             assert_eq!(read_agents_md(&test_workspace).await, None);
 
             // Non-UTF-8: skipped and logged
+            std::fs::write(root.join("AGENTS.md"), b"hello \xff\xfe world").expect("write non-utf8");
+            assert_eq!(read_agents_md(&test_workspace).await, None);
+            std::fs::remove_file(root.join("AGENTS.md")).expect("remove non-utf8");
+
+            // Symlink: skipped and logged
             #[cfg(unix)]
             {
                 use std::os::unix::fs::symlink;
-                std::fs::remove_file(root.join("AGENTS.md")).expect("remove");
-                // Symlink: skipped and logged
                 std::fs::write(root.join("target.md"), "target").expect("write target");
                 symlink(root.join("target.md"), root.join("AGENTS.md")).expect("symlink");
                 assert_eq!(read_agents_md(&test_workspace).await, None);
@@ -2055,11 +2043,11 @@ async fn read_agents_md(
     match result {
         Ok(Ok(content)) => content,
         Ok(Err(reason)) => {
-            eprintln!("skipping AGENTS.md: {reason}");
+            log::warn!("skipping AGENTS.md: {reason}");
             None
         }
         Err(e) => {
-            eprintln!("skipping AGENTS.md: blocking task failed: {e}");
+            log::warn!("skipping AGENTS.md: blocking task failed: {e}");
             None
         }
     }
@@ -3894,9 +3882,10 @@ mod failure_tests {
         let (_workspace, root) =
             crate::test_support::temporary_directory("provider-network", "retry-workspace");
         std::fs::write(root.join("input"), "read me").expect("file");
-        let mut tools = crate::orchestration::workspace_read::read_file_tools(
+        let mut tools = crate::orchestration::workspace_command::workspace_tools(
             crate::orchestration::workspace_read::Workspace::authorize(&root, &directory)
                 .expect("workspace"),
+            crate::orchestration::workspace_command::Grant::Read,
         )
         .expect("tools");
         tools.limits.max_provider_requests = 2;

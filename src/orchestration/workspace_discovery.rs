@@ -785,7 +785,7 @@ fn search_parameters() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": MAX_TEXT_BYTES,
-                "description": "Match files whose content contains this exact, case-sensitive text on one line; returns the matching lines"
+                "description": "Match files whose content contains this case-sensitive text on one line (exact by default, or as a regular expression when `regex` is true); returns the matching lines"
             },
             "regex": {
                 "type": "boolean",

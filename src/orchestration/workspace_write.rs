@@ -60,7 +60,6 @@ use rustix::io::Errno;
 use serde_json::{Value, json};
 
 use crate::orchestration::blocking::{self, Kind};
-use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -120,6 +119,8 @@ enum Refusal {
     Occurrences(usize),
     #[error("the file is over 64 KiB; ask the user to delete it")]
     FileTooLargeForDelete,
+    #[error("the file could not be deleted")]
+    NotDeleted,
 }
 
 /// Why what a call did to the Workspace is not known, or not all known.
@@ -131,6 +132,8 @@ enum Uncertainty {
     Unknown,
     #[error("the new content was published, but its durability could not be confirmed")]
     NotDurable,
+    #[error("the file was deleted, but its durability could not be confirmed")]
+    DeleteNotDurable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,12 +348,15 @@ fn replace(
     let current_bytes = current.as_bytes();
     let mut count = 0;
     let mut offset = 0;
-    if old_bytes.len() <= current_bytes.len() {
-        for i in 0..=(current_bytes.len() - old_bytes.len()) {
-            if &current_bytes[i..i + old_bytes.len()] == old_bytes {
-                count += 1;
-                offset = i;
-            }
+    let finder = memchr::memmem::Finder::new(old_bytes);
+    let mut search_start = 0;
+    while search_start <= current_bytes.len() {
+        if let Some(hit) = finder.find(&current_bytes[search_start..]) {
+            count += 1;
+            offset = search_start + hit;
+            search_start = offset + 1;
+        } else {
+            break;
         }
     }
     if count != 1 {
@@ -421,10 +427,10 @@ fn delete(workspace: &Workspace, path: &str, expected: &str) -> Result<(), Failu
     if version(&read) != version(&after) {
         return Err(Refusal::Changed.into());
     }
-    rustix::fs::unlinkat(&directory, name, AtFlags::empty()).map_err(|_| Refusal::NotPublished)?;
+    rustix::fs::unlinkat(&directory, name, AtFlags::empty()).map_err(|_| Refusal::NotDeleted)?;
     directory
         .sync_all()
-        .map_err(|_| Uncertainty::NotDurable.into())
+        .map_err(|_| Uncertainty::DeleteNotDurable.into())
 }
 
 /// What identifies a file and its last change: a replacement, a new link,
@@ -799,28 +805,6 @@ pub(crate) fn register(
     )
 }
 
-/// The tools of an execution that may read and write files of `workspace`:
-/// exactly `workspace_read_file` and `workspace_write_file`, registered in a
-/// registry of their own and authorized there, with the default
-/// [`ToolLoopLimits`]. The registry is not shared, so nothing else can be
-/// offered or authorized through it.
-///
-/// # Errors
-///
-/// Returns a registration failure, which these tools' fixed definitions
-/// never cause.
-pub fn edit_file_tools(workspace: Workspace) -> Result<ToolExecution, ToolRegistryError> {
-    let registry = ToolRegistry::default();
-    workspace_read::register(&registry, workspace.clone())?;
-    register(&registry, workspace)?;
-    registry.authorize(workspace_read::TOOL_NAME)?;
-    registry.authorize(TOOL_NAME)?;
-    Ok(ToolExecution {
-        offer: registry.offer(&[workspace_read::TOOL_NAME, TOOL_NAME])?,
-        limits: ToolLoopLimits::default(),
-    })
-}
-
 /// Test seams of a write: each runs at its point and may make the step
 /// there fail.
 #[cfg(test)]
@@ -882,6 +866,7 @@ mod tests {
     use super::write_seam::Point;
     use super::*;
     use crate::data_directory::DataDirectory;
+    use crate::orchestration::execution_runtime::ToolExecution;
     use crate::test_support::{TestRoot, data_directory, temporary_directory};
 
     const SUITE: &str = "ocg-workspace-write";
@@ -1401,7 +1386,11 @@ mod tests {
     fn the_tools_are_offered_only_together_and_only_when_asked() {
         let (_guard, root, _data, directory) = workspace("registration");
         let authorize = || Workspace::authorize(&root, &directory).expect("authorize");
-        let read_only = workspace_read::read_file_tools(authorize()).expect("read tools");
+        let read_only = crate::orchestration::workspace_command::workspace_tools(
+            authorize(),
+            crate::orchestration::workspace_command::Grant::Read,
+        )
+        .expect("read tools");
         let names = |tools: &ToolExecution| {
             tools
                 .offer
@@ -1411,16 +1400,22 @@ mod tests {
                 .map(|wire| wire.function.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            names(&read_only),
-            [workspace_read::TOOL_NAME],
+        assert!(
+            !names(&read_only).iter().any(|name| name == TOOL_NAME),
             "reading never offers writing"
         );
-        let editing = edit_file_tools(authorize()).expect("edit tools");
-        assert_eq!(names(&editing), [workspace_read::TOOL_NAME, TOOL_NAME]);
+        let editing = crate::orchestration::workspace_command::workspace_tools(
+            authorize(),
+            crate::orchestration::workspace_command::Grant::Edit,
+        )
+        .expect("edit tools");
+        assert!(names(&editing).iter().any(|name| name == TOOL_NAME));
         let wires = editing.offer.wires().expect("offered");
-        assert_eq!(wires[1].function.parameters, Some(parameters()));
-        assert_eq!(editing.limits, ToolLoopLimits::default());
+        let write_wire = wires
+            .iter()
+            .find(|w| w.function.name == TOOL_NAME)
+            .expect("write wire");
+        assert_eq!(write_wire.function.parameters, Some(parameters()));
 
         let handler = WriteFile {
             workspace: authorize(),
@@ -1485,6 +1480,16 @@ mod tests {
         });
         assert_eq!(call(&workspace, fail_multi), refused(Refusal::Occurrences(3)));
 
+        // Occurrences check: overlapping occurrences ("aa" in "aaa" is 2)
+        write(&root, "overlap.txt", "aaa");
+        let fail_overlap = json!({
+            "operation": "replace",
+            "path": "overlap.txt",
+            "old": "aa",
+            "new": "x",
+        });
+        assert_eq!(call(&workspace, fail_overlap), refused(Refusal::Occurrences(2)));
+
         // Test delete
         let del_call = json!({
             "operation": "delete",
@@ -1513,5 +1518,42 @@ mod tests {
             "expected_content": "",
         });
         assert_eq!(call(&workspace, fail_dir), refused(PathRefusal::NotRegularFile));
+
+        // Refuse symlink
+        write(&root, "del_target.txt", "target\n");
+        symlink(root.join("del_target.txt"), root.join("del_symlink.txt")).expect("symlink");
+        let fail_symlink = json!({
+            "operation": "delete",
+            "path": "del_symlink.txt",
+            "expected_content": "target\n",
+        });
+        assert_eq!(call(&workspace, fail_symlink), refused(PathRefusal::SymbolicLink));
+
+        // Refuse hard link
+        write(&root, "del_hard_target.txt", "hard\n");
+        std::fs::hard_link(
+            root.join("del_hard_target.txt"),
+            root.join("del_hardlink.txt"),
+        )
+        .expect("hard link");
+        let fail_hardlink = json!({
+            "operation": "delete",
+            "path": "del_hardlink.txt",
+            "expected_content": "hard\n",
+        });
+        assert_eq!(call(&workspace, fail_hardlink), refused(PathRefusal::HardLinked));
+
+        // Refuse file over 64 KiB
+        let big = vec![b'a'; 65 * 1024];
+        std::fs::write(root.join("del_big.txt"), &big).expect("write big");
+        let fail_big = json!({
+            "operation": "delete",
+            "path": "del_big.txt",
+            "expected_content": "dummy",
+        });
+        assert_eq!(
+            call(&workspace, fail_big),
+            refused(Refusal::FileTooLargeForDelete)
+        );
     }
 }

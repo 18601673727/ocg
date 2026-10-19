@@ -55,7 +55,6 @@ use serde_json::{Value, json};
 
 use crate::data_directory::DataDirectory;
 use crate::orchestration::blocking::{self, Kind};
-use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -844,25 +843,6 @@ pub(crate) fn register(
     )
 }
 
-/// The tools of an execution that may read from `workspace`: exactly
-/// `workspace_read_file`, registered in a registry of its own and
-/// authorized there, with the default [`ToolLoopLimits`]. The registry is
-/// not shared, so nothing else can be offered or authorized through it.
-///
-/// # Errors
-///
-/// Returns a registration failure, which this tool's fixed definition never
-/// causes.
-pub fn read_file_tools(workspace: Workspace) -> Result<ToolExecution, ToolRegistryError> {
-    let registry = ToolRegistry::default();
-    register(&registry, workspace)?;
-    registry.authorize(TOOL_NAME)?;
-    Ok(ToolExecution {
-        offer: registry.offer(&[TOOL_NAME])?,
-        limits: ToolLoopLimits::default(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
@@ -1322,15 +1302,14 @@ mod tests {
             "registering authorizes nothing"
         );
 
-        let tools = read_file_tools(Workspace::authorize(&root, &directory).expect("authorize"))
-            .expect("enable the tool");
-        let wires = tools.offer.wires().expect("offered");
+        registry.authorize(TOOL_NAME).expect("authorize");
+        let offer = registry.offer(&[TOOL_NAME]).expect("offer");
+        let wires = offer.wires().expect("offered");
         let [wire] = wires.as_slice() else {
             panic!("exactly one tool is offered: {wires:?}");
         };
         assert_eq!(wire.function.name, TOOL_NAME);
         assert_eq!(wire.function.parameters, Some(parameters()));
-        assert_eq!(tools.limits, ToolLoopLimits::default());
         let handler = ReadFile {
             workspace: Workspace::authorize(&root, &directory).expect("authorize"),
         };

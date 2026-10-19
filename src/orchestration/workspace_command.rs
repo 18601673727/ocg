@@ -1266,12 +1266,8 @@ mod tests {
         );
         assert_eq!(edit.limits, coding_limits(COMMAND_TIMEOUT));
 
-        for other in [
-            workspace_read::read_file_tools(authorize()).expect("read tools"),
-            workspace_write::edit_file_tools(authorize()).expect("edit tools"),
-        ] {
-            assert!(!names(&other).iter().any(|name| name == TOOL_NAME));
-            assert_eq!(other.limits, ToolLoopLimits::default());
+        for other in [&read, &edit] {
+            assert!(!names(other).iter().any(|name| name == TOOL_NAME));
         }
 
         let handler = setup.handler(COMMAND_TIMEOUT);

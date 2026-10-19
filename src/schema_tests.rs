@@ -8549,6 +8549,17 @@ mod requests_and_tool_loop {
                 .collect()
         }
 
+        fn read_tools(root: &std::path::Path, directory: &DataDirectory) -> ToolExecution {
+            let registry = ToolRegistry::default();
+            let workspace = Workspace::authorize(root, directory).expect("authorize");
+            workspace_read::register(&registry, workspace).expect("register");
+            registry.authorize(workspace_read::TOOL_NAME).expect("authorize");
+            ToolExecution {
+                offer: registry.offer(&[workspace_read::TOOL_NAME]).expect("offer"),
+                limits: ToolLoopLimits::default(),
+            }
+        }
+
         #[test]
         fn workspace_read_file_reads_the_authorized_file_for_the_final_answer() {
             let text = "# Demo\n\nA \"README\" with ünïcode, a tab\tand a backslash \\.\n";
@@ -8559,10 +8570,7 @@ mod requests_and_tool_loop {
             let handle = worker.handle();
             let (_provider, llm) = llm_setup(&handle, "model-a");
             let run = local_run(&handle, llm);
-            let tools = workspace_read::read_file_tools(
-                Workspace::authorize(&root, &directory).expect("authorize the Workspace"),
-            )
-            .expect("enable the tool");
+            let tools = read_tools(&root, &directory);
 
             let admitted_first = Arc::new(AtomicUsize::new(0));
             let (seen, seam_handle) = (admitted_first.clone(), handle.clone());
@@ -8717,10 +8725,7 @@ mod requests_and_tool_loop {
                 ("big.txt", "the file is larger than 8192 bytes"),
             ] {
                 let run = local_run(&handle, llm);
-                let tools = workspace_read::read_file_tools(
-                    Workspace::authorize(&root, &directory).expect("authorize"),
-                )
-                .expect("enable the tool");
+                let tools = read_tools(&root, &directory);
                 let arguments = json!({ "path": path }).to_string();
                 let looped = run_loop(
                     &handle,
@@ -8920,7 +8925,7 @@ mod requests_and_tool_loop {
 
     // ---- workspace_write_file -----------------------------------------------
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(unix)]
     mod workspace_write_file {
         use std::path::{Path, PathBuf};
 
@@ -8939,10 +8944,18 @@ mod requests_and_tool_loop {
         }
 
         fn edit_tools(root: &Path, directory: &DataDirectory) -> ToolExecution {
-            workspace_write::edit_file_tools(
-                Workspace::authorize(root, directory).expect("authorize the Workspace"),
-            )
-            .expect("enable the tools")
+            let registry = ToolRegistry::default();
+            let workspace = Workspace::authorize(root, directory).expect("authorize the Workspace");
+            workspace_read::register(&registry, workspace.clone()).expect("register read");
+            workspace_write::register(&registry, workspace).expect("register write");
+            registry.authorize(workspace_read::TOOL_NAME).expect("authorize read");
+            registry.authorize(workspace_write::TOOL_NAME).expect("authorize write");
+            ToolExecution {
+                offer: registry
+                    .offer(&[workspace_read::TOOL_NAME, workspace_write::TOOL_NAME])
+                    .expect("offer"),
+                limits: ToolLoopLimits::default(),
+            }
         }
 
         /// What an independent read of the Workspace finds at `path`.

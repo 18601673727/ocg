@@ -2,8 +2,8 @@ use super::*;
 
 pub(crate) fn ground_workspace(root: &std::path::Path, grant: Option<&str>) -> ChatMessage {
     let allows = match grant {
-        Some("edit") => "edit",
-        Some("code") => "run commands",
+        Some("code") => "read, edit and run commands",
+        Some("edit") => "read and edit",
         _ => "read",
     };
     ChatMessage::system(format!(

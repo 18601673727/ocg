@@ -46,7 +46,7 @@ use ocg::orchestration::execution_runtime::{
     AdmissionError, ExecutionRuntimeError, ProviderExecutionPlan, ToolExecution,
 };
 use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceError};
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(unix)]
 use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write};
 use ocg::persistence::{
     AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, JobId, JobInputDraft,
@@ -64,11 +64,11 @@ use crate::llm_target::{Target, targets};
 /// argument before the objective.
 pub const COMMAND: &str = "workspace-read";
 /// The command that selects the mode that may also write files.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(unix)]
 pub const EDIT_COMMAND: &str = "workspace-edit";
 /// The command that selects the mode that may also run build and test
 /// commands.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+#[cfg(unix)]
 pub const CODE_COMMAND: &str = "workspace-code";
 /// The command that selects the mode that sends one image with the
 /// objective.
@@ -84,13 +84,13 @@ pub enum Mode {
     Read,
     /// Read, create and conditionally update files: `workspace_read_file`
     /// and `workspace_write_file`.
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(unix)]
     Edit,
     /// Read, write, build and test, and discover files:
     /// `workspace_read_file`, `workspace_write_file`,
     /// `workspace_run_command`, `workspace_list_directory` and
     /// `workspace_search`.
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(unix)]
     Code,
     /// Send one image of the Workspace with the objective; no tool.
     Vision,
@@ -101,9 +101,9 @@ impl Mode {
     pub fn of(command: &str) -> Option<Self> {
         match command {
             COMMAND => Some(Self::Read),
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            #[cfg(unix)]
             EDIT_COMMAND => Some(Self::Edit),
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            #[cfg(unix)]
             CODE_COMMAND => Some(Self::Code),
             VISION_COMMAND => Some(Self::Vision),
             _ => None,
@@ -116,9 +116,9 @@ impl Mode {
     pub fn command(self) -> &'static str {
         match self {
             Self::Read => COMMAND,
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            #[cfg(unix)]
             Self::Edit => EDIT_COMMAND,
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            #[cfg(unix)]
             Self::Code => CODE_COMMAND,
             Self::Vision => VISION_COMMAND,
         }
@@ -254,19 +254,20 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 "OCG Workspace authorized for {}: {root}",
                 workspace_read::TOOL_NAME
             );
-            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            #[cfg(unix)]
             {
                 Some(workspace_command::workspace_tools(
                     workspace,
                     workspace_command::Grant::Read,
                 )?)
             }
-            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            #[cfg(not(unix))]
             {
-                Some(workspace_read::read_file_tools(workspace)?)
+                let _ = workspace;
+                None
             }
         }
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(unix)]
         Mode::Edit => {
             eprintln!(
                 "OCG Workspace authorized for {} and {}: {root}",
@@ -281,7 +282,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 workspace_command::Grant::Edit,
             )?)
         }
-        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        #[cfg(unix)]
         Mode::Code => {
             eprintln!(
                 "OCG Workspace authorized for {}, {}, {}, {} and {}: {root}",
@@ -572,7 +573,7 @@ async fn report(
 /// A call's arguments as the report shows them: as recorded, except that
 /// the contents a write carries are shown only by their size.
 fn shown_arguments(tool: &str, arguments: &str) -> String {
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(unix)]
     if tool == workspace_write::TOOL_NAME {
         let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str(arguments) else {
             return "(not shown)".to_owned();
@@ -594,7 +595,7 @@ fn shown_arguments(tool: &str, arguments: &str) -> String {
 /// What the report shows of a completed call's result besides its size: a
 /// command's exit and whether its output was truncated, never the output.
 fn shown_result(tool: &str, result: &str) -> String {
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    #[cfg(unix)]
     if tool == workspace_command::TOOL_NAME {
         let Ok(result) = serde_json::from_str::<serde_json::Value>(result) else {
             return String::new();
