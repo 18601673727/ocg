@@ -35,6 +35,8 @@ pub struct NewSentRequest {
     pub parameters: ContentDigest,
     pub dropped_turns: Option<u32>,
     pub bodies: Vec<MessageBody>,
+    // Only the recorder can exempt references it has already durably stored for this Job.
+    pub(crate) required_messages: Vec<ContentDigest>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,15 +62,15 @@ pub(crate) fn record_sent_request(
     if batch.require_job(sent.job)?.execution.is_none() {
         return batch.reject(Violation::NotAnLlmExecution(sent.job));
     }
+    batch.require_executing_here(sent.job)?;
     for body in &sent.bodies {
         batch.put_message(body)?;
     }
     batch.require_messages(
-        sent.messages
+        sent.bodies
             .iter()
-            .copied()
-            .chain(sent.tools)
-            .chain([sent.parameters]),
+            .map(MessageBody::digest)
+            .chain(sent.required_messages.iter().copied()),
     )?;
     batch.insert_request_event(
         sent.job,

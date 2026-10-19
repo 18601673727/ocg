@@ -3337,14 +3337,15 @@ impl ProviderOutputSink for DatabaseOutputSink {
         body: &'a serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
         Box::pin(async move {
-            let sent = self
-                .recorder
-                .prepare(self.job, self.request, body, self.dropped_turns)?;
+            let (sent, state) =
+                self.recorder
+                    .prepare(self.job, self.request, body, self.dropped_turns)?;
             if let Err(error) = self.database.record_sent_request(sent).await {
                 let message = format!("database could not persist provider request: {error}");
                 self.gap.get_or_insert(error);
                 return Err(OutputSinkError { message });
             }
+            self.recorder.remember_sent(state);
             Ok(())
         })
     }
@@ -4009,6 +4010,218 @@ mod provider_record_tests {
     use crate::test_support::{data_directory, wait};
     use serde_json::json;
 
+    fn claim(handle: &DatabaseHandle, job: JobId) {
+        let executor = wait(handle.create_executor(crate::persistence::NewExecutor {
+            name: "provider recorder".into(),
+            concurrency_limit: std::num::NonZeroU32::new(1).expect("one"),
+            llm_transports: std::collections::BTreeSet::from([
+                crate::persistence::LlmTransport::OpenAiChatCompletions,
+            ]),
+        }))
+        .expect("executor");
+        wait(handle.claim_fixture(job, executor)).expect("claim");
+    }
+
+    fn job(handle: &DatabaseHandle) -> JobId {
+        wait(handle.create_job(NewJob {
+            name: None,
+            eligible_at: None,
+            parent: handle.genesis(),
+            projects: vec![],
+            dependencies: vec![],
+            input: Default::default(),
+            previous: None,
+            configuration: Some(crate::test_support::execution_configuration(handle)),
+        }))
+        .expect("job")
+    }
+
+    #[test]
+    fn a_refused_sent_preserves_recorder_state_and_database_availability() {
+        wait(async {
+            let (_root, directory) = data_directory("provider-record", "failed-sent");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let job = job(&handle);
+            claim(&handle, job);
+            let mut sink = output_sink(handle.clone(), job);
+            let body = json!({"model":"mock", "stream":true, "tools":[{"type":"function"}],
+                "messages":[{"role":"system","content":"instructions"},
+                    {"role":"user","content":"question"}]});
+            let (mut refused, _) = sink
+                .recorder
+                .prepare(job, sink.request, &body, 0)
+                .expect("prepare");
+            let expected = refused.clone();
+            refused
+                .bodies
+                .retain(|body| body.digest() != refused.parameters);
+            assert!(matches!(
+                handle.record_sent_request(refused).await,
+                Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "messages",
+                    _
+                )))
+            ));
+            assert_eq!(handle.status(), crate::database::DatabaseStatus::Open);
+            assert!(
+                handle
+                    .provider_request(job, sink.request)
+                    .await
+                    .expect("read")
+                    .is_none()
+            );
+            let (retry, _) = sink
+                .recorder
+                .prepare(job, sink.request, &body, 0)
+                .expect("retry");
+            assert_eq!(retry.bodies, expected.bodies);
+            assert_eq!(retry.messages, expected.messages);
+            assert_eq!(retry.tools, expected.tools);
+            assert_eq!(retry.parameters, expected.parameters);
+            sink.sending(&body).await.expect("retry records all bodies");
+            let recorded = handle
+                .provider_request(job, sink.request)
+                .await
+                .expect("read")
+                .expect("Sent");
+            assert_eq!(
+                recorded.messages,
+                body["messages"].as_array().expect("messages").clone()
+            );
+            assert_eq!(recorded.tools, Some(body["tools"].clone()));
+            assert_eq!(recorded.parameters, json!({"model":"mock", "stream":true}));
+            assert_eq!(handle.status(), crate::database::DatabaseStatus::Open);
+            worker.shutdown().expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn sent_requires_a_claimed_running_job() {
+        wait(async {
+            let (_root, directory) = data_directory("provider-record", "sent-claim");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let job = job(&handle);
+            let mut sink = output_sink(handle.clone(), job);
+            let body = json!({"model":"mock", "messages":[{"role":"user","content":"hi"}]});
+            assert!(sink.sending(&body).await.is_err());
+            assert!(
+                matches!(sink.gap.take(), Some(DatabaseError::Rejected(Violation::NotExecutingLocally(id))) if id == job)
+            );
+            claim(&handle, job);
+            sink.sending(&body).await.expect("claimed retry");
+            handle
+                .finalize_job(job, JobFinalization::Unknown)
+                .await
+                .expect("settle");
+            sink.request = sink.request.next().expect("next");
+            assert!(sink.sending(&body).await.is_err());
+            assert!(
+                matches!(sink.gap.take(), Some(DatabaseError::Rejected(Violation::NotExecutingLocally(id))) if id == job)
+            );
+            assert!(
+                handle
+                    .provider_request(job, sink.request)
+                    .await
+                    .expect("read")
+                    .is_none()
+            );
+            assert_eq!(handle.status(), crate::database::DatabaseStatus::Open);
+            worker.shutdown().expect("shutdown");
+        });
+    }
+
+    #[test]
+    fn sent_checks_only_the_digests_introduced_for_this_job() {
+        wait(async {
+            let (_root, directory) = data_directory("provider-record", "sent-suffix");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let job = job(&handle);
+            claim(&handle, job);
+            let mut sink = output_sink(handle.clone(), job);
+            let mut body =
+                json!({"model":"mock", "tools":[], "messages":[{"role":"user","content":"hi"}]});
+            sink.sending(&body).await.expect("first Sent");
+            let response = sink
+                .recorder
+                .response(&ChatMessage::assistant(Some("answer".into()), vec![]))
+                .expect("response");
+            // A received body is acknowledged by the recorder only after the answer commits.
+            let digest = response.digest();
+            handle
+                .record_provider_answer(crate::persistence::NewProviderAnswer {
+                    stat: NewAvailabilityStat {
+                        job,
+                        request: sink.request,
+                        observed_at: Timestamp::now(),
+                        observation: crate::persistence::AvailabilityObservation {
+                            status_code: Some(200),
+                            finish_reason: Some(ChatFinishReason::Stop),
+                            raw_finish_reason: Some("stop".into()),
+                            failure: None,
+                        },
+                    },
+                    measurements: Measurements {
+                        request_finished_in_ms: Some(1),
+                        ..Default::default()
+                    },
+                    response,
+                })
+                .await
+                .expect("answer");
+            sink.recorder.remember_response(digest);
+            body["messages"].as_array_mut().expect("messages").extend([
+                json!({"role":"assistant","content":"answer"}),
+                json!({"role":"user","content":"next"}),
+            ]);
+            sink.request = sink.request.next().expect("next");
+            let old = crate::persistence::MessageBody::new(&body["messages"][0]).expect("old body");
+            let old_digest = old.digest();
+            handle
+                .with_database(move |database| {
+                    let tx = database.begin_write()?;
+                    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("message"))?
+                        .remove(old_digest.as_bytes().as_slice())?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await
+                .expect("hide acknowledged history to detect redundant validation");
+            let (sent, state) = sink
+                .recorder
+                .prepare(job, sink.request, &body, 0)
+                .expect("prepare");
+            assert_eq!(sent.required_messages, [sent.messages[2]]);
+            assert_eq!(sent.bodies.len(), 1);
+            handle.record_sent_request(sent).await.expect("new suffix");
+            sink.recorder.remember_sent(state);
+            handle
+                .with_database(move |database| {
+                    let tx = database.begin_write()?;
+                    tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("message"))?
+                        .insert(old.digest.as_bytes().as_slice(), old.bytes.as_slice())?;
+                    tx.commit()?;
+                    Ok(())
+                })
+                .await
+                .expect("restore history");
+            let (retry, _) = sink
+                .recorder
+                .prepare(job, sink.request, &body, 0)
+                .expect("retry");
+            assert!(retry.required_messages.is_empty());
+            assert!(retry.bodies.is_empty());
+            let other_job = self::job(&handle);
+            let (fresh, _) = provider_execution::RequestRecorder::default()
+                .prepare(other_job, RequestNumber::FIRST, &body, 0)
+                .expect("fresh recorder");
+            assert_eq!(fresh.required_messages.len(), 5);
+            worker.shutdown().expect("shutdown");
+        });
+    }
+
     #[test]
     fn sent_requests_are_content_addressed_and_reuse_received_messages() {
         wait(async {
@@ -4039,6 +4252,7 @@ mod provider_record_tests {
                 })
                 .await
                 .expect("job");
+            claim(&handle, job);
             let mut sink = output_sink(handle.clone(), job);
             sink.dropped_turns = 2;
             sink.recorder.image_attachments.insert(1, vec![attachment]);
@@ -4066,7 +4280,7 @@ mod provider_record_tests {
                 json!({"attachment":attachment.to_string()})
             );
             sink.request = sink.request.next().expect("retry number");
-            let retry = sink
+            let (retry, state) = sink
                 .recorder
                 .prepare(job, sink.request, &body, 2)
                 .expect("retry");
@@ -4076,6 +4290,7 @@ mod provider_record_tests {
             );
             assert_eq!(retry.dropped_turns, None);
             handle.record_sent_request(retry).await.expect("Sent retry");
+            sink.recorder.remember_sent(state);
             let result = ProviderExecutionResult {
                 text: "answer".into(),
                 reasoning: "private thinking".into(),
@@ -4098,12 +4313,13 @@ mod provider_record_tests {
                 .expect("messages")
                 .push(serde_json::to_value(assistant).expect("assistant"));
             sink.request = sink.request.next().expect("third");
-            let next = sink
+            let (next, state) = sink
                 .recorder
                 .prepare(job, sink.request, &body, 2)
                 .expect("next");
             assert!(next.bodies.is_empty(), "the response is already stored");
             handle.record_sent_request(next).await.expect("Sent 3");
+            sink.recorder.remember_sent(state);
             let received = handle
                 .provider_request(job, RequestNumber::new(2).expect("two"))
                 .await

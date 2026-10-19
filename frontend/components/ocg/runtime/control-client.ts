@@ -84,6 +84,8 @@ export type ControlProfileWriteRequest =
         temperature?: number | null;
         top_p?: number | null;
         max_tokens?: number | null;
+        max_completion_tokens?: number | null;
+        reasoning_effort?: string | null;
         presence_penalty?: number | null;
         frequency_penalty?: number | null;
       };

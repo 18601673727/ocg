@@ -699,17 +699,22 @@ impl Batch {
         &mut self,
         digests: impl Iterator<Item = ContentDigest>,
     ) -> Result<(), BatchError> {
-        self.step(|tx| {
+        let missing = self.step(|tx| {
             let table = tx.open_table(MESSAGES)?;
             for digest in digests {
                 if table.get(digest.as_bytes().as_slice())?.is_none() {
-                    return Err(StorageError::corrupted(
-                        "request references a missing message",
-                    ));
+                    return Ok(true);
                 }
             }
-            Ok(())
-        })
+            Ok(false)
+        })?;
+        if missing {
+            return self.reject(Violation::InvalidValue(
+                "messages",
+                "request references a missing message",
+            ));
+        }
+        Ok(())
     }
 
     // ---- request events ----------------------------------------------------------------------

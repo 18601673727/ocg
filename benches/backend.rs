@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,9 +41,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
 struct TemporaryRoot(PathBuf);
 
 impl TemporaryRoot {
-    fn new() -> Result<Self> {
+    fn new(directory: &Path) -> Result<Self> {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let root = std::env::temp_dir().join(format!("ocg-backend-{}-{stamp}", std::process::id()));
+        let root = directory.join(format!("ocg-backend-{}-{stamp}", std::process::id()));
         std::fs::create_dir(&root)?;
         Ok(Self(root))
     }
@@ -67,6 +67,7 @@ struct Options {
     outputs: Vec<usize>,
     scheduler_jobs: Vec<usize>,
     provider_jobs: usize,
+    directory: PathBuf,
 }
 
 /// One comma-separated list of positive sizes, as `--clients 1,8` carries.
@@ -88,6 +89,7 @@ fn sizes(argument: &str) -> Result<Vec<usize>> {
 impl Options {
     fn parse() -> Result<Option<Self>> {
         let mut options = Self {
+            directory: std::env::current_dir()?.join("target/backend-bench"),
             section: "all".into(),
             iterations: 50,
             jobs: 1_000,
@@ -107,7 +109,7 @@ impl Options {
                     println!(
                         "cargo bench --bench backend -- \
                          [all|jobs|scheduler|reads|search|search_scale|mixed|maintenance|provider-record] \
-                         [--iterations N] [--jobs N] [--files N] \
+                         [--iterations N] [--jobs N] [--files N] [--dir PATH] \
                          [--clients 1,8] [--payloads 1024,65536] [--outputs 3]\n\
                          Defaults: all, 50 iterations per client, 1000 read-fixture jobs, \
                          1000 search files, 1 and 8 clients, 1/64 KiB payloads, 3 progress \
@@ -132,6 +134,10 @@ impl Options {
                          Other sections exclude HTTP, scheduler dispatch, external providers and LLM inference."
                     );
                     return Ok(None);
+                }
+                "--dir" => {
+                    options.directory =
+                        PathBuf::from(arguments.next().ok_or("missing option value")?);
                 }
                 "--iterations" | "--files" => {
                     let value: usize = arguments.next().ok_or("missing option value")?.parse()?;
@@ -173,6 +179,8 @@ impl Options {
         {
             return Err("--jobs and --files must be at most 4000 (production limits)".into());
         }
+        std::fs::create_dir_all(&options.directory)?;
+        options.directory = options.directory.canonicalize()?;
         Ok(Some(options))
     }
 
@@ -227,9 +235,10 @@ fn measure<T>(
 }
 
 fn with_database(
+    options: &Options,
     operation: impl FnOnce(&DatabaseHandle, &DataDirectory) -> Result<()>,
 ) -> Result<()> {
-    let root = TemporaryRoot::new()?;
+    let root = TemporaryRoot::new(&options.directory)?;
     let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
     let worker = DatabaseWorker::start(&directory)?;
     let result = operation(&worker.handle(), &directory);
@@ -391,7 +400,7 @@ fn jobs(options: &Options) -> Result<()> {
     for clients in options.clients.iter().copied() {
         for payload_bytes in options.payloads.iter().copied() {
             for outputs in options.outputs.iter().copied() {
-                with_database(|handle, _directory| {
+                with_database(options, |handle, _directory| {
                     let executor = executor(handle)?;
                     let payload = "x".repeat(payload_bytes);
                     for _ in 0..3 {
@@ -708,7 +717,7 @@ fn scheduler(options: &Options) -> Result<()> {
         let run_started = Instant::now();
 
         // 1 & 2: Admit independent jobs, claim and finalize
-        let root = TemporaryRoot::new()?;
+        let root = TemporaryRoot::new(&options.directory)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let worker = DatabaseWorker::start(&directory)?;
         let handle = worker.handle();
@@ -745,7 +754,7 @@ fn scheduler(options: &Options) -> Result<()> {
         drop(root);
 
         // 3: Repeat once with half the Jobs depending on an earlier Job
-        let root = TemporaryRoot::new()?;
+        let root = TemporaryRoot::new(&options.directory)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let worker = DatabaseWorker::start(&directory)?;
         let handle = worker.handle();
@@ -814,7 +823,7 @@ fn scheduler(options: &Options) -> Result<()> {
         // 5: Work still queued: admit N Jobs (half dependent), claim none,
         // stop without clean shutdown, time reopen, report peak memory,
         // and check after reopen that no Job is still pending.
-        let root = TemporaryRoot::new()?;
+        let root = TemporaryRoot::new(&options.directory)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let worker = DatabaseWorker::start(&directory)?;
         let handle = worker.handle();
@@ -903,7 +912,7 @@ fn mixed(options: &Options) -> Result<()> {
     let payload_bytes = options.payloads.first().copied().unwrap_or(1_024);
     let outputs = options.outputs.first().copied().unwrap_or(3);
     for writers in options.clients.iter().copied() {
-        with_database(|handle, _directory| {
+        with_database(options, |handle, _directory| {
             let executor = executor(handle)?;
             let mut ids = Vec::with_capacity(options.jobs);
             for _ in 0..options.jobs {
@@ -1012,7 +1021,7 @@ fn mixed(options: &Options) -> Result<()> {
 
 fn reads(options: &Options) -> Result<()> {
     for count in BTreeSet::from([100.min(options.jobs), options.jobs]) {
-        with_database(|handle, _directory| {
+        with_database(options, |handle, _directory| {
             let executor = executor(handle)?;
             let mut ids = Vec::with_capacity(count);
             for _ in 0..count {
@@ -1192,7 +1201,7 @@ fn search(options: &Options) -> Result<()> {
     use ocg::orchestration::workspace_fts::{FtsLimits, WorkspaceFts};
     use ocg::orchestration::workspace_read::Workspace;
 
-    let root = TemporaryRoot::new()?;
+    let root = TemporaryRoot::new(&options.directory)?;
     let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
     let source = root.0.join("workspace");
     std::fs::create_dir(&source)?;
@@ -1246,7 +1255,7 @@ fn search_scale(options: &Options) -> Result<()> {
     for target in [1u64, 4, 16, 64].map(|mib| mib * 1024 * 1024) {
         let within = target <= limits.content_bytes;
         let label = format!("{}mib", target / (1024 * 1024));
-        let root = TemporaryRoot::new()?;
+        let root = TemporaryRoot::new(&options.directory)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let source = root.0.join("workspace");
         std::fs::create_dir(&source)?;
@@ -1315,7 +1324,7 @@ fn search_scale(options: &Options) -> Result<()> {
 /// a compaction attempt did and what the readers and commands around it paid.
 /// A refusal is a result here, not a failure of the run: the compaction holds
 /// every read and command off, and past a full queue they are refused.
-fn maintenance(_options: &Options) -> Result<()> {
+fn maintenance(options: &Options) -> Result<()> {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
 
@@ -1325,7 +1334,7 @@ fn maintenance(_options: &Options) -> Result<()> {
     const PAYLOAD_BYTES: usize = 65_536;
     const OUTPUTS: usize = 3;
 
-    with_database(|handle, directory| {
+    with_database(options, |handle, directory| {
         let executor = executor(handle)?;
         let payload = "x".repeat(PAYLOAD_BYTES);
         let mut timings = Timings::new();
@@ -1485,7 +1494,7 @@ fn main() -> Result<()> {
         "jobs": if options.section == "provider-record" { options.provider_jobs } else { options.jobs }, "files": options.files,
         "clients": options.clients, "payloads": options.payloads,
         "progress_outputs_per_job": options.outputs,
-        "load_model": "closed_loop", "latency_unit": "ms", "temporary_storage": std::env::temp_dir(),
+        "load_model": "closed_loop", "latency_unit": "ms", "storage_dir": options.directory,
         "scope": if options.section == "provider-record" { "mock provider HTTP, request persistence and replay HTTP; excludes tool handlers and scheduler dispatch" } else { "public database and FTS APIs; excludes HTTP, scheduler dispatch and providers" }})
     );
     if options.section == "provider-record" {
@@ -1522,23 +1531,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct ProviderCommits {
+    sent: Vec<Duration>,
+    output_flush: Vec<Duration>,
+    answer: Vec<Duration>,
+    delivered: Vec<Duration>,
+    usage: Vec<Duration>,
+    not_delivered: Vec<Duration>,
+}
+
 struct ProviderBenchSink<'a> {
     database: DatabaseHandle,
     job: JobId,
     request: ocg::persistence::RequestNumber,
     recorder: ocg::provider_execution::RequestRecorder,
-    commits: &'a mut Vec<Duration>,
+    commits: &'a mut ProviderCommits,
     gap: Option<String>,
 }
 
 impl ProviderBenchSink<'_> {
     async fn commit<T>(
-        &mut self,
+        commits: &mut Vec<Duration>,
         operation: impl Future<Output = std::result::Result<T, ocg::database::DatabaseError>>,
     ) -> std::result::Result<T, ocg::provider_execution::OutputSinkError> {
         let began = Instant::now();
         let result = operation.await;
-        self.commits.push(began.elapsed());
+        commits.push(began.elapsed());
         result.map_err(|error| ocg::provider_execution::OutputSinkError {
             message: error.to_string(),
         })
@@ -1556,9 +1575,14 @@ impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
         >,
     > {
         Box::pin(async move {
-            let sent = self.recorder.prepare(self.job, self.request, body, 0)?;
-            let database = self.database.clone();
-            self.commit(database.record_sent_request(sent)).await
+            let (sent, state) = self.recorder.prepare(self.job, self.request, body, 0)?;
+            Self::commit(
+                &mut self.commits.sent,
+                self.database.record_sent_request(sent),
+            )
+            .await?;
+            self.recorder.remember_sent(state);
+            Ok(())
         })
     }
 
@@ -1574,16 +1598,19 @@ impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
     > {
         Box::pin(async move {
             let database = self.database.clone();
-            self.commit(database.append_job_output(
-                self.job,
-                NewJobOutput {
-                    kind,
-                    summary: Some(text.into()),
-                    code: None,
-                    goal_reached: None,
-                    value: None,
-                },
-            ))
+            Self::commit(
+                &mut self.commits.output_flush,
+                database.append_job_output(
+                    self.job,
+                    NewJobOutput {
+                        kind,
+                        summary: Some(text.into()),
+                        code: None,
+                        goal_reached: None,
+                        value: None,
+                    },
+                ),
+            )
             .await
             .map(|_| ())
         })
@@ -1596,11 +1623,16 @@ impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
         Box::pin(async move {
             use ocg::provider_execution::ProviderFact;
             use ocg::token_usage::{TokenAnnotation, UsageFinality};
-            let (measurements, token) = match observed.fact {
-                ProviderFact::NotDelivered => (Default::default(), TokenAnnotation::excluded()),
+            let (measurements, token, commits) = match observed.fact {
+                ProviderFact::NotDelivered => (
+                    Default::default(),
+                    TokenAnnotation::excluded(),
+                    &mut self.commits.not_delivered,
+                ),
                 ProviderFact::Delivered => (
                     Default::default(),
                     TokenAnnotation::eligible(UsageFinality::Cumulative),
+                    &mut self.commits.delivered,
                 ),
                 ProviderFact::Usage { usage, finality } => (
                     ocg::persistence::Measurements {
@@ -1608,18 +1640,21 @@ impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
                         ..Default::default()
                     },
                     TokenAnnotation::eligible(finality),
+                    &mut self.commits.usage,
                 ),
             };
             let database = self.database.clone();
-            if let Err(error) = self
-                .commit(database.record_metrics(ocg::persistence::NewMetrics {
+            if let Err(error) = Self::commit(
+                commits,
+                database.record_metrics(ocg::persistence::NewMetrics {
                     job: self.job,
                     request: self.request,
                     observed_at: observed.observed_at,
                     measurements,
                     token: Some(token),
-                }))
-                .await
+                }),
+            )
+            .await
             {
                 self.gap.get_or_insert(error.message);
             }
@@ -1629,6 +1664,7 @@ impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
 
 fn provider_record(options: &Options) -> Result<()> {
     let provider_jobs = options.provider_jobs;
+    let storage_dir = options.directory.clone();
     ntex::rt::System::new("provider-record-bench", ntex::rt::DefaultRuntime).block_on(async move {
         use ntex::web::{self, App, HttpResponse, HttpServer};
         use ocg::control_plane::{ControlPlane, ControlPlaneConfig};
@@ -1638,7 +1674,7 @@ fn provider_record(options: &Options) -> Result<()> {
         use ocg::provider_execution::{self, EnvironmentCredentialResolver, ProviderExecutionConfig};
         use redb::ReadableTable;
 
-        let root = TemporaryRoot::new()?;
+        let root = TemporaryRoot::new(&storage_dir)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let worker = DatabaseWorker::start(&directory)?;
         let handle = worker.handle();
@@ -1648,22 +1684,28 @@ fn provider_record(options: &Options) -> Result<()> {
             App::new().default_service(web::to(async |body: web::types::Json<Value>| {
                 let count = body["messages"].as_array().map_or(0, Vec::len);
                 let round = count.saturating_sub(6) / 2;
+                let question = body["messages"][5]["content"].as_str().ok_or_else(||
+                    ntex::web::error::ErrorBadRequest("missing Job index"))?;
+                let index = question.strip_prefix("Current question for Job ")
+                    .and_then(|value| value.strip_suffix('.'))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .ok_or_else(|| ntex::web::error::ErrorBadRequest("invalid Job index"))?;
                 let choice = if round < 2 {
                     json!({"index":0, "delta":{"content":"Checking.", "reasoning_content":"Think.",
-                        "tool_calls":[{"index":0,"id":format!("call-{round}"),"type":"function",
+                        "tool_calls":[{"index":0,"id":format!("call-{index}-{round}"),"type":"function",
                         "function":{"name":"lookup","arguments":"{}"}}]}, "finish_reason":"tool_calls"})
                 } else {
-                    json!({"index":0, "delta":{"content":"Done.","reasoning_content":"Think."}, "finish_reason":"stop"})
+                    json!({"index":0, "delta":{"content":format!("Done for Job {index}."),"reasoning_content":"Think."}, "finish_reason":"stop"})
                 };
                 let response = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
                     json!({"choices":[choice]}),
                     json!({"choices":[],"usage":{"prompt_tokens":2048,"completion_tokens":8}}));
-                HttpResponse::Ok().content_type("text/event-stream").body(response)
+                Ok::<_, ntex::web::Error>(HttpResponse::Ok().content_type("text/event-stream").body(response))
             }))
         }).workers(1).disable_signals().listen(listener)?.run();
         let mock_finished = ntex::rt::spawn(mock.clone());
         let target = executor(&handle)?;
-        let mut commits = Vec::new();
+        let mut commits = ProviderCommits::default();
         let mut job_commits = Vec::new();
         let mut ids = Vec::with_capacity(provider_jobs);
         let started = Instant::now();
@@ -1707,7 +1749,8 @@ fn provider_record(options: &Options) -> Result<()> {
                         observation: provider_execution::success_observation(&response) },
                     measurements: provider_execution::metrics(&response), response: stored,
                 };
-                sink.commit(handle.record_provider_answer(answer)).await.map_err(|error| error.message)?;
+                ProviderBenchSink::commit(&mut sink.commits.answer, handle.record_provider_answer(answer))
+                    .await.map_err(|error| error.message)?;
                 conversation.messages.push(assistant);
                 sink.recorder.remember_response(digest);
                 for call in response.tool_calls {
@@ -1717,7 +1760,7 @@ fn provider_record(options: &Options) -> Result<()> {
             }
             let began = Instant::now();
             handle.finalize_job(id, JobFinalization::Completed(FinalResult {
-                summary: Some("Done.".into()), code: None, goal_reached: None, value: None,
+                summary: Some(format!("Done for Job {index}.")), code: None, goal_reached: None, value: None,
             })).await?;
             job_commits.push(began.elapsed());
             ids.push(id);
@@ -1728,7 +1771,7 @@ fn provider_record(options: &Options) -> Result<()> {
         let control = ControlPlane::start(ControlPlaneConfig::new(0, TOKEN)?, handle.clone(), runtime.scheduler())?;
         let client = ntex::client::Client::builder().build(ntex::SharedCfg::default()).await?;
         let mut gets = Vec::with_capacity(provider_jobs * 3);
-        for id in ids {
+        for (index, id) in ids.into_iter().enumerate() {
             for request in 1..=3 {
                 let began = Instant::now();
                 let response = client.get(format!("http://{}/api/v1/jobs/{id}/requests/{request}", control.address()))
@@ -1737,7 +1780,7 @@ fn provider_record(options: &Options) -> Result<()> {
                 let value: Value = response.json().await?;
                 gets.push(began.elapsed());
                 if value["messages"].as_array().map(Vec::len) != Some(6 + (request as usize - 1) * 2)
-                    || value["response"]["content"] != if request < 3 { "Checking." } else { "Done." }
+                    || value["response"]["content"] != if request < 3 { "Checking.".to_owned() } else { format!("Done for Job {index}.") }
                     || value["tools"].as_array().map(Vec::len) != Some(1) {
                     return Err("GET did not reconstruct the mock request".into());
                 }
@@ -1757,29 +1800,41 @@ fn provider_record(options: &Options) -> Result<()> {
             let (key, value) = row?;
             message_bytes += (key.value().len() + value.value().len()) as u64;
         }
-        if messages.len()? != 10 + provider_jobs as u64 * 3 {
-            return Err("shared prompts, tools, parameters and responses were not deduplicated".into());
+        if messages.len()? != 7 + provider_jobs as u64 * 6 {
+            return Err("unexpected shared prompts/tools/parameters or unique per-Job message rows".into());
         }
         let parameters = json!({"jobs": provider_jobs, "requests_per_job":3,"history_turns":2,
             "shared_system_and_tools":true,"load_model":"serial", "commit_latency":"durable command acknowledgement including transaction and queue"});
+        let requests = (provider_jobs * 3) as f64;
+        let provider_commits = commits.sent.len() + commits.output_flush.len() + commits.answer.len()
+            + commits.delivered.len() + commits.usage.len() + commits.not_delivered.len();
+        if commits.sent.len() != provider_jobs * 3 || commits.answer.len() != provider_jobs * 3
+            || commits.delivered.len() != provider_jobs * 3 || commits.usage.len() != provider_jobs * 3
+            || !commits.not_delivered.is_empty() || job_commits.len() != provider_jobs * 3 {
+            return Err("unexpected provider commit counts".into());
+        }
         println!("{}", json!({"type":"measurement", "name":"provider_record.storage", "parameters":parameters,
-            "provider_commits_per_request": commits.len() as f64 / (provider_jobs * 3) as f64,
-            "total_commits_per_request": (commits.len() + job_commits.len()) as f64 / (provider_jobs * 3) as f64,
+            "storage_dir": storage_dir,
+            "commits_per_request": {"sent": commits.sent.len() as f64 / requests,
+                "output_flush": commits.output_flush.len() as f64 / requests,
+                "answer": commits.answer.len() as f64 / requests,
+                "job": job_commits.len() as f64 / requests,
+                "delivered": commits.delivered.len() as f64 / requests,
+                "usage": commits.usage.len() as f64 / requests,
+                "not_delivered": commits.not_delivered.len() as f64 / requests},
+            "provider_commits_per_request": provider_commits as f64 / requests,
+            "total_commits_per_request": (provider_commits + job_commits.len()) as f64 / requests,
             "message_table_bytes":message_bytes, "message_table_bytes_per_job": message_bytes as f64 / provider_jobs as f64,
             "message_rows":messages.len()?, "database_bytes":database_bytes(&directory)?, "write_elapsed_s":write_elapsed.as_secs_f64()}));
-        report("provider_record.commit", &parameters, commits, None);
+        for (kind, samples) in [("sent", commits.sent), ("output_flush", commits.output_flush),
+            ("answer", commits.answer), ("delivered", commits.delivered), ("usage", commits.usage),
+            ("not_delivered", commits.not_delivered)] {
+            if !samples.is_empty() {
+                report(&format!("provider_record.{kind}_commit"), &parameters, samples, None);
+            }
+        }
         report("provider_record.job_commit", &parameters, job_commits, None);
         report("provider_record.GET_requests_n", &parameters, gets, None);
         Ok(())
     })
-}
-
-#[test]
-fn provider_record_smoke_test() {
-    let options = Options {
-        section: "provider-record".into(), provider_jobs: 2,
-        iterations: 1, jobs: 2, files: 1, clients: vec![1], payloads: vec![1024],
-        outputs: vec![3], scheduler_jobs: vec![2],
-    };
-    provider_record(&options).expect("two Jobs, six requests and six HTTP replays");
 }

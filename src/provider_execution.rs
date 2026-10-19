@@ -37,7 +37,7 @@ mod models;
 mod observe;
 mod proxy;
 mod record;
-pub use record::RequestRecorder;
+pub use record::{RequestRecorder, SentRequestState};
 mod stream;
 mod types;
 mod usage;

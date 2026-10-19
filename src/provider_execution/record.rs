@@ -14,15 +14,24 @@ pub struct RequestRecorder {
     pub(crate) image_attachments: BTreeMap<usize, Vec<AttachmentId>>,
 }
 
+pub struct SentRequestState {
+    messages: Vec<ContentDigest>,
+    stored: Vec<ContentDigest>,
+    tools: Option<ContentDigest>,
+    parameters: ContentDigest,
+}
+
 impl RequestRecorder {
     pub fn prepare(
-        &mut self,
+        &self,
         job: JobId,
         request: RequestNumber,
         body: &Value,
         dropped_turns: u32,
-    ) -> Result<NewSentRequest, OutputSinkError> {
+    ) -> Result<(NewSentRequest, SentRequestState), OutputSinkError> {
         let mut bodies = Vec::new();
+        let mut pending = BTreeSet::new();
+        let mut digests = self.messages.clone();
         let messages = body
             .get("messages")
             .and_then(Value::as_array)
@@ -39,54 +48,77 @@ impl RequestRecorder {
                     .map_or(&[], Vec::as_slice),
             )?;
             let body = MessageBody::new(&value).map_err(|error| record_error(error.to_string()))?;
-            self.messages.push(body.digest());
-            if self.stored.insert(body.digest()) {
+            digests.push(body.digest());
+            if !self.stored.contains(&body.digest()) && pending.insert(body.digest()) {
                 bodies.push(body);
             }
         }
         let tools = match self.tools {
             Some(tools) => tools,
-            None => {
-                let tools = body
-                    .get("tools")
-                    .map(|value| self.keep(value, &mut bodies))
-                    .transpose()?;
-                self.tools = Some(tools);
-                tools
-            }
+            None => body
+                .get("tools")
+                .map(|value| self.keep(value, &mut bodies, &mut pending))
+                .transpose()?,
         };
         let parameters = match self.parameters {
             Some(parameters) => parameters,
             None => {
-                let parameters = body.as_object()
+                let parameters = body
+                    .as_object()
                     .ok_or_else(|| record_error("request is not an object"))?
-                    .iter().filter(|(key, _)| !matches!(key.as_str(), "messages" | "tools"))
-                    .map(|(key, value)| (key.clone(), value.clone())).collect();
-                let digest = self.keep(&Value::Object(parameters), &mut bodies)?;
-                self.parameters = Some(digest);
-                digest
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "messages" | "tools"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                self.keep(&Value::Object(parameters), &mut bodies, &mut pending)?
             }
         };
-        Ok(NewSentRequest {
-            job,
-            request,
-            observed_at: Timestamp::now(),
-            messages: self.messages.clone(),
+        let required_messages = digests
+            .iter()
+            .skip(self.messages.len())
+            .copied()
+            .chain(tools)
+            .chain([parameters])
+            .filter(|digest| !self.stored.contains(digest))
+            .collect();
+        let state = SentRequestState {
+            messages: digests.clone(),
+            stored: pending.into_iter().collect(),
             tools,
             parameters,
-            dropped_turns: (request == RequestNumber::FIRST).then_some(dropped_turns),
-            bodies,
-        })
+        };
+        Ok((
+            NewSentRequest {
+                job,
+                request,
+                observed_at: Timestamp::now(),
+                messages: digests,
+                tools,
+                parameters,
+                dropped_turns: (request == RequestNumber::FIRST).then_some(dropped_turns),
+                bodies,
+                required_messages,
+            },
+            state,
+        ))
+    }
+
+    pub fn remember_sent(&mut self, state: SentRequestState) {
+        self.messages = state.messages;
+        self.stored.extend(state.stored);
+        self.tools = Some(state.tools);
+        self.parameters = Some(state.parameters);
     }
 
     fn keep(
-        &mut self,
+        &self,
         value: &Value,
         bodies: &mut Vec<MessageBody>,
+        pending: &mut BTreeSet<ContentDigest>,
     ) -> Result<ContentDigest, OutputSinkError> {
         let body = MessageBody::new(value).map_err(|error| record_error(error.to_string()))?;
         let digest = body.digest();
-        if self.stored.insert(digest) {
+        if !self.stored.contains(&digest) && pending.insert(digest) {
             bodies.push(body);
         }
         Ok(digest)

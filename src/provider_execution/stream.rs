@@ -106,7 +106,7 @@ impl<'a> StreamOutput<'a> {
         kind: IntermediateOutputKind,
         mut delta: &str,
     ) -> Result<(), OutputSinkError> {
-        if self.sink.is_none() {
+        if delta.is_empty() || self.sink.is_none() {
             return Ok(());
         }
         if self.kind != kind {
@@ -593,6 +593,58 @@ mod reasoning_output_tests {
                 Ok(())
             })
         }
+    }
+
+    #[test]
+    fn empty_deltas_of_the_other_kind_do_not_flush_each_chunk() {
+        crate::test_support::on_system(|| async {
+            for (field, empty_field, kind) in [
+                (
+                    "content",
+                    "reasoning_content",
+                    IntermediateOutputKind::Progress,
+                ),
+                (
+                    "reasoning_content",
+                    "content",
+                    IntermediateOutputKind::Reasoning,
+                ),
+            ] {
+                let chunk = serde_json::json!({"choices":[{"delta":{field:"x", empty_field:""}}]});
+                let chunk = Box::leak(format!("data: {chunk}\n\n").into_boxed_str());
+                let mut steps: Vec<_> = (0..STREAM_OUTPUT_BUFFER_BYTES + 3)
+                    .map(|_| Step::Chunk(chunk))
+                    .collect();
+                steps.push(Step::Quiet(
+                    STREAM_OUTPUT_FLUSH_INTERVAL + Duration::from_millis(50),
+                ));
+                steps.push(Step::Chunk(chunk));
+                steps.push(Step::Chunk(
+                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                ));
+                let config = ProviderExecutionConfig::default();
+                let mut sink = Sink::default();
+                parse_stream(
+                    payload(steps, config.cancellation.clone()),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut sink),
+                    &mut UsageCapture::default(),
+                )
+                .await
+                .expect("stream");
+                assert_eq!(
+                    sink.0,
+                    [
+                        (kind, "x".repeat(STREAM_OUTPUT_BUFFER_BYTES)),
+                        (kind, "xxx".into()),
+                        (kind, "x".into()),
+                    ]
+                );
+            }
+        });
     }
 
     #[test]

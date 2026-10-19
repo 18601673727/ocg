@@ -789,7 +789,7 @@ impl Batch {
 
     /// Refuses unless the Job is claimed by this opening of the database and
     /// has no outcome (I13).
-    fn require_executing_here(&mut self, job: JobId) -> Result<(), BatchError> {
+    pub(crate) fn require_executing_here(&mut self, job: JobId) -> Result<(), BatchError> {
         let state = self.require_job_state(job)?;
         match &state.claim {
             Some(claim) if claim.epoch == self.epoch && state.outcome.is_none() => Ok(()),
