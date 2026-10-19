@@ -280,7 +280,7 @@ fn default_credential_ref(name: &str) -> String {
     slug
 }
 
-fn map_mutation_error(error: DatabaseError) -> Refusal {
+pub(super) fn map_mutation_error(error: DatabaseError) -> Refusal {
     match error {
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
@@ -902,7 +902,7 @@ mod tests {
                     name: None,
                     eligible_at: None,
                     parent: handle.genesis(),
-                    projects: Vec::new(),
+                    project: None,
                     dependencies: Vec::new(),
                     input: JobInputDraft {
                         objective: Some("Hold the old model".to_owned()),
@@ -1309,7 +1309,7 @@ mod reasoning_parameter_tests {
                     name: None,
                     eligible_at: None,
                     parent: handle.genesis(),
-                    projects: vec![],
+                    project: None,
                     dependencies: vec![],
                     input: JobInputDraft::default(),
                     previous: None,

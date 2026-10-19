@@ -26,7 +26,6 @@ pub(super) struct Derived {
     tool_totals: BTreeMap<u64, (u64, u64)>,
     retries: BTreeMap<(u64, u64), ()>,
     attachment_refs: BTreeMap<(u64, u64), ()>,
-    job_projects: BTreeMap<(u64, u64), ()>,
 }
 
 struct Authoritative {
@@ -34,7 +33,6 @@ struct Authoritative {
     states: BTreeMap<u64, JobStateRow>,
     tool_call_ids: Vec<(u64, String, u32, u32)>,
     tool_totals: BTreeMap<u64, (u64, u64)>,
-    members: Vec<(u64, u64)>,
 }
 
 fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageError> {
@@ -61,16 +59,11 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         }
         tool_call_ids.push((job, record.tool_call_id, request, index));
     }
-    let mut members = Vec::new();
-    for entry in tx.open_table(PROJECT_MEMBERS)?.iter()? {
-        members.push(entry?.0.value());
-    }
     Ok(Authoritative {
         jobs,
         states,
         tool_call_ids,
         tool_totals,
-        members,
     })
 }
 
@@ -181,9 +174,6 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
             .tool_call_ids
             .insert((*job, id.clone()), (*request, *index));
     }
-    for (project, job) in &auth.members {
-        derived.job_projects.insert((*job, *project), ());
-    }
     derived.tool_totals = auth.tool_totals.clone();
     Ok(derived)
 }
@@ -249,11 +239,6 @@ pub(super) fn rebuild(
     note(
         "attachment_ref",
         sync!(tx, ATTACHMENT_REFS, derived.attachment_refs),
-        true,
-    );
-    note(
-        "job_project",
-        sync!(tx, JOB_PROJECTS, derived.job_projects),
         true,
     );
     note("tool_total", sync!(tx, TOOL_TOTALS, derived.tool_totals), true);

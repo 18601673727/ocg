@@ -2,10 +2,7 @@ use super::*;
 
 /// What the host can establish: it runs, as the listener answers only
 /// while it does, and what the database says of itself now.
-pub(super) async fn health(
-    database: &DatabaseHandle,
-    workspace_root: Option<&std::path::Path>,
-) -> Value {
+pub(super) async fn health(database: &DatabaseHandle) -> Value {
     let status = match database.status() {
         DatabaseStatus::Open => "open",
         DatabaseStatus::Protected => "protected",
@@ -33,7 +30,6 @@ pub(super) async fn health(
     json!({
         "api_version": API_VERSION,
         "host": "running",
-        "workspace_root": workspace_root.map(|root| root.to_string_lossy()),
         "database": {
             "status": status,
             "accepting_commands": status == "open",
@@ -85,6 +81,7 @@ pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
         "execution_mode": "once",
         "input": record.input.to_string(),
         "previous": record.previous.map(|previous| previous.to_string()),
+        "project": record.project.map(|project| project.to_string()),
         "assigned_executor": record.assigned_executor.map(|executor| executor.to_string()),
         "created_at_us": record.created_at.as_unix_micros(),
         "updated_at_us": record.updated_at.as_unix_micros(),
@@ -326,21 +323,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn health_exposes_the_resolved_workspace_root_or_null() {
+    fn health_names_no_workspace_root() {
         use crate::database::DatabaseWorker;
-        use crate::test_support::{data_directory, temporary_directory, wait};
+        use crate::test_support::{data_directory, wait};
 
         let (_data, directory) = data_directory("health", "workspace-root");
-        let (_workspace, root) = temporary_directory("health", "workspace");
         let worker = DatabaseWorker::start(&directory).expect("start");
         let handle = worker.handle();
-        let root = root.canonicalize().expect("resolve");
-        assert_eq!(
-            wait(health(&handle, Some(&root)))["workspace_root"],
-            root.to_string_lossy().as_ref()
-        );
-        let unconfigured = wait(health(&handle, None));
-        assert_eq!(unconfigured.get("workspace_root"), Some(&Value::Null));
+        assert_eq!(wait(health(&handle)).get("workspace_root"), None);
         worker.shutdown().expect("shutdown");
     }
 

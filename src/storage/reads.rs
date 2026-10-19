@@ -38,13 +38,6 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
             .filter(|outcome| outcome.kind == kind)
             .map(|outcome| outcome.at)
     };
-    let mut projects = Vec::new();
-    for entry in rx
-        .open_table(JOB_PROJECTS)?
-        .range((id.get(), 0)..=(id.get(), u64::MAX))?
-    {
-        projects.push(ProjectId::new(entry?.0.value().1));
-    }
     let subtree_settled = rx.open_table(UNSETTLED)?.get(id.get())?.is_none();
     let configuration = row
         .execution
@@ -89,7 +82,7 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
         retry_of: row.retry_of,
         continues: row.continues,
         submission: row.submission,
-        projects,
+        project: row.project,
         configuration,
         assigned_executor: state.claim.as_ref().map(|claim| claim.pool_id.into()),
         previous: row.continues,
@@ -442,25 +435,6 @@ pub(crate) fn read_projects(
     Ok(records)
 }
 
-pub(crate) fn read_project_jobs(
-    database: &Database,
-    project: ProjectId,
-    after: Option<JobId>,
-    limit: usize,
-) -> Result<Vec<JobId>, StorageError> {
-    let rx = read(database)?;
-    let table = rx.open_table(PROJECT_MEMBERS)?;
-    let start = after.map_or(0, |after| after.get().saturating_add(1));
-    let mut jobs = Vec::new();
-    for entry in table
-        .range((project.get(), start)..=(project.get(), u64::MAX))?
-        .take(limit.min(MAX_PAGE))
-    {
-        jobs.push(JobId::new(entry?.0.value().1));
-    }
-    Ok(jobs)
-}
-
 // ---- configs -----------------------------------------------------------------------
 
 fn config_record(row: ConfigRow) -> ConfigRecord {
@@ -776,6 +750,7 @@ pub struct ConversationEntry {
     pub tip_job: JobId,
     pub agent: ConfigId,
     pub title: String,
+    pub project: Option<ProjectId>,
     pub turn_count: u32,
     pub tip_settlement_state: String,
     pub tip_created_at: Timestamp,
@@ -796,6 +771,7 @@ pub(crate) fn read_conversations(
     let rx = read(database)?;
     let threads_table = rx.open_table(CHAT_THREADS)?;
     let successors_table = rx.open_table(SUCCESSORS)?;
+    let conversations_table = rx.open_table(CONVERSATIONS)?;
 
     struct ThreadInfo {
         root_job: JobId,
@@ -809,6 +785,14 @@ pub(crate) fn read_conversations(
         let (key, _) = entry?;
         let (agent_id, root_id) = key.value();
         let root_job = JobId::new(root_id);
+        let hidden = conversations_table
+            .get(root_id)?
+            .map(|bytes| ConversationRow::decode(bytes.value()))
+            .transpose()?
+            .is_some_and(|row| row.hidden_at.is_some());
+        if hidden {
+            continue;
+        }
         let agent = ConfigId::new(agent_id);
         let mut tip = root_id;
         let mut turn_count = 1u32;
@@ -849,12 +833,21 @@ pub(crate) fn read_conversations(
     let mut conversations = Vec::with_capacity(slice.len());
     for t in slice {
         let root_row = read_job_row(&rx, t.root_job)?;
-        let title = match root_row.as_ref().and_then(|r| r.objective.as_deref()) {
-            Some(obj) => match obj.char_indices().nth(80) {
+        let stored_title = conversations_table
+            .get(t.root_job.get())?
+            .map(|bytes| ConversationRow::decode(bytes.value()))
+            .transpose()?
+            .and_then(|row| row.title);
+        let title = match (
+            stored_title,
+            root_row.as_ref().and_then(|r| r.objective.as_deref()),
+        ) {
+            (Some(title), _) => title,
+            (None, Some(obj)) => match obj.char_indices().nth(80) {
                 Some((idx, _)) => obj[..idx].to_string(),
                 None => obj.to_string(),
             },
-            None => String::new(),
+            (None, None) => String::new(),
         };
 
         let tip_row = read_job_row(&rx, t.tip_job)?;
@@ -879,6 +872,7 @@ pub(crate) fn read_conversations(
             tip_job: t.tip_job,
             agent: t.agent,
             title,
+            project: root_row.as_ref().and_then(|r| r.project),
             turn_count: t.turn_count,
             tip_settlement_state,
             tip_created_at,

@@ -1,14 +1,18 @@
-//! `workspace_run_command`: runs one of OCG's fixed commands in a Workspace
-//! the operator authorized, and returns how it exited and what it printed.
+//! `workspace_run_command`: runs one of the Project's commands in a
+//! Workspace the operator authorized, and returns how it exited and what it
+//! printed.
 //!
-//! A call names a preset, never a command line. `cargo_check` runs
-//! `cargo check --all-targets` and `cargo_test` runs
-//! `cargo test --all-targets`; no other program, argument, flag, directory
-//! or variable can be chosen. The argument vector is OCG's own, and the
-//! process is started directly, never through a shell. Its program is found
-//! on the PATH OCG itself was started with, among absolute entries only, so
-//! never in a path a call names or the Workspace provides by a relative
-//! entry. A program that is not found is refused before anything starts.
+//! A call names a command, never a command line. The built-in `cargo_check`
+//! runs `cargo check --all-targets` and `cargo_test` runs
+//! `cargo test --all-targets`; the Project adds commands of its own by name,
+//! each with the argument vector its owner stored. No other program,
+//! argument, flag, directory or variable can be chosen. The argument vector
+//! is never the call's, and the process is started directly, never through
+//! a shell. A bare program name is found on the PATH OCG itself was started
+//! with, among absolute entries only, so never in a path a call names or the
+//! Workspace provides by a relative entry; an absolute program path is used
+//! when it is an executable regular file. A program that is not found is
+//! refused before anything starts.
 //!
 //! The process runs in the Workspace root, once the root is checked to still
 //! be the directory authorized. Its environment is built, not inherited:
@@ -83,13 +87,13 @@ use crate::orchestration::tools::{
 };
 use crate::orchestration::workspace_read::{self, Refusal as PathRefusal, Workspace};
 use crate::orchestration::{workspace_discovery, workspace_write};
-use crate::persistence::{JobId, ToolCallRef, ToolEffect};
+use crate::persistence::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef, ToolEffect};
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-4";
+const HANDLER_VERSION: &str = "workspace_run_command-5";
 
 /// Longest a command may run before it is stopped.
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -136,8 +140,8 @@ impl Preset {
 
     fn name(self) -> &'static str {
         match self {
-            Self::CargoCheck => "cargo_check",
-            Self::CargoTest => "cargo_test",
+            Self::CargoCheck => BUILT_IN_COMMANDS[0],
+            Self::CargoTest => BUILT_IN_COMMANDS[1],
         }
     }
 
@@ -210,17 +214,51 @@ impl From<Failure> for ToolFailure {
     }
 }
 
-/// The preset a call names. The schema already allows nothing else; the
+/// The command a call names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Selected {
+    Preset(Preset),
+    Project(ProjectCommand),
+}
+
+impl Selected {
+    fn name(&self) -> &str {
+        match self {
+            Self::Preset(preset) => preset.name(),
+            Self::Project(command) => &command.name,
+        }
+    }
+
+    fn argv(&self) -> Vec<String> {
+        match self {
+            Self::Preset(preset) => std::iter::once(preset.program())
+                .chain(preset.arguments().iter().copied())
+                .map(str::to_owned)
+                .collect(),
+            Self::Project(command) => command.argv.clone(),
+        }
+    }
+}
+
+/// The command a call names. The schema already allows nothing else; the
 /// arguments are checked again here, so nothing else can ever run.
-fn parse(arguments: &Value) -> Result<Preset, Refusal> {
+fn parse(arguments: &Value, commands: &[ProjectCommand]) -> Result<Selected, Refusal> {
     let object = arguments.as_object().ok_or(Refusal::InvalidArguments)?;
     if object.len() != 1 {
         return Err(Refusal::InvalidArguments);
     }
-    object
+    let name = object
         .get("command")
         .and_then(Value::as_str)
-        .and_then(Preset::of)
+        .ok_or(Refusal::InvalidArguments)?;
+    if let Some(preset) = Preset::of(name) {
+        return Ok(Selected::Preset(preset));
+    }
+    commands
+        .iter()
+        .find(|command| command.name == name)
+        .cloned()
+        .map(Selected::Project)
         .ok_or(Refusal::InvalidArguments)
 }
 
@@ -272,18 +310,29 @@ impl CommandEnvironment {
         self.search
             .iter()
             .map(|directory| directory.join(program))
-            .find(|candidate| {
-                std::fs::metadata(candidate).is_ok_and(|metadata| {
-                    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-                })
-            })
+            .find(|candidate| executable(candidate))
     }
+
+    /// The program a command names: a bare name found on the search path,
+    /// or an absolute path that is an executable regular file.
+    fn locate(&self, program: &str) -> Option<PathBuf> {
+        if !program.contains('/') {
+            return self.find(program);
+        }
+        let path = PathBuf::from(program);
+        (path.is_absolute() && executable(&path)).then_some(path)
+    }
+}
+
+fn executable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// Everything needed to start one command, prepared by trusted code.
 struct Invocation {
     program: PathBuf,
-    arguments: &'static [&'static str],
+    arguments: Vec<String>,
     directory: PathBuf,
     variables: Vec<(OsString, OsString)>,
 }
@@ -531,8 +580,11 @@ fn compact(preset: Preset, ended: &Ended) -> Option<Capture> {
 /// The call's result: the command, its exit, and its output within the
 /// bounds. A process ended by a signal has no exit code, and its signal is
 /// given instead.
-fn result(preset: Preset, ended: &Ended) -> Value {
-    let compact = compact(preset, ended);
+fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
+    let compact = match selected {
+        Selected::Preset(preset) => compact(*preset, ended),
+        Selected::Project(_) => None,
+    };
     let empty = Capture::default();
     let (stdout, stderr) = match &compact {
         Some(stdout) => (stdout, &empty),
@@ -544,7 +596,8 @@ fn result(preset: Preset, ended: &Ended) -> Value {
         let (stdout, stdout_cut) = stdout.render("stdout", stdout_share);
         let (stderr, stderr_cut) = stderr.render("stderr", stderr_share);
         let mut value = json!({
-            "command": preset.name(),
+            "command": selected.name(),
+            "argv": argv,
             "exit_code": ended.status.code(),
             "stdout": stdout,
             "stderr": stderr,
@@ -570,7 +623,7 @@ fn supervise(
 ) -> Result<Ended, Failure> {
     let mut command = Command::new(&invocation.program);
     command
-        .args(invocation.arguments)
+        .args(&invocation.arguments)
         .current_dir(&invocation.directory)
         .env_clear()
         .envs(
@@ -651,22 +704,24 @@ fn reader(mut pipe: impl Read + Send + 'static) -> Option<JoinHandle<Capture>> {
 /// and the environment its commands get.
 struct RunCommand {
     workspace: Workspace,
+    commands: Vec<ProjectCommand>,
     environment: CommandEnvironment,
     timeout: Duration,
 }
 
 impl RunCommand {
-    /// The command `preset` names, ready to start: the Workspace root must
+    /// The command `selected` names, ready to start: the Workspace root must
     /// still be the directory authorized, and the program must be found.
-    fn prepare(&self, preset: Preset) -> Result<Invocation, Refusal> {
+    fn prepare(&self, selected: &Selected) -> Result<Invocation, Refusal> {
         self.workspace.open_root()?;
-        let program = self
-            .environment
-            .find(preset.program())
+        let mut argv = selected.argv().into_iter();
+        let program = argv
+            .next()
+            .and_then(|program| self.environment.locate(&program))
             .ok_or(Refusal::ProgramNotFound)?;
         Ok(Invocation {
             program,
-            arguments: preset.arguments(),
+            arguments: argv.collect(),
             directory: self.workspace.root().to_path_buf(),
             variables: self.environment.variables.clone(),
         })
@@ -753,8 +808,11 @@ impl ToolHandler for RunCommand {
 impl RunCommand {
     fn invoke(&self, call: CommandCall, arguments: Value, start: ToolStart) -> ToolFuture<'_> {
         Box::pin(async move {
-            let preset = parse(&arguments).map_err(Failure::from)?;
-            let invocation = self.prepare(preset).map_err(Failure::from)?;
+            let selected = parse(&arguments, &self.commands).map_err(Failure::from)?;
+            let invocation = self.prepare(&selected).map_err(Failure::from)?;
+            let argv = std::iter::once(invocation.program.to_string_lossy().into_owned())
+                .chain(invocation.arguments.iter().cloned())
+                .collect::<Vec<_>>();
             let stop = StopSignal::new();
             let _stop_on_drop = StopOnDrop(stop.clone());
             let (report, reported) = flume::bounded(1);
@@ -824,20 +882,33 @@ impl RunCommand {
             if timed_out {
                 return Err(Failure::from(Uncertainty::TimedOut(self.timeout)).into());
             }
-            Ok(result(preset, &ended))
+            Ok(result(&selected, &argv, &ended))
         })
     }
 }
 
-/// The parameters a call must match exactly: one preset.
-fn parameters() -> Value {
+/// The parameters a call must match exactly: one command name, the built-in
+/// presets first, then the Project's.
+fn parameters(commands: &[ProjectCommand]) -> Value {
+    let names = Preset::ALL
+        .map(Preset::name)
+        .into_iter()
+        .chain(commands.iter().map(|command| command.name.as_str()))
+        .collect::<Vec<_>>();
+    let description = Preset::ALL
+        .into_iter()
+        .map(Selected::Preset)
+        .chain(commands.iter().cloned().map(Selected::Project))
+        .map(|selected| format!("{} runs `{}`", selected.name(), selected.argv().join(" ")))
+        .collect::<Vec<_>>()
+        .join("; ");
     json!({
         "type": "object",
         "properties": {
             "command": {
                 "type": "string",
-                "enum": Preset::ALL.map(Preset::name),
-                "description": "cargo_check runs `cargo check --all-targets`; cargo_test runs `cargo test --all-targets`"
+                "enum": names,
+                "description": description
             }
         },
         "required": ["command"],
@@ -846,22 +917,24 @@ fn parameters() -> Value {
 }
 
 /// Registers `workspace_run_command` for `workspace` in `registry`, without
-/// authorizing it. Its commands get `environment` and run for at most
-/// `timeout`.
+/// authorizing it. It offers the built-in presets and `commands`; they get
+/// `environment` and run for at most `timeout`.
 pub(crate) fn register(
     registry: &ToolRegistry,
     workspace: Workspace,
+    commands: &[ProjectCommand],
     environment: CommandEnvironment,
     timeout: Duration,
 ) -> Result<(), ToolRegistryError> {
     registry.register(
         TOOL_NAME,
         Some(
-            "Run one of OCG's fixed commands in the authorized Workspace root and return its exit code, stdout and stderr. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. No other command, argument, directory or environment can be chosen.",
+            "Run one of the Project's commands in the authorized Workspace root and return its argv, exit code, stdout and stderr. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. No other command, argument, directory or environment can be chosen.",
         ),
-        parameters(),
+        parameters(commands),
         Arc::new(RunCommand {
             workspace,
+            commands: commands.to_vec(),
             environment,
             timeout,
         }),
@@ -901,14 +974,22 @@ impl Grant {
 pub fn workspace_tools(
     workspace: Workspace,
     grant: Grant,
+    commands: &[ProjectCommand],
 ) -> Result<ToolExecution, ToolRegistryError> {
-    workspace_tools_with(workspace, grant, CommandEnvironment::of_process(), COMMAND_TIMEOUT)
+    workspace_tools_with(
+        workspace,
+        grant,
+        commands,
+        CommandEnvironment::of_process(),
+        COMMAND_TIMEOUT,
+    )
 }
 
 /// [`workspace_tools`] with the given command environment and limit.
 pub(crate) fn workspace_tools_with(
     workspace: Workspace,
     grant: Grant,
+    commands: &[ProjectCommand],
     environment: CommandEnvironment,
     timeout: Duration,
 ) -> Result<ToolExecution, ToolRegistryError> {
@@ -930,7 +1011,7 @@ pub(crate) fn workspace_tools_with(
         workspace_write::register(&registry, workspace.clone())?;
     }
     if matches!(grant, Grant::Code) {
-        register(&registry, workspace.clone(), environment, timeout)?;
+        register(&registry, workspace.clone(), commands, environment, timeout)?;
     }
 
     let mut names = vec![
@@ -969,17 +1050,26 @@ pub(crate) fn workspace_tools_with(
 ///
 /// Returns a registration failure, which these tools' fixed definitions
 /// never cause.
-pub fn code_tools(workspace: Workspace) -> Result<ToolExecution, ToolRegistryError> {
-    code_tools_with(workspace, CommandEnvironment::of_process(), COMMAND_TIMEOUT)
+pub fn code_tools(
+    workspace: Workspace,
+    commands: &[ProjectCommand],
+) -> Result<ToolExecution, ToolRegistryError> {
+    code_tools_with(
+        workspace,
+        commands,
+        CommandEnvironment::of_process(),
+        COMMAND_TIMEOUT,
+    )
 }
 
 /// [`code_tools`] with the given command environment and limit.
 pub(crate) fn code_tools_with(
     workspace: Workspace,
+    commands: &[ProjectCommand],
     environment: CommandEnvironment,
     timeout: Duration,
 ) -> Result<ToolExecution, ToolRegistryError> {
-    workspace_tools_with(workspace, Grant::Code, environment, timeout)
+    workspace_tools_with(workspace, Grant::Code, commands, environment, timeout)
 }
 
 #[cfg(test)]
@@ -1056,6 +1146,7 @@ mod tests {
         fn handler_with(&self, environment: CommandEnvironment, timeout: Duration) -> RunCommand {
             RunCommand {
                 workspace: Workspace::authorize(&self.root, &self.directory).expect("authorize"),
+                commands: Vec::new(),
                 environment,
                 timeout,
             }
@@ -1119,7 +1210,7 @@ mod tests {
         assert_eq!(Preset::CargoTest.arguments(), ["test", "--all-targets"]);
         assert!(Preset::ALL.iter().all(|preset| preset.program() == "cargo"));
         let setup = setup("presets", "touch ran");
-        let validator = crate::openai_compatible::admission::compile_parameters(&parameters())
+        let validator = crate::openai_compatible::admission::compile_parameters(&parameters(&[]))
             .expect("an enforceable schema");
         for (name, preset) in [
             ("cargo_check", Preset::CargoCheck),
@@ -1127,7 +1218,7 @@ mod tests {
         ] {
             let arguments = json!({ "command": name });
             assert!(validator.is_valid(&arguments), "{arguments}");
-            assert_eq!(parse(&arguments), Ok(preset));
+            assert_eq!(parse(&arguments, &[]), Ok(Selected::Preset(preset)));
         }
         let invalid = [
             json!({"command": "cargo_build"}),
@@ -1198,7 +1289,7 @@ mod tests {
                 .map(|wire| wire.function.name)
                 .collect::<Vec<_>>()
         };
-        let coding = code_tools(authorize()).expect("coding tools");
+        let coding = code_tools(authorize(), &[]).expect("coding tools");
         assert_eq!(
             names(&coding),
             [
@@ -1218,10 +1309,7 @@ mod tests {
             .into_iter()
             .find(|wire| wire.function.name == TOOL_NAME)
             .expect("run command wire");
-        assert_eq!(
-            run_command_wire.function.parameters,
-            Some(parameters())
-        );
+        assert_eq!(run_command_wire.function.parameters, Some(parameters(&[])));
         assert_eq!(
             coding.limits,
             ToolLoopLimits {
@@ -1239,7 +1327,7 @@ mod tests {
             ToolLoopLimits::default(),
             "the defaults are not changed"
         );
-        let read = workspace_tools(authorize(), Grant::Read).expect("read tools");
+        let read = workspace_tools(authorize(), Grant::Read, &[]).expect("read tools");
         assert_eq!(
             names(&read),
             [
@@ -1252,7 +1340,7 @@ mod tests {
         );
         assert_eq!(read.limits, coding_limits(COMMAND_TIMEOUT));
 
-        let edit = workspace_tools(authorize(), Grant::Edit).expect("edit tools");
+        let edit = workspace_tools(authorize(), Grant::Edit, &[]).expect("edit tools");
         assert_eq!(
             names(&edit),
             [
@@ -1272,12 +1360,12 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-4");
+        assert_eq!(handler.version(), "workspace_run_command-5");
         assert!(
             crate::persistence::ToolAdmission {
                 handler_version: handler.version().to_owned(),
                 effect: handler.effect(),
-                parameters: parameters().to_string(),
+                parameters: parameters(&[]).to_string(),
                 arguments: crate::persistence::ToolPayload::new(test_command().to_string()),
                 authorization: crate::persistence::AuthorizationBasis::RegistryGrant,
             }
@@ -1285,7 +1373,14 @@ mod tests {
         );
         assert!(crate::persistence::is_handler_version(handler.version()));
         let registry = ToolRegistry::default();
-        register(&registry, authorize(), setup.environment(), COMMAND_TIMEOUT).expect("register");
+        register(
+            &registry,
+            authorize(),
+            &[],
+            setup.environment(),
+            COMMAND_TIMEOUT,
+        )
+        .expect("register");
         assert!(
             matches!(
                 registry.offer(&[TOOL_NAME]),
@@ -1329,7 +1424,7 @@ mod tests {
         let setup = setup("search-coexistence", "exit 0");
         std::fs::write(setup.root.join("source.rs"), "pub fn needle() {}\n").expect("source");
         let workspace = Workspace::authorize(&setup.root, &setup.directory).expect("authorize");
-        let coding = code_tools(workspace).expect("coding tools");
+        let coding = code_tools(workspace, &[]).expect("coding tools");
         let names = coding
             .offer
             .wires()
@@ -1416,6 +1511,9 @@ mod tests {
                 run(setup.handler(WAIT), json!({ "command": command })),
                 Ok(json!({
                     "command": command,
+                    "argv": std::iter::once(setup.bin.join("cargo").display().to_string())
+                        .chain(arguments.split(' ').map(str::to_owned))
+                        .collect::<Vec<_>>(),
                     "exit_code": code,
                     "stdout": format!("{root}\narguments: {arguments}\n"),
                     "stderr": "to stderr\n",
@@ -1425,6 +1523,53 @@ mod tests {
             );
             assert!(gone(setup.pid("leader.pid")), "the process was reaped");
         }
+    }
+
+    #[test]
+    fn a_project_command_runs_in_the_root_and_an_unknown_name_starts_nothing() {
+        let setup = setup(
+            "project-command",
+            "pwd -P\necho \"arguments: $*\"\necho 'to stderr' >&2\ntouch ran\nexit 3",
+        );
+        let program = setup.bin.join("cargo").display().to_string();
+        let commands = vec![ProjectCommand {
+            name: "lint".into(),
+            argv: vec![program.clone(), "--strict".into(), "src".into()],
+        }];
+        let handler = || RunCommand {
+            commands: commands.clone(),
+            ..setup.handler(WAIT)
+        };
+        assert_eq!(
+            parse(&json!({"command": "lint"}), &commands),
+            Ok(Selected::Project(commands[0].clone()))
+        );
+        assert_eq!(
+            parameters(&commands)["properties"]["command"]["enum"],
+            json!(["cargo_check", "cargo_test", "lint"])
+        );
+        for unknown in ["fmt", "cargo", "Lint"] {
+            assert_eq!(
+                run(handler(), json!({ "command": unknown })),
+                refused(Refusal::InvalidArguments),
+                "{unknown}"
+            );
+        }
+        assert!(!setup.ran(), "an unknown name starts nothing");
+
+        let root = setup.root.display().to_string();
+        assert_eq!(
+            run(handler(), json!({"command": "lint"})),
+            Ok(json!({
+                "command": "lint",
+                "argv": [program, "--strict", "src"],
+                "exit_code": 3,
+                "stdout": format!("{root}\narguments: --strict src\n"),
+                "stderr": "to stderr\n",
+                "truncated": false,
+            }))
+        );
+        assert!(setup.ran());
     }
 
     #[test]
@@ -1488,7 +1633,8 @@ mod tests {
         };
         ended.stdout.push(stdout.as_bytes());
         ended.stderr.push(stderr.as_bytes());
-        result(preset, &ended)
+        let selected = Selected::Preset(preset);
+        result(&selected, &selected.argv(), &ended)
     }
 
     #[test]
@@ -1539,6 +1685,7 @@ mod tests {
                 captured_result(preset, stdout, "failure details\n", 101),
                 json!({
                     "command": preset.name(),
+                    "argv": Selected::Preset(preset).argv(),
                     "exit_code": 101,
                     "stdout": stdout,
                     "stderr": "failure details\n",
@@ -1564,6 +1711,11 @@ mod tests {
             result,
             json!({
                 "command": "cargo_test",
+                "argv": [
+                    setup.bin.join("cargo").display().to_string(),
+                    "test",
+                    "--all-targets",
+                ],
                 "exit_code": 0,
                 "stdout": format!(
                     "{}\n[OCG omitted {} bytes of stdout here]\n{}end\n",

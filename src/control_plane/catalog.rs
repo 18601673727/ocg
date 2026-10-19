@@ -12,25 +12,32 @@
 use serde_json::{Value, json};
 
 use super::{
-    API_VERSION, INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, Refusal, Reply, decimal,
-    micros, routing,
+    API_VERSION, INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, NOT_FOUND, Refusal, Reply,
+    decimal, micros, profiles, routing, submissions,
 };
-use crate::database::DatabaseHandle;
-use crate::persistence::{ConfigBody, ConfigKind, JobId, ModelCapability, ProfileId};
+use crate::database::{DatabaseError, DatabaseHandle};
+use crate::persistence::{
+    ConfigBody, ConfigKind, ConversationEdit, JobId, ModelCapability, ProfileId, RecordRef,
+    Violation,
+};
 
-/// The most Conversations one page of Conversations reads, and the default.
+/// The most one page of Conversations or Projects reads, and the default.
 pub(super) const MAX_CONVERSATION_PAGE: usize = 100;
 const DEFAULT_CONVERSATION_PAGE: usize = 50;
 
-/// `before` and `limit`, each at most once, and nothing else.
-pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize), Refusal> {
+/// `before`, as `parse_before` reads it, and `limit`, each at most once, and
+/// nothing else.
+pub(super) fn page_query<T>(
+    query: &str,
+    parse_before: impl Fn(&str) -> Result<T, Refusal>,
+) -> Result<(Option<T>, usize), Refusal> {
     let (mut before, mut limit) = (None, None);
     if !query.is_empty() {
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
             match key {
                 "before" if before.is_none() => {
-                    before = Some(routing::job_id(value)?);
+                    before = Some(parse_before(value)?);
                 }
                 "limit" if limit.is_none() => {
                     limit = Some(
@@ -44,6 +51,10 @@ pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize),
         }
     }
     Ok((before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
+}
+
+pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize), Refusal> {
+    page_query(query, routing::job_id)
 }
 
 /// The most Profiles one page of Agent Profiles reads, and the default.
@@ -283,6 +294,7 @@ pub(super) async fn conversations(
                 "tip_job": c.tip_job.to_string(),
                 "agent": ProfileId::from(c.agent).to_string(),
                 "title": c.title,
+                "project": c.project.map(|project| project.to_string()),
                 "turn_count": c.turn_count,
                 "tip_settlement_state": c.tip_settlement_state,
                 "tip_created_at_us": c.tip_created_at.as_unix_micros(),
@@ -295,6 +307,43 @@ pub(super) async fn conversations(
         "has_more": page.has_more,
         "next_before": page.next_before.map(|j| j.to_string()),
     })))
+}
+
+/// Exactly one of the two fields.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireConversationEdit {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    hidden: Option<bool>,
+}
+
+/// `POST /api/v1/conversations/{job}`: renames the conversation whose root
+/// is `root`, or hides it for good. No Job changes.
+pub(super) async fn edit_conversation(
+    database: &DatabaseHandle,
+    root: JobId,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    let wire: WireConversationEdit = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
+    let edit = match (wire.title, wire.hidden) {
+        (Some(title), None) if submissions::text(&title, submissions::MAX_NAME_BYTES) => {
+            ConversationEdit::Title(title)
+        }
+        (None, Some(true)) => ConversationEdit::Hide,
+        _ => return Err(INVALID_REQUEST),
+    };
+    database
+        .set_conversation(root, edit)
+        .await
+        .map_err(|error| match error {
+            DatabaseError::Rejected(Violation::NotFound(RecordRef::Job(_))) => NOT_FOUND,
+            other => profiles::map_mutation_error(other),
+        })?;
+    Ok(Reply::ok(
+        json!({"api_version": API_VERSION, "conversation": root.to_string()}),
+    ))
 }
 
 #[cfg(test)]

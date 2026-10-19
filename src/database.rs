@@ -20,14 +20,15 @@ use crate::disk_protection::{
 use crate::persistence::{
     self, AppendedOutput, AttachmentId, AttachmentOrigin, AttachmentRecord, AvailabilityStatId,
     AvailabilityStatRecord, CleanupKind, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
-    ContentDigest, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId, ExecutorId,
-    JobFinalization, JobId, JobInputId, JobOutputRecord, JobRecord, JobRetry, MetricsId,
-    MetricsRecord, NewAttachment, NewAvailabilityStat, NewConfig, NewExecutionPool, NewExecutor,
-    NewJob, NewJobOutput, NewMetrics, NewProject, NewProviderAnswer, NewSentRequest, NewSubmission,
-    NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
-    ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, ProjectId, ProjectRecord,
-    ProviderRequestRecord, PublishedAttachment, RequestNumber, SubmissionKey, SubmissionRecord,
-    ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
+    ContentDigest, ConversationEdit, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId,
+    ExecutorId, JobFinalization, JobId, JobInputId, JobOutputRecord, JobRecord, JobRetry,
+    MetricsId, MetricsRecord, NewAttachment, NewAvailabilityStat, NewConfig, NewExecutionPool,
+    NewExecutor, NewJob, NewJobOutput, NewMetrics, NewProject, NewProviderAnswer, NewSentRequest,
+    NewSubmission, NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage,
+    ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
+    ProjectCommand, ProjectId, ProjectRecord, ProviderRequestRecord, PublishedAttachment,
+    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
+    ToolOutcome, ToolReconciliation, Violation,
 };
 use crate::persistence::{
     ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding, PendingCapturePage,
@@ -134,6 +135,8 @@ mod read_pool_tests {
         crate::persistence::NewProject {
             name: "probe".to_owned(),
             description: None,
+            root: "/ocg-test/probe".to_owned(),
+            commands: Vec::new(),
         }
     }
     const QUEUED: usize = 5;

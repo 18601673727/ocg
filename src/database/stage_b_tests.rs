@@ -60,7 +60,7 @@ fn pending(database: &DatabaseHandle, llm: ProfileId) -> JobId {
         name: None,
         eligible_at: None,
         parent: database.genesis(),
-        projects: Vec::new(),
+        project: None,
         dependencies: Vec::new(),
         input: JobInputDraft::default(),
         configuration: Some(ExecutionConfiguration {
@@ -214,7 +214,9 @@ fn uncertain_claim_flush_never_grants_and_reopening_settles_a_committed_claim() 
     entered.recv_timeout(WAIT).unwrap();
     let mut extra = std::pin::pin!(database.create_project(NewProject {
         name: "flush group".into(),
-        description: None
+        description: None,
+        root: "/ocg-test/flush-group".into(),
+        commands: Vec::new(),
     }));
     assert!(poll_once(extra.as_mut()).is_none());
     probe.fail_next_flush.store(true, Ordering::SeqCst);
@@ -361,7 +363,7 @@ fn local_job_with_a_spawning_call(
             name: None,
             eligible_at: None,
             parent: database.genesis(),
-            projects: Vec::new(),
+            project: None,
             dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {

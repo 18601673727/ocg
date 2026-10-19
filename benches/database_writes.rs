@@ -84,6 +84,8 @@ fn write_workload(
                     block_on(handle.create_project(NewProject {
                         name: format!("{tag}-{writer}-{index}"),
                         description: Some("benchmark".to_string()),
+                        root: format!("/ocg-bench/{tag}-{writer}-{index}"),
+                        commands: Vec::new(),
                     }))?;
                     local.push(began.elapsed());
                 }

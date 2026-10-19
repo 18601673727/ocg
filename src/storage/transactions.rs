@@ -230,6 +230,9 @@ impl Batch {
                 "a continuation names the Agent of its predecessor",
             ));
         }
+        if previous.project != spec.project {
+            return self.reject(Violation::ProjectMismatch);
+        }
         let is_chat = |row: &JobRow| {
             row.execution
                 .as_ref()

@@ -8,10 +8,10 @@ use crate::persistence::{
     ConfigKind, ConnectionConfig, ContentDigest, DependencyCondition, EffectConclusion,
     ExecutionOperation, FrozenExecutionConfig, JobId, JobOutputId, JobOutputRecord, LlmParameters,
     LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause,
-    OutcomeKind, OutcomeRecord, PoolConfig, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
-    RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord,
-    SuspensionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
-    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
+    OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord, Recorded,
+    RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
+    SubmissionRecord, SuspensionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
+    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
     WithheldReason,
 };
 use crate::token_usage::{RequestEligibility, UsageFinality};
@@ -36,6 +36,7 @@ pub(crate) struct JobRow {
     pub(crate) retry_of: Option<JobId>,
     pub(crate) continues: Option<JobId>,
     pub(crate) submission: Option<SubmissionKey>,
+    pub(crate) project: Option<ProjectId>,
 }
 
 impl JobRow {
@@ -67,6 +68,7 @@ impl JobRow {
         e.ou64(self.retry_of.map(|r| r.get()));
         e.ou64(self.continues.map(|c| c.get()));
         e.opt(&self.submission, |e, s| e.0.extend_from_slice(s.as_bytes()));
+        e.ou64(self.project.map(|p| p.get()));
         e.0
     }
 
@@ -112,6 +114,7 @@ impl JobRow {
                 .map_err(|_| StorageError::corrupted("invalid submission key"))?;
             Ok(SubmissionKey::from_digest(arr))
         })?;
+        let project = d.ou64()?.map(ProjectId::new);
         d.end()?;
         Ok(JobRow {
             id,
@@ -130,6 +133,7 @@ impl JobRow {
             retry_of,
             continues,
             submission,
+            project,
         })
     }
 }
@@ -575,20 +579,75 @@ pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
     e.u64(p.id.get());
     e.str(&p.name);
     e.ostr(&p.description);
+    e.str(&p.root);
+    e.u32(u32::try_from(p.commands.len()).unwrap_or(u32::MAX));
+    for command in &p.commands {
+        e.str(&command.name);
+        e.u32(u32::try_from(command.argv.len()).unwrap_or(u32::MAX));
+        for argument in &command.argv {
+            e.str(argument);
+        }
+    }
     e.ts(p.created_at);
+    e.ts(p.updated_at);
     e.0
 }
 
 pub(super) fn decode_project(bytes: &[u8]) -> DecodeResult<ProjectRecord> {
     let mut d = Dec::new(bytes, TAG_PROJECT)?;
-    let p = ProjectRecord {
-        id: ProjectId::new(d.u64()?),
-        name: d.str()?,
-        description: d.ostr()?,
-        created_at: d.ts()?,
-    };
+    let id = ProjectId::new(d.u64()?);
+    let name = d.str()?;
+    let description = d.ostr()?;
+    let root = d.str()?;
+    let command_count = d.u32()? as usize;
+    let mut commands = Vec::new();
+    for _ in 0..command_count {
+        let name = d.str()?;
+        let argument_count = d.u32()? as usize;
+        let mut argv = Vec::new();
+        for _ in 0..argument_count {
+            argv.push(d.str()?);
+        }
+        commands.push(ProjectCommand { name, argv });
+    }
+    let created_at = d.ts()?;
+    let updated_at = d.ts()?;
     d.end()?;
-    Ok(p)
+    Ok(ProjectRecord {
+        id,
+        name,
+        description,
+        root,
+        commands,
+        created_at,
+        updated_at,
+    })
+}
+
+/// What the owner changed about a conversation root.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConversationRow {
+    pub(crate) title: Option<String>,
+    pub(crate) hidden_at: Option<Timestamp>,
+}
+
+impl ConversationRow {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_CONVERSATION);
+        e.ostr(&self.title);
+        e.ots(self.hidden_at);
+        e.0
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_CONVERSATION)?;
+        let row = Self {
+            title: d.ostr()?,
+            hidden_at: d.ots()?,
+        };
+        d.end()?;
+        Ok(row)
+    }
 }
 
 pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {

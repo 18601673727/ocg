@@ -1,16 +1,28 @@
 use super::*;
 
-pub(crate) fn ground_workspace(root: &std::path::Path, grant: Option<&str>) -> ChatMessage {
+/// Tells the Provider which Project it works in, where its root is, what
+/// its grant allows and, for a grant that runs commands, which command names
+/// it may run.
+pub(crate) fn ground_project(
+    name: &str,
+    root: &str,
+    grant: Option<&str>,
+    command_names: &[&str],
+) -> ChatMessage {
     let allows = match grant {
         Some("code") => "read, edit and run commands",
         Some("edit") => "read and edit",
         _ => "read",
     };
+    let commands = if grant == Some("code") {
+        format!(" The commands you may run: {}.", command_names.join(", "))
+    } else {
+        String::new()
+    };
     ChatMessage::system(format!(
-        "Your Workspace's absolute root is {}. Your grant allows: {allows}. Every tool path is relative to this root. \
+        "You work in the Project {name:?}. Its Workspace's absolute root is {root}. Your grant allows: {allows}.{commands} Every tool path is relative to this root. \
          Paths outside this Workspace cannot be reached. If asked to act outside it, \
-         say that you cannot reach that path instead of claiming you acted there.",
-        root.display()
+         say that you cannot reach that path instead of claiming you acted there."
     ))
 }
 

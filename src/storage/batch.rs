@@ -1,7 +1,7 @@
 use super::rows::{decode_request_event, encode_request_event};
 use super::*;
 use crate::persistence::{
-    AttachmentId, ConfigBody, ConfigId, ConfigKind, JobId, OutputKind, ProjectId,
+    AttachmentId, ConfigBody, ConfigId, ConfigKind, JobId, OutputKind, ProjectId, ProjectRecord,
     RequestEventRecord, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord,
     ToolCallRef, ToolEvidenceRecord, Violation,
 };
@@ -618,28 +618,57 @@ impl Batch {
         })
     }
 
-    /// Adds `job` to `project`, in `project_member` and its mirror
-    /// `job_project`.
-    pub(crate) fn link_project(
+    pub(crate) fn require_project_record(
         &mut self,
-        job: JobId,
-        project: ProjectId,
-    ) -> Result<(), BatchError> {
-        let added = self.step(|tx| {
-            let mut members = tx.open_table(PROJECT_MEMBERS)?;
-            if members.get((project.get(), job.get()))?.is_some() {
-                return Ok(false);
-            }
-            members.insert((project.get(), job.get()), ())?;
-            tx.open_table(JOB_PROJECTS)?
-                .insert((job.get(), project.get()), ())?;
-            Ok(true)
+        id: ProjectId,
+    ) -> Result<ProjectRecord, BatchError> {
+        let record = self.step(|tx| {
+            tx.open_table(PROJECTS)?
+                .get(id.get())?
+                .map(|bytes| decode_project(bytes.value()))
+                .transpose()
         })?;
-        if added {
-            Ok(())
-        } else {
-            self.reject(Violation::AlreadyInProject { job, project })
+        match record {
+            Some(record) => Ok(record),
+            None => self.reject(Violation::NotFound(RecordRef::Project(id))),
         }
+    }
+
+    /// Every Project's root, to refuse one that overlaps another.
+    pub(crate) fn project_roots(&mut self) -> Result<Vec<(ProjectId, String)>, BatchError> {
+        self.step(|tx| {
+            let mut roots = Vec::new();
+            for entry in tx.open_table(PROJECTS)?.iter()? {
+                let record = decode_project(entry?.1.value())?;
+                roots.push((record.id, record.root));
+            }
+            Ok(roots)
+        })
+    }
+
+    // ---- conversations ---------------------------------------------------------------------
+
+    pub(crate) fn conversation(&mut self, root: JobId) -> Result<ConversationRow, BatchError> {
+        self.step(|tx| {
+            Ok(tx
+                .open_table(CONVERSATIONS)?
+                .get(root.get())?
+                .map(|bytes| ConversationRow::decode(bytes.value()))
+                .transpose()?
+                .unwrap_or_default())
+        })
+    }
+
+    pub(crate) fn insert_conversation(
+        &mut self,
+        root: JobId,
+        row: &ConversationRow,
+    ) -> Result<(), BatchError> {
+        self.step(|tx| {
+            tx.open_table(CONVERSATIONS)?
+                .insert(root.get(), row.encode().as_slice())?;
+            Ok(())
+        })
     }
 
     // ---- tool calls ------------------------------------------------------------------------

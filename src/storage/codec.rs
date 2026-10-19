@@ -12,6 +12,7 @@ pub(super) const TAG_ATTACHMENT: u8 = 6;
 pub(super) const TAG_TOOL_CALL: u8 = 7;
 pub(super) const TAG_REQUEST_EVENT: u8 = 8;
 pub(super) const TAG_PROJECT: u8 = 9;
+pub(super) const TAG_CONVERSATION: u8 = 10;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 

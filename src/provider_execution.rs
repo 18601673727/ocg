@@ -44,7 +44,7 @@ mod usage;
 
 pub use cancellation::CancellationToken;
 pub use conversation::{execute_chat, objective_conversation, objective_conversation_with_images};
-pub(crate) use conversation::{ground_workspace, request_body};
+pub(crate) use conversation::{ground_project, request_body};
 #[cfg(test)]
 use exchange::authorization;
 use exchange::incomplete_tool_calls;

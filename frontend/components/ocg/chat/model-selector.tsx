@@ -1,13 +1,13 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { ChatModelSelection, ControlAgentProfile, decodeHealth } from "../contracts";
+import type { ChatModelSelection, ControlAgentProfile, ControlProject } from "../contracts";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
 import { ModelSelectorView } from "./model-selector-view";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
 
-type Catalog = { agents: ControlAgentProfile[]; health: ReturnType<typeof decodeHealth> };
+type Catalog = { agents: ControlAgentProfile[]; projects: ControlProject[] };
 
 export function ModelSelector({ sessionId, selection, onChange, onPreference, busy }: {
   sessionId?: string;
@@ -27,7 +27,7 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
     if (!control) return;
     const controller = new AbortController();
     const load = async () => {
-      const [profiles, health] = await Promise.all([control.readProfiles(controller.signal), control.readHealth(controller.signal)]);
+      const [profiles, projects] = await Promise.all([control.readProfiles(controller.signal), control.readAllProjects(controller.signal)]);
       const agents: ControlAgentProfile[] = [];
       let before: string | undefined;
       for (;;) {
@@ -39,7 +39,7 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
       }
       const listed = new Set(profiles.agent_profiles.map(profile => profile.id));
       if (agents.some(agent => !listed.has(agent.id))) throw new Error("Profile catalog changed while loading. Refresh the selection.");
-      if (!controller.signal.aborted) { setCatalog({ agents, health }); setError(undefined); }
+      if (!controller.signal.aborted) { setCatalog({ agents, projects }); setError(undefined); }
     };
     void load().catch(cause => { if (!controller.signal.aborted) { setCatalog(null); setError(cause instanceof Error ? cause.message : String(cause)); } });
     return () => controller.abort();
@@ -56,13 +56,16 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
   const llmId = llm?.id;
   const model = llm?.model;
   const disabled = busy || !catalog || !llm || !executor;
+  // A conversation keeps the Project of its first turn, so only a new one chooses.
+  const projects = agent?.tool_grant && !fixedAgent ? catalog?.projects ?? [] : [];
+  const projectId = (projects.find(project => project.id === selection?.project) ?? projects[0])?.id;
 
   useEffect(() => {
     if (!agentId || !llmId || !executor || !model) return;
-    const next = { model, effort: null, agentProfile: agentId, llmProfile: llmId, executor };
-    if (selection?.agentProfile !== agentId || selection?.llmProfile !== llmId || selection?.executor !== executor || selection?.model !== model) onChange(next);
+    const next = { model, effort: null, agentProfile: agentId, llmProfile: llmId, executor, ...(projectId ? { project: projectId } : {}) };
+    if (selection?.agentProfile !== agentId || selection?.llmProfile !== llmId || selection?.executor !== executor || selection?.model !== model || selection?.project !== projectId) onChange(next);
     if (sessionId) client.setChatSelection?.(sessionId, next);
-  }, [agentId, llmId, executor, model, selection, onChange, client, sessionId]);
+  }, [agentId, llmId, executor, model, projectId, selection, onChange, client, sessionId]);
 
   function choose(agentProfile: string, llmProfile?: string, executor?: string) {
     const agent = agents.find(agent => agent.id === agentProfile);
@@ -70,6 +73,13 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
     const llm = choices.find(target => target.id === llmProfile) ?? choices[0];
     if (!agent || !llm) return;
     const next = { model: llm.model, effort: null, agentProfile, llmProfile: llm.id, executor: executor ?? llm.executors[0] };
+    onChange(next);
+    onPreference?.(next);
+  }
+
+  function chooseProject(project: string) {
+    if (!selection) return;
+    const next = { ...selection, project };
     onChange(next);
     onPreference?.(next);
   }
@@ -82,7 +92,15 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
       provider={{ value: agentId ?? "", options: agents.filter(option => !fixedAgent || option.id === fixedAgent).map(agent => ({ value: agent.id, label: agent.name })), onChange: value => choose(value) }}
       model={{ value: llmId ?? "", options: targets.map(target => ({ value: target.id, label: `${target.model} (${target.id})` })), onChange: value => { if (agentId) choose(agentId, value); } }}
       effort={{ value: executor ?? "", options: (llm?.executors ?? []).map(id => ({ value: id, label: id })), onChange: value => { if (agentId) choose(agentId, llmId, value); } }} effortUnsupported={false} />
-    {agent && <p className="mt-1 px-1 text-xs text-muted-foreground">{agent.tool_grant ? t("chat.workspaceAccess", { grant: agent.tool_grant, root: catalog?.health.workspace_root ?? t("chat.workspaceUnavailable") }) : t("chat.noWorkspaceAccess")}</p>}
+    {agent && <p className="mt-1 px-1 text-xs text-muted-foreground">{agent.tool_grant ? t("chat.workspaceAccess", { grant: agent.tool_grant }) : t("chat.noWorkspaceAccess")}</p>}
+    {agent?.tool_grant && !fixedAgent && catalog && (projects.length
+      ? <label className="mt-1 flex items-center gap-2 px-1 text-xs text-muted-foreground">{t("chat.project")}
+        <select className="h-7 min-w-0 rounded-md border border-input bg-background px-2 text-xs text-foreground" value={projectId ?? ""} disabled={busy}
+          onChange={event => chooseProject(event.target.value)}>
+          {projects.map(project => <option key={project.id} value={project.id}>{project.name} ({project.id})</option>)}
+        </select>
+      </label>
+      : <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.projectNone")}</p>)}
     {llm && !llm.declared_capabilities.includes("tools") && <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.toolsWarning")}</p>}
     {llm && !llm.declared_capabilities.includes("vision") && <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.visionWarning")}</p>}
   </div>;

@@ -103,17 +103,11 @@ pub(super) enum Command {
     CreateSubmittedJob {
         job: NewJob,
         submission: NewSubmission,
-        workspace_available: Option<bool>,
         reply: Reply<JobId>,
     },
     RetryJob {
         retry: JobRetry,
         reply: Reply<JobId>,
-    },
-    AssociateJobProject {
-        job: JobId,
-        project: ProjectId,
-        reply: Reply<()>,
     },
     AppendJobOutput {
         job: JobId,
@@ -132,6 +126,18 @@ pub(super) enum Command {
     CreateProject {
         project: NewProject,
         reply: Reply<ProjectId>,
+    },
+    UpdateProject {
+        id: ProjectId,
+        name: String,
+        description: Option<String>,
+        commands: Vec<ProjectCommand>,
+        reply: Reply<()>,
+    },
+    SetConversation {
+        root: JobId,
+        edit: ConversationEdit,
+        reply: Reply<()>,
     },
     CreateConfig {
         config: NewConfig,
@@ -311,7 +317,6 @@ impl Command {
             Self::CreateSubmittedJob {
                 job,
                 submission,
-                workspace_available,
                 reply,
             } => run(
                 database,
@@ -319,9 +324,7 @@ impl Command {
                 commit,
                 Kind::CreateJobWithInput,
                 reply,
-                |batch| {
-                    persistence::create_submitted_job(batch, job, submission, workspace_available)
-                },
+                |batch| persistence::create_submitted_job(batch, job, submission),
             ),
             Self::RetryJob { retry, reply } => run(
                 database,
@@ -330,18 +333,6 @@ impl Command {
                 Kind::RetryJob,
                 reply,
                 |batch| persistence::retry_job(batch, retry),
-            ),
-            Self::AssociateJobProject {
-                job,
-                project,
-                reply,
-            } => run(
-                database,
-                operation,
-                commit,
-                Kind::AssociateJobProject,
-                reply,
-                |batch| persistence::associate_job_project(batch, job, project),
             ),
             Self::AppendJobOutput { job, output, reply } => run(
                 database,
@@ -378,6 +369,28 @@ impl Command {
                 Kind::CreateProject,
                 reply,
                 |batch| persistence::create_project(batch, project),
+            ),
+            Self::UpdateProject {
+                id,
+                name,
+                description,
+                commands,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::UpdateProject,
+                reply,
+                |batch| persistence::update_project(batch, id, name, description, commands),
+            ),
+            Self::SetConversation { root, edit, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::SetConversation,
+                reply,
+                |batch| persistence::set_conversation(batch, root, edit),
             ),
             Self::CreateConfig { config, reply } => run(
                 database,
@@ -505,7 +518,7 @@ impl Command {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
             Self::RetryJob { retry, .. } => text_bytes(&retry.name),
-            Self::AssociateJobProject { .. } | Self::ConfirmJobStopped { .. } => 0,
+            Self::ConfirmJobStopped { .. } => 0,
             // The record rewritten keeps its length; the allowance covers it.
             Self::CleanupAttachment { .. } => 0,
             Self::AppendJobOutput { output, .. } => {
@@ -520,9 +533,22 @@ impl Command {
                 JobFinalization::Unknown => 0,
             },
             Self::CreateExecutor { executor, .. } => byte_count(executor.name.len()),
-            Self::CreateProject { project, .. } => {
-                byte_count(project.name.len()).saturating_add(text_bytes(&project.description))
-            }
+            Self::CreateProject { project, .. } => byte_count(project.name.len())
+                .saturating_add(text_bytes(&project.description))
+                .saturating_add(byte_count(project.root.len()))
+                .saturating_add(command_bytes(&project.commands)),
+            Self::UpdateProject {
+                name,
+                description,
+                commands,
+                ..
+            } => byte_count(name.len())
+                .saturating_add(text_bytes(description))
+                .saturating_add(command_bytes(commands)),
+            Self::SetConversation { edit, .. } => match edit {
+                ConversationEdit::Title(title) => byte_count(title.len()),
+                ConversationEdit::Hide => 16,
+            },
             Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {
                 byte_count(config.name.len()).saturating_add(match &config.body {
                     ConfigBody::Agent(agent) => text_bytes(&agent.instructions)
@@ -594,11 +620,12 @@ impl Command {
             Self::CreateJob { reply, .. }
             | Self::CreateSubmittedJob { reply, .. }
             | Self::RetryJob { reply, .. } => refuse(reply, error),
-            Self::AssociateJobProject { reply, .. } => refuse(reply, error),
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
             Self::FinalizeJob { reply, .. } => refuse(reply, error),
             Self::CreateExecutor { reply, .. } => refuse(reply, error),
             Self::CreateProject { reply, .. } => refuse(reply, error),
+            Self::UpdateProject { reply, .. } => refuse(reply, error),
+            Self::SetConversation { reply, .. } => refuse(reply, error),
             Self::CreateConfig { reply, .. } => refuse(reply, error),
             Self::UpdateConfig { reply, .. } => refuse(reply, error),
             Self::CreateAttachment { reply, .. } => refuse(reply, error),
@@ -617,6 +644,15 @@ impl Command {
 
 pub(super) fn refuse<T>(reply: Reply<T>, error: impl Fn() -> DatabaseError) {
     reply.send(Err(error())).ok();
+}
+
+pub(super) fn command_bytes(commands: &[ProjectCommand]) -> u64 {
+    commands.iter().fold(0, |total, command| {
+        command.argv.iter().fold(
+            total.saturating_add(byte_count(command.name.len())),
+            |total, entry| total.saturating_add(byte_count(entry.len())),
+        )
+    })
 }
 
 pub(super) fn byte_count(length: usize) -> u64 {

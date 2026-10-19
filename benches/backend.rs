@@ -324,7 +324,7 @@ fn job(handle: &DatabaseHandle, target: Target) -> NewJob {
         name: Some("benchmark".into()),
         eligible_at: None,
         parent: handle.genesis(),
-        projects: Vec::new(),
+        project: None,
         dependencies: Vec::new(),
         input: JobInputDraft {
             objective: Some("measure backend overhead".into()),
@@ -522,7 +522,7 @@ fn admit_jobs(
                 name: Some("benchmark".into()),
                 eligible_at: None,
                 parent: handle.genesis(),
-                projects: Vec::new(),
+                project: None,
                 dependencies: vec![(prereq, DependencyCondition::Success)],
                 input: JobInputDraft {
                     objective: Some("measure scheduler overhead".into()),
@@ -1837,7 +1837,7 @@ fn provider_record(options: &Options) -> Result<()> {
             let durable_commits = handle.durable_commits() - durable_before;
             let runtime = ExecutionRuntime::start(handle.clone())?;
             const TOKEN: &str = "provider-record-benchmark-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-            let control = ControlPlane::start(ControlPlaneConfig::new(0, TOKEN)?, handle.clone(), runtime.scheduler())?;
+            let control = ControlPlane::start(ControlPlaneConfig::new(0, TOKEN)?, handle.clone(), runtime.scheduler(), directory.clone())?;
             let client = ntex::client::Client::builder().build(ntex::SharedCfg::default()).await?;
             let mut gets = Vec::with_capacity(provider_jobs * 3);
             let gets_started = Instant::now();

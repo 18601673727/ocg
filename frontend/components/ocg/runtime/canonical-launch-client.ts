@@ -195,7 +195,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!selection?.agentProfile || !selection.llmProfile || !selection.executor) throw new Error("Select an Agent, Model and Executor before sending.");
     const predecessor = previous ? this.turns.get(previous) : undefined;
     if (predecessor?.input.configuration?.agent_profile && predecessor.input.configuration.agent_profile !== selection.agentProfile) throw new Error("A follow-up keeps the conversation's Agent. Start a new conversation to change Agents.");
-    const submission: ControlSubmission = { agent_profile: selection.agentProfile, llm_profile: selection.llmProfile, executor: selection.executor, objective: input.content, ...(previous ? { previous } : {}), attachments: input.images?.map(image => image.id) ?? [] };
+    const submission: ControlSubmission = { agent_profile: selection.agentProfile, llm_profile: selection.llmProfile, executor: selection.executor, objective: input.content, ...(previous ? { previous } : selection.project ? { project: selection.project } : {}), attachments: input.images?.map(image => image.id) ?? [] };
     const signature = JSON.stringify(submission);
     const held = this.pending.get(sessionId);
     if (held && held.signature !== signature) throw new Error("The previous admission is unresolved. Resend the unchanged message to resolve its existing Idempotency-Key.");

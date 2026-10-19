@@ -17,12 +17,14 @@ import {
   decodeJobTools,
   decodeOutputsPage,
   decodeProfiles,
+  decodeProjects,
   decodeSession,
   decodeStop,
   type ControlAttachment,
   type ControlCapability,
   type ControlJobEvent,
   type ControlJobToolsPage,
+  type ControlProject,
   type ControlToolCall,
 } from "../contracts";
 import { SseParser } from "./sse";
@@ -65,6 +67,8 @@ export type ControlSubmission = {
   name?: string;
   // A completed predecessor Job whose conversation history precedes this turn.
   previous?: string;
+  // The Project the Job works in; an Agent with a Workspace grant requires one on a conversation's first turn.
+  project?: string;
   // Image Attachments to send with the objective.
   attachments?: string[];
 };
@@ -362,6 +366,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     return decodeJobTools(answer.input, job);
   };
 
+  async function readProjectPage(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {
+    const query: string[] = [];
+    if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before", "project:")}`);
+    if (settings.limit !== undefined) {
+      if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
+        throw new ContractError("limit", "an integer from 1 to 100");
+      }
+      query.push(`limit=${settings.limit}`);
+    }
+    const suffix = query.length ? `?${query.join("&")}` : "";
+    return decodeProjects((await send("GET", `/api/v1/projects${suffix}`, { signal: settings.signal })).input);
+  }
+
   return {
     onProfilesChanged(listener: () => void) {
       profileListeners.add(listener);
@@ -441,6 +458,22 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
       const suffix = query.length ? `?${query.join("&")}` : "";
       return decodeAgentProfiles((await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal })).input);
+    },
+
+    /** One page of Projects, newest first. */
+    readProjects: readProjectPage,
+
+    /** Every Project, newest first. */
+    async readAllProjects(signal?: AbortSignal) {
+      const projects: ControlProject[] = [];
+      let before: string | undefined;
+      for (;;) {
+        const page = await readProjectPage({ before, limit: 100, signal });
+        projects.push(...page.projects);
+        if (!page.has_more) return projects;
+        if (!page.next_before || page.next_before === before) throw new Error("Project cursor did not advance.");
+        before = page.next_before;
+      }
     },
 
     /** Full Profile catalog (LLM Profiles, Agent Profiles) and computed Provider projection. */
@@ -528,6 +561,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       identity(submission.llm_profile, "llm_profile", "profile:");
       identity(submission.executor, "executor", "executor:");
       if (submission.previous !== undefined) jobIdentity(submission.previous);
+      if (submission.project !== undefined) identity(submission.project, "project", "project:");
       if (submission.attachments !== undefined) {
         for (const [index, att] of submission.attachments.entries()) {
           identity(att, `attachments[${index}]`, "attachment:");

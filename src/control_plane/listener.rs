@@ -1,4 +1,5 @@
 use super::*;
+use crate::data_directory::DataDirectory;
 
 /// How long a stop waits for requests in flight before it closes them.
 const STOP_TIMEOUT: Seconds = Seconds(5);
@@ -42,6 +43,7 @@ impl ControlPlane {
     /// Binds `127.0.0.1` at the configured port, then starts answering on
     /// a thread of its own. Nothing is answered unless the bind succeeded.
     /// Jobs are submitted to `scheduler`, which must be the host's own.
+    /// A Project's root must stay apart from `data_directory`.
     ///
     /// # Errors
     ///
@@ -50,12 +52,13 @@ impl ControlPlane {
         config: ControlPlaneConfig,
         database: DatabaseHandle,
         scheduler: SchedulerHandle,
+        data_directory: DataDirectory,
     ) -> Result<Self, StartError> {
         Self::start_with_workspace(
             config,
             database,
             scheduler,
-            crate::orchestration::execution_runtime::WorkspaceTools::default(),
+            crate::orchestration::execution_runtime::WorkspaceTools::new(data_directory),
         )
     }
 

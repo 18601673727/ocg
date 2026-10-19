@@ -39,27 +39,28 @@ pub use identity::{
     RequestRef, Timestamp,
 };
 pub(crate) use mutations::{
-    PublishedAttachment, append_job_output, associate_job_project, check_new_attachment,
-    claim_execution, cleanup_attachment, confirm_job_stopped, create_attachment, create_config,
+    PublishedAttachment, append_job_output, check_new_attachment, claim_execution,
+    cleanup_attachment, confirm_job_stopped, create_attachment, create_config,
     create_execution_pool, create_executor, create_job, create_project, create_submitted_job,
     finalize_job, reconcile_tool_effect, record_availability_stat, record_metrics,
-    record_tool_decision, record_tool_outcome, retry_job, set_execution_pool_enabled,
-    update_config, update_execution_pool,
+    record_tool_decision, record_tool_outcome, retry_job, set_conversation,
+    set_execution_pool_enabled, update_config, update_execution_pool, update_project,
 };
 pub use mutations::{is_handler_version, sanitize_display_name};
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
 pub use records::{
     AgentBehavior, AgentConfig, AttachmentCleanup, AttachmentOrigin, AttachmentRecord,
-    CapabilitySet, ClaimRecord, CleanupKind, ConfigBody, ConfigKind, ConfigRecord, ConfigRef,
-    ConnectionConfig, ContentDigest, ExecutionOperation, ExecutionPool, ExecutionPoolConfig,
-    ExecutorRecord, FrozenExecutionConfig, FrozenLlmConfig, JobInputRecord, JobOutputRecord,
-    JobRecord, JobStateRecord, LlmConfig, LlmParameters, LlmTarget, LlmTransport,
-    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES, MAX_ATTACHMENT_NAME_BYTES, Measurements,
-    MetricsRecord, ModelCapability, ModelConfig, NewAttachment, NewConfig, NewExecutionPool,
-    NewMetrics, NewProject, NewSubmission, OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey,
-    PendingJobsPage, PoolConfig, ProjectRecord, ProviderSnapshot, RequestEventRecord,
-    RequestFingerprint, RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord,
-    SubmittedConfiguration, SuspensionRecord, ToolCallRecord,
+    BUILT_IN_COMMANDS, CapabilitySet, ClaimRecord, CleanupKind, ConfigBody, ConfigKind,
+    ConfigRecord, ConfigRef, ConnectionConfig, ContentDigest, ConversationEdit, ExecutionOperation,
+    ExecutionPool, ExecutionPoolConfig, ExecutorRecord, FrozenExecutionConfig, FrozenLlmConfig,
+    JobInputRecord, JobOutputRecord, JobRecord, JobStateRecord, LlmConfig, LlmParameters,
+    LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES,
+    MAX_ATTACHMENT_NAME_BYTES, Measurements, MetricsRecord, ModelCapability, ModelConfig,
+    NewAttachment, NewConfig, NewExecutionPool, NewMetrics, NewProject, NewSubmission,
+    OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey, PendingJobsPage, PoolConfig,
+    ProjectCommand, ProjectRecord, ProviderSnapshot, RequestEventRecord, RequestFingerprint,
+    RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord, SubmittedConfiguration,
+    SuspensionRecord, ToolCallRecord, validate_project_commands,
 };
 pub use scheduling::*;
 pub use tool_evidence::{

@@ -10,7 +10,7 @@ import {
   type ControlSubmission,
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/control-client";
-import { ContractError, type ControlCapability } from "@/components/ocg/contracts";
+import { ContractError, type ControlCapability, type ControlProject } from "@/components/ocg/contracts";
 
 type Phase = "editing" | "submitting" | "pending" | "uncertain" | "admitted" | "refused";
 
@@ -39,6 +39,8 @@ export type SubmissionTarget = {
   llmProfile: string;
   executor: string;
   declaredCapabilities?: ControlCapability[];
+  // The Project of a conversation's first turn, when the Agent has a Workspace grant.
+  project?: string;
 };
 
 const MAX_SINGLE_IMAGE_BYTES = 4 * 1024 * 1024; // 4 MiB
@@ -99,7 +101,9 @@ export function JobSubmissionForm({
   const [message, setMessage] = useState<string | null>(null);
   const [key, setKey] = useState<string | null>(null);
   const [availableLlms, setAvailableLlms] = useState<{ id: string; name: string; model: string; executors: string[]; declared_capabilities?: ControlCapability[] }[]>([]);
-  const [availableAgents, setAvailableAgents] = useState<{ id: string; name: string; llm_targets: string[] }[]>([]);
+  const [availableAgents, setAvailableAgents] = useState<{ id: string; name: string; llm_targets: string[]; tool_grant?: string | null }[]>([]);
+  const [projects, setProjects] = useState<ControlProject[]>([]);
+  const [project, setProject] = useState("");
   const [catalogVersion, setCatalogVersion] = useState(0);
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
@@ -214,6 +218,23 @@ export function JobSubmissionForm({
     return () => controller.abort();
   }, [chat, client, catalogVersion]);
 
+  useEffect(() => {
+    if (chat) return;
+    const controller = new AbortController();
+    client
+      .readAllProjects(controller.signal)
+      .then((all) => {
+        if (!controller.signal.aborted) setProjects(all);
+      })
+      .catch(() => {
+        // A Project can still be typed by the API; the Agent's refusal says if one is needed.
+      });
+    return () => controller.abort();
+  }, [chat, client, catalogVersion]);
+
+  const granted = !chat && Boolean(availableAgents.find((agent) => agent.id === agentProfile.trim())?.tool_grant);
+  const chosenProject = projects.find((candidate) => candidate.id === project) ?? projects[0];
+
   const settled = phase === "submitting" || phase === "pending" || phase === "uncertain";
 
   function clearReconciliation() {
@@ -310,6 +331,8 @@ export function JobSubmissionForm({
               objective,
               ...(name.trim() ? { name: name.trim() } : {}),
               ...(previousJob ? { previous: previousJob } : {}),
+              ...(!previousJob && chat && target?.project ? { project: target.project } : {}),
+              ...(granted && chosenProject ? { project: chosenProject.id } : {}),
               ...(attachmentIds.length > 0 ? { attachments: attachmentIds } : {}),
             };
       requestRef.current = request;
@@ -346,8 +369,8 @@ export function JobSubmissionForm({
             ? "contract"
             : "unreachable";
       setMessage(
-        error instanceof ControlTransportError && error.code === "workspace_not_configured"
-          ? "The selected Agent has Workspace access, but this host has no authorized Workspace. Configure OCG_WORKSPACE_ROOT and restart the host, or select an Agent with Workspace access set to None. Nothing was submitted (workspace_not_configured)."
+        error instanceof ControlTransportError && error.code === "project_required"
+          ? "The selected Agent has Workspace access, which needs a Project. Select a Project, or select an Agent with Workspace access set to None. Nothing was submitted (project_required)."
           : outcome === "uncertain"
             ? `The submission did not finish (${code}). Whether it created a Job is unknown; this key is not submitted again under another.`
             : `Nothing was submitted (${code}).`,
@@ -459,6 +482,23 @@ export function JobSubmissionForm({
               />
             </label>
           </div>
+          {granted ? (
+            <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+              Project
+              <select
+                className="h-9 rounded-md border border-input bg-background px-3 text-sm font-normal normal-case tracking-normal text-foreground"
+                value={chosenProject?.id ?? ""}
+                onChange={(event) => setProject(event.target.value)}
+                disabled={settled}
+              >
+                {projects.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.name} ({candidate.id})
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
         </>
       )}
       <div className="flex flex-col gap-2">

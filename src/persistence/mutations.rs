@@ -37,32 +37,20 @@ fn spec_of(batch: &mut Batch, job: &NewJob) -> Result<JobRow, BatchError> {
         retry_of: None,
         continues: job.previous,
         submission: None,
+        project: job.project,
     })
-}
-
-/// Joins a new Job to its Projects.
-fn join_projects(batch: &mut Batch, job: JobId, projects: &[ProjectId]) -> Result<(), BatchError> {
-    for (index, project) in projects.iter().enumerate() {
-        if projects[..index].contains(project) {
-            return batch.reject(Violation::DuplicateReference(RecordRef::Project(*project)));
-        }
-        batch.require_project(*project)?;
-        batch.link_project(job, *project)?;
-    }
-    Ok(())
 }
 
 /// T1: submits a Job, or the next turn of a conversation when it continues a
 /// predecessor. The Job is pending; the claim batch grants it later.
 pub(crate) fn create_job(batch: &mut Batch, job: NewJob) -> OpResult<JobId> {
-    submit(batch, job, None, None)
+    submit(batch, job, None)
 }
 
 fn submit(
     batch: &mut Batch,
     job: NewJob,
     submission: Option<NewSubmission>,
-    workspace_available: Option<bool>,
 ) -> Result<JobId, BatchError> {
     let spec = spec_of(batch, &job)?;
     if submission.is_some()
@@ -79,34 +67,29 @@ fn submit(
     {
         return batch.reject(Violation::ToolsNotSupported);
     }
-    if workspace_available == Some(false)
-        && spec
-            .execution
-            .as_ref()
-            .and_then(|execution| execution.agent.as_ref())
-            .is_some_and(|agent| agent.tool_grant.is_some())
+    if let Some(project) = spec.project {
+        batch.require_project(project)?;
+    } else if spec
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.agent.as_ref())
+        .is_some_and(|agent| agent.tool_grant.is_some())
     {
-        return batch.reject(Violation::WorkspaceNotConfigured);
-    }
-    for project in &job.projects {
-        batch.require_project(*project)?;
+        return batch.reject(Violation::ProjectRequired);
     }
     let submission = submission.map(|submission| (submission.key, submission.fingerprint));
-    let id = match job.previous {
-        Some(previous) => batch.t1_continue(submission, spec, previous)?,
-        None => batch.t1_submit(submission, spec)?,
-    };
-    join_projects(batch, id, &job.projects)?;
-    Ok(id)
+    match job.previous {
+        Some(previous) => batch.t1_continue(submission, spec, previous),
+        None => batch.t1_submit(submission, spec),
+    }
 }
 
 pub(crate) fn create_submitted_job(
     batch: &mut Batch,
     job: NewJob,
     submission: NewSubmission,
-    workspace_available: Option<bool>,
 ) -> OpResult<JobId> {
-    submit(batch, job, Some(submission), workspace_available)
+    submit(batch, job, Some(submission))
 }
 
 /// Creates a new Job that retries `retry.original`. The original Job is not
@@ -137,29 +120,13 @@ pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
     if let Some(pair) = dependencies.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return batch.reject(Violation::DuplicateDependency(pair[0].0));
     }
-    for project in &retry.projects {
-        batch.require_project(*project)?;
-    }
     spec.name = retry.name.or(spec.name);
     spec.eligible_at = retry.eligible_at;
     spec.parent_id = (retry.parent.get() != 0).then_some(retry.parent);
     spec.dependencies = dependencies;
     spec.retry_of = Some(original);
     spec.continues = None;
-    let id = batch.t1_submit(None, spec)?;
-    join_projects(batch, id, &retry.projects)?;
-    Ok(id)
-}
-
-/// Adds one more Project to the Job's Project set.
-pub(crate) fn associate_job_project(
-    batch: &mut Batch,
-    job: JobId,
-    project: ProjectId,
-) -> OpResult<()> {
-    batch.require_job(job)?;
-    batch.require_project(project)?;
-    batch.link_project(job, project)
+    batch.t1_submit(None, spec)
 }
 
 /// T2 for one named Job: claims it into the first of `request.allowed_pools`
@@ -607,15 +574,88 @@ pub(crate) fn cleanup_attachment(
     Ok(record)
 }
 
+/// Creates a Project. Its root, which the caller resolved, may not equal,
+/// contain or lie inside another Project's root.
 pub(crate) fn create_project(batch: &mut Batch, project: NewProject) -> OpResult<ProjectId> {
+    if let Err(reason) = validate_project_commands(&project.commands) {
+        return batch.reject(Violation::InvalidValue("commands", reason));
+    }
+    let root = std::path::Path::new(&project.root);
+    for (existing, other) in batch.project_roots()? {
+        let other = std::path::Path::new(&other);
+        if other.starts_with(root) || root.starts_with(other) {
+            return batch.reject(Violation::ProjectRootOverlap { project: existing });
+        }
+    }
     let id = ProjectId(batch.next_id(crate::storage::Sequence::Project)?);
+    let now = batch.now();
     batch.insert_project(&ProjectRecord {
         id,
         name: project.name,
         description: project.description,
-        created_at: batch.now(),
+        root: project.root,
+        commands: project.commands,
+        created_at: now,
+        updated_at: now,
     })?;
     Ok(id)
+}
+
+/// Replaces a Project's name, description and commands. Its root stays.
+pub(crate) fn update_project(
+    batch: &mut Batch,
+    id: ProjectId,
+    name: String,
+    description: Option<String>,
+    commands: Vec<ProjectCommand>,
+) -> OpResult<()> {
+    if let Err(reason) = validate_project_commands(&commands) {
+        return batch.reject(Violation::InvalidValue("commands", reason));
+    }
+    let mut record = batch.require_project_record(id)?;
+    record.name = name;
+    record.description = description;
+    record.commands = commands;
+    record.updated_at = batch.now();
+    batch.insert_project(&record)
+}
+
+// ---- conversations --------------------------------------------------------------------------
+
+/// The one place that decides which Jobs are conversations: a Job with Chat
+/// behavior that continues nothing.
+fn require_conversation(batch: &mut Batch, id: JobId) -> OpResult<()> {
+    let row = match batch.job(id)? {
+        Some(row) => row,
+        None => return batch.reject(Violation::NotFound(RecordRef::Job(id))),
+    };
+    let chat = row
+        .execution
+        .as_ref()
+        .and_then(|execution| execution.agent.as_ref())
+        .is_some_and(|agent| agent.behavior == AgentBehavior::Chat);
+    if chat && row.continues.is_none() {
+        Ok(())
+    } else {
+        batch.reject(Violation::NotFound(RecordRef::Job(id)))
+    }
+}
+
+/// Renames or hides a conversation. Hiding twice changes nothing, and no
+/// Job is touched.
+pub(crate) fn set_conversation(
+    batch: &mut Batch,
+    root: JobId,
+    edit: ConversationEdit,
+) -> OpResult<()> {
+    require_conversation(batch, root)?;
+    let mut row = batch.conversation(root)?;
+    match edit {
+        ConversationEdit::Title(title) => row.title = Some(title),
+        ConversationEdit::Hide if row.hidden_at.is_some() => return Ok(()),
+        ConversationEdit::Hide => row.hidden_at = Some(batch.now()),
+    }
+    batch.insert_conversation(root, &row)
 }
 
 // ---- request events -------------------------------------------------------------------------

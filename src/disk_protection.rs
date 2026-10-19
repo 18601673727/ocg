@@ -692,6 +692,8 @@ mod tests {
         wait(handle.create_project(crate::persistence::NewProject {
             name: "after recovery".into(),
             description: None,
+            root: "/ocg-test/after-recovery".into(),
+            commands: Vec::new(),
         }))
         .expect("commands are accepted again");
         worker.shutdown().expect("shutdown database");

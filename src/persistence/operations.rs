@@ -38,8 +38,9 @@ pub enum OperationKind {
     FinalizeJob,
     CreateExecutor,
     RetryJob,
-    AssociateJobProject,
     CreateProject,
+    UpdateProject,
+    SetConversation,
     CreateLlmProvider,
     CreateProfile,
     UpdateProfile,
@@ -81,8 +82,12 @@ pub enum OperationKind {
 pub enum Violation {
     #[error("the Agent has a Workspace tool grant but the LLM Profile does not declare Tools")]
     ToolsNotSupported,
-    #[error("the Agent requires Workspace access but the host has no authorized Workspace")]
-    WorkspaceNotConfigured,
+    #[error("the Agent has a Workspace tool grant, which needs a Project")]
+    ProjectRequired,
+    #[error("the Job's Project differs from its predecessor's; a conversation keeps its Project")]
+    ProjectMismatch,
+    #[error("the Project root overlaps the root of {project}")]
+    ProjectRootOverlap { project: ProjectId },
     #[error("{0} not found")]
     NotFound(RecordRef),
     #[error("{config} is a {found:?} config, not a {expected:?} config")]
@@ -135,8 +140,6 @@ pub enum Violation {
     ParentFixed(JobId),
     #[error("making {parent} the parent of {child} would create a parent cycle")]
     ParentCycle { child: JobId, parent: JobId },
-    #[error("{job} is already associated with {project}")]
-    AlreadyInProject { job: JobId, project: ProjectId },
     #[error("{0} is listed more than once")]
     DuplicateReference(RecordRef),
     #[error("{llm_profile} is not a configured LLM target of {agent_profile}")]

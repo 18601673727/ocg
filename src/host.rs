@@ -17,6 +17,9 @@ use crate::logger::RuntimeLogger;
 use crate::orchestration::execution_runtime::{ExecutionRuntime, SchedulerHandle};
 use crate::system_policy::SystemPolicy;
 
+/// The variable that named the one Workspace of a host before Projects.
+const REMOVED_WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
+
 /// Where in a run something happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -219,7 +222,7 @@ where
         }
     };
     let workspace_tools =
-        crate::orchestration::execution_runtime::WorkspaceTools::from_environment(data_directory);
+        crate::orchestration::execution_runtime::WorkspaceTools::new(data_directory.clone());
     let served = ntex::rt::System::build()
         .name("ocg")
         .signals(signals)
@@ -312,6 +315,11 @@ where
         Ok(()) => {
             log::set_max_level(log_handle.active_config().level.filter());
             log::info!("OCG foundation initialized; storage is ready");
+            if std::env::var_os(REMOVED_WORKSPACE_ROOT_VARIABLE).is_some() {
+                log::warn!(
+                    "{REMOVED_WORKSPACE_ROOT_VARIABLE} is ignored; a Project names the Workspace of a Job"
+                );
+            }
             let abandoned = handle.abandoned_at_open();
             if !abandoned.is_empty() {
                 let jobs = abandoned

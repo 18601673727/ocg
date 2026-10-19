@@ -26,6 +26,15 @@ pub(super) enum Route {
     ProfileCreate,
     ProviderModels,
     ProfileUpdate(ProfileId),
+    Projects {
+        before: Option<ProjectId>,
+        limit: usize,
+    },
+    ProjectCreate,
+    ProjectUpdate(ProjectId),
+    Pools,
+    PoolUpdate(ExecutionPoolId),
+    ConversationEdit(JobId),
     Outputs {
         job: JobId,
         after_seq: Option<i64>,
@@ -80,6 +89,12 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ProviderModels
             | Route::ProfileCreate
             | Route::ProfileUpdate(_)
+            | Route::Projects { .. }
+            | Route::ProjectCreate
+            | Route::ProjectUpdate(_)
+            | Route::Pools
+            | Route::PoolUpdate(_)
+            | Route::ConversationEdit(_)
             | Route::Outputs { .. }
             | Route::Events { .. }
             | Route::Admission
@@ -117,6 +132,19 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 let profile = profiles::profile_id(profile)?;
                 no_query(query).map(|()| Route::ProfileUpdate(profile))
             }
+            ["projects"] => no_query(query).map(|()| Route::ProjectCreate),
+            ["projects", project] => {
+                let project = projects::project_id(project)?;
+                no_query(query).map(|()| Route::ProjectUpdate(project))
+            }
+            ["pools", pool] => {
+                let pool = pools::pool_id(pool)?;
+                no_query(query).map(|()| Route::PoolUpdate(pool))
+            }
+            ["conversations", job] => {
+                let job = job_id(job)?;
+                no_query(query).map(|()| Route::ConversationEdit(job))
+            }
             ["attachments"] => no_query(query).map(|()| Route::AttachmentUpload),
             ["session"] => no_query(query).map(|()| Route::SessionCreate),
             _ => Err(NOT_FOUND),
@@ -141,6 +169,10 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["admissions"] => no_query(query).map(|()| Route::Admission),
         ["session"] => no_query(query).map(|()| Route::SessionStatus),
         ["profiles"] => no_query(query).map(|()| Route::Profiles),
+        ["projects"] => {
+            projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
+        }
+        ["pools"] => no_query(query).map(|()| Route::Pools),
         ["attachments", attachment] => {
             let attachment = attachments::attachment_id(attachment)?;
             no_query(query).map(|()| Route::Attachment(attachment))
@@ -251,9 +283,7 @@ pub(super) async fn respond(
 ) -> Result<Reply, Refusal> {
     let database = &shared.database;
     match route {
-        Route::Health => Ok(Reply::ok(
-            health(database, shared.workspace_tools.root()).await,
-        )),
+        Route::Health => Ok(Reply::ok(health(database).await)),
         Route::Jobs { before, limit } => dashboard::jobs(shared, before, limit).await,
         Route::Conversations { before, limit } => {
             catalog::conversations(database, before, limit).await
@@ -295,6 +325,24 @@ pub(super) async fn respond(
         Route::ProfileUpdate(profile) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::save_profile(database, Some(profile), &body).await
+        }
+        Route::Projects { before, limit } => projects::list(database, before, limit).await,
+        Route::ProjectCreate => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            projects::create(shared, &body).await
+        }
+        Route::ProjectUpdate(project) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            projects::update(database, project, &body).await
+        }
+        Route::Pools => pools::list(database).await,
+        Route::PoolUpdate(pool) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            pools::update(database, pool, &body).await
+        }
+        Route::ConversationEdit(job) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            catalog::edit_conversation(database, job, &body).await
         }
         Route::Outputs {
             job,

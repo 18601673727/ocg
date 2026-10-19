@@ -56,6 +56,13 @@
 //!   newest first, each with the LLM Profiles it may run with and the
 //!   Executors that can run each now. A page reads `limit` Profiles of either
 //!   kind, so it may list fewer; `next_before` continues it. See [`catalog`].
+//! - `GET /api/v1/projects`, `POST /api/v1/projects` and
+//!   `POST /api/v1/projects/{project}`: Projects, each a root and the commands
+//!   an Agent may run in it. See [`projects`].
+//! - `GET /api/v1/pools` and `POST /api/v1/pools/{execution_pool}`: every
+//!   Pool, and its concurrency limit or enabled state. See [`pools`].
+//! - `POST /api/v1/conversations/{job}`: renames or hides a conversation
+//!   whose root Job is `job`. See [`catalog`].
 //! - `GET /api/v1/jobs/{job}/outputs?after_seq=N&limit=M`: the Job's
 //!   outputs as stored, in `seq` order, strictly after `after_seq`, at most
 //!   `limit` ([`MAX_OUTPUT_PAGE`]) of them, with the cursor of the next page.
@@ -70,8 +77,10 @@
 //!   "profile:<n>"}`, `name` and `agent_profile` optional: an existing LLM
 //!   Profile and an Executor that can run it, and an Agent Profile that
 //!   targets that LLM Profile, all checked here and again when the Job is
-//!   created. Workspace tools follow the frozen Agent grant;
-//!   nothing of a Provider, credential or command is accepted. The answer
+//!   created. Workspace tools follow the frozen Agent grant and the optional
+//!   `"project": "project:<n>"`, which an Agent with a grant requires and a
+//!   follow-up takes from its previous turn; nothing of a Provider,
+//!   credential or command is accepted. The answer
 //!   is `{"admission": {"status", "job"}}`: `201` when this request created
 //!   the Job, `200` when the key already named it, `202` with `pending`
 //!   when the admission did not end within a bounded wait; it runs on, and
@@ -120,9 +129,9 @@ use serde_json::{Value, json};
 use crate::database::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::orchestration::execution_runtime::SchedulerHandle;
 use crate::persistence::{
-    AttachmentId, JobId, JobOutputRecord, JobRecord, NotInvokedReason, OutputKind, ProfileId,
-    RequestNumber, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind, UncertainCause,
-    WithheldReason,
+    AttachmentId, ExecutionPoolId, JobId, JobOutputRecord, JobRecord, NotInvokedReason, OutputKind,
+    ProfileId, ProjectId, RequestNumber, ToolDecision, ToolEvidenceRecord, ToolOutcome,
+    ToolOutcomeKind, UncertainCause, WithheldReason,
 };
 
 mod assets;
@@ -133,8 +142,10 @@ mod config;
 mod dashboard;
 mod events;
 mod listener;
+mod pools;
 mod profiles;
 mod projection;
+mod projects;
 mod routing;
 mod security;
 mod submissions;

@@ -554,7 +554,7 @@ fn job_template(handle: &DatabaseHandle, configuration: ExecutionConfiguration) 
         name: Some("live acceptance request".into()),
         eligible_at: None,
         parent: handle.genesis(),
-        projects: Vec::new(),
+        project: None,
         dependencies: Vec::new(),
         input: JobInputDraft::default(),
         configuration: Some(configuration),

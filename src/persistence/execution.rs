@@ -59,9 +59,8 @@ pub struct JobInputDraft {
     pub attachments: Vec<AttachmentId>,
 }
 
-/// Every relationship here is fixed once the Job is submitted. Project
-/// associations are independent of `parent`: a child never inherits its
-/// parent's Projects.
+/// Every relationship here is fixed once the Job is submitted. The Project
+/// is independent of `parent`: a child never inherits its parent's Project.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewJob {
     pub name: Option<String>,
@@ -69,7 +68,7 @@ pub struct NewJob {
     /// Top-level work names the Genesis Job (0), see
     /// [`crate::database::DatabaseHandle::genesis`].
     pub parent: JobId,
-    pub projects: Vec<ProjectId>,
+    pub project: Option<ProjectId>,
     pub dependencies: Vec<(JobId, DependencyCondition)>,
     pub input: JobInputDraft,
     /// Present for an LLM execution child; absent for orchestrating or
@@ -99,7 +98,6 @@ pub struct JobRetry {
     pub parent: JobId,
     pub name: Option<String>,
     pub eligible_at: Option<Timestamp>,
-    pub projects: Vec<ProjectId>,
     pub dependencies: Vec<(JobId, DependencyCondition)>,
     /// Accepts that the retry may repeat a non-idempotent tool effect the
     /// original, or any Job it retries in turn, is known to have had. It

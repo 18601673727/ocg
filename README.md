@@ -55,7 +55,7 @@ The Control Plane binds `127.0.0.1:<OCG_CONTROL_PORT>` and prints
 | `OCG_CONTROL_PORT` | No | The loopback TCP port (1–65535) the Control Plane listens on. It must be set together with `OCG_CONTROL_TOKEN`; setting only one is a startup error. |
 | `OCG_CONTROL_TOKEN` | No | The bearer token programmatic Control Plane clients present. It must be 32–512 characters with at least 8 distinct characters, using `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`, `+`, `/` or `=`. It is never logged. |
 | `OCG_UI_DIR` | No | A directory of the exported frontend for the Control Plane to serve. It must exist, is read only when the Control Plane is enabled, and without it no console or browser pairing is offered. |
-| `OCG_WORKSPACE_ROOT` | No for the host; yes for `workspace-*` | An absolute path to the Workspace Jobs may use. The host offers Workspace tools to Agents with a Workspace grant from this root; it cannot be your home directory, `/`, or overlap the data directory. |
+| `OCG_PROJECT` | `workspace-*` | The Project, written `project:<n>`, whose root is the Workspace the Job may use; see [Projects](#projects). It must exist, and its root must still pass the checks below. |
 | `OCG_PROVIDER_ENDPOINT` | `register-llm` and `workspace-*` | The Provider's OpenAI-compatible endpoint, which must be an `https://` URL. |
 | `OCG_PROVIDER_MODEL` | `register-llm` and `workspace-*` | The Provider's model identifier. |
 | `OCG_PROVIDER_CREDENTIAL_REF` | `register-llm` and `workspace-*` | The name of the environment variable that holds the Provider's API key. That variable is read when a request is built; its value is never stored, printed or logged. |
@@ -64,7 +64,53 @@ When a Profile's API key is not in the data directory's credential store, OCG
 reads the environment variable named by that Profile's `credential_ref`.
 
 Chat tools need an Agent with Workspace access and an LLM Profile that declares
-Tools. Tools can reach only `OCG_WORKSPACE_ROOT`.
+Tools, and every Job of such an Agent names a Project. Tools can reach only that
+Project's root. `OCG_WORKSPACE_ROOT` is no longer read: when it is still set,
+the host logs one warning that it is ignored.
+
+## Projects
+
+A Project names a directory, its root, and the commands an Agent may run there.
+Create one with the Control Plane (bearer token shown; a signed-in browser also
+sends its CSRF token):
+
+```sh
+curl -X POST http://127.0.0.1:7840/api/v1/projects \
+  -H "Authorization: Bearer $OCG_CONTROL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "ocg", "root": "/absolute/path/to/ocg",
+       "commands": [{"name": "lint", "argv": ["cargo", "clippy", "--all-targets"]}]}'
+```
+
+- The root is resolved when the Project is created and never changes. It must
+  be an absolute path to an existing directory with a UTF-8 path, not `/` or a
+  directory that contains your home directory, and apart from the data
+  directory. It may not equal, contain or lie inside the root of another
+  Project. Every Job re-checks the root when it starts and fails, running
+  nothing, when the root no longer authorizes or resolves anywhere else.
+- Known limit: on macOS, firmlinked aliases of a directory
+  (`/System/Volumes/Data/...`) are not detected as overlapping roots.
+- A command is a name matching `[a-z][a-z0-9_]{0,63}` (not `cargo_check` or
+  `cargo_test`, which every `code` grant already has) and an `argv` of 1 to 64
+  entries, each 1 to 4 KiB without NUL. `argv[0]` is a bare program name, found
+  on OCG's own absolute `PATH` entries, or an absolute path. A Project has at
+  most 32 commands, and their encoding takes at most 16 KiB. Commands run in the
+  root with the same filtered environment and time limit as every other
+  command, never through a shell.
+- **The argv of every command is sent to the Provider with each request, so put
+  no secret in it.**
+- `POST /api/v1/projects/{project}` replaces the name, description and commands;
+  a body that names `root` is refused. `GET /api/v1/projects` lists Projects
+  newest first with `before=project:<n>` and `limit`. There is no delete.
+- A Job names its Project when it is submitted (`"project": "project:<n>"`); a
+  follow-up to a conversation takes its previous turn's and may not name
+  another.
+
+Pools and conversations have routes too: `GET /api/v1/pools` lists every Pool,
+and `POST /api/v1/pools/{execution_pool}` sets `{"concurrency_limit": n}` or
+`{"enabled": bool}` (lowering the limit stops new claims; running Jobs
+continue); `POST /api/v1/conversations/{job}` sends `{"title": "..."}` or
+`{"hidden": true}`, and hiding is permanent.
 
 ## Sign a browser in
 
@@ -98,11 +144,12 @@ Each command below also needs `OCG_DATA_DIR`.
 ### Workspace Jobs
 
 These run one Job through the host and print what was recorded for it. They
-also read `OCG_WORKSPACE_ROOT` and the three `OCG_PROVIDER_*` variables.
+also read `OCG_PROJECT` and the three `OCG_PROVIDER_*` variables. The Project
+must already exist, and its root must authorize before anything is recorded.
 
 - `ocg workspace-read <objective>` — run one Job with only `workspace_read_file`.
 - `ocg workspace-edit <objective>` — also allow creating and conditionally updating files.
-- `ocg workspace-code <objective>` — also allow build and test commands and directory listing/search.
+- `ocg workspace-code <objective>` — also allow build and test commands, the Project's commands, and directory listing/search.
 - `ocg workspace-vision <image-path> <objective>` — store one PNG or JPEG from the Workspace as an Attachment and send it with the objective, offering no tool.
 
 `workspace-edit` and `workspace-code` are built for Linux, Android and Apple

@@ -66,8 +66,8 @@ pub(crate) use batch::{
     compact, persist_staged, run_batch_declinable, run_batch_with,
 };
 use codec::{
-    Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_JOB, TAG_JOB_STATE, TAG_OUTPUT,
-    TAG_PROJECT, TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
+    Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_CONVERSATION, TAG_JOB,
+    TAG_JOB_STATE, TAG_OUTPUT, TAG_PROJECT, TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
 };
 #[cfg(test)]
 pub(crate) use derived::relationship_inconsistencies;
@@ -91,10 +91,10 @@ pub(crate) use reads::{
     read_executor, read_executors, read_job, read_job_compatible_executors,
     read_job_configuration, read_job_input, read_job_input_for_job, read_jobs,
     read_latest_output, read_occupancy, read_outputs, read_pending_jobs, read_pool_binding,
-    read_project, read_project_jobs, read_projects, read_retries, read_submission,
+    read_project, read_projects, read_retries, read_submission,
     read_tool_evidence, read_unresolved_executions, unneeded_content,
 };
-pub(crate) use rows::{ConfigRow, JobRow, JobStateRow};
+pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow};
 use rows::{
     decode_attachment, decode_output, decode_project, decode_submission, decode_tool_evidence,
     encode_attachment, encode_output, encode_project, encode_submission, encode_tool_evidence,

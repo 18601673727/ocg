@@ -167,9 +167,6 @@ export function decodeHealth(input: unknown) {
   });
   return {
     host,
-    workspace_root: envelope.workspace_root === null
-      ? null
-      : string(envelope.workspace_root, "workspace_root"),
     database: {
       status,
       accepting_commands: boolean(database.accepting_commands, "database.accepting_commands"),
@@ -596,6 +593,43 @@ export function decodeAgentProfiles(input: unknown) {
   };
 }
 
+/** One page of Projects from `GET /api/v1/projects`, newest first. */
+export function decodeProjects(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const nextBefore = envelope.next_before === null
+    ? null
+    : identity(envelope.next_before, "next_before", "project:");
+  const hasMore = boolean(envelope.has_more, "has_more");
+  if (hasMore !== (nextBefore !== null)) {
+    throw new ContractError("next_before", "a cursor exactly when more Projects remain");
+  }
+  return {
+    projects: listOf(envelope.projects, "projects", (entry, path) => {
+      const project = record(entry, path);
+      return {
+        id: identity(project.id, `${path}.id`, "project:"),
+        name: string(project.name, `${path}.name`),
+        description: optionalString(project.description, `${path}.description`),
+        root: string(project.root, `${path}.root`),
+        commands: listOf(project.commands, `${path}.commands`, (command, commandPath) => {
+          const named = record(command, commandPath);
+          return {
+            name: string(named.name, `${commandPath}.name`),
+            argv: listOf(named.argv, `${commandPath}.argv`, (argument, argumentPath) => string(argument, argumentPath)),
+          };
+        }),
+        created_at_us: integer(project.created_at_us, `${path}.created_at_us`),
+        updated_at_us: integer(project.updated_at_us, `${path}.updated_at_us`),
+      };
+    }),
+    has_more: hasMore,
+    next_before: nextBefore,
+  };
+}
+
+export type ControlProjects = ReturnType<typeof decodeProjects>;
+export type ControlProject = ControlProjects["projects"][number];
 export type ControlJobInput = ReturnType<typeof decodeJobInput>;
 export type ControlAgentProfiles = ReturnType<typeof decodeAgentProfiles>;
 export type ControlAgentProfile = ControlAgentProfiles["agent_profiles"][number];

@@ -619,18 +619,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// The Jobs associated with a Project in ID order, strictly after
-    /// `after` when given; at most 1,000 per call.
-    pub async fn project_jobs(
-        &self,
-        project: ProjectId,
-        after: Option<JobId>,
-        limit: usize,
-    ) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| storage::read_project_jobs(database, project, after, limit))
-            .await
-    }
-
     /// A Job's Metrics in recording order, strictly after `after` when
     /// given; at most 1,000 per call.
     pub async fn job_metrics(
@@ -788,22 +776,6 @@ impl DatabaseHandle {
         self.submit(|reply| Command::CreateSubmittedJob {
             job,
             submission,
-            workspace_available: None,
-            reply,
-        })
-        .await
-    }
-
-    pub(crate) async fn create_workspace_submitted_job(
-        &self,
-        job: NewJob,
-        submission: NewSubmission,
-        workspace_available: bool,
-    ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateSubmittedJob {
-            job,
-            submission,
-            workspace_available: Some(workspace_available),
             reply,
         })
         .await
@@ -853,19 +825,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn associate_job_project(
-        &self,
-        job: JobId,
-        project: ProjectId,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::AssociateJobProject {
-            job,
-            project,
-            reply,
-        })
-        .await
-    }
-
     pub async fn append_job_output(
         &self,
         job: JobId,
@@ -898,6 +857,35 @@ impl DatabaseHandle {
 
     pub async fn create_project(&self, project: NewProject) -> Result<ProjectId, DatabaseError> {
         self.submit(|reply| Command::CreateProject { project, reply })
+            .await
+    }
+
+    /// Replaces a Project's name, description and commands. Its root never
+    /// changes.
+    pub async fn update_project(
+        &self,
+        id: ProjectId,
+        name: String,
+        description: Option<String>,
+        commands: Vec<ProjectCommand>,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::UpdateProject {
+            id,
+            name,
+            description,
+            commands,
+            reply,
+        })
+        .await
+    }
+
+    /// Renames or hides the conversation whose root Job is `root`.
+    pub async fn set_conversation(
+        &self,
+        root: JobId,
+        edit: ConversationEdit,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::SetConversation { root, edit, reply })
             .await
     }
 

@@ -146,4 +146,6 @@ export type ChatModelSelection = import("./generated").ChatModelSelection & {
   agentProfile?: string;
   llmProfile?: string;
   executor?: string;
+  // The Project of a conversation's first turn; chosen only for an Agent with a Workspace grant.
+  project?: string;
 };

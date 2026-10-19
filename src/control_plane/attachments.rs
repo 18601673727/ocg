@@ -403,7 +403,7 @@ mod tests {
 
         let fingerprint = vision_job_req.fingerprint();
         let sub_key = digest_key(b"vision-test-key-00000001");
-        let plan = plan(&handle, vision_job_req);
+        let plan = plan(&handle, vision_job_req, None);
         let admitted = wait(scheduler.admit_submitted_provider(
             plan,
             NewSubmission {

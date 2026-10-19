@@ -122,6 +122,7 @@ impl ToolAdmission {
                 | "workspace_run_command-2"
                 | "workspace_run_command-3"
                 | "workspace_run_command-4"
+                | "workspace_run_command-5"
         )
     }
 }

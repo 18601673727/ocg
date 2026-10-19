@@ -91,8 +91,9 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::ReconcileToolEffect => true,
         OperationKind::ClaimExecution
         | OperationKind::SaveJobInput
-        | OperationKind::AssociateJobProject
         | OperationKind::CreateProject
+        | OperationKind::UpdateProject
+        | OperationKind::SetConversation
         | OperationKind::AppendJobOutput
         | OperationKind::RecordMetrics
         | OperationKind::RecordAvailabilityStat
@@ -131,8 +132,9 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::CreateAgent
         | OperationKind::RecordToolOutcome
         | OperationKind::ReconcileToolEffect
-        | OperationKind::AssociateJobProject
         | OperationKind::CreateProject
+        | OperationKind::UpdateProject
+        | OperationKind::SetConversation
         | OperationKind::AppendJobOutput
         | OperationKind::RecordMetrics
         | OperationKind::RecordAvailabilityStat

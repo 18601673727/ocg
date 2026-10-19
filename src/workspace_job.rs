@@ -11,8 +11,9 @@
 //! scheduler, offering only `workspace_read_file`; for `workspace-edit`,
 //! `workspace_read_file` and `workspace_write_file`; for `workspace-code`,
 //! those, `workspace_run_command`, `workspace_list_directory` and
-//! `workspace_search`; all bound to the Workspace named by
-//! [`WORKSPACE_ROOT_VARIABLE`]. Writing is offered by the last two commands
+//! `workspace_search`; all bound to the root of the Project named by
+//! [`PROJECT_VARIABLE`], which the Job is submitted with, and
+//! `workspace_run_command` offering that Project's commands. Writing is offered by the last two commands
 //! alone, and running commands by `workspace-code` alone; every write is
 //! recorded, with its contents, and every command's output in plaintext tool
 //! evidence. An image is published to the attachment store of the data
@@ -29,7 +30,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -50,8 +51,8 @@ use ocg::orchestration::workspace_read::{self, Refusal, Workspace, WorkspaceErro
 use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write};
 use ocg::persistence::{
     AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, JobId, JobInputDraft,
-    MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind, RequestNumber, ToolDecision,
-    ToolOutcome,
+    MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind, ProjectId, RequestNumber,
+    ToolDecision, ToolOutcome,
 };
 use ocg::provider_execution::{
     CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
@@ -74,8 +75,9 @@ pub const CODE_COMMAND: &str = "workspace-code";
 /// objective.
 pub const VISION_COMMAND: &str = "workspace-vision";
 pub use crate::llm_target::{CREDENTIAL_REF_VARIABLE, ENDPOINT_VARIABLE, MODEL_VARIABLE};
-/// The Workspace the Job may read from: an absolute path to a directory.
-pub use workspace_read::WORKSPACE_ROOT_VARIABLE;
+/// The Project the Job works in, written `project:<n>`: its root is the
+/// Workspace the Job may read from.
+pub const PROJECT_VARIABLE: &str = "OCG_PROJECT";
 
 /// What the one Job may do in its Workspace, as its command chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +155,12 @@ impl Mode {
 pub enum Error {
     #[error("{0} must be set")]
     NotConfigured(&'static str),
+    #[error("{PROJECT_VARIABLE} must name a Project as project:<n>")]
+    InvalidProject,
+    #[error("{0} does not exist")]
+    ProjectMissing(ProjectId),
+    #[error("the root of the Project is no longer the directory it was created with")]
+    ProjectRootChanged,
     #[error("{ENDPOINT_VARIABLE} must be an https:// URL")]
     NotHttps,
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
@@ -187,7 +195,7 @@ pub struct Config {
     /// The image to send, relative to the Workspace root, for a mode that
     /// takes one.
     image: Option<String>,
-    workspace_root: PathBuf,
+    project: ProjectId,
     endpoint: String,
     model: String,
     credential_ref: String,
@@ -216,10 +224,11 @@ impl Config {
                 .filter(|value| !value.trim().is_empty())
                 .ok_or(Error::NotConfigured(name))
         };
-        let workspace_root = std::env::var_os(WORKSPACE_ROOT_VARIABLE)
-            .filter(|root| !root.is_empty())
-            .map(PathBuf::from)
-            .ok_or(Error::NotConfigured(WORKSPACE_ROOT_VARIABLE))?;
+        let project = variable(PROJECT_VARIABLE)?
+            .strip_prefix("project:")
+            .and_then(|number| number.parse::<u64>().ok())
+            .map(ProjectId::new)
+            .ok_or(Error::InvalidProject)?;
         let endpoint = variable(ENDPOINT_VARIABLE)?;
         if !endpoint.starts_with("https://") {
             return Err(Error::NotHttps);
@@ -232,7 +241,7 @@ impl Config {
         Ok(Self {
             mode,
             image,
-            workspace_root,
+            project,
             endpoint,
             model,
             credential_ref,
@@ -241,12 +250,41 @@ impl Config {
     }
 }
 
-/// Authorizes the Workspace, then runs the host until the one Job has
-/// settled and been reported. Nothing is recorded, and the host does not
-/// start, unless the Workspace is authorized.
+/// Runs the host until the one Job has settled and been reported. Inside
+/// it, the Project is read and its root authorized before anything is
+/// recorded.
 pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> {
-    let workspace = Workspace::authorize(&config.workspace_root, data_directory)?;
-    let root = workspace.root().display().to_string();
+    let settled = Rc::new(RefCell::new(None));
+    let slot = settled.clone();
+    let directory = data_directory.clone();
+    let hosted = host::run_hosted(data_directory, true, move |context| async move {
+        *slot.borrow_mut() = Some(submit(&context, &directory, config).await);
+    });
+    let settled = settled.borrow_mut().take();
+    match (settled, hosted) {
+        (Some(Err(error)), _) => Err(error),
+        (_, Err(error)) => Err(error.into()),
+        (None, Ok(())) => Err(Error::NotRun),
+        (Some(Ok(())), Ok(())) => Ok(()),
+    }
+}
+
+/// What the mode offers: the tools bound to the Project's Workspace, and the
+/// image to store when the mode sends one.
+async fn prepare(
+    database: &DatabaseHandle,
+    data_directory: &DataDirectory,
+    config: &Config,
+) -> Result<(Option<ToolExecution>, Option<NewAttachment>), Error> {
+    let project = database
+        .project(config.project)
+        .await?
+        .ok_or(Error::ProjectMissing(config.project))?;
+    let workspace = Workspace::authorize(Path::new(&project.root), data_directory)?;
+    if workspace.root() != Path::new(&project.root) {
+        return Err(Error::ProjectRootChanged);
+    }
+    let root = project.root.as_str();
     let mut image = None;
     let tools = match config.mode {
         Mode::Read => {
@@ -259,6 +297,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 Some(workspace_command::workspace_tools(
                     workspace,
                     workspace_command::Grant::Read,
+                    &project.commands,
                 )?)
             }
             #[cfg(not(unix))]
@@ -280,6 +319,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
             Some(workspace_command::workspace_tools(
                 workspace,
                 workspace_command::Grant::Edit,
+                &project.commands,
             )?)
         }
         #[cfg(unix)]
@@ -296,12 +336,13 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 "OCG records the path and complete content of every write, an update or delete's expected content, a replace's old and new content, and every command's output in plaintext tool evidence, and sends command output to the Provider"
             );
             eprintln!(
-                "OCG runs `cargo check` and `cargo test` in the Workspace with its own permissions; build scripts and tests run project code unsandboxed, so authorize only a Workspace you trust"
+                "OCG runs `cargo check`, `cargo test` and the Project's commands in the Workspace with its own permissions; build scripts, tests and commands run unsandboxed, so authorize only a Workspace you trust"
             );
             eprintln!("OCG additionally offers lazy bounded FTS.");
             Some(workspace_command::workspace_tools(
                 workspace,
                 workspace_command::Grant::Code,
+                &project.commands,
             )?)
         }
         Mode::Vision => {
@@ -325,18 +366,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
             None
         }
     };
-    let settled = Rc::new(RefCell::new(None));
-    let slot = settled.clone();
-    let hosted = host::run_hosted(data_directory, true, move |context| async move {
-        *slot.borrow_mut() = Some(submit(&context, config, tools, image).await);
-    });
-    let settled = settled.borrow_mut().take();
-    match (settled, hosted) {
-        (Some(Err(error)), _) => Err(error),
-        (_, Err(error)) => Err(error.into()),
-        (None, Ok(())) => Err(Error::NotRun),
-        (Some(Ok(())), Ok(())) => Ok(()),
-    }
+    Ok((tools, image))
 }
 
 /// The image at `path` in the Workspace: its type is the one its extension
@@ -374,13 +404,13 @@ fn declared_type(path: &str) -> Option<ImageMime> {
 /// was recorded.
 async fn submit(
     context: &HostContext,
+    data_directory: &DataDirectory,
     config: Config,
-    tools: Option<ToolExecution>,
-    image: Option<NewAttachment>,
 ) -> Result<(), Error> {
     // Registered first, so a signal while the Job is prepared cancels it too.
     let signal = ntex::rt::signals::signal();
     let database = context.database();
+    let (tools, image) = prepare(database, data_directory, &config).await?;
     let target = Target {
         name: config.mode.command().to_owned(),
         endpoint: config.endpoint,
@@ -407,7 +437,7 @@ async fn submit(
             name: Some(format!("{command} one-shot")),
             eligible_at: None,
             parent: database.genesis(),
-            projects: Vec::new(),
+            project: Some(config.project),
             dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {

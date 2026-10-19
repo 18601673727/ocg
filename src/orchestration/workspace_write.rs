@@ -1389,6 +1389,7 @@ mod tests {
         let read_only = crate::orchestration::workspace_command::workspace_tools(
             authorize(),
             crate::orchestration::workspace_command::Grant::Read,
+            &[],
         )
         .expect("read tools");
         let names = |tools: &ToolExecution| {
@@ -1407,6 +1408,7 @@ mod tests {
         let editing = crate::orchestration::workspace_command::workspace_tools(
             authorize(),
             crate::orchestration::workspace_command::Grant::Edit,
+            &[],
         )
         .expect("edit tools");
         assert!(names(&editing).iter().any(|name| name == TOOL_NAME));

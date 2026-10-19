@@ -54,7 +54,7 @@ use crate::orchestration::execution_runtime::{
 };
 use crate::persistence::{
     AttachmentId, AttachmentOrigin, ConfigBody, ConfigRecord, ExecutionConfiguration, ExecutorId,
-    JobId, JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId,
+    JobId, JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId, ProjectId,
     RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
 };
 
@@ -127,10 +127,20 @@ const EXECUTOR_INCOMPATIBLE: Refusal = Refusal::new(
     "executor_incompatible",
     "the Executor cannot run the LLM Profile; nothing was submitted",
 );
-const WORKSPACE_NOT_CONFIGURED: Refusal = Refusal::new(
+const PROJECT_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
-    "workspace_not_configured",
-    "the selected Agent has Workspace access, but the host has no authorized Workspace; configure OCG_WORKSPACE_ROOT and restart the host; nothing was submitted",
+    "project_not_found",
+    "no such Project; nothing was submitted",
+);
+const PROJECT_REQUIRED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "project_required",
+    "the selected Agent has Workspace access, which needs a Project; nothing was submitted",
+);
+const PROJECT_MISMATCH: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "project_mismatch",
+    "a conversation keeps the Project of its first turn; nothing was submitted",
 );
 const CONFIGURATION_REFUSED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -219,9 +229,10 @@ pub(crate) const MAX_CONVERSATION_TURNS: usize = 64;
 
 /// A validated submission: an existing LLM Profile and Executor, by their
 /// persisted identities, an objective and, optionally, an Agent Profile
-/// that targets the LLM Profile, a Job name, and a completed predecessor Job.
-/// Nothing else can be submitted: the Provider, its credential and the model
-/// come from the Profile; Workspace tools come from the frozen Agent grant.
+/// that targets the LLM Profile, a Job name, a Project, and a completed
+/// predecessor Job. Nothing else can be submitted: the Provider, its
+/// credential and the model come from the Profile; Workspace tools come from
+/// the frozen Agent grant and the Project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct JobRequest {
     agent_profile: Option<ProfileId>,
@@ -230,6 +241,9 @@ pub(super) struct JobRequest {
     objective: String,
     name: Option<String>,
     previous: Option<JobId>,
+    /// The Project the Job works in. A follow-up that names none takes its
+    /// previous turn's.
+    project: Option<ProjectId>,
     /// Image Attachments sent with the objective, in order.
     attachments: Vec<AttachmentId>,
 }
@@ -247,12 +261,14 @@ struct WireRequest {
     #[serde(default)]
     previous: Option<String>,
     #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
     attachments: Vec<String>,
 }
 
 /// Text that may be stored: no control character but tab, carriage return
 /// and line feed, and not only white space.
-fn text(value: &str, max_bytes: usize) -> bool {
+pub(super) fn text(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max_bytes
         && !value
@@ -283,6 +299,12 @@ impl JobRequest {
             .map(|prev| identity(prev, "job:").ok_or(INVALID_BODY))
             .transpose()?
             .map(JobId::new);
+        let project = wire
+            .project
+            .as_deref()
+            .map(|project| identity(project, "project:").ok_or(INVALID_BODY))
+            .transpose()?
+            .map(ProjectId::new);
         if wire.attachments.len() > MAX_REQUEST_IMAGES {
             return Err(TOO_MANY_IMAGES);
         }
@@ -310,6 +332,7 @@ impl JobRequest {
             objective: wire.objective,
             name: wire.name,
             previous,
+            project,
             attachments,
         })
     }
@@ -349,6 +372,10 @@ impl JobRequest {
             for attachment in &self.attachments {
                 context.update(&attachment.get().to_le_bytes());
             }
+        }
+        if let Some(project) = self.project {
+            context.update(&[5]);
+            context.update(&project.get().to_le_bytes());
         }
         RequestFingerprint::from_digest(sha256(context))
     }
@@ -876,10 +903,11 @@ async fn admit(
             return finish(Outcome::Refused(refusal));
         }
     }
-    if let Err(refusal) = check_configuration(&shared.database, &request).await {
-        return finish(Outcome::Refused(refusal));
-    }
-    let plan = plan(&shared.database, request);
+    let project = match check_configuration(&shared.database, &request).await {
+        Ok(project) => project,
+        Err(refusal) => return finish(Outcome::Refused(refusal)),
+    };
+    let plan = plan(&shared.database, request, project);
     let admitted = shared
         .scheduler
         .admit_workspace_provider(
@@ -927,13 +955,16 @@ async fn admit(
 }
 
 /// Refuses a Profile that is not an existing LLM Profile, an Agent Profile
-/// that does not exist or does not target it, and an Executor
-/// that does not exist or cannot run it now. The creation checks both again
-/// in its own transaction.
+/// that does not exist or does not target it, an Executor
+/// that does not exist or cannot run it now, and a Project that does not
+/// exist, is missing for an Agent with a grant, or is not the Project of the
+/// previous turn. The creation checks them again in its own transaction.
+/// Answers the Project the Job works in: the request's, else its previous
+/// turn's.
 pub(super) async fn check_configuration(
     database: &DatabaseHandle,
     request: &JobRequest,
-) -> Result<(), Refusal> {
+) -> Result<Option<ProjectId>, Refusal> {
     let llm = match database.config(request.llm_profile.into()).await? {
         Some(ConfigRecord {
             body: ConfigBody::Model(model),
@@ -971,6 +1002,7 @@ pub(super) async fn check_configuration(
     // Every image the conversation's one Provider request will carry: the
     // earlier turns' first, then this one's.
     let mut images: Vec<AttachmentId> = Vec::new();
+    let mut project = request.project;
     if let Some(previous) = request.previous {
         // A conversation continues with the Agent of its earlier turn, and
         // that Agent holds conversations.
@@ -1005,6 +1037,15 @@ pub(super) async fn check_configuration(
             if !record.settled() {
                 return Err(PREVIOUS_JOB_NOT_COMPLETED);
             }
+            if current == previous {
+                if request
+                    .project
+                    .is_some_and(|named| Some(named) != record.project)
+                {
+                    return Err(PROJECT_MISMATCH);
+                }
+                project = record.project;
+            }
             if record.completed_at.is_some()
                 && let Some(input) = database.job_input(record.input).await?
             {
@@ -1013,12 +1054,21 @@ pub(super) async fn check_configuration(
             cursor = record.previous;
         }
     }
+    match project {
+        Some(project) => {
+            if database.project(project).await?.is_none() {
+                return Err(PROJECT_NOT_FOUND);
+            }
+        }
+        None if tool_grant => return Err(PROJECT_REQUIRED),
+        None => {}
+    }
     if tool_grant && !llm.declared_capabilities.contains(&ModelCapability::Tools) {
         return Err(TOOLS_NOT_SUPPORTED);
     }
     images.extend(request.attachments.iter().copied());
     if images.is_empty() {
-        return Ok(());
+        return Ok(project);
     }
     if !llm.declared_capabilities.contains(&ModelCapability::Vision) {
         return Err(VISION_NOT_SUPPORTED);
@@ -1030,7 +1080,7 @@ pub(super) async fn check_configuration(
         }
     }
     match attachment_images(database, &images).await {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(project),
         Err(AttachmentImageError::TooMany) => Err(TOO_MANY_IMAGES),
         Err(AttachmentImageError::TooLarge) => Err(IMAGES_TOO_LARGE),
         Err(AttachmentImageError::NotAnImage { .. }) => Err(ATTACHMENT_NOT_AN_IMAGE),
@@ -1050,7 +1100,11 @@ pub(super) async fn check_configuration(
 /// Its images are referenced by Attachment identity; their bytes stay in the
 /// attachment store. Workspace tools are selected after T1 from the frozen
 /// grant, so an Agent edit racing admission cannot change the Job's access.
-pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderExecutionPlan {
+pub(super) fn plan(
+    database: &DatabaseHandle,
+    request: JobRequest,
+    project: Option<ProjectId>,
+) -> ProviderExecutionPlan {
     let mut plan = ProviderExecutionPlan::environment_credentials(
         request.executor,
         JobInputDraft {
@@ -1062,7 +1116,7 @@ pub(super) fn plan(database: &DatabaseHandle, request: JobRequest) -> ProviderEx
             name: request.name,
             eligible_at: None,
             parent: database.genesis(),
-            projects: Vec::new(),
+            project,
             dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
@@ -1087,7 +1141,8 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
         ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
         ExecutionRuntimeError::Database(error) => match error {
             DatabaseError::Rejected(Violation::ToolsNotSupported) => TOOLS_NOT_SUPPORTED,
-            DatabaseError::Rejected(Violation::WorkspaceNotConfigured) => WORKSPACE_NOT_CONFIGURED,
+            DatabaseError::Rejected(Violation::ProjectRequired) => PROJECT_REQUIRED,
+            DatabaseError::Rejected(Violation::ProjectMismatch) => PROJECT_MISMATCH,
             DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,
             DatabaseError::Rejected(_) => CONFIGURATION_REFUSED,
             DatabaseError::ShuttingDown => SHUTTING_DOWN,
@@ -1294,16 +1349,39 @@ mod tests {
             llm_transports: [crate::persistence::LlmTransport::OpenAiChatCompletions].into(),
         }))
         .expect("executor");
+        let project = wait(handle.create_project(crate::persistence::NewProject {
+            name: "tools".into(),
+            description: None,
+            root: "/ocg-test/tools".into(),
+            commands: Vec::new(),
+        }))
+        .expect("project");
         let request = JobRequest::parse(
             &serde_json::to_vec(&json!({
                 "agent_profile": ProfileId::from(agent).to_string(),
                 "llm_profile": configuration.llm_profile.to_string(),
                 "executor": executor.to_string(), "objective": "read a file",
+                "project": project.to_string(),
             }))
             .expect("json"),
         )
         .expect("request");
-        wait(check_configuration(&handle, &request)).expect("tools supported");
+        assert_eq!(
+            wait(check_configuration(&handle, &request)),
+            Ok(Some(project)),
+            "tools supported"
+        );
+        let mut elsewhere = request.clone();
+        elsewhere.project = None;
+        assert_eq!(
+            wait(check_configuration(&handle, &elsewhere)),
+            Err(PROJECT_REQUIRED)
+        );
+        elsewhere.project = Some(ProjectId::new(999_999));
+        assert_eq!(
+            wait(check_configuration(&handle, &elsewhere)),
+            Err(PROJECT_NOT_FOUND)
+        );
         body.declared_capabilities = [ModelCapability::Chat].into();
         wait(handle.update_config(
             model_id,
@@ -1317,17 +1395,16 @@ mod tests {
             wait(check_configuration(&handle, &request)),
             Err(TOOLS_NOT_SUPPORTED)
         );
-        let mut plan = plan(&handle, request.clone());
+        let mut plan = plan(&handle, request.clone(), Some(project));
         plan.job.input = plan.input;
         let key = digest_key(b"tools-capability-test");
         let before = wait(handle.jobs(None, 100)).expect("jobs").len();
-        let error = wait(handle.create_workspace_submitted_job(
+        let error = wait(handle.create_submitted_job(
             plan.job,
             NewSubmission {
                 key,
                 fingerprint: request.fingerprint(),
             },
-            true,
         ))
         .expect_err("T1 refuses the changed profile");
         assert!(matches!(
@@ -1459,7 +1536,7 @@ mod tests {
             wait(check_configuration(&handle, &request)).expect("valid configuration");
             let fingerprint = request.fingerprint();
             let sub_key = digest_key(key.as_bytes());
-            let plan = plan(&handle, request);
+            let plan = plan(&handle, request, None);
             let admitted = wait(scheduler.admit_submitted_provider(
                 plan,
                 NewSubmission {

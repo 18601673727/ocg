@@ -292,7 +292,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(REQUEST_EVENTS)?;
     tx.open_table(MESSAGES)?;
     tx.open_table(PROJECTS)?;
-    tx.open_table(PROJECT_MEMBERS)?;
+    tx.open_table(CONVERSATIONS)?;
     tx.open_table(PENDING)?;
     tx.open_table(READY)?;
     tx.open_table(DELAYED)?;
@@ -307,7 +307,6 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(RETRIES)?;
     tx.open_table(ATTACHMENT_REFS)?;
     tx.open_table(REQUEST_SCOPES)?;
-    tx.open_table(JOB_PROJECTS)?;
     Ok(())
 }
 
@@ -446,7 +445,7 @@ mod tests {
                 name: None,
                 eligible_at: None,
                 parent: database.genesis(),
-                projects: Vec::new(),
+                project: None,
                 dependencies: Vec::new(),
                 input: JobInputDraft::default(),
                 configuration: Some(execution_configuration(&database)),
