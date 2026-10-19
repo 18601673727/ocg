@@ -65,15 +65,21 @@ use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 use crate::orchestration::workspace_read::{
-    self, MAX_FILE_BYTES, Refusal as PathRefusal, Step, Workspace, open_at, read_whole,
+    self, MAX_FILE_BYTES, Refusal as PathRefusal, Step, Workspace, open_at, open_within, read_bytes, read_whole,
 };
-use crate::persistence::ToolEffect;
+use crate::persistence::{ContentDigest, ToolEffect};
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_write_file";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_write_file-1";
+const HANDLER_VERSION: &str = "workspace_write_file-2";
+
+/// The largest file a delete may read and delete.
+const MAX_DELETE_BYTES: usize = 64 * 1024;
+
+/// The largest file a replace may read and replace within.
+const MAX_REPLACE_FILE_BYTES: usize = 1024 * 1024;
 
 /// How a staged file's name begins. The leading dot keeps it out of reach
 /// of every Workspace tool.
@@ -86,11 +92,11 @@ const STAGING_ATTEMPTS: usize = 8;
 /// may reach the Provider, so it never repeats the path or any content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 enum Refusal {
-    #[error("the arguments are neither a create nor a conditional update")]
+    #[error("the arguments are invalid for the requested operation")]
     InvalidArguments,
-    #[error("content or expected_content is larger than {MAX_FILE_BYTES} bytes")]
+    #[error("content, expected_content, old or new is larger than {MAX_FILE_BYTES} bytes")]
     TooLarge,
-    #[error("content or expected_content contains a NUL character")]
+    #[error("content, expected_content, old or new contains a NUL character")]
     NotText,
     #[error(transparent)]
     Path(#[from] PathRefusal),
@@ -110,6 +116,10 @@ enum Refusal {
     NotStaged,
     #[error("the new content could not be published")]
     NotPublished,
+    #[error("found {0} occurrences of `old`, expected 1")]
+    Occurrences(usize),
+    #[error("the file is over 64 KiB; ask the user to delete it")]
+    FileTooLargeForDelete,
 }
 
 /// Why what a call did to the Workspace is not known, or not all known.
@@ -159,14 +169,25 @@ impl From<Failure> for ToolFailure {
 /// What a call asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation<'a> {
-    Create,
-    Update { expected: &'a str },
+    Create {
+        content: &'a str,
+    },
+    Update {
+        content: &'a str,
+        expected: &'a str,
+    },
+    Replace {
+        old: &'a str,
+        new: &'a str,
+    },
+    Delete {
+        expected: &'a str,
+    },
 }
 
 /// A call's arguments, checked. The schema already enforces their shape;
-/// they are checked again here, so nothing malformed can become a write, and
-/// an update without its expected content is never anything but refused.
-fn parse(arguments: &Value) -> Result<(&str, &str, Operation<'_>), Refusal> {
+/// they are checked again here, so nothing malformed can become a write.
+fn parse(arguments: &Value) -> Result<(&str, Operation<'_>), Refusal> {
     let object = arguments.as_object().ok_or(Refusal::InvalidArguments)?;
     let text = |key: &str| {
         object
@@ -174,32 +195,81 @@ fn parse(arguments: &Value) -> Result<(&str, &str, Operation<'_>), Refusal> {
             .map(|value| value.as_str().ok_or(Refusal::InvalidArguments))
             .transpose()
     };
-    let (Some(operation), Some(path), Some(content)) =
-        (text("operation")?, text("path")?, text("content")?)
-    else {
+    let (Some(operation), Some(path)) = (text("operation")?, text("path")?) else {
         return Err(Refusal::InvalidArguments);
     };
-    let operation = match (operation, text("expected_content")?) {
-        ("create", None) => Operation::Create,
-        ("update", Some(expected)) => Operation::Update { expected },
+    let operation = match operation {
+        "create" => {
+            if object.len() != 3 {
+                return Err(Refusal::InvalidArguments);
+            }
+            let Some(content) = text("content")? else {
+                return Err(Refusal::InvalidArguments);
+            };
+            if content.len() > MAX_FILE_BYTES {
+                return Err(Refusal::TooLarge);
+            }
+            if content.contains('\0') {
+                return Err(Refusal::NotText);
+            }
+            Operation::Create { content }
+        }
+        "update" => {
+            if object.len() != 4 {
+                return Err(Refusal::InvalidArguments);
+            }
+            let (Some(content), Some(expected)) = (text("content")?, text("expected_content")?)
+            else {
+                return Err(Refusal::InvalidArguments);
+            };
+            for t in [content, expected] {
+                if t.len() > MAX_FILE_BYTES {
+                    return Err(Refusal::TooLarge);
+                }
+                if t.contains('\0') {
+                    return Err(Refusal::NotText);
+                }
+            }
+            Operation::Update { content, expected }
+        }
+        "replace" => {
+            if object.len() != 4 {
+                return Err(Refusal::InvalidArguments);
+            }
+            let (Some(old), Some(new)) = (text("old")?, text("new")?) else {
+                return Err(Refusal::InvalidArguments);
+            };
+            if old.is_empty() {
+                return Err(Refusal::InvalidArguments);
+            }
+            for t in [old, new] {
+                if t.len() > MAX_FILE_BYTES {
+                    return Err(Refusal::TooLarge);
+                }
+                if t.contains('\0') {
+                    return Err(Refusal::NotText);
+                }
+            }
+            Operation::Replace { old, new }
+        }
+        "delete" => {
+            if object.len() != 3 {
+                return Err(Refusal::InvalidArguments);
+            }
+            let Some(expected) = text("expected_content")? else {
+                return Err(Refusal::InvalidArguments);
+            };
+            if expected.len() > MAX_DELETE_BYTES {
+                return Err(Refusal::FileTooLargeForDelete);
+            }
+            if expected.contains('\0') {
+                return Err(Refusal::NotText);
+            }
+            Operation::Delete { expected }
+        }
         _ => return Err(Refusal::InvalidArguments),
     };
-    let expected = match operation {
-        Operation::Create => None,
-        Operation::Update { expected } => Some(expected),
-    };
-    if object.len() != 3 + usize::from(expected.is_some()) {
-        return Err(Refusal::InvalidArguments);
-    }
-    for text in std::iter::once(content).chain(expected) {
-        if text.len() > MAX_FILE_BYTES {
-            return Err(Refusal::TooLarge);
-        }
-        if text.contains('\0') {
-            return Err(Refusal::NotText);
-        }
-    }
-    Ok((path, content, operation))
+    Ok((path, operation))
 }
 
 /// The directory holding the file at `path`, and the file's name in it. A
@@ -250,6 +320,111 @@ fn update(workspace: &Workspace, path: &str, expected: &str, content: &str) -> R
             read: &read,
         },
     )
+}
+
+/// Replaces a single occurrence of `old` with `new` in the file at `path`.
+fn replace(
+    workspace: &Workspace,
+    path: &str,
+    old: &str,
+    new: &str,
+) -> Result<(usize, String, String), Failure> {
+    let (directory, name) = parent(workspace, path)?;
+    let file = open_within(&directory, name, Step::File, MAX_REPLACE_FILE_BYTES)?;
+    let before = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
+    let current_bytes = read_bytes(&file, MAX_REPLACE_FILE_BYTES)?;
+    let read = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
+    if version(&before) != version(&read) {
+        return Err(PathRefusal::Changed.into());
+    }
+    let current = String::from_utf8(current_bytes).map_err(|_| Refusal::NotText)?;
+    if current.contains('\0') {
+        return Err(Refusal::NotText.into());
+    }
+    let old_bytes = old.as_bytes();
+    let current_bytes = current.as_bytes();
+    let mut count = 0;
+    let mut offset = 0;
+    if old_bytes.len() <= current_bytes.len() {
+        for i in 0..=(current_bytes.len() - old_bytes.len()) {
+            if &current_bytes[i..i + old_bytes.len()] == old_bytes {
+                count += 1;
+                offset = i;
+            }
+        }
+    }
+    if count != 1 {
+        return Err(Refusal::Occurrences(count).into());
+    }
+    let mut new_content = Vec::with_capacity(current_bytes.len() - old_bytes.len() + new.len());
+    new_content.extend_from_slice(&current_bytes[..offset]);
+    new_content.extend_from_slice(new.as_bytes());
+    new_content.extend_from_slice(&current_bytes[offset + old_bytes.len()..]);
+    let new_content_str = String::from_utf8(new_content).map_err(|_| Refusal::NotText)?;
+
+    let before_sha256 = ContentDigest::of(current_bytes).to_string();
+    let after_sha256 = ContentDigest::of(new_content_str.as_bytes()).to_string();
+
+    let staged = Staged::new(&directory, &new_content_str, Some(&read))?;
+    staged.publish(
+        name,
+        Publication::Replace {
+            file: &file,
+            read: &read,
+        },
+    )?;
+    Ok((offset, before_sha256, after_sha256))
+}
+
+/// Deletes the regular file at `path`, when its whole current content is `expected`.
+fn delete(workspace: &Workspace, path: &str, expected: &str) -> Result<(), Failure> {
+    let (directory, name) = parent(workspace, path)?;
+    let initial_stat = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|e| match e {
+            Errno::NOENT => PathRefusal::NotFound.into(),
+            other => Failure::Refused(PathRefusal::from_errno(other).into()),
+        })?;
+    if FileType::from_raw_mode(initial_stat.st_mode) == FileType::Symlink {
+        return Err(PathRefusal::SymbolicLink.into());
+    }
+    if FileType::from_raw_mode(initial_stat.st_mode) == FileType::Directory {
+        return Err(PathRefusal::NotRegularFile.into());
+    }
+    if initial_stat.st_size > MAX_DELETE_BYTES as i64 {
+        return Err(Refusal::FileTooLargeForDelete.into());
+    }
+    let file = open_within(&directory, name, Step::File, MAX_DELETE_BYTES)?;
+    let before = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
+    if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
+        return Err(PathRefusal::NotRegularFile.into());
+    }
+    if before.st_nlink != 1 {
+        return Err(PathRefusal::HardLinked.into());
+    }
+    if before.st_size > MAX_DELETE_BYTES as i64 {
+        return Err(Refusal::FileTooLargeForDelete.into());
+    }
+    let current_bytes = read_bytes(&file, MAX_DELETE_BYTES)?;
+    let read = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
+    if version(&before) != version(&read) {
+        return Err(PathRefusal::Changed.into());
+    }
+    let current = String::from_utf8(current_bytes).map_err(|_| Refusal::NotText)?;
+    if current.contains('\0') {
+        return Err(Refusal::NotText.into());
+    }
+    if current != expected {
+        return Err(Refusal::Mismatch.into());
+    }
+    let after = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| Refusal::Changed)?;
+    if version(&read) != version(&after) {
+        return Err(Refusal::Changed.into());
+    }
+    rustix::fs::unlinkat(&directory, name, AtFlags::empty()).map_err(|_| Refusal::NotPublished)?;
+    directory
+        .sync_all()
+        .map_err(|_| Uncertainty::NotDurable.into())
 }
 
 /// What identifies a file and its last change: a replacement, a new link,
@@ -441,16 +616,15 @@ fn staging_file(directory: &File) -> Result<(String, File), Refusal> {
     Err(Refusal::NotStaged)
 }
 
-/// The parameters a call must match exactly: a create, or an update that
-/// carries the file's expected content.
+/// The parameters a call must match exactly: a create, update, replace, or delete.
 fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
             "operation": {
                 "type": "string",
-                "enum": ["create", "update"],
-                "description": "create a new file, or update an existing one"
+                "enum": ["create", "update", "replace", "delete"],
+                "description": "create a new file, update an existing one, replace exact text in a file, or delete a file"
             },
             "path": {
                 "type": "string",
@@ -458,18 +632,45 @@ fn parameters() -> Value {
             },
             "content": {
                 "type": "string",
-                "description": "The complete new content of the file"
+                "description": "For create and update: the complete new content of the file"
             },
             "expected_content": {
                 "type": "string",
-                "description": "For update only: the complete current content of the file, exactly as read"
+                "description": "For update and delete: the complete current content of the file, exactly as read"
+            },
+            "old": {
+                "type": "string",
+                "description": "For replace: the exact text to replace (must occur exactly once)"
+            },
+            "new": {
+                "type": "string",
+                "description": "For replace: the new text to put in place of old"
             }
         },
-        "required": ["operation", "path", "content"],
-        "additionalProperties": false,
-        "if": {"properties": {"operation": {"const": "update"}}},
-        "then": {"required": ["expected_content"]},
-        "else": {"not": {"required": ["expected_content"]}}
+        "required": ["operation", "path"],
+        "oneOf": [
+            {
+                "properties": {"operation": {"const": "create"}},
+                "required": ["content"],
+                "not": {"anyOf": [{"required": ["expected_content"]}, {"required": ["old"]}, {"required": ["new"]}]}
+            },
+            {
+                "properties": {"operation": {"const": "update"}},
+                "required": ["content", "expected_content"],
+                "not": {"anyOf": [{"required": ["old"]}, {"required": ["new"]}]}
+            },
+            {
+                "properties": {"operation": {"const": "replace"}},
+                "required": ["old", "new"],
+                "not": {"anyOf": [{"required": ["content"]}, {"required": ["expected_content"]}]}
+            },
+            {
+                "properties": {"operation": {"const": "delete"}},
+                "required": ["expected_content"],
+                "not": {"anyOf": [{"required": ["content"]}, {"required": ["old"]}, {"required": ["new"]}]}
+            }
+        ],
+        "additionalProperties": false
     })
 }
 
@@ -491,38 +692,93 @@ impl ToolHandler for WriteFile {
     /// Writes on a dedicated blocking worker while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
-            let (path, content, operation) = parse(&arguments)
+            let (path, operation) = parse(&arguments)
                 .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
             let path = path.to_owned();
-            let content = content.to_owned();
-            let (operation_name, expected) = match operation {
-                Operation::Create => ("create", None),
-                Operation::Update { expected } => ("update", Some(expected.to_owned())),
-            };
             let workspace = self.workspace.clone();
             let path_for_worker = path.clone();
-            let content_for_write = content.clone();
             #[cfg(test)]
             let seam = write_seam::take();
-            blocking::run(Kind::File, move || {
-                #[cfg(test)]
-                write_seam::install_boxed(seam);
-                let _mutation = workspace_read::WorkspaceMutation::begin();
-                match expected.as_deref() {
-                    None => create(&workspace, &path_for_worker, &content_for_write),
-                    Some(expected) => {
-                        update(&workspace, &path_for_worker, expected, &content_for_write)
-                    }
+            let result = match operation {
+                Operation::Create { content } => {
+                    let content = content.to_owned();
+                    let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
+                    let bytes_written = content.len();
+                    blocking::run(Kind::File, move || {
+                        #[cfg(test)]
+                        write_seam::install_boxed(seam);
+                        let _mutation = workspace_read::WorkspaceMutation::begin();
+                        create(&workspace, &path_for_worker, &content)
+                    })
+                    .await
+                    .map_err(ToolFailure::uncertain)?
+                    .map_err(ToolFailure::from)?;
+                    json!({
+                        "operation": "create",
+                        "path": path,
+                        "bytes_written": bytes_written,
+                        "after_sha256": after_sha256,
+                    })
                 }
-            })
-            .await
-            .map_err(ToolFailure::uncertain)?
-            .map_err(ToolFailure::from)?;
-            Ok(json!({
-                "operation": operation_name,
-                "path": path,
-                "bytes_written": content.len(),
-            }))
+                Operation::Update { content, expected } => {
+                    let content = content.to_owned();
+                    let expected = expected.to_owned();
+                    let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
+                    let bytes_written = content.len();
+                    blocking::run(Kind::File, move || {
+                        #[cfg(test)]
+                        write_seam::install_boxed(seam);
+                        let _mutation = workspace_read::WorkspaceMutation::begin();
+                        update(&workspace, &path_for_worker, &expected, &content)
+                    })
+                    .await
+                    .map_err(ToolFailure::uncertain)?
+                    .map_err(ToolFailure::from)?;
+                    json!({
+                        "operation": "update",
+                        "path": path,
+                        "bytes_written": bytes_written,
+                        "after_sha256": after_sha256,
+                    })
+                }
+                Operation::Replace { old, new } => {
+                    let old = old.to_owned();
+                    let new = new.to_owned();
+                    let (offset, before_sha256, after_sha256) = blocking::run(Kind::File, move || {
+                        #[cfg(test)]
+                        write_seam::install_boxed(seam);
+                        let _mutation = workspace_read::WorkspaceMutation::begin();
+                        replace(&workspace, &path_for_worker, &old, &new)
+                    })
+                    .await
+                    .map_err(ToolFailure::uncertain)?
+                    .map_err(ToolFailure::from)?;
+                    json!({
+                        "operation": "replace",
+                        "path": path,
+                        "offset": offset,
+                        "before_sha256": before_sha256,
+                        "after_sha256": after_sha256,
+                    })
+                }
+                Operation::Delete { expected } => {
+                    let expected = expected.to_owned();
+                    blocking::run(Kind::File, move || {
+                        #[cfg(test)]
+                        write_seam::install_boxed(seam);
+                        let _mutation = workspace_read::WorkspaceMutation::begin();
+                        delete(&workspace, &path_for_worker, &expected)
+                    })
+                    .await
+                    .map_err(ToolFailure::uncertain)?
+                    .map_err(ToolFailure::from)?;
+                    json!({
+                        "operation": "delete",
+                        "path": path,
+                    })
+                }
+            };
+            Ok(result)
         })
     }
 }
@@ -536,7 +792,7 @@ pub(crate) fn register(
     registry.register(
         TOOL_NAME,
         Some(
-            "Create a new UTF-8 text file, or replace the whole content of an existing one, in the authorized Workspace; content is at most 8 KiB. `create` fails when anything exists at the path. `update` requires `expected_content` to equal the file's entire current content, as read with workspace_read_file, and fails without changing the file otherwise. Directories are never created.",
+            "Create a new UTF-8 text file, replace the whole content of an existing one, replace exact text in a file, or delete a file in the authorized Workspace. Operations: `create` {path, content} fails if the file exists. `update` {path, content, expected_content} requires the whole file to match `expected_content`. `replace` {path, old, new} replaces `old` (must occur exactly once) with `new` (up to 8 KiB each, in files up to 1 MiB). `delete` {path, expected_content} deletes a file matching `expected_content` (up to 64 KiB). Directories are never created or deleted.",
         ),
         parameters(),
         Arc::new(WriteFile { workspace }),
@@ -701,7 +957,12 @@ mod tests {
         let text = "Hello from OCG.\nünïcødé ✓ \"quotes\" \\ and a tab\t\n";
         assert_eq!(
             call(&workspace, create_call("notes.txt", text)),
-            Ok(json!({"operation": "create", "path": "notes.txt", "bytes_written": text.len()})),
+            Ok(json!({
+                "operation": "create",
+                "path": "notes.txt",
+                "bytes_written": text.len(),
+                "after_sha256": ContentDigest::of(text.as_bytes()).to_string(),
+            })),
             "the result is compact and repeats no content"
         );
         assert_eq!(content(&root, "notes.txt"), text);
@@ -851,7 +1112,12 @@ mod tests {
         let updated = "Project: OCG\nStatus: completed\n";
         assert_eq!(
             call(&workspace, update_call("notes.txt", original, updated)),
-            Ok(json!({"operation": "update", "path": "notes.txt", "bytes_written": updated.len()}))
+            Ok(json!({
+                "operation": "update",
+                "path": "notes.txt",
+                "bytes_written": updated.len(),
+                "after_sha256": ContentDigest::of(updated.as_bytes()).to_string(),
+            }))
         );
         assert_eq!(content(&root, "notes.txt"), updated);
         let metadata = std::fs::metadata(root.join("notes.txt")).expect("metadata");
@@ -1054,6 +1320,11 @@ mod tests {
             json!({"operation": "create", "path": ["notes.txt"], "content": "x"}),
             json!({"operation": "create", "path": "notes.txt", "content": 7}),
             json!(["create", "notes.txt", "x"]),
+            json!({"operation": "replace", "path": "notes.txt", "old": "x"}),
+            json!({"operation": "replace", "path": "notes.txt", "new": "x"}),
+            json!({"operation": "replace", "path": "notes.txt", "old": "x", "new": "y", "content": "z"}),
+            json!({"operation": "delete", "path": "notes.txt"}),
+            json!({"operation": "delete", "path": "notes.txt", "expected_content": "x", "content": "y"}),
         ];
         for arguments in invalid {
             assert!(
@@ -1069,6 +1340,8 @@ mod tests {
         for valid in [
             create_call("new.txt", ""),
             update_call("notes.txt", "", "x"),
+            json!({"operation": "replace", "path": "notes.txt", "old": "a", "new": "b"}),
+            json!({"operation": "delete", "path": "notes.txt", "expected_content": "x"}),
         ] {
             assert!(validator.is_valid(&valid), "{valid}");
         }
@@ -1077,15 +1350,28 @@ mod tests {
             create_call("new.txt", &oversized),
             update_call("notes.txt", &oversized, "x"),
             update_call("notes.txt", "original\n", &oversized),
+            json!({"operation": "replace", "path": "notes.txt", "old": &oversized, "new": "x"}),
+            json!({"operation": "replace", "path": "notes.txt", "old": "x", "new": &oversized}),
         ] {
             assert_eq!(call(&workspace, arguments), refused(Refusal::TooLarge));
         }
         for arguments in [
             create_call("new.txt", "a\0b"),
             update_call("notes.txt", "original\n", "a\0b"),
+            json!({"operation": "replace", "path": "notes.txt", "old": "a\0b", "new": "x"}),
+            json!({"operation": "delete", "path": "notes.txt", "expected_content": "a\0b"}),
         ] {
             assert_eq!(call(&workspace, arguments), refused(Refusal::NotText));
         }
+        assert_eq!(
+            call(&workspace, json!({"operation": "replace", "path": "notes.txt", "old": "", "new": "x"})),
+            refused(Refusal::InvalidArguments)
+        );
+        let delete_oversized = "a".repeat(MAX_DELETE_BYTES + 1);
+        assert_eq!(
+            call(&workspace, json!({"operation": "delete", "path": "notes.txt", "expected_content": &delete_oversized})),
+            refused(Refusal::FileTooLargeForDelete)
+        );
         assert_eq!(content(&root, "notes.txt"), "original\n");
         assert!(!root.join("new.txt").exists());
     }
@@ -1140,7 +1426,7 @@ mod tests {
             workspace: authorize(),
         };
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_write_file-1");
+        assert_eq!(handler.version(), "workspace_write_file-2");
         assert!(crate::persistence::is_handler_version(handler.version()));
         let registry = ToolRegistry::default();
         register(&registry, authorize()).expect("register");
@@ -1151,5 +1437,81 @@ mod tests {
             ),
             "registering authorizes nothing"
         );
+    }
+
+    #[test]
+    fn replace_and_delete_in_workspace() {
+        let (_guard, root, _data, directory) = workspace("replace-and-delete");
+        write(&root, "notes.txt", "hello world\n");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+
+        // Test replace
+        let replace_call = json!({
+            "operation": "replace",
+            "path": "notes.txt",
+            "old": "world",
+            "new": "everyone",
+        });
+        let result = call(&workspace, replace_call).expect("replace ok");
+        assert_eq!(result["operation"], "replace");
+        assert_eq!(result["path"], "notes.txt");
+        assert_eq!(result["offset"], 6);
+        assert_eq!(
+            result["before_sha256"],
+            ContentDigest::of(b"hello world\n").to_string()
+        );
+        assert_eq!(
+            result["after_sha256"],
+            ContentDigest::of(b"hello everyone\n").to_string()
+        );
+        assert_eq!(content(&root, "notes.txt"), "hello everyone\n");
+
+        // Occurrences check: 0 occurrences
+        let fail_zero = json!({
+            "operation": "replace",
+            "path": "notes.txt",
+            "old": "nonexistent",
+            "new": "x",
+        });
+        assert_eq!(call(&workspace, fail_zero), refused(Refusal::Occurrences(0)));
+
+        // Occurrences check: multiple occurrences
+        write(&root, "repeat.txt", "abc abc abc\n");
+        let fail_multi = json!({
+            "operation": "replace",
+            "path": "repeat.txt",
+            "old": "abc",
+            "new": "x",
+        });
+        assert_eq!(call(&workspace, fail_multi), refused(Refusal::Occurrences(3)));
+
+        // Test delete
+        let del_call = json!({
+            "operation": "delete",
+            "path": "notes.txt",
+            "expected_content": "hello everyone\n",
+        });
+        let del_result = call(&workspace, del_call).expect("delete ok");
+        assert_eq!(del_result["operation"], "delete");
+        assert_eq!(del_result["path"], "notes.txt");
+        assert!(!root.join("notes.txt").exists());
+
+        // Delete mismatch
+        write(&root, "mismatch.txt", "actual\n");
+        let fail_mismatch = json!({
+            "operation": "delete",
+            "path": "mismatch.txt",
+            "expected_content": "wrong\n",
+        });
+        assert_eq!(call(&workspace, fail_mismatch), refused(Refusal::Mismatch));
+
+        // Refuse directory
+        std::fs::create_dir(root.join("subdir")).expect("mkdir");
+        let fail_dir = json!({
+            "operation": "delete",
+            "path": "subdir",
+            "expected_content": "",
+        });
+        assert_eq!(call(&workspace, fail_dir), refused(PathRefusal::NotRegularFile));
     }
 }

@@ -1377,9 +1377,9 @@ mod reasoning_parameter_tests {
             let mut limits = ContextLimits::for_profile(&frozen.llm.config);
             assert_eq!(limits.max_tokens, Some(8192));
             limits.context_window = Some(8193);
-            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, vec![], limits).is_none());
+            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, None, None, vec![], limits).is_none());
             limits.context_window = Some(8194);
-            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, vec![], limits).is_some());
+            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, None, None, vec![], limits).is_some());
             let listed = list_profiles(&handle).await.expect("GET profiles");
             assert_eq!(
                 listed.body["llm_profiles"][0]["parameters"]["reasoning_effort"],

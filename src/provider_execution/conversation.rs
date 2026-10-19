@@ -1,15 +1,17 @@
 use super::*;
 
-pub(crate) fn ground_workspace(conversation: &mut ChatConversation, root: &std::path::Path) {
-    conversation.messages.insert(
-        0,
-        ChatMessage::system(format!(
-            "Your Workspace's absolute root is {}. Every tool path is relative to this root. \
-             Paths outside this Workspace cannot be reached. If asked to act outside it, \
-             say that you cannot reach that path instead of claiming you acted there.",
-            root.display()
-        )),
-    );
+pub(crate) fn ground_workspace(root: &std::path::Path, grant: Option<&str>) -> ChatMessage {
+    let allows = match grant {
+        Some("edit") => "edit",
+        Some("code") => "run commands",
+        _ => "read",
+    };
+    ChatMessage::system(format!(
+        "Your Workspace's absolute root is {}. Your grant allows: {allows}. Every tool path is relative to this root. \
+         Paths outside this Workspace cannot be reached. If asked to act outside it, \
+         say that you cannot reach that path instead of claiming you acted there.",
+        root.display()
+    ))
 }
 
 pub async fn execute_chat(

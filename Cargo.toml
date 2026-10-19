@@ -41,6 +41,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 log = { version = "=0.4.34", default-features = false, features = ["std"] }
 time = { version = "=0.3.55", default-features = false, features = ["std"] }
+regex = "1.13.1"
 
 [target.'cfg(unix)'.dependencies]
 # Opens Workspace files component by component without following links; the

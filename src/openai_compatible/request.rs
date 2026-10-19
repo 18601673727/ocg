@@ -1199,8 +1199,8 @@ mod tests {
         for (url, problem) in [
             ("https://example.com/a.png".to_owned(), "never a remote URL"),
             (
-                format!("data:image/gif;base64,{data}"),
-                "image/png and image/jpeg",
+                format!("data:image/bmp;base64,{data}"),
+                "only image/png, image/jpeg, image/gif and image/webp",
             ),
             (format!("data:image/png;base64,{data}!"), "canonical base64"),
             (

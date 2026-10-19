@@ -523,6 +523,11 @@ impl WorkspaceTools {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) fn workspace(&self) -> Option<&crate::orchestration::workspace_read::Workspace> {
+        self.workspace.as_ref()
+    }
+
     fn available(&self) -> bool {
         #[cfg(unix)]
         {
@@ -538,7 +543,22 @@ impl WorkspaceTools {
         let Some(grant) = grant else {
             return Ok(None);
         };
-        #[cfg(unix)]
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        {
+            use crate::orchestration::workspace_command::{self, Grant};
+            let workspace = self.workspace.clone().ok_or({
+                ExecutionRuntimeError::Database(DatabaseError::Rejected(
+                    Violation::WorkspaceNotConfigured,
+                ))
+            })?;
+            let Some(grant) = Grant::parse(grant) else {
+                return Err(ExecutionRuntimeError::WorkspaceGrantUnsupported);
+            };
+            let tools = workspace_command::workspace_tools(workspace, grant)
+                .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
+            Ok(Some(tools))
+        }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))))]
         {
             use crate::orchestration::workspace_read;
             let workspace = self.workspace.clone().ok_or({
@@ -546,15 +566,11 @@ impl WorkspaceTools {
                     Violation::WorkspaceNotConfigured,
                 ))
             })?;
-            let tools = match grant {
-                "read" => workspace_read::read_file_tools(workspace),
-                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-                "edit" => crate::orchestration::workspace_write::edit_file_tools(workspace),
-                #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-                "code" => crate::orchestration::workspace_command::code_tools(workspace),
-                _ => return Err(ExecutionRuntimeError::WorkspaceGrantUnsupported),
+            if grant != "read" {
+                return Err(ExecutionRuntimeError::WorkspaceGrantUnsupported);
             }
-            .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
+            let tools = workspace_read::read_file_tools(workspace)
+                .map_err(ExecutionRuntimeError::ToolsUnavailable)?;
             Ok(Some(tools))
         }
         #[cfg(not(unix))]
@@ -674,6 +690,7 @@ mod grounding_tests {
                     assert!(text.contains("Every tool path is relative to this root"));
                     assert!(text.contains("cannot be reached"));
                     assert!(text.contains("instead of claiming you acted there"));
+                    assert!(text.contains("Your grant allows: read."));
                     assert_eq!(messages[1]["content"], "Agent instructions");
                     assert!(!conversation.tools.is_empty());
                 } else {
@@ -726,6 +743,173 @@ mod grounding_tests {
             ))
             .expect("configure next turn");
         }
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn grounding_includes_grant_and_agents_md_in_system_messages() {
+        let (_data, directory) = data_directory("chat", "agents-md-grounding");
+        let (_root, root) = temporary_directory("chat", "agents-md-workspace");
+        std::fs::write(root.join("AGENTS.md"), "# Project Instructions\nFollow these rules.\n")
+            .expect("write AGENTS.md");
+        let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+        let workspace_tools = WorkspaceTools {
+            workspace: Some(workspace),
+        };
+        let worker = DatabaseWorker::start(&directory).expect("start");
+        let handle = worker.handle();
+        let mut configuration = execution_configuration(&handle);
+        let model = wait(handle.config(configuration.llm_profile.into()))
+            .expect("read")
+            .expect("model");
+        let ConfigBody::Model(model) = model.body else {
+            panic!("model")
+        };
+        let endpoint = "https://agents-md-grounding.invalid/v1";
+        wait(handle.update_config(
+            model.connection_id,
+            NewConfig {
+                name: "agents-md provider".into(),
+                body: ConfigBody::Connection(crate::persistence::ConnectionConfig {
+                    protocol: crate::persistence::LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(endpoint.into()),
+                    credential_ref: None,
+                }),
+            },
+        ))
+        .expect("provider endpoint");
+
+        for (grant, allowed_text) in [
+            ("read", "read"),
+            ("edit", "edit"),
+            ("code", "run commands"),
+        ] {
+            let agent_body = AgentConfig {
+                instructions: Some("Agent instructions".into()),
+                behavior: AgentBehavior::Chat,
+                models: vec![configuration.llm_profile.into()],
+                tool_grant: Some(grant.into()),
+                ..Default::default()
+            };
+            let agent = wait(handle.create_config(NewConfig {
+                name: format!("agent-{grant}"),
+                body: ConfigBody::Agent(agent_body),
+            }))
+            .expect("agent");
+            configuration.agent_profile = Some(agent.into());
+            let executor = wait(handle.create_executor(NewExecutor {
+                name: format!("executor-{grant}"),
+                concurrency_limit: std::num::NonZeroU32::MIN,
+                llm_transports: [crate::persistence::LlmTransport::OpenAiChatCompletions].into(),
+            }))
+            .expect("executor");
+            let job = wait(handle.create_claimed_fixture(
+                NewJob {
+                    name: None,
+                    eligible_at: None,
+                    parent: handle.genesis(),
+                    projects: vec![],
+                    dependencies: vec![],
+                    input: JobInputDraft {
+                        objective: Some("test objective".into()),
+                        ..Default::default()
+                    },
+                    configuration: Some(configuration),
+                    previous: None,
+                },
+                executor,
+            ))
+            .expect("claim");
+            let tools = workspace_tools.clone();
+            let expected_root = tools.root().expect("root").to_string_lossy().into_owned();
+            let run_handle = handle.clone();
+            let allowed_text_owned = allowed_text.to_owned();
+            provider_seam::install(endpoint, move |conversation| {
+                let sent = serde_json::to_value(conversation).expect("json");
+                let messages = sent["messages"].as_array().expect("messages");
+                // 1. Grounding message
+                assert_eq!(messages[0]["role"], "system");
+                let grounding = messages[0]["content"].as_str().expect("grounding");
+                assert!(grounding.contains(&expected_root));
+                assert!(grounding.contains(&format!("Your grant allows: {allowed_text_owned}.")));
+                // 2. Agent instructions
+                assert_eq!(messages[1]["role"], "system");
+                assert_eq!(messages[1]["content"], "Agent instructions");
+                // 3. AGENTS.md as its own System message, never User
+                assert_eq!(messages[2]["role"], "system");
+                assert_eq!(
+                    messages[2]["content"],
+                    "# Project Instructions\nFollow these rules.\n"
+                );
+                // 4. User objective
+                assert_eq!(messages[3]["role"], "user");
+                assert_eq!(messages[3]["content"], "test objective");
+                provider_seam::Response {
+                    gate: None,
+                    steps: vec![crate::provider_execution::scripted::Step::Chunk(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )],
+                }
+            });
+            on_system(move || async move {
+                run_started_provider_job(
+                    run_handle,
+                    ProviderTask {
+                        workspace_tools: Some(tools),
+                        tools: None,
+                        credential_resolver: Arc::new(EnvironmentCredentialResolver),
+                        provider_config: ProviderExecutionConfig::default(),
+                    },
+                    (
+                        StartedJob {
+                            executor,
+                            input: JobInputId::new(job.get()),
+                            job,
+                        },
+                        None,
+                    ),
+                    &Cell::new(false),
+                )
+                .await
+            })
+            .expect("settled");
+        }
+
+        // Test AGENTS.md skip conditions: symlink, >32 KiB, non-UTF-8, NUL
+        let test_workspace = workspace_tools.workspace().expect("workspace").clone();
+        on_system(move || async move {
+            // Valid content
+            assert_eq!(
+                read_agents_md(&test_workspace).await.as_deref(),
+                Some("# Project Instructions\nFollow these rules.\n")
+            );
+
+            // NUL byte: skipped and logged
+            std::fs::write(root.join("AGENTS.md"), "hello\0world").expect("write");
+            assert_eq!(read_agents_md(&test_workspace).await, None);
+
+            // Non-UTF-8: skipped and logged
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::symlink;
+                std::fs::remove_file(root.join("AGENTS.md")).expect("remove");
+                // Symlink: skipped and logged
+                std::fs::write(root.join("target.md"), "target").expect("write target");
+                symlink(root.join("target.md"), root.join("AGENTS.md")).expect("symlink");
+                assert_eq!(read_agents_md(&test_workspace).await, None);
+                std::fs::remove_file(root.join("AGENTS.md")).expect("remove symlink");
+                std::fs::remove_file(root.join("target.md")).expect("remove target");
+            }
+
+            // > 32 KiB: skipped and logged
+            std::fs::write(root.join("AGENTS.md"), vec![b'a'; 33 * 1024]).expect("write large");
+            assert_eq!(read_agents_md(&test_workspace).await, None);
+
+            // Missing: skipped silently
+            std::fs::remove_file(root.join("AGENTS.md")).expect("remove");
+            assert_eq!(read_agents_md(&test_workspace).await, None);
+        });
+
         worker.shutdown().expect("shutdown");
     }
 }
@@ -1695,6 +1879,7 @@ fn append_omitted_notice(conversation: &mut ChatConversation) {
 }
 
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_conversation(
     frozen: &FrozenExecutionConfig,
     prior_turns: &[(Option<String>, Vec<ImageInput>, String)],
@@ -1702,14 +1887,11 @@ pub(crate) fn assemble_conversation(
     current_objective: Option<&str>,
     current_images: &[ImageInput],
     workspace_root: Option<&std::path::Path>,
+    grant: Option<&str>,
+    agents_md: Option<&str>,
     tools: Vec<ToolWire>,
 ) -> ChatConversation {
-    let mut conversation = provider_execution::objective_conversation(frozen, None);
-    conversation.messages.pop();
-
-    if omitted_notice {
-        append_omitted_notice(&mut conversation);
-    }
+    let mut messages = system_messages(frozen, workspace_root, grant, agents_md, omitted_notice);
 
     for (turn_objective, turn_images, assistant_text) in prior_turns {
         if let Some(user_msg) = provider_execution::objective_conversation_with_images(
@@ -1720,11 +1902,9 @@ pub(crate) fn assemble_conversation(
         .messages
         .pop()
         {
-            conversation.messages.push(user_msg);
+            messages.push(user_msg);
         }
-        conversation
-            .messages
-            .push(ChatMessage::assistant(Some(assistant_text.clone()), Vec::new()));
+        messages.push(ChatMessage::assistant(Some(assistant_text.clone()), Vec::new()));
     }
 
     if let Some(user_msg) = provider_execution::objective_conversation_with_images(
@@ -1735,14 +1915,14 @@ pub(crate) fn assemble_conversation(
     .messages
     .pop()
     {
-        conversation.messages.push(user_msg);
+        messages.push(user_msg);
     }
 
-    if let Some(root) = workspace_root {
-        provider_execution::ground_workspace(&mut conversation, root);
+    ChatConversation {
+        messages,
+        tools,
+        ..Default::default()
     }
-    conversation.tools = tools;
-    conversation
 }
 
 fn message_weights(message: &ChatMessage) -> (usize, usize) {
@@ -1835,22 +2015,83 @@ pub(crate) struct PriorTurnMessages {
     pub(crate) assistant: ChatMessage,
 }
 
+#[cfg(unix)]
+async fn read_agents_md(
+    workspace: &crate::orchestration::workspace_read::Workspace,
+) -> Option<String> {
+    use crate::orchestration::blocking::{self, Kind};
+    use crate::orchestration::workspace_read::{self, Refusal, Step};
+
+    const MAX_AGENTS_MD_BYTES: usize = 32 * 1024;
+
+    let workspace = workspace.clone();
+    let result = blocking::run(Kind::File, move || -> Result<Option<String>, String> {
+        let (parent, name) = match workspace.parent("AGENTS.md") {
+            Ok(res) => res,
+            Err(Refusal::NotFound) => return Ok(None),
+            Err(e) => return Err(format!("failed to locate AGENTS.md: {e}")),
+        };
+        let file = match workspace_read::open_within(&parent, name, Step::File, MAX_AGENTS_MD_BYTES) {
+            Ok(f) => f,
+            Err(Refusal::NotFound) => return Ok(None),
+            Err(e) => return Err(format!("failed to open AGENTS.md: {e}")),
+        };
+        let bytes = match workspace_read::read_bytes(&file, MAX_AGENTS_MD_BYTES) {
+            Ok(b) => b,
+            Err(Refusal::NotFound) => return Ok(None),
+            Err(e) => return Err(format!("failed to read AGENTS.md: {e}")),
+        };
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(e) => return Err(format!("AGENTS.md is not valid UTF-8: {e}")),
+        };
+        if text.contains('\0') {
+            return Err("AGENTS.md contains a NUL byte".to_string());
+        }
+        Ok(Some(text))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(content)) => content,
+        Ok(Err(reason)) => {
+            eprintln!("skipping AGENTS.md: {reason}");
+            None
+        }
+        Err(e) => {
+            eprintln!("skipping AGENTS.md: blocking task failed: {e}");
+            None
+        }
+    }
+}
+
 fn system_messages(
     frozen: &FrozenExecutionConfig,
     workspace_root: Option<&std::path::Path>,
+    grant: Option<&str>,
+    agents_md: Option<&str>,
     omitted_notice: bool,
 ) -> Vec<ChatMessage> {
-    let mut conversation = provider_execution::objective_conversation(frozen, None);
-    conversation.messages.pop();
-
-    if omitted_notice {
-        append_omitted_notice(&mut conversation);
-    }
+    let mut messages = Vec::new();
 
     if let Some(root) = workspace_root {
-        provider_execution::ground_workspace(&mut conversation, root);
+        messages.push(provider_execution::ground_workspace(root, grant));
     }
-    conversation.messages
+
+    let mut agent_conv = provider_execution::objective_conversation(frozen, None);
+    agent_conv.messages.pop();
+
+    if omitted_notice {
+        append_omitted_notice(&mut agent_conv);
+    }
+
+    messages.extend(agent_conv.messages);
+
+    if let Some(agents_md) = agents_md.filter(|content| !content.is_empty()) {
+        messages.push(ChatMessage::system(agents_md));
+    }
+
+    messages
 }
 
 fn assemble_final_conversation(
@@ -1876,12 +2117,15 @@ fn assemble_final_conversation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_conversation(
     frozen: &FrozenExecutionConfig,
     prior_turns: Vec<(Option<String>, Vec<ImageInput>, String)>,
     current_objective: Option<&str>,
     current_images: &[ImageInput],
     workspace_root: Option<&std::path::Path>,
+    grant: Option<&str>,
+    agents_md: Option<&str>,
     tools: Vec<ToolWire>,
     context_limits: ContextLimits,
 ) -> Option<ChatConversation> {
@@ -1911,15 +2155,15 @@ pub(crate) fn fit_conversation(
 
     let Some(window) = context_limits.context_window else {
         return Some(assemble_final_conversation(
-            system_messages(frozen, workspace_root, false),
+            system_messages(frozen, workspace_root, grant, agents_md, false),
             prior_messages,
             current_user_message,
             tools,
         ));
     };
 
-    let system_without_notice = system_messages(frozen, workspace_root, false);
-    let system_with_notice = system_messages(frozen, workspace_root, true);
+    let system_without_notice = system_messages(frozen, workspace_root, grant, agents_md, false);
+    let system_with_notice = system_messages(frozen, workspace_root, grant, agents_md, true);
 
     // 2. Estimate token weights once for prior turns and the rest (system, notice, current turn, tools, max_tokens).
     let tools_bytes: usize = tools.iter().map(tool_bytes).sum();
@@ -2042,12 +2286,13 @@ async fn run_started_provider_job(
         return refused("provider execution requires frozen LLM configuration".to_owned()).await;
     };
     let mut workspace_root = None;
+    let mut agents_md = None;
+    let grant = configuration
+        .frozen
+        .agent
+        .as_ref()
+        .and_then(|agent| agent.tool_grant.as_deref());
     if let Some(tools) = &plan.workspace_tools {
-        let grant = configuration
-            .frozen
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.tool_grant.as_deref());
         plan.tools = match tools.build(grant) {
             Ok(tools) => tools,
             Err(error) => return refused(error.to_string()).await,
@@ -2064,6 +2309,10 @@ async fn run_started_provider_job(
             Ok(offered) => offered,
             Err(error) => return refused(error.to_string()).await,
         };
+        #[cfg(unix)]
+        if let (Some(_), Some(workspace)) = (workspace_root, tools.workspace()) {
+            agents_md = read_agents_md(workspace).await;
+        }
     }
     let Some(input_record) = database.job_input(input).await? else {
         return refused("submitted Job input disappeared".to_owned()).await;
@@ -2151,6 +2400,8 @@ async fn run_started_provider_job(
         input_record.objective.as_deref(),
         &images,
         workspace_root,
+        grant,
+        agents_md.as_deref(),
         tools_wire,
         context_limits,
     ) {

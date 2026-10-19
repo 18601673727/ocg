@@ -254,7 +254,17 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 "OCG Workspace authorized for {}: {root}",
                 workspace_read::TOOL_NAME
             );
-            Some(workspace_read::read_file_tools(workspace)?)
+            #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+            {
+                Some(workspace_command::workspace_tools(
+                    workspace,
+                    workspace_command::Grant::Read,
+                )?)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+            {
+                Some(workspace_read::read_file_tools(workspace)?)
+            }
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         Mode::Edit => {
@@ -264,9 +274,12 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 workspace_write::TOOL_NAME
             );
             eprintln!(
-                "OCG records the path and complete content of every write, and an update's expected content, in plaintext tool evidence"
+                "OCG records the path and complete content of every write, an update or delete's expected content, and a replace's old and new content, in plaintext tool evidence"
             );
-            Some(workspace_write::edit_file_tools(workspace)?)
+            Some(workspace_command::workspace_tools(
+                workspace,
+                workspace_command::Grant::Edit,
+            )?)
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         Mode::Code => {
@@ -279,13 +292,16 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
                 workspace_discovery::SEARCH_TOOL_NAME
             );
             eprintln!(
-                "OCG records the path and complete content of every write, an update's expected content, and every command's output in plaintext tool evidence, and sends command output to the Provider"
+                "OCG records the path and complete content of every write, an update or delete's expected content, a replace's old and new content, and every command's output in plaintext tool evidence, and sends command output to the Provider"
             );
             eprintln!(
                 "OCG runs `cargo check` and `cargo test` in the Workspace with its own permissions; build scripts and tests run project code unsandboxed, so authorize only a Workspace you trust"
             );
             eprintln!("OCG additionally offers lazy bounded FTS.");
-            Some(workspace_command::code_tools(workspace)?)
+            Some(workspace_command::workspace_tools(
+                workspace,
+                workspace_command::Grant::Code,
+            )?)
         }
         Mode::Vision => {
             let path = config
@@ -327,7 +343,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
 /// type.
 fn load_image(workspace: &Workspace, path: &str) -> Result<ImageInput, Error> {
     let declared = declared_type(path).ok_or_else(|| {
-        Error::Image("only .png, .jpg and .jpeg files can be sent as images".to_owned())
+        Error::Image("only .png, .jpg, .jpeg, .gif and .webp files can be sent as images".to_owned())
     })?;
     let bytes = workspace
         .read_binary(path, MAX_IMAGE_BYTES)
@@ -346,6 +362,8 @@ fn declared_type(path: &str) -> Option<ImageMime> {
     match extension.to_ascii_lowercase().as_str() {
         "png" => Some(ImageMime::Png),
         "jpg" | "jpeg" => Some(ImageMime::Jpeg),
+        "gif" => Some(ImageMime::Gif),
+        "webp" => Some(ImageMime::Webp),
         _ => None,
     }
 }
@@ -559,7 +577,7 @@ fn shown_arguments(tool: &str, arguments: &str) -> String {
         let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str(arguments) else {
             return "(not shown)".to_owned();
         };
-        for key in ["content", "expected_content"] {
+        for key in ["content", "expected_content", "old", "new"] {
             if let Some(field) = fields.get_mut(key) {
                 *field = serde_json::Value::String(match field.as_str() {
                     Some(text) => format!("{} bytes", text.len()),
@@ -950,6 +968,24 @@ mod tests {
             shown_arguments("workspace_write_file", created),
             r#"{"content":"0 bytes","operation":"create","path":"empty.txt"}"#
         );
+        let replaced = serde_json::json!({
+            "operation": "replace",
+            "path": "notes.txt",
+            "old": "secret old",
+            "new": "secret new",
+        })
+        .to_string();
+        let shown_replaced = shown_arguments("workspace_write_file", &replaced);
+        assert!(!shown_replaced.contains("secret"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&shown_replaced).expect("JSON"),
+            serde_json::json!({
+                "operation": "replace",
+                "path": "notes.txt",
+                "old": "10 bytes",
+                "new": "10 bytes",
+            })
+        );
         assert_eq!(
             shown_arguments("workspace_write_file", "[1]"),
             "(not shown)"
@@ -1036,7 +1072,8 @@ mod tests {
             ("shot.png", Some(ImageMime::Png)),
             ("dir/Photo.JPG", Some(ImageMime::Jpeg)),
             ("scan.jpeg", Some(ImageMime::Jpeg)),
-            ("anim.gif", None),
+            ("anim.gif", Some(ImageMime::Gif)),
+            ("pic.webp", Some(ImageMime::Webp)),
             ("vector.svg", None),
             ("png", None),
             ("dir.png/file", None),
@@ -1057,6 +1094,7 @@ mod tests {
         std::fs::write(root.join("fake.jpg"), &png).expect("write");
         std::fs::write(root.join("notes.txt"), "text").expect("write");
         std::fs::write(root.join("anim.gif"), b"GIF89a").expect("write");
+        std::fs::write(root.join("pic.webp"), b"RIFF\x04\x00\x00\x00WEBP").expect("write");
         let mut large = png.clone();
         large.resize(MAX_IMAGE_BYTES + 1, 0);
         std::fs::write(root.join("large.png"), &large).expect("write");
@@ -1068,6 +1106,16 @@ mod tests {
             (image.mime(), image.bytes()),
             (ImageMime::Png, png.as_slice())
         );
+        let gif = load_image(&workspace, "anim.gif").expect("a GIF");
+        assert_eq!(
+            (gif.mime(), gif.bytes()),
+            (ImageMime::Gif, b"GIF89a".as_slice())
+        );
+        let webp = load_image(&workspace, "pic.webp").expect("a WEBP");
+        assert_eq!(
+            (webp.mime(), webp.bytes()),
+            (ImageMime::Webp, b"RIFF\x04\x00\x00\x00WEBP".as_slice())
+        );
         let refusal = |path: &str| match load_image(&workspace, path) {
             Err(Error::Image(message)) => message,
             other => panic!("{path} must be refused, got {other:?}"),
@@ -1076,12 +1124,10 @@ mod tests {
             refusal("fake.jpg"),
             "the image's content is not the image/jpeg its type declares"
         );
-        for path in ["notes.txt", "anim.gif"] {
-            assert_eq!(
-                refusal(path),
-                "only .png, .jpg and .jpeg files can be sent as images"
-            );
-        }
+        assert_eq!(
+            refusal("notes.txt"),
+            "only .png, .jpg, .jpeg, .gif and .webp files can be sent as images"
+        );
         assert_eq!(
             refusal("large.png"),
             "the image is larger than 4194304 bytes"

@@ -1283,6 +1283,7 @@ dependencies = [
  "ntex",
  "petgraph",
  "redb",
+ "regex",
  "rustix",
  "rustls",
  "serde",

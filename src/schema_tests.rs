@@ -8978,8 +8978,13 @@ mod requests_and_tool_loop {
         }
 
         fn written(operation: &str, path: &str, content: &str) -> String {
-            json!({"operation": operation, "path": path, "bytes_written": content.len()})
-                .to_string()
+            json!({
+                "operation": operation,
+                "path": path,
+                "bytes_written": content.len(),
+                "after_sha256": crate::persistence::ContentDigest::of(content.as_bytes()).to_string(),
+            })
+            .to_string()
         }
 
         #[test]
@@ -9081,7 +9086,7 @@ mod requests_and_tool_loop {
                 ("call_write", workspace_write::TOOL_NAME)
             );
             let admission = write_record.admission().expect("admitted");
-            assert_eq!(admission.handler_version, "workspace_write_file-1");
+            assert_eq!(admission.handler_version, "workspace_write_file-2");
             assert_eq!(admission.effect, ToolEffect::NonIdempotent);
             assert_eq!(
                 serde_json::from_str::<Value>(admission.arguments.as_str()).expect("JSON"),
@@ -9740,12 +9745,12 @@ mod requests_and_tool_loop {
                     .collect::<Vec<_>>(),
                 [
                     workspace_read::TOOL_NAME,
-                    workspace_write::TOOL_NAME,
-                    workspace_command::TOOL_NAME,
                     crate::orchestration::workspace_discovery::LIST_TOOL_NAME,
                     crate::orchestration::workspace_discovery::SEARCH_TOOL_NAME,
-                    crate::orchestration::workspace_code::TOOL_NAME,
                     crate::orchestration::workspace_fts::TOOL_NAME,
+                    crate::orchestration::workspace_code::TOOL_NAME,
+                    workspace_write::TOOL_NAME,
+                    workspace_command::TOOL_NAME,
                 ]
             );
             let failed = answer_to(third, "call_test_1").expect("answered");
@@ -10696,7 +10701,7 @@ mod requests_and_tool_loop {
                     "workspace_list_directory-1",
                     second,
                 ),
-                (search, 2, SEARCH_TOOL_NAME, "workspace_search-1", third),
+                (search, 2, SEARCH_TOOL_NAME, "workspace_search-2", third),
                 (
                     range,
                     3,
@@ -16599,7 +16604,7 @@ mod requests_and_tool_loop {
             );
 
             for (mime, content) in [
-                ("image/gif", b"GIF89a".to_vec()),
+                ("image/svg+xml", b"<svg></svg>".to_vec()),
                 ("text/plain", b"text".to_vec()),
             ] {
                 let other = attach(&handle, content, mime, "other");
@@ -16771,7 +16776,7 @@ mod requests_and_tool_loop {
                 "image/png",
                 "c.png",
             );
-            let gif = attach(&handle, b"GIF89a".to_vec(), "image/gif", "anim.gif");
+            let svg = attach(&handle, b"<svg></svg>".to_vec(), "image/svg+xml", "vector.svg");
             std::fs::remove_file(content_path(&directory, &attachment(&handle, missing)))
                 .expect("remove");
             std::fs::write(
@@ -16785,7 +16790,7 @@ mod requests_and_tool_loop {
                     corrupt,
                     "the content file does not have the recorded SHA-256",
                 ),
-                (gif, "only image/png and image/jpeg"),
+                (svg, "only image/png, image/jpeg, image/gif and image/webp"),
             ] {
                 let receipt = schedule(vec![usable, bad], Duration::from_secs(5)).expect("settled");
                 let job = job_record(&handle, receipt.job);
@@ -16996,6 +17001,8 @@ mod requests_and_tool_loop {
                 Some("current"),
                 &[],
                 None,
+                None,
+                None,
                 Vec::new(),
             );
             let sys_text = assembled
@@ -17163,6 +17170,8 @@ mod requests_and_tool_loop {
                 Some(current_objective),
                 &[],
                 None,
+                None,
+                None,
                 Vec::new(),
                 limits_all_fit,
             )
@@ -17189,6 +17198,8 @@ mod requests_and_tool_loop {
                 prior_turns.clone(),
                 Some(current_objective),
                 &[],
+                None,
+                None,
                 None,
                 Vec::new(),
                 limits_drop_1,
@@ -17221,6 +17232,8 @@ mod requests_and_tool_loop {
                 prior_turns,
                 Some(current_objective),
                 &[],
+                None,
+                None,
                 None,
                 Vec::new(),
                 limits_too_small,

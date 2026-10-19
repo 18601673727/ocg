@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use regex::RegexBuilder;
 use rustix::fs::{AtFlags, Dir, FileType};
 use rustix::io::Errno;
 use serde_json::{Value, json};
@@ -66,7 +67,7 @@ pub const SEARCH_TOOL_NAME: &str = "workspace_search";
 
 /// Identify these handlers' behavior in every call they record.
 const LIST_HANDLER_VERSION: &str = "workspace_list_directory-1";
-const SEARCH_HANDLER_VERSION: &str = "workspace_search-1";
+const SEARCH_HANDLER_VERSION: &str = "workspace_search-2";
 
 /// Directories a search does not enter below the directory it searches:
 /// build output and installed dependencies, which are large and rarely what
@@ -298,13 +299,20 @@ fn wildcard_match(pattern: &[char], name: &[char]) -> bool {
     pattern[at..].iter().all(|character| *character == '*')
 }
 
+/// How a search matches file content.
+#[derive(Debug)]
+enum TextMatcher {
+    Literal(String),
+    Regex(regex::Regex),
+}
+
 /// What a search looks for: files whose name matches, files holding a text,
 /// or files that do both.
 #[derive(Debug)]
 struct Query {
     path: String,
     name: Option<NamePattern>,
-    text: Option<String>,
+    text: Option<TextMatcher>,
 }
 
 /// Why a search's arguments are refused. Its message is recorded and may
@@ -315,6 +323,8 @@ enum QueryRefusal {
         "a search needs a `name` of 1 to {MAX_NAME_PATTERN_BYTES} bytes without `/` or control characters, a `text` of 1 to {MAX_TEXT_BYTES} bytes on one line, or both"
     )]
     Invalid,
+    #[error("the regular expression cannot be compiled")]
+    Regex,
     #[error(transparent)]
     Path(#[from] Refusal),
 }
@@ -329,7 +339,7 @@ fn only_fields(arguments: &Value, fields: &[&str]) -> bool {
 /// The search a call asks for. The schema already bounds the arguments;
 /// they are checked again here.
 fn query(arguments: &Value) -> Result<Query, QueryRefusal> {
-    if !only_fields(arguments, &["path", "name", "text"]) {
+    if !only_fields(arguments, &["path", "name", "text", "regex"]) {
         return Err(QueryRefusal::Invalid);
     }
     let path = match arguments.get("path") {
@@ -342,6 +352,11 @@ fn query(arguments: &Value) -> Result<Query, QueryRefusal> {
     };
     let name = field("name")?;
     let text = field("text")?;
+    let regex = match arguments.get("regex") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(QueryRefusal::Invalid),
+    };
     if let Some(name) = name
         && (name.is_empty()
             || name.len() > MAX_NAME_PATTERN_BYTES
@@ -355,13 +370,28 @@ fn query(arguments: &Value) -> Result<Query, QueryRefusal> {
     {
         return Err(QueryRefusal::Invalid);
     }
+    if regex && text.is_none() {
+        return Err(QueryRefusal::Invalid);
+    }
     if name.is_none() && text.is_none() {
         return Err(QueryRefusal::Invalid);
     }
+    let text_matcher = match (text, regex) {
+        (None, _) => None,
+        (Some(text), false) => Some(TextMatcher::Literal(text.to_owned())),
+        (Some(text), true) => {
+            let compiled = RegexBuilder::new(text)
+                .size_limit(1 << 20)
+                .dfa_size_limit(1 << 20)
+                .build()
+                .map_err(|_| QueryRefusal::Regex)?;
+            Some(TextMatcher::Regex(compiled))
+        }
+    };
     Ok(Query {
         path,
         name: name.map(NamePattern::new),
-        text: text.map(str::to_owned),
+        text: text_matcher,
     })
 }
 
@@ -524,7 +554,12 @@ impl Walk<'_> {
         let mut matches = Vec::new();
         let mut more = false;
         for (index, line) in content.split('\n').enumerate() {
-            if !line.contains(text.as_str()) {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let matched = match text {
+                TextMatcher::Literal(text) => line.contains(text.as_str()),
+                TextMatcher::Regex(regex) => regex.is_match(line),
+            };
+            if !matched {
                 continue;
             }
             if matches.len() == self.limits.matches_per_file {
@@ -751,6 +786,10 @@ fn search_parameters() -> Value {
                 "minLength": 1,
                 "maxLength": MAX_TEXT_BYTES,
                 "description": "Match files whose content contains this exact, case-sensitive text on one line; returns the matching lines"
+            },
+            "regex": {
+                "type": "boolean",
+                "description": "When true, match `text` as a regular expression against each line with ^ and $ as line anchors; refuses an invalid pattern"
             }
         },
         "additionalProperties": false
@@ -1460,7 +1499,7 @@ mod tests {
         let search = handler(&workspace, DiscoveryLimits::default(), None);
         for (handler, version) in [
             (&list as &dyn ToolHandler, "workspace_list_directory-1"),
-            (&search, "workspace_search-1"),
+            (&search, "workspace_search-2"),
         ] {
             assert_eq!(handler.effect(), ToolEffect::ReadOnly);
             assert_eq!(handler.version(), version);
@@ -1472,5 +1511,37 @@ mod tests {
                 < crate::orchestration::execution_runtime::ToolLoopLimits::default()
                     .max_tool_result_bytes
         );
+    }
+
+    #[test]
+    fn a_search_with_regex_anchors() {
+        let (_guard, root, _data, directory) = workspace("search-regex");
+        write(&root, "test.txt", b"abc\nstart abc end\nabc middle\n");
+        let workspace = authorize(&root, &directory);
+
+        let result = search_default(&workspace, json!({"text": "^abc$", "regex": true}))
+            .expect("search regex");
+        let files = result["files"].as_array().expect("files");
+        assert_eq!(files.len(), 1);
+        let matches = files[0]["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["line"], 1);
+        assert_eq!(matches[0]["text"], "abc");
+
+        let err = searching(
+            &workspace,
+            DiscoveryLimits::default(),
+            json!({"text": "[invalid", "regex": true}),
+        )
+        .unwrap_err();
+        assert_eq!(err.message, "the regular expression cannot be compiled");
+
+        let err = searching(
+            &workspace,
+            DiscoveryLimits::default(),
+            json!({"regex": true}),
+        )
+        .unwrap_err();
+        assert_eq!(err.message, QueryRefusal::Invalid.to_string());
     }
 }

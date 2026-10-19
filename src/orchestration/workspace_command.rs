@@ -878,6 +878,86 @@ pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     }
 }
 
+/// The grant authorized on a Workspace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Grant {
+    Read,
+    Edit,
+    Code,
+}
+
+impl Grant {
+    pub fn parse(grant: &str) -> Option<Self> {
+        match grant {
+            "read" => Some(Self::Read),
+            "edit" => Some(Self::Edit),
+            "code" => Some(Self::Code),
+            _ => None,
+        }
+    }
+}
+
+/// Builds the tools for `workspace` under `grant` with [`coding_limits(COMMAND_TIMEOUT)`].
+pub fn workspace_tools(
+    workspace: Workspace,
+    grant: Grant,
+) -> Result<ToolExecution, ToolRegistryError> {
+    workspace_tools_with(workspace, grant, CommandEnvironment::of_process(), COMMAND_TIMEOUT)
+}
+
+/// [`workspace_tools`] with the given command environment and limit.
+pub(crate) fn workspace_tools_with(
+    workspace: Workspace,
+    grant: Grant,
+    environment: CommandEnvironment,
+    timeout: Duration,
+) -> Result<ToolExecution, ToolRegistryError> {
+    let registry = ToolRegistry::default();
+    let limits = coding_limits(timeout);
+
+    workspace_read::register(&registry, workspace.clone())?;
+    workspace_discovery::register(&registry, workspace.clone())?;
+    crate::orchestration::workspace_fts::register(&registry, workspace.clone())?;
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    crate::orchestration::workspace_code::register(
+        &registry,
+        workspace.clone(),
+        limits.max_tool_result_bytes,
+        timeout,
+    )?;
+
+    if matches!(grant, Grant::Edit | Grant::Code) {
+        workspace_write::register(&registry, workspace.clone())?;
+    }
+    if matches!(grant, Grant::Code) {
+        register(&registry, workspace.clone(), environment, timeout)?;
+    }
+
+    let mut names = vec![
+        workspace_read::TOOL_NAME,
+        workspace_discovery::LIST_TOOL_NAME,
+        workspace_discovery::SEARCH_TOOL_NAME,
+        crate::orchestration::workspace_fts::TOOL_NAME,
+    ];
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    names.push(crate::orchestration::workspace_code::TOOL_NAME);
+
+    if matches!(grant, Grant::Edit | Grant::Code) {
+        names.push(workspace_write::TOOL_NAME);
+    }
+    if matches!(grant, Grant::Code) {
+        names.push(TOOL_NAME);
+    }
+
+    for name in &names {
+        registry.authorize(name)?;
+    }
+    Ok(ToolExecution {
+        offer: registry.offer(&names)?,
+        limits,
+    })
+}
+
 /// The tools of an execution that may read, write and build `workspace`:
 /// `workspace_read_file`, `workspace_write_file`, `workspace_run_command`,
 /// `workspace_list_directory`, `workspace_search`, `workspace_code` and
@@ -899,35 +979,7 @@ pub(crate) fn code_tools_with(
     environment: CommandEnvironment,
     timeout: Duration,
 ) -> Result<ToolExecution, ToolRegistryError> {
-    let registry = ToolRegistry::default();
-    let limits = coding_limits(timeout);
-    workspace_read::register(&registry, workspace.clone())?;
-    workspace_write::register(&registry, workspace.clone())?;
-    register(&registry, workspace.clone(), environment, timeout)?;
-    workspace_discovery::register(&registry, workspace.clone())?;
-    crate::orchestration::workspace_code::register(
-        &registry,
-        workspace.clone(),
-        limits.max_tool_result_bytes,
-        timeout,
-    )?;
-    let mut names = vec![
-        workspace_read::TOOL_NAME,
-        workspace_write::TOOL_NAME,
-        TOOL_NAME,
-        workspace_discovery::LIST_TOOL_NAME,
-        workspace_discovery::SEARCH_TOOL_NAME,
-        crate::orchestration::workspace_code::TOOL_NAME,
-    ];
-    super::workspace_fts::register(&registry, workspace.clone())?;
-    names.push(super::workspace_fts::TOOL_NAME);
-    for name in &names {
-        registry.authorize(name)?;
-    }
-    Ok(ToolExecution {
-        offer: registry.offer(&names)?,
-        limits,
-    })
+    workspace_tools_with(workspace, Grant::Code, environment, timeout)
 }
 
 #[cfg(test)]
@@ -1151,18 +1203,23 @@ mod tests {
             names(&coding),
             [
                 workspace_read::TOOL_NAME,
-                workspace_write::TOOL_NAME,
-                TOOL_NAME,
                 workspace_discovery::LIST_TOOL_NAME,
                 workspace_discovery::SEARCH_TOOL_NAME,
-                crate::orchestration::workspace_code::TOOL_NAME,
                 super::super::workspace_fts::TOOL_NAME,
+                crate::orchestration::workspace_code::TOOL_NAME,
+                workspace_write::TOOL_NAME,
+                TOOL_NAME,
             ]
         );
+        let run_command_wire = coding
+            .offer
+            .wires()
+            .expect("offered")
+            .into_iter()
+            .find(|wire| wire.function.name == TOOL_NAME)
+            .expect("run command wire");
         assert_eq!(
-            coding.offer.wires().expect("offered")[2]
-                .function
-                .parameters,
+            run_command_wire.function.parameters,
             Some(parameters())
         );
         assert_eq!(
@@ -1182,6 +1239,33 @@ mod tests {
             ToolLoopLimits::default(),
             "the defaults are not changed"
         );
+        let read = workspace_tools(authorize(), Grant::Read).expect("read tools");
+        assert_eq!(
+            names(&read),
+            [
+                workspace_read::TOOL_NAME,
+                workspace_discovery::LIST_TOOL_NAME,
+                workspace_discovery::SEARCH_TOOL_NAME,
+                super::super::workspace_fts::TOOL_NAME,
+                crate::orchestration::workspace_code::TOOL_NAME,
+            ]
+        );
+        assert_eq!(read.limits, coding_limits(COMMAND_TIMEOUT));
+
+        let edit = workspace_tools(authorize(), Grant::Edit).expect("edit tools");
+        assert_eq!(
+            names(&edit),
+            [
+                workspace_read::TOOL_NAME,
+                workspace_discovery::LIST_TOOL_NAME,
+                workspace_discovery::SEARCH_TOOL_NAME,
+                super::super::workspace_fts::TOOL_NAME,
+                crate::orchestration::workspace_code::TOOL_NAME,
+                workspace_write::TOOL_NAME,
+            ]
+        );
+        assert_eq!(edit.limits, coding_limits(COMMAND_TIMEOUT));
+
         for other in [
             workspace_read::read_file_tools(authorize()).expect("read tools"),
             workspace_write::edit_file_tools(authorize()).expect("edit tools"),
@@ -1269,7 +1353,7 @@ mod tests {
             (
                 workspace_discovery::SEARCH_TOOL_NAME,
                 json!({"text": "needle"}),
-                "workspace_search-1",
+                "workspace_search-2",
             ),
             (
                 workspace_code::TOOL_NAME,

@@ -32,6 +32,8 @@ const MAX_IMAGE_BASE64_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
 pub enum ImageMime {
     Png,
     Jpeg,
+    Gif,
+    Webp,
 }
 
 impl ImageMime {
@@ -40,6 +42,8 @@ impl ImageMime {
         match self {
             Self::Png => "image/png",
             Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
         }
     }
 
@@ -49,15 +53,21 @@ impl ImageMime {
         match mime {
             "image/png" => Some(Self::Png),
             "image/jpeg" => Some(Self::Jpeg),
+            "image/gif" => Some(Self::Gif),
+            "image/webp" => Some(Self::Webp),
             _ => None,
         }
     }
 
-    /// The bytes every file of the type begins with.
-    fn signature(self) -> &'static [u8] {
+    /// Whether `bytes` matches the signature of this image type.
+    fn matches_signature(self, bytes: &[u8]) -> bool {
         match self {
-            Self::Png => b"\x89PNG\r\n\x1a\n",
-            Self::Jpeg => b"\xff\xd8\xff",
+            Self::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            Self::Jpeg => bytes.starts_with(b"\xff\xd8\xff"),
+            Self::Gif => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+            Self::Webp => {
+                bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+            }
         }
     }
 }
@@ -65,7 +75,7 @@ impl ImageMime {
 /// Why an image is refused. No message repeats any of the image.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ImageError {
-    #[error("only image/png and image/jpeg images are supported")]
+    #[error("only image/png, image/jpeg, image/gif and image/webp images are supported")]
     UnsupportedType,
     #[error("only an inline base64 data: URL is supported, never a remote URL")]
     NotDataUrl,
@@ -87,7 +97,7 @@ fn check(declared: ImageMime, bytes: &[u8]) -> Result<(), ImageError> {
     if bytes.len() > MAX_IMAGE_BYTES {
         return Err(ImageError::TooLarge);
     }
-    if !bytes.starts_with(declared.signature()) {
+    if !declared.matches_signature(bytes) {
         return Err(ImageError::Mismatch(declared.as_str()));
     }
     Ok(())
@@ -217,9 +227,18 @@ pub(crate) mod tests {
             ImageInput::new(ImageMime::Png, jpeg()),
             Err(ImageError::Mismatch("image/png"))
         );
-        let gif = b"GIF89a\x01\x00\x01\x00".to_vec();
+        let gif87 = b"GIF87a\x01\x00\x01\x00".to_vec();
+        let gif89 = b"GIF89a\x01\x00\x01\x00".to_vec();
+        assert!(ImageInput::new(ImageMime::Gif, gif87).is_ok());
+        assert!(ImageInput::new(ImageMime::Gif, gif89.clone()).is_ok());
+        let webp = b"RIFF\x04\x00\x00\x00WEBP".to_vec();
+        assert!(ImageInput::new(ImageMime::Webp, webp.clone()).is_ok());
         assert_eq!(
-            ImageInput::new(ImageMime::Png, gif.clone()),
+            ImageInput::new(ImageMime::Webp, b"RIFF\x04\x00\x00\x00JPEG".to_vec()),
+            Err(ImageError::Mismatch("image/webp"))
+        );
+        assert_eq!(
+            ImageInput::new(ImageMime::Png, gif89),
             Err(ImageError::Mismatch("image/png"))
         );
         assert_eq!(
@@ -277,10 +296,14 @@ pub(crate) mod tests {
             ),
             (
                 format!("data:image/gif;base64,{data}"),
-                ImageError::UnsupportedType,
+                ImageError::Mismatch("image/gif"),
             ),
             (
                 format!("data:image/webp;base64,{data}"),
+                ImageError::Mismatch("image/webp"),
+            ),
+            (
+                format!("data:image/bmp;base64,{data}"),
                 ImageError::UnsupportedType,
             ),
             (

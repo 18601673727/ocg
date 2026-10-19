@@ -201,7 +201,7 @@ const IMAGES_TOO_LARGE: Refusal = Refusal::new(
 const ATTACHMENT_NOT_AN_IMAGE: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "attachment_not_an_image",
-    "an Attachment is not a PNG or JPEG image that can be sent; nothing was submitted",
+    "an Attachment is not a PNG, JPEG, GIF or WEBP image that can be sent; nothing was submitted",
 );
 const ATTACHMENT_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,

@@ -37,7 +37,7 @@ const INVALID_UPLOAD: Refusal = Refusal::new(
 const UNSUPPORTED_IMAGE_TYPE: Refusal = Refusal::new(
     StatusCode::UNSUPPORTED_MEDIA_TYPE,
     "unsupported_image_type",
-    "only image/png and image/jpeg images are accepted; nothing was stored",
+    "only image/png, image/jpeg, image/gif and image/webp images are accepted; nothing was stored",
 );
 const MALFORMED_IMAGE_DATA: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
@@ -229,7 +229,7 @@ mod tests {
 
         // 1. Invalid uploads
         let invalid_mime = json!({
-            "mime": "image/gif",
+            "mime": "image/svg+xml",
             "data_base64": PNG_BASE64,
         });
         assert_eq!(
