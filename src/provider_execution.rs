@@ -19,7 +19,7 @@ use crate::openai_compatible::{
     ChatConversation, ChatFinishReason, ChatMessage, CompletedToolCall, ContentPartWire,
     ImageInput, InvalidToolCall, NormalizedUsage, ProviderFailure, ToolCallAssembler,
 };
-use crate::persistence::{FrozenExecutionConfig, LlmParameters, Timestamp};
+use crate::persistence::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters, Timestamp};
 use crate::token_usage::UsageFinality;
 
 const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
@@ -36,6 +36,8 @@ mod exchange;
 mod models;
 mod observe;
 mod proxy;
+mod record;
+pub use record::RequestRecorder;
 mod stream;
 mod types;
 mod usage;
@@ -230,7 +232,7 @@ pub(crate) mod tests {
             .await
             .expect("reasoning stream");
             assert_eq!(result.reasoning, "think");
-            assert!(sink.deltas.is_empty());
+            assert_eq!(sink.deltas, ["think"]);
             let error = parse_stream(
                 payload(
                     vec![
@@ -404,6 +406,7 @@ pub(crate) mod tests {
     impl ProviderOutputSink for RecordingSink {
         fn append<'a>(
             &'a mut self,
+            _kind: IntermediateOutputKind,
             text: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
             Box::pin(async move {
@@ -1342,6 +1345,7 @@ pub(crate) mod tests {
     impl ProviderOutputSink for SlowSink {
         fn append<'a>(
             &'a mut self,
+            _kind: IntermediateOutputKind,
             _text: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
             Box::pin(async { Ok(()) })
@@ -1400,6 +1404,7 @@ pub(crate) mod tests {
     impl ProviderOutputSink for SlowOutputSink {
         fn append<'a>(
             &'a mut self,
+            _kind: IntermediateOutputKind,
             text: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
             Box::pin(async move {
@@ -2882,7 +2887,11 @@ pub(crate) mod tests {
         )
         .expect("a mixed response");
         assert_eq!(result.text, "Checking.");
-        assert_eq!(sink.deltas, ["Checking."], "only the text is published");
+        assert_eq!(
+            sink.deltas,
+            ["need weather", "Checking."],
+            "reasoning precedes the answer"
+        );
         assert_eq!(result.reasoning, "need weather");
         assert_eq!(result.tool_calls, [call(0, "c", "get_weather", "{}")]);
         assert!(result.requests_tools());

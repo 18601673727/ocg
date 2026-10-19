@@ -228,6 +228,15 @@ pub(super) async fn agent_profiles(
                 "name": llm.name,
                 "model": model.model,
                 "context_window": model.context_window,
+                "parameters": {
+                    "temperature": model.parameters.temperature,
+                    "top_p": model.parameters.top_p,
+                    "max_tokens": model.parameters.max_tokens,
+                    "reasoning_effort": model.parameters.reasoning_effort,
+                    "max_completion_tokens": model.parameters.max_completion_tokens,
+                    "presence_penalty": model.parameters.presence_penalty,
+                    "frequency_penalty": model.parameters.frequency_penalty,
+                },
                 "declared_capabilities": model
                     .declared_capabilities
                     .iter()

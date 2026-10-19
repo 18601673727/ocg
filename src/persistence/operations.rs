@@ -47,6 +47,8 @@ pub enum OperationKind {
     ConfirmJobStopped,
     RecordMetrics,
     RecordAvailabilityStat,
+    RecordSentRequest,
+    RecordProviderAnswer,
     /// One bounded batch of AvailabilityStat aggregation. Its marker's
     /// subject is the last record the batch consumed.
     ConsumeAvailability,

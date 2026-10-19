@@ -35,11 +35,12 @@ export function jobTranscript(
   attachments?: readonly string[],
   tools?: readonly ControlToolCall[],
 ): TranscriptTurn[] {
-  const progress = outputs
+  const answerOutputs = outputs.filter((output) => output.kind !== "reasoning");
+  const progress = answerOutputs
     .filter((output) => output.kind === "progress")
     .map((output) => output.summary ?? "")
     .join("");
-  const result = outputs.findLast((output) => output.kind === "result") ?? null;
+  const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
   const state = settlement?.state ?? "unsettled";
   const base = {
     id: `${jobId}:answer`,

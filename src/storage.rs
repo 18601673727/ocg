@@ -73,17 +73,17 @@ use codec::{
 pub(crate) use derived::relationship_inconsistencies;
 pub(crate) use observations::{
     read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
-    read_observed_models,
+    read_observed_models, read_provider_request,
 };
 use open::allocate;
 pub(crate) use open::{OpenError, OpenedFile, database_file, open};
 pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pending_snapshot};
-use reads::read;
-#[cfg(test)]
-pub(crate) use reads::record_attachment_cleanup;
 #[allow(unused_imports)]
 pub(crate) use reads::ConversationEntry;
 pub(crate) use reads::ConversationsPage;
+use reads::read;
+#[cfg(test)]
+pub(crate) use reads::record_attachment_cleanup;
 pub(crate) use reads::{
     UnresolvedExecution, content_available, probe_committed, read_attachment,
     read_attachment_inputs, read_attachments, read_children, read_compatible_executors,

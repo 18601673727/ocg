@@ -86,6 +86,13 @@ async fn exchange(
             request.set_header(AUTHORIZATION, authorization)
         });
 
+    if let Some(sink) = sink.as_deref_mut() {
+        sink.sending(&body)
+            .await
+            .map_err(|error| ProviderExecutionError::NotDelivered {
+                message: error.message,
+            })?;
+    }
     let started = Instant::now();
     let sent = select(
         config.cancellation.cancelled(),

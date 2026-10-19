@@ -443,6 +443,8 @@ pub struct LlmParameters {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
     pub max_tokens: Option<u32>,
+    pub reasoning_effort: Option<String>,
+    pub max_completion_tokens: Option<u32>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
 }
@@ -560,10 +562,21 @@ pub enum RequestPayloadKind {
     Measurement = 1,
     Availability = 2,
     Token = 3,
+    Sent = 4,
+    Received = 5,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestPayload {
+    Sent {
+        messages: Vec<ContentDigest>,
+        tools: Option<ContentDigest>,
+        parameters: ContentDigest,
+        dropped_turns: Option<u32>,
+    },
+    Received {
+        digest: ContentDigest,
+    },
     Measurement {
         measurements: Measurements,
     },

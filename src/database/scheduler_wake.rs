@@ -96,6 +96,8 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::AppendJobOutput
         | OperationKind::RecordMetrics
         | OperationKind::RecordAvailabilityStat
+        | OperationKind::RecordSentRequest
+        | OperationKind::RecordProviderAnswer
         | OperationKind::ConsumeAvailability
         | OperationKind::ConsumeTokenUsage
         // Decisions only add evidence while the owning Job executes locally;
@@ -134,6 +136,8 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::AppendJobOutput
         | OperationKind::RecordMetrics
         | OperationKind::RecordAvailabilityStat
+        | OperationKind::RecordSentRequest
+        | OperationKind::RecordProviderAnswer
         | OperationKind::ConsumeAvailability
         | OperationKind::ConsumeTokenUsage
         | OperationKind::RecordToolDecision

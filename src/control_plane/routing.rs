@@ -17,6 +17,7 @@ pub(super) enum Route {
     Job(JobId),
     JobInput(JobId),
     JobConversation(JobId),
+    ProviderRequest(JobId, RequestNumber),
     AgentProfiles {
         before: Option<ProfileId>,
         limit: usize,
@@ -72,6 +73,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Job(_)
             | Route::JobInput(_)
             | Route::JobConversation(_)
+            | Route::ProviderRequest(..)
             | Route::Tools { .. }
             | Route::AgentProfiles { .. }
             | Route::Profiles
@@ -150,6 +152,13 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["jobs", job] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
+        }
+        ["jobs", job, "requests", number] => {
+            let job = job_id(job)?;
+            let request = decimal::<u32>(number)
+                .and_then(RequestNumber::new)
+                .ok_or(INVALID_REQUEST)?;
+            no_query(query).map(|()| Route::ProviderRequest(job, request))
         }
         ["jobs", job, "input"] => {
             let job = job_id(job)?;
@@ -260,6 +269,17 @@ pub(super) async fn respond(
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
         Route::JobConversation(job) => catalog::job_conversation(database, job).await,
+        Route::ProviderRequest(job, request) => {
+            let record = database
+                .provider_request(job, request)
+                .await?
+                .ok_or(NOT_FOUND)?;
+            Ok(Reply::ok(
+                json!({"api_version": API_VERSION, "job": job.to_string(),
+                "request": request.get(), "messages": record.messages, "tools": record.tools,
+                "parameters": record.parameters, "dropped_turns": record.dropped_turns, "response": record.response}),
+            ))
+        }
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await
         }

@@ -89,7 +89,7 @@ const INVALID_CAPABILITIES: Refusal = Refusal::new(
 const INVALID_PARAMETERS: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_parameters",
-    "LLM parameters must be finite numbers within valid bounds (temperature 0..=2, top_p 0..=1, max_tokens >= 1, penalties -2..=2)",
+    "LLM parameters must be finite numbers within valid bounds (temperature 0..=2, top_p 0..=1, one token limit >= 1, reasoning_effort supported by the wire, penalties -2..=2)",
 );
 const INVALID_INSTRUCTIONS: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -162,6 +162,10 @@ struct WireParameters {
     top_p: Option<f64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
     #[serde(default)]
     presence_penalty: Option<f64>,
     #[serde(default)]
@@ -441,6 +445,8 @@ async fn build_profiles_snapshot(
                         "temperature": model.parameters.temperature,
                         "top_p": model.parameters.top_p,
                         "max_tokens": model.parameters.max_tokens,
+                        "reasoning_effort": model.parameters.reasoning_effort,
+                        "max_completion_tokens": model.parameters.max_completion_tokens,
                         "presence_penalty": model.parameters.presence_penalty,
                         "frequency_penalty": model.parameters.frequency_penalty,
                     },
@@ -584,6 +590,14 @@ pub(super) async fn save_profile(
                     .top_p
                     .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
                 || parameters.max_tokens.is_some_and(|v| v == 0)
+                || parameters.max_completion_tokens.is_some_and(|v| v == 0)
+                || (parameters.max_tokens.is_some() && parameters.max_completion_tokens.is_some())
+                || parameters
+                    .reasoning_effort
+                    .as_deref()
+                    .is_some_and(|effort| {
+                        crate::openai_compatible::request::parse_reasoning_effort(effort).is_err()
+                    })
                 || parameters
                     .presence_penalty
                     .is_some_and(|v| !v.is_finite() || !(-2.0..=2.0).contains(&v))
@@ -699,6 +713,8 @@ pub(super) async fn save_profile(
                         temperature: parameters.temperature,
                         top_p: parameters.top_p,
                         max_tokens: parameters.max_tokens,
+                        reasoning_effort: parameters.reasoning_effort,
+                        max_completion_tokens: parameters.max_completion_tokens,
                         presence_penalty: parameters.presence_penalty,
                         frequency_penalty: parameters.frequency_penalty,
                     },
@@ -1264,5 +1280,116 @@ mod provider_network_tests {
             assert!(echoed.bytes().all(|byte| byte == b'x'));
         });
         worker.shutdown().expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod reasoning_parameter_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::persistence::{ExecutionConfiguration, JobInputDraft, NewJob};
+
+    #[test]
+    fn reasoning_parameters_validate_freeze_and_round_trip() {
+        crate::test_support::wait(async {
+            let (_root, directory) =
+                crate::test_support::data_directory("profiles", "reasoning-parameters");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let mut body = json!({"kind":"llm", "name":"reasoner", "model":"reasoner",
+                "declared_capabilities":["chat","reasoning"],
+                "parameters":{"reasoning_effort":"high", "max_completion_tokens":8192}});
+            let saved = save_profile(&handle, None, &serde_json::to_vec(&body).expect("JSON"))
+                .await
+                .expect("save");
+            let profile =
+                profile_id(saved.body["profile_id"].as_str().expect("id")).expect("profile");
+            let job = handle
+                .create_job(NewJob {
+                    name: None,
+                    eligible_at: None,
+                    parent: handle.genesis(),
+                    projects: vec![],
+                    dependencies: vec![],
+                    input: JobInputDraft::default(),
+                    previous: None,
+                    configuration: Some(ExecutionConfiguration {
+                        agent_profile: None,
+                        llm_profile: profile,
+                    }),
+                })
+                .await
+                .expect("freeze");
+            for invalid in [
+                json!({"reasoning_effort":"HIGH"}),
+                json!({"reasoning_effort":"unknown"}),
+                json!({"max_tokens":1,"max_completion_tokens":2}),
+                json!({"max_completion_tokens":0}),
+            ] {
+                body["parameters"] = invalid;
+                let refused = save_profile(
+                    &handle,
+                    Some(profile),
+                    &serde_json::to_vec(&body).expect("JSON"),
+                )
+                .await;
+                assert!(matches!(refused, Err(refusal) if refusal.code == "invalid_parameters"));
+            }
+            for effort in ["none", "minimal", "low", "medium", "high", "xhigh"] {
+                body["parameters"] = json!({"reasoning_effort":effort,"max_tokens":128});
+                save_profile(
+                    &handle,
+                    Some(profile),
+                    &serde_json::to_vec(&body).expect("JSON"),
+                )
+                .await
+                .expect("wire accepts effort");
+            }
+            worker.shutdown().expect("close");
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            let handle = worker.handle();
+            let frozen = handle
+                .job_configuration(job)
+                .await
+                .expect("read")
+                .expect("frozen")
+                .frozen;
+            assert_eq!(
+                frozen.llm.config.parameters.reasoning_effort.as_deref(),
+                Some("high")
+            );
+            assert_eq!(
+                frozen.llm.config.parameters.max_completion_tokens,
+                Some(8192)
+            );
+            let conversation =
+                crate::provider_execution::objective_conversation(&frozen, Some("hi"));
+            let request = crate::provider_execution::request_body(
+                &frozen.llm.config.model,
+                &frozen.llm.config.parameters,
+                &conversation,
+            )
+            .expect("request");
+            assert_eq!(request["reasoning_effort"], "high");
+            assert_eq!(request["max_completion_tokens"], 8192);
+            assert!(request.get("max_tokens").is_none());
+            use crate::orchestration::execution_runtime::{ContextLimits, fit_conversation};
+            let mut limits = ContextLimits::for_profile(&frozen.llm.config);
+            assert_eq!(limits.max_tokens, Some(8192));
+            limits.context_window = Some(8193);
+            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, vec![], limits).is_none());
+            limits.context_window = Some(8194);
+            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, vec![], limits).is_some());
+            let listed = list_profiles(&handle).await.expect("GET profiles");
+            assert_eq!(
+                listed.body["llm_profiles"][0]["parameters"]["reasoning_effort"],
+                "xhigh"
+            );
+            assert_eq!(
+                listed.body["llm_profiles"][0]["parameters"]["max_tokens"],
+                128
+            );
+            worker.shutdown().expect("close");
+        });
     }
 }

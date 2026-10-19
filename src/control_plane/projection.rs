@@ -103,6 +103,7 @@ pub(super) fn output_json(record: &JobOutputRecord) -> Value {
         OutputKind::Progress => "progress",
         OutputKind::Evaluation => "evaluation",
         OutputKind::Result => "result",
+        OutputKind::Reasoning => "reasoning",
     };
     json!({
         "id": record.id.to_string(),

@@ -98,8 +98,8 @@ function outputRecord(input: unknown) {
   const seq = integer(output.seq, "output.seq");
   if (seq === 0) throw new ContractError("output.seq", "a positive stored sequence");
   const kind = output.kind;
-  if (kind !== "progress" && kind !== "evaluation" && kind !== "result") {
-    throw new ContractError("output.kind", "progress, evaluation or result");
+  if (kind !== "progress" && kind !== "evaluation" && kind !== "result" && kind !== "reasoning") {
+    throw new ContractError("output.kind", "progress, evaluation, result or reasoning");
   }
   if (output.goal_reached !== null && typeof output.goal_reached !== "boolean") {
     throw new ContractError("output.goal_reached", "a boolean or null");
@@ -656,6 +656,8 @@ export function decodeProfiles(input: unknown) {
           temperature: optionalFiniteNumber(params.temperature, `${path}.parameters.temperature`),
           top_p: optionalFiniteNumber(params.top_p, `${path}.parameters.top_p`),
           max_tokens: timestamp(params.max_tokens, `${path}.parameters.max_tokens`),
+          reasoning_effort: optionalString(params.reasoning_effort, `${path}.parameters.reasoning_effort`),
+          max_completion_tokens: optionalInteger(params.max_completion_tokens, `${path}.parameters.max_completion_tokens`),
           presence_penalty: optionalFiniteNumber(params.presence_penalty, `${path}.parameters.presence_penalty`),
           frequency_penalty: optionalFiniteNumber(params.frequency_penalty, `${path}.parameters.frequency_penalty`),
         },

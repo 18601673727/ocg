@@ -69,7 +69,7 @@ fn provider_progress_skips_empty_text_and_preserves_whitespace() {
     wait(handle.claim_fixture(job, test_executor(&handle))).expect("claim");
     let mut sink = crate::orchestration::execution_runtime::output_sink(handle.clone(), job);
     for text in ["", " \t\n", "\u{2003}", " answer \n"] {
-        wait(sink.append(text)).expect("append");
+        wait(sink.append(IntermediateOutputKind::Progress, text)).expect("append");
     }
     let outputs = wait(handle.job_outputs(job, None, 10)).expect("outputs");
     assert_eq!(outputs.len(), 3);
@@ -15431,7 +15431,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 16);
+            assert_eq!(crate::storage::FORMAT_VERSION, 17);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");

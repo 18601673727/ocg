@@ -15,7 +15,7 @@ use ocg::persistence::{
     NewExecutor, NewJob, NewJobOutput, OutcomeCause, OutcomeKind,
 };
 use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -66,6 +66,7 @@ struct Options {
     payloads: Vec<usize>,
     outputs: Vec<usize>,
     scheduler_jobs: Vec<usize>,
+    provider_jobs: usize,
 }
 
 /// One comma-separated list of positive sizes, as `--clients 1,8` carries.
@@ -90,6 +91,7 @@ impl Options {
             section: "all".into(),
             iterations: 50,
             jobs: 1_000,
+            provider_jobs: 100_000,
             files: 1_000,
             clients: vec![1, 8],
             payloads: vec![1_024, 65_536],
@@ -104,7 +106,7 @@ impl Options {
                 "--help" | "-h" => {
                     println!(
                         "cargo bench --bench backend -- \
-                         [all|jobs|scheduler|reads|search|search_scale|mixed|maintenance] \
+                         [all|jobs|scheduler|reads|search|search_scale|mixed|maintenance|provider-record] \
                          [--iterations N] [--jobs N] [--files N] \
                          [--clients 1,8] [--payloads 1024,65536] [--outputs 3]\n\
                          Defaults: all, 50 iterations per client, 1000 read-fixture jobs, \
@@ -125,7 +127,9 @@ impl Options {
                          Maintenance: grows the file past the compaction policy, then reports what \
                          the compaction did and what concurrent readers and commands paid for it; \
                          refusals are counted, not fatal.\n\
-                         No HTTP, scheduler dispatch, external providers or LLM inference."
+                         Provider-record (opt-in): 100000 Jobs, 3 mock HTTP requests each; shared system\n\
+                         prompt/tools and 2 history turns; durable command and replay HTTP latency.\n\
+                         Other sections exclude HTTP, scheduler dispatch, external providers and LLM inference."
                     );
                     return Ok(None);
                 }
@@ -143,6 +147,7 @@ impl Options {
                     let val_str = arguments.next().ok_or("missing option value")?;
                     let values = sizes(&val_str)?;
                     options.jobs = *values.first().unwrap();
+                    options.provider_jobs = options.jobs;
                     options.scheduler_jobs = values;
                 }
                 "--clients" | "--payloads" | "--outputs" => {
@@ -154,7 +159,7 @@ impl Options {
                     }
                 }
                 "all" | "jobs" | "scheduler" | "reads" | "search" | "search_scale" | "mixed"
-                | "maintenance"
+                | "maintenance" | "provider-record"
                     if !section_seen =>
                 {
                     options.section = argument;
@@ -163,7 +168,9 @@ impl Options {
                 _ => return Err(format!("unknown argument: {argument}; use --help").into()),
             }
         }
-        if options.section != "scheduler" && (options.jobs > 4_000 || options.files > 4_000) {
+        if !matches!(options.section.as_str(), "scheduler" | "provider-record")
+            && (options.jobs > 4_000 || options.files > 4_000)
+        {
             return Err("--jobs and --files must be at most 4000 (production limits)".into());
         }
         Ok(Some(options))
@@ -1475,12 +1482,15 @@ fn main() -> Result<()> {
         "compiler": String::from_utf8(compiler.stdout)?.trim(),
         "available_parallelism": std::thread::available_parallelism()?.get(),
         "section": options.section, "iterations_per_client": options.iterations,
-        "jobs": options.jobs, "files": options.files,
+        "jobs": if options.section == "provider-record" { options.provider_jobs } else { options.jobs }, "files": options.files,
         "clients": options.clients, "payloads": options.payloads,
         "progress_outputs_per_job": options.outputs,
         "load_model": "closed_loop", "latency_unit": "ms", "temporary_storage": std::env::temp_dir(),
-        "scope": "public database and FTS APIs; excludes HTTP, scheduler dispatch and providers"})
+        "scope": if options.section == "provider-record" { "mock provider HTTP, request persistence and replay HTTP; excludes tool handlers and scheduler dispatch" } else { "public database and FTS APIs; excludes HTTP, scheduler dispatch and providers" }})
     );
+    if options.section == "provider-record" {
+        return provider_record(&options);
+    }
     if options.selected("jobs") {
         jobs(&options)?;
     }
@@ -1510,4 +1520,266 @@ fn main() -> Result<()> {
         return Err("search benchmarks require Unix".into());
     }
     Ok(())
+}
+
+struct ProviderBenchSink<'a> {
+    database: DatabaseHandle,
+    job: JobId,
+    request: ocg::persistence::RequestNumber,
+    recorder: ocg::provider_execution::RequestRecorder,
+    commits: &'a mut Vec<Duration>,
+    gap: Option<String>,
+}
+
+impl ProviderBenchSink<'_> {
+    async fn commit<T>(
+        &mut self,
+        operation: impl Future<Output = std::result::Result<T, ocg::database::DatabaseError>>,
+    ) -> std::result::Result<T, ocg::provider_execution::OutputSinkError> {
+        let began = Instant::now();
+        let result = operation.await;
+        self.commits.push(began.elapsed());
+        result.map_err(|error| ocg::provider_execution::OutputSinkError {
+            message: error.to_string(),
+        })
+    }
+}
+
+impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
+    fn sending<'a>(
+        &'a mut self,
+        body: &'a Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = std::result::Result<(), ocg::provider_execution::OutputSinkError>>
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let sent = self.recorder.prepare(self.job, self.request, body, 0)?;
+            let database = self.database.clone();
+            self.commit(database.record_sent_request(sent)).await
+        })
+    }
+
+    fn append<'a>(
+        &'a mut self,
+        kind: IntermediateOutputKind,
+        text: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = std::result::Result<(), ocg::provider_execution::OutputSinkError>>
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let database = self.database.clone();
+            self.commit(database.append_job_output(
+                self.job,
+                NewJobOutput {
+                    kind,
+                    summary: Some(text.into()),
+                    code: None,
+                    goal_reached: None,
+                    value: None,
+                },
+            ))
+            .await
+            .map(|_| ())
+        })
+    }
+
+    fn observe<'a>(
+        &'a mut self,
+        observed: ocg::provider_execution::ProviderObservation,
+    ) -> std::pin::Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            use ocg::provider_execution::ProviderFact;
+            use ocg::token_usage::{TokenAnnotation, UsageFinality};
+            let (measurements, token) = match observed.fact {
+                ProviderFact::NotDelivered => (Default::default(), TokenAnnotation::excluded()),
+                ProviderFact::Delivered => (
+                    Default::default(),
+                    TokenAnnotation::eligible(UsageFinality::Cumulative),
+                ),
+                ProviderFact::Usage { usage, finality } => (
+                    ocg::persistence::Measurements {
+                        usage,
+                        ..Default::default()
+                    },
+                    TokenAnnotation::eligible(finality),
+                ),
+            };
+            let database = self.database.clone();
+            if let Err(error) = self
+                .commit(database.record_metrics(ocg::persistence::NewMetrics {
+                    job: self.job,
+                    request: self.request,
+                    observed_at: observed.observed_at,
+                    measurements,
+                    token: Some(token),
+                }))
+                .await
+            {
+                self.gap.get_or_insert(error.message);
+            }
+        })
+    }
+}
+
+fn provider_record(options: &Options) -> Result<()> {
+    let provider_jobs = options.provider_jobs;
+    ntex::rt::System::new("provider-record-bench", ntex::rt::DefaultRuntime).block_on(async move {
+        use ntex::web::{self, App, HttpResponse, HttpServer};
+        use ocg::control_plane::{ControlPlane, ControlPlaneConfig};
+        use ocg::openai_compatible::{ChatConversation, ChatMessage, ChatToolCallWire};
+        use ocg::orchestration::execution_runtime::ExecutionRuntime;
+        use ocg::persistence::{NewAvailabilityStat, NewProviderAnswer, RequestNumber, Timestamp};
+        use ocg::provider_execution::{self, EnvironmentCredentialResolver, ProviderExecutionConfig};
+        use redb::ReadableTable;
+
+        let root = TemporaryRoot::new()?;
+        let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
+        let worker = DatabaseWorker::start(&directory)?;
+        let handle = worker.handle();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let provider_address = listener.local_addr()?;
+        let mock = HttpServer::new(async || {
+            App::new().default_service(web::to(async |body: web::types::Json<Value>| {
+                let count = body["messages"].as_array().map_or(0, Vec::len);
+                let round = count.saturating_sub(6) / 2;
+                let choice = if round < 2 {
+                    json!({"index":0, "delta":{"content":"Checking.", "reasoning_content":"Think.",
+                        "tool_calls":[{"index":0,"id":format!("call-{round}"),"type":"function",
+                        "function":{"name":"lookup","arguments":"{}"}}]}, "finish_reason":"tool_calls"})
+                } else {
+                    json!({"index":0, "delta":{"content":"Done.","reasoning_content":"Think."}, "finish_reason":"stop"})
+                };
+                let response = format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    json!({"choices":[choice]}),
+                    json!({"choices":[],"usage":{"prompt_tokens":2048,"completion_tokens":8}}));
+                HttpResponse::Ok().content_type("text/event-stream").body(response)
+            }))
+        }).workers(1).disable_signals().listen(listener)?.run();
+        let mock_finished = ntex::rt::spawn(mock.clone());
+        let target = executor(&handle)?;
+        let mut commits = Vec::new();
+        let mut job_commits = Vec::new();
+        let mut ids = Vec::with_capacity(provider_jobs);
+        let started = Instant::now();
+        for index in 0..provider_jobs {
+            let began = Instant::now();
+            let id = handle.create_job(job(&handle, target)).await?;
+            job_commits.push(began.elapsed());
+            let began = Instant::now();
+            handle.claim_execution(ocg::persistence::ClaimRequest {
+                job: id, allowed_pools: BTreeSet::from([target.executor.into()]),
+            }).await?.map_err(|refusal| format!("claim refused: {refusal:?}"))?;
+            job_commits.push(began.elapsed());
+            let mut frozen = handle.job_configuration(id).await?.ok_or("missing configuration")?.frozen;
+            frozen.llm.provider.endpoint = Some(format!("http://{provider_address}/v1"));
+            let mut conversation = ChatConversation {
+                messages: vec![ChatMessage::system("Shared system instructions. ".repeat(160)),
+                    ChatMessage::user("First historical question."),
+                    ChatMessage::assistant(Some("First historical answer.".into()), vec![]),
+                    ChatMessage::user("Second historical question."),
+                    ChatMessage::assistant(Some("Second historical answer.".into()), vec![]),
+                    ChatMessage::user(format!("Current question for Job {index}."))],
+                tools: vec![serde_json::from_value(json!({"type":"function", "function":{"name":"lookup",
+                    "description":"A shared lookup tool", "parameters":{"type":"object","properties":{},"additionalProperties":false}}}))?],
+                ..Default::default()
+            };
+            let mut sink = ProviderBenchSink {
+                database: handle.clone(), job: id, request: RequestNumber::FIRST,
+                recorder: Default::default(), commits: &mut commits, gap: None,
+            };
+            for round in 0..3 {
+                let response = provider_execution::execute_conversation(&frozen, &conversation,
+                    &EnvironmentCredentialResolver, &ProviderExecutionConfig::default(), Some(&mut sink)).await?;
+                if let Some(error) = sink.gap.take() { return Err(error.into()); }
+                if response.requests_tools() != (round < 2) { return Err("mock response has wrong round".into()); }
+                let assistant = ChatMessage::assistant(Some(response.text.clone()),
+                    response.tool_calls.iter().map(ChatToolCallWire::from).collect());
+                let stored = sink.recorder.response(&assistant).map_err(|error| error.message)?;
+                let digest = stored.digest();
+                let answer = NewProviderAnswer {
+                    stat: NewAvailabilityStat { job: id, request: sink.request, observed_at: Timestamp::now(),
+                        observation: provider_execution::success_observation(&response) },
+                    measurements: provider_execution::metrics(&response), response: stored,
+                };
+                sink.commit(handle.record_provider_answer(answer)).await.map_err(|error| error.message)?;
+                conversation.messages.push(assistant);
+                sink.recorder.remember_response(digest);
+                for call in response.tool_calls {
+                    conversation.messages.push(ChatMessage::tool(call.id, format!("{{\"job\":{index},\"round\":{round}}}")));
+                }
+                if round < 2 { sink.request = sink.request.next().ok_or("request overflow")?; }
+            }
+            let began = Instant::now();
+            handle.finalize_job(id, JobFinalization::Completed(FinalResult {
+                summary: Some("Done.".into()), code: None, goal_reached: None, value: None,
+            })).await?;
+            job_commits.push(began.elapsed());
+            ids.push(id);
+        }
+        let write_elapsed = started.elapsed();
+        let runtime = ExecutionRuntime::start(handle.clone())?;
+        const TOKEN: &str = "provider-record-benchmark-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let control = ControlPlane::start(ControlPlaneConfig::new(0, TOKEN)?, handle.clone(), runtime.scheduler())?;
+        let client = ntex::client::Client::builder().build(ntex::SharedCfg::default()).await?;
+        let mut gets = Vec::with_capacity(provider_jobs * 3);
+        for id in ids {
+            for request in 1..=3 {
+                let began = Instant::now();
+                let response = client.get(format!("http://{}/api/v1/jobs/{id}/requests/{request}", control.address()))
+                    .set_header("Authorization", format!("Bearer {TOKEN}")).send().await.map_err(|error| error.to_string())?;
+                if response.status() != ntex::http::StatusCode::OK { return Err(format!("GET failed: {}", response.status()).into()); }
+                let value: Value = response.json().await?;
+                gets.push(began.elapsed());
+                if value["messages"].as_array().map(Vec::len) != Some(6 + (request as usize - 1) * 2)
+                    || value["response"]["content"] != if request < 3 { "Checking." } else { "Done." }
+                    || value["tools"].as_array().map(Vec::len) != Some(1) {
+                    return Err("GET did not reconstruct the mock request".into());
+                }
+            }
+        }
+        control.stop().await?;
+        runtime.shutdown().await?;
+        mock.stop(true).await;
+        mock_finished.await.map_err(|_| "mock server panicked")??;
+        drop(handle);
+        worker.shutdown()?;
+        let database = Database::open(directory.database_path().join("ocg.redb"))?;
+        let tx = database.begin_read()?;
+        let messages = tx.open_table(TableDefinition::<&[u8], &[u8]>::new("message"))?;
+        let mut message_bytes = 0u64;
+        for row in messages.iter()? {
+            let (key, value) = row?;
+            message_bytes += (key.value().len() + value.value().len()) as u64;
+        }
+        if messages.len()? != 10 + provider_jobs as u64 * 3 {
+            return Err("shared prompts, tools, parameters and responses were not deduplicated".into());
+        }
+        let parameters = json!({"jobs": provider_jobs, "requests_per_job":3,"history_turns":2,
+            "shared_system_and_tools":true,"load_model":"serial", "commit_latency":"durable command acknowledgement including transaction and queue"});
+        println!("{}", json!({"type":"measurement", "name":"provider_record.storage", "parameters":parameters,
+            "provider_commits_per_request": commits.len() as f64 / (provider_jobs * 3) as f64,
+            "total_commits_per_request": (commits.len() + job_commits.len()) as f64 / (provider_jobs * 3) as f64,
+            "message_table_bytes":message_bytes, "message_table_bytes_per_job": message_bytes as f64 / provider_jobs as f64,
+            "message_rows":messages.len()?, "database_bytes":database_bytes(&directory)?, "write_elapsed_s":write_elapsed.as_secs_f64()}));
+        report("provider_record.commit", &parameters, commits, None);
+        report("provider_record.job_commit", &parameters, job_commits, None);
+        report("provider_record.GET_requests_n", &parameters, gets, None);
+        Ok(())
+    })
+}
+
+#[test]
+fn provider_record_smoke_test() {
+    let options = Options {
+        section: "provider-record".into(), provider_jobs: 2,
+        iterations: 1, jobs: 2, files: 1, clients: vec![1], payloads: vec![1024],
+        outputs: vec![3], scheduler_jobs: vec![2],
+    };
+    provider_record(&options).expect("two Jobs, six requests and six HTTP replays");
 }

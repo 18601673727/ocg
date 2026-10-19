@@ -6,12 +6,14 @@ use super::*;
 pub enum IntermediateOutputKind {
     Progress,
     Evaluation,
+    Reasoning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputKind {
     Progress,
     Evaluation,
+    Reasoning,
     Result,
 }
 
@@ -20,6 +22,7 @@ impl From<IntermediateOutputKind> for OutputKind {
         match kind {
             IntermediateOutputKind::Progress => Self::Progress,
             IntermediateOutputKind::Evaluation => Self::Evaluation,
+            IntermediateOutputKind::Reasoning => Self::Reasoning,
         }
     }
 }

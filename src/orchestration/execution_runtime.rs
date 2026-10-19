@@ -1821,6 +1821,15 @@ pub(crate) struct ContextLimits {
     pub(crate) max_tokens: Option<u32>,
 }
 
+impl ContextLimits {
+    pub(crate) fn for_profile(config: &crate::persistence::LlmConfig) -> Self {
+        Self {
+            context_window: config.context_window,
+            max_tokens: Some(config.parameters.max_completion_tokens.or(config.parameters.max_tokens).unwrap_or(4096)),
+        }
+    }
+}
+
 pub(crate) struct PriorTurnMessages {
     pub(crate) user: Option<ChatMessage>,
     pub(crate) assistant: ChatMessage,
@@ -1985,12 +1994,14 @@ pub(crate) fn fit_conversation(
     let mut kept_prior_messages = prior_messages;
     kept_prior_messages.drain(0..drop_count);
 
-    Some(assemble_final_conversation(
+    let mut conversation = assemble_final_conversation(
         system_with_notice,
         kept_prior_messages,
         current_user_message,
         tools,
-    ))
+    );
+    conversation.dropped_turns = drop_count as u32;
+    Some(conversation)
 }
 
 /// Runs a provider plan whose Job was started to its settlement.
@@ -2067,6 +2078,7 @@ async fn run_started_provider_job(
             return refused(format!("the input's attachments cannot be sent: {error}")).await;
         }
     };
+    let mut prior_attachments = Vec::new();
     let mut prior_turns = Vec::new();
     if let Some(first_previous) = job_record.previous {
         const MAX_CONVERSATION_TURNS: usize = 64;
@@ -2123,18 +2135,17 @@ async fn run_started_provider_job(
                 }
                 _ => return refused(format!("previous Job {current} has no final answer")).await,
             };
+            prior_attachments.push(ancestor_input.attachments);
             prior_turns.push((ancestor_input.objective, ancestor_images, assistant_text));
         }
         prior_turns.reverse();
+        prior_attachments.reverse();
     }
 
-    let context_limits = ContextLimits {
-        context_window: configuration.frozen.llm.config.context_window,
-        max_tokens: configuration.frozen.llm.config.parameters.max_tokens,
-    };
+    let context_limits = ContextLimits::for_profile(&configuration.frozen.llm.config);
     let tools_wire = offered.unwrap_or_default();
 
-    let conversation = match fit_conversation(
+    let mut conversation = match fit_conversation(
         &configuration.frozen,
         prior_turns,
         input_record.objective.as_deref(),
@@ -2163,6 +2174,17 @@ async fn run_started_provider_job(
         }
     };
 
+    let mut attachments = prior_attachments
+        .into_iter()
+        .skip(conversation.dropped_turns as usize)
+        .chain([input_record.attachments]);
+    for (index, message) in conversation.messages.iter().enumerate() {
+        if message.role == ChatRole::User {
+            conversation
+                .image_attachments
+                .insert(index, attachments.next().unwrap_or_default());
+        }
+    }
     let frozen = &configuration.frozen;
     let resolver = plan.credential_resolver.as_ref();
     let config = &plan.provider_config;
@@ -2299,6 +2321,16 @@ pub(crate) mod provider_seam {
                 message: "provider execution was cancelled before sending".to_owned(),
             });
         }
+        let body = provider_execution::request_body(
+            &frozen.llm.config.model,
+            &frozen.llm.config.parameters,
+            conversation,
+        )?;
+        super::ProviderOutputSink::sending(sink, &body)
+            .await
+            .map_err(|error| ProviderExecutionError::NotDelivered {
+                message: error.message,
+            })?;
         let response = {
             let mut scripts = SCRIPTS.lock().unwrap_or_else(PoisonError::into_inner);
             let script = endpoint(frozen)
@@ -2493,6 +2525,8 @@ async fn run_provider_job_inner(
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let mut sink = output_sink(run.database.clone(), run.job);
+    sink.recorder.image_attachments = std::mem::take(&mut conversation.image_attachments);
+    sink.dropped_turns = conversation.dropped_turns;
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
         // Nothing was sent, so nothing of a Provider is recorded.
         let stopped = Stopped::from(ToolLoopStop::InvalidLimits(error));
@@ -2560,9 +2594,8 @@ async fn run_provider_job_inner(
         };
         // A response that requests tools is no answer, but its facts are
         // this request's own.
-        if let Some(error) = record_answer(&run.database, run.job, sink.request, &result).await {
-            sink.gap.get_or_insert(error);
-        }
+        let assistant = assistant_message(&result);
+        record_answer(&mut sink, &result, &assistant).await;
         let next = sink
             .request
             .next()
@@ -2599,15 +2632,10 @@ async fn run_provider_job_inner(
             }
             (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
         };
-        let text = Some(result.text.clone()).filter(|text| !text.is_empty());
-        conversation.messages.push(ChatMessage::assistant(
-            text,
-            result
-                .tool_calls
-                .iter()
-                .map(ChatToolCallWire::from)
-                .collect(),
-        ));
+        conversation.messages.push(assistant);
+        if let Some(digest) = sink.response_digest.take() {
+            sink.recorder.remember_response(digest);
+        }
         for (call, content) in result.tool_calls.iter().zip(answers) {
             conversation
                 .messages
@@ -3124,32 +3152,49 @@ async fn stop_tool_loop(
 
 /// Records the facts of one answered request: its timing and its
 /// availability observation. Returns the first write that failed.
+fn assistant_message(result: &ProviderExecutionResult) -> ChatMessage {
+    ChatMessage::assistant(
+        Some(result.text.clone()).filter(|text| !text.is_empty()),
+        result
+            .tool_calls
+            .iter()
+            .map(ChatToolCallWire::from)
+            .collect(),
+    )
+}
+
 async fn record_answer(
-    database: &DatabaseHandle,
-    job: JobId,
-    request: RequestNumber,
+    sink: &mut DatabaseOutputSink,
     result: &ProviderExecutionResult,
-) -> Option<DatabaseError> {
-    let timing = database
-        .record_metrics(NewMetrics {
-            job,
-            request,
-            observed_at: Timestamp::now(),
+    assistant: &ChatMessage,
+) {
+    let response = match sink.recorder.response(assistant) {
+        Ok(response) => response,
+        Err(error) => {
+            // ChatMessage serialization is infallible for the admitted wire types.
+            unreachable!("assistant message could not be serialized: {error:?}");
+        }
+    };
+    let digest = response.digest();
+    let recorded = sink
+        .database
+        .record_provider_answer(crate::persistence::NewProviderAnswer {
+            stat: NewAvailabilityStat {
+                job: sink.job,
+                request: sink.request,
+                observed_at: Timestamp::now(),
+                observation: provider_execution::success_observation(result),
+            },
             measurements: provider_execution::metrics(result),
-            token: None,
+            response,
         })
-        .await
-        .map(|_| ());
-    let availability = database
-        .record_availability_stat(NewAvailabilityStat {
-            job,
-            request,
-            observed_at: Timestamp::now(),
-            observation: provider_execution::success_observation(result),
-        })
-        .await
-        .map(|_| ());
-    timing.err().or(availability.err())
+        .await;
+    match recorded {
+        Ok(()) => sink.response_digest = Some(digest),
+        Err(error) => {
+            sink.gap.get_or_insert(error);
+        }
+    }
 }
 
 /// Settles the Job from a finished execution, then records what the run
@@ -3167,11 +3212,11 @@ pub(crate) async fn finish_provider_job(
     executor: ExecutorId,
     input: JobInputId,
     job: JobId,
-    sink: DatabaseOutputSink,
+    mut sink: DatabaseOutputSink,
     execution: Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let request = sink.request;
-    let mut gap = sink.gap;
+    let mut gap = sink.gap.take();
     let receipt = match execution {
         Ok(result) => {
             let mut refused = None;
@@ -3208,7 +3253,10 @@ pub(crate) async fn finish_provider_job(
                 }
                 settled => settled,
             };
-            if let Some(error) = record_answer(&database, job, request, &result).await {
+            sink.database = database.clone();
+            sink.job = job;
+            record_answer(&mut sink, &result, &assistant_message(&result)).await;
+            if let Some(error) = sink.gap.take() {
                 gap.get_or_insert(error);
             }
             let final_output = match settled {
@@ -3266,6 +3314,9 @@ pub(crate) struct DatabaseOutputSink {
     /// The first observation that could not be written. The execution goes on
     /// regardless, see [`ProviderOutputSink::observe`].
     gap: Option<DatabaseError>,
+    recorder: provider_execution::RequestRecorder,
+    dropped_turns: u32,
+    response_digest: Option<crate::persistence::ContentDigest>,
 }
 
 pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutputSink {
@@ -3274,12 +3325,33 @@ pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutpu
         job,
         request: RequestNumber::FIRST,
         gap: None,
+        recorder: provider_execution::RequestRecorder::default(),
+        dropped_turns: 0,
+        response_digest: None,
     }
 }
 
 impl ProviderOutputSink for DatabaseOutputSink {
+    fn sending<'a>(
+        &'a mut self,
+        body: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+        Box::pin(async move {
+            let sent = self
+                .recorder
+                .prepare(self.job, self.request, body, self.dropped_turns)?;
+            if let Err(error) = self.database.record_sent_request(sent).await {
+                let message = format!("database could not persist provider request: {error}");
+                self.gap.get_or_insert(error);
+                return Err(OutputSinkError { message });
+            }
+            Ok(())
+        })
+    }
+
     fn append<'a>(
         &'a mut self,
+        kind: IntermediateOutputKind,
         text: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), OutputSinkError>> + 'a>>
     {
@@ -3291,7 +3363,7 @@ impl ProviderOutputSink for DatabaseOutputSink {
                 .append_job_output(
                     self.job,
                     NewJobOutput {
-                        kind: IntermediateOutputKind::Progress,
+                        kind,
                         summary: Some(text.to_owned()),
                         code: None,
                         goal_reached: None,
@@ -3444,7 +3516,9 @@ mod failure_tests {
                 200, Instant::now(), None, &config, Some(&mut sink),
                 &ChatConversation { messages: vec![ChatMessage::user("hi")], ..Default::default() },
             ).await.expect("stream persisted");
-            sink.append("").await.expect("skip empty");
+            sink.append(IntermediateOutputKind::Progress, "")
+                .await
+                .expect("skip empty");
             let outputs = database.job_outputs(job, None, 10).await.expect("outputs");
             assert_eq!(outputs.len(), 2);
             assert_eq!(outputs[0].summary.as_deref(), Some(prefix.as_str()));
@@ -3923,5 +3997,163 @@ mod failure_tests {
         assert_eq!(receiver.len(), 64);
         assert!(wait(database.jobs(None, 100)).expect("jobs").is_empty());
         worker.shutdown().expect("shutdown");
+    }
+}
+
+#[cfg(test)]
+mod provider_record_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::openai_compatible::{ChatFinishReason, NormalizedUsage};
+    use crate::persistence::{ContentDigest, NewAttachment, NewJob};
+    use crate::test_support::{data_directory, wait};
+    use serde_json::json;
+
+    #[test]
+    fn sent_requests_are_content_addressed_and_reuse_received_messages() {
+        wait(async {
+            let (_root, directory) = data_directory("provider-record", "replay");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let attachment = handle
+                .create_user_attachment(NewAttachment {
+                    content: crate::openai_compatible::image::tests::png(),
+                    mime: "image/png".into(),
+                    display_name: None,
+                })
+                .await
+                .expect("attachment");
+            let job = handle
+                .create_job(NewJob {
+                    name: None,
+                    eligible_at: None,
+                    parent: handle.genesis(),
+                    projects: vec![],
+                    dependencies: vec![],
+                    input: JobInputDraft {
+                        attachments: vec![attachment],
+                        ..Default::default()
+                    },
+                    previous: None,
+                    configuration: Some(crate::test_support::execution_configuration(&handle)),
+                })
+                .await
+                .expect("job");
+            let mut sink = output_sink(handle.clone(), job);
+            sink.dropped_turns = 2;
+            sink.recorder.image_attachments.insert(1, vec![attachment]);
+            let mut body = json!({"model":"mock", "stream":true, "tools":[{"type":"function"}],
+                "messages":[{"role":"user","content":"hello"},
+                {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]}]});
+            let pinned = crate::persistence::MessageBody::new(&body["messages"][0]).expect("body");
+            assert_eq!(
+                pinned.digest().to_string(),
+                "f4f7e767b9a1966921d93f1818bb0238c1633ed715f29a789b4e3a624ab16512"
+            );
+            sink.sending(&body).await.expect("Sent 1");
+            let first = handle
+                .provider_request(job, RequestNumber::FIRST)
+                .await
+                .expect("read")
+                .expect("Sent");
+            assert!(
+                first.response.is_none(),
+                "a crash here has no invented response"
+            );
+            assert_eq!(first.dropped_turns, 2);
+            assert_eq!(
+                first.messages[1]["content"][0]["image_url"]["url"],
+                json!({"attachment":attachment.to_string()})
+            );
+            sink.request = sink.request.next().expect("retry number");
+            let retry = sink
+                .recorder
+                .prepare(job, sink.request, &body, 2)
+                .expect("retry");
+            assert!(
+                retry.bodies.is_empty(),
+                "retry hashes and sends no earlier body"
+            );
+            assert_eq!(retry.dropped_turns, None);
+            handle.record_sent_request(retry).await.expect("Sent retry");
+            let result = ProviderExecutionResult {
+                text: "answer".into(),
+                reasoning: "private thinking".into(),
+                tool_calls: vec![],
+                usage: NormalizedUsage::default(),
+                finish_reason: Some(ChatFinishReason::Stop),
+                raw_finish_reason: Some("stop".into()),
+                status_code: 200,
+                request_id: None,
+                ttfb: Duration::ZERO,
+                finished_in: Duration::ZERO,
+            };
+            let assistant = assistant_message(&result);
+            record_answer(&mut sink, &result, &assistant).await;
+            assert!(sink.gap.is_none());
+            sink.recorder
+                .remember_response(sink.response_digest.take().expect("response digest"));
+            body["messages"]
+                .as_array_mut()
+                .expect("messages")
+                .push(serde_json::to_value(assistant).expect("assistant"));
+            sink.request = sink.request.next().expect("third");
+            let next = sink
+                .recorder
+                .prepare(job, sink.request, &body, 2)
+                .expect("next");
+            assert!(next.bodies.is_empty(), "the response is already stored");
+            handle.record_sent_request(next).await.expect("Sent 3");
+            let received = handle
+                .provider_request(job, RequestNumber::new(2).expect("two"))
+                .await
+                .expect("read")
+                .expect("request");
+            assert_eq!(
+                received.response,
+                Some(json!({"role":"assistant","content":"answer"}))
+            );
+            assert_eq!(received.parameters, json!({"model":"mock","stream":true}));
+            assert_eq!(received.tools, Some(body["tools"].clone()));
+            let third = handle
+                .provider_request(job, sink.request)
+                .await
+                .expect("read")
+                .expect("third");
+            assert_eq!(third.messages[2], received.response.expect("response"));
+            assert_eq!(third.dropped_turns, 2);
+            handle
+                .with_database(move |database| {
+                    use redb::{ReadableDatabase, ReadableTable};
+                    let tx = database.begin_read()?;
+                    let table =
+                        tx.open_table(redb::TableDefinition::<&[u8], &[u8]>::new("message"))?;
+                    let mut count = 0;
+                    for row in table.iter()? {
+                        let (key, bytes) = row?;
+                        assert_eq!(
+                            ContentDigest::of(bytes.value()).as_bytes().as_slice(),
+                            key.value()
+                        );
+                        assert!(!String::from_utf8_lossy(bytes.value()).contains("base64"));
+                        count += 1;
+                    }
+                    assert_eq!(count, 5, "two messages, tools, parameters and response");
+                    Ok(())
+                })
+                .await
+                .expect("check rows");
+            worker.shutdown().expect("close");
+            let worker = DatabaseWorker::start(&directory).expect("reopen");
+            assert_eq!(
+                worker
+                    .handle()
+                    .provider_request(job, RequestNumber::FIRST)
+                    .await
+                    .expect("read"),
+                Some(first)
+            );
+            worker.shutdown().expect("close");
+        });
     }
 }

@@ -19,8 +19,16 @@ pub trait CredentialResolver: Send + Sync {
 pub trait ProviderOutputSink {
     fn append<'a>(
         &'a mut self,
+        kind: IntermediateOutputKind,
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>>;
+
+    fn sending<'a>(
+        &'a mut self,
+        _body: &'a Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// Takes one Token fact. It cannot fail the request: a sink that cannot
     /// keep a fact owns that gap, and the provider outcome stays what the

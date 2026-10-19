@@ -1107,6 +1107,34 @@ impl DatabaseHandle {
         .await
     }
 
+    pub async fn record_sent_request(&self, sent: NewSentRequest) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::RecordSentRequest {
+            sent: Box::new(sent),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn record_provider_answer(
+        &self,
+        answer: NewProviderAnswer,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::RecordProviderAnswer {
+            answer: Box::new(answer),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn provider_request(
+        &self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<Option<ProviderRequestRecord>, DatabaseError> {
+        self.read(move |database| storage::read_provider_request(database, job, request))
+            .await
+    }
+
     /// Appends one availability observation of an LLM request a configured
     /// Job sent. Its LLM is the one the Job froze.
     pub async fn record_availability_stat(

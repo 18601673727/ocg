@@ -290,6 +290,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(ATTACHMENTS)?;
     tx.open_table(TOOL_CALLS)?;
     tx.open_table(REQUEST_EVENTS)?;
+    tx.open_table(MESSAGES)?;
     tx.open_table(PROJECTS)?;
     tx.open_table(PROJECT_MEMBERS)?;
     tx.open_table(PENDING)?;

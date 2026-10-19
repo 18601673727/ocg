@@ -160,6 +160,14 @@ pub(super) enum Command {
         metrics: Box<NewMetrics>,
         reply: Reply<MetricsId>,
     },
+    RecordSentRequest {
+        sent: Box<NewSentRequest>,
+        reply: Reply<()>,
+    },
+    RecordProviderAnswer {
+        answer: Box<NewProviderAnswer>,
+        reply: Reply<()>,
+    },
     RecordAvailabilityStat {
         stat: Box<NewAvailabilityStat>,
         reply: Reply<AvailabilityStatId>,
@@ -419,6 +427,22 @@ impl Command {
                 reply,
                 |batch| persistence::record_metrics(batch, *metrics),
             ),
+            Self::RecordSentRequest { sent, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::RecordSentRequest,
+                reply,
+                |batch| persistence::record_sent_request(batch, *sent),
+            ),
+            Self::RecordProviderAnswer { answer, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::RecordProviderAnswer,
+                reply,
+                |batch| persistence::record_provider_answer(batch, *answer),
+            ),
             Self::RecordAvailabilityStat { stat, reply } => run(
                 database,
                 operation,
@@ -512,6 +536,12 @@ impl Command {
             Self::CreateAttachment { attachment, .. } => byte_count(attachment.mime.len())
                 .saturating_add(text_bytes(&attachment.display_name)),
             Self::RecordMetrics { metrics, .. } => json_bytes(&metrics.measurements.usage.raw),
+            Self::RecordSentRequest { sent, .. } => sent.bodies.iter().fold(
+                byte_count(sent.messages.len()).saturating_mul(32),
+                |bytes, body| bytes.saturating_add(byte_count(body.byte_length())),
+            ),
+            Self::RecordProviderAnswer { answer, .. } => byte_count(answer.response.byte_length())
+                .saturating_add(json_bytes(&answer.measurements.usage.raw)),
             Self::RecordAvailabilityStat { stat, .. } => {
                 let observation = &stat.observation;
                 let failure = observation.failure.as_ref().map_or(0, |failure| {
@@ -576,7 +606,9 @@ impl Command {
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),
             Self::RecordMetrics { reply, .. } => refuse(reply, error),
             Self::RecordAvailabilityStat { reply, .. } => refuse(reply, error),
-            Self::RecordToolDecision { reply, .. }
+            Self::RecordSentRequest { reply, .. }
+            | Self::RecordProviderAnswer { reply, .. }
+            | Self::RecordToolDecision { reply, .. }
             | Self::RecordToolOutcome { reply, .. }
             | Self::ReconcileToolEffect { reply, .. } => refuse(reply, error),
         }

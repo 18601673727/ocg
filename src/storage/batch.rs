@@ -676,6 +676,42 @@ impl Batch {
         })
     }
 
+    pub(crate) fn put_message(
+        &mut self,
+        body: &crate::persistence::MessageBody,
+    ) -> Result<(), BatchError> {
+        self.step(|tx| {
+            let mut table = tx.open_table(MESSAGES)?;
+            {
+                if let Some(existing) = table.get(body.digest.as_bytes().as_slice())? {
+                    if existing.value() != body.bytes.as_slice() {
+                        return Err(StorageError::corrupted("message digest collision"));
+                    }
+                    return Ok(());
+                }
+            }
+            table.insert(body.digest.as_bytes().as_slice(), body.bytes.as_slice())?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_messages(
+        &mut self,
+        digests: impl Iterator<Item = ContentDigest>,
+    ) -> Result<(), BatchError> {
+        self.step(|tx| {
+            let table = tx.open_table(MESSAGES)?;
+            for digest in digests {
+                if table.get(digest.as_bytes().as_slice())?.is_none() {
+                    return Err(StorageError::corrupted(
+                        "request references a missing message",
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
     // ---- request events ----------------------------------------------------------------------
 
     pub(crate) fn request_observed(
@@ -744,7 +780,8 @@ impl Batch {
             recorded_at: self.now,
             payload,
         };
-        let scope = row.execution.as_ref().map(|execution| {
+        let scope = row.execution.as_ref().filter(|_| !matches!(event.payload,
+            RequestPayload::Sent { .. } | RequestPayload::Received { .. })).map(|execution| {
             (
                 execution.llm.provider.id.get(),
                 *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),

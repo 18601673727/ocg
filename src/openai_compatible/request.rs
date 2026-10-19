@@ -165,6 +165,10 @@ impl ChatRequest {
 /// frozen execution configuration and nothing here can change them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatConversation {
+    #[serde(skip)]
+    pub dropped_turns: u32,
+    #[serde(skip)]
+    pub image_attachments: BTreeMap<usize, Vec<crate::persistence::AttachmentId>>,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolWire>,
@@ -950,7 +954,7 @@ fn parse_tool_arguments(raw: &str, field: &str) -> Result<Value, TransportError>
     })
 }
 
-fn parse_reasoning_effort(effort: &str) -> Result<(), TransportError> {
+pub(crate) fn parse_reasoning_effort(effort: &str) -> Result<(), TransportError> {
     match effort {
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" => Ok(()),
         other => Err(TransportError::unsupported(

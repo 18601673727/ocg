@@ -76,6 +76,7 @@ pub(super) async fn parse_stream(
 struct StreamOutput<'a> {
     sink: Option<&'a mut dyn ProviderOutputSink>,
     text: String,
+    kind: IntermediateOutputKind,
     started: Option<Instant>,
 }
 
@@ -84,6 +85,7 @@ impl<'a> StreamOutput<'a> {
         Self {
             sink,
             text: String::with_capacity(STREAM_OUTPUT_BUFFER_BYTES),
+            kind: IntermediateOutputKind::Progress,
             started: None,
         }
     }
@@ -99,9 +101,17 @@ impl<'a> StreamOutput<'a> {
             })
     }
 
-    async fn buffer(&mut self, mut delta: &str) -> Result<(), OutputSinkError> {
+    async fn buffer(
+        &mut self,
+        kind: IntermediateOutputKind,
+        mut delta: &str,
+    ) -> Result<(), OutputSinkError> {
         if self.sink.is_none() {
             return Ok(());
+        }
+        if self.kind != kind {
+            self.flush().await?;
+            self.kind = kind;
         }
         while !delta.is_empty() {
             if self.text.is_empty() {
@@ -131,16 +141,17 @@ impl<'a> StreamOutput<'a> {
         let Some(sink) = self.sink.as_deref_mut() else {
             return Ok(());
         };
-        sink.append(&text).await
+        sink.append(self.kind, &text).await
     }
 }
 
 impl ProviderOutputSink for StreamOutput<'_> {
     fn append<'a>(
         &'a mut self,
+        kind: IntermediateOutputKind,
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
-        Box::pin(async move { self.buffer(text).await })
+        Box::pin(async move { self.buffer(kind, text).await })
     }
 
     fn observe<'a>(
@@ -377,8 +388,8 @@ async fn parse_stream_body(
             {
                 saw_delta = true;
             }
-            if let Some(delta) = delta.as_deref() {
-                output.buffer(delta).await.map_err(|error| {
+            for (kind, delta) in delta {
+                output.buffer(kind, &delta).await.map_err(|error| {
                     local_stop(
                         &error.message,
                         status_code,
@@ -453,8 +464,7 @@ fn local_stop(
     }
 }
 
-/// What a response stream has produced so far. Only the text is streamed
-/// out; reasoning and tool-call fragments wait for the end of the stream.
+/// What a response stream has produced so far.
 #[derive(Default)]
 struct StreamedResponse {
     text: String,
@@ -511,7 +521,7 @@ enum Refused {
     OutputLimit,
 }
 
-/// Folds the choice of one event into `response` and returns its text delta.
+/// Folds the choice of one event into `response` and returns its ordered deltas.
 /// The event's usage is not read here, see [`reported_usage`]. An invalid
 /// tool-call fragment rejects the whole choice, so none of its text and no
 /// finish reason of it is taken either.
@@ -519,15 +529,15 @@ fn consume_event(
     event: &Value,
     response: &mut StreamedResponse,
     max_output_bytes: usize,
-) -> Result<Option<String>, Refused> {
+) -> Result<Vec<(IntermediateOutputKind, String)>, Refused> {
     let Some(choice) = event
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
     else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let mut text = None;
+    let mut deltas = Vec::new();
     if let Some(delta) = choice.get("delta") {
         if let Some(deltas) = delta.get("tool_calls") {
             response
@@ -547,18 +557,69 @@ fn consume_event(
                 return Err(Refused::OutputLimit);
             }
             response.reasoning.push_str(value);
+            deltas.push((IntermediateOutputKind::Reasoning, value.to_owned()));
         }
         if let Some(value) = delta.get("content").and_then(Value::as_str) {
             if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
                 return Err(Refused::OutputLimit);
             }
             response.text.push_str(value);
-            text = Some(value.to_owned());
+            deltas.push((IntermediateOutputKind::Progress, value.to_owned()));
         }
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
         response.raw_finish_reason = Some(raw.to_owned());
         response.finish_reason = Some(ChatFinishReason::from_openai_str(raw));
     }
-    Ok(text)
+    Ok(deltas)
+}
+
+#[cfg(test)]
+mod reasoning_output_tests {
+    use super::*;
+    use crate::provider_execution::scripted::{Step, payload};
+
+    #[derive(Default)]
+    struct Sink(Vec<(IntermediateOutputKind, String)>);
+
+    impl ProviderOutputSink for Sink {
+        fn append<'a>(
+            &'a mut self,
+            kind: IntermediateOutputKind,
+            text: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+            Box::pin(async move {
+                self.0.push((kind, text.to_owned()));
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn reasoning_streams_in_order_with_the_same_bounds_as_answers() {
+        crate::test_support::on_system(|| async {
+            let mut sink = Sink::default();
+            let mut output = StreamOutput::new(Some(&mut sink));
+            output.append(IntermediateOutputKind::Reasoning, &"r".repeat(STREAM_OUTPUT_BUFFER_BYTES + 1)).await.expect("buffer");
+            output.append(IntermediateOutputKind::Progress, "answer").await.expect("switch flushes reasoning");
+            output.append(IntermediateOutputKind::Reasoning, "again").await.expect("switch flushes answer");
+            assert!(output.flush_delay() <= STREAM_OUTPUT_FLUSH_INTERVAL);
+            output.flush().await.expect("flush");
+            assert_eq!(sink.0, vec![
+                (IntermediateOutputKind::Reasoning, "r".repeat(STREAM_OUTPUT_BUFFER_BYTES)),
+                (IntermediateOutputKind::Reasoning, "r".into()),
+                (IntermediateOutputKind::Progress, "answer".into()),
+                (IntermediateOutputKind::Reasoning, "again".into()),
+            ]);
+            let config = ProviderExecutionConfig { max_output_bytes: 4, ..Default::default() };
+            let mut sink = Sink::default();
+            let result = parse_stream(payload(vec![
+                Step::Chunk("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"why\"}}]}\n\n"),
+                Step::Quiet(STREAM_OUTPUT_FLUSH_INTERVAL + Duration::from_millis(30)),
+                Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n"),
+            ], config.cancellation.clone()), 200, Instant::now(), None, &config, Some(&mut sink), &mut UsageCapture::default()).await.expect("reasoning counted once");
+            assert_eq!((result.text.as_str(), result.reasoning.as_str()), ("a", "why"));
+            assert_eq!(sink.0, [(IntermediateOutputKind::Reasoning, "why".into()), (IntermediateOutputKind::Progress, "a".into())]);
+        });
+    }
 }

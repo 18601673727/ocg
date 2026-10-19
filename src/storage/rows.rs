@@ -320,6 +320,8 @@ impl ConfigRow {
                 e.of64(p.temperature);
                 e.of64(p.top_p);
                 e.ou32(p.max_tokens);
+                e.ostr(&p.reasoning_effort);
+                e.ou32(p.max_completion_tokens);
                 e.of64(p.presence_penalty);
                 e.of64(p.frequency_penalty);
                 e.u32(m.declared_capabilities.len() as u32);
@@ -396,6 +398,8 @@ impl ConfigRow {
                     temperature: d.of64()?,
                     top_p: d.of64()?,
                     max_tokens: d.ou32()?,
+                    reasoning_effort: d.ostr()?,
+                    max_completion_tokens: d.ou32()?,
                     presence_penalty: d.of64()?,
                     frequency_penalty: d.of64()?,
                 };
@@ -753,6 +757,25 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
     e.ts(r.observed_at);
     e.ts(r.recorded_at);
     match &r.payload {
+        RequestPayload::Sent {
+            messages,
+            tools,
+            parameters,
+            dropped_turns,
+        } => {
+            e.u8(4);
+            e.u32(u32::try_from(messages.len()).expect("request messages fit u32"));
+            for digest in messages {
+                e.0.extend_from_slice(digest.as_bytes());
+            }
+            e.opt(tools, |e, digest| e.0.extend_from_slice(digest.as_bytes()));
+            e.0.extend_from_slice(parameters.as_bytes());
+            e.ou32(*dropped_turns);
+        }
+        RequestPayload::Received { digest } => {
+            e.u8(5);
+            e.0.extend_from_slice(digest.as_bytes());
+        }
         RequestPayload::Measurement { measurements } => {
             e.u8(1);
             for ms in [
@@ -805,6 +828,30 @@ pub(super) fn decode_request_event(
     let observed_at = d.ts()?;
     let recorded_at = d.ts()?;
     let payload = match d.u8()? {
+        4 => {
+            let mut messages = Vec::new();
+            for _ in 0..d.u32()? {
+                messages.push(ContentDigest::from_bytes(
+                    d.take(32)?.try_into().expect("32 bytes"),
+                ));
+            }
+            let tools = d.opt(|d| {
+                Ok(ContentDigest::from_bytes(
+                    d.take(32)?.try_into().expect("32 bytes"),
+                ))
+            })?;
+            let parameters = ContentDigest::from_bytes(d.take(32)?.try_into().expect("32 bytes"));
+            let dropped_turns = d.ou32()?;
+            RequestPayload::Sent {
+                messages,
+                tools,
+                parameters,
+                dropped_turns,
+            }
+        }
+        5 => RequestPayload::Received {
+            digest: ContentDigest::from_bytes(d.take(32)?.try_into().expect("32 bytes")),
+        },
         1 => {
             let ttfb_ms = d.ou64()?;
             let reasoning_ttft_ms = d.ou64()?;

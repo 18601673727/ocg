@@ -15,7 +15,10 @@ mod execution;
 mod identity;
 mod mutations;
 mod operations;
+mod provider_record;
 mod records;
+pub use provider_record::{MessageBody, NewProviderAnswer, NewSentRequest, ProviderRequestRecord};
+pub(crate) use provider_record::{record_provider_answer, record_sent_request};
 mod scheduling;
 mod tool_evidence;
 

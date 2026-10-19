@@ -95,6 +95,8 @@ impl Enc {
         self.of64(parameters.temperature);
         self.of64(parameters.top_p);
         self.ou32(parameters.max_tokens);
+        self.ostr(&parameters.reasoning_effort);
+        self.ou32(parameters.max_completion_tokens);
         self.of64(parameters.presence_penalty);
         self.of64(parameters.frequency_penalty);
         self.u32(u32::try_from(llm.declared_capabilities.len()).unwrap_or(u32::MAX));
@@ -283,6 +285,8 @@ impl<'a> Dec<'a> {
             temperature: self.of64()?,
             top_p: self.of64()?,
             max_tokens: self.ou32()?,
+            reasoning_effort: self.ostr()?,
+            max_completion_tokens: self.ou32()?,
             presence_penalty: self.of64()?,
             frequency_penalty: self.of64()?,
         };
@@ -367,7 +371,7 @@ pub(super) trait Code: Sized + Copy {
     fn from_code(code: u8) -> Option<Self>;
 }
 
-codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3 });
+codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3, OutputKind::Reasoning = 4 });
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
 codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1 });

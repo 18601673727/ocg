@@ -111,7 +111,9 @@ fn metrics_of(
                 }
                 last_measurement = None;
             }
-            RequestPayload::Availability { .. } => last_measurement = None,
+            RequestPayload::Availability { .. }
+            | RequestPayload::Sent { .. }
+            | RequestPayload::Received { .. } => last_measurement = None,
         }
     }
     records
@@ -499,6 +501,7 @@ pub(crate) fn read_observed_models(
         match event.payload {
             RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => flags.0 = true,
             RequestPayload::Availability { .. } => flags.1 = true,
+            RequestPayload::Sent { .. } | RequestPayload::Received { .. } => {}
         }
         Ok(true)
     })?;
@@ -524,4 +527,77 @@ pub(crate) fn read_observed_models(
         choices: page,
         next,
     })
+}
+
+pub(crate) fn read_provider_request(
+    database: &Database,
+    job: JobId,
+    request: RequestNumber,
+) -> Result<Option<crate::persistence::ProviderRequestRecord>, StorageError> {
+    let rx = read(database)?;
+    let events = rx.open_table(REQUEST_EVENTS)?;
+    let messages = rx.open_table(MESSAGES)?;
+    let value = |digest: ContentDigest| -> Result<serde_json::Value, StorageError> {
+        let bytes = messages
+            .get(digest.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("request references a missing message"))?;
+        serde_json::from_slice(bytes.value())
+            .map_err(|error| StorageError::corrupted(format!("invalid message JSON: {error}")))
+    };
+    let mut sent = None;
+    let mut response = None;
+    let mut dropped_turns = 0;
+    for entry in
+        events.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+    {
+        let (key, bytes) = entry?;
+        let event = decode_request_event(job, request, key.value().2, bytes.value())?;
+        match event.payload {
+            RequestPayload::Sent {
+                messages,
+                tools,
+                parameters,
+                dropped_turns: dropped,
+            } => {
+                if sent.is_some() {
+                    return Err(StorageError::corrupted("request has multiple Sent events"));
+                }
+                dropped_turns = dropped.unwrap_or_default();
+                sent = Some((
+                    messages
+                        .into_iter()
+                        .map(&value)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    tools.map(&value).transpose()?,
+                    value(parameters)?,
+                ));
+            }
+            RequestPayload::Received { digest } => response = Some(value(digest)?),
+            _ => {}
+        }
+    }
+    let Some((messages, tools, parameters)) = sent else {
+        return Ok(None);
+    };
+    if request != RequestNumber::FIRST {
+        for entry in events.range((job.get(), 1, 0)..=(job.get(), 1, u32::MAX))? {
+            let (key, bytes) = entry?;
+            if let RequestPayload::Sent {
+                dropped_turns: dropped,
+                ..
+            } = decode_request_event(job, RequestNumber::FIRST, key.value().2, bytes.value())?
+                .payload
+            {
+                dropped_turns = dropped.unwrap_or_default();
+                break;
+            }
+        }
+    }
+    Ok(Some(crate::persistence::ProviderRequestRecord {
+        messages,
+        tools,
+        parameters,
+        dropped_turns,
+        response,
+    }))
 }
