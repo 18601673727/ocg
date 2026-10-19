@@ -18,6 +18,9 @@ import {
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/control-client";
 import { cn } from "@/lib/utils";
+import { Section, describeError } from "./settings-parts";
+import { ProjectsSection } from "./projects-section";
+import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
 
 type Health = {
@@ -92,46 +95,7 @@ function SettingRow({
   );
 }
 
-function Section({
-  id,
-  title,
-  description,
-  action,
-  children,
-}: {
-  id: string;
-  title: string;
-  description: string;
-  action?: ReactNode;
-  children: ReactNode;
-}) {
-  return (
-    <section
-      aria-labelledby={id}
-      className="rounded-lg border border-border bg-background px-3 py-2.5 sm:px-4"
-    >
-      <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
-        <div className="min-w-0">
-          <h2 id={id} className="text-base font-semibold tracking-tight">{title}</h2>
-          <p className="mt-1 text-[13px] leading-5 text-muted-foreground">{description}</p>
-        </div>
-        {action}
-      </div>
-      <div>{children}</div>
-    </section>
-  );
-}
-
 const value = "[overflow-wrap:anywhere] text-[13px] font-medium text-foreground";
-
-function describeError(error: unknown): string {
-  if (error instanceof ControlTransportError) {
-    return error.detail
-      ? `${error.detail} (${error.code})`
-      : `Request refused (${error.code}, HTTP ${error.status}).`;
-  }
-  return error instanceof Error ? error.message : "The request could not be completed.";
-}
 
 export function SettingsSurface({
   client,
@@ -823,6 +787,9 @@ export function SettingsSurface({
                 </div>
               )}
             </Section>
+
+            <ProjectsSection client={client} />
+            <PoolsSection client={client} />
           </>
         ) : null}
 
@@ -930,6 +897,7 @@ export function SettingsSurface({
         >
           <ul className="flex list-disc flex-col gap-1.5 py-3 pl-5 text-[13px] leading-5 text-muted-foreground">
             <li>Workspace and startup preferences: no route owns them.</li>
+            <li>Releasing a quarantined slot: use <code>ocg release-slot &lt;job&gt;</code>; no route exists yet.</li>
           </ul>
         </Section>
       </div>

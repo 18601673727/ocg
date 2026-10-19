@@ -4,6 +4,7 @@ import {
   decodeAgentProfiles,
   decodeAttachment,
   decodeControlError,
+  decodeConversationEdit,
   decodeConversations,
   decodeHealth,
   decodeJobs,
@@ -16,7 +17,10 @@ import {
   decodeJobEvent,
   decodeJobTools,
   decodeOutputsPage,
+  decodePoolAnswer,
+  decodePools,
   decodeProfiles,
+  decodeProjectAnswer,
   decodeProjects,
   decodeSession,
   decodeStop,
@@ -28,6 +32,29 @@ import {
   type ControlToolCall,
 } from "../contracts";
 import { SseParser } from "./sse";
+
+export type ControlProjectCommand = { name: string; argv: string[] };
+
+export type ControlProjectCreate = {
+  name: string;
+  root: string;
+  description?: string | null;
+  commands?: ControlProjectCommand[];
+};
+
+export type ControlProjectUpdate = {
+  name: string;
+  description: string | null;
+  commands: ControlProjectCommand[];
+};
+
+export type ControlPoolUpdate =
+  | { concurrency_limit: number; enabled?: never }
+  | { enabled: boolean; concurrency_limit?: never };
+
+export type ControlConversationEdit =
+  | { title: string; hidden?: never }
+  | { hidden: true; title?: never };
 
 export type JobStreamEvent = ControlJobEvent | { type: "heartbeat"; };
 export type JobStreamEnd = "settled" | "stream_error" | "aborted";
@@ -396,6 +423,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeConversations((await send("GET", `/api/v1/conversations?${query.join("&")}`, { signal: settings.signal })).input);
     },
 
+    /** Renames a conversation or hides it for good. */
+    async editConversation(root: string, edit: ControlConversationEdit, signal?: AbortSignal) {
+      jobIdentity(root);
+      const answer = await send("POST", `/api/v1/conversations/${root}`, {
+        body: edit,
+        sign: true,
+        signal,
+      });
+      const result = decodeConversationEdit(answer.input, root);
+      conversationListeners.forEach((listener) => listener());
+      return result;
+    },
+
     async readJobs(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {
       const query = [`limit=${settings.limit ?? 50}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
@@ -474,6 +514,49 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         if (!page.next_before || page.next_before === before) throw new Error("Project cursor did not advance.");
         before = page.next_before;
       }
+    },
+
+    /** Creates a new Project. */
+    async createProject(body: ControlProjectCreate, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/projects", {
+        body,
+        sign: true,
+        signal,
+      });
+      return decodeProjectAnswer(answer.input);
+    },
+
+    /** Updates an existing Project. */
+    async updateProject(projectId: string, body: ControlProjectUpdate, signal?: AbortSignal) {
+      identity(projectId, "project", "project:");
+      const answer = await send("POST", `/api/v1/projects/${projectId}`, {
+        body,
+        sign: true,
+        signal,
+      });
+      return decodeProjectAnswer(answer.input);
+    },
+
+    /** Every Pool. */
+    async readPools(signal?: AbortSignal) {
+      const answer = await send("GET", "/api/v1/pools", { signal });
+      return decodePools(answer.input);
+    },
+
+    /** Updates a Pool's concurrency limit or enabled state. */
+    async updatePool(poolId: string, body: ControlPoolUpdate, signal?: AbortSignal) {
+      identity(poolId, "pool", "execution_pool:");
+      if (body.concurrency_limit !== undefined) {
+        if (!Number.isSafeInteger(body.concurrency_limit) || body.concurrency_limit < 1 || body.concurrency_limit > 4294967295) {
+          throw new ContractError("concurrency_limit", "an integer from 1 to 4294967295");
+        }
+      }
+      const answer = await send("POST", `/api/v1/pools/${poolId}`, {
+        body,
+        sign: true,
+        signal,
+      });
+      return decodePoolAnswer(answer.input);
     },
 
     /** Full Profile catalog (LLM Profiles, Agent Profiles) and computed Provider projection. */

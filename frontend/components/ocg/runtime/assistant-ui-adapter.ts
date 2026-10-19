@@ -59,7 +59,7 @@ function textPart(text: string): TextMessagePart {
 
 /**
  * Managed images are served by OCG's control server, so their stored URL is a
- * path relative to that server (e.g. `/api/v1/canonical/chat/images/...`). A
+ * path relative to that server (e.g. `/api/v1/attachments/...`). A
  * browser can only fetch it once it is resolved against the control base; the
  * page origin is not necessarily that server. Already-absolute URLs (https,
  * data, blob) are left untouched, and with no control base a relative path is

@@ -100,7 +100,16 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
   const sidebar = <OcgSidebar sessions={[...runtime.snapshot.sessions].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))}
     activeSessionId={sessionId} collapsed={collapsed} onToggle={() => setCollapsed(value => !value)}
     onSelect={id => { const selected = runtime.snapshot.sessions.find(session => session.id === id); setSessionId(id); setError(null); go("chat", selected?.sessionId ?? null); }}
-    onNewChat={() => void newChat()} runtimeStatus={runtime.snapshot.status} runtimeAuthority="canonical"
+    onNewChat={() => void newChat()}
+    onRename={runtime.client.renameSession ? (id, title) => runtime.client.renameSession!(id, title) : undefined}
+    onHide={runtime.client.hideSession ? async (id) => {
+      await runtime.client.hideSession!(id);
+      if (id === sessionId) {
+        setSessionId("");
+        go("chat");
+      }
+    } : undefined}
+    runtimeStatus={runtime.snapshot.status} runtimeAuthority="canonical"
     activeView={location.view} onNavigate={view => go(view)} onSettingsClick={() => go("settings")} />;
 
   return <div className="flex h-dvh min-h-0 w-full bg-background">

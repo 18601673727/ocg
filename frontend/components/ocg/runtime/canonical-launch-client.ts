@@ -7,6 +7,7 @@ import { jobTranscript } from "../chat/job-transcript-model";
 
 type Turn = { sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string };
 type Pending = { key: string; signature: string; submission: ControlSubmission; admittedJob?: string };
+type StreamEntry = { subscription: JobStreamSubscription; timer: ReturnType<typeof setTimeout> | null; stopped: boolean };
 
 /** Projects and sessions are presentation scope only: every backend turn is a Job. */
 export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
@@ -21,7 +22,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly pending = new Map<string, Pending>();
   private readonly sending = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
-  private readonly streams = new Map<string, { subscription: JobStreamSubscription; timer: ReturnType<typeof setInterval> }>();
+  private readonly streams = new Map<string, StreamEntry>();
   private refresh: Promise<void> | null = null;
 
   constructor(scenario: ScenarioId, private readonly control: HttpCanonicalControlClient) {
@@ -88,6 +89,47 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     throw new Error("The 0.5 Control Plane does not provide conversation deletion.");
   }
 
+  private sessionRoot(sessionId: string): string {
+    for (const [root, id] of this.roots.entries()) {
+      if (id === sessionId) return root;
+    }
+    throw new Error("This session has no admitted conversation.");
+  }
+
+  async renameSession(sessionId: string, title: string): Promise<void> {
+    const root = this.sessionRoot(sessionId);
+    const trimmed = title.trim();
+    await this.control.editConversation(root, { title: trimmed }, this.lifetime.signal);
+    const session = this.getSnapshot().sessions.find(s => s.id === sessionId);
+    if (session) {
+      this.emit({ type: "conversation.session-updated", session: { ...session, title: trimmed } });
+    }
+  }
+
+  async hideSession(sessionId: string): Promise<void> {
+    const root = this.sessionRoot(sessionId);
+    await this.refresh?.catch(() => {});
+    await this.control.editConversation(root, { hidden: true }, this.lifetime.signal);
+    this.pending.delete(sessionId);
+    this.selections.delete(sessionId);
+    this.emit({ type: "conversation.session-deleted", sessionId });
+    for (const [jobId, turn] of this.turns.entries()) {
+      if (turn.sessionId === sessionId) {
+        const stream = this.streams.get(jobId);
+        if (stream) {
+          stream.stopped = true;
+          if (stream.timer) clearTimeout(stream.timer);
+          stream.subscription.close();
+          this.streams.delete(jobId);
+        }
+      }
+    }
+    this.tips.delete(sessionId);
+    for (const [r, sid] of this.roots.entries()) {
+      if (sid === sessionId) this.roots.delete(r);
+    }
+  }
+
   setChatSelection(sessionId: string, selection: ChatModelSelection) {
     this.selections.set(sessionId, selection);
   }
@@ -108,10 +150,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async readConversation(job: string): Promise<string> {
-    const conversation = await this.control.readJobConversation(job, this.lifetime.signal);
+    await this.refresh?.catch(() => {});
+    let conversation = await this.control.readJobConversation(job, this.lifetime.signal);
     const root = conversation.turns[0].job.id;
     const id = this.roots.get(root) ?? root;
     this.roots.set(root, id);
+    const listedTip = this.tips.get(id);
+    if (listedTip && !conversation.turns.some(t => t.job.id === listedTip)) {
+      job = listedTip;
+      conversation = await this.control.readJobConversation(job, this.lifetime.signal);
+    }
     if (!this.getSnapshot().sessions.some(session => session.id === id)) {
       this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0].input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
     }
@@ -125,7 +173,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }));
     if (this.disposed) return id;
     this.tips.set(id, job);
-    const session = this.getSnapshot().sessions.find(session => session.id === id)!;
+    const session = this.getSnapshot().sessions.find(session => session.id === id);
+    if (!session) return id;
     this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: conversation.turns.at(-1)?.input.configuration?.agent_profile ?? undefined } });
     this.publish(id);
     for (const turn of conversation.turns) if (turn.job.settlement.state === "unsettled") this.watch(turn.job.id);
@@ -156,32 +205,89 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private watch(jobId: string) {
     const turn = this.turns.get(jobId);
     if (!turn || this.streams.has(jobId) || this.disposed) return;
-    const tools = async () => {
-      try { turn.tools = await this.control.readAllJobTools(jobId, this.lifetime.signal); this.publish(turn.sessionId); }
-      catch (error) { if (!this.disposed) { turn.error = `Tool evidence unavailable: ${error instanceof Error ? error.message : String(error)}`; this.publish(turn.sessionId); } }
+    const entry: StreamEntry = { subscription: null as unknown as JobStreamSubscription, timer: null, stopped: false };
+    let delay = 1500;
+    let inFlight = false;
+    let lastToolsJson = JSON.stringify(turn.tools);
+
+    const rearm = () => {
+      if (entry.stopped || this.disposed) return;
+      entry.timer = setTimeout(() => void tick(), delay);
     };
+
+    const tick = async () => {
+      if (entry.stopped || this.disposed) return;
+      if (typeof document !== "undefined" && document.hidden) {
+        rearm();
+        return;
+      }
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const fetched = await this.control.readAllJobTools(jobId, this.lifetime.signal);
+        if (entry.stopped || this.disposed) return;
+        const currentJson = JSON.stringify(fetched);
+        const changed = currentJson !== lastToolsJson;
+        lastToolsJson = currentJson;
+        turn.tools = fetched;
+        if (changed) {
+          delay = 1500;
+          this.publish(turn.sessionId);
+        } else {
+          delay = Math.min(delay * 2, 12000);
+        }
+      } catch (error) {
+        if (!this.disposed && !entry.stopped) {
+          turn.error = `Tool evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
+          this.publish(turn.sessionId);
+        }
+      } finally {
+        inFlight = false;
+        if (!entry.stopped && !this.disposed) {
+          rearm();
+        }
+      }
+    };
+
     const afterSeq = this.control.lastOutputSequence(jobId) ?? turn.outputs.at(-1)?.seq ?? 0;
     const subscription = this.control.subscribeJobEvents(jobId, event => {
       if (this.disposed) return;
       if (event.type === "job") turn.job = event.job;
-      if (event.type === "output" && !turn.outputs.some(output => output.seq === event.output.seq)) turn.outputs.push(event.output);
+      if (event.type === "output" && !turn.outputs.some(output => output.seq === event.output.seq)) {
+        turn.outputs.push(event.output);
+        delay = 1500;
+      }
       if (event.type === "settlement") turn.job = { ...turn.job, settlement: event.settlement, stop_confirmed_at_us: event.stop_confirmed_at_us };
-      if (event.type === "stream_error") throw new Error(`${event.error.code}: ${event.error.message}`);
+      if (event.type === "stream_error") {
+        turn.error = `${event.error.code}: ${event.error.message}. Reopen this conversation to recover persisted output.`;
+        this.publish(turn.sessionId);
+        return;
+      }
       this.publish(turn.sessionId);
     }, { signal: this.lifetime.signal, afterSeq, onReconnect: error => { turn.error = `Reconnecting: ${error.code}`; this.publish(turn.sessionId); } });
-    const timer = setInterval(() => void tools(), 1500);
-    this.streams.set(jobId, { subscription, timer });
+
+    entry.subscription = subscription;
+    this.streams.set(jobId, entry);
+    rearm();
+
     void subscription.closed.then(async end => {
       if (end === "settled") {
         turn.error = undefined;
-        await tools();
+        try { turn.tools = await this.control.readAllJobTools(jobId, this.lifetime.signal); } catch { /* ignore */ }
+        this.publish(turn.sessionId);
         await this.refreshConversations();
+      } else if (end === "stream_error") {
+        this.publish(turn.sessionId);
       }
     }).catch(error => {
       turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Reopen this conversation to recover persisted output.`;
       this.publish(turn.sessionId);
       this.report(error);
-    }).finally(() => { clearInterval(timer); this.streams.delete(jobId); });
+    }).finally(() => {
+      entry.stopped = true;
+      if (entry.timer) clearTimeout(entry.timer);
+      this.streams.delete(jobId);
+    });
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
@@ -253,7 +359,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   override dispose() {
     this.disposed = true;
     this.lifetime.abort();
-    for (const { subscription, timer } of this.streams.values()) { subscription.close(); clearInterval(timer); }
+    for (const entry of this.streams.values()) {
+      entry.stopped = true;
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.subscription.close();
+    }
     this.streams.clear();
     super.dispose();
   }

@@ -593,6 +593,25 @@ export function decodeAgentProfiles(input: unknown) {
   };
 }
 
+function projectRecord(input: unknown, path: string) {
+  const project = record(input, path);
+  return {
+    id: identity(project.id, `${path}.id`, "project:"),
+    name: string(project.name, `${path}.name`),
+    description: optionalString(project.description, `${path}.description`),
+    root: string(project.root, `${path}.root`),
+    commands: listOf(project.commands, `${path}.commands`, (command, commandPath) => {
+      const named = record(command, commandPath);
+      return {
+        name: string(named.name, `${commandPath}.name`),
+        argv: listOf(named.argv, `${commandPath}.argv`, (argument, argumentPath) => string(argument, argumentPath)),
+      };
+    }),
+    created_at_us: integer(project.created_at_us, `${path}.created_at_us`),
+    updated_at_us: integer(project.updated_at_us, `${path}.updated_at_us`),
+  };
+}
+
 /** One page of Projects from `GET /api/v1/projects`, newest first. */
 export function decodeProjects(input: unknown) {
   const envelope = record(input, "response");
@@ -605,29 +624,58 @@ export function decodeProjects(input: unknown) {
     throw new ContractError("next_before", "a cursor exactly when more Projects remain");
   }
   return {
-    projects: listOf(envelope.projects, "projects", (entry, path) => {
-      const project = record(entry, path);
-      return {
-        id: identity(project.id, `${path}.id`, "project:"),
-        name: string(project.name, `${path}.name`),
-        description: optionalString(project.description, `${path}.description`),
-        root: string(project.root, `${path}.root`),
-        commands: listOf(project.commands, `${path}.commands`, (command, commandPath) => {
-          const named = record(command, commandPath);
-          return {
-            name: string(named.name, `${commandPath}.name`),
-            argv: listOf(named.argv, `${commandPath}.argv`, (argument, argumentPath) => string(argument, argumentPath)),
-          };
-        }),
-        created_at_us: integer(project.created_at_us, `${path}.created_at_us`),
-        updated_at_us: integer(project.updated_at_us, `${path}.updated_at_us`),
-      };
-    }),
+    projects: listOf(envelope.projects, "projects", (entry, path) => projectRecord(entry, path)),
     has_more: hasMore,
     next_before: nextBefore,
   };
 }
 
+export function decodeProjectAnswer(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return projectRecord(envelope.project, "project");
+}
+
+function poolRecord(input: unknown, path: string) {
+  const pool = record(input, path);
+  const concurrencyLimit = integer(pool.concurrency_limit, `${path}.concurrency_limit`);
+  if (concurrencyLimit < 1) {
+    throw new ContractError(`${path}.concurrency_limit`, "an integer >= 1");
+  }
+  return {
+    id: identity(pool.id, `${path}.id`, "execution_pool:"),
+    name: string(pool.name, `${path}.name`),
+    concurrency_limit: concurrencyLimit,
+    enabled: boolean(pool.enabled, `${path}.enabled`),
+  };
+}
+
+export function decodePools(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return {
+    pools: listOf(envelope.pools, "pools", (entry, path) => poolRecord(entry, path)),
+  };
+}
+
+export function decodePoolAnswer(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return poolRecord(envelope.pool, "pool");
+}
+
+export function decodeConversationEdit(input: unknown, root: string): string {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const conversation = string(envelope.conversation, "conversation");
+  if (conversation !== root) {
+    throw new ContractError("conversation", `matching root ${root}`);
+  }
+  return root;
+}
+
+export type ControlPools = ReturnType<typeof decodePools>;
+export type ControlPool = ControlPools["pools"][number];
 export type ControlProjects = ReturnType<typeof decodeProjects>;
 export type ControlProject = ControlProjects["projects"][number];
 export type ControlJobInput = ReturnType<typeof decodeJobInput>;

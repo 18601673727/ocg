@@ -20,7 +20,7 @@ import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { STATUS_TEXT } from "../primitives/tone";
+import { Input } from "@/components/ui/input";
 import {
   Tooltip,
   TooltipContent,
@@ -29,6 +29,7 @@ import {
 } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus } from "../types";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
+import { ControlTransportError } from "../runtime/control-client";
 import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { AccountMenu } from "./account-menu";
 import { ConversationSearch } from "./conversation-search";
@@ -50,8 +51,8 @@ type OcgSidebarProps = {
   onToggle: () => void;
   onSelect: (id: string) => void;
   onNewChat: () => void;
-  onDelete?: (id: string) => Promise<void>;
-  busySessionIds?: readonly string[];
+  onRename?: (id: string, title: string) => Promise<void>;
+  onHide?: (id: string) => Promise<void>;
   runtimeStatus: RuntimeStatus;
   /** Which runtime answers Chat, so the footer never claims a fixture runtime. */
   runtimeAuthority: RuntimeAuthority;
@@ -112,8 +113,8 @@ export function OcgSidebar({
   onToggle,
   onSelect,
   onNewChat,
-  onDelete,
-  busySessionIds = [],
+  onRename,
+  onHide,
   runtimeAuthority,
   activeView = "chat",
   projectName,
@@ -122,27 +123,55 @@ export function OcgSidebar({
   onSettingsClick,
 }: OcgSidebarProps) {
   const { t } = useI18n();
-  const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null);
-  const [deleting, setDeleting] = useState(false);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [hideTarget, setHideTarget] = useState<ChatSession | null>(null);
+  const [hiding, setHiding] = useState(false);
+  const [hideError, setHideError] = useState<string | null>(null);
+
+  const [renameTarget, setRenameTarget] = useState<ChatSession | null>(null);
+  const [renameTitle, setRenameTitle] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
-  const cancelDeleteRef = useRef<HTMLButtonElement>(null);
-  const targetBusy = deleteTarget !== null && busySessionIds.includes(deleteTarget.id);
-  // The signed Access email, when the request carried one. Local mode has no
-  // signed identity, so the account menu names that state instead.
+  const cancelHideRef = useRef<HTMLButtonElement>(null);
+
   const email = useAccountEmail();
   const logout = useRemoteLogout();
-  const confirmDelete = async () => {
-    if (!deleteTarget || !onDelete || deleting || targetBusy) return;
-    setDeleting(true);
-    setDeleteError(null);
+
+  const conversationError = (error: unknown): string => {
+    if (error instanceof ControlTransportError) {
+      if (error.code === "not_found") return t("sidebar.conversationNotFound");
+      if (error.code === "invalid_request") return t("sidebar.titleInvalid");
+    }
+    return error instanceof Error ? error.message : String(error);
+  };
+
+  const confirmRename = async (event?: React.FormEvent) => {
+    event?.preventDefault();
+    if (!renameTarget || !onRename || renaming) return;
+    setRenaming(true);
+    setRenameError(null);
     try {
-      await onDelete(deleteTarget.id);
-      setDeleteTarget(null);
+      await onRename(renameTarget.id, renameTitle);
+      setRenameTarget(null);
     } catch (cause: unknown) {
-      setDeleteError(cause instanceof Error ? cause.message : String(cause));
+      setRenameError(t("sidebar.renameFailed", { error: conversationError(cause) }));
     } finally {
-      setDeleting(false);
+      setRenaming(false);
+    }
+  };
+
+  const confirmHide = async () => {
+    if (!hideTarget || !onHide || hiding) return;
+    setHiding(true);
+    setHideError(null);
+    try {
+      await onHide(hideTarget.id);
+      setHideTarget(null);
+    } catch (cause: unknown) {
+      setHideError(t("sidebar.hideFailed", { error: conversationError(cause) }));
+    } finally {
+      setHiding(false);
     }
   };
   const canonicalMode = runtimeAuthority === "canonical";
@@ -408,12 +437,12 @@ export function OcgSidebar({
                       {session.title || t("sidebar.newChat")}
                     </span>
                   </button>
-                  {onDelete && (
+                  {(onRename || onHide) && session.sessionId && (
                     <DropdownMenu open={isMenuOpen} onOpenChange={(open) => setOpenMenuId(open ? session.id : null)}>
                       <DropdownMenuTrigger asChild>
                         <button
                           type="button"
-                          aria-label={t("sidebar.deleteChatNamed", { title: session.title || t("sidebar.newChat") })}
+                          aria-label={t("sidebar.chatActions", { title: session.title || t("sidebar.newChat") })}
                           onClick={(e) => {
                             e.stopPropagation();
                           }}
@@ -430,16 +459,28 @@ export function OcgSidebar({
                         </button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          disabled={busySessionIds.includes(session.id) || deleting}
-                          onSelect={() => {
-                            setDeleteError(null);
-                            setDeleteTarget(session);
-                          }}
-                          className="text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive"
-                        >
-                          {t("sidebar.deleteChat")}
-                        </DropdownMenuItem>
+                        {onRename && (
+                          <DropdownMenuItem
+                            onSelect={() => {
+                              setRenameError(null);
+                              setRenameTitle(session.title || "");
+                              setRenameTarget(session);
+                            }}
+                          >
+                            {t("sidebar.renameChat")}
+                          </DropdownMenuItem>
+                        )}
+                        {onHide && (
+                          <DropdownMenuItem
+                            onSelect={() => {
+                              setHideError(null);
+                              setHideTarget(session);
+                            }}
+                            className="text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive"
+                          >
+                            {t("sidebar.hideChat")}
+                          </DropdownMenuItem>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   )}
@@ -462,19 +503,43 @@ export function OcgSidebar({
           />
         </div>
       </div>
-      <Dialog open={deleteTarget !== null} onOpenChange={open => { if (!open && !deleting) setDeleteTarget(null); }}>
-        <DialogContent initialFocus={cancelDeleteRef} showCloseButton={!deleting} className="rounded-lg">
+      <Dialog open={renameTarget !== null} onOpenChange={open => { if (!open && !renaming) setRenameTarget(null); }}>
+        <DialogContent showCloseButton={!renaming} className="rounded-lg">
           <DialogHeader>
-            <DialogTitle className="normal-case tracking-normal">{t("sidebar.deleteChatTitle")}</DialogTitle>
-            <DialogDescription>{t("sidebar.deleteChatBody", { title: deleteTarget?.title || t("sidebar.newChat") })}</DialogDescription>
+            <DialogTitle className="normal-case tracking-normal">{t("sidebar.renameChatTitle")}</DialogTitle>
           </DialogHeader>
-          {targetBusy && <p role="status" className={`text-xs ${STATUS_TEXT['warning']}`}>{t("sidebar.deleteRunning")}</p>}
-          {deleteError && <p role="alert" className="break-words text-xs text-destructive">{t("sidebar.deleteFailed", { error: deleteError })}</p>}
+          <form onSubmit={(e) => void confirmRename(e)} className="flex flex-col gap-4">
+            <Input
+              value={renameTitle}
+              onChange={(e) => setRenameTitle(e.target.value)}
+              disabled={renaming}
+              autoFocus
+            />
+            {renameError && <p role="alert" className="break-words text-xs text-destructive">{renameError}</p>}
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={renaming} onClick={() => setRenameTarget(null)}>
+                {t("common.cancel")}
+              </Button>
+              <Button type="submit" disabled={renaming}>
+                {renaming && <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />}
+                {t("common.save")}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+      <Dialog open={hideTarget !== null} onOpenChange={open => { if (!open && !hiding) setHideTarget(null); }}>
+        <DialogContent initialFocus={cancelHideRef} showCloseButton={!hiding} className="rounded-lg">
+          <DialogHeader>
+            <DialogTitle className="normal-case tracking-normal">{t("sidebar.hideChatTitle")}</DialogTitle>
+            <DialogDescription>{t("sidebar.hideChatBody", { title: hideTarget?.title || t("sidebar.newChat") })}</DialogDescription>
+          </DialogHeader>
+          {hideError && <p role="alert" className="break-words text-xs text-destructive">{hideError}</p>}
           <DialogFooter>
-            <Button ref={cancelDeleteRef} variant="outline" disabled={deleting} onClick={() => setDeleteTarget(null)}>{t("common.cancel")}</Button>
-            <Button variant="destructive" disabled={deleting || targetBusy} onClick={() => void confirmDelete()}>
-              {deleting && <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />}
-              {t(deleting ? "sidebar.deletingChat" : "sidebar.deleteChat")}
+            <Button ref={cancelHideRef} variant="outline" disabled={hiding} onClick={() => setHideTarget(null)}>{t("common.cancel")}</Button>
+            <Button variant="destructive" disabled={hiding} onClick={() => void confirmHide()}>
+              {hiding && <LoaderCircle className="size-3.5 animate-spin" aria-hidden="true" />}
+              {t(hiding ? "sidebar.hiding" : "sidebar.hideChat")}
             </Button>
           </DialogFooter>
         </DialogContent>
