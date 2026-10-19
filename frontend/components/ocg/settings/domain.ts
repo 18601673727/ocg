@@ -64,7 +64,6 @@ export function createSettingsState(
       general: [], runtime: [], resources: [], access: [], diagnostics: [], advanced: [],
       appearance: [
         { id: "appearance.theme", label: "Theme", value: appearance.theme, description: "", ownership: "frontend-only", readOnly: false },
-        { id: "appearance.density", label: "Density", value: appearance.density, description: "", ownership: "frontend-only", readOnly: false },
         { id: "appearance.accent", label: "Accent", value: appearance.accent, description: "", ownership: "frontend-only", readOnly: false },
       ],
     } };
@@ -100,7 +99,6 @@ export function createSettingsState(
       ],
       appearance: [
         { id: "appearance.theme", label: "Theme", value: appearance.theme, description: "System, light, or dark presentation preference.", ownership: "frontend-only", readOnly: false },
-        { id: "appearance.density", label: "Density", value: appearance.density, description: "A restrained comfortable or compact layout preference.", ownership: "frontend-only", readOnly: false },
         { id: "appearance.accent", label: "Accent", value: appearance.accent, description: "A predefined technical accent; arbitrary CSS is not accepted.", ownership: "frontend-only", readOnly: false },
       ],
       diagnostics: [

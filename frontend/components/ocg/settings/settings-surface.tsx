@@ -78,9 +78,8 @@ function ChoiceGroup<T extends string>({
 
 function AppearanceSetting({ setting }: { setting: NormalizedSetting }) {
   const { t } = useI18n();
-  const { preferences, setTheme, setDensity, setAccent } = useTheme();
+  const { preferences, setTheme, setAccent } = useTheme();
   if (setting.id === "appearance.theme") return <ChoiceGroup label={t("settings.theme.label")} value={preferences.theme} onChange={setTheme} options={[{ value: "system", label: t("settings.theme.system") }, { value: "light", label: t("settings.theme.light") }, { value: "dark", label: t("settings.theme.dark") }]} />;
-  if (setting.id === "appearance.density") return <ChoiceGroup label={t("settings.density.label")} value={preferences.density} onChange={setDensity} options={[{ value: "comfortable", label: t("settings.density.comfortable") }, { value: "compact", label: t("settings.density.compact") }]} />;
   if (setting.id === "appearance.accent") return <ChoiceGroup label={t("settings.accent.label")} value={preferences.accent} onChange={setAccent} options={[{ value: "ochre", label: t("settings.accent.ochre") }, { value: "slate", label: t("settings.accent.slate") }, { value: "teal", label: t("settings.accent.teal") }]} />;
   return null;
 }
@@ -110,8 +109,6 @@ function localizeSetting(
       return { ...setting, label: t("settings.general.confirmations"), description: t("settings.general.confirmationsDesc") };
     case "appearance.theme":
       return { ...setting, label: t("settings.theme.label"), description: t("settings.theme.desc") };
-    case "appearance.density":
-      return { ...setting, label: t("settings.density.label"), description: t("settings.density.desc") };
     case "appearance.accent":
       return { ...setting, label: t("settings.accent.label"), description: t("settings.accent.desc") };
     default:

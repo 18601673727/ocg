@@ -17,7 +17,7 @@ import {
   SYNC_STATUS,
   TEXT_TONE,
 } from "@/components/ocg/primitives";
-import { useI18n, LanguageSwitcher } from "../i18n";
+import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 
 type OcgTopbarProps = {
@@ -133,8 +133,6 @@ export function OcgTopbar({
           <span className="font-medium">{syncLabel}</span>
         </div>
       )}
-
-      <LanguageSwitcher variant="select" className="ml-auto shrink-0" />
 
       {/* The execution-details control, kept clear of the title on the right. */}
       {inspectorControls && (
