@@ -1745,6 +1745,9 @@ fn provider_record(options: &Options) -> Result<()> {
             // leaves no client idle, and each keeps its own samples until
             // every client has finished and they can be merged.
             let next = Arc::new(AtomicUsize::new(0));
+            // The worker counts durable commits since the opening, so the
+            // window this section measures starts from what setup spent.
+            let durable_before = handle.durable_commits();
             let started = Instant::now();
             let mut runners = Vec::with_capacity(clients);
             for _ in 0..clients {
@@ -1831,6 +1834,7 @@ fn provider_record(options: &Options) -> Result<()> {
             // request named, so the merged order is the Job order again.
             ids.sort_unstable_by_key(|(index, _)| *index);
             let write_elapsed = started.elapsed();
+            let durable_commits = handle.durable_commits() - durable_before;
             let runtime = ExecutionRuntime::start(handle.clone())?;
             const TOKEN: &str = "provider-record-benchmark-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
             let control = ControlPlane::start(ControlPlaneConfig::new(0, TOKEN)?, handle.clone(), runtime.scheduler())?;
@@ -1880,6 +1884,7 @@ fn provider_record(options: &Options) -> Result<()> {
                 || !commits.not_delivered.is_empty() || job_commits.len() != provider_jobs * 3 {
                 return Err("unexpected provider commit counts".into());
             }
+            let commands = provider_commits + job_commits.len();
             println!("{}", json!({"type":"measurement", "name":"provider_record.storage", "parameters":parameters,
                 "storage_dir": storage_dir.clone(),
                 "commits_per_request": {"sent": commits.sent.len() as f64 / requests,
@@ -1890,18 +1895,23 @@ fn provider_record(options: &Options) -> Result<()> {
                     "usage": commits.usage.len() as f64 / requests,
                     "not_delivered": commits.not_delivered.len() as f64 / requests},
                 "provider_commits_per_request": provider_commits as f64 / requests,
-                "total_commits_per_request": (provider_commits + job_commits.len()) as f64 / requests,
+                "total_commits_per_request": commands as f64 / requests,
+                "commands": commands, "durable_commits": durable_commits,
+                "mean_group_size": commands as f64 / durable_commits as f64,
+                "durable_commits_per_second": durable_commits as f64 / write_elapsed.as_secs_f64(),
                 "message_table_bytes":message_bytes, "message_table_bytes_per_job": message_bytes as f64 / provider_jobs as f64,
-                "message_rows":messages.len()?, "database_bytes":database_bytes(&directory)?, "write_elapsed_s":write_elapsed.as_secs_f64(),
-                "commits_per_second": (provider_commits + job_commits.len()) as f64 / write_elapsed.as_secs_f64()}));
+                "message_rows":messages.len()?, "database_bytes":database_bytes(&directory)?, "write_elapsed_s":write_elapsed.as_secs_f64()}));
+            // No per-kind rate: one kind's samples over the whole run's time
+            // is neither that operation's throughput nor its share of the
+            // write thread. The storage line above carries the counts instead.
             for (kind, samples) in [("sent", commits.sent), ("output_flush", commits.output_flush),
                 ("answer", commits.answer), ("delivered", commits.delivered), ("usage", commits.usage),
                 ("not_delivered", commits.not_delivered)] {
                 if !samples.is_empty() {
-                    report(&format!("provider_record.{kind}_commit"), &parameters, samples, Some(write_elapsed));
+                    report(&format!("provider_record.{kind}_commit"), &parameters, samples, None);
                 }
             }
-            report("provider_record.job_commit", &parameters, job_commits, Some(write_elapsed));
+            report("provider_record.job_commit", &parameters, job_commits, None);
             report("provider_record.GET_requests_n", &parameters, gets, Some(gets_elapsed));
         }
         Ok(())

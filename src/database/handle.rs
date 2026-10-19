@@ -23,6 +23,18 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Command groups that have issued a durable commit since this opening
+    /// began. Every group ends in exactly one, so this is also the durable
+    /// commit count, and the commands submitted divided by it is the mean
+    /// group size.
+    ///
+    /// It counts work the worker has done, not what committed: a group whose
+    /// durable commit failed is counted here too, and the callers of those
+    /// commands are told their outcome is unknown.
+    pub fn durable_commits(&self) -> u64 {
+        self.shared.durable_commits.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
         self.shared
             .scheduler_subscription

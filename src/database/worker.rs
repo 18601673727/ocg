@@ -229,6 +229,7 @@ impl DatabaseWorker {
                     genesis,
                     epoch: AtomicU64::new(epoch),
                     next_operation: AtomicU64::new(next_operation),
+                    durable_commits: AtomicU64::new(0),
                     abandoned_at_open,
                     released: AtomicBool::new(false),
                     live_readers: AtomicUsize::new(0),
@@ -873,6 +874,11 @@ impl WriteWorker {
                 error: error.clone(),
                 outcome_unknown: false,
             });
+        }
+        // The group's durability is settled: a lone command committed its own
+        // transaction, and a group of them made all of theirs durable together.
+        if !executed.is_empty() {
+            self.shared.durable_commits.fetch_add(1, Ordering::SeqCst);
         }
         for (ran, outcome_unknown) in &executed {
             if *outcome_unknown {

@@ -64,6 +64,10 @@ pub(super) struct Shared {
     /// admission read lock never mix openings.
     pub(super) epoch: AtomicU64,
     pub(super) next_operation: AtomicU64,
+    /// Command groups that have issued a durable commit. Every group ends in
+    /// exactly one, so this counts durable commits too, and dividing the
+    /// commands submitted by it gives the mean group size.
+    pub(super) durable_commits: AtomicU64,
     /// The Jobs this worker's start settled as abandoned by an earlier
     /// opening; see [`DatabaseHandle::abandoned_at_open`].
     pub(super) abandoned_at_open: Vec<JobId>,
