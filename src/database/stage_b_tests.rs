@@ -101,6 +101,7 @@ fn leave_a_spawning_call(database: &DatabaseHandle, job: JobId) -> ToolCallRef {
         authorization: AuthorizationBasis::RegistryGrant,
     };
     wait(database.record_tool_decision(NewToolEvidence {
+        approval: None,
         call,
         tool_call_id: "call-1".into(),
         name: "workspace_run_command".into(),

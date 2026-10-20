@@ -535,7 +535,36 @@ pub struct AgentConfig {
     pub models: Vec<ConfigId>,
     pub default_model: Option<ConfigId>,
     pub dispatch_to: Vec<ConfigId>,
+    pub approve: Vec<ApproveClass>,
     pub tool_grant: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ApproveClass {
+    Commands,
+    Writes,
+    Dispatch,
+    Close,
+}
+
+impl ApproveClass {
+    pub fn of(tool_name: &str) -> Option<Self> {
+        match tool_name {
+            "workspace_run_command" => Some(Self::Commands),
+            "workspace_write_file" => Some(Self::Writes),
+            "job_dispatch" => Some(Self::Dispatch),
+            "job_close" => Some(Self::Close),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Commands => "commands",
+            Self::Writes => "writes",
+            Self::Dispatch => "dispatch",
+            Self::Close => "close",
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -546,6 +575,7 @@ impl Default for AgentConfig {
             models: Vec::new(),
             default_model: None,
             dispatch_to: Vec::new(),
+            approve: Vec::new(),
             tool_grant: None,
         }
     }
@@ -626,10 +656,12 @@ pub enum RequestPayloadKind {
     Token = 3,
     Sent = 4,
     Received = 5,
+    ApprovedCalls = 6,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestPayload {
+    ApprovedCalls,
     Sent {
         messages: Vec<ContentDigest>,
         tools: Option<ContentDigest>,

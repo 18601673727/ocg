@@ -109,6 +109,11 @@ pub(super) enum Command {
         submission: NewSubmission,
         reply: Reply<JobId>,
     },
+    DecideApproval {
+        approval: ToolCallRef,
+        decision: persistence::ApprovalDecision,
+        reply: Reply<Appended>,
+    },
     ApplyJobTool {
         call: ToolCallRef,
         tool: crate::orchestration::job_tools::JobToolCall,
@@ -387,6 +392,18 @@ impl Command {
                 reply,
                 |batch| persistence::create_submitted_job(batch, job, submission),
             ),
+            Self::DecideApproval {
+                approval,
+                decision,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::DecideApproval,
+                reply,
+                |batch| batch.decide(approval, decision),
+            ),
             Self::ApplyJobTool { call, tool, reply } => run(
                 database,
                 operation,
@@ -646,6 +663,12 @@ impl Command {
                 byte_count(request.allowed_pools.len()).saturating_mul(8)
             }
             Self::ClaimBatch { .. } | Self::BoundaryB { .. } => 4096,
+            Self::DecideApproval { decision, .. } => match decision {
+                persistence::ApprovalDecision::Answered { text } => byte_count(text.len()),
+                persistence::ApprovalDecision::Approved
+                | persistence::ApprovalDecision::Rejected
+                | persistence::ApprovalDecision::Voided => 64,
+            },
             Self::ApplyJobTool { tool, .. } => {
                 byte_count(format!("{tool:?}").len()).saturating_add(4096)
             }
@@ -731,9 +754,9 @@ impl Command {
             Self::RecordToolDecision { evidence, .. } => {
                 let identity = byte_count(evidence.tool_call_id.len())
                     .saturating_add(byte_count(evidence.name.len()));
-                match &evidence.decision {
-                    ToolDecision::Refused(_) => identity,
-                    ToolDecision::Admitted(admission) => identity
+                match evidence.decision.stored_admission() {
+                    None => identity,
+                    Some(admission) => identity
                         .saturating_add(byte_count(admission.handler_version.len()))
                         .saturating_add(byte_count(admission.parameters.len()))
                         .saturating_add(byte_count(admission.arguments.len())),
@@ -764,6 +787,7 @@ impl Command {
             Self::CreateClaimedFixture { reply, .. } => refuse(reply, error),
             Self::ClaimExecution { reply, .. } => refuse(reply, error),
             Self::ClaimBatch { reply, .. } => refuse(reply, error),
+            Self::DecideApproval { reply, .. } => refuse(reply, error),
             Self::ApplyJobTool { reply, .. } => refuse(reply, error),
             Self::BoundaryB { reply, .. } => refuse(reply, error),
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),

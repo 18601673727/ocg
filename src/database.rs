@@ -27,8 +27,7 @@ use crate::persistence::{
     NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
     ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, ProjectCommand, ProjectId,
     ProjectRecord, ProviderRequestRecord, PublishedAttachment, RequestNumber, SubmissionKey,
-    SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome,
-    ToolReconciliation, Violation,
+    SubmissionRecord, ToolCallRef, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
 };
 use crate::persistence::{
     Actor, Appended, ConversationAction, ConversationSpec, Entry, ExecutionConfiguration, StopProof,

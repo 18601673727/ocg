@@ -227,9 +227,11 @@ pub(super) fn tools_query(query: &str) -> Result<(Option<(RequestNumber, u32)>, 
 pub(super) fn tool_json(record: &ToolEvidenceRecord) -> Value {
     let decision = match &record.decision.fact {
         ToolDecision::Admitted(_) => "admitted",
+        ToolDecision::AwaitingApproval(_) => "awaiting_approval",
+        ToolDecision::AwaitingAnswer(_) => "awaiting_answer",
         ToolDecision::Refused(refusal) => refusal.as_str(),
     };
-    let (arguments, arguments_cut) = match record.admission() {
+    let (arguments, arguments_cut) = match record.decision.fact.stored_admission() {
         Some(admission) => {
             let (cut, truncated) = cut_tool_string(admission.arguments.as_str());
             (Some(cut), truncated)
@@ -484,6 +486,7 @@ mod tests {
             index: 0,
         };
         let admitted_record = ToolEvidenceRecord {
+            approval: None,
             call,
             tool_call_id: "call_abc".into(),
             name: "workspace_read_file".into(),
@@ -520,6 +523,7 @@ mod tests {
         assert_eq!(json["result"].as_str().unwrap().len(), 2048);
 
         let refused_record = ToolEvidenceRecord {
+            approval: None,
             call: ToolCallRef {
                 job: JobId::new(1),
                 request: RequestNumber::new(1).unwrap(),

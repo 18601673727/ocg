@@ -128,6 +128,11 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
     Ok(())
 }
 
+pub(crate) fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
+    registry.register("ask_user", Some("Ask the deciding user a question and wait for their answer."), json!({"type":"object", "additionalProperties":false, "properties":{"question":{"type":"string", "minLength":1}}, "required":["question"]}), Arc::new(HostOnly { version:"ask_user-1".into() }))?;
+    registry.authorize("ask_user")
+}
+
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     ToolLoopLimits {
         handler_timeout: timeout.saturating_add(super::blocking::STOP_GRACE),
@@ -135,15 +140,26 @@ pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     }
 }
 
-pub(crate) fn add(tools: Option<ToolExecution>) -> Result<ToolExecution, ToolRegistryError> {
+pub(crate) fn add(
+    tools: Option<ToolExecution>,
+    dispatch: bool,
+    ask_user: bool,
+) -> Result<ToolExecution, ToolRegistryError> {
     let mut tools = match tools {
         Some(tools) => tools,
         None => ToolExecution {
+            approve: Vec::new(),
+            decider: false,
             offer: ToolRegistry::default().offer(&[])?,
             limits: coding_limits(COMMAND_TIMEOUT),
         },
     };
-    tools.offer = tools.offer.with_job_tools()?;
+    if dispatch {
+        tools.offer = tools.offer.with_job_tools()?;
+    }
+    if ask_user {
+        tools.offer = tools.offer.with_ask_user()?;
+    }
     Ok(tools)
 }
 

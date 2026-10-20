@@ -143,7 +143,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 22, with no migration;
+cancelled if reopened without a claim. The stored format is 23, with no migration;
 recreate data directories made by earlier versions.
 
 ## Sign a browser in
@@ -248,3 +248,33 @@ does not consume this bound.
 conversations, including settled children, with title, Agent, state, hold,
 keep-open and recurrence details. The chat's child strip opens a child in the
 same chat view and provides Stop, Close and Hold/Unhold.
+
+Agents also accept `approve: ["commands", "writes", "dispatch", "close"]` on
+`POST /api/v1/profiles`. It defaults to empty; an omitted field on update keeps
+the policy, and `[]` clears it. These classes gate `workspace_run_command`,
+`workspace_write_file`, `job_dispatch` and `job_close`, respectively. A conversation
+needs an origin-user ancestor, itself included, to open with this policy.
+
+A gated call is recorded without running. Other calls in its response run, then
+the turn completes with the pending requests in its result. Child conversations
+with a deciding user and a Model that supports Tools also offer
+`ask_user {"question":"..."}`. Questions complete the turn in the same way.
+
+`GET /api/v1/conversations/{job:N}/cards` reads undecided approvals, questions,
+loop holds and quarantines throughout the live subtree. Each card names its
+conversation and parent; the chat nests cards under their parent conversation.
+System conversations show only quarantine cards.
+
+`POST /api/v1/approvals/{job:N}/{request}/{index}` takes
+`{"decision":"approve"}`, `{"decision":"reject"}`, or, for a question,
+`{"answer":"..."}`. A decision commits once and appends one Decision entry.
+The next claimed turn executes approved calls once under a host-made request 1,
+rechecking the current registry and grant; its first provider request is 2.
+Closing voids undecided calls. Approved calls that never ran appear in the final
+conversation result, and an unresolved approved execution blocks Retry.
+
+`POST /api/v1/jobs/{job:N}/release-slot` takes `{}` and first tries the host's
+process-group proof. A live group refuses with `slot_live`. When no group is
+tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
+confirmation. Successful replies are `released` or `already_released`. This route
+is available for any origin; the CLI continues to record operator confirmation.

@@ -51,27 +51,28 @@ pub(crate) use mutations::{
 pub use mutations::{is_handler_version, sanitize_display_name};
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
 pub use records::{
-    AgentBehavior, AgentConfig, AttachmentCleanup, AttachmentOrigin, AttachmentRecord,
-    BUILT_IN_COMMANDS, CapabilitySet, ClaimRecord, CleanupKind, ConfigBody, ConfigKind,
-    ConfigRecord, ConfigRef, ConnectionConfig, ContentDigest, ConversationEdit, ExecutionOperation,
-    ExecutionPool, ExecutionPoolConfig, ExecutorRecord, FrozenExecutionConfig, FrozenLlmConfig,
-    JobInputRecord, JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmTarget, LlmTransport,
-    MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES, MAX_ATTACHMENT_NAME_BYTES, Measurements,
-    MetricsRecord, ModelCapability, ModelConfig, NewAttachment, NewConfig, NewExecutionPool,
-    NewMetrics, NewProject, NewSubmission, OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey,
-    PendingJobsPage, PoolConfig, ProjectCommand, ProjectRecord, ProviderSnapshot,
-    RequestEventRecord, RequestFingerprint, RequestPayload, RequestPayloadKind, SubmissionKey,
-    SubmissionRecord, SubmittedConfiguration, ToolCallRecord, ToolStatRecord,
-    USAGE_SUMMARY_HOUR_MICROS, UsageSummaryFilter, UsageSummaryResponse, UsageSummaryRow,
-    validate_project_commands,
+    AgentBehavior, AgentConfig, ApproveClass, AttachmentCleanup, AttachmentOrigin,
+    AttachmentRecord, BUILT_IN_COMMANDS, CapabilitySet, ClaimRecord, CleanupKind, ConfigBody,
+    ConfigKind, ConfigRecord, ConfigRef, ConnectionConfig, ContentDigest, ConversationEdit,
+    ExecutionOperation, ExecutionPool, ExecutionPoolConfig, ExecutorRecord, FrozenExecutionConfig,
+    FrozenLlmConfig, JobInputRecord, JobOutputRecord, JobRecord, LlmConfig, LlmParameters,
+    LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES,
+    MAX_ATTACHMENT_NAME_BYTES, Measurements, MetricsRecord, ModelCapability, ModelConfig,
+    NewAttachment, NewConfig, NewExecutionPool, NewMetrics, NewProject, NewSubmission,
+    OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey, PendingJobsPage, PoolConfig,
+    ProjectCommand, ProjectRecord, ProviderSnapshot, RequestEventRecord, RequestFingerprint,
+    RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord, SubmittedConfiguration,
+    ToolCallRecord, ToolStatRecord, USAGE_SUMMARY_HOUR_MICROS, UsageSummaryFilter,
+    UsageSummaryResponse, UsageSummaryRow, validate_project_commands,
 };
 pub use scheduling::*;
 pub use tool_evidence::{
-    AuthorizationBasis, EffectConclusion, MAX_HANDLER_VERSION_BYTES,
-    MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES,
-    MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES, NewToolEvidence, NotInvokedReason, Recorded,
-    ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
-    ToolOutcomeKind, ToolPayload, ToolReconciliation, UncertainCause, WithheldReason,
+    ApprovalDecision, ApprovalRecord, AuthorizationBasis, EffectConclusion,
+    MAX_HANDLER_VERSION_BYTES, MAX_STORED_TOOL_ARGUMENTS_BYTES,
+    MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES,
+    NewToolEvidence, NotInvokedReason, Recorded, ToolAdmission, ToolCallRef, ToolDecision,
+    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind, ToolPayload, ToolReconciliation,
+    UncertainCause, WithheldReason,
 };
 use tool_evidence::{MAX_RECONCILER_BYTES, MAX_RECONCILIATION_TEXT_BYTES};
 

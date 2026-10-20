@@ -590,14 +590,22 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
     e.str(&record.tool_call_id);
     e.str(&record.name);
     e.bool(record.spawns);
+    e.opt(&record.approval, |e, call| e.call_ref(call));
     e.ts(record.decision.at);
     match &record.decision.fact {
         ToolDecision::Refused(refusal) => {
             e.u8(1);
             e.u8(refusal.code());
         }
-        ToolDecision::Admitted(admission) => {
-            e.u8(2);
+        ToolDecision::Admitted(admission)
+        | ToolDecision::AwaitingApproval(admission)
+        | ToolDecision::AwaitingAnswer(admission) => {
+            e.u8(match record.decision.fact {
+                ToolDecision::Admitted(_) => 2,
+                ToolDecision::AwaitingApproval(_) => 3,
+                ToolDecision::AwaitingAnswer(_) => 4,
+                ToolDecision::Refused(_) => unreachable!(),
+            });
             e.str(&admission.handler_version);
             e.u8(admission.effect.code());
             e.str(&admission.parameters);
@@ -655,16 +663,24 @@ pub(super) fn decode_tool_evidence(
     let tool_call_id = d.str()?;
     let name = d.str()?;
     let spawns = d.bool()?;
+    let approval = d.opt(|d| d.call_ref())?;
     let decided_at = d.ts()?;
     let decision = match d.u8()? {
         1 => ToolDecision::Refused(d.code(crate::openai_compatible::ToolCallRefusal::from_code)?),
-        2 => ToolDecision::Admitted(ToolAdmission {
-            handler_version: d.str()?,
-            effect: d.code(ToolEffect::from_code)?,
-            parameters: d.str()?,
-            arguments: ToolPayload::new(d.str()?),
-            authorization: d.code(AuthorizationBasis::from_code)?,
-        }),
+        tag @ 2..=4 => {
+            let admission = ToolAdmission {
+                handler_version: d.str()?,
+                effect: d.code(ToolEffect::from_code)?,
+                parameters: d.str()?,
+                arguments: ToolPayload::new(d.str()?),
+                authorization: d.code(AuthorizationBasis::from_code)?,
+            };
+            match tag {
+                2 => ToolDecision::Admitted(admission),
+                3 => ToolDecision::AwaitingApproval(admission),
+                _ => ToolDecision::AwaitingAnswer(admission),
+            }
+        }
         _ => return Err(StorageError::corrupted("invalid tool decision")),
     };
     let outcome = d.opt(|d| {
@@ -709,6 +725,7 @@ pub(super) fn decode_tool_evidence(
         tool_call_id,
         name,
         spawns,
+        approval,
         decision: Recorded {
             fact: decision,
             at: decided_at,
@@ -751,6 +768,7 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
     e.ts(r.observed_at);
     e.ts(r.recorded_at);
     match &r.payload {
+        RequestPayload::ApprovedCalls => e.u8(6),
         RequestPayload::Sent {
             messages,
             tools,
@@ -822,6 +840,7 @@ pub(super) fn decode_request_event(
     let observed_at = d.ts()?;
     let recorded_at = d.ts()?;
     let payload = match d.u8()? {
+        6 => RequestPayload::ApprovedCalls,
         4 => {
             let mut messages = Vec::new();
             for _ in 0..d.u32()? {

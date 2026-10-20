@@ -1070,7 +1070,7 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
 
 fn conversation_refusal(code: &'static str) -> Refusal {
     Refusal::new(
-        if code == "conversation_not_found" {
+        if matches!(code, "conversation_not_found" | "approval_not_found") {
             StatusCode::NOT_FOUND
         } else {
             StatusCode::UNPROCESSABLE_ENTITY
@@ -1714,5 +1714,191 @@ pub(super) mod tests {
 
         wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");
+    }
+}
+
+pub(super) async fn decide(
+    shared: &Shared,
+    approval: crate::persistence::ToolCallRef,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    use crate::persistence::ApprovalDecision;
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
+    let object = value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .ok_or(INVALID_BODY)?;
+    let (decision, name) = if let Some(answer) = object.get("answer") {
+        (
+            ApprovalDecision::Answered {
+                text: answer.as_str().ok_or(INVALID_BODY)?.to_owned(),
+            },
+            "answered",
+        )
+    } else {
+        match object.get("decision").and_then(Value::as_str) {
+            Some("approve") => (ApprovalDecision::Approved, "approved"),
+            Some("reject") => (ApprovalDecision::Rejected, "rejected"),
+            _ => return Err(INVALID_BODY),
+        }
+    };
+    let appended = shared
+        .database
+        .decide_approval(approval, decision)
+        .await
+        .map_err(action_error)?;
+    Ok(Reply::ok(
+        json!({"api_version":API_VERSION, "approval":[approval.job.get(),approval.request.get(),approval.index], "decision":name, "turn":appended.turn.to_string(), "seq":appended.seq, "joined":appended.joined}),
+    ))
+}
+
+pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply, Refusal> {
+    if !shared
+        .database
+        .job(conversation)
+        .await?
+        .is_some_and(|job| job.kind.is_conversation())
+    {
+        return Err(conversation_refusal("conversation_not_found"));
+    }
+    let cards = shared.database.conversation_cards(conversation).await?;
+    Ok(Reply::ok(
+        json!({"api_version":API_VERSION, "conversation":conversation.to_string(), "cards":cards}),
+    ))
+}
+
+pub(super) async fn release_slot(
+    database: &DatabaseHandle,
+    job: JobId,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    use crate::orchestration::blocking::{self, JobProof};
+    use crate::persistence::StopProof;
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
+    let object = value.as_object().ok_or(INVALID_BODY)?;
+    if object.keys().any(|key| key != "confirm")
+        || object
+            .get("confirm")
+            .is_some_and(|v| v != &Value::Bool(true))
+    {
+        return Err(INVALID_BODY);
+    }
+    let record = database.job(job).await?.ok_or(super::JOB_NOT_FOUND)?;
+    if record.unknown_at.is_none() {
+        return Err(conversation_refusal("not_quarantined"));
+    }
+    let released = || Reply::ok(json!({"api_version":API_VERSION,"status":"already_released"}));
+    if record.stop_confirmed_at.is_some() {
+        return Ok(released());
+    }
+    let proof = ntex::rt::spawn_blocking(move || blocking::prove_job(job))
+        .await
+        .map_err(|_| INTERNAL)?;
+    let by = match proof {
+        JobProof::Proven => StopProof::Proof,
+        JobProof::Live { group } => {
+            let refusal = conversation_refusal("slot_live");
+            return Ok(Reply::new(
+                refusal.status,
+                json!({"api_version":API_VERSION, "error":{"code":refusal.code,"message":format!("process group {group} is still live"),"group":group}}),
+            ));
+        }
+        JobProof::Untracked if object.get("confirm") == Some(&Value::Bool(true)) => StopProof::User,
+        JobProof::Untracked => return Err(conversation_refusal("confirm_required")),
+    };
+    match database.confirm_job_stopped(job, by).await {
+        Ok(()) => Ok(Reply::ok(
+            json!({"api_version":API_VERSION,"status":"released"}),
+        )),
+        Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => Ok(released()),
+        Err(error) => Err(action_error(error)),
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::persistence::*;
+    use crate::test_support::{data_directory, wait};
+    #[test]
+    fn inherited_quarantine_requires_confirmation_and_records_user_proof() {
+        let (_root, directory) = data_directory("approvals", "release-slot");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let configuration = crate::test_support::execution_configuration(&db);
+        let pool = wait(db.create_executor(NewExecutor {
+            name: "test".into(),
+            concurrency_limit: std::num::NonZeroU32::new(1).unwrap(),
+            llm_transports: std::collections::BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .unwrap();
+        let job = wait(db.create_claimed_fixture(
+            NewJob {
+                process_grant: None,
+                name: None,
+                eligible_at: None,
+                parent: db.genesis(),
+                project: None,
+                input: Default::default(),
+                configuration: Some(configuration),
+                previous: None,
+            },
+            pool,
+        ))
+        .unwrap();
+        wait(db.record_metrics(NewMetrics {
+            job,
+            request: RequestNumber::FIRST,
+            observed_at: Timestamp::now(),
+            measurements: Default::default(),
+            token: Some(crate::token_usage::TokenAnnotation::eligible(
+                crate::token_usage::UsageFinality::Cumulative,
+            )),
+        }))
+        .unwrap();
+        wait(db.record_tool_decision(NewToolEvidence {
+            call: ToolCallRef {
+                job,
+                request: RequestNumber::FIRST,
+                index: 0,
+            },
+            approval: None,
+            tool_call_id: "spawn".into(),
+            name: "workspace_run_command".into(),
+            spawns: true,
+            decision: ToolDecision::Admitted(ToolAdmission {
+                handler_version: "workspace_run_command-6".into(),
+                effect: ToolEffect::NonIdempotent,
+                parameters: "{}".into(),
+                arguments: ToolPayload::new("{}"),
+                authorization: AuthorizationBasis::RegistryGrant,
+            }),
+        }))
+        .unwrap();
+        worker.shutdown().unwrap();
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        crate::test_support::on_system(move || async move {
+            assert!(
+                matches!(release_slot(&db, job, b"{}").await, Err(refusal) if refusal.code == "confirm_required")
+            );
+            assert_eq!(
+                release_slot(&db, job, br#"{"confirm":true}"#)
+                    .await
+                    .unwrap()
+                    .body["status"],
+                "released"
+            );
+            assert_eq!(
+                db.job(job).await.unwrap().unwrap().stop_confirmed_by,
+                Some(StopProof::User)
+            );
+            assert_eq!(
+                release_slot(&db, job, b"{}").await.unwrap().body["status"],
+                "already_released"
+            );
+        });
+        worker.shutdown().unwrap();
     }
 }

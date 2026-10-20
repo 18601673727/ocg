@@ -1050,6 +1050,8 @@ pub(crate) fn workspace_tools_with(
         registry.authorize(name)?;
     }
     Ok(ToolExecution {
+        approve: Vec::new(),
+        decider: false,
         offer: registry.offer(&names)?,
         limits,
     })

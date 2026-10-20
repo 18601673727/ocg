@@ -372,6 +372,15 @@ impl Batch {
                     let frozen = (|| {
                         let frozen = self.freeze_configuration(configuration)?;
                         let agent = frozen.agent.as_ref();
+                        if tip.is_none()
+                            && agent.is_some_and(|a| !a.approve.is_empty())
+                            && !self.step(|tx| {
+                                reads::has_decider(&tx.open_table(JOBS)?, Some(conversation))
+                            })?
+                        {
+                            return self
+                                .reject(Violation::InvalidValue("approve", "no deciding user"));
+                        }
                         if agent.is_some_and(|agent| {
                             agent.tool_grant.is_some() || !agent.dispatch_to.is_empty()
                         }) && !frozen
@@ -621,7 +630,7 @@ impl Batch {
                 }
             }
             self.halt_recurrence(*current, RecurrenceHalt::Closed)?;
-            // K3 voids undecided approvals and questions here.
+            self.void_approvals(*current, by.clone())?;
         }
         for current in subtree.into_iter().rev() {
             self.settle(current)?;
@@ -738,7 +747,31 @@ impl Batch {
                 "not a turn of this conversation",
             ));
         }
-        // K3 refuses an approved call without a definite outcome.
+        let unresolved = self.step(|tx| {
+            let calls = tx.open_table(TOOL_CALLS)?;
+            let links = tx.open_table(APPROVAL_CALLS)?;
+            for record in job_tool_evidence(&calls, turn)? {
+                if record.approval.is_some() && record.is_unresolved() {
+                    return Ok(true);
+                }
+                if let Some(executing) = links.get(tool_call_key(record.call))? {
+                    let call = tool_call_ref(executing.value())?;
+                    let bytes = calls
+                        .get(tool_call_key(call))?
+                        .ok_or_else(|| StorageError::corrupted("approval execution missing"))?;
+                    if decode_tool_evidence(call, bytes.value())?.is_unresolved() {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        })?;
+        if unresolved {
+            return self.reject(Violation::InvalidValue(
+                "retry_unresolved_approval",
+                "an approved call has no definite outcome or reconciliation",
+            ));
+        }
         if matches!(by, Actor::Agent { .. })
             && self.step(|tx| {
                 let inputs = tx.open_table(TURN_INPUTS)?;
@@ -819,7 +852,19 @@ impl Batch {
         {
             return Ok(false);
         }
-        // K3 checks for undecided approvals and questions here.
+        if self.step(|tx| {
+            Ok(tx
+                .open_table(OPEN_APPROVALS)?
+                .range(
+                    (conversation.get(), 0, 0, 0)
+                        ..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX),
+                )?
+                .next()
+                .transpose()?
+                .is_some())
+        })? {
+            return Ok(false);
+        }
         let mut row = self.conversation(conversation)?;
         row.closing = Some(Closing {
             at: self.now,
@@ -1984,6 +2029,7 @@ mod tests {
             fixture
                 .database
                 .record_tool_decision(crate::persistence::NewToolEvidence {
+                    approval: None,
                     call,
                     tool_call_id: "spawn".into(),
                     name: "workspace_run_command".into(),
@@ -2267,6 +2313,7 @@ mod tests {
                 index,
             };
             wait(self.database.record_tool_decision(NewToolEvidence {
+                approval: None,
                 call,
                 tool_call_id: format!("call-{index}"),
                 name: tool.name().into(),
@@ -2743,6 +2790,287 @@ mod tests {
                 crate::persistence::Violation::InvalidValue("retry_limit", _)
             ))
         ));
+        fixture.worker.shutdown().unwrap();
+    }
+    fn awaiting(fixture: &Fixture, turn: JobId) -> ToolCallRef {
+        use crate::persistence::*;
+        fixture.claim_observed(turn);
+        let call = ToolCallRef {
+            job: turn,
+            request: RequestNumber::FIRST,
+            index: 0,
+        };
+        wait(fixture.database.record_tool_decision(NewToolEvidence {
+            call,
+            approval: None,
+            tool_call_id: "awaiting".into(),
+            name: "workspace_run_command".into(),
+            spawns: false,
+            decision: ToolDecision::AwaitingApproval(ToolAdmission {
+                handler_version: "test-1".into(),
+                effect: ToolEffect::NonIdempotent,
+                parameters: "{}".into(),
+                arguments: ToolPayload::new("{}"),
+                authorization: AuthorizationBasis::RegistryGrant,
+            }),
+        }))
+        .unwrap();
+        call
+    }
+
+    #[test]
+    fn approval_indexes_follow_request_decision_and_execution_and_detect_a_missing_row() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("approval-indexes");
+        let (conversation, first) = fixture.open();
+        let approval = awaiting(&fixture, first);
+        wait(fixture.database.with_database(move |database| {
+            assert!(derived::inconsistencies(database).unwrap().is_empty());
+            let tx = database.begin_write().unwrap();
+            tx.open_table(OPEN_APPROVALS)
+                .unwrap()
+                .remove(approvals::open_key(conversation, approval))
+                .unwrap();
+            tx.commit().unwrap();
+            assert_eq!(
+                derived::inconsistencies(database).unwrap(),
+                ["open_approval"]
+            );
+            let tx = database.begin_write().unwrap();
+            derived::rebuild(&tx, open::promotion_clock()).unwrap();
+            tx.commit().unwrap();
+
+            Ok(())
+        }))
+        .unwrap();
+        let next = wait(
+            fixture
+                .database
+                .decide_approval(approval, ApprovalDecision::Approved),
+        )
+        .unwrap()
+        .turn;
+        wait(fixture.database.with_database(|database| {
+            assert!(derived::inconsistencies(database).unwrap().is_empty());
+            Ok(())
+        }))
+        .unwrap();
+        wait(
+            fixture
+                .database
+                .finalize_job(first, JobFinalization::Completed(result("awaiting"))),
+        )
+        .unwrap();
+        fixture.claim(next);
+        wait(fixture.database.record_tool_decision(NewToolEvidence {
+            call: ToolCallRef {
+                job: next,
+                request: RequestNumber::FIRST,
+                index: 0,
+            },
+            approval: Some(approval),
+            tool_call_id: "execution".into(),
+            name: "workspace_run_command".into(),
+            spawns: false,
+            decision: ToolDecision::Refused(
+                crate::openai_compatible::ToolCallRefusal::Unauthorized,
+            ),
+        }))
+        .unwrap();
+        wait(fixture.database.with_database(|database| {
+            assert!(derived::inconsistencies(database).unwrap().is_empty());
+            Ok(())
+        }))
+        .unwrap();
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn concurrent_approval_decisions_append_exactly_once() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("approval-race");
+        let (_, first) = fixture.open();
+        let approval = awaiting(&fixture, first);
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let db = fixture.database.clone();
+            threads.push(std::thread::spawn(move || {
+                wait(db.decide_approval(approval, ApprovalDecision::Approved))
+            }));
+        }
+        let results = threads
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(
+                    r,
+                    Err(crate::database::DatabaseError::Rejected(
+                        Violation::InvalidValue("approval_decided", _)
+                    ))
+                ))
+                .count(),
+            1
+        );
+        wait(fixture.database.with_database(|database| {
+            let tx = database.begin_read().unwrap();
+            assert_eq!(tx.open_table(APPROVALS).unwrap().iter().unwrap().count(), 1);
+            assert_eq!(
+                tx.open_table(TURN_INPUTS)
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .filter(|entry| matches!(
+                        TurnEntry::decode(entry.as_ref().unwrap().1.value())
+                            .unwrap()
+                            .entry,
+                        Entry::Decision { .. }
+                    ))
+                    .count(),
+                1
+            );
+
+            Ok(())
+        }))
+        .unwrap();
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn close_voids_pending_approval_and_settles_the_child() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("approval-close");
+        let (root, _) = fixture.open();
+        let (child, turn) = fixture.child(root, false);
+        let approval = awaiting(&fixture, turn);
+        wait(
+            fixture
+                .database
+                .finalize_job(turn, JobFinalization::Completed(result("waiting"))),
+        )
+        .unwrap();
+        assert!(
+            wait(fixture.database.job(child))
+                .unwrap()
+                .unwrap()
+                .children_closed_at
+                .is_none()
+        );
+        wait(fixture.database.close(child, Actor::User)).unwrap();
+        assert!(matches!(
+            wait(
+                fixture
+                    .database
+                    .decide_approval(approval, ApprovalDecision::Approved)
+            ),
+            Err(crate::database::DatabaseError::Rejected(
+                Violation::InvalidValue("approval_decided", _)
+            ))
+        ));
+        assert!(
+            wait(fixture.database.job(child))
+                .unwrap()
+                .unwrap()
+                .subtree_settled
+        );
+        wait(fixture.database.with_database(move |database| {
+            let tx = database.begin_read().unwrap();
+            let table = tx.open_table(APPROVALS).unwrap();
+            let row = table.get(tool_call_key(approval)).unwrap().unwrap();
+            assert_eq!(
+                ApprovalRecord::decode(row.value()).unwrap().decision,
+                ApprovalDecision::Voided
+            );
+
+            Ok(())
+        }))
+        .unwrap();
+        assert!(matches!(
+            wait(fixture.database.tool_evidence(turn, None, 10)).unwrap()[0]
+                .decision
+                .fact,
+            ToolDecision::AwaitingApproval(_)
+        ));
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn unresolved_approved_execution_blocks_retry_of_both_turns() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("approval-retry");
+        let (conversation, first) = fixture.open();
+        let approval = awaiting(&fixture, first);
+        let next = wait(
+            fixture
+                .database
+                .decide_approval(approval, ApprovalDecision::Approved),
+        )
+        .unwrap()
+        .turn;
+        wait(
+            fixture
+                .database
+                .finalize_job(first, JobFinalization::Completed(result("waiting"))),
+        )
+        .unwrap();
+        fixture.claim(next);
+        wait(fixture.database.record_tool_decision(NewToolEvidence {
+            call: ToolCallRef {
+                job: next,
+                request: RequestNumber::FIRST,
+                index: 0,
+            },
+            approval: Some(approval),
+            tool_call_id: "execution".into(),
+            name: "workspace_run_command".into(),
+            spawns: true,
+            decision: ToolDecision::Admitted(ToolAdmission {
+                handler_version: "workspace_run_command-6".into(),
+                effect: ToolEffect::NonIdempotent,
+                parameters: "{}".into(),
+                arguments: ToolPayload::new("{}"),
+                authorization: AuthorizationBasis::RegistryGrant,
+            }),
+        }))
+        .unwrap();
+        for turn in [first, next] {
+            assert!(matches!(
+                wait(fixture.database.retry(conversation, turn, Actor::User)),
+                Err(crate::database::DatabaseError::Rejected(
+                    Violation::InvalidValue("retry_unresolved_approval", _)
+                ))
+            ));
+        }
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn grandchild_card_carries_its_parent_and_disappears_after_decision() {
+        use crate::persistence::ApprovalDecision;
+        let fixture = Fixture::new("approval-grandchild");
+        let (root, _) = fixture.open();
+        let (child, _) = fixture.child(root, true);
+        let (grandchild, turn) = fixture.child(child, true);
+        let approval = awaiting(&fixture, turn);
+        assert!(wait(fixture.database.has_decider(Some(grandchild))).unwrap());
+        let cards = wait(fixture.database.conversation_cards(root)).unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0]["parent"], child.to_string());
+        assert_eq!(cards[0]["conversation"], grandchild.to_string());
+        wait(
+            fixture
+                .database
+                .decide_approval(approval, ApprovalDecision::Rejected),
+        )
+        .unwrap();
+        assert!(
+            wait(fixture.database.conversation_cards(root))
+                .unwrap()
+                .is_empty()
+        );
         fixture.worker.shutdown().unwrap();
     }
 }

@@ -316,6 +316,9 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(TOOL_STATS)?;
     tx.open_table(USAGE_TOTALS)?;
     tx.open_table(RETRIES)?;
+    tx.open_table(APPROVALS)?;
+    tx.open_table(OPEN_APPROVALS)?;
+    tx.open_table(APPROVAL_CALLS)?;
     tx.open_table(RECURRENCES)?;
     tx.open_table(RECURRENCE_DUE)?;
     tx.open_table(ATTACHMENT_REFS)?;

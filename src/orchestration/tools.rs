@@ -378,6 +378,16 @@ pub(crate) struct Dispatch {
 }
 
 impl ToolOffer {
+    pub(crate) fn with_ask_user(&self) -> Result<Self, ToolRegistryError> {
+        super::job_tools::register_ask_user(&self.registry)?;
+        let names = self
+            .tools
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(["ask_user"])
+            .collect::<Vec<_>>();
+        self.registry.offer(&names)
+    }
     pub(crate) fn with_job_tools(&self) -> Result<Self, ToolRegistryError> {
         super::job_tools::register(&self.registry)?;
         let names = self

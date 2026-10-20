@@ -653,6 +653,52 @@ fn live_group_members(_: Pid) -> std::io::Result<bool> {
     ))
 }
 
+pub(crate) enum JobProof {
+    Proven,
+    Live { group: u32 },
+    Untracked,
+}
+
+#[cfg(unix)]
+pub(crate) fn prove_job(job: JobId) -> JobProof {
+    let mut groups = UNPROVEN_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut tracked = false;
+    let mut live = None;
+    let mut remaining = Vec::new();
+    for mut entry in groups.drain(..) {
+        if entry.job != job {
+            remaining.push(entry);
+            continue;
+        }
+        tracked = true;
+        signal(entry.group, Signal::KILL);
+        match prove_empty_timeout(entry.group, &entry.sentinel, Duration::from_millis(50)) {
+            Ok(()) => {
+                if let Err(error) = entry.leader.wait() {
+                    log::warn!("failed to reap unproven process leader: {error}");
+                }
+            }
+            Err(_) => {
+                live.get_or_insert(entry.group.as_raw_pid() as u32);
+                remaining.push(entry);
+            }
+        }
+    }
+    *groups = remaining;
+    match live {
+        Some(group) => JobProof::Live { group },
+        None if tracked => JobProof::Proven,
+        None => JobProof::Untracked,
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn prove_job(_job: JobId) -> JobProof {
+    JobProof::Untracked
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

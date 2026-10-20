@@ -95,6 +95,32 @@ pub enum ToolDecision {
     /// OCG accepted the call for execution. The handler may have been
     /// invoked only once this was durable.
     Admitted(ToolAdmission),
+    AwaitingApproval(ToolAdmission),
+    AwaitingAnswer(ToolAdmission),
+}
+
+impl ToolDecision {
+    pub fn stored_admission(&self) -> Option<&ToolAdmission> {
+        match self {
+            Self::Admitted(a) | Self::AwaitingApproval(a) | Self::AwaitingAnswer(a) => Some(a),
+            Self::Refused(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approved,
+    Rejected,
+    Answered { text: String },
+    Voided,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRecord {
+    pub decision: ApprovalDecision,
+    pub by: super::Actor,
+    pub at: Timestamp,
 }
 
 /// What OCG accepted for one execution: the exact registration, the
@@ -132,6 +158,7 @@ impl ToolAdmission {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewToolEvidence {
     pub call: ToolCallRef,
+    pub approval: Option<ToolCallRef>,
     /// The id the Provider gave the call; unique within the Job.
     pub tool_call_id: String,
     /// The tool the call named.
@@ -251,6 +278,7 @@ pub struct Recorded<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolEvidenceRecord {
     pub call: ToolCallRef,
+    pub approval: Option<ToolCallRef>,
     pub tool_call_id: String,
     pub name: String,
     /// Whether the admitted handler can start an OS process, as the caller of
@@ -265,7 +293,9 @@ impl ToolEvidenceRecord {
     pub fn admission(&self) -> Option<&ToolAdmission> {
         match &self.decision.fact {
             ToolDecision::Admitted(admission) => Some(admission),
-            ToolDecision::Refused(_) => None,
+            ToolDecision::Refused(_)
+            | ToolDecision::AwaitingApproval(_)
+            | ToolDecision::AwaitingAnswer(_) => None,
         }
     }
 

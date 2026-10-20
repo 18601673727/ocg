@@ -8,6 +8,18 @@ import type { Locale } from "./locale";
  * plural forms (`one` / `other`) since Chinese does not pluralize.
  */
 export const en = {
+  "chat.card.cards": "Needs your attention",
+  "chat.card.approve": "Approve",
+  "chat.card.reject": "Reject",
+  "chat.card.answer": "Send answer",
+  "chat.card.answerPlaceholder": "Your answer",
+  "chat.card.approval": "Approval requested",
+  "chat.card.question": "Question for you",
+  "chat.card.loop_hold": "Conversation loop paused",
+  "chat.card.quarantine": "Unconfirmed process stop",
+  "chat.card.release": "Release slot",
+  "chat.card.confirm": "This host has no tracked process group. Confirm that this turn’s processes have stopped before releasing its slot.",
+
   "chat.children": "Child conversations",
   "chat.child.open": "Open",
   "chat.child.closing": "Closing",
@@ -1468,6 +1480,18 @@ export type I18nKey = keyof typeof en;
 export type Dictionary = Record<I18nKey, string>;
 
 export const zh: Dictionary = {
+  "chat.card.cards": "需要您处理",
+  "chat.card.approve": "批准",
+  "chat.card.reject": "拒绝",
+  "chat.card.answer": "发送回答",
+  "chat.card.answerPlaceholder": "您的回答",
+  "chat.card.approval": "请求批准",
+  "chat.card.question": "向您提问",
+  "chat.card.loop_hold": "对话循环已暂停",
+  "chat.card.quarantine": "进程停止尚未确认",
+  "chat.card.release": "释放执行槽",
+  "chat.card.confirm": "此主机没有跟踪的进程组。请确认此轮的进程已停止，再释放执行槽。",
+
   "chat.children": "子对话",
   "chat.child.open": "开放",
   "chat.child.closing": "关闭中",

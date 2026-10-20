@@ -579,6 +579,13 @@ async fn report(
         );
         let _ = match &evidence.decision.fact {
             ToolDecision::Refused(refusal) => write!(report, "refused ({refusal:?})"),
+            ToolDecision::AwaitingApproval(admission) | ToolDecision::AwaitingAnswer(admission) => {
+                write!(
+                    report,
+                    "awaiting decision, arguments {}",
+                    shown_arguments(&evidence.name, admission.arguments.as_str())
+                )
+            }
             ToolDecision::Admitted(admission) => write!(
                 report,
                 "admitted ({:?}, handler {}), arguments {}",

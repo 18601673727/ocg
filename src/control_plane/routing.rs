@@ -67,6 +67,9 @@ pub(super) enum Route {
     },
     Submit,
     Admission,
+    DecideApproval(crate::persistence::ToolCallRef),
+    ReleaseSlot(JobId),
+    ConversationCards(JobId),
     ConversationAction(JobId, &'static str),
     AttachmentUpload,
     Attachment(AttachmentId),
@@ -119,6 +122,9 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Events { .. }
             | Route::Admission
             | Route::Submit
+            | Route::DecideApproval(_)
+            | Route::ReleaseSlot(_)
+            | Route::ConversationCards(_)
             | Route::ConversationAction(..)
             | Route::AttachmentUpload
             | Route::Attachment(_)
@@ -142,6 +148,19 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     if request.method() == Method::POST {
         return match segments.as_slice() {
             ["jobs"] => no_query(query).map(|()| Route::Submit),
+            ["jobs", job, "release-slot"] => {
+                no_query(query).and_then(|()| job_id(job).map(Route::ReleaseSlot))
+            }
+            ["approvals", job, request, index] => {
+                let approval = crate::persistence::ToolCallRef {
+                    job: job_id(job)?,
+                    request: decimal::<u32>(request)
+                        .and_then(RequestNumber::new)
+                        .ok_or(INVALID_REQUEST)?,
+                    index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
+                };
+                no_query(query).map(|()| Route::DecideApproval(approval))
+            }
             ["conversations", conversation, action]
                 if matches!(*action, "stop" | "close" | "hold" | "unhold" | "retry") =>
             {
@@ -227,6 +246,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["jobs", job, "input"] => {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::JobInput(job))
+        }
+        ["conversations", conversation, "cards"] => {
+            no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationCards))
         }
         ["conversations", conversation, "children"] => {
             let conversation = job_id(conversation)?;
@@ -438,6 +460,15 @@ pub(super) async fn respond(
             let key = submissions::idempotency_key(request.headers())?;
             submissions::lookup(shared, key).await
         }
+        Route::DecideApproval(approval) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            submissions::decide(shared, approval, &body).await
+        }
+        Route::ReleaseSlot(job) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            submissions::release_slot(database, job, &body).await
+        }
+        Route::ConversationCards(conversation) => submissions::cards(shared, conversation).await,
         Route::ConversationAction(conversation, action) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             submissions::action(shared, conversation, action, &body).await

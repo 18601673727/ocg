@@ -15,6 +15,17 @@ fn conversation_action(rest: &str) -> bool {
     matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry"), None) if !id.is_empty())
 }
 
+fn approval_or_release(rest: &str) -> bool {
+    let segments = rest.split('/').collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["approvals", job, request, index] => {
+            !job.is_empty() && !request.is_empty() && !index.is_empty()
+        }
+        ["jobs", job, "release-slot"] => !job.is_empty(),
+        _ => false,
+    }
+}
+
 /// Whether `path` names a route that is submitted to with `POST`: Job
 /// submission, a Job's stop, a Profile, Project, Pool or conversation
 /// change, or an image upload.
@@ -23,6 +34,7 @@ fn takes_post(path: &str) -> bool {
         Some("jobs" | "profiles" | "projects" | "provider-models" | "attachments") => true,
         Some(rest) => {
             conversation_action(rest)
+                || approval_or_release(rest)
                 || MEMBER_COLLECTIONS
                     .iter()
                     .any(|collection| member(rest, collection))
@@ -38,6 +50,7 @@ fn json_post_limit(path: &str) -> Option<usize> {
         Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
         Some("jobs" | "profiles" | "projects" | "provider-models") => Some(MAX_SUBMISSION_BYTES),
         Some(rest) => (conversation_action(rest)
+            || approval_or_release(rest)
             || MEMBER_COLLECTIONS
                 .iter()
                 .any(|collection| member(rest, collection)))

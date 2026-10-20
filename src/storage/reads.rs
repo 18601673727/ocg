@@ -331,6 +331,16 @@ fn conversation_result(
             }
         }
     }
+    for call in approved_calls(rx, conversation)? {
+        summary.push_str(&format!(
+            "\nApproved, never ran: {} {}",
+            call.name,
+            call.decision
+                .fact
+                .stored_admission()
+                .map_or("{}", |a| a.arguments.as_str())
+        ));
+    }
     Ok(Some(JobOutputRecord {
         id: JobOutputId::new(1),
         job: conversation,
@@ -1436,7 +1446,34 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
             text
         }
         Entry::Decision { approval } => {
-            format!("Decision for {}:{}/{}", approval.0, approval.1, approval.2)
+            let call = tool_call_ref((approval.0.get(), approval.1, approval.2))?;
+            let bytes = rx
+                .open_table(TOOL_CALLS)?
+                .get(tool_call_key(call))?
+                .ok_or_else(|| StorageError::corrupted("approval call missing"))?
+                .value()
+                .to_vec();
+            let call = decode_tool_evidence(call, &bytes)?;
+            let bytes = rx
+                .open_table(APPROVALS)?
+                .get((approval.0.get(), approval.1, approval.2))?
+                .ok_or_else(|| StorageError::corrupted("approval decision missing"))?
+                .value()
+                .to_vec();
+            let decision = ApprovalRecord::decode(&bytes)?;
+            let arguments = call
+                .decision
+                .fact
+                .stored_admission()
+                .map_or("{}", |a| a.arguments.as_str());
+            match decision.decision {
+                ApprovalDecision::Approved => format!("Approved: {} {}", call.name, arguments),
+                ApprovalDecision::Rejected => format!("Rejected: {} {}", call.name, arguments),
+                ApprovalDecision::Answered { text } => {
+                    format!("Answer to {}: {}", question(arguments), text)
+                }
+                ApprovalDecision::Voided => format!("Voided: {} {}", call.name, arguments),
+            }
         }
         Entry::Iteration { n } => format!("Iteration {n}"),
     })
@@ -1621,4 +1658,166 @@ pub(crate) fn read_turn_context(
         }
     }
     Ok(context)
+}
+
+pub(super) fn has_decider(
+    jobs: &impl ReadableTable<u64, &'static [u8]>,
+    conversation: Option<JobId>,
+) -> Result<bool, StorageError> {
+    let mut current = conversation;
+    for _ in 0..=3 {
+        let Some(id) = current else {
+            return Ok(false);
+        };
+        let Some(bytes) = jobs.get(id.get())? else {
+            return Ok(false);
+        };
+        let row = JobRow::decode(bytes.value())?;
+        match row.kind {
+            JobKind::Conversation {
+                origin: Origin::User,
+                ..
+            } => return Ok(true),
+            JobKind::Conversation { .. } => current = row.parent_id,
+            JobKind::Turn { .. } => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+pub(crate) fn read_has_decider(
+    database: &Database,
+    conversation: Option<JobId>,
+) -> Result<bool, StorageError> {
+    has_decider(&read(database)?.open_table(JOBS)?, conversation)
+}
+fn approved_calls(
+    rx: &ReadTransaction,
+    conversation: JobId,
+) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
+    let mut calls = Vec::new();
+    let table = rx.open_table(TOOL_CALLS)?;
+    for entry in rx
+        .open_table(OPEN_APPROVALS)?
+        .range((conversation.get(), 0, 0, 0)..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX))?
+    {
+        let (key, state) = entry?;
+        if state.value() != 1 {
+            continue;
+        }
+        let (_, turn, request, index) = key.value();
+        let call = tool_call_ref((turn, request, index))?;
+        let bytes = table
+            .get(tool_call_key(call))?
+            .ok_or_else(|| StorageError::corrupted("approved call missing"))?;
+        calls.push(decode_tool_evidence(call, bytes.value())?);
+    }
+    Ok(calls)
+}
+pub(crate) fn read_approved_calls(
+    database: &Database,
+    conversation: JobId,
+) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
+    approved_calls(&read(database)?, conversation)
+}
+fn question(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| {
+            v.get("question")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+pub(crate) fn read_cards(
+    database: &Database,
+    root: JobId,
+) -> Result<Vec<serde_json::Value>, StorageError> {
+    use serde_json::json;
+    let rx = read(database)?;
+    let mut cards = Vec::new();
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(conversation) = pending.pop() {
+        if !seen.insert(conversation) || seen.len() > 65 {
+            return Err(StorageError::corrupted(
+                "live conversation tree exceeds its bound",
+            ));
+        }
+        let row = read_job_row(&rx, conversation)?
+            .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+        let JobKind::Conversation { origin, .. } = row.kind else {
+            return Err(StorageError::corrupted("expected a conversation"));
+        };
+        let parent = row.parent_id.map(|id| id.to_string());
+        let metadata = read_conversation(&rx, conversation)?;
+        if origin != Origin::System {
+            for entry in rx.open_table(OPEN_APPROVALS)?.range(
+                (conversation.get(), 0, 0, 0)..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX),
+            )? {
+                let (key, state) = entry?;
+                if state.value() != 0 {
+                    continue;
+                }
+                let (_, turn, request, index) = key.value();
+                let call = tool_call_ref((turn, request, index))?;
+                let table = rx.open_table(TOOL_CALLS)?;
+                let bytes = table
+                    .get(tool_call_key(call))?
+                    .ok_or_else(|| StorageError::corrupted("awaiting call missing"))?;
+                let call = decode_tool_evidence(call, bytes.value())?;
+                let arguments = call
+                    .decision
+                    .fact
+                    .stored_admission()
+                    .ok_or_else(|| StorageError::corrupted("awaiting admission missing"))?
+                    .arguments
+                    .as_str();
+                let mut card = json!({"kind": if matches!(call.decision.fact, crate::persistence::ToolDecision::AwaitingAnswer(_)) { "question" } else { "approval" }, "conversation": conversation.to_string(), "parent":parent, "approval":[turn,request,index], "tool":call.name});
+                if matches!(
+                    call.decision.fact,
+                    crate::persistence::ToolDecision::AwaitingAnswer(_)
+                ) {
+                    card["question"] = json!(question(arguments));
+                } else {
+                    card["arguments"] = json!(arguments);
+                }
+                cards.push(card);
+            }
+            if let Some(seq) = metadata.on_hold {
+                let notice = rx
+                    .open_table(NOTICES)?
+                    .get((conversation.get(), seq))?
+                    .map(|v| Notice::decode(v.value()))
+                    .transpose()?;
+                if matches!(
+                    notice.map(|n| n.body),
+                    Some(NoticeBody::Record {
+                        by: Actor::Loop,
+                        ..
+                    })
+                ) {
+                    cards.push(json!({"kind":"loop_hold", "conversation":conversation.to_string(), "parent":parent}));
+                }
+            }
+        }
+        if let Some(active) = rx.open_table(ACTIVE_TURNS)?.get(conversation.get())? {
+            let turn = JobId::new(active.value());
+            let state = read_state(&rx, turn)?;
+            if state
+                .outcome
+                .is_some_and(|o| o.kind == OutcomeKind::Unknown)
+                && state.stop_confirmed_at.is_none()
+            {
+                cards.push(json!({"kind":"quarantine", "conversation":conversation.to_string(), "parent":parent, "turn":turn.to_string()}));
+            }
+        }
+        for entry in rx
+            .open_table(LIVE_CHILDREN)?
+            .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+        {
+            pending.push(JobId::new(entry?.0.value().1));
+        }
+    }
+    Ok(cards)
 }

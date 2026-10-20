@@ -88,7 +88,7 @@ impl Batch {
         conversation: JobId,
         entry: Entry,
     ) -> Result<Appended, BatchError> {
-        if matches!(entry, Entry::Iteration { .. }) {
+        if matches!(entry, Entry::Iteration { .. } | Entry::Decision { .. }) {
             return Ok(Appended {
                 turn: conversation,
                 seq: 0,
@@ -120,7 +120,6 @@ impl Batch {
             joined: false,
         })
     }
-    // K3 approval requests notify the parent here.
     pub(crate) fn notify(
         &mut self,
         child: JobId,
@@ -222,6 +221,21 @@ impl Batch {
             outcome.cause,
             Some(crate::persistence::OutcomeCause::Closed)
         ) {
+            return Ok(());
+        }
+        if outcome.kind == OutcomeKind::Completed
+            && self.step(|tx| {
+                for entry in tx.open_table(OPEN_APPROVALS)?.range(
+                    (conversation.get(), turn.get(), 0, 0)
+                        ..=(conversation.get(), turn.get(), u32::MAX, u32::MAX),
+                )? {
+                    if entry?.1.value() == 0 {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?
+        {
             return Ok(());
         }
         let event = if matches!(

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { decodeChildren, decodeAdmission, decodeConversationTurns, decodeConversations, decodeStop } from "../components/ocg/contracts/control-plane";
+import { decodeChildren, decodeCards, decodeAdmission, decodeConversationTurns, decodeConversations, decodeStop } from "../components/ocg/contracts/control-plane";
 
 const admission = decodeAdmission({ api_version: 1, admission: { status: "admitted", job: "job:3", conversation: "job:1", seq: 2, joined: true, model: "frozen", kept: false } });
 assert.equal(admission.conversation, "job:1");
@@ -18,4 +18,16 @@ assert.equal(children.children[0].on_hold?.by.kind, "loop");
 assert.equal(children.next_before, "job:4");
 assert.throws(() => decodeChildren({ api_version: 1, conversation: "job:2", children: [], has_more: false, next_before: null }, "job:1"));
 assert.throws(() => decodeChildren({ api_version: 1, conversation: "job:1", children: [{ ...children.children[0], recurrence: { interval_s: 1, phase: "active", due_us: null } }], has_more: false, next_before: null }, "job:1"));
-console.log("conversation contract: 2 tests passed");
+
+const cards = decodeCards({ api_version: 1, conversation: "job:1", cards: [
+  { kind: "approval", conversation: "job:5", parent: "job:3", approval: [6, 1, 0], tool: "workspace_run_command", arguments: "{}" },
+  { kind: "question", conversation: "job:5", parent: "job:3", approval: [6, 1, 1], tool: "ask_user", question: "Which branch?" },
+  { kind: "loop_hold", conversation: "job:3", parent: "job:1" },
+  { kind: "quarantine", conversation: "job:5", parent: "job:3", turn: "job:8" },
+] }, "job:1");
+assert.equal(cards.cards.length, 4);
+assert.equal(cards.cards[0].parent, "job:3");
+assert.throws(() => decodeCards({ api_version: 1, conversation: "job:2", cards: [] }, "job:1"));
+assert.throws(() => decodeCards({ api_version: 1, conversation: "job:1", cards: [{ kind: "approval", conversation: "job:5", parent: null, approval: [6, 0, 0], tool: "x", arguments: "{}" }] }, "job:1"));
+
+console.log("conversation contract: 3 tests passed");

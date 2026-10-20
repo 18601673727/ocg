@@ -84,6 +84,10 @@ impl Enc {
         for model in &agent.models {
             self.u64(model.get());
         }
+        self.u32(agent.approve.len() as u32);
+        for class in &agent.approve {
+            self.u8(class.code());
+        }
         self.ou64(agent.default_model.map(ConfigId::get));
         self.ostr(&agent.tool_grant);
         self.u32(agent.dispatch_to.len() as u32);
@@ -269,6 +273,10 @@ impl<'a> Dec<'a> {
         for _ in 0..self.u32()? {
             models.push(ConfigId::new(self.u64()?));
         }
+        let mut approve = Vec::new();
+        for _ in 0..self.u32()? {
+            approve.push(self.code(ApproveClass::from_code)?);
+        }
         let default_model = self.ou64()?.map(ConfigId::new);
         let tool_grant = self.ostr()?;
         let mut dispatch_to = Vec::new();
@@ -282,6 +290,7 @@ impl<'a> Dec<'a> {
             default_model,
             tool_grant,
             dispatch_to,
+            approve,
         })
     }
     pub(super) fn config_ref(&mut self) -> DecodeResult<ConfigRef> {
@@ -392,10 +401,11 @@ codes!(ChatFinishReason {
     ChatFinishReason::Stop = 1, ChatFinishReason::Length = 2, ChatFinishReason::ToolCalls = 3,
     ChatFinishReason::ContentFilter = 4, ChatFinishReason::Error = 5, ChatFinishReason::Other = 6,
 });
+codes!(ApproveClass { ApproveClass::Commands = 1, ApproveClass::Writes = 2, ApproveClass::Dispatch = 3, ApproveClass::Close = 4 });
 codes!(ToolCallRefusal {
     ToolCallRefusal::Malformed = 1, ToolCallRefusal::ConflictingIdentity = 2, ToolCallRefusal::AmbiguousIdentity = 3,
     ToolCallRefusal::LimitExceeded = 4, ToolCallRefusal::Incomplete = 5, ToolCallRefusal::Unauthorized = 6,
-    ToolCallRefusal::MissingSchema = 7, ToolCallRefusal::UnsupportedSchema = 8, ToolCallRefusal::InvalidArguments = 9,
+    ToolCallRefusal::MissingSchema = 7, ToolCallRefusal::UnsupportedSchema = 8, ToolCallRefusal::InvalidArguments = 9, ToolCallRefusal::NoDecider = 10,
 });
 codes!(ToolEffect { ToolEffect::ReadOnly = 1, ToolEffect::Idempotent = 2, ToolEffect::NonIdempotent = 3 });
 codes!(AuthorizationBasis { AuthorizationBasis::RegistryGrant = 1 });

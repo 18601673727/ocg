@@ -12,6 +12,8 @@ import { useI18n, runtimeStatusDetail } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
 import { ModelSelector } from "./model-selector";
 import { useOcgRuntime } from "../runtime/runtime-context";
+import { ControlTransportError } from "../runtime/control-client";
+import type { ControlConversationCard } from "../contracts";
 import type { ControlChildConversation } from "../contracts";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
@@ -529,19 +531,12 @@ export function ChatView({
   );
 }
 
-export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
+function useConversation(turn?: string) {
   const { control } = useOcgRuntime();
-  const { t } = useI18n();
   const [conversation, setConversation] = useState<string | null>(null);
-  const [children, setChildren] = useState<ControlChildConversation[]>([]);
-  const [hasMore, setHasMore] = useState(false);
-  const [pages, setPages] = useState(1);
-  const [revision, setRevision] = useState(0);
-  const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const lock = useRef(false);
   useEffect(() => {
-    if (!control || !turn || conversation) return;
+    if (!control || !turn) return;
     const controller = new AbortController();
     void control.readJob(turn, controller.signal).then(record => {
       if (!controller.signal.aborted) setConversation(record.kind === "conversation" ? record.id : record.conversation);
@@ -549,7 +544,21 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
       if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
     });
     return () => controller.abort();
-  }, [control, turn, conversation]);
+  }, [control, turn]);
+  return { conversation, error };
+}
+
+export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
+  const { control } = useOcgRuntime();
+  const { t } = useI18n();
+  const { conversation, error: resolutionError } = useConversation(turn);
+  const [children, setChildren] = useState<ControlChildConversation[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [pages, setPages] = useState(1);
+  const [revision, setRevision] = useState(0);
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const lock = useRef(false);
   useEffect(() => {
     if (!control || !conversation) return;
     const controller = new AbortController();
@@ -591,7 +600,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { lock.current = false; setPending(null); }
   }
-  if (!control || (!children.length && !error)) return null;
+  if (!control || (!children.length && !error && !resolutionError)) return null;
   return <section className="shrink-0 border-b border-border px-3 py-2" aria-label={t("chat.children")}>
     <div className="flex max-h-40 gap-2 overflow-auto">
       {children.map(child => <div key={child.id} className="min-w-56 rounded-md border border-border px-3 py-2 text-xs">
@@ -607,6 +616,89 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
       </div>)}
       {hasMore && <Button size="sm" variant="ghost" onClick={() => setPages(value => value + 1)}>{t("chat.child.more")}</Button>}
     </div>
-    {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+    {(error || resolutionError) && <p role="alert" className="text-xs text-destructive">{error || resolutionError}</p>}
+  </section>;
+}
+
+function ConversationQuestion({ question, disabled, answer }: { question: string; disabled: boolean; answer: (text: string) => void }) {
+  const { t } = useI18n();
+  const [text, setText] = useState("");
+  return <form className="mt-2 flex flex-col gap-2" onSubmit={event => { event.preventDefault(); answer(text); }}>
+    <label className="flex flex-col gap-1">{question}<textarea className="rounded border border-border bg-background p-2" value={text} onChange={event => setText(event.target.value)} placeholder={t("chat.card.answerPlaceholder")} disabled={disabled} /></label>
+    <Button type="submit" size="xs" disabled={disabled || !text.trim()}>{t("chat.card.answer")}</Button>
+  </form>;
+}
+
+export function ConversationCardStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
+  const { control } = useOcgRuntime();
+  const { t } = useI18n();
+  const { conversation, error: resolutionError } = useConversation(turn);
+  const [cards, setCards] = useState<ControlConversationCard[]>([]);
+  const [revision, setRevision] = useState(0);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const lock = useRef(false);
+  useEffect(() => {
+    if (!control || !conversation) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const reply = await control.readCards(conversation, controller.signal);
+        if (!controller.signal.aborted) { setCards(reply.cards); setError(null); }
+      } catch (cause) { if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause)); }
+      finally { if (!controller.signal.aborted) timer = setTimeout(() => void refresh(), 2000); }
+    };
+    void refresh();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [control, conversation, revision]);
+
+  async function act(card: ControlConversationCard, decision?: { decision: "approve" | "reject" } | { answer: string }) {
+    if (!control || lock.current) return;
+    lock.current = true; setPending(true); setError(null);
+    try {
+      if (card.kind === "approval" || card.kind === "question") {
+        if (decision) await control.decideApproval(card.approval, decision);
+      } else if (card.kind === "loop_hold") await control.unholdConversation(card.conversation);
+      else {
+        try { await control.releaseSlot(card.turn); }
+        catch (cause) {
+          if (!(cause instanceof ControlTransportError) || cause.code !== "confirm_required") throw cause;
+          if (window.confirm(t("chat.card.confirm"))) await control.releaseSlot(card.turn, true);
+        }
+      }
+      setRevision(value => value + 1);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { lock.current = false; setPending(false); }
+  }
+  const groups = new Map<string, { parent: string | null; cards: ControlConversationCard[] }>();
+  for (const card of cards) {
+    let group = groups.get(card.conversation);
+    if (!group) { group = { parent: card.parent, cards: [] }; groups.set(card.conversation, group); }
+    group.parent = card.parent;
+    group.cards.push(card);
+    if (card.parent && card.parent !== conversation && !groups.has(card.parent)) groups.set(card.parent, { parent: conversation, cards: [] });
+  }
+  function renderGroup(id: string, ancestors: Set<string>) {
+    if (ancestors.has(id)) return null;
+    const group = groups.get(id);
+    if (!group) return null;
+    const visited = new Set(ancestors).add(id);
+    return <div key={id} className="min-w-64 rounded-md border border-border p-2 text-xs" data-conversation={id}>
+      <Button size="xs" variant="ghost" onClick={() => onOpen(id)}>{id}</Button>
+      {group.cards.map(card => <div className="mt-2 rounded border border-border p-2" key={card.kind === "approval" || card.kind === "question" ? `${card.approval.join(":")}` : card.kind}>
+        <p className="font-medium">{t(`chat.card.${card.kind}`)}</p>
+        {card.kind === "approval" && <><p>{card.tool}</p><pre className="max-h-32 max-w-lg overflow-auto whitespace-pre-wrap break-all">{card.arguments}</pre><div className="mt-2 flex gap-2"><Button size="xs" disabled={pending} onClick={() => void act(card, { decision: "approve" })}>{t("chat.card.approve")}</Button><Button size="xs" variant="outline" disabled={pending} onClick={() => void act(card, { decision: "reject" })}>{t("chat.card.reject")}</Button></div></>}
+        {card.kind === "question" && <ConversationQuestion question={card.question} disabled={pending} answer={text => void act(card, { answer: text })} />}
+        {card.kind === "loop_hold" && <Button size="xs" disabled={pending} onClick={() => void act(card)}>{t("chat.child.unhold")}</Button>}
+        {card.kind === "quarantine" && <><p>{card.turn}</p><Button size="xs" disabled={pending} onClick={() => void act(card)}>{t("chat.card.release")}</Button></>}
+      </div>)}
+      {[...groups].filter(([child, value]) => child !== id && value.parent === id).map(([child]) => <div key={child} className="ml-3 mt-2">{renderGroup(child, visited)}</div>)}
+    </div>;
+  }
+  if (!control || (!cards.length && !error && !resolutionError)) return null;
+  return <section className="shrink-0 border-b border-border px-3 py-2" aria-label={t("chat.card.cards")}>
+    <div className="flex max-h-80 gap-2 overflow-auto">{[...groups].filter(([, group]) => !group.parent || !groups.has(group.parent)).map(([id]) => renderGroup(id, new Set()))}</div>
+    {(error || resolutionError) && <p role="alert" className="text-xs text-destructive">{error || resolutionError}</p>}
   </section>;
 }

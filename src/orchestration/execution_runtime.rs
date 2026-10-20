@@ -24,7 +24,7 @@ use crate::orchestration::tools::{
     FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolRegistryError, ToolStart,
 };
 use crate::persistence::{
-    AppendedOutput, AttachmentId, AuthorizationBasis, ExecutorId, FinalResult,
+    AppendedOutput, ApproveClass, AttachmentId, AuthorizationBasis, ExecutorId, FinalResult,
     FrozenExecutionConfig, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
     JobInputId, JobOutcome, JobRecord, MAX_STORED_TOOL_ARGUMENTS_BYTES,
     MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, NewAvailabilityStat, NewJob,
@@ -79,6 +79,8 @@ pub struct ProviderExecutionPlan {
 pub struct ToolExecution {
     pub(crate) offer: ToolOffer,
     pub(crate) limits: ToolLoopLimits,
+    pub(crate) approve: Vec<ApproveClass>,
+    pub(crate) decider: bool,
 }
 
 /// Bounds of one execution's tool loop. Each is a refusal, never a
@@ -2650,7 +2652,7 @@ pub(crate) fn fit_conversation(
 async fn run_started_provider_job(
     database: DatabaseHandle,
     mut plan: ProviderTask,
-    (started, mut offered): (StartedJob, Option<Vec<ToolWire>>),
+    (started, _offered): (StartedJob, Option<Vec<ToolWire>>),
     tool_may_have_run: &Cell<bool>,
     scheduler: Option<StopHandle>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
@@ -2723,37 +2725,57 @@ async fn run_started_provider_job(
         if grant.is_some() {
             return refused(ExecutionRuntimeError::WorkspaceGrantUnsupported.to_string()).await;
         }
-        offered = match plan
-            .tools
-            .as_ref()
-            .map(|tools| tools.offer.wires())
-            .transpose()
-        {
-            Ok(offered) => offered,
-            Err(error) => return refused(error.to_string()).await,
-        };
     }
-    if job_record.kind.is_stored()
+    let decider =
+        job_record.kind.is_stored() && database.has_decider(job_record.conversation).await?;
+    let dispatch = job_record.kind.is_stored()
         && configuration
             .frozen
             .agent
             .as_ref()
-            .is_some_and(|agent| !agent.dispatch_to.is_empty())
-    {
-        plan.tools = match super::job_tools::add(plan.tools.take()) {
+            .is_some_and(|agent| !agent.dispatch_to.is_empty());
+    let ask_user = if let Some(conversation) = job_record.conversation {
+        decider
+            && database
+                .job(conversation)
+                .await?
+                .is_some_and(|row| row.parent_id.is_some())
+            && configuration
+                .frozen
+                .llm
+                .config
+                .declared_capabilities
+                .contains(&crate::persistence::ModelCapability::Tools)
+    } else {
+        false
+    };
+    if dispatch || ask_user {
+        plan.tools = match super::job_tools::add(plan.tools.take(), dispatch, ask_user) {
             Ok(tools) => Some(tools),
             Err(error) => return refused(error.to_string()).await,
         };
-        offered = match plan
-            .tools
-            .as_ref()
-            .map(|tools| tools.offer.wires())
-            .transpose()
-        {
-            Ok(offered) => offered,
-            Err(error) => return refused(error.to_string()).await,
-        };
     }
+    if let Some(tools) = &mut plan.tools {
+        tools.approve = configuration
+            .frozen
+            .agent
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.approve.clone());
+        tools.decider = decider;
+    }
+    let offered = match plan
+        .tools
+        .as_ref()
+        .map(|tools| tools.offer.wires())
+        .transpose()
+    {
+        Ok(offered) => offered,
+        Err(error) => return refused(error.to_string()).await,
+    };
+    let approved = match job_record.conversation {
+        Some(conversation) => database.approved_calls(conversation).await?,
+        None => Vec::new(),
+    };
     let Some(input_record) = database.job_input(input).await? else {
         return refused("submitted Job input disappeared".to_owned()).await;
     };
@@ -2880,6 +2902,7 @@ async fn run_started_provider_job(
         },
         conversation,
         plan.tools.as_ref(),
+        &approved,
         context_limits,
         &config.cancellation,
         tool_may_have_run,
@@ -3172,6 +3195,7 @@ pub(crate) async fn run_provider_job_with_window(
         run,
         conversation,
         tools,
+        &[],
         ContextLimits {
             context_window,
             max_tokens,
@@ -3187,10 +3211,12 @@ pub(crate) async fn run_provider_job_with_window(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_provider_job_inner(
     run: ProviderRun,
     mut conversation: ChatConversation,
     tools: Option<&ToolExecution>,
+    approved: &[crate::persistence::ToolEvidenceRecord],
     context_limits: ContextLimits,
     cancellation: &CancellationToken,
     tool_may_have_run: &Cell<bool>,
@@ -3214,6 +3240,73 @@ async fn run_provider_job_inner(
         return stop_tool_loop(run, sink, None, stopped).await;
     }
     let mut budget = ToolBudget::default();
+    if !approved.is_empty() {
+        let calls = approved
+            .iter()
+            .enumerate()
+            .map(|(index, record)| CompletedToolCall {
+                index: index as u32,
+                id: format!(
+                    "approval_{}_{}_{}",
+                    record.call.job.get(),
+                    record.call.request.get(),
+                    record.call.index
+                ),
+                name: record.name.clone(),
+                arguments: record
+                    .decision
+                    .fact
+                    .stored_admission()
+                    .map_or("{}", |a| a.arguments.as_str())
+                    .to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let links = approved
+            .iter()
+            .map(|record| record.call)
+            .collect::<Vec<_>>();
+        let empty_tools = ToolExecution {
+            offer: super::tools::ToolRegistry::default()
+                .offer(&[])
+                .map_err(ExecutionRuntimeError::ToolsUnavailable)?,
+            approve: Vec::new(),
+            decider: false,
+            limits: ToolLoopLimits::default(),
+        };
+        let site = CallSite {
+            scheduler: run.scheduler.as_ref(),
+            database: &run.database,
+            job: run.job,
+            request: RequestNumber::FIRST,
+        };
+        let answers = match answer_calls(
+            tools.unwrap_or(&empty_tools),
+            &site,
+            &conversation,
+            &calls,
+            &links,
+            &mut budget,
+            cancellation,
+            tool_may_have_run,
+        )
+        .await
+        {
+            Ok((answers, _)) => answers,
+            Err(stopped) => return stop_tool_loop(run, sink, None, stopped).await,
+        };
+        conversation.messages.push(ChatMessage::assistant(
+            None,
+            calls.iter().map(ChatToolCallWire::from).collect(),
+        ));
+        for (call, answer) in calls.iter().zip(answers) {
+            conversation
+                .messages
+                .push(ChatMessage::tool(call.id.clone(), answer));
+        }
+        sink.request = RequestNumber::FIRST
+            .next()
+            .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
+    }
     let mut round = 1u32;
     loop {
         let mut retries = 0;
@@ -3288,6 +3381,7 @@ async fn run_provider_job_inner(
                     &site,
                     &conversation,
                     &result.tool_calls,
+                    &[],
                     &mut budget,
                     cancellation,
                     tool_may_have_run,
@@ -3302,7 +3396,46 @@ async fn run_provider_job_inner(
             .into()),
         };
         let (answers, next) = match (answered, next) {
-            (Ok(answers), Some(next)) => (answers, next),
+            (Ok((answers, awaiting)), Some(next)) => {
+                if !awaiting.is_empty() {
+                    let mut summary = result.text.clone();
+                    for index in awaiting {
+                        if let Some(call) =
+                            result.tool_calls.iter().find(|call| call.index == index)
+                        {
+                            summary.push('\n');
+                            if call.name == "ask_user" {
+                                let question =
+                                    serde_json::from_str::<serde_json::Value>(&call.arguments)
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("question")
+                                                .and_then(|v| v.as_str())
+                                                .map(str::to_owned)
+                                        })
+                                        .unwrap_or_default();
+                                summary.push_str(&format!("Awaiting answer: {question}"));
+                            } else {
+                                summary.push_str(&format!(
+                                    "Awaiting approval: {} {}",
+                                    call.name, call.arguments
+                                ));
+                            }
+                        }
+                    }
+                    return complete_provider_job(
+                        run.database,
+                        run.executor,
+                        run.input,
+                        run.job,
+                        sink,
+                        &result,
+                        summary,
+                    )
+                    .await;
+                }
+                (answers, next)
+            }
             (Err(stopped), _) => {
                 return stop_tool_loop(run, sink, Some(&result), stopped).await;
             }
@@ -3448,20 +3581,22 @@ pub(crate) mod dispatch_seam {
 /// runs under the time limit and the execution's cancellation, and what is
 /// known of its outcome is recorded before its result can be sent on. Its
 /// result, serialized, is the answer, and it is never truncated.
+#[allow(clippy::too_many_arguments)]
 async fn answer_calls(
     tools: &ToolExecution,
     site: &CallSite<'_>,
     conversation: &ChatConversation,
     calls: &[CompletedToolCall],
+    approvals: &[ToolCallRef],
     budget: &mut ToolBudget,
     cancellation: &CancellationToken,
     tool_may_have_run: &Cell<bool>,
-) -> Result<Vec<String>, Stopped> {
+) -> Result<(Vec<String>, Vec<u32>), Stopped> {
     let limits = &tools.limits;
     if cancellation.is_cancelled() {
         return Err(ToolLoopStop::Cancelled.into());
     }
-    if budget.calls.saturating_add(calls.len()) > limits.max_tool_calls {
+    if approvals.is_empty() && budget.calls.saturating_add(calls.len()) > limits.max_tool_calls {
         return Err(ToolLoopStop::CallLimit.into());
     }
     let earlier = conversation
@@ -3472,7 +3607,7 @@ async fn answer_calls(
         .map(|call| call.id.as_str())
         .collect::<std::collections::HashSet<_>>();
     let mut argument_bytes = budget.argument_bytes;
-    for call in calls {
+    for call in calls.iter().filter(|_| approvals.is_empty()) {
         if earlier.contains(call.id.as_str()) {
             return Err(ToolLoopStop::Refused(InvalidToolCall::at(
                 ToolCallRefusal::ConflictingIdentity,
@@ -3501,12 +3636,48 @@ async fn answer_calls(
     }
 
     let mut answers = Vec::with_capacity(calls.len());
+    let mut awaiting = Vec::new();
     for call in calls {
         if cancellation.is_cancelled() {
             return Err(ToolLoopStop::Cancelled.into());
         }
-        let dispatch = match tools.offer.resolve(call) {
+        let approval = approvals.get(call.index as usize).copied();
+        let resolved = if approval.is_some() && budget.calls >= limits.max_tool_calls {
+            Err(InvalidToolCall::at(
+                ToolCallRefusal::LimitExceeded,
+                call.index,
+                "tool call limit reached",
+            ))
+        } else if approval.is_some() && earlier.contains(call.id.as_str()) {
+            Err(InvalidToolCall::at(
+                ToolCallRefusal::ConflictingIdentity,
+                call.index,
+                "tool call id already used",
+            ))
+        } else if approval.is_some()
+            && (call.arguments.len() > MAX_STORED_TOOL_ARGUMENTS_BYTES
+                || budget.argument_bytes.saturating_add(call.arguments.len())
+                    > MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES)
+        {
+            Err(InvalidToolCall::at(
+                ToolCallRefusal::LimitExceeded,
+                call.index,
+                "arguments exceed the recording limit",
+            ))
+        } else {
+            tools.offer.resolve(call)
+        };
+        let dispatch = match resolved {
             Ok(dispatch) => dispatch,
+            Err(refusal) if approval.is_some() => {
+                record_call_decision(site, call, ToolDecision::Refused(refusal.kind), approval)
+                    .await?;
+                answers.push(
+                    serde_json::json!({"refused":refusal.kind.as_str(), "reason":refusal.message})
+                        .to_string(),
+                );
+                continue;
+            }
             Err(refusal) => return Err(refuse(site, call, refusal).await),
         };
         let index = call.index;
@@ -3518,7 +3689,34 @@ async fn answer_calls(
             arguments: ToolPayload::new(call.arguments.clone()),
             authorization: AuthorizationBasis::RegistryGrant,
         };
+        if approval.is_none()
+            && (call.name == "ask_user"
+                || ApproveClass::of(&call.name).is_some_and(|class| tools.approve.contains(&class)))
+        {
+            if tools.decider {
+                let decision = if call.name == "ask_user" {
+                    ToolDecision::AwaitingAnswer(decided)
+                } else {
+                    ToolDecision::AwaitingApproval(decided)
+                };
+                record_call_decision(site, call, decision, None).await?;
+                awaiting.push(call.index);
+            } else {
+                record_call_decision(
+                    site,
+                    call,
+                    ToolDecision::Refused(ToolCallRefusal::NoDecider),
+                    None,
+                )
+                .await?;
+                answers.push(serde_json::json!({"refused":"no_decider", "reason":"the conversation has no deciding user"}).to_string());
+            }
+            budget.calls += 1;
+            budget.argument_bytes = budget.argument_bytes.saturating_add(call.arguments.len());
+            continue;
+        }
         let admission = NewToolEvidence {
+            approval,
             call: reference,
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
@@ -3560,6 +3758,20 @@ async fn answer_calls(
                 let outcome = ToolOutcome::NotInvoked {
                     reason: NotInvokedReason::Refused(refusal.kind),
                 };
+                if approval.is_some() {
+                    site.database
+                        .record_tool_outcome(reference, outcome)
+                        .await
+                        .map_err(|error| Stopped {
+                            stop: ToolLoopStop::EvidenceNotRecorded {
+                                index,
+                                outcome: Some(ToolOutcomeKind::NotInvoked),
+                            },
+                            evidence: Some(error),
+                        })?;
+                    answers.push(serde_json::json!({"refused":refusal.kind.as_str(), "reason":refusal.message}).to_string());
+                    continue;
+                }
                 return Err(
                     conclude(site, reference, outcome, ToolLoopStop::Refused(refusal)).await,
                 );
@@ -3788,7 +4000,7 @@ async fn answer_calls(
         };
         return Err(conclude(site, reference, outcome, stop).await);
     }
-    Ok(answers)
+    Ok((answers, awaiting))
 }
 
 /// A handler's call, created and polled so that a panic in the handler fails
@@ -3810,6 +4022,37 @@ impl Future for CatchPanic {
     }
 }
 
+async fn record_call_decision(
+    site: &CallSite<'_>,
+    call: &CompletedToolCall,
+    decision: ToolDecision,
+    approval: Option<ToolCallRef>,
+) -> Result<(), Stopped> {
+    let evidence = NewToolEvidence {
+        call: site.call(call),
+        approval,
+        tool_call_id: call.id.clone(),
+        name: call.name.clone(),
+        spawns: false,
+        decision,
+    };
+    match site.database.record_tool_decision(evidence).await {
+        Ok(()) => Ok(()),
+        Err(DatabaseError::Rejected(violation)) => Err(ToolLoopStop::AdmissionRefused {
+            index: call.index,
+            violation,
+        }
+        .into()),
+        Err(error) => Err(Stopped {
+            stop: ToolLoopStop::EvidenceNotRecorded {
+                index: call.index,
+                outcome: None,
+            },
+            evidence: Some(error),
+        }),
+    }
+}
+
 /// Records the refusal of a call that never ran, and stops on it. A
 /// refusal that cannot be recorded changes nothing about the call, which
 /// did not run, so the stop stays the refusal.
@@ -3821,6 +4064,7 @@ async fn refuse(
     let recorded = site
         .database
         .record_tool_decision(NewToolEvidence {
+            approval: None,
             call: site.call(call),
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
@@ -3968,6 +4212,76 @@ async fn record_answer(
     }
 }
 
+async fn complete_provider_job(
+    database: DatabaseHandle,
+    executor: ExecutorId,
+    input: JobInputId,
+    job: JobId,
+    mut sink: DatabaseOutputSink,
+    result: &ProviderExecutionResult,
+    summary: String,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let gap = sink.gap.take();
+    let mut refused = None;
+    let mut settlement = JobFinalization::Completed(FinalResult {
+        summary: Some(summary),
+        code: None,
+        goal_reached: None,
+        value: Some(provider_execution::result_value(result)),
+    });
+    let settled = match database.finalize_job(job, settlement.clone()).await {
+        Err(DatabaseError::Rejected(violation))
+            if !matches!(violation, Violation::JobAlreadyFinalized(_)) =>
+        {
+            settlement = JobFinalization::Failed(FinalResult {
+                summary: Some(format!(
+                    "the Provider answered, but the Job cannot complete: {violation}"
+                )),
+                code: None,
+                goal_reached: Some(false),
+                value: Some(provider_execution::result_value(result)),
+            });
+            let settled = database
+                .without_stop_cause()
+                .finalize_job(job, settlement.clone())
+                .await;
+            refused = Some(violation);
+            settled
+        }
+        settled => settled,
+    };
+    let final_output = match settled {
+        Ok(final_output) => final_output,
+        Err(source) => {
+            return Err(ExecutionRuntimeError::NotSettled {
+                source,
+                observations: gap.map(Box::new),
+                settlement: Box::new(settlement),
+            });
+        }
+    };
+    let receipt = ExecutionReceipt {
+        executor,
+        input,
+        job,
+        result: final_output,
+    };
+    if let Some(source) = refused {
+        return Err(ExecutionRuntimeError::CompletionRefused {
+            receipt: Box::new(receipt),
+            source,
+            observations: gap.map(Box::new),
+        });
+    }
+    match gap {
+        None => Ok(receipt),
+        Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
+            receipt: Box::new(receipt),
+            source,
+        }),
+    }
+}
+
 /// Settles the Job from a finished execution, then records what the run
 /// observed. Settlement comes first and is authoritative: a later write that
 /// fails is reported as [`ExecutionRuntimeError::ObservationsNotRecorded`]
@@ -3990,64 +4304,22 @@ pub(crate) async fn finish_provider_job(
     let mut gap = sink.gap.take();
     let receipt = match execution {
         Ok(result) => {
-            let mut refused = None;
-            let mut settlement = JobFinalization::Completed(FinalResult {
-                summary: Some(result.text.clone()),
-                code: None,
-                goal_reached: None,
-                value: Some(provider_execution::result_value(&result)),
-            });
-            let settled = match database.finalize_job(job, settlement.clone()).await {
-                Err(DatabaseError::Rejected(violation))
-                    if !matches!(violation, Violation::JobAlreadyFinalized(_)) =>
-                {
-                    settlement = JobFinalization::Failed(FinalResult {
-                        summary: Some(format!(
-                            "the Provider answered, but the Job cannot complete: {violation}"
-                        )),
-                        code: None,
-                        goal_reached: Some(false),
-                        value: Some(provider_execution::result_value(&result)),
-                    });
-                    let settled = database
-                        .without_stop_cause()
-                        .finalize_job(job, settlement.clone())
-                        .await;
-                    refused = Some(violation);
-                    settled
-                }
-                settled => settled,
-            };
             sink.database = database.clone();
             sink.job = job;
             record_answer(&mut sink, &result, &assistant_message(&result)).await;
-            if let Some(error) = sink.gap.take() {
-                gap.get_or_insert(error);
+            if let Some(error) = gap.take() {
+                sink.gap.get_or_insert(error);
             }
-            let final_output = match settled {
-                Ok(final_output) => final_output,
-                Err(source) => {
-                    return Err(ExecutionRuntimeError::NotSettled {
-                        source,
-                        observations: gap.map(Box::new),
-                        settlement: Box::new(settlement),
-                    });
-                }
-            };
-            let receipt = ExecutionReceipt {
+            return complete_provider_job(
+                database,
                 executor,
                 input,
                 job,
-                result: final_output,
-            };
-            if let Some(source) = refused {
-                return Err(ExecutionRuntimeError::CompletionRefused {
-                    receipt: Box::new(receipt),
-                    source,
-                    observations: gap.map(Box::new),
-                });
-            }
-            receipt
+                sink,
+                &result,
+                result.text.clone(),
+            )
+            .await;
         }
         Err(error) => {
             match settle_provider_error(database, executor, input, job, request, error).await {
@@ -5678,5 +5950,296 @@ mod provider_record_tests {
             );
             worker.shutdown().expect("close");
         });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod approval_runtime_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::orchestration::workspace_command::{Grant, workspace_tools};
+    use crate::orchestration::workspace_read::Workspace;
+    use crate::persistence::*;
+    use crate::test_support::{data_directory, on_system, temporary_directory, wait};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn open(
+        db: &DatabaseHandle,
+        project: ProjectId,
+        approve: ApproveClass,
+    ) -> (JobId, JobId, ExecutorId) {
+        let mut configuration = crate::test_support::execution_configuration(db);
+        let ConfigBody::Model(mut model) = wait(db.config(configuration.llm_profile.into()))
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!("model");
+        };
+        model
+            .declared_capabilities
+            .extend([ModelCapability::Chat, ModelCapability::Tools]);
+        wait(db.update_config(
+            configuration.llm_profile.into(),
+            NewConfig {
+                name: "tool model".into(),
+                body: ConfigBody::Model(model),
+            },
+        ))
+        .unwrap();
+        let agent = wait(db.create_config(NewConfig {
+            name: "approval Agent".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                models: vec![configuration.llm_profile.into()],
+                tool_grant: Some("code".into()),
+                approve: vec![approve],
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        configuration.agent_profile = Some(agent.into());
+        let pool = wait(db.create_executor(NewExecutor {
+            name: "worker".into(),
+            concurrency_limit: std::num::NonZeroU32::new(1).unwrap(),
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .unwrap();
+        let (conversation, entry) = wait(db.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: Some(agent),
+                project: Some(project),
+                origin: Origin::User,
+                keep_open: true,
+            },
+            Entry::UserMessage {
+                text: "objective".into(),
+                attachments: vec![],
+            },
+            configuration,
+            None,
+        ))
+        .unwrap();
+        wait(db.claim_fixture(entry.turn, pool)).unwrap();
+        (conversation, entry.turn, pool)
+    }
+    fn response(text: &str, calls: serde_json::Value) -> provider_seam::Response {
+        let tools = calls.as_array().is_some_and(|calls| !calls.is_empty());
+        let mut delta = json!({"content":text});
+        if tools {
+            delta["tool_calls"] = calls;
+        }
+        let chunk = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":delta,"finish_reason":if tools { "tool_calls" } else { "stop" }}]})
+        );
+        provider_seam::Response {
+            gate: None,
+            steps: vec![crate::provider_execution::scripted::Step::Chunk(Box::leak(
+                chunk.into_boxed_str(),
+            ))],
+        }
+    }
+    async fn execute(
+        db: DatabaseHandle,
+        job: JobId,
+        pool: ExecutorId,
+        tools: &ToolExecution,
+        approved: &[ToolEvidenceRecord],
+        endpoint: &str,
+        dropped_turns: u32,
+    ) {
+        let mut frozen = db.job_configuration(job).await.unwrap().unwrap().frozen;
+        frozen.llm.provider.endpoint = Some(endpoint.into());
+        let config = ProviderExecutionConfig::default();
+        run_provider_job_inner(
+            ProviderRun {
+                scheduler: None,
+                database: db,
+                executor: pool,
+                input: JobInputId::new(job.get()),
+                job,
+            },
+            ChatConversation {
+                messages: vec![ChatMessage::user("objective")],
+                tools: tools.offer.wires().unwrap(),
+                dropped_turns,
+                ..Default::default()
+            },
+            Some(tools),
+            approved,
+            ContextLimits {
+                context_window: None,
+                max_tokens: None,
+            },
+            &config.cancellation,
+            &Cell::new(false),
+            async |conversation, sink| {
+                provider_seam::exchange(&frozen, &config, conversation, sink).await
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn approval_runs_the_read_only_and_completes_without_a_second_request() {
+        let (_data, directory) = data_directory("approvals", "mixed-response");
+        let (_files, root) = temporary_directory("approvals", "mixed-files");
+        std::fs::write(root.join("input"), "read me").unwrap();
+        let workspace = Workspace::authorize(&root, &directory).unwrap();
+        let mut tools = workspace_tools(workspace, Grant::Code, &[]).unwrap();
+        tools.approve = vec![ApproveClass::Writes];
+        tools.decider = true;
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let project = wait(db.create_project(NewProject {
+            name: "files".into(),
+            description: None,
+            root: root.to_string_lossy().into_owned(),
+            commands: vec![],
+        }))
+        .unwrap();
+        let (_, turn, pool) = open(&db, project, ApproveClass::Writes);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let endpoint = "https://approval-mixed.invalid/v1";
+        provider_seam::install(endpoint, move |_| {
+            assert_eq!(count.fetch_add(1, Ordering::SeqCst), 0);
+            response(
+                "Checking",
+                json!([
+                    {"index":0,"id":"write","type":"function","function":{"name":"workspace_write_file","arguments":"{\"operation\":\"create\",\"path\":\"output\",\"content\":\"written\"}"}},
+                    {"index":1,"id":"read","type":"function","function":{"name":"workspace_read_file","arguments":"{\"path\":\"input\"}"}}
+                ]),
+            )
+        });
+        let handle = db.clone();
+        on_system(move || async move {
+            execute(handle, turn, pool, &tools, &[], endpoint, 0).await;
+        });
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!root.join("output").exists());
+        let calls = wait(db.tool_evidence(turn, None, 10)).unwrap();
+        assert!(matches!(
+            calls[0].decision.fact,
+            ToolDecision::AwaitingApproval(_)
+        ));
+        assert!(calls[0].outcome.is_none());
+        assert!(matches!(
+            calls[1].outcome.as_ref().unwrap().fact,
+            ToolOutcome::Completed { .. }
+        ));
+        assert!(wait(db.job(turn)).unwrap().unwrap().completed_at.is_some());
+        assert!(
+            wait(db.latest_output(turn))
+                .unwrap()
+                .unwrap()
+                .summary
+                .unwrap()
+                .contains("Awaiting approval: workspace_write_file")
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn approved_command_runs_once_under_request_one_before_the_first_provider_request() {
+        let (_data, directory) = data_directory("approvals", "approved-runtime");
+        let (_files, root) = temporary_directory("approvals", "approved-files");
+        let command = ProjectCommand {
+            name: "run".into(),
+            argv: vec!["sh".into(), "-c".into(), "echo ran >> ran.txt".into()],
+        };
+        let workspace = Workspace::authorize(&root, &directory).unwrap();
+        let mut tools =
+            workspace_tools(workspace, Grant::Code, std::slice::from_ref(&command)).unwrap();
+        tools.approve = vec![ApproveClass::Commands];
+        tools.decider = true;
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let project = wait(db.create_project(NewProject {
+            name: "files".into(),
+            description: None,
+            root: root.to_string_lossy().into_owned(),
+            commands: vec![command],
+        }))
+        .unwrap();
+        let (conversation, first, pool) = open(&db, project, ApproveClass::Commands);
+        let endpoint = "https://approval-execute.invalid/v1";
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        provider_seam::install(endpoint, move |_| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                response(
+                    "Requesting",
+                    json!([{"index":0,"id":"run","type":"function","function":{"name":"workspace_run_command","arguments":"{\"command\":\"run\"}"}}]),
+                )
+            } else {
+                response("Done", json!([]))
+            }
+        });
+        let handle = db.clone();
+        let first_tools = tools.clone();
+        on_system(move || async move {
+            execute(handle, first, pool, &first_tools, &[], endpoint, 0).await;
+        });
+        let approval = wait(db.tool_evidence(first, None, 10)).unwrap()[0].call;
+        let next = wait(db.decide_approval(approval, ApprovalDecision::Approved))
+            .unwrap()
+            .turn;
+        wait(db.claim_fixture(next, pool)).unwrap();
+        let approved = wait(db.approved_calls(conversation)).unwrap();
+        let handle = db.clone();
+        let next_tools = tools.clone();
+        on_system(move || async move {
+            execute(handle, next, pool, &next_tools, &approved, endpoint, 7).await;
+        });
+        let calls = wait(db.tool_evidence(next, None, 10)).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].call.request, RequestNumber::FIRST);
+        assert_eq!(calls[0].approval, Some(approval));
+        assert!(
+            calls[0]
+                .tool_call_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        );
+        assert!(
+            wait(db.provider_request(next, RequestNumber::FIRST))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            wait(db.provider_request(next, RequestNumber::FIRST.next().unwrap()))
+                .unwrap()
+                .unwrap()
+                .dropped_turns,
+            7
+        );
+        let third = wait(db.append(
+            conversation,
+            Entry::UserMessage {
+                text: "again".into(),
+                attachments: vec![],
+            },
+            None,
+            None,
+        ))
+        .unwrap()
+        .turn;
+        wait(db.claim_fixture(third, pool)).unwrap();
+        assert!(wait(db.approved_calls(conversation)).unwrap().is_empty());
+        let handle = db.clone();
+        on_system(move || async move {
+            execute(handle, third, pool, &tools, &[], endpoint, 0).await;
+        });
+        assert!(wait(db.tool_evidence(third, None, 10)).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(root.join("ran.txt")).unwrap(),
+            "ran\n"
+        );
+        worker.shutdown().unwrap();
     }
 }

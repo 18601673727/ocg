@@ -1020,6 +1020,36 @@ impl DatabaseHandle {
             .await
     }
 
+    pub async fn decide_approval(
+        &self,
+        approval: ToolCallRef,
+        decision: persistence::ApprovalDecision,
+    ) -> Result<Appended, DatabaseError> {
+        self.submit(|reply| Command::DecideApproval {
+            approval,
+            decision,
+            reply,
+        })
+        .await
+    }
+    pub async fn has_decider(&self, conversation: Option<JobId>) -> Result<bool, DatabaseError> {
+        self.read(move |database| storage::read_has_decider(database, conversation))
+            .await
+    }
+    pub async fn approved_calls(
+        &self,
+        conversation: JobId,
+    ) -> Result<Vec<ToolEvidenceRecord>, DatabaseError> {
+        self.read(move |database| storage::read_approved_calls(database, conversation))
+            .await
+    }
+    pub async fn conversation_cards(
+        &self,
+        conversation: JobId,
+    ) -> Result<Vec<serde_json::Value>, DatabaseError> {
+        self.read(move |database| storage::read_cards(database, conversation))
+            .await
+    }
     pub async fn apply_job_tool(
         &self,
         call: ToolCallRef,

@@ -361,6 +361,12 @@ impl Batch {
                 self.require_config_kind(model.connection_id, ConfigKind::Connection)?;
             }
             ConfigBody::Agent(agent) => {
+                if agent.approve.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return self.reject(Violation::InvalidValue(
+                        "approve",
+                        "must be sorted and unique",
+                    ));
+                }
                 if agent.dispatch_to.windows(2).any(|pair| pair[0] >= pair[1]) {
                     return self.reject(Violation::InvalidValue(
                         "dispatch_to",
@@ -836,7 +842,9 @@ impl Batch {
             .filter(|_| {
                 !matches!(
                     event.payload,
-                    RequestPayload::Sent { .. } | RequestPayload::Received { .. }
+                    RequestPayload::Sent { .. }
+                        | RequestPayload::Received { .. }
+                        | RequestPayload::ApprovedCalls
                 )
             })
             .map(|execution| {

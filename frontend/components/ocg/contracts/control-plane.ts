@@ -873,3 +873,56 @@ export function decodeChildren(input: unknown, conversationId: string) {
   return { conversation: conversationId, children, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:") };
 }
 export type ControlChildConversation = ReturnType<typeof decodeChildren>["children"][number];
+
+export type ControlApproval = [number, number, number];
+
+function approvalRef(input: unknown, path: string): ControlApproval {
+  if (!Array.isArray(input) || input.length !== 3) throw new ContractError(path, "an approval triple");
+  const turn = integer(input[0], `${path}.turn`);
+  const request = integer(input[1], `${path}.request`);
+  const index = integer(input[2], `${path}.index`);
+  if (turn === 0 || request === 0 || request > 0xffffffff || index > 0xffffffff) throw new ContractError(path, "a stored call reference");
+  return [turn, request, index];
+}
+
+export type ControlConversationCard = { conversation: string; parent: string | null } & (
+  | { kind: "approval"; approval: ControlApproval; tool: string; arguments: string }
+  | { kind: "question"; approval: ControlApproval; tool: string; question: string }
+  | { kind: "loop_hold" }
+  | { kind: "quarantine"; turn: string }
+);
+
+export function decodeCards(input: unknown, conversationId: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.conversation !== conversationId) throw new ContractError("conversation", `matching ${conversationId}`);
+  const cards = listOf(envelope.cards, "cards", (input, path): ControlConversationCard => {
+    const card = record(input, path);
+    const common = { conversation: identity(card.conversation, `${path}.conversation`, "job:"), parent: card.parent === null ? null : identity(card.parent, `${path}.parent`, "job:") };
+    switch (card.kind) {
+      case "approval": return { ...common, kind: card.kind, approval: approvalRef(card.approval, `${path}.approval`), tool: string(card.tool, `${path}.tool`), arguments: string(card.arguments, `${path}.arguments`) };
+      case "question": return { ...common, kind: card.kind, approval: approvalRef(card.approval, `${path}.approval`), tool: string(card.tool, `${path}.tool`), question: string(card.question, `${path}.question`) };
+      case "loop_hold": return { ...common, kind: card.kind };
+      case "quarantine": return { ...common, kind: card.kind, turn: identity(card.turn, `${path}.turn`, "job:") };
+      default: throw new ContractError(`${path}.kind`, "an approval, question, loop_hold or quarantine card");
+    }
+  });
+  return { conversation: conversationId, cards };
+}
+
+export function decodeApprovalDecision(input: unknown, expected: ControlApproval) {
+  const value = record(input, "response");
+  if (value.api_version !== 1) throw new ContractError("api_version", "1");
+  const approval = approvalRef(value.approval, "approval");
+  if (approval.some((part, index) => part !== expected[index])) throw new ContractError("approval", "the requested approval");
+  const decision = value.decision;
+  if (decision !== "approved" && decision !== "rejected" && decision !== "answered") throw new ContractError("decision", "an approval decision");
+  return { approval, decision, turn: identity(value.turn, "turn", "job:"), seq: integer(value.seq, "seq"), joined: boolean(value.joined, "joined") };
+}
+
+export function decodeReleaseSlot(input: unknown) {
+  const value = record(input, "response");
+  if (value.api_version !== 1) throw new ContractError("api_version", "1");
+  if (value.status !== "released" && value.status !== "already_released") throw new ContractError("status", "a released slot");
+  return { status: value.status };
+}

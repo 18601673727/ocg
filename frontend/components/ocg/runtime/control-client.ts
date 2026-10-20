@@ -7,6 +7,10 @@ import {
   decodeConversationEdit,
   decodeConversations,
   decodeChildren,
+  decodeCards,
+  decodeApprovalDecision,
+  decodeReleaseSlot,
+  type ControlApproval,
   decodeHealth,
   decodeJobs,
   decodeUsage,
@@ -501,6 +505,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (before) jobIdentity(before);
       const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
       return decodeChildren((await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal })).input, conversation);
+    },
+    async readCards(conversation: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      return decodeCards((await send("GET", `/api/v1/conversations/${conversation}/cards`, { signal })).input, conversation);
+    },
+    async decideApproval(approval: ControlApproval, decision: { decision: "approve" | "reject" } | { answer: string }, signal?: AbortSignal) {
+      approval.forEach(sequence);
+      const [turn, request, index] = approval;
+      return decodeApprovalDecision((await send("POST", `/api/v1/approvals/job:${turn}/${request}/${index}`, { body: decision, sign: true, signal })).input, approval);
+    },
+    async releaseSlot(turn: string, confirm = false, signal?: AbortSignal) {
+      jobIdentity(turn);
+      return decodeReleaseSlot((await send("POST", `/api/v1/jobs/${turn}/release-slot`, { body: confirm ? { confirm: true } : {}, sign: true, signal })).input);
     },
     async holdConversation(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);

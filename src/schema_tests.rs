@@ -4739,6 +4739,7 @@ mod settlement {
     /// An admitted call that spawns a process.
     fn spawning(call: ToolCallRef) -> NewToolEvidence {
         NewToolEvidence {
+            approval: None,
             call,
             tool_call_id: "run".into(),
             name: "workspace_run_command".into(),
@@ -5270,6 +5271,8 @@ mod requests_and_tool_loop {
 
     fn execution(registry: &ToolRegistry, names: &[&str], limits: ToolLoopLimits) -> ToolExecution {
         ToolExecution {
+            approve: Vec::new(),
+            decider: false,
             offer: registry.offer(names).expect("offer"),
             limits,
         }
@@ -6552,6 +6555,8 @@ mod requests_and_tool_loop {
             "a plan offers no tool unless OCG selects one"
         );
         plan.tools = Some(ToolExecution {
+            approve: Vec::new(),
+            decider: false,
             offer,
             limits: ToolLoopLimits::default(),
         });
@@ -6644,6 +6649,7 @@ mod requests_and_tool_loop {
         arguments: &str,
     ) -> NewToolEvidence {
         NewToolEvidence {
+            approval: None,
             call,
             tool_call_id: id.into(),
             name: "add".into(),
@@ -6664,6 +6670,7 @@ mod requests_and_tool_loop {
 
     fn refused(call: ToolCallRef, id: &str) -> NewToolEvidence {
         NewToolEvidence {
+            approval: None,
             call,
             tool_call_id: id.into(),
             name: "add".into(),
@@ -8270,6 +8277,8 @@ mod requests_and_tool_loop {
                 .authorize(workspace_read::TOOL_NAME)
                 .expect("authorize");
             ToolExecution {
+                approve: Vec::new(),
+                decider: false,
                 offer: registry.offer(&[workspace_read::TOOL_NAME]).expect("offer"),
                 limits: ToolLoopLimits::default(),
             }
@@ -8670,6 +8679,8 @@ mod requests_and_tool_loop {
                 .authorize(workspace_write::TOOL_NAME)
                 .expect("authorize write");
             ToolExecution {
+                approve: Vec::new(),
+                decider: false,
                 offer: registry
                     .offer(&[workspace_read::TOOL_NAME, workspace_write::TOOL_NAME])
                     .expect("offer"),
@@ -9989,6 +10000,7 @@ mod requests_and_tool_loop {
                 authorization: AuthorizationBasis::RegistryGrant,
             };
             wait(handle.record_tool_decision(NewToolEvidence {
+                approval: None,
                 call,
                 tool_call_id: "call-1".into(),
                 name: "workspace_run_command".into(),
@@ -15661,7 +15673,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 22);
+            assert_eq!(crate::storage::FORMAT_VERSION, 23);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");

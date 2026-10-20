@@ -121,7 +121,7 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         let (key, bytes) = entry?;
         let (job, request, index) = key.value();
         let record = decode_tool_evidence(tool_call_ref((job, request, index))?, bytes.value())?;
-        if let Some(admission) = record.admission() {
+        if let Some(admission) = record.decision.fact.stored_admission() {
             let totals = tool_totals.entry(job).or_insert((0, 0));
             totals.0 = totals.0.saturating_add(admission.arguments.len() as u64);
             totals.1 = totals.1.saturating_add(admission.parameters.len() as u64);
@@ -134,6 +134,8 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
                 admitted_inc = 1;
                 count_changed = true;
             }
+            crate::persistence::ToolDecision::AwaitingApproval(_)
+            | crate::persistence::ToolDecision::AwaitingAnswer(_) => {}
             crate::persistence::ToolDecision::Refused(
                 crate::storage::ToolCallRefusal::InvalidArguments,
             ) => {
@@ -148,7 +150,8 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
                 | crate::storage::ToolCallRefusal::Incomplete
                 | crate::storage::ToolCallRefusal::Unauthorized
                 | crate::storage::ToolCallRefusal::MissingSchema
-                | crate::storage::ToolCallRefusal::UnsupportedSchema,
+                | crate::storage::ToolCallRefusal::UnsupportedSchema
+                | crate::storage::ToolCallRefusal::NoDecider,
             ) => {}
         }
         if count_changed || record.outcome.is_some() {
@@ -519,6 +522,66 @@ pub(super) fn rebuild(
             changed.push(name);
         }
     };
+    let mut open_approvals = BTreeMap::new();
+    let mut approval_calls = BTreeMap::new();
+    for entry in tx.open_table(TOOL_CALLS)?.iter()? {
+        let (key, bytes) = entry?;
+        let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
+        if let Some(original) = call.approval
+            && approval_calls
+                .insert(tool_call_key(original), key.value())
+                .is_some()
+        {
+            return Err(StorageError::corrupted("approval executed twice"));
+        }
+        if matches!(
+            call.decision.fact,
+            crate::persistence::ToolDecision::AwaitingApproval(_)
+                | crate::persistence::ToolDecision::AwaitingAnswer(_)
+        ) {
+            let conversation = auth
+                .jobs
+                .get(&call.call.job.get())
+                .and_then(|row| row.parent_id)
+                .ok_or_else(|| StorageError::corrupted("awaiting call has no conversation"))?;
+            let decision = tx
+                .open_table(APPROVALS)?
+                .get(key.value())?
+                .map(|v| ApprovalRecord::decode(v.value()))
+                .transpose()?;
+            match decision.map(|r| r.decision) {
+                None => {
+                    open_approvals.insert(approvals::open_key(conversation, call.call), 0);
+                }
+                Some(ApprovalDecision::Approved) => {
+                    open_approvals.insert(approvals::open_key(conversation, call.call), 1);
+                }
+                Some(
+                    ApprovalDecision::Rejected
+                    | ApprovalDecision::Answered { .. }
+                    | ApprovalDecision::Voided,
+                ) => {}
+            }
+        }
+    }
+    for approval in approval_calls.keys() {
+        let conversation = auth
+            .jobs
+            .get(&approval.0)
+            .and_then(|row| row.parent_id)
+            .ok_or_else(|| StorageError::corrupted("approval has no conversation"))?;
+        open_approvals.remove(&(conversation.get(), approval.0, approval.1, approval.2));
+    }
+    note(
+        "open_approval",
+        sync!(tx, OPEN_APPROVALS, open_approvals),
+        true,
+    );
+    note(
+        "approval_call",
+        sync!(tx, APPROVAL_CALLS, approval_calls),
+        true,
+    );
     note("pending", sync!(tx, PENDING, derived.pending), false);
     note("ready", sync!(tx, READY, derived.ready), false);
     note("delayed", sync!(tx, DELAYED, derived.delayed), false);
@@ -836,6 +899,7 @@ mod tests {
             index: 0,
         };
         wait(database.record_tool_decision(NewToolEvidence {
+            approval: None,
             call: call1,
             tool_call_id: "c-1".into(),
             name: "tool_a".into(),
@@ -858,6 +922,7 @@ mod tests {
             index: 1,
         };
         wait(database.record_tool_decision(NewToolEvidence {
+            approval: None,
             call: call2,
             tool_call_id: "c-2".into(),
             name: "tool_a".into(),
@@ -880,6 +945,7 @@ mod tests {
             index: 2,
         };
         wait(database.record_tool_decision(NewToolEvidence {
+            approval: None,
             call: call3,
             tool_call_id: "c-3".into(),
             name: "tool_a".into(),

@@ -224,7 +224,7 @@ pub(crate) fn record_tool_decision(batch: &mut Batch, evidence: NewToolEvidence)
     if !is_function_name(&evidence.name) {
         return batch.reject(Violation::InvalidValue("name", "is not a function name"));
     }
-    if let ToolDecision::Admitted(admission) = &evidence.decision {
+    if let Some(admission) = evidence.decision.stored_admission() {
         if !is_handler_version(&admission.handler_version) {
             return batch.reject(Violation::InvalidValue(
                 "handler_version",
@@ -256,6 +256,7 @@ pub(crate) fn record_tool_decision(batch: &mut Batch, evidence: NewToolEvidence)
         &evidence.name,
         evidence.decision,
         evidence.spawns,
+        evidence.approval,
     )
 }
 

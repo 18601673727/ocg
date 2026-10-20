@@ -32,12 +32,13 @@ use crate::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
 };
 use crate::persistence::{
-    Actor, Appended, ConversationAction, ConversationSpec, Entry, EntryKind, JobKind, Notice,
-    NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind, PlanSource, RecordEvent, Recurrence,
-    RecurrenceHalt, RecurrencePhase, StopProof, TurnEntry, TurnExecution,
+    Actor, Appended, ApprovalDecision, ApprovalRecord, ConversationAction, ConversationSpec, Entry,
+    EntryKind, JobKind, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind,
+    PlanSource, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase, StopProof, TurnEntry,
+    TurnExecution,
 };
 use crate::persistence::{
-    AgentBehavior, AgentConfig, AttachmentId, AttachmentOrigin, AttachmentRecord,
+    AgentBehavior, AgentConfig, ApproveClass, AttachmentId, AttachmentOrigin, AttachmentRecord,
     AuthorizationBasis, CapacityScope, CleanupKind, ConfigId, ConfigRef, ContentDigest,
     DependencyCondition, EffectConclusion, ExecutionOperation, ExecutionPool, ExecutionPoolId,
     ExecutorId, ExecutorRecord, FinalResult, FrozenExecutionConfig, FrozenLlmConfig, JobId,
@@ -50,6 +51,7 @@ use crate::persistence::{
 };
 use crate::token_usage::RequestEligibility;
 
+mod approvals;
 mod batch;
 mod codec;
 mod conversations;
@@ -92,7 +94,10 @@ pub(crate) use reads::ConversationEntry;
 use reads::read;
 #[cfg(test)]
 pub(crate) use reads::record_attachment_cleanup;
-pub(crate) use reads::{ChildConversationEntry, ConversationsPage, read_conversation_children};
+pub(crate) use reads::{
+    ChildConversationEntry, ConversationsPage, read_approved_calls, read_cards,
+    read_conversation_children, read_has_decider,
+};
 pub(crate) use reads::{
     TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,
     read_turn_execution,

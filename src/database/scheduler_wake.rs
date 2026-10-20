@@ -79,6 +79,7 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::Hold
         | OperationKind::Unhold
         | OperationKind::Retry
+        | OperationKind::DecideApproval
         | OperationKind::ApplyJobTool
         | OperationKind::AssignJobExecutor
         | OperationKind::FinalizeJob
@@ -139,6 +140,7 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::Hold
         | OperationKind::Unhold
         | OperationKind::Retry
+        | OperationKind::DecideApproval
         | OperationKind::ApplyJobTool
         | OperationKind::BoundaryB
         | OperationKind::AssignJobExecutor

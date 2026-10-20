@@ -117,7 +117,8 @@ pub(super) fn metrics_of(
             }
             RequestPayload::Availability { .. }
             | RequestPayload::Sent { .. }
-            | RequestPayload::Received { .. } => last_measurement = None,
+            | RequestPayload::Received { .. }
+            | RequestPayload::ApprovedCalls => last_measurement = None,
         }
     }
     records
@@ -528,7 +529,9 @@ pub(crate) fn read_observed_models(
         match event.payload {
             RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => flags.0 = true,
             RequestPayload::Availability { .. } => flags.1 = true,
-            RequestPayload::Sent { .. } | RequestPayload::Received { .. } => {}
+            RequestPayload::Sent { .. }
+            | RequestPayload::Received { .. }
+            | RequestPayload::ApprovedCalls => {}
         }
         Ok(true)
     })?;
@@ -605,18 +608,18 @@ pub(crate) fn read_provider_request(
     let Some((messages, tools, parameters)) = sent else {
         return Ok(None);
     };
-    if request != RequestNumber::FIRST {
-        for entry in events.range((job.get(), 1, 0)..=(job.get(), 1, u32::MAX))? {
-            let (key, bytes) = entry?;
-            if let RequestPayload::Sent {
-                dropped_turns: dropped,
-                ..
-            } = decode_request_event(job, RequestNumber::FIRST, key.value().2, bytes.value())?
-                .payload
-            {
-                dropped_turns = dropped.unwrap_or_default();
-                break;
-            }
+    for entry in events.range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))? {
+        let (key, bytes) = entry?;
+        let (_, number, seq) = key.value();
+        let number = RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("zero request number"))?;
+        if let RequestPayload::Sent {
+            dropped_turns: dropped,
+            ..
+        } = decode_request_event(job, number, seq, bytes.value())?.payload
+        {
+            dropped_turns = dropped.unwrap_or_default();
+            break;
         }
     }
     Ok(Some(crate::persistence::ProviderRequestRecord {

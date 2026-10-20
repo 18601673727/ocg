@@ -207,6 +207,8 @@ enum WireProfileRequest {
         llm_targets: Vec<String>,
         #[serde(default)]
         dispatch_to: Option<Vec<String>>,
+        #[serde(default)]
+        approve: Option<Vec<String>>,
         #[serde(default, deserialize_with = "optional_default_model")]
         default_model: Option<Option<String>>,
     },
@@ -477,6 +479,7 @@ async fn build_profiles_snapshot(
                     "name": record.name,
                     "instructions": agent.instructions,
                     "tool_grant": agent.tool_grant,
+                    "approve": agent.approve.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
                     "dispatch_to": agent.dispatch_to.iter().map(|id| ProfileId::from(*id).to_string()).collect::<Vec<_>>(),
                     "default_model": agent.default_model.map(|id| ProfileId::from(id).to_string()),
                     "behavior": match agent.behavior {
@@ -742,6 +745,7 @@ pub(super) async fn save_profile(
             tool_grant,
             llm_targets,
             dispatch_to,
+            approve,
             default_model,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
@@ -801,6 +805,31 @@ pub(super) async fn save_profile(
             } else {
                 AgentConfig::default()
             };
+            let mut parsed_approve = if let Some(values) = approve {
+                let invalid = Refusal::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_approve",
+                    "approve must contain unique commands, writes, dispatch or close",
+                );
+                let mut classes = Vec::new();
+                for value in values {
+                    let class = match value.as_str() {
+                        "commands" => crate::persistence::ApproveClass::Commands,
+                        "writes" => crate::persistence::ApproveClass::Writes,
+                        "dispatch" => crate::persistence::ApproveClass::Dispatch,
+                        "close" => crate::persistence::ApproveClass::Close,
+                        _ => return Err(invalid),
+                    };
+                    if classes.contains(&class) {
+                        return Err(invalid);
+                    }
+                    classes.push(class);
+                }
+                classes
+            } else {
+                prior.approve
+            };
+            parsed_approve.sort();
             let invalid_dispatch = Refusal::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_dispatch_to",
@@ -850,6 +879,7 @@ pub(super) async fn save_profile(
             NewConfig {
                 name: name.trim().to_owned(),
                 body: ConfigBody::Agent(AgentConfig {
+                    approve: parsed_approve,
                     instructions: normalized_instructions,
                     behavior,
                     models: parsed_targets,
@@ -1517,6 +1547,75 @@ mod reasoning_parameter_tests {
                 128
             );
             worker.shutdown().expect("close");
+        });
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::persistence::{ConversationSpec, Entry, ExecutionConfiguration, Origin};
+    #[test]
+    fn approve_profile_round_trips_keeps_omitted_clears_empty_and_requires_a_decider_at_t1() {
+        crate::test_support::on_system(|| async {
+            let (_root, directory) = crate::test_support::data_directory("profiles", "approve");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let model = save_profile(&db, None, br#"{"kind":"llm","name":"model","model":"m","declared_capabilities":["chat","tools"]}"#).await.unwrap().body["profile_id"].as_str().unwrap().to_owned();
+            let mut body = json!({"kind":"agent","name":"approval agent","llm_targets":[model],"default_model":model,"approve":["close","commands"]});
+            let saved = save_profile(&db, None, &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            let id = profile_id(saved.body["profile_id"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                saved.body["agent_profiles"][0]["approve"],
+                json!(["commands", "close"])
+            );
+            body.as_object_mut().unwrap().remove("approve");
+            let saved = save_profile(&db, Some(id), &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                saved.body["agent_profiles"][0]["approve"],
+                json!(["commands", "close"])
+            );
+            assert!(matches!(
+                db.open_conversation(
+                    None,
+                    ConversationSpec {
+                        name: None,
+                        agent: Some(id.into()),
+                        project: None,
+                        origin: Origin::System,
+                        keep_open: true
+                    },
+                    Entry::UserMessage {
+                        text: "system".into(),
+                        attachments: vec![]
+                    },
+                    ExecutionConfiguration {
+                        agent_profile: Some(id),
+                        llm_profile: profile_id(&model).unwrap()
+                    },
+                    None
+                )
+                .await,
+                Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "approve",
+                    "no deciding user"
+                )))
+            ));
+            body["approve"] = json!([]);
+            let saved = save_profile(&db, Some(id), &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(saved.body["agent_profiles"][0]["approve"], json!([]));
+            body["approve"] = json!(["unknown"]);
+            assert!(
+                matches!(save_profile(&db, Some(id), &serde_json::to_vec(&body).unwrap()).await, Err(refusal) if refusal.code == "invalid_approve")
+            );
+            worker.shutdown().unwrap();
         });
     }
 }

@@ -38,6 +38,7 @@ pub enum OperationKind {
     FinalizeJob,
     CreateExecutor,
     ApplyJobTool,
+    DecideApproval,
     BoundaryB,
     Open,
     Append,

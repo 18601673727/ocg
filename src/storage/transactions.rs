@@ -735,8 +735,77 @@ impl Batch {
         name: &str,
         decision: ToolDecision,
         spawns: bool,
+        approval: Option<ToolCallRef>,
     ) -> Result<(), BatchError> {
         self.require_executing_here(call.job)?;
+        let turn = self.require_job(call.job)?;
+        let conversation = if turn.kind.is_stored() {
+            turn.parent_id
+        } else {
+            None
+        };
+        if let Some(original) = approval {
+            let Some(conversation) = conversation else {
+                return self.reject(Violation::InvalidValue(
+                    "approval_executed",
+                    "no matching approval in this conversation",
+                ));
+            };
+            if self.conversation(conversation)?.closing.is_some() {
+                return self.reject(Violation::InvalidValue(
+                    "conversation_closing",
+                    "approved calls cannot run while closing",
+                ));
+            }
+            let eligible = self.step(|tx| {
+                Ok(tx
+                    .open_table(OPEN_APPROVALS)?
+                    .get(approvals::open_key(conversation, original))?
+                    .is_some_and(|v| v.value() == 1)
+                    && tx
+                        .open_table(APPROVAL_CALLS)?
+                        .get(tool_call_key(original))?
+                        .is_none())
+            })?;
+            if !eligible {
+                return self.reject(Violation::InvalidValue(
+                    "approval_executed",
+                    "approval is unavailable or already executed",
+                ));
+            }
+            let Some(original) = self.tool_evidence(original)? else {
+                return self.reject(Violation::InvalidValue(
+                    "approval_not_found",
+                    "awaiting call missing",
+                ));
+            };
+            if original.name != name {
+                return self.reject(Violation::InvalidValue(
+                    "name",
+                    "must equal the approved tool name",
+                ));
+            }
+            if call.request == RequestNumber::FIRST
+                && !self.request_observed(call.job, call.request)?
+            {
+                self.insert_request_event(
+                    call.job,
+                    call.request,
+                    self.now,
+                    crate::persistence::RequestPayload::ApprovedCalls,
+                )?;
+            }
+        }
+        if matches!(
+            decision,
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
+        ) && conversation.is_none()
+        {
+            return self.reject(Violation::InvalidValue(
+                "approve",
+                "awaiting calls require a conversation",
+            ));
+        }
         if !self.request_observed(call.job, call.request)? {
             return self.reject(Violation::RequestNotObserved {
                 job: call.job,
@@ -759,7 +828,7 @@ impl Batch {
             return self.reject(Violation::DuplicateToolCallId { call, existing });
         }
         let mut updated_totals = None;
-        if let ToolDecision::Admitted(admission) = &decision {
+        if let Some(admission) = decision.stored_admission() {
             let current = self.step(|tx| {
                 Ok(tx
                     .open_table(TOOL_TOTALS)?
@@ -800,6 +869,7 @@ impl Batch {
                 updated_stats.1 = updated_stats.1.saturating_add(1);
                 stats_changed = true;
             }
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_) => {}
             ToolDecision::Refused(
                 ToolCallRefusal::Malformed
                 | ToolCallRefusal::ConflictingIdentity
@@ -808,11 +878,13 @@ impl Batch {
                 | ToolCallRefusal::Incomplete
                 | ToolCallRefusal::Unauthorized
                 | ToolCallRefusal::MissingSchema
-                | ToolCallRefusal::UnsupportedSchema,
+                | ToolCallRefusal::UnsupportedSchema
+                | ToolCallRefusal::NoDecider,
             ) => {}
         }
         let record = ToolEvidenceRecord {
             call,
+            approval,
             tool_call_id: tool_call_id.to_owned(),
             name: name.to_owned(),
             spawns: spawns && matches!(decision, ToolDecision::Admitted(_)),
@@ -838,6 +910,33 @@ impl Batch {
             }
             Ok(())
         })?;
+        if let Some(original) = approval
+            && let Some(conversation) = conversation
+        {
+            self.step(|tx| {
+                tx.open_table(OPEN_APPROVALS)?
+                    .remove(approvals::open_key(conversation, original))?;
+                tx.open_table(APPROVAL_CALLS)?
+                    .insert(tool_call_key(original), tool_call_key(call))?;
+                Ok(())
+            })?;
+        }
+        if matches!(
+            record.decision.fact,
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
+        ) && let Some(conversation) = conversation
+        {
+            if let Some(closing) = self.conversation(conversation)?.closing {
+                self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
+            } else {
+                self.step(|tx| {
+                    tx.open_table(OPEN_APPROVALS)?
+                        .insert(approvals::open_key(conversation, call), 0)?;
+                    Ok(())
+                })?;
+                self.notify(conversation, NoticeEvent::Requested, call.job)?;
+            }
+        }
         self.probe = Some(Probe::ToolCall(call));
         Ok(())
     }
@@ -959,6 +1058,7 @@ impl Batch {
                         if matches!(
                             rows::decode_request_event(job, request, seq, bytes.value())?.payload,
                             crate::persistence::RequestPayload::Sent { .. }
+                                | crate::persistence::RequestPayload::ApprovedCalls
                         ) {
                             return Ok(true);
                         }

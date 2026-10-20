@@ -161,6 +161,7 @@ pub enum ToolCallRefusal {
     UnsupportedSchema,
     /// The arguments are not one strict JSON object satisfying the schema.
     InvalidArguments,
+    NoDecider,
 }
 
 impl ToolCallRefusal {
@@ -176,6 +177,7 @@ impl ToolCallRefusal {
             Self::MissingSchema => "missing parameter schema",
             Self::UnsupportedSchema => "unsupported parameter schema",
             Self::InvalidArguments => "invalid arguments",
+            Self::NoDecider => "no decider",
         }
     }
 }

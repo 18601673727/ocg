@@ -95,7 +95,7 @@ impl RequestRecorder {
                 messages: digests,
                 tools,
                 parameters,
-                dropped_turns: (request == RequestNumber::FIRST).then_some(dropped_turns),
+                dropped_turns: self.parameters.is_none().then_some(dropped_turns),
                 bodies,
                 required_messages,
             },
