@@ -1,3 +1,4 @@
+use super::codec::TAG_APPROVAL;
 use super::*;
 use crate::persistence::{ToolCallRef, ToolDecision, Violation};
 
@@ -12,7 +13,7 @@ pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u64, u64, u32
 
 impl ApprovalRecord {
     pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(15);
+        let mut e = Enc::new(TAG_APPROVAL);
         match &self.decision {
             ApprovalDecision::Approved => e.u8(1),
             ApprovalDecision::Rejected => e.u8(2),
@@ -27,7 +28,7 @@ impl ApprovalRecord {
         e.0
     }
     pub(super) fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut d = Dec::new(bytes, 15)?;
+        let mut d = Dec::new(bytes, TAG_APPROVAL)?;
         let decision = match d.u8()? {
             1 => ApprovalDecision::Approved,
             2 => ApprovalDecision::Rejected,

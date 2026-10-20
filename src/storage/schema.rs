@@ -28,6 +28,12 @@ pub(super) const REQUEST_EVENTS: TableDefinition<(u64, u32, u32), &[u8]> =
     TableDefinition::new("request_event");
 pub(super) const PROJECTS: TableDefinition<u64, &[u8]> = TableDefinition::new("project");
 pub(super) const CONVERSATIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("conversation");
+pub(super) const TURN_INPUTS: TableDefinition<(u64, u32), &[u8]> =
+    TableDefinition::new("turn_input");
+pub(super) const NOTICES: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("notice");
+pub(super) const APPROVALS: TableDefinition<(u64, u32, u32), &[u8]> =
+    TableDefinition::new("approval");
+pub(super) const RECURRENCES: TableDefinition<u64, &[u8]> = TableDefinition::new("recurrence");
 
 // ---- Derived tables ----------------------------------------------------------------
 
@@ -41,9 +47,6 @@ pub(super) const HELD_SLOTS: TableDefinition<(u64, u64), (u64, bool)> =
     TableDefinition::new("held_slot");
 pub(super) const CHILDREN: TableDefinition<(u64, u64), ()> = TableDefinition::new("children");
 pub(super) const SUCCESSORS: TableDefinition<u64, u64> = TableDefinition::new("successor");
-pub(super) const TURN_INPUTS: TableDefinition<(u64, u32), &[u8]> =
-    TableDefinition::new("turn_input");
-pub(super) const NOTICES: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("notice");
 pub(super) const TIPS: TableDefinition<u64, u64> = TableDefinition::new("tip");
 pub(super) const RECENT: TableDefinition<(u64, u64), ()> = TableDefinition::new("recent");
 pub(super) const CHILD_CONVERSATIONS: TableDefinition<(u64, u64), ()> =
@@ -72,17 +75,14 @@ pub(super) const USAGE_TOTALS: TableDefinition<UsageTotalKey, UsageTotalValue> =
 pub(super) const RETRIES: TableDefinition<(u64, u64), bool> = TableDefinition::new("retry");
 pub(super) const ATTACHMENT_REFS: TableDefinition<(u64, u64), ()> =
     TableDefinition::new("attachment_ref");
-type RequestScopeKey = (u64, [u8; 32], i64, u64, u32, u32);
+pub(super) type RequestScopeKey = (u64, [u8; 32], i64, u64, u32, u32);
 pub(super) const REQUEST_SCOPES: TableDefinition<RequestScopeKey, ()> =
     TableDefinition::new("request_scope");
 
-pub(super) const APPROVALS: TableDefinition<(u64, u32, u32), &[u8]> =
-    TableDefinition::new("approval");
 pub(super) const OPEN_APPROVALS: TableDefinition<(u64, u64, u32, u32), u8> =
     TableDefinition::new("open_approval");
 pub(super) const APPROVAL_CALLS: TableDefinition<(u64, u32, u32), (u64, u32, u32)> =
     TableDefinition::new("approval_call");
 
-pub(super) const RECURRENCES: TableDefinition<u64, &[u8]> = TableDefinition::new("recurrence");
 pub(super) const RECURRENCE_DUE: TableDefinition<(i64, u64), ()> =
     TableDefinition::new("recurrence_due");

@@ -22,12 +22,11 @@ fn read_job_row(rx: &ReadTransaction, id: JobId) -> Result<Option<JobRow>, Stora
 }
 
 fn read_conversation(rx: &ReadTransaction, id: JobId) -> Result<ConversationRow, StorageError> {
-    Ok(rx
-        .open_table(CONVERSATIONS)?
+    rx.open_table(CONVERSATIONS)?
         .get(id.get())?
         .map(|bytes| ConversationRow::decode(bytes.value()))
         .transpose()?
-        .unwrap_or_default())
+        .ok_or_else(|| StorageError::corrupted(format!("{id} has no conversation row")))
 }
 
 fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobStateRow, StorageError> {
@@ -1417,30 +1416,53 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
             let mut text = format!(
                 "Retry {turn}. Its started tool calls below are uncertain; do not replay them automatically."
             );
-            for (_, original) in turn_entries(rx, *turn)? {
-                if !matches!(original.entry, Entry::RetryOf { .. }) {
-                    text.push('\n');
-                    text.push_str(&entry_text(rx, &original.entry)?);
+            // A retry of a retry does not repeat the original prompt, so the
+            // chain of retries is walked to the root turn that has none, and
+            // that root's entries and uncertain calls come first.
+            let mut chain = Vec::new();
+            let mut visited = BTreeSet::new();
+            let mut next = Some(*turn);
+            while let Some(current) = next {
+                if !visited.insert(current) {
+                    break;
+                }
+                chain.push(current);
+                next = turn_entries(rx, current)?
+                    .into_iter()
+                    .find_map(|(_, entry)| match entry.entry {
+                        Entry::RetryOf { turn: original, .. } => Some(original),
+                        _ => None,
+                    });
+            }
+            chain.reverse();
+            for current in &chain {
+                for (_, original) in turn_entries(rx, *current)? {
+                    if !matches!(original.entry, Entry::RetryOf { .. }) {
+                        text.push('\n');
+                        text.push_str(&entry_text(rx, &original.entry)?);
+                    }
                 }
             }
-            for call in job_tool_evidence(&rx.open_table(TOOL_CALLS)?, *turn)? {
-                if call.admission().is_some()
-                    && call.outcome.as_ref().is_none_or(|outcome| {
-                        matches!(
-                            outcome.fact,
-                            crate::persistence::ToolOutcome::Uncertain { .. }
-                        )
-                    })
-                {
-                    text.push_str(&format!(
-                        "\nUncertain: request {}, index {}, tool {}, arguments {}",
-                        call.call.request.get(),
-                        call.call.index,
-                        call.name,
-                        call.admission()
-                            .map(|admission| admission.arguments.as_str())
-                            .unwrap_or("{}")
-                    ));
+            for current in &chain {
+                for call in job_tool_evidence(&rx.open_table(TOOL_CALLS)?, *current)? {
+                    if call.admission().is_some()
+                        && call.outcome.as_ref().is_none_or(|outcome| {
+                            matches!(
+                                outcome.fact,
+                                crate::persistence::ToolOutcome::Uncertain { .. }
+                            )
+                        })
+                    {
+                        text.push_str(&format!(
+                            "\nUncertain: request {}, index {}, tool {}, arguments {}",
+                            call.call.request.get(),
+                            call.call.index,
+                            call.name,
+                            call.admission()
+                                .map(|admission| admission.arguments.as_str())
+                                .unwrap_or("{}")
+                        ));
+                    }
                 }
             }
             text

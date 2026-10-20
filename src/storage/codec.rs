@@ -15,6 +15,9 @@ pub(super) const TAG_PROJECT: u8 = 9;
 pub(super) const TAG_CONVERSATION: u8 = 10;
 pub(super) const TAG_TURN_INPUT: u8 = 11;
 pub(super) const TAG_NOTICE: u8 = 12;
+pub(super) const TAG_RECURRENCE: u8 = 13;
+// 14 is unused.
+pub(super) const TAG_APPROVAL: u8 = 15;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 

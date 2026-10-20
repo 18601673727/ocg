@@ -1648,6 +1648,28 @@ mod tests {
         fixture.worker.shutdown().expect("shutdown");
     }
     #[test]
+    fn a_conversation_without_its_row_is_corruption_not_a_default() {
+        let fixture = Fixture::new("no-conversation-row");
+        let (conversation, _turn) = fixture.open();
+        wait(fixture.database.with_database(move |database| {
+            let tx = database.begin_write()?;
+            tx.open_table(CONVERSATIONS)?.remove(conversation.get())?;
+            tx.commit()?;
+            Ok(())
+        }))
+        .expect("remove row");
+        // The missing row is a storage failure, so the worker protects itself
+        // and only a shutdown that refuses proves it.
+        assert!(
+            wait(fixture.database.set_conversation(
+                conversation,
+                crate::persistence::ConversationEdit::Title("renamed".into())
+            ))
+            .is_err()
+        );
+        assert!(fixture.worker.shutdown().is_err());
+    }
+    #[test]
     fn running_turn_gets_one_waiting_successor_and_messages_join_until_claim() {
         let fixture = Fixture::new("append");
         let (conversation, first) = fixture.open();
@@ -1945,6 +1967,30 @@ mod tests {
         assert_eq!(
             wait(fixture.database.retries(first)).expect("retries"),
             [retry.turn]
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+    #[test]
+    fn a_retry_of_a_retry_still_quotes_the_root_prompt() {
+        let fixture = Fixture::new("retry-of-retry");
+        let (conversation, first) = fixture.open();
+        fixture.finish(first, OutcomeKind::Unknown);
+        let retry = wait(fixture.database.retry(conversation, first, Actor::User)).expect("retry");
+        fixture.finish(retry.turn, OutcomeKind::Unknown);
+        let again = wait(
+            fixture
+                .database
+                .retry(conversation, retry.turn, Actor::User),
+        )
+        .expect("retry");
+        assert!(
+            wait(fixture.database.read_turn_context(again.turn, 1000))
+                .expect("context")
+                .turns
+                .last()
+                .expect("retry input")
+                .text
+                .contains("first")
         );
         fixture.worker.shutdown().expect("shutdown");
     }

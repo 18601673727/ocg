@@ -1,9 +1,10 @@
+use super::codec::TAG_RECURRENCE;
 use super::*;
 use crate::persistence::{ConfigBody, ConfigKind, ExecutionConfiguration};
 
 impl Recurrence {
     pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(13);
+        let mut e = Enc::new(TAG_RECURRENCE);
         match self.phase {
             RecurrencePhase::Active => e.u8(0),
             RecurrencePhase::WaitingDue { due } => {
@@ -26,7 +27,7 @@ impl Recurrence {
         e.0
     }
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, 13)?;
+        let mut d = Dec::new(bytes, TAG_RECURRENCE)?;
         let phase = match d.u8()? {
             0 => RecurrencePhase::Active,
             1 => RecurrencePhase::WaitingDue { due: d.i64()? },

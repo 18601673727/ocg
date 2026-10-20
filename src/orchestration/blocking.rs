@@ -208,6 +208,13 @@ struct RunningGroup {
 
 impl Drop for RunningGroup {
     fn drop(&mut self) {
+        // A panic inside Process::finish unwinds through the process group it
+        // was supervising: its processes may still run, so the entry stays and
+        // the job keeps answering slot_live. The operator restarts the host
+        // rather than freeing a slot whose group may still be alive.
+        if thread::panicking() {
+            return;
+        }
         let mut groups = RUNNING_GROUPS
             .lock()
             .unwrap_or_else(PoisonError::into_inner);

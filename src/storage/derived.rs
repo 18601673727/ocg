@@ -7,8 +7,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use redb::ReadableTableMetadata;
+
 use super::*;
-use crate::persistence::OutcomeKind;
+use crate::persistence::{OutcomeKind, RequestEventRecord, RequestPayload};
 
 /// What every derived table must hold, given the authoritative rows.
 #[derive(Default)]
@@ -41,7 +43,6 @@ struct Authoritative {
     jobs: BTreeMap<u64, JobRow>,
     states: BTreeMap<u64, JobStateRow>,
     conversations: BTreeMap<u64, ConversationRow>,
-    inputs: BTreeMap<(u64, u32), TurnEntry>,
     result_turns: BTreeSet<u64>,
     executions: BTreeMap<u64, FrozenExecutionConfig>,
     held_conversations: BTreeSet<u64>,
@@ -49,6 +50,10 @@ struct Authoritative {
     tool_totals: BTreeMap<u64, (u64, u64)>,
     tool_stats: BTreeMap<String, schema::ToolStatValue>,
     usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
+    attachment_refs: BTreeMap<(u64, u64), ()>,
+    user_entry_at: BTreeMap<u64, i64>,
+    retries: BTreeMap<(u64, u64), bool>,
+    request_scopes_differ: bool,
 }
 
 fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageError> {
@@ -74,10 +79,32 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
             result_turns.insert(key.value().0);
         }
     }
-    let mut inputs = BTreeMap::new();
+    let mut attachment_refs = BTreeMap::new();
+    let mut user_entry_at = BTreeMap::new();
+    let mut retries = BTreeMap::new();
     for entry in tx.open_table(TURN_INPUTS)?.iter()? {
         let (key, bytes) = entry?;
-        inputs.insert(key.value(), TurnEntry::decode(bytes.value())?);
+        let (turn, _) = key.value();
+        let input = TurnEntry::decode(bytes.value())?;
+        match &input.entry {
+            Entry::UserMessage { attachments, .. } => {
+                for attachment in attachments {
+                    attachment_refs.insert((attachment.get(), turn), ());
+                }
+                if let Some(conversation) = jobs[&turn].parent_id {
+                    user_entry_at
+                        .entry(conversation.get())
+                        .or_insert(input.at.as_unix_micros());
+                }
+            }
+            Entry::RetryOf { turn: original, by } => {
+                retries.insert((original.get(), turn), matches!(by, Actor::Agent { .. }));
+            }
+            Entry::AgentMessage { .. }
+            | Entry::Notice { .. }
+            | Entry::Decision { .. }
+            | Entry::Iteration { .. } => {}
+        }
     }
     let mut executions = BTreeMap::new();
     let mut held_conversations = BTreeSet::new();
@@ -183,13 +210,16 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         }
         tool_call_ids.push((job, record.tool_call_id, request, index));
     }
-    let usage_totals =
-        usage_totals_from_events(&tx.open_table(REQUEST_EVENTS)?, &jobs, &executions)?;
+    let (usage_totals, request_scopes_differ) = usage_totals_from_events(
+        &tx.open_table(REQUEST_EVENTS)?,
+        &tx.open_table(REQUEST_SCOPES)?,
+        &jobs,
+        &executions,
+    )?;
     Ok(Authoritative {
         jobs,
         states,
         conversations,
-        inputs,
         result_turns,
         executions,
         held_conversations,
@@ -197,20 +227,64 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         tool_totals,
         tool_stats,
         usage_totals,
+        attachment_refs,
+        user_entry_at,
+        retries,
+        request_scopes_differ,
     })
+}
+
+/// The REQUEST_SCOPES key an event writes, if it writes one: only an event
+/// of a Job with a frozen execution, which no conversation has, and never a
+/// Sent, Received or ApprovedCalls event. The definition every writer and
+/// the rebuild share.
+pub(super) fn request_scope_key(
+    execution: Option<&FrozenExecutionConfig>,
+    event: &RequestEventRecord,
+) -> Option<schema::RequestScopeKey> {
+    execution
+        .filter(|_| {
+            !matches!(
+                event.payload,
+                RequestPayload::Sent { .. }
+                    | RequestPayload::Received { .. }
+                    | RequestPayload::ApprovedCalls
+            )
+        })
+        .map(|execution| {
+            (
+                execution.llm.provider.id.get(),
+                *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),
+                event.observed_at.as_unix_micros(),
+                event.job_id.get(),
+                event.request.get(),
+                event.seq,
+            )
+        })
 }
 
 /// One ordered pass over the request events, grouped by (Job, request): the
 /// events of one request are contiguous in table order, so each group is
 /// reduced on its own as the pass meets its first event of the next request.
 /// Nothing else is kept, so the pass holds one request's events, never the
-/// whole table.
+/// whole table. Each event's expected scope key is looked up as the event is
+/// decoded and counted, never collected, and the scopes differ when one is
+/// missing or the count does not match the table.
 fn usage_totals_from_events(
     table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
+    scopes: &impl ReadableTable<schema::RequestScopeKey, ()>,
     jobs: &BTreeMap<u64, JobRow>,
     executions: &BTreeMap<u64, FrozenExecutionConfig>,
-) -> Result<BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>, StorageError> {
+) -> Result<
+    (
+        BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
+        bool,
+    ),
+    StorageError,
+> {
     let mut totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue> = BTreeMap::new();
+    let mut scopes_differ = false;
+    let mut scopes_seen = 0u64;
     let mut current: Option<(u64, u32)> = None;
     let mut events: Vec<crate::persistence::RequestEventRecord> = Vec::new();
     for entry in table.iter()? {
@@ -224,18 +298,23 @@ fn usage_totals_from_events(
             current = Some((job, request));
         }
         if let Some(request) = RequestNumber::new(request) {
-            events.push(rows::decode_request_event(
-                JobId::new(job),
-                request,
-                seq,
-                bytes.value(),
-            )?);
+            let event = rows::decode_request_event(JobId::new(job), request, seq, bytes.value())?;
+            if let Some(scope) = request_scope_key(executions.get(&job), &event) {
+                scopes_seen += 1;
+                if scopes.get(scope)?.is_none() {
+                    scopes_differ = true;
+                }
+            }
+            events.push(event);
         }
     }
     if let Some((job, request)) = current {
         add_usage(&mut totals, jobs, executions, job, request, &events)?;
     }
-    Ok(totals)
+    if ReadableTableMetadata::len(scopes)? != scopes_seen {
+        scopes_differ = true;
+    }
+    Ok((totals, scopes_differ))
 }
 
 /// Adds one request's sample, per the shared Token rule, to the usage
@@ -445,31 +524,14 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
             derived.recent.insert((*tip, *conversation), ());
         }
     }
-    for ((turn, _), input) in &auth.inputs {
-        match &input.entry {
-            Entry::UserMessage { attachments, .. } => {
-                for attachment in attachments {
-                    derived
-                        .attachment_refs
-                        .insert((attachment.get(), *turn), ());
-                }
-                if let Some(conversation) = auth.jobs[turn].parent_id {
-                    derived
-                        .user_entry_at
-                        .entry(conversation.get())
-                        .or_insert(input.at.as_unix_micros());
-                }
-            }
-            Entry::RetryOf { turn: original, by } => {
-                derived
-                    .retries
-                    .insert((original.get(), *turn), matches!(by, Actor::Agent { .. }));
-            }
-            Entry::AgentMessage { .. }
-            | Entry::Notice { .. }
-            | Entry::Decision { .. }
-            | Entry::Iteration { .. } => {}
-        }
+    for key in auth.attachment_refs.keys() {
+        derived.attachment_refs.insert(*key, ());
+    }
+    for (conversation, at) in &auth.user_entry_at {
+        derived.user_entry_at.entry(*conversation).or_insert(*at);
+    }
+    for (key, by_agent) in &auth.retries {
+        derived.retries.insert(*key, *by_agent);
     }
     for (job, id, request, index) in &auth.tool_call_ids {
         derived
@@ -693,6 +755,22 @@ pub(super) fn rebuild(
         }
     }
     note("usage_total", usage_totals_differs, true);
+    if auth.request_scopes_differ {
+        tx.delete_table(REQUEST_SCOPES)?;
+        let mut scopes = tx.open_table(REQUEST_SCOPES)?;
+        for entry in tx.open_table(REQUEST_EVENTS)?.iter()? {
+            let (key, bytes) = entry?;
+            let (job, request, seq) = key.value();
+            if let Some(request) = RequestNumber::new(request) {
+                let event =
+                    rows::decode_request_event(JobId::new(job), request, seq, bytes.value())?;
+                if let Some(scope) = request_scope_key(auth.executions.get(&job), &event) {
+                    scopes.insert(scope, ())?;
+                }
+            }
+        }
+        note("request_scope", true, true);
+    }
     Ok(changed)
 }
 
@@ -784,6 +862,42 @@ mod tests {
         let tx = opened.database.begin_write().expect("tx");
         let changed = rebuild(&tx, open::promotion_clock()).expect("rebuild");
         assert!(changed.contains(&"usage_total"));
+        tx.commit().expect("commit");
+
+        // After rebuild, clean
+        let problems_after = relationship_inconsistencies(&opened.database).expect("clean");
+        assert!(
+            problems_after.is_empty(),
+            "expected clean, got: {problems_after:?}"
+        );
+    }
+
+    #[test]
+    fn request_scope_rebuild_detects_difference() {
+        let (_data, directory) = data_directory("derived", "request-scope-rebuild");
+        let opened =
+            crate::storage::open(directory.database_path()).unwrap_or_else(|_| panic!("open"));
+
+        // Corrupt REQUEST_SCOPES by adding an extra entry
+        let tx = opened.database.begin_write().expect("tx");
+        {
+            let mut table = tx.open_table(REQUEST_SCOPES).expect("open");
+            table
+                .insert((1, [0u8; 32], 1, 1, 1, 1), ())
+                .expect("insert");
+        }
+        tx.commit().expect("commit");
+
+        let problems = relationship_inconsistencies(&opened.database).expect("inconsistencies");
+        assert!(
+            problems.iter().any(|p| p.contains("request_scope differs")),
+            "expected request_scope difference, got: {problems:?}"
+        );
+
+        // Now run rebuild
+        let tx = opened.database.begin_write().expect("tx");
+        let changed = rebuild(&tx, open::promotion_clock()).expect("rebuild");
+        assert!(changed.contains(&"request_scope"));
         tx.commit().expect("commit");
 
         // After rebuild, clean

@@ -189,7 +189,10 @@ impl Batch {
         }
         if let Some(parent) = spec.parent_id {
             let state = self.require_job_state(parent)?;
-            if state.outcome.is_some() || self.conversation(parent)?.closing.is_some() {
+            if state.outcome.is_some()
+                || (self.require_job(parent)?.kind.is_conversation()
+                    && self.conversation(parent)?.closing.is_some())
+            {
                 return self.reject(Violation::ParentClosed(parent));
             }
         }

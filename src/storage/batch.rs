@@ -367,6 +367,12 @@ impl Batch {
                         "must be sorted and unique",
                     ));
                 }
+                if agent.models.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return self.reject(Violation::InvalidValue(
+                        "models",
+                        "must be sorted and unique",
+                    ));
+                }
                 if agent.dispatch_to.windows(2).any(|pair| pair[0] >= pair[1]) {
                     return self.reject(Violation::InvalidValue(
                         "dispatch_to",
@@ -666,12 +672,11 @@ impl Batch {
 
     pub(crate) fn conversation(&mut self, root: JobId) -> Result<ConversationRow, BatchError> {
         self.step(|tx| {
-            Ok(tx
-                .open_table(CONVERSATIONS)?
+            tx.open_table(CONVERSATIONS)?
                 .get(root.get())?
                 .map(|bytes| ConversationRow::decode(bytes.value()))
                 .transpose()?
-                .unwrap_or_default())
+                .ok_or_else(|| StorageError::corrupted(format!("{root} has no conversation row")))
         })
     }
 
@@ -837,39 +842,14 @@ impl Batch {
         } else {
             Some(self.turn_execution(&row)?.0)
         };
-        let scope = execution
-            .as_ref()
-            .filter(|_| {
-                !matches!(
-                    event.payload,
-                    RequestPayload::Sent { .. }
-                        | RequestPayload::Received { .. }
-                        | RequestPayload::ApprovedCalls
-                )
-            })
-            .map(|execution| {
-                (
-                    execution.llm.provider.id.get(),
-                    *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),
-                )
-            });
+        let scope = derived::request_scope_key(execution.as_ref(), &event);
         self.step(|tx| {
             tx.open_table(REQUEST_EVENTS)?.insert(
                 (job.get(), request.get(), seq),
                 encode_request_event(&event).as_slice(),
             )?;
-            if let Some((connection, model_hash)) = scope {
-                tx.open_table(REQUEST_SCOPES)?.insert(
-                    (
-                        connection,
-                        model_hash,
-                        observed_at.as_unix_micros(),
-                        job.get(),
-                        request.get(),
-                        seq,
-                    ),
-                    (),
-                )?;
+            if let Some(scope) = scope {
+                tx.open_table(REQUEST_SCOPES)?.insert(scope, ())?;
             }
             Ok(())
         })?;
@@ -960,7 +940,10 @@ impl Batch {
         self.step(|tx| {
             let mut table = tx.open_table(USAGE_TOTALS)?;
             if let Some(old) = old_sample {
-                let hour = old.observed_at.as_unix_micros().div_euclid(3_600_000_000);
+                let hour = old
+                    .observed_at
+                    .as_unix_micros()
+                    .div_euclid(crate::persistence::USAGE_SUMMARY_HOUR_MICROS);
                 let key = (hour, agent, provider, model_hash);
                 let current_val = table.get(key)?.map(|c| c.value()).ok_or_else(|| {
                     StorageError::corrupted(format!("missing usage bucket for {key:?}"))
@@ -1051,7 +1034,10 @@ impl Batch {
                 }
             }
             if let Some(new) = new_sample {
-                let hour = new.observed_at.as_unix_micros().div_euclid(3_600_000_000);
+                let hour = new
+                    .observed_at
+                    .as_unix_micros()
+                    .div_euclid(crate::persistence::USAGE_SUMMARY_HOUR_MICROS);
                 let key = (hour, agent, provider, model_hash);
                 let current_val = table
                     .get(key)?

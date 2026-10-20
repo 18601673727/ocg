@@ -111,7 +111,7 @@ pub(crate) fn database_file(directory: &Path) -> PathBuf {
 }
 
 /// An opened database file with this opening's operation epoch and the
-/// instance's Genesis Job (0 in format 16).
+/// instance's Genesis Job (always Job 0).
 pub(crate) struct OpenedFile {
     pub(crate) database: Database,
     pub(crate) epoch: u64,

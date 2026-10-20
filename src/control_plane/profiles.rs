@@ -951,6 +951,10 @@ mod tests {
             let kept = updated.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
             assert_eq!(kept["dispatch_to"], json!([target]));
             assert_eq!(kept["default_model"], model);
+            let approved = json!({"kind":"agent","name":"renamed","llm_targets":[model],"approve":["commands"]});
+            let updated = save_profile(&database, Some(id), &serde_json::to_vec(&approved).unwrap()).await.unwrap();
+            let stored = updated.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
+            assert_eq!(stored["approve"], json!(["commands"]));
             let cleared = json!({"kind":"agent","name":"renamed","llm_targets":[model],"dispatch_to":null,"approve":null});
             let updated = save_profile(&database, Some(id), &serde_json::to_vec(&cleared).unwrap()).await.unwrap();
             let cleared = updated.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
@@ -1565,6 +1569,35 @@ mod approval_tests {
     use super::*;
     use crate::database::DatabaseWorker;
     use crate::persistence::{ConversationSpec, Entry, ExecutionConfiguration, Origin};
+    #[test]
+    fn an_agent_with_unsorted_or_repeated_models_is_refused() {
+        crate::test_support::on_system(|| async {
+            let (_root, directory) = crate::test_support::data_directory("profiles", "models");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let first = save_profile(&db, None, br#"{"kind":"llm","name":"first","model":"a","declared_capabilities":["chat","tools"]}"#).await.unwrap().body["profile_id"].as_str().unwrap().to_owned();
+            let second = save_profile(&db, None, br#"{"kind":"llm","name":"second","model":"b","declared_capabilities":["chat","tools"]}"#).await.unwrap().body["profile_id"].as_str().unwrap().to_owned();
+            let first: ConfigId = profile_id(&first).unwrap().into();
+            let second: ConfigId = profile_id(&second).unwrap().into();
+            let models = vec![second, first];
+            assert!(matches!(
+                db.create_config(crate::persistence::NewConfig {
+                    name: "descending agent".into(),
+                    body: crate::persistence::ConfigBody::Agent(AgentConfig {
+                        models,
+                        ..Default::default()
+                    })
+                })
+                .await,
+                Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "models",
+                    "must be sorted and unique"
+                )))
+            ));
+            worker.shutdown().unwrap();
+        });
+    }
+
     #[test]
     fn approve_profile_round_trips_keeps_omitted_clears_empty_and_requires_a_decider_at_t1() {
         crate::test_support::on_system(|| async {
