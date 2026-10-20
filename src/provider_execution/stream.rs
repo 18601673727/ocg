@@ -652,26 +652,56 @@ mod reasoning_output_tests {
         crate::test_support::on_system(|| async {
             let mut sink = Sink::default();
             let mut output = StreamOutput::new(Some(&mut sink));
-            output.append(IntermediateOutputKind::Reasoning, &"r".repeat(STREAM_OUTPUT_BUFFER_BYTES + 1)).await.expect("buffer");
-            output.append(IntermediateOutputKind::Progress, "answer").await.expect("switch flushes reasoning");
-            output.append(IntermediateOutputKind::Reasoning, "again").await.expect("switch flushes answer");
+            output
+                .append(
+                    IntermediateOutputKind::Reasoning,
+                    &"r".repeat(STREAM_OUTPUT_BUFFER_BYTES + 1),
+                )
+                .await
+                .expect("buffer");
+            output
+                .append(IntermediateOutputKind::Progress, "answer")
+                .await
+                .expect("switch flushes reasoning");
+            output
+                .append(IntermediateOutputKind::Reasoning, "again")
+                .await
+                .expect("switch flushes answer");
             assert!(output.flush_delay() <= STREAM_OUTPUT_FLUSH_INTERVAL);
             output.flush().await.expect("flush");
-            assert_eq!(sink.0, vec![
-                (IntermediateOutputKind::Reasoning, "r".repeat(STREAM_OUTPUT_BUFFER_BYTES)),
-                (IntermediateOutputKind::Reasoning, "r".into()),
-                (IntermediateOutputKind::Progress, "answer".into()),
-                (IntermediateOutputKind::Reasoning, "again".into()),
-            ]);
-            let config = ProviderExecutionConfig { max_output_bytes: 4, ..Default::default() };
+            assert_eq!(
+                sink.0,
+                vec![
+                    (
+                        IntermediateOutputKind::Reasoning,
+                        "r".repeat(STREAM_OUTPUT_BUFFER_BYTES)
+                    ),
+                    (IntermediateOutputKind::Reasoning, "r".into()),
+                    (IntermediateOutputKind::Progress, "answer".into()),
+                    (IntermediateOutputKind::Reasoning, "again".into()),
+                ]
+            );
+            let config = ProviderExecutionConfig {
+                max_output_bytes: 4,
+                ..Default::default()
+            };
             let mut sink = Sink::default();
             let result = parse_stream(payload(vec![
                 Step::Chunk("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"why\"}}]}\n\n"),
                 Step::Quiet(STREAM_OUTPUT_FLUSH_INTERVAL + Duration::from_millis(30)),
                 Step::Chunk("data: {\"choices\":[{\"delta\":{\"content\":\"a\"},\"finish_reason\":\"stop\"}]}\n\n"),
             ], config.cancellation.clone()), 200, Instant::now(), None, &config, Some(&mut sink), &mut UsageCapture::default()).await.expect("reasoning counted once");
-            assert_eq!((result.text.as_str(), result.reasoning.as_str()), ("a", "why"));
-            assert_eq!(sink.0, [(IntermediateOutputKind::Reasoning, "why".into()), (IntermediateOutputKind::Progress, "a".into())]);
+            assert_eq!(
+                (result.text.as_str(), result.reasoning.as_str()),
+                ("a", "why")
+            );
+            assert_eq!(
+                sink.0,
+                [
+                    (IntermediateOutputKind::Reasoning, "why".into()),
+                    (IntermediateOutputKind::Progress, "a".into())
+                ]
+            );
         });
     }
 }

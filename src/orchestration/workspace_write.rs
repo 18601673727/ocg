@@ -64,7 +64,8 @@ use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 use crate::orchestration::workspace_read::{
-    self, MAX_FILE_BYTES, Refusal as PathRefusal, Step, Workspace, open_at, open_within, read_bytes, read_whole,
+    self, MAX_FILE_BYTES, Refusal as PathRefusal, Step, Workspace, open_at, open_within,
+    read_bytes, read_whole,
 };
 use crate::persistence::{ContentDigest, ToolEffect};
 
@@ -172,20 +173,10 @@ impl From<Failure> for ToolFailure {
 /// What a call asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation<'a> {
-    Create {
-        content: &'a str,
-    },
-    Update {
-        content: &'a str,
-        expected: &'a str,
-    },
-    Replace {
-        old: &'a str,
-        new: &'a str,
-    },
-    Delete {
-        expected: &'a str,
-    },
+    Create { content: &'a str },
+    Update { content: &'a str, expected: &'a str },
+    Replace { old: &'a str, new: &'a str },
+    Delete { expected: &'a str },
 }
 
 /// A call's arguments, checked. The schema already enforces their shape;
@@ -385,8 +376,8 @@ fn replace(
 /// Deletes the regular file at `path`, when its whole current content is `expected`.
 fn delete(workspace: &Workspace, path: &str, expected: &str) -> Result<(), Failure> {
     let (directory, name) = parent(workspace, path)?;
-    let initial_stat = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(|e| match e {
+    let initial_stat =
+        rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| match e {
             Errno::NOENT => PathRefusal::NotFound.into(),
             other => Failure::Refused(PathRefusal::from_errno(other).into()),
         })?;
@@ -750,15 +741,16 @@ impl ToolHandler for WriteFile {
                 Operation::Replace { old, new } => {
                     let old = old.to_owned();
                     let new = new.to_owned();
-                    let (offset, before_sha256, after_sha256) = blocking::run(Kind::File, move || {
-                        #[cfg(test)]
-                        write_seam::install_boxed(seam);
-                        let _mutation = workspace_read::WorkspaceMutation::begin();
-                        replace(&workspace, &path_for_worker, &old, &new)
-                    })
-                    .await
-                    .map_err(ToolFailure::uncertain)?
-                    .map_err(ToolFailure::from)?;
+                    let (offset, before_sha256, after_sha256) =
+                        blocking::run(Kind::File, move || {
+                            #[cfg(test)]
+                            write_seam::install_boxed(seam);
+                            let _mutation = workspace_read::WorkspaceMutation::begin();
+                            replace(&workspace, &path_for_worker, &old, &new)
+                        })
+                        .await
+                        .map_err(ToolFailure::uncertain)?
+                        .map_err(ToolFailure::from)?;
                     json!({
                         "operation": "replace",
                         "path": path,
@@ -1349,12 +1341,18 @@ mod tests {
             assert_eq!(call(&workspace, arguments), refused(Refusal::NotText));
         }
         assert_eq!(
-            call(&workspace, json!({"operation": "replace", "path": "notes.txt", "old": "", "new": "x"})),
+            call(
+                &workspace,
+                json!({"operation": "replace", "path": "notes.txt", "old": "", "new": "x"})
+            ),
             refused(Refusal::InvalidArguments)
         );
         let delete_oversized = "a".repeat(MAX_DELETE_BYTES + 1);
         assert_eq!(
-            call(&workspace, json!({"operation": "delete", "path": "notes.txt", "expected_content": &delete_oversized})),
+            call(
+                &workspace,
+                json!({"operation": "delete", "path": "notes.txt", "expected_content": &delete_oversized})
+            ),
             refused(Refusal::FileTooLargeForDelete)
         );
         assert_eq!(content(&root, "notes.txt"), "original\n");
@@ -1470,7 +1468,10 @@ mod tests {
             "old": "nonexistent",
             "new": "x",
         });
-        assert_eq!(call(&workspace, fail_zero), refused(Refusal::Occurrences(0)));
+        assert_eq!(
+            call(&workspace, fail_zero),
+            refused(Refusal::Occurrences(0))
+        );
 
         // Occurrences check: multiple occurrences
         write(&root, "repeat.txt", "abc abc abc\n");
@@ -1480,7 +1481,10 @@ mod tests {
             "old": "abc",
             "new": "x",
         });
-        assert_eq!(call(&workspace, fail_multi), refused(Refusal::Occurrences(3)));
+        assert_eq!(
+            call(&workspace, fail_multi),
+            refused(Refusal::Occurrences(3))
+        );
 
         // Occurrences check: overlapping occurrences ("aa" in "aaa" is 2)
         write(&root, "overlap.txt", "aaa");
@@ -1490,7 +1494,10 @@ mod tests {
             "old": "aa",
             "new": "x",
         });
-        assert_eq!(call(&workspace, fail_overlap), refused(Refusal::Occurrences(2)));
+        assert_eq!(
+            call(&workspace, fail_overlap),
+            refused(Refusal::Occurrences(2))
+        );
 
         // Test delete
         let del_call = json!({
@@ -1519,7 +1526,10 @@ mod tests {
             "path": "subdir",
             "expected_content": "",
         });
-        assert_eq!(call(&workspace, fail_dir), refused(PathRefusal::NotRegularFile));
+        assert_eq!(
+            call(&workspace, fail_dir),
+            refused(PathRefusal::NotRegularFile)
+        );
 
         // Refuse symlink
         write(&root, "del_target.txt", "target\n");
@@ -1529,7 +1539,10 @@ mod tests {
             "path": "del_symlink.txt",
             "expected_content": "target\n",
         });
-        assert_eq!(call(&workspace, fail_symlink), refused(PathRefusal::SymbolicLink));
+        assert_eq!(
+            call(&workspace, fail_symlink),
+            refused(PathRefusal::SymbolicLink)
+        );
 
         // Refuse hard link
         write(&root, "del_hard_target.txt", "hard\n");
@@ -1543,7 +1556,10 @@ mod tests {
             "path": "del_hardlink.txt",
             "expected_content": "hard\n",
         });
-        assert_eq!(call(&workspace, fail_hardlink), refused(PathRefusal::HardLinked));
+        assert_eq!(
+            call(&workspace, fail_hardlink),
+            refused(PathRefusal::HardLinked)
+        );
 
         // Refuse file over 64 KiB
         let big = vec![b'a'; 65 * 1024];

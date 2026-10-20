@@ -116,8 +116,11 @@ pub(crate) fn request_body(
         object.insert("max_tokens".to_owned(), json!(value));
     }
     if let Some(value) = &parameters.reasoning_effort {
-        crate::openai_compatible::request::parse_reasoning_effort(value)
-            .map_err(|error| ProviderExecutionError::Build { message: error.to_string() })?;
+        crate::openai_compatible::request::parse_reasoning_effort(value).map_err(|error| {
+            ProviderExecutionError::Build {
+                message: error.to_string(),
+            }
+        })?;
         object.insert("reasoning_effort".to_owned(), json!(value));
     }
     if let Some(value) = parameters.max_completion_tokens {

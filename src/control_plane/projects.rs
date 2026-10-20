@@ -86,9 +86,7 @@ struct WireProjectUpdate {
 
 /// A field that must be in the body but may be `null`: `deserialize_with`
 /// turns off serde's default for a missing `Option`.
-fn present<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error> {
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     Option::deserialize(deserializer)
 }
 

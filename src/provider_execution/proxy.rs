@@ -70,10 +70,7 @@ impl Proxy {
         Ok(Self {
             uri,
             authorization,
-            exclusions: exclusions
-                .split(',')
-                .filter_map(parse_exclusion)
-                .collect(),
+            exclusions: exclusions.split(',').filter_map(parse_exclusion).collect(),
             tls: tunnel_tls(),
         })
     }

@@ -161,7 +161,12 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
         block_on(handle.projects(None, 20))?;
         alone.push(read_began.elapsed());
     }
-    report("reads alone,    1 reader ", projects_now(), alone, began.elapsed());
+    report(
+        "reads alone,    1 reader ",
+        projects_now(),
+        alone,
+        began.elapsed(),
+    );
     Ok(())
 }
 

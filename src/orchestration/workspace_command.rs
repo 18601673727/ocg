@@ -653,13 +653,14 @@ fn supervise(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut process = Process::spawn(command, Kind::Command, stop.clone(), job).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::TimedOut {
-            Refusal::CommandBusy
-        } else {
-            Refusal::NotStarted
-        }
-    })?;
+    let mut process =
+        Process::spawn(command, Kind::Command, stop.clone(), job).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                Refusal::CommandBusy
+            } else {
+                Refusal::NotStarted
+            }
+        })?;
     start.mark_started();
     let (stdout_pipe, stderr_pipe) = process.take_output();
     let readers = match (stdout_pipe, stderr_pipe) {
@@ -1090,7 +1091,9 @@ pub(crate) fn code_tools_with(
 #[cfg(test)]
 pub(crate) fn strip_command_stats(mut value: Value) -> Value {
     assert!(
-        value.get("wall_ms").is_some_and(|v| v.is_u64() || v.is_i64() || v.is_number()),
+        value
+            .get("wall_ms")
+            .is_some_and(|v| v.is_u64() || v.is_i64() || v.is_number()),
         "wall_ms must be a number: {value:?}"
     );
     let cpu_user = &value["cpu_user_ms"];

@@ -90,10 +90,10 @@ impl ControlPlane {
         // A browser surface exists in both modes: the served frontend signs
         // itself in, while a headless listener prints the pairing code a
         // remote control client uses.
-        let browser = Some(
-            browser::State::start()
-                .map_err(|_| StartError::Serve(std::io::Error::other("no randomness for sign-in")))?,
-        );
+        let browser =
+            Some(browser::State::start().map_err(|_| {
+                StartError::Serve(std::io::Error::other("no randomness for sign-in"))
+            })?);
         let shared = Arc::new(Shared {
             database,
             scheduler,
