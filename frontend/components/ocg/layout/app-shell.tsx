@@ -1,7 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { PanelRight } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { ChatScreen } from "../chat/chat-screen";
+import { ChatInspector } from "../chat/chat-inspector";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { JobsSurface } from "../job/jobs-surface";
@@ -39,10 +43,25 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
   const [sessionId, setSessionId] = useState("");
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const session = runtime.snapshot.sessions.find(session => session.id === sessionId);
+  const closeInspector = useCallback(() => {
+    setInspectorOpen(false);
+    requestAnimationFrame(() => document.getElementById("chat-inspector-toggle")?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!inspectorOpen || location.view !== "chat") return;
+    document.getElementById("chat-inspector-close")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeInspector();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [inspectorOpen, location.view, closeInspector]);
 
   useEffect(() => {
     const pop = () => { setLocation(currentLocation()); setSessionId(""); };
@@ -112,14 +131,15 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
     runtimeStatus={runtime.snapshot.status} runtimeAuthority="canonical"
     activeView={location.view} onNavigate={view => go(view)} onSettingsClick={() => go("settings")} />;
 
-  return <div className="flex h-dvh min-h-0 w-full bg-background">
-    <aside className="hidden shrink-0 lg:flex">{sidebar}</aside>
-    {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label="Close navigation" className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full">{sidebar}</aside></div>}
-    <div className="flex min-w-0 flex-1 flex-col">
-      <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view} inspectorOpen={false} inspectorControls={false}
-        onToggleInspector={() => {}} onOpenMobileSidebar={() => setMobile(true)} onOpenMobileInspector={() => {}} syncStatus={runtime.sync?.status} />
+  return <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
+    <aside className={cn("hidden shrink-0 border-r border-sidebar-border bg-sidebar lg:flex", collapsed ? "w-16" : "w-72")}>{sidebar}</aside>
+    {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label="Close navigation" className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
+    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+      <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view}
+        onOpenMobileSidebar={() => setMobile(true)} syncStatus={runtime.sync?.status} />
+      {location.view === "chat" && !inspectorOpen && <Button id="chat-inspector-toggle" type="button" variant="ghost" size="icon" className="absolute top-3 right-3 z-20 size-11 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted" aria-label={t("topbar.expandInspector")} title={t("topbar.expandInspector")} aria-expanded={false} aria-controls="chat-inspector" onClick={() => setInspectorOpen(true)}><PanelRight className="size-4" /></Button>}
       {signOutError && <p role="alert" className="px-5 text-sm text-destructive">{signOutError}</p>}
-      <main className="flex min-h-0 flex-1 flex-col overflow-auto">
+      <main className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
         {location.view === "chat" ? <>
           {runtime.snapshot.status.state === "failed" && <p role="alert" className="px-5 py-2 text-sm text-destructive">{runtime.snapshot.status.detail} <button className="underline" onClick={() => void runtime.client.refreshConversations?.().catch(cause => setError(String(cause)))}>Refresh conversations</button></p>}
           {error && <p role="alert" className="px-5 py-2 text-sm text-destructive">{error} <button className="underline" onClick={() => setAttempt(value => value + 1)}>Retry loading</button></p>}
@@ -131,5 +151,6 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
         {location.view === "settings" && <SettingsSurface client={client} health={health} sessionExpiresAtUs={sessionExpiresAtUs} signingOut={signingOut} onSignOut={onSignOut} />}
       </main>
     </div>
+    {location.view === "chat" && inspectorOpen && <ChatInspector session={session} messages={session ? runtime.snapshot.messagesBySession[session.id] ?? [] : []} onClose={closeInspector} onOpenJob={job => go("jobs", job)} />}
   </div>;
 }

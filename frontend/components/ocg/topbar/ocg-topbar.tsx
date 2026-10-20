@@ -1,11 +1,6 @@
 "use client";
 
-import {
-  ChevronsLeft,
-  ChevronsRight,
-  PanelLeft,
-  PanelRight,
-} from "lucide-react";
+import { PanelLeft } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
@@ -23,12 +18,7 @@ import type { WorkspaceView } from "../layout/view-domain";
 type OcgTopbarProps = {
   session?: ChatSession;
   projectName?: string;
-  inspectorOpen: boolean;
-  /** When false, the job inspector toggles are hidden (for example on the ledger view). Defaults to true. */
-  inspectorControls?: boolean;
-  onToggleInspector: () => void;
   onOpenMobileSidebar: () => void;
-  onOpenMobileInspector: () => void;
   activeView?: WorkspaceView;
   /** Canonical reconciler sync status. Only degraded states are surfaced. */
   syncStatus?: RuntimeSyncStatus | null;
@@ -40,18 +30,11 @@ type OcgTopbarProps = {
   projectSelector?: React.ReactNode;
 };
 
-/** Quiet floating surface shared by the title and the details control. */
-const PILL = "rounded-full border border-border/70 bg-muted/40 text-foreground";
-
 export function OcgTopbar({
   session,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   projectName,
-  inspectorOpen,
-  inspectorControls = true,
-  onToggleInspector,
   onOpenMobileSidebar,
-  onOpenMobileInspector,
   activeView = "chat",
   syncStatus,
   projectSelector,
@@ -87,14 +70,9 @@ export function OcgTopbar({
         ? "topbar.syncError"
         : "topbar.syncing",
   );
-  const inspectorLabel = inspectorOpen ? t("topbar.collapseInspector") : t("topbar.expandInspector");
-  // An untitled conversation has no title to show. The pill is only drawn when
-  // there is text for it, rather than leaving an empty outline in the header.
   const title = session && activeView === "chat" ? session.title : getViewTitle(activeView);
   return (
-    // The header floats over the conversation: no bottom border and no toolbar
-    // band, so the thread reads as one surface. Its controls are pills.
-    <header className="flex h-12 shrink-0 items-center gap-1.5 px-2 sm:px-3">
+    <header className={cn("flex h-14 shrink-0 items-center gap-1.5 px-2 sm:px-5", activeView === "chat" && "pointer-events-none [&_button]:pointer-events-auto")}>
       {/* Mobile sidebar toggle */}
       <Tooltip>
         <TooltipTrigger
@@ -114,7 +92,7 @@ export function OcgTopbar({
       </Tooltip>
       {/* Conversation title, or the open workspace's name. */}
       {title && (
-        <h1 className={cn("min-w-0 max-w-full truncate px-3 py-1.5 text-[13px] font-semibold tracking-tight", PILL)}>
+        <h1 className={cn("min-w-0 max-w-full truncate px-2 text-sm font-medium", activeView === "chat" && "sr-only")}>
           {title}
         </h1>
       )}
@@ -134,50 +112,6 @@ export function OcgTopbar({
         </div>
       )}
 
-      {/* The execution-details control, kept clear of the title on the right. */}
-      {inspectorControls && (
-        <div className="ml-auto flex shrink-0 items-center gap-1" data-execution-details-control="">
-          {/* Mobile job inspector toggle */}
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className={cn("size-11 rounded-full lg:hidden", PILL)}
-                  onClick={onOpenMobileInspector}
-                  aria-label={t("topbar.openInspector")}
-                >
-                  <PanelRight className="size-4" />
-                </Button>
-              }
-            />
-            <TooltipContent side="bottom">{t("topbar.openInspector")}</TooltipContent>
-          </Tooltip>
-          {/* Desktop job inspector toggle */}
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className={cn("hidden rounded-full lg:inline-flex", PILL, inspectorOpen && "bg-muted")}
-                  onClick={onToggleInspector}
-                  aria-label={inspectorLabel}
-                  aria-expanded={inspectorOpen}
-                >
-                  {inspectorOpen ? (
-                    <ChevronsRight className="size-4" />
-                  ) : (
-                    <ChevronsLeft className="size-4" />
-                  )}
-                </Button>
-              }
-            />
-            <TooltipContent side="bottom">{inspectorLabel}</TooltipContent>
-          </Tooltip>
-        </div>
-      )}
     </header>
   );
 }

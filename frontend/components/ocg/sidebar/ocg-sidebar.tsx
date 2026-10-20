@@ -224,9 +224,9 @@ export function OcgSidebar({
     <>
       <div className="flex items-center gap-1 px-2 pb-2">
         <Button
-          variant="outline"
+          variant="ghost"
           size="sm"
-          className="min-w-0 flex-1 justify-start"
+          className="h-11 min-w-0 flex-1 justify-start rounded-lg px-3 text-sm font-normal"
           onClick={onNewChat}
         >
           <Plus className="size-3.5" data-icon="inline-start" />
@@ -243,7 +243,7 @@ export function OcgSidebar({
           projectName={projectName}
           onSelect={onSelect}
           trigger={
-            <Button variant="outline" size="icon-sm" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
+            <Button variant="ghost" size="icon-sm" className="size-11 rounded-lg" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
               <Search className="size-4" aria-hidden="true" />
             </Button>
           }
@@ -261,7 +261,7 @@ export function OcgSidebar({
           open={workbenchNav.some((item) => item.target === activeView) || undefined}
           data-workbench-menu=""
         >
-          <summary className={cn("group flex cursor-pointer items-center gap-2 rounded-md border border-border px-2 py-1.5 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
+          <summary className={cn("group flex min-h-11 cursor-pointer items-center gap-2 rounded-lg px-3 py-2 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
             <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
             <ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
@@ -426,13 +426,7 @@ export function OcgSidebar({
                         : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                     )}
                   >
-                    <span
-                      aria-hidden="true"
-                      className={cn(
-                        "h-4 w-0.5 shrink-0 rounded-full",
-                        active ? "bg-foreground" : "bg-transparent group-hover:bg-border",
-                      )}
-                    />
+                    <MessageSquare className="size-4 shrink-0" aria-hidden="true" />
                     <span className="min-w-0 flex-1 truncate">
                       {session.title || t("sidebar.newChat")}
                     </span>
