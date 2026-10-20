@@ -184,6 +184,43 @@ impl Batch {
             ));
         }
         if let Entry::UserMessage { attachments, .. } = &entry {
+            if !attachments.is_empty() {
+                let (frozen, _, _) = self.turn_execution(&row)?;
+                if !frozen
+                    .llm
+                    .config
+                    .declared_capabilities
+                    .contains(&ModelCapability::Vision)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "vision_not_supported",
+                        "the turn's model does not support images",
+                    ));
+                }
+                let existing = self.step(|tx| {
+                    let mut count = 0;
+                    for entry in tx
+                        .open_table(TURN_INPUTS)?
+                        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+                    {
+                        let (_, bytes) = entry?;
+                        if let Entry::UserMessage { attachments, .. } =
+                            TurnEntry::decode(bytes.value())?.entry
+                        {
+                            count += attachments.len();
+                        }
+                    }
+                    Ok(count)
+                })?;
+                if existing + attachments.len()
+                    > crate::openai_compatible::image::MAX_REQUEST_IMAGES
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "too_many_images",
+                        "the turn has too many images",
+                    ));
+                }
+            }
             for attachment in attachments {
                 if !self.require_attachment(*attachment)?.is_available() {
                     return self.reject(Violation::AttachmentCleanedUp(*attachment));
@@ -264,7 +301,7 @@ impl Batch {
             return Ok(Appended {
                 turn: existing.job,
                 seq: existing.seq,
-                joined: self.require_job_state(existing.job)?.claim.is_none(),
+                joined: existing.seq > 1,
             });
         }
         let row = self.require_job(conversation)?;
@@ -467,6 +504,7 @@ impl Batch {
                     OutcomeKind::Cancelled,
                     Some(OutcomeCause::Stopped { record }),
                     None,
+                    false,
                 )?;
             }
         }
@@ -479,6 +517,7 @@ impl Batch {
             conversation,
             record_seq: Some(record),
             running,
+            already: false,
         })
     }
     pub(crate) fn close(
@@ -487,11 +526,28 @@ impl Batch {
         by: Actor,
     ) -> Result<ConversationAction, BatchError> {
         self.require_user_conversation(conversation)?;
+        if self
+            .require_job_state(conversation)?
+            .children_closed_at
+            .is_some()
+        {
+            return Ok(ConversationAction {
+                conversation,
+                record_seq: None,
+                running: Vec::new(),
+                already: true,
+            });
+        }
         let subtree = self.live_subtree(conversation)?;
         let mut running = Vec::new();
+        let mut notified = Vec::new();
         for current in &subtree {
             let mut state = self.require_job_state(*current)?;
-            state.children_closed_at.get_or_insert(self.now);
+            if state.children_closed_at.is_some() {
+                continue;
+            }
+            notified.push(*current);
+            state.children_closed_at = Some(self.now);
             self.put_job_state(*current, &state)?;
             let mut row = self.conversation(*current)?;
             row.closed_by.get_or_insert(by.clone());
@@ -510,6 +566,7 @@ impl Batch {
                         OutcomeKind::Cancelled,
                         Some(OutcomeCause::Closed),
                         None,
+                        false,
                     )?;
                 }
             } else {
@@ -519,14 +576,17 @@ impl Batch {
         }
         for current in subtree.into_iter().rev() {
             self.settle(current)?;
-            let reference = self.tip(current)?.unwrap_or(current);
-            self.notify(current, NoticeEvent::ClosedAbove, reference)?;
+            if notified.contains(&current) {
+                let reference = self.tip(current)?.unwrap_or(current);
+                self.notify(current, NoticeEvent::ClosedAbove, reference)?;
+            }
         }
         self.touched_ready_or_delayed = true;
         Ok(ConversationAction {
             conversation,
             record_seq: None,
             running,
+            already: false,
         })
     }
     pub(crate) fn hold(
@@ -612,6 +672,7 @@ impl Batch {
             conversation,
             record_seq: Some(record),
             running: Vec::new(),
+            already: false,
         })
     }
     pub(crate) fn retry(
@@ -1043,6 +1104,242 @@ mod tests {
         );
         fixture.worker.shutdown().expect("shutdown");
     }
+    #[test]
+    fn k1_round2_completed_answer_survives_stop_and_next_turn_runs() {
+        use crate::persistence::{JobFinalization, StopCause};
+        use std::sync::{Arc, Mutex};
+        let fixture = Fixture::new("round2-stop");
+        let (conversation, turn) = fixture.open();
+        fixture.claim(turn);
+        let stopped = wait(fixture.database.stop_turn(conversation, Actor::User)).expect("stop");
+        let record = stopped.record_seq.expect("record");
+        let handle = fixture
+            .database
+            .with_stop_cause(Arc::new(Mutex::new(Some(StopCause::Stopped(record)))));
+        wait(handle.finalize_job(turn, JobFinalization::Completed(result("finished answer"))))
+            .expect("complete");
+        let outcome = wait(fixture.database.job(turn))
+            .expect("read")
+            .expect("turn")
+            .outcome
+            .expect("outcome");
+        assert_eq!(
+            (outcome.kind, outcome.cause),
+            (OutcomeKind::Completed, None)
+        );
+        let outputs = wait(fixture.database.job_outputs(turn, None, 10)).expect("outputs");
+        assert_eq!(
+            outputs.last().expect("Result").summary.as_deref(),
+            Some("finished answer")
+        );
+        assert!(
+            wait(fixture.database.notices(conversation, 0, 20))
+                .expect("notices")
+                .iter()
+                .any(|(seq, notice)| *seq == record
+                    && matches!(
+                        notice.body,
+                        NoticeBody::Record {
+                            event: RecordEvent::Stop,
+                            ..
+                        }
+                    ))
+        );
+        let next = wait(
+            fixture
+                .database
+                .append(conversation, message("next"), None, None),
+        )
+        .expect("next")
+        .turn;
+        fixture.finish(next, OutcomeKind::Completed);
+        assert_eq!(
+            wait(fixture.database.job(next))
+                .expect("read")
+                .expect("next")
+                .outcome
+                .expect("outcome")
+                .kind,
+            OutcomeKind::Completed
+        );
+        let cancelled = wait(fixture.database.append(
+            conversation,
+            message("stop before sending"),
+            None,
+            None,
+        ))
+        .expect("next")
+        .turn;
+        fixture.claim(cancelled);
+        let record = wait(fixture.database.stop_turn(conversation, Actor::User))
+            .expect("stop")
+            .record_seq
+            .expect("record");
+        let handle = fixture
+            .database
+            .with_stop_cause(Arc::new(Mutex::new(Some(StopCause::Stopped(record)))));
+        wait(handle.finalize_job(cancelled, JobFinalization::Failed(result("NotDelivered"))))
+            .expect("cancel before send");
+        let outcome = wait(fixture.database.job(cancelled))
+            .expect("read")
+            .expect("turn")
+            .outcome
+            .expect("outcome");
+        assert_eq!(
+            (outcome.kind, outcome.cause),
+            (
+                OutcomeKind::Cancelled,
+                Some(OutcomeCause::Stopped { record })
+            )
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn k1_round2_close_notifies_a_child_only_once() {
+        let fixture = Fixture::new("round2-close");
+        let (parent, _) = fixture.open();
+        let (child, turn) = fixture.child(parent, true);
+        fixture.claim(turn);
+        let first = wait(fixture.database.close(child, Actor::User)).expect("close child");
+        assert!(!first.already);
+        assert_eq!(first.running, [turn]);
+        let second = wait(fixture.database.close(child, Actor::User)).expect("close twice");
+        assert!(second.already && second.running.is_empty());
+        wait(fixture.database.close(parent, Actor::User)).expect("close parent");
+        let notices = wait(fixture.database.notices(parent, 0, 100)).expect("notices");
+        assert_eq!(notices.iter().filter(|(_, notice)| matches!(notice.body, NoticeBody::Event { child: found, event: NoticeEvent::ClosedAbove, .. } if found == child)).count(), 1);
+        wait(fixture.database.finalize_job(
+            turn,
+            crate::persistence::JobFinalization::Completed(result("finished")),
+        ))
+        .expect("finish");
+        let outcome = wait(fixture.database.job(turn))
+            .expect("read")
+            .expect("turn")
+            .outcome
+            .expect("outcome");
+        assert_eq!(
+            (outcome.kind, outcome.cause),
+            (OutcomeKind::Completed, None)
+        );
+        assert_eq!(
+            wait(fixture.database.job(child))
+                .expect("read")
+                .expect("child")
+                .outcome
+                .expect("outcome")
+                .kind,
+            OutcomeKind::Cancelled
+        );
+        assert!(
+            wait(fixture.database.close(child, Actor::User))
+                .expect("settled close")
+                .already
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn k1_round2_unset_context_window_bounds_the_read() {
+        use crate::orchestration::execution_runtime::ContextLimits;
+        let fixture = Fixture::new("round2-context");
+        let (conversation, mut turn) = fixture.open();
+        let frozen = wait(fixture.database.turn_execution(turn))
+            .expect("frozen")
+            .0;
+        assert_eq!(frozen.llm.config.context_window, None);
+        let limits = ContextLimits::for_profile(&frozen.llm.config);
+        for _ in 0..6 {
+            fixture.finish(turn, OutcomeKind::Completed);
+            turn = wait(fixture.database.append(
+                conversation,
+                message(&"x".repeat(100_000)),
+                None,
+                None,
+            ))
+            .expect("append")
+            .turn;
+        }
+        let context = wait(
+            fixture
+                .database
+                .read_turn_context(turn, limits.read_budget()),
+        )
+        .expect("context");
+        assert!(context.omitted);
+        assert!(context.turns.len() <= 3);
+        assert_eq!(context.turns.last().expect("current").turn, turn);
+        assert_eq!(limits.context_window, None);
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn k1_round2_create_job_cannot_add_a_conversation_turn() {
+        let fixture = Fixture::new("round2-create");
+        let (conversation, _) = fixture.open();
+        let job = crate::persistence::NewJob {
+            process_grant: None,
+            name: None,
+            eligible_at: None,
+            parent: conversation,
+            project: None,
+            dependencies: vec![],
+            input: Default::default(),
+            configuration: Some(fixture.configuration),
+            previous: None,
+        };
+        assert!(matches!(
+            wait(fixture.database.create_job(job)),
+            Err(crate::database::DatabaseError::Rejected(
+                Violation::InvalidValue(
+                    "parent",
+                    "turns are created by append or open_conversation"
+                )
+            ))
+        ));
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn k1_round2_replay_preserves_the_turn_creating_joined_flag() {
+        let fixture = Fixture::new("round2-replay");
+        let (conversation, first) = fixture.open();
+        fixture.finish(first, OutcomeKind::Completed);
+        let submission = NewSubmission {
+            key: SubmissionKey::from_digest([3; 32]),
+            fingerprint: RequestFingerprint::from_digest([4; 32]),
+        };
+        let created = wait(fixture.database.append(
+            conversation,
+            message("next"),
+            None,
+            Some(submission),
+        ))
+        .expect("create");
+        assert!(!created.joined);
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .append(conversation, message("next"), None, Some(submission))
+            )
+            .expect("replay before claim"),
+            created
+        );
+        fixture.claim(created.turn);
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .append(conversation, message("next"), None, Some(submission))
+            )
+            .expect("replay after claim"),
+            created
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
     #[test]
     fn a_claim_freezes_input_and_a_submission_key_names_one_entry() {
         let fixture = Fixture::new("input-freeze");

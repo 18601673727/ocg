@@ -952,6 +952,12 @@ impl DatabaseHandle {
         self.submit(|reply| Command::CreateJob { job, reply }).await
     }
 
+    #[doc(hidden)]
+    pub async fn bench_create_dependent_turn(&self, job: NewJob) -> Result<JobId, DatabaseError> {
+        self.submit(|reply| Command::BenchCreateDependentTurn { job, reply })
+            .await
+    }
+
     pub async fn create_submitted_job(
         &self,
         job: NewJob,
@@ -1115,6 +1121,14 @@ impl DatabaseHandle {
     ) -> Self {
         let mut handle = self.clone();
         handle.stop_cause = Some(cause);
+        handle.ignore_stop_cause = false;
+        handle
+    }
+
+    pub(crate) fn without_stop_cause(&self) -> Self {
+        let mut handle = self.clone();
+        handle.stop_cause = None;
+        handle.ignore_stop_cause = true;
         handle
     }
 
@@ -1137,6 +1151,7 @@ impl DatabaseHandle {
             job,
             finalization,
             cause,
+            ignore_stop_cause: self.ignore_stop_cause,
             reply,
         })
         .await

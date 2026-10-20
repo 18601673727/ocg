@@ -3149,6 +3149,15 @@ mod control_plane {
     /// Sends `GET path` with exactly `headers`, over a new connection, and
     /// reads the whole response.
     fn send(address: SocketAddr, request_line: &str, headers: &[(&str, &str)]) -> Response {
+        send_body(address, request_line, headers, b"")
+    }
+
+    fn send_body(
+        address: SocketAddr,
+        request_line: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Response {
         let mut stream = TcpStream::connect(address).expect("connect");
         stream
             .set_read_timeout(Some(crate::test_support::WAIT))
@@ -3159,6 +3168,7 @@ mod control_plane {
         }
         request.push_str("Connection: close\r\n\r\n");
         stream.write_all(request.as_bytes()).expect("send");
+        stream.write_all(body).expect("body");
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).expect("read");
         let raw = String::from_utf8(raw).expect("UTF-8");
@@ -3264,6 +3274,71 @@ mod control_plane {
             },
         ))
         .expect("append an output");
+    }
+
+    #[test]
+    fn k1_round2_session_pairing_and_served_frontend_sign_in() {
+        let (_root, directory) = data_directory("round2-session-remote");
+        let (report, checked) = hosted(&directory, Some(config()), |address| {
+            let address = address.expect("listener");
+            let host = format!("127.0.0.1:{}", address.port());
+            let response = send(address, "GET /api/v1/session", &[("Host", &host)]);
+            assert_eq!(
+                (response.status, response.error()),
+                (401, "unauthenticated".into())
+            );
+            for (body, status, code) in [
+                ("{}", 400, "invalid_body"),
+                (r#"{"pairing_code":"wrong"}"#, 401, "invalid_pairing_code"),
+            ] {
+                let length = body.len().to_string();
+                let response = send_body(
+                    address,
+                    "POST /api/v1/session",
+                    &[
+                        ("Host", &host),
+                        ("Content-Type", "application/json"),
+                        ("Content-Length", &length),
+                    ],
+                    body.as_bytes(),
+                );
+                assert_eq!((response.status, response.error()), (status, code.into()));
+            }
+            true
+        });
+        only_logger_failures(&report);
+        assert_eq!(checked, Some(true));
+
+        let (_root, directory) = data_directory("round2-session-web");
+        let (_ui_root, ui_dir) =
+            crate::test_support::temporary_directory("control-plane", "round2-session-ui");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("free port");
+        let port = listener.local_addr().expect("address").port().to_string();
+        drop(listener);
+        let control = ControlPlaneConfig::from_source(|name| match name {
+            "OCG_CONTROL_PORT" => Some(Ok(port.clone())),
+            "OCG_CONTROL_TOKEN" => Some(Ok(TOKEN.into())),
+            "OCG_UI_DIR" => Some(Ok(ui_dir.to_string_lossy().into_owned())),
+            _ => None,
+        })
+        .expect("web configuration")
+        .expect("enabled");
+        let (report, checked) = hosted(&directory, Some(control), |address| {
+            let address = address.expect("listener");
+            let host = format!("127.0.0.1:{}", address.port());
+            let response = send(address, "GET /api/v1/session", &[("Host", &host)]);
+            assert_eq!(response.status, 201);
+            assert!(
+                response
+                    .headers
+                    .get("set-cookie")
+                    .is_some_and(|cookie| cookie.starts_with("ocg_session="))
+            );
+            assert_eq!(response.json()["session"]["authenticated"], true);
+            true
+        });
+        only_logger_failures(&report);
+        assert_eq!(checked, Some(true));
     }
 
     #[test]
@@ -4646,20 +4721,23 @@ mod settlement {
         prerequisite: JobId,
         _condition: DependencyCondition,
     ) -> JobId {
-        create_job(
-            handle,
-            NewJob {
-                configuration: llm_only(llm),
-                previous: Some(prerequisite),
-                ..new_job(
-                    handle,
-                    name,
-                    record(handle, prerequisite)
-                        .conversation
-                        .expect("conversation"),
-                )
-            },
+        let grants = wait(handle.claim_batch()).expect("claim prerequisite");
+        assert_eq!(grants, vec![prerequisite]);
+        wait(
+            handle.append(
+                record(handle, prerequisite)
+                    .conversation
+                    .expect("conversation"),
+                crate::persistence::Entry::UserMessage {
+                    text: name.into(),
+                    attachments: vec![],
+                },
+                llm_only(llm),
+                None,
+            ),
         )
+        .expect("dependent message")
+        .turn
     }
 
     fn record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
@@ -4695,9 +4773,11 @@ mod settlement {
         let job_a = job(&handle, llm, "job-a");
         let job_b = dependent(&handle, llm, "job-b", job_a, Success);
 
-        // Job A is ready; Job B is waiting on Job A
-        let grants = wait(handle.claim_batch()).expect("claim batch");
-        assert_eq!(grants, vec![job_a]);
+        assert!(
+            wait(handle.claim_batch())
+                .expect("waiting successor")
+                .is_empty()
+        );
 
         // Complete Job A; SETTLE marks Job A SubtreeSettled and places Job B into ready
         wait(handle.finalize_job(job_a, JobFinalization::Completed(result("A done"))))
@@ -4748,8 +4828,11 @@ mod settlement {
         let job_a = job(&handle, llm, "job-a");
         let job_b = dependent(&handle, llm, "job-b", job_a, Settled);
 
-        let grants = wait(handle.claim_batch()).expect("claim batch");
-        assert_eq!(grants, vec![job_a]);
+        assert!(
+            wait(handle.claim_batch())
+                .expect("waiting successor")
+                .is_empty()
+        );
 
         // Fail Job A; since Job B required Settled (not Success), Job B is satisfied!
         wait(handle.finalize_job(job_a, JobFinalization::Failed(result("A failed"))))

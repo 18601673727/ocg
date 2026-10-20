@@ -24,6 +24,7 @@ import {
   decodeProjects,
   decodeSession,
   decodeStop,
+  decodeRetry,
   type ControlAttachment,
   type ControlCapability,
   type ControlJobEvent,
@@ -490,6 +491,15 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
       const answer = await send("GET", `/api/v1/conversations/${conversation}/turns${query}`, { signal });
       return decodeConversationTurns(answer.input, conversation);
+    },
+
+    async retryConversation(conversation: string, turn: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      jobIdentity(turn);
+      const answer = await send("POST", `/api/v1/conversations/${conversation}/retry`, { body: { turn }, signal });
+      const result = decodeRetry(answer.input);
+      if (result.conversation !== conversation) throw new ContractError("conversation", `matching ${conversation}`);
+      return result;
     },
 
     /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */

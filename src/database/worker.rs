@@ -116,6 +116,7 @@ pub struct DatabaseWorker {
 /// database thread.
 #[derive(Clone)]
 pub struct DatabaseHandle {
+    pub(super) ignore_stop_cause: bool,
     pub(super) stop_cause: Option<Arc<std::sync::Mutex<Option<crate::persistence::StopCause>>>>,
     pub(super) sender: flume::Sender<Message>,
     pub(super) read_sender: flume::Sender<ReadMessage>,
@@ -298,6 +299,7 @@ impl DatabaseWorker {
         let mut worker = Self {
             handle: DatabaseHandle {
                 stop_cause: None,
+                ignore_stop_cause: false,
                 sender,
                 read_sender,
                 control_sender,

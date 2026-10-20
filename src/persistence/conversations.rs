@@ -187,6 +187,7 @@ pub struct ConversationAction {
     pub conversation: JobId,
     pub record_seq: Option<u32>,
     pub running: Vec<JobId>,
+    pub already: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopCause {

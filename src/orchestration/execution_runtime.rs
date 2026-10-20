@@ -1929,6 +1929,16 @@ async fn finalize_claim_error(
         return;
     }
     let outcome = claim_error_finalization(error, tool_may_have_run);
+    let database = if matches!(
+        error,
+        ExecutionRuntimeError::NotSettled { source: DatabaseError::Rejected(violation), .. }
+            | ExecutionRuntimeError::ToolLoopNotSettled { source: DatabaseError::Rejected(violation), .. }
+            if !matches!(violation, Violation::JobAlreadyFinalized(_))
+    ) {
+        database.without_stop_cause()
+    } else {
+        database.clone()
+    };
     match database.finalize_job(job, outcome).await {
         Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
         Err(failure) => log::error!(
@@ -2308,6 +2318,8 @@ pub(crate) fn estimate_request_tokens(
         .saturating_add(output_tokens)
 }
 
+pub(crate) const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
+
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub(crate) struct ContextLimits {
     pub(crate) context_window: Option<u32>,
@@ -2315,6 +2327,12 @@ pub(crate) struct ContextLimits {
 }
 
 impl ContextLimits {
+    pub(crate) fn read_budget(self) -> usize {
+        self.context_window
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+            .saturating_sub(self.max_tokens.unwrap_or(4096)) as usize
+    }
+
     pub(crate) fn for_profile(config: &crate::persistence::LlmConfig) -> Self {
         Self {
             context_window: config.context_window,
@@ -2687,25 +2705,27 @@ async fn run_started_provider_job(
     let mut context_omitted = false;
     let mut tree_status = String::new();
     if job_record.conversation.is_some() {
-        let budget = context_limits.context_window.map_or(usize::MAX, |window| {
-            window.saturating_sub(context_limits.max_tokens.unwrap_or(4096)) as usize
-        });
+        let budget = context_limits.read_budget();
         let mut context = database.read_turn_context(job, budget).await?;
         context_omitted = context.omitted;
         tree_status = context.tree_status;
         if let Some(current) = context.turns.pop() {
             debug_assert_eq!(current.turn, job);
             current_objective = Some(format!("{}{}", context.attention, current.text));
-            current_attachments = current
-                .attachments
-                .into_iter()
-                .rev()
-                .take(crate::openai_compatible::image::MAX_REQUEST_IMAGES)
-                .collect();
-            current_attachments.reverse();
+            current_attachments = current.attachments;
         }
-        let mut images_left = crate::openai_compatible::image::MAX_REQUEST_IMAGES
-            .saturating_sub(current_attachments.len());
+        let mut images_left = if configuration
+            .frozen
+            .llm
+            .config
+            .declared_capabilities
+            .contains(&crate::persistence::ModelCapability::Vision)
+        {
+            crate::openai_compatible::image::MAX_REQUEST_IMAGES
+                .saturating_sub(current_attachments.len())
+        } else {
+            0
+        };
         let mut prior = Vec::new();
         for turn in context.turns.into_iter().rev() {
             let mut attachments: Vec<_> = turn
@@ -3831,7 +3851,10 @@ pub(crate) async fn finish_provider_job(
                         goal_reached: Some(false),
                         value: Some(provider_execution::result_value(&result)),
                     });
-                    let settled = database.finalize_job(job, settlement.clone()).await;
+                    let settled = database
+                        .without_stop_cause()
+                        .finalize_job(job, settlement.clone())
+                        .await;
                     refused = Some(violation);
                     settled
                 }
@@ -4612,6 +4635,158 @@ mod failure_tests {
                     .outcome
                     .is_none()
             );
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn k1_round2_joined_image_limit_and_nonvision_follow_up() {
+        use crate::persistence::{
+            ConfigBody, ConversationSpec, Entry, ModelCapability, NewAttachment, NewConfig, Origin,
+        };
+        let (_root, directory) = data_directory("dispatcher-errors", "round2-images");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let pool = executor(&database);
+        let configuration = execution_configuration(&database);
+        let ConfigBody::Model(mut model) = wait(database.config(configuration.llm_profile.into()))
+            .expect("read")
+            .expect("model")
+            .body
+        else {
+            panic!("model")
+        };
+        let endpoint = "https://round2-images.invalid/v1";
+        wait(database.update_config(
+            model.connection_id,
+            NewConfig {
+                name: "test connection".into(),
+                body: ConfigBody::Connection(crate::persistence::ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(endpoint.into()),
+                    credential_ref: None,
+                }),
+            },
+        ))
+        .expect("endpoint");
+        model.declared_capabilities.insert(ModelCapability::Vision);
+        wait(database.update_config(
+            configuration.llm_profile.into(),
+            NewConfig {
+                name: "vision".into(),
+                body: ConfigBody::Model(model.clone()),
+            },
+        ))
+        .expect("vision");
+        let attachment = wait(database.create_user_attachment(NewAttachment {
+            content: crate::openai_compatible::image::tests::png(),
+            mime: "image/png".into(),
+            display_name: None,
+        }))
+        .expect("image");
+        let (conversation, first) = wait(database.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            Entry::UserMessage {
+                text: "images".into(),
+                attachments: vec![attachment; 8],
+            },
+            configuration,
+            None,
+        ))
+        .expect("open");
+        assert!(matches!(
+            wait(database.append(
+                conversation,
+                Entry::UserMessage {
+                    text: "more images".into(),
+                    attachments: vec![attachment; 8]
+                },
+                None,
+                None
+            )),
+            Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "too_many_images",
+                _
+            )))
+        ));
+        wait(database.claim_fixture(first.turn, pool)).expect("claim");
+        wait(database.finalize_job(
+            first.turn,
+            JobFinalization::Completed(FinalResult {
+                summary: Some("first answer".into()),
+                code: None,
+                goal_reached: None,
+                value: None,
+            }),
+        ))
+        .expect("complete");
+        model.declared_capabilities.clear();
+        wait(database.update_config(
+            configuration.llm_profile.into(),
+            NewConfig {
+                name: "text only".into(),
+                body: ConfigBody::Model(model),
+            },
+        ))
+        .expect("text model");
+        let next = wait(database.append(
+            conversation,
+            Entry::UserMessage {
+                text: "text follow up".into(),
+                attachments: vec![],
+            },
+            Some(configuration),
+            None,
+        ))
+        .expect("follow up");
+        provider_seam::install(endpoint, |conversation| {
+            assert!(
+                conversation
+                    .messages
+                    .iter()
+                    .all(|message| message_weights(message).1 == 0)
+            );
+            assert!(conversation.image_attachments.values().all(Vec::is_empty));
+            provider_seam::Response {
+                gate: None,
+                steps: vec![crate::provider_execution::scripted::Step::Chunk(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"text answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )],
+            }
+        });
+        on_system(move || async move {
+            let runtime =
+                ExecutionRuntime::start(database.clone(), ClaimScope::Stored).expect("runtime");
+            ntex::time::timeout(Duration::from_secs(5), async {
+                while !database
+                    .job(next.turn)
+                    .await
+                    .expect("read")
+                    .expect("turn")
+                    .any_terminal()
+                {
+                    ntex::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("finished");
+            assert!(
+                database
+                    .job(next.turn)
+                    .await
+                    .expect("read")
+                    .expect("turn")
+                    .completed_at
+                    .is_some()
+            );
+            runtime.shutdown().await.expect("shutdown");
         });
         worker.shutdown().expect("shutdown");
     }

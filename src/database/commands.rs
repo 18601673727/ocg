@@ -100,6 +100,10 @@ pub(super) enum Command {
         job: NewJob,
         reply: Reply<JobId>,
     },
+    BenchCreateDependentTurn {
+        job: NewJob,
+        reply: Reply<JobId>,
+    },
     CreateSubmittedJob {
         job: NewJob,
         submission: NewSubmission,
@@ -154,6 +158,7 @@ pub(super) enum Command {
     FinalizeJob {
         job: JobId,
         cause: Option<crate::persistence::OutcomeCause>,
+        ignore_stop_cause: bool,
         finalization: JobFinalization,
         reply: Reply<Option<AppendedOutput>>,
     },
@@ -353,6 +358,14 @@ impl Command {
                 reply,
                 |batch| persistence::create_job(batch, job),
             ),
+            Self::BenchCreateDependentTurn { job, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateJobWithInput,
+                reply,
+                |batch| persistence::bench_create_dependent_turn(batch, job),
+            ),
             Self::CreateSubmittedJob {
                 job,
                 submission,
@@ -438,6 +451,7 @@ impl Command {
                 job,
                 finalization,
                 cause,
+                ignore_stop_cause,
                 reply,
             } => run(
                 database,
@@ -445,7 +459,9 @@ impl Command {
                 commit,
                 Kind::FinalizeJob,
                 reply,
-                |batch| persistence::finalize_job(batch, job, finalization, cause),
+                |batch| {
+                    persistence::finalize_job(batch, job, finalization, cause, ignore_stop_cause)
+                },
             ),
             Self::CreateExecutor { executor, reply } => run(
                 database,
@@ -607,7 +623,9 @@ impl Command {
             Self::ClaimBatch { .. } => 4096,
             Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
             Self::SetExecutionPoolEnabled { .. } | Self::UpdateExecutionPool { .. } => 64,
-            Self::CreateJob { job, .. } | Self::CreateSubmittedJob { job, .. } => {
+            Self::CreateJob { job, .. }
+            | Self::BenchCreateDependentTurn { job, .. }
+            | Self::CreateSubmittedJob { job, .. } => {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
             Self::Open { first, .. } | Self::Append { entry: first, .. } => {
@@ -717,9 +735,9 @@ impl Command {
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
             Self::SetExecutionPoolEnabled { reply, .. }
             | Self::UpdateExecutionPool { reply, .. } => refuse(reply, error),
-            Self::CreateJob { reply, .. } | Self::CreateSubmittedJob { reply, .. } => {
-                refuse(reply, error)
-            }
+            Self::CreateJob { reply, .. }
+            | Self::BenchCreateDependentTurn { reply, .. }
+            | Self::CreateSubmittedJob { reply, .. } => refuse(reply, error),
             Self::Open { reply, .. } => refuse(reply, error),
             Self::Append { reply, .. } | Self::Retry { reply, .. } => refuse(reply, error),
             Self::StopTurn { reply, .. }

@@ -664,6 +664,18 @@ export function decodePoolAnswer(input: unknown) {
   return poolRecord(envelope.pool, "pool");
 }
 
+export function decodeRetry(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  return {
+    api_version: 1,
+    conversation: identity(envelope.conversation, "conversation", "job:"),
+    turn: identity(envelope.turn, "turn", "job:"),
+    seq: integer(envelope.seq, "seq"),
+    joined: boolean(envelope.joined, "joined"),
+  };
+}
+
 export function decodeConversationEdit(input: unknown, root: string): string {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");

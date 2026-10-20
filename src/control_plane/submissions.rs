@@ -915,6 +915,12 @@ async fn admit(
         Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
             registry.uncertain(key, generation, operation.epoch())
         }
+        Err(DatabaseError::Rejected(Violation::InvalidValue("vision_not_supported", _))) => {
+            finish(Outcome::Refused(VISION_NOT_SUPPORTED))
+        }
+        Err(DatabaseError::Rejected(Violation::InvalidValue("too_many_images", _))) => {
+            finish(Outcome::Refused(TOO_MANY_IMAGES))
+        }
         Err(error) => finish(Outcome::Refused(not_admitted(
             &ExecutionRuntimeError::Database(error),
         ))),
@@ -964,9 +970,29 @@ pub(super) async fn check_configuration(
     {
         return Err(EXECUTOR_INCOMPATIBLE);
     }
-    // Every image the conversation's one Provider request will carry: the
-    // earlier turns' first, then this one's.
     let mut images: Vec<AttachmentId> = Vec::new();
+    let mut capabilities = llm.declared_capabilities.clone();
+    if let Some(conversation) = request.conversation
+        && let Some(tip) = database
+            .conversation_turns(conversation, None, 1)
+            .await?
+            .first()
+        && tip.claim.is_none()
+        && tip.outcome.is_none()
+    {
+        capabilities = database
+            .turn_execution(tip.id)
+            .await?
+            .0
+            .llm
+            .config
+            .declared_capabilities;
+        for (_, entry) in database.turn_entries(tip.id).await? {
+            if let crate::persistence::Entry::UserMessage { attachments, .. } = entry.entry {
+                images.extend(attachments);
+            }
+        }
+    }
     let project = request.project;
     match project {
         Some(project) => {
@@ -984,7 +1010,7 @@ pub(super) async fn check_configuration(
     if images.is_empty() {
         return Ok(project);
     }
-    if !llm.declared_capabilities.contains(&ModelCapability::Vision) {
+    if !capabilities.contains(&ModelCapability::Vision) {
         return Err(VISION_NOT_SUPPORTED);
     }
     for &attachment in &request.attachments {
@@ -1153,6 +1179,21 @@ pub(super) async fn action(
                 StopCause::Stopped(result.record_seq.ok_or(INTERNAL)?)
             },
         );
+    }
+    if result.already {
+        let settled = shared
+            .database
+            .job(conversation)
+            .await?
+            .ok_or(INTERNAL)?
+            .outcome
+            .is_some();
+        return Ok(Reply::ok(json!({
+            "api_version": API_VERSION,
+            "conversation": conversation.to_string(),
+            "status": if settled { "already_settled" } else { "already_closing" },
+            "record_seq": result.record_seq,
+        })));
     }
     let changed = action != "stop"
         || !result.running.is_empty()

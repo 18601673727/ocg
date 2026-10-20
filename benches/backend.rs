@@ -527,7 +527,7 @@ fn admit_jobs(
                 .and_then(|job| job.conversation)
                 .ok_or("benchmark turn has no conversation")?;
             // Direct T1 preserves a synthetic dependency queue; interactive append would join the unclaimed tip.
-            block_on(handle.create_job(NewJob {
+            block_on(handle.bench_create_dependent_turn(NewJob {
                 parent: conversation,
                 previous: Some(previous),
                 ..job(handle, target)

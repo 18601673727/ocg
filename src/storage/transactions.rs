@@ -906,42 +906,20 @@ impl Batch {
         mut kind: OutcomeKind,
         mut cause: Option<OutcomeCause>,
         result: Option<FinalResult>,
+        ignore_stop_cause: bool,
     ) -> Result<(OutcomeKind, Option<u32>), BatchError> {
         let mut state = self.require_job_state(job)?;
         if state.outcome.is_some() {
             return self.reject(Violation::JobAlreadyFinalized(job));
         }
         let row = self.require_job(job)?;
-        if row.kind.is_stored()
+        if kind == OutcomeKind::Completed || ignore_stop_cause {
+            cause = None;
+        } else if row.kind.is_stored()
             && let Some(conversation) = row.parent_id
         {
-            if cause.is_none() {
-                if self.conversation(conversation)?.closed_running {
-                    cause = Some(OutcomeCause::Closed);
-                } else if let Some(started_at) = state.claim.as_ref().map(|claim| claim.started_at)
-                {
-                    cause = self.step(|tx| {
-                        for entry in tx
-                            .open_table(NOTICES)?
-                            .range((conversation.get(), 0)..=(conversation.get(), u32::MAX))?
-                            .rev()
-                        {
-                            let (key, value) = entry?;
-                            if let NoticeBody::Record {
-                                event: RecordEvent::Stop,
-                                at,
-                                ..
-                            } = Notice::decode(value.value())?.body
-                                && at >= started_at
-                            {
-                                return Ok(Some(OutcomeCause::Stopped {
-                                    record: key.value().1,
-                                }));
-                            }
-                        }
-                        Ok(None)
-                    })?;
-                }
+            if cause.is_none() && self.conversation(conversation)?.closed_running {
+                cause = Some(OutcomeCause::Closed);
             }
             if matches!(
                 cause,

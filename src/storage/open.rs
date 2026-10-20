@@ -405,6 +405,7 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
                 OutcomeKind::Cancelled,
                 Some(OutcomeCause::Abandoned),
                 None,
+                false,
             )?;
         }
     }

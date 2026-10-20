@@ -7,7 +7,14 @@ pub(crate) type OpResult<T> = Result<T, BatchError>;
 
 /// The immutable spec of a Job about to be submitted: its input, its
 /// relationships and the configuration it freezes.
-fn spec_of(batch: &mut Batch, job: &NewJob) -> Result<JobRow, BatchError> {
+fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow, BatchError> {
+    let stored = job.parent.get() != 0 && batch.require_job(job.parent)?.kind.is_conversation();
+    if stored && !allow_stored {
+        return batch.reject(Violation::InvalidValue(
+            "parent",
+            "turns are created by append or open_conversation",
+        ));
+    }
     let frozen = match job.configuration {
         Some(configuration) => Some(batch.freeze_configuration(configuration)?),
         None => None,
@@ -26,7 +33,6 @@ fn spec_of(batch: &mut Batch, job: &NewJob) -> Result<JobRow, BatchError> {
     if let Some(project) = job.project {
         batch.require_project(project)?;
     }
-    let stored = job.parent.get() != 0 && batch.require_job(job.parent)?.kind.is_conversation();
     if !stored && job.previous.is_some() {
         return batch.reject(Violation::InvalidValue(
             "previous",
@@ -79,15 +85,20 @@ fn spec_of(batch: &mut Batch, job: &NewJob) -> Result<JobRow, BatchError> {
 
 /// T1 constructs a spec directly. Interactive messages use append instead.
 pub(crate) fn create_job(batch: &mut Batch, job: NewJob) -> OpResult<JobId> {
-    submit(batch, job, None)
+    submit(batch, job, None, false)
+}
+
+pub(crate) fn bench_create_dependent_turn(batch: &mut Batch, job: NewJob) -> OpResult<JobId> {
+    submit(batch, job, None, true)
 }
 
 fn submit(
     batch: &mut Batch,
     job: NewJob,
     submission: Option<NewSubmission>,
+    allow_stored: bool,
 ) -> Result<JobId, BatchError> {
-    let spec = spec_of(batch, &job)?;
+    let spec = spec_of(batch, &job, allow_stored)?;
     let submission = submission.map(|submission| (submission.key, submission.fingerprint));
     let stored = spec.kind.is_stored();
     let turn = batch.t1_submit(submission, spec)?;
@@ -108,7 +119,7 @@ pub(crate) fn create_submitted_job(
     job: NewJob,
     submission: NewSubmission,
 ) -> OpResult<JobId> {
-    submit(batch, job, Some(submission))
+    submit(batch, job, Some(submission), false)
 }
 
 /// T2 for one named Job: claims it into the first of `request.allowed_pools`
@@ -164,6 +175,7 @@ pub(crate) fn finalize_job(
     job: JobId,
     finalization: JobFinalization,
     cause: Option<OutcomeCause>,
+    ignore_stop_cause: bool,
 ) -> OpResult<Option<AppendedOutput>> {
     let (kind, result) = match finalization {
         JobFinalization::Unknown => (OutcomeKind::Unknown, None),
@@ -171,7 +183,7 @@ pub(crate) fn finalize_job(
         JobFinalization::Failed(result) => (OutcomeKind::Failed, Some(result)),
         JobFinalization::Cancelled(result) => (OutcomeKind::Cancelled, Some(result)),
     };
-    let (_, appended) = batch.finalize(job, kind, cause, result)?;
+    let (_, appended) = batch.finalize(job, kind, cause, result, ignore_stop_cause)?;
     Ok(appended.map(|seq| AppendedOutput {
         output: JobOutputId::new(u64::from(seq)),
         seq: i64::from(seq),

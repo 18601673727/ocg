@@ -360,22 +360,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       const admitted = await this.control.readJob(job);
       if (admitted.conversation) this.roots.set(admitted.conversation, sessionId);
       this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: selection.agentProfile, title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
-      const [record, frozen, outputs, tools] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), this.control.readAllJobTools(job)]);
-      const page = record.conversation ? await this.control.readConversationTurns(record.conversation, undefined, 20, this.lifetime.signal) : null;
-      const stored = page?.turns.find(turn => turn.job.id === job);
-      const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools };
-      while (outputs.has_more) {
-        const page = await this.control.readOutputs(job, { afterSeq: turn.outputs.at(-1)?.seq, limit: 100 });
-        turn.outputs.push(...page.outputs);
-        if (!page.has_more) break;
-        if (!page.outputs.length) throw new Error("Output page did not advance.");
-      }
-      if (!this.getSnapshot().sessions.some(s => s.id === sessionId)) return;
-      this.turns.set(job, turn);
-      this.pending.delete(sessionId);
-      this.publish(sessionId);
-      if (record.settlement.state === "unsettled") this.watch(job);
-      void this.refreshConversations().catch(error => this.report(error));
+      await this.trackTurn(sessionId, job);
     } catch (error) {
       if (!pending.admittedJob && error instanceof ControlTransportError && ((error.status >= 400 && error.status < 500) || error.status === 503)) this.pending.delete(sessionId);
       if (conversation && this.unlisted.has(sessionId) && error instanceof ControlTransportError && error.status === 422 && error.code === "configuration_refused") throw new Error("Open this conversation's latest turn from Jobs to continue.");
@@ -383,11 +368,39 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     } finally { this.sending.delete(sessionId); }
   }
 
+  private async trackTurn(sessionId: string, job: string) {
+    const [record, frozen, outputs, tools] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), this.control.readAllJobTools(job)]);
+    const page = record.conversation ? await this.control.readConversationTurns(record.conversation, undefined, 20, this.lifetime.signal) : null;
+    const stored = page?.turns.find(turn => turn.job.id === job);
+    const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools };
+    while (outputs.has_more) {
+      const page = await this.control.readOutputs(job, { afterSeq: turn.outputs.at(-1)?.seq, limit: 100 });
+      turn.outputs.push(...page.outputs);
+      if (!page.has_more) break;
+      if (!page.outputs.length) throw new Error("Output page did not advance.");
+    }
+    if (!this.getSnapshot().sessions.some(s => s.id === sessionId)) return;
+    this.turns.set(job, turn);
+    this.pending.delete(sessionId);
+    this.publish(sessionId);
+    if (record.settlement.state === "unsettled") this.watch(job);
+    void this.refreshConversations().catch(error => this.report(error));
+  }
+
   override async retryMessage(sessionId: string, messageId: string): Promise<void> {
     const message = this.getSnapshot().messagesBySession[sessionId]?.find(message => message.id === messageId);
     const turn = message?.jobId ? this.turns.get(message.jobId) : undefined;
-    if (!turn || turn.job.settlement.state !== "failed" || (this.tips.get(sessionId) !== turn.job.id && this.pending.get(sessionId)?.submission.conversation !== turn.job.conversation)) throw new Error("Only the latest failed turn can be retried.");
-    await this.submit(sessionId, { content: turn.input.objective ?? "", images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) }, turn.job.conversation ?? undefined);
+    if (!turn || !turn.job.conversation || !["failed", "unknown", "cancelled"].includes(turn.job.settlement.state) || (this.tips.get(sessionId) !== turn.job.id && this.pending.get(sessionId)?.submission.conversation !== turn.job.conversation)) throw new Error("Only the latest failed, unknown or cancelled turn can be retried.");
+    if (this.hiding.has(sessionId) || this.sending.has(sessionId)) throw new Error("Wait for this conversation's current action to finish.");
+    const session = this.getSnapshot().sessions.find(session => session.id === sessionId);
+    if (!session) throw new Error("Conversation presentation is no longer available.");
+    this.sending.add(sessionId);
+    try {
+      const result = await this.control.retryConversation(turn.job.conversation, turn.job.id, this.lifetime.signal);
+      this.tips.set(sessionId, result.turn);
+      this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: result.turn, updatedAt: new Date().toISOString() } });
+      await this.trackTurn(sessionId, result.turn);
+    } finally { this.sending.delete(sessionId); }
   }
 
   override async cancel(sessionId: string): Promise<void> {
