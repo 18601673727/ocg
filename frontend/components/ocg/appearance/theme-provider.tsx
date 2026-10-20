@@ -11,7 +11,6 @@ import {
   serializeAppearancePreferences,
   type AppearancePreferences,
   type AccentPreference,
-  type DensityPreference,
   type ResolvedTheme,
   type ThemePreference,
 } from "./theme-domain";
@@ -20,11 +19,9 @@ type ThemeContextValue = {
   preferences: AppearancePreferences;
   theme: ThemePreference;
   resolvedTheme: ResolvedTheme;
-  density: DensityPreference;
   accent: AccentPreference;
   hydrated: boolean;
   setTheme: (theme: ThemePreference) => void;
-  setDensity: (density: DensityPreference) => void;
   setAccent: (accent: AccentPreference) => void;
   resetAppearance: () => void;
 };
@@ -36,7 +33,6 @@ function applyRootAppearance(preferences: AppearancePreferences, systemTheme: Re
   const state = appearanceRootState(preferences, systemTheme);
   root.classList.toggle("dark", state.theme === "dark");
   root.dataset.theme = state.theme;
-  root.dataset.density = state.density;
   root.dataset.accent = state.accent;
 }
 
@@ -84,21 +80,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, [hydrated, preferences, systemTheme]);
 
   const setTheme = useCallback((theme: ThemePreference) => setPreferences((current) => ({ ...current, theme })), []);
-  const setDensity = useCallback((density: DensityPreference) => setPreferences((current) => ({ ...current, density })), []);
   const setAccent = useCallback((accent: AccentPreference) => setPreferences((current) => ({ ...current, accent })), []);
   const resetAppearance = useCallback(() => setPreferences({ ...DEFAULT_APPEARANCE }), []);
   const value = useMemo(() => ({
     preferences,
     theme: preferences.theme,
     resolvedTheme: resolveEffectiveTheme(preferences.theme, systemTheme),
-    density: preferences.density,
     accent: preferences.accent,
     hydrated,
     setTheme,
-    setDensity,
     setAccent,
     resetAppearance,
-  }), [hydrated, preferences, resetAppearance, setAccent, setDensity, setTheme, systemTheme]);
+  }), [hydrated, preferences, resetAppearance, setAccent, setTheme, systemTheme]);
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }

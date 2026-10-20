@@ -17,7 +17,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly lifetime = new AbortController();
   private readonly turns = new Map<string, Turn>();
   private readonly roots = new Map<string, string>();
+  // hiddenRoots and unlisted live as long as the client.
   private readonly hiddenRoots = new Set<string>();
+  private readonly unlisted = new Set<string>();
   private readonly hiding = new Set<string>();
   private readonly tips = new Map<string, string>();
   private readonly selections = new Map<string, ChatModelSelection>();
@@ -112,13 +114,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   async hideSession(sessionId: string): Promise<void> {
     const root = this.sessionRoot(sessionId);
     if (this.hiding.has(sessionId)) throw new Error("This conversation is being hidden.");
-    if (this.sending.has(sessionId) || this.pending.has(sessionId)) throw new Error("Resolve the current submission before hiding this conversation.");
-    if ([...this.turns.values()].some(turn => turn.sessionId === sessionId && turn.job.settlement.state === "unsettled")) throw new Error("Stop the running turn or wait for settlement before hiding this conversation.");
     this.hiding.add(sessionId);
     try {
-      const tip = this.tips.get(sessionId) ?? root;
-      const job = await this.control.readJob(tip, this.lifetime.signal);
-      if (job.settlement.state === "unsettled") throw new Error("Stop the running turn or wait for settlement before hiding this conversation.");
       await this.control.editConversation(root, { hidden: true }, this.lifetime.signal);
       this.hiddenRoots.add(root);
       this.pending.delete(sessionId);
@@ -172,14 +169,18 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     let conversation = await this.control.readJobConversation(job, this.lifetime.signal);
     const root = conversation.turns[0].job.id;
     if (!this.roots.has(root) && !this.hiddenRoots.has(root)) await this.refreshConversations();
-    const id = this.roots.get(root);
-    if (!id || this.hiddenRoots.has(root)) throw new Error("This conversation is hidden. Its turns remain readable in Jobs.");
-    const listedTip = this.tips.get(id);
+    const hiddenBefore = this.hiddenRoots.has(root);
+    const id = this.roots.get(root) ?? root;
+    const listed = this.roots.has(root) && !hiddenBefore && !this.unlisted.has(id);
+    if (!listed) {
+      this.roots.set(root, id);
+      this.unlisted.add(id);
+    }
+    const listedTip = listed ? this.tips.get(id) : undefined;
     if (listedTip && !conversation.turns.some(t => t.job.id === listedTip)) {
       job = listedTip;
       conversation = await this.control.readJobConversation(job, this.lifetime.signal);
     }
-    if (this.hiddenRoots.has(root)) throw new Error("This conversation is hidden. Its turns remain readable in Jobs.");
     if (!this.getSnapshot().sessions.some(session => session.id === id)) {
       this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0].input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
     }
@@ -187,14 +188,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     await Promise.all(conversation.turns.map(async turn => {
       if (this.streams.has(turn.job.id)) return;
       const tools = await this.control.readAllJobTools(turn.job.id, this.lifetime.signal);
-      if (this.hiddenRoots.has(root) || this.disposed) return;
+      if ((!hiddenBefore && this.hiddenRoots.has(root)) || this.disposed) return;
       const state: Turn = { sessionId: id, ...turn, tools };
       const images = await this.readImages(state);
-      if (this.hiddenRoots.has(root) || this.disposed) return;
+      if ((!hiddenBefore && this.hiddenRoots.has(root)) || this.disposed) return;
       for (const image of images) this.images.set(image.id, image);
       this.turns.set(turn.job.id, state);
     }));
-    if (this.disposed || this.hiddenRoots.has(root)) return id;
+    if (this.disposed || (!hiddenBefore && this.hiddenRoots.has(root))) return id;
     this.tips.set(id, job);
     const session = this.getSnapshot().sessions.find(session => session.id === id);
     if (!session) return id;
@@ -324,7 +325,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }).finally(() => {
       entry.stopped = true;
       if (entry.timer) clearTimeout(entry.timer);
-      this.streams.delete(jobId);
+      if (this.streams.get(jobId) === entry) this.streams.delete(jobId);
     });
   }
 
@@ -370,6 +371,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         if (!page.has_more) break;
         if (!page.outputs.length) throw new Error("Output page did not advance.");
       }
+      if (!this.getSnapshot().sessions.some(s => s.id === sessionId)) return;
       this.turns.set(job, turn);
       this.pending.delete(sessionId);
       this.publish(sessionId);
@@ -377,6 +379,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       void this.refreshConversations().catch(error => this.report(error));
     } catch (error) {
       if (!pending.admittedJob && error instanceof ControlTransportError && ((error.status >= 400 && error.status < 500) || error.status === 503)) this.pending.delete(sessionId);
+      if (previous && this.unlisted.has(sessionId) && error instanceof ControlTransportError && error.status === 422 && error.code === "configuration_refused") throw new Error("Open this conversation's latest turn from Jobs to continue.");
       throw error;
     } finally { this.sending.delete(sessionId); }
   }

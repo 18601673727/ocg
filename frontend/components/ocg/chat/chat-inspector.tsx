@@ -34,7 +34,7 @@ export function ChatInspector({ session, messages, onClose, onOpenJob }: {
             <ol className="space-y-3">
               {turns.map((message, index) => <li key={message.id} className="space-y-2 rounded-2xl bg-background/60 p-4 text-xs">
                 <div className="flex items-center justify-between gap-3"><span className="font-medium">{t("usage.turns")} {index + 1}</span><span className="text-muted-foreground">{runtimeStateLabel(t, message.status)}</span></div>
-                {message.jobId && <button type="button" className="flex max-w-full items-center gap-2 rounded-md py-1 text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring" onClick={() => { if (message.jobId) onOpenJob(message.jobId); }}><span className="truncate font-mono">{message.jobId}</span><ExternalLink className="size-3.5 shrink-0" /><span className="sr-only">Jobs</span></button>}
+                {message.jobId && <button type="button" className="flex max-w-full items-center gap-2 rounded-md py-1 text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring" onClick={() => { if (message.jobId) onOpenJob(message.jobId); }}><span className="truncate font-mono">{message.jobId}</span><ExternalLink className="size-3.5 shrink-0" /><span className="sr-only">{t("chat.openInJobs")}</span></button>}
                 {message.failureReason && <p className="text-destructive">{message.failureReason}</p>}
               </li>)}
             </ol>

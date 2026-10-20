@@ -23,7 +23,6 @@ export const THEME_BOOTSTRAP_SCRIPT = `(function () {
     root.classList.toggle("dark", dark);
     root.dataset.theme = dark ? "dark" : "light";
     if (saved) {
-      root.dataset.density = saved.density || fallback.density;
       root.dataset.accent = saved.accent || fallback.accent;
     }
   } catch (error) {

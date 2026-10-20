@@ -504,6 +504,7 @@ export function OcgSidebar({
           </DialogHeader>
           <form onSubmit={(e) => void confirmRename(e)} className="flex flex-col gap-4">
             <Input
+              aria-label={t("sidebar.renameChatTitle")}
               value={renameTitle}
               onChange={(e) => setRenameTitle(e.target.value)}
               disabled={renaming}

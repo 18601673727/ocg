@@ -126,8 +126,8 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
       name: cmd.name.trim(),
       argv: cmd.argvText
         .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0),
+        .map((line) => line.replace(/\r$/, ""))
+        .filter((line) => line.trim().length > 0),
     }));
 
     try {
@@ -265,7 +265,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="My Project"
+              placeholder={t("settings.projects.namePlaceholder")}
               spellCheck={false}
             />
           </label>
@@ -283,7 +283,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
               <Input
                 value={root}
                 onChange={(e) => setRoot(e.target.value)}
-                placeholder="/path/to/project"
+                placeholder={t("settings.projects.rootPlaceholder")}
                 spellCheck={false}
               />
             </label>
@@ -294,7 +294,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
             <Textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Optional project description"
+              placeholder={t("settings.projects.descriptionPlaceholder")}
               rows={2}
             />
           </label>

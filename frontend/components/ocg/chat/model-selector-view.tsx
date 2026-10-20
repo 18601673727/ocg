@@ -62,7 +62,6 @@ export function ModelSelectorView({
             <span className="block truncate text-xs font-medium" title={active ? t("chat.activeExecution") : undefined}>{title}</span>
             <span
               id={id + "-status"}
-              role={error ? "alert" : undefined}
               className={cn("block truncate text-xs", error ? "text-destructive" : "text-muted-foreground")}
               title={error}
             >
@@ -109,6 +108,7 @@ export function ModelSelectorView({
         {modelId && <p className="truncate font-mono text-xs text-muted-foreground" title={modelId}>{modelId}</p>}
         {effortUnsupported && <p className="text-xs text-muted-foreground">{t("chat.effortUnsupportedHint")}</p>}
       </div>}
+      {error && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
     </div>
   );
 }

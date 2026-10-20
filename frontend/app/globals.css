@@ -162,10 +162,6 @@
   --ring: oklch(0.72 0.11 178);
 }
 
-html[data-density="compact"] {
-  --radius: 0.45rem;
-}
-
 @layer base {
   * {
     @apply border-border outline-ring/50;

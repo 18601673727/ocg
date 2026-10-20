@@ -22,6 +22,7 @@ import { Section, describeError } from "./settings-parts";
 import { ProjectsSection } from "./projects-section";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
+import { LanguageSwitcher, useI18n } from "../i18n";
 
 type Health = {
   host: string;
@@ -110,6 +111,7 @@ export function SettingsSurface({
   signingOut: boolean;
   onSignOut: () => void;
 }) {
+  const { t } = useI18n();
   const theme = useTheme();
   const [snapshot, setSnapshot] = useState<ControlProfilesSnapshot | null>(null);
   const [loadingProfiles, setLoadingProfiles] = useState(false);
@@ -808,6 +810,7 @@ export function SettingsSurface({
             </Button>
           }
         >
+          <SettingRow label={t("settings.language.label")} description={t("settings.language.desc")} origin="browser"><LanguageSwitcher /></SettingRow>
           <SettingRow label="Theme" description="Follow the system, or fix light or dark." origin="browser">
             <ChoiceGroup
               label="Theme"
@@ -817,17 +820,6 @@ export function SettingsSurface({
                 { value: "system", label: "System" },
                 { value: "light", label: "Light" },
                 { value: "dark", label: "Dark" },
-              ]}
-            />
-          </SettingRow>
-          <SettingRow label="Density" description="How tightly surfaces are spaced." origin="browser">
-            <ChoiceGroup
-              label="Density"
-              value={theme.preferences.density}
-              onChange={theme.setDensity}
-              options={[
-                { value: "comfortable", label: "Comfortable" },
-                { value: "compact", label: "Compact" },
               ]}
             />
           </SettingRow>
