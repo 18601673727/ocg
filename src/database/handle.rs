@@ -92,7 +92,7 @@ impl DatabaseHandle {
     /// durable commit failed is counted here too, and the callers of those
     /// commands are told their outcome is unknown.
     pub fn durable_commits(&self) -> u64 {
-        self.shared.durable_commits.load(Ordering::Relaxed)
+        self.shared.durable_commits.load(Ordering::SeqCst)
     }
 
     pub async fn vitals(&self) -> Vitals {
