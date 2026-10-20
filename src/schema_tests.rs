@@ -3302,17 +3302,15 @@ mod control_plane {
         let (_root, directory) = data_directory("round2-session-web");
         let (_ui_root, ui_dir) =
             crate::test_support::temporary_directory("control-plane", "round2-session-ui");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("free port");
-        let port = listener.local_addr().expect("address").port().to_string();
-        drop(listener);
         let control = ControlPlaneConfig::from_source(|name| match name {
-            "OCG_CONTROL_PORT" => Some(Ok(port.clone())),
+            "OCG_CONTROL_PORT" => Some(Ok("1".into())),
             "OCG_CONTROL_TOKEN" => Some(Ok(TOKEN.into())),
             "OCG_UI_DIR" => Some(Ok(ui_dir.to_string_lossy().into_owned())),
             _ => None,
         })
         .expect("web configuration")
-        .expect("enabled");
+        .expect("enabled")
+        .with_port(0);
         let (report, checked) = hosted(&directory, Some(control), |address| {
             let address = address.expect("listener");
             let host = format!("127.0.0.1:{}", address.port());

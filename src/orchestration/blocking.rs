@@ -198,7 +198,29 @@ pub(crate) struct Process {
     stopped: Arc<AtomicBool>,
     started_at: Instant,
     job: Option<JobId>,
+    running: Option<RunningGroup>,
 }
+
+struct RunningGroup {
+    job: JobId,
+    group: Pid,
+}
+
+impl Drop for RunningGroup {
+    fn drop(&mut self) {
+        let mut groups = RUNNING_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(index) = groups
+            .iter()
+            .position(|(job, group)| *job == self.job && *group == self.group)
+        {
+            groups.remove(index);
+        }
+    }
+}
+
+static RUNNING_GROUPS: Mutex<Vec<(JobId, Pid)>> = Mutex::new(Vec::new());
 
 pub(crate) struct UnprovenGroup {
     pub(crate) job: JobId,
@@ -322,6 +344,13 @@ impl Process {
         };
         let group = Pid::from_child(&child);
         drop(sentinel.write);
+        let running = job.map(|job| {
+            RUNNING_GROUPS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((job, group));
+            RunningGroup { job, group }
+        });
         Ok(Self {
             child,
             sentinel: sentinel.read,
@@ -330,6 +359,7 @@ impl Process {
             stopped: stop_signal.stopped,
             started_at: Instant::now(),
             job,
+            running,
         })
     }
 
@@ -401,6 +431,7 @@ impl Process {
                     leader: self.child,
                 });
             }
+            drop(self.running);
             drop(self.permit);
             return Err(FinishError::NotProven(error));
         }
@@ -661,6 +692,18 @@ pub(crate) enum JobProof {
 
 #[cfg(unix)]
 pub(crate) fn prove_job(job: JobId) -> JobProof {
+    let running = {
+        let groups = RUNNING_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        groups
+            .iter()
+            .find(|(running, _)| *running == job)
+            .map(|(_, group)| group.as_raw_pid() as u32)
+    };
+    if let Some(group) = running {
+        return JobProof::Live { group };
+    }
     let mut groups = UNPROVEN_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
@@ -751,6 +794,23 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(error.to_string(), "too many tool operations are running");
         drop(files);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_whose_process_has_not_finished_is_live() {
+        use super::*;
+
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let stop = StopSignal::new();
+        let job = JobId::new(u64::MAX);
+        let process =
+            Process::spawn(command, Kind::Command, stop.clone(), Some(job)).expect("spawn process");
+        assert!(matches!(prove_job(job), JobProof::Live { .. }));
+        stop.request();
+        process.finish(|| true).expect("finish");
+        assert!(matches!(prove_job(job), JobProof::Untracked));
     }
 
     #[test]

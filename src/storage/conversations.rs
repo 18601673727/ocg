@@ -807,11 +807,14 @@ impl Batch {
                         let (key, agent) = row?;
                         if agent.value() {
                             count += 1;
+                            if count >= 2 {
+                                return Ok(true);
+                            }
                         }
                         pending.push(key.value().1);
                     }
                 }
-                Ok(count >= 2)
+                Ok(false)
             })?
         {
             return self.reject(Violation::InvalidValue(

@@ -3368,8 +3368,15 @@ async fn run_provider_job_inner(
             .request
             .next()
             .filter(|_| tools.is_some_and(|tools| round < tools.limits.max_provider_requests));
-        let answered = match (tools, next) {
-            (Some(tools), Some(_)) => {
+        let awaits = tools.is_some_and(|tools| {
+            tools.decider
+                && result
+                    .tool_calls
+                    .iter()
+                    .any(|call| needs_decision(tools, &call.name))
+        });
+        let answered = match tools {
+            Some(tools) if next.is_some() || awaits => {
                 let site = CallSite {
                     scheduler: run.scheduler.as_ref(),
                     database: &run.database,
@@ -3388,59 +3395,57 @@ async fn run_provider_job_inner(
                 )
                 .await
             }
-            (Some(_), None) => Err(ToolLoopStop::RequestLimit.into()),
-            (None, _) => Err(ToolLoopStop::Refused(InvalidToolCall::new(
+            Some(_) => Err(ToolLoopStop::RequestLimit.into()),
+            None => Err(ToolLoopStop::Refused(InvalidToolCall::new(
                 ToolCallRefusal::Unauthorized,
                 "the Provider requested tools that OCG did not offer",
             ))
             .into()),
         };
-        let (answers, next) = match (answered, next) {
-            (Ok((answers, awaiting)), Some(next)) => {
-                if !awaiting.is_empty() {
-                    let mut summary = result.text.clone();
-                    for index in awaiting {
-                        if let Some(call) =
-                            result.tool_calls.iter().find(|call| call.index == index)
-                        {
-                            summary.push('\n');
-                            if call.name == "ask_user" {
-                                let question =
-                                    serde_json::from_str::<serde_json::Value>(&call.arguments)
-                                        .ok()
-                                        .and_then(|v| {
-                                            v.get("question")
-                                                .and_then(|v| v.as_str())
-                                                .map(str::to_owned)
-                                        })
-                                        .unwrap_or_default();
-                                summary.push_str(&format!("Awaiting answer: {question}"));
-                            } else {
-                                summary.push_str(&format!(
-                                    "Awaiting approval: {} {}",
-                                    call.name, call.arguments
-                                ));
-                            }
-                        }
-                    }
-                    return complete_provider_job(
-                        run.database,
-                        run.executor,
-                        run.input,
-                        run.job,
-                        sink,
-                        &result,
-                        summary,
-                        None,
-                    )
-                    .await;
-                }
-                (answers, next)
-            }
-            (Err(stopped), _) => {
+        let (answers, awaiting) = match answered {
+            Ok(answered) => answered,
+            Err(stopped) => {
                 return stop_tool_loop(run, sink, Some(&result), stopped).await;
             }
-            (Ok(_), None) => unreachable!("calls are answered only when a request may follow"),
+        };
+        if !awaiting.is_empty() {
+            let mut summary = result.text.clone();
+            for index in awaiting {
+                if let Some(call) = result.tool_calls.iter().find(|call| call.index == index) {
+                    summary.push('\n');
+                    if call.name == "ask_user" {
+                        let question = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("question")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_default();
+                        summary.push_str(&format!("Awaiting answer: {question}"));
+                    } else {
+                        summary.push_str(&format!(
+                            "Awaiting approval: {} {}",
+                            call.name, call.arguments
+                        ));
+                    }
+                }
+            }
+            return complete_provider_job(
+                run.database,
+                run.executor,
+                run.input,
+                run.job,
+                sink,
+                &result,
+                summary,
+                None,
+            )
+            .await;
+        }
+        let Some(next) = next else {
+            return stop_tool_loop(run, sink, Some(&result), ToolLoopStop::RequestLimit.into())
+                .await;
         };
         conversation.messages.push(assistant);
         if let Some(digest) = sink.response_digest.take() {
@@ -3570,6 +3575,10 @@ pub(crate) mod dispatch_seam {
     }
 }
 
+fn needs_decision(tools: &ToolExecution, name: &str) -> bool {
+    name == "ask_user" || ApproveClass::of(name).is_some_and(|class| tools.approve.contains(&class))
+}
+
 /// Answers every call of one response, in order, or stops. The calls are
 /// checked together before any runs: against the call limit, against the
 /// ids already in the conversation, each against the registry and its
@@ -3690,10 +3699,7 @@ async fn answer_calls(
             arguments: ToolPayload::new(call.arguments.clone()),
             authorization: AuthorizationBasis::RegistryGrant,
         };
-        if approval.is_none()
-            && (call.name == "ask_user"
-                || ApproveClass::of(&call.name).is_some_and(|class| tools.approve.contains(&class)))
-        {
+        if approval.is_none() && needs_decision(tools, &call.name) {
             if tools.decider {
                 let decision = if call.name == "ask_user" {
                     ToolDecision::AwaitingAnswer(decided)
@@ -6148,6 +6154,219 @@ mod approval_runtime_tests {
                 .summary
                 .unwrap()
                 .contains("Awaiting approval: workspace_write_file")
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn approval_on_the_last_allowed_round_completes_without_a_second_request() {
+        let (_data, directory) = data_directory("approvals", "last-round");
+        let (_files, root) = temporary_directory("approvals", "last-round-files");
+        let workspace = Workspace::authorize(&root, &directory).unwrap();
+        let mut tools = workspace_tools(workspace, Grant::Code, &[]).unwrap();
+        tools.approve = vec![ApproveClass::Writes];
+        tools.decider = true;
+        tools.limits.max_provider_requests = 1;
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let project = wait(db.create_project(NewProject {
+            name: "files".into(),
+            description: None,
+            root: root.to_string_lossy().into_owned(),
+            commands: vec![],
+        }))
+        .unwrap();
+        let (_, turn, pool) = open(&db, project, ApproveClass::Writes);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let endpoint = "https://approval-last-round.invalid/v1";
+        provider_seam::install(endpoint, move |_| {
+            assert_eq!(count.fetch_add(1, Ordering::SeqCst), 0);
+            response(
+                "Checking",
+                json!([
+                    {"index":0,"id":"write","type":"function","function":{"name":"workspace_write_file","arguments":"{\"operation\":\"create\",\"path\":\"output\",\"content\":\"written\"}"}}
+                ]),
+            )
+        });
+        let handle = db.clone();
+        on_system(move || async move {
+            execute(handle, turn, pool, &tools, &[], endpoint, 0).await;
+        });
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!root.join("output").exists());
+        let calls = wait(db.tool_evidence(turn, None, 10)).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            calls[0].decision.fact,
+            ToolDecision::AwaitingApproval(_)
+        ));
+        assert!(calls[0].outcome.is_none());
+        assert!(wait(db.job(turn)).unwrap().unwrap().completed_at.is_some());
+        assert!(
+            wait(db.latest_output(turn))
+                .unwrap()
+                .unwrap()
+                .summary
+                .unwrap()
+                .contains("Awaiting approval: workspace_write_file")
+        );
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_child_turn_offers_ask_user_and_awaits_its_answer() {
+        let (_data, directory) = data_directory("approvals", "ask-user");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let configuration = crate::test_support::execution_configuration(&db);
+        let record = wait(db.config(configuration.llm_profile.into()))
+            .unwrap()
+            .unwrap();
+        let ConfigBody::Model(mut model) = record.body else {
+            panic!("model");
+        };
+        model
+            .declared_capabilities
+            .extend([ModelCapability::Chat, ModelCapability::Tools]);
+        let endpoint = "https://approval-ask-user.invalid/v1";
+        wait(db.update_config(
+            model.connection_id,
+            NewConfig {
+                name: "ask user connection".into(),
+                body: ConfigBody::Connection(crate::persistence::ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(endpoint.into()),
+                    credential_ref: None,
+                }),
+            },
+        ))
+        .unwrap();
+        wait(db.update_config(
+            record.id,
+            NewConfig {
+                name: "tool model".into(),
+                body: ConfigBody::Model(model),
+            },
+        ))
+        .unwrap();
+        let agent = wait(db.create_config(NewConfig {
+            name: "child Agent".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                models: vec![configuration.llm_profile.into()],
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        let pool = wait(db.create_executor(NewExecutor {
+            name: "worker".into(),
+            concurrency_limit: std::num::NonZeroU32::new(1).unwrap(),
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .unwrap();
+        let (chat, _) = wait(db.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            Entry::UserMessage {
+                text: "objective".into(),
+                attachments: vec![],
+            },
+            configuration,
+            None,
+        ))
+        .unwrap();
+        let call = ToolCallRef {
+            job: chat,
+            request: RequestNumber::FIRST,
+            index: 0,
+        };
+        let (_, child) = wait(db.open_conversation(
+            Some(chat),
+            ConversationSpec {
+                name: None,
+                agent: Some(agent),
+                project: None,
+                origin: Origin::Agent { call },
+                keep_open: true,
+            },
+            Entry::AgentMessage {
+                text: "objective".into(),
+                call,
+            },
+            ExecutionConfiguration {
+                agent_profile: Some(agent.into()),
+                ..configuration
+            },
+            None,
+        ))
+        .unwrap();
+        wait(db.claim_fixture(child.turn, pool)).unwrap();
+        provider_seam::install(endpoint, move |request| {
+            assert!(
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.function.name == "ask_user")
+            );
+            response(
+                "Asking",
+                json!([
+                    {"index":0,"id":"ask","type":"function","function":{"name":"ask_user","arguments":"{\"question\":\"Which file?\"}"}}
+                ]),
+            )
+        });
+        let handle = db.clone();
+        on_system(move || async move {
+            let possible_effect = Cell::new(false);
+            run_started_provider_job(
+                handle,
+                ProviderTask {
+                    workspace_tools: None,
+                    credential_resolver: Arc::new(EnvironmentCredentialResolver),
+                    provider_config: ProviderExecutionConfig::default(),
+                    tools: None,
+                },
+                (
+                    StartedJob {
+                        job: child.turn,
+                        input: JobInputId::new(child.turn.get()),
+                        executor: pool,
+                    },
+                    None,
+                ),
+                &possible_effect,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+        let calls = wait(db.tool_evidence(child.turn, None, 10)).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            calls[0].decision.fact,
+            ToolDecision::AwaitingAnswer(_)
+        ));
+        assert!(calls[0].outcome.is_none());
+        assert!(
+            wait(db.job(child.turn))
+                .unwrap()
+                .unwrap()
+                .completed_at
+                .is_some()
+        );
+        assert!(
+            wait(db.latest_output(child.turn))
+                .unwrap()
+                .unwrap()
+                .summary
+                .unwrap()
+                .contains("Awaiting answer:")
         );
         worker.shutdown().unwrap();
     }

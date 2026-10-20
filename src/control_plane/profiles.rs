@@ -205,20 +205,21 @@ enum WireProfileRequest {
         tool_grant: Option<String>,
         #[serde(default)]
         llm_targets: Vec<String>,
-        #[serde(default)]
-        dispatch_to: Option<Vec<String>>,
-        #[serde(default)]
-        approve: Option<Vec<String>>,
-        #[serde(default, deserialize_with = "optional_default_model")]
+        #[serde(default, deserialize_with = "optional_value")]
+        dispatch_to: Option<Option<Vec<String>>>,
+        #[serde(default, deserialize_with = "optional_value")]
+        approve: Option<Option<Vec<String>>>,
+        #[serde(default, deserialize_with = "optional_value")]
         default_model: Option<Option<String>>,
     },
 }
 
-fn optional_default_model<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+fn optional_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
 {
-    Option::<String>::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 fn valid_single_line(text: &str, max_bytes: usize) -> bool {
@@ -805,29 +806,30 @@ pub(super) async fn save_profile(
             } else {
                 AgentConfig::default()
             };
-            let mut parsed_approve = if let Some(values) = approve {
-                let invalid = Refusal::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "invalid_approve",
-                    "approve must contain unique commands, writes, dispatch or close",
-                );
-                let mut classes = Vec::new();
-                for value in values {
-                    let class = match value.as_str() {
-                        "commands" => crate::persistence::ApproveClass::Commands,
-                        "writes" => crate::persistence::ApproveClass::Writes,
-                        "dispatch" => crate::persistence::ApproveClass::Dispatch,
-                        "close" => crate::persistence::ApproveClass::Close,
-                        _ => return Err(invalid),
-                    };
-                    if classes.contains(&class) {
-                        return Err(invalid);
+            let mut parsed_approve = match approve {
+                None => prior.approve,
+                Some(values) => {
+                    let invalid = Refusal::new(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid_approve",
+                        "approve must contain unique commands, writes, dispatch or close",
+                    );
+                    let mut classes = Vec::new();
+                    for value in values.unwrap_or_default() {
+                        let class = match value.as_str() {
+                            "commands" => crate::persistence::ApproveClass::Commands,
+                            "writes" => crate::persistence::ApproveClass::Writes,
+                            "dispatch" => crate::persistence::ApproveClass::Dispatch,
+                            "close" => crate::persistence::ApproveClass::Close,
+                            _ => return Err(invalid),
+                        };
+                        if classes.contains(&class) {
+                            return Err(invalid);
+                        }
+                        classes.push(class);
                     }
-                    classes.push(class);
+                    classes
                 }
-                classes
-            } else {
-                prior.approve
             };
             parsed_approve.sort();
             let invalid_dispatch = Refusal::new(
@@ -835,28 +837,30 @@ pub(super) async fn save_profile(
                 "invalid_dispatch_to",
                 "dispatch_to must name unique Agent Profiles",
             );
-            let mut parsed_dispatch = if dispatch_to.is_none() {
-                prior.dispatch_to
-            } else {
-                Vec::new()
-            };
-            for raw in dispatch_to.unwrap_or_default() {
-                let id = profile_id(&raw)
-                    .map(ConfigId::from)
-                    .map_err(|_| invalid_dispatch)?;
-                if parsed_dispatch.contains(&id)
-                    || !matches!(
-                        database.config(id).await?,
-                        Some(ConfigRecord {
-                            body: ConfigBody::Agent(_),
-                            ..
-                        })
-                    )
-                {
-                    return Err(invalid_dispatch);
+            let mut parsed_dispatch = match dispatch_to {
+                None => prior.dispatch_to,
+                Some(values) => {
+                    let mut parsed = Vec::new();
+                    for raw in values.unwrap_or_default() {
+                        let id = profile_id(&raw)
+                            .map(ConfigId::from)
+                            .map_err(|_| invalid_dispatch)?;
+                        if parsed.contains(&id)
+                            || !matches!(
+                                database.config(id).await?,
+                                Some(ConfigRecord {
+                                    body: ConfigBody::Agent(_),
+                                    ..
+                                })
+                            )
+                        {
+                            return Err(invalid_dispatch);
+                        }
+                        parsed.push(id);
+                    }
+                    parsed
                 }
-                parsed_dispatch.push(id);
-            }
+            };
             parsed_dispatch.sort();
             let invalid_default = Refusal::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -947,6 +951,11 @@ mod tests {
             let kept = updated.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
             assert_eq!(kept["dispatch_to"], json!([target]));
             assert_eq!(kept["default_model"], model);
+            let cleared = json!({"kind":"agent","name":"renamed","llm_targets":[model],"dispatch_to":null,"approve":null});
+            let updated = save_profile(&database, Some(id), &serde_json::to_vec(&cleared).unwrap()).await.unwrap();
+            let cleared = updated.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
+            assert_eq!(cleared["dispatch_to"], json!([]));
+            assert_eq!(cleared["approve"], json!([]));
             body["dispatch_to"] = json!([model]);
             assert!(matches!(save_profile(&database, None, &serde_json::to_vec(&body).unwrap()).await, Err(refusal) if refusal.code == "invalid_dispatch_to"));
             body["dispatch_to"] = json!([target]);

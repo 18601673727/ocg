@@ -191,6 +191,12 @@ impl ControlPlaneConfig {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
+        self
+    }
+
     /// At most `streams` event streams, each reading again every `poll`,
     /// silent at most `heartbeat`, disconnected once its client took
     /// nothing for `stall`, and lasting at most `lifetime`.

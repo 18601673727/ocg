@@ -83,6 +83,11 @@ pub(super) const INVALID_BODY: Refusal = Refusal::new(
     "invalid_body",
     "the body is not a Job submission this API accepts",
 );
+const INVALID_ROUTE_BODY: Refusal = Refusal::new(
+    StatusCode::BAD_REQUEST,
+    "invalid_body",
+    "the body is not a request this route accepts",
+);
 const KEY_CONFLICT: Refusal = Refusal::new(
     StatusCode::CONFLICT,
     "idempotency_key_conflict",
@@ -1138,17 +1143,17 @@ pub(super) async fn action(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     use crate::persistence::{Actor, StopCause};
-    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
-    let object = value.as_object().ok_or(INVALID_BODY)?;
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
+    let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
     if action == "retry" {
         if object.len() != 1 {
-            return Err(INVALID_BODY);
+            return Err(INVALID_ROUTE_BODY);
         }
         let turn = super::routing::job_id(
             object
                 .get("turn")
                 .and_then(Value::as_str)
-                .ok_or(INVALID_BODY)?,
+                .ok_or(INVALID_ROUTE_BODY)?,
         )?;
         let appended = shared
             .database
@@ -1160,14 +1165,14 @@ pub(super) async fn action(
         ));
     }
     if !object.is_empty() {
-        return Err(INVALID_BODY);
+        return Err(INVALID_ROUTE_BODY);
     }
     let result = match action {
         "stop" => shared.database.stop_turn(conversation, Actor::User).await,
         "close" => shared.database.close(conversation, Actor::User).await,
         "hold" => shared.database.hold(conversation, Actor::User).await,
         "unhold" => shared.database.unhold(conversation, Actor::User).await,
-        _ => return Err(INVALID_BODY),
+        _ => return Err(INVALID_ROUTE_BODY),
     }
     .map_err(action_error)?;
     for running in &result.running {
@@ -1723,15 +1728,15 @@ pub(super) async fn decide(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     use crate::persistence::ApprovalDecision;
-    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
     let object = value
         .as_object()
         .filter(|object| object.len() == 1)
-        .ok_or(INVALID_BODY)?;
+        .ok_or(INVALID_ROUTE_BODY)?;
     let (decision, name) = if let Some(answer) = object.get("answer") {
         (
             ApprovalDecision::Answered {
-                text: answer.as_str().ok_or(INVALID_BODY)?.to_owned(),
+                text: answer.as_str().ok_or(INVALID_ROUTE_BODY)?.to_owned(),
             },
             "answered",
         )
@@ -1739,7 +1744,7 @@ pub(super) async fn decide(
         match object.get("decision").and_then(Value::as_str) {
             Some("approve") => (ApprovalDecision::Approved, "approved"),
             Some("reject") => (ApprovalDecision::Rejected, "rejected"),
-            _ => return Err(INVALID_BODY),
+            _ => return Err(INVALID_ROUTE_BODY),
         }
     };
     let appended = shared
@@ -1774,14 +1779,14 @@ pub(super) async fn release_slot(
 ) -> Result<Reply, Refusal> {
     use crate::orchestration::blocking::{self, JobProof};
     use crate::persistence::StopProof;
-    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
-    let object = value.as_object().ok_or(INVALID_BODY)?;
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
+    let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
     if object.keys().any(|key| key != "confirm")
         || object
             .get("confirm")
             .is_some_and(|v| v != &Value::Bool(true))
     {
-        return Err(INVALID_BODY);
+        return Err(INVALID_ROUTE_BODY);
     }
     let record = database.job(job).await?.ok_or(super::JOB_NOT_FOUND)?;
     if record.unknown_at.is_none() {

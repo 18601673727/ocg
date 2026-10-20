@@ -529,8 +529,7 @@ mod tests {
                 ..spec.clone()
             }))
             .expect("child");
-            let waiter =
-                wait(database.create_job(NewJob { ..spec.clone() })).expect("blocked root");
+            let waiter = wait(database.create_job(spec.clone())).expect("blocked root");
             let delayed = wait(database.create_job(NewJob {
                 eligible_at: Some(Timestamp::from_unix_micros(
                     Timestamp::now().as_unix_micros() + 3_600_000_000,
