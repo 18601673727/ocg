@@ -3431,6 +3431,7 @@ async fn run_provider_job_inner(
                         sink,
                         &result,
                         summary,
+                        None,
                     )
                     .await;
                 }
@@ -4212,6 +4213,7 @@ async fn record_answer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_provider_job(
     database: DatabaseHandle,
     executor: ExecutorId,
@@ -4220,8 +4222,9 @@ async fn complete_provider_job(
     mut sink: DatabaseOutputSink,
     result: &ProviderExecutionResult,
     summary: String,
+    answer: Option<&ChatMessage>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-    let gap = sink.gap.take();
+    let mut gap = sink.gap.take();
     let mut refused = None;
     let mut settlement = JobFinalization::Completed(FinalResult {
         summary: Some(summary),
@@ -4250,6 +4253,14 @@ async fn complete_provider_job(
         }
         settled => settled,
     };
+    if let Some(answer) = answer {
+        sink.database = database.clone();
+        sink.job = job;
+        record_answer(&mut sink, result, answer).await;
+        if let Some(error) = sink.gap.take() {
+            gap.get_or_insert(error);
+        }
+    }
     let final_output = match settled {
         Ok(final_output) => final_output,
         Err(source) => {
@@ -4301,16 +4312,10 @@ pub(crate) async fn finish_provider_job(
     execution: Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let request = sink.request;
-    let mut gap = sink.gap.take();
-    let receipt = match execution {
+    match execution {
         Ok(result) => {
-            sink.database = database.clone();
-            sink.job = job;
-            record_answer(&mut sink, &result, &assistant_message(&result)).await;
-            if let Some(error) = gap.take() {
-                sink.gap.get_or_insert(error);
-            }
-            return complete_provider_job(
+            let answer = assistant_message(&result);
+            complete_provider_job(
                 database,
                 executor,
                 input,
@@ -4318,37 +4323,40 @@ pub(crate) async fn finish_provider_job(
                 sink,
                 &result,
                 result.text.clone(),
+                Some(&answer),
             )
-            .await;
+            .await
         }
         Err(error) => {
-            match settle_provider_error(database, executor, input, job, request, error).await {
-                Ok(receipt) => receipt,
-                Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
-                    gap.get_or_insert(source);
-                    *receipt
-                }
-                Err(ExecutionRuntimeError::NotSettled {
-                    source,
-                    observations: None,
-                    settlement,
-                }) => {
-                    return Err(ExecutionRuntimeError::NotSettled {
+            let mut gap = sink.gap.take();
+            let receipt =
+                match settle_provider_error(database, executor, input, job, request, error).await {
+                    Ok(receipt) => receipt,
+                    Err(ExecutionRuntimeError::ObservationsNotRecorded { receipt, source }) => {
+                        gap.get_or_insert(source);
+                        *receipt
+                    }
+                    Err(ExecutionRuntimeError::NotSettled {
                         source,
-                        observations: gap.map(Box::new),
+                        observations: None,
                         settlement,
-                    });
-                }
-                Err(error) => return Err(error),
+                    }) => {
+                        return Err(ExecutionRuntimeError::NotSettled {
+                            source,
+                            observations: gap.map(Box::new),
+                            settlement,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+            match gap {
+                None => Ok(receipt),
+                Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
+                    receipt: Box::new(receipt),
+                    source,
+                }),
             }
         }
-    };
-    match gap {
-        None => Ok(receipt),
-        Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
-            receipt: Box::new(receipt),
-            source,
-        }),
     }
 }
 

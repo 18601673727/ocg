@@ -2216,7 +2216,7 @@ fn observability(options: &Options) -> Result<()> {
                                 };
                                 let evidence = NewToolEvidence {
                                     approval: None,
-            call: call_ref,
+                                    call: call_ref,
                                     tool_call_id: call.id.clone(),
                                     name: call.name.clone(),
                                     decision: ToolDecision::Admitted(ToolAdmission {
