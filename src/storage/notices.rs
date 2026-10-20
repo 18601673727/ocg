@@ -17,10 +17,10 @@ pub(crate) fn notice_class(
                 Some(NoticeClass::Attention)
             }
         }
-        NoticeEvent::ClosedAbove
-        | NoticeEvent::StoppedAbove
-        | NoticeEvent::Requested
-        | NoticeEvent::IterationCompleted => Some(NoticeClass::Progress),
+        NoticeEvent::ClosedAbove | NoticeEvent::StoppedAbove | NoticeEvent::Requested => {
+            Some(NoticeClass::Progress)
+        }
+        NoticeEvent::IterationCompleted => completed_class(caused_by),
         NoticeEvent::TurnEnded { kind } => match kind {
             OutcomeKind::Failed | OutcomeKind::Unknown | OutcomeKind::Cancelled => {
                 Some(NoticeClass::Attention)
@@ -120,7 +120,7 @@ impl Batch {
             joined: false,
         })
     }
-    // K3 approval requests notify here;
+    // K3 approval requests notify the parent here.
     pub(crate) fn notify(
         &mut self,
         child: JobId,
@@ -133,13 +133,23 @@ impl Batch {
         if !self.require_job(parent)?.kind.is_conversation() {
             return Ok(());
         }
+        let first_iteration =
+            self.recurrence(child)?.is_some() && self.require_job(reference)?.previous.is_none();
         let causes = self.step(|tx| {
             let mut causes = BTreeSet::new();
             for entry in tx
                 .open_table(TURN_INPUTS)?
                 .range((reference.get(), 0)..=(reference.get(), u32::MAX))?
             {
-                causes.insert(TurnEntry::decode(entry?.1.value())?.entry.kind());
+                let (key, bytes) = entry?;
+                let kind = TurnEntry::decode(bytes.value())?.entry.kind();
+                causes.insert(
+                    if first_iteration && key.value().1 == 1 && kind == EntryKind::AgentMessage {
+                        EntryKind::Iteration
+                    } else {
+                        kind
+                    },
+                );
             }
             Ok(causes)
         })?;

@@ -141,6 +141,8 @@ export function SettingsSurface({
   const [agentBehavior, setAgentBehavior] = useState<ControlAgentBehavior>("chat");
   const [agentToolGrant, setAgentToolGrant] = useState<Exclude<ControlToolGrant, null> | "none">("none");
   const [agentTargets, setAgentTargets] = useState<string[]>([]);
+  const [agentDispatchTo, setAgentDispatchTo] = useState<string[] | undefined>();
+  const [agentDefaultModel, setAgentDefaultModel] = useState<string | null | undefined>();
   const [agentSaving, setAgentSaving] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
   const [agentNotice, setAgentNotice] = useState<string | null>(null);
@@ -309,6 +311,8 @@ export function SettingsSurface({
     setAgentBehavior("chat");
     setAgentToolGrant("none");
     setAgentTargets([]);
+    setAgentDispatchTo(undefined);
+    setAgentDefaultModel(undefined);
     setAgentError(null);
   }
 
@@ -319,6 +323,8 @@ export function SettingsSurface({
     setAgentBehavior(agent.behavior);
     setAgentToolGrant(agent.tool_grant ?? "none");
     setAgentTargets([...agent.llm_targets]);
+    setAgentDispatchTo(agent.dispatch_to);
+    setAgentDefaultModel(agent.default_model);
     setAgentError(null);
     setAgentNotice(null);
   }
@@ -356,6 +362,8 @@ export function SettingsSurface({
         behavior: agentBehavior,
         tool_grant: agentToolGrant === "none" ? null : agentToolGrant,
         llm_targets: agentTargets,
+        dispatch_to: agentDispatchTo,
+        default_model: agentDefaultModel && !agentTargets.includes(agentDefaultModel) ? null : agentDefaultModel,
       };
       const updated = editingAgentId
         ? await client.updateProfile(editingAgentId, payload)

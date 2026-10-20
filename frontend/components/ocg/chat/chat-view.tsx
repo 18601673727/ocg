@@ -441,7 +441,6 @@ export function ChatView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <ConversationChildrenStrip key={session.sessionId} turn={session.sessionId} />
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div ref={scrollRef} onScroll={() => {
           const el = scrollRef.current;
@@ -530,9 +529,10 @@ export function ChatView({
   );
 }
 
-export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen?: (conversation: string) => void }) {
+export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
+  const [conversation, setConversation] = useState<string | null>(null);
   const [children, setChildren] = useState<ControlChildConversation[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [pages, setPages] = useState(1);
@@ -541,14 +541,21 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
   const [error, setError] = useState<string | null>(null);
   const lock = useRef(false);
   useEffect(() => {
-    if (!control || !turn) return;
+    if (!control || !turn || conversation) return;
+    const controller = new AbortController();
+    void control.readJob(turn, controller.signal).then(record => {
+      if (!controller.signal.aborted) setConversation(record.kind === "conversation" ? record.id : record.conversation);
+    }).catch(cause => {
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+    });
+    return () => controller.abort();
+  }, [control, turn, conversation]);
+  useEffect(() => {
+    if (!control || !conversation) return;
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     const refresh = async () => {
       try {
-        const record = await control.readJob(turn, controller.signal);
-        const conversation = record.kind === "conversation" ? record.id : record.conversation;
-        if (!conversation) return;
         const items: ControlChildConversation[] = [];
         let before: string | undefined;
         let more = false;
@@ -568,7 +575,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
     };
     void refresh();
     return () => { controller.abort(); clearTimeout(timer); };
-  }, [control, turn, pages, revision]);
+  }, [control, conversation, pages, revision]);
 
   async function act(child: ControlChildConversation, action: "stop" | "close" | "hold" | "unhold") {
     if (!control || lock.current) return;
@@ -592,7 +599,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
         <p className="text-muted-foreground">{child.id} · {child.agent} · {t(`chat.child.${child.state}`)}{child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}</p>
         {child.recurrence && <p className="text-muted-foreground">{t("chat.child.every", { seconds: child.recurrence.interval_s })} · {t(`chat.child.${child.recurrence.phase}`)}{child.recurrence.due_us !== null ? ` · ${new Date(child.recurrence.due_us / 1000).toLocaleString()}` : ""}</p>}
         <div className="mt-1 flex gap-1">
-          {onOpen ? <Button size="xs" variant="ghost" onClick={() => onOpen(child.id)}>{t("common.open")}</Button> : <a className="px-2 py-1 underline" href={`/?job=${encodeURIComponent(child.id)}`}>{t("common.open")}</a>}
+          <Button size="xs" variant="ghost" onClick={() => onOpen(child.id)}>{t("common.open")}</Button>
           <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, "stop")}>{t("chat.child.stop")}</Button>
           <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, "close")}>{t("common.close")}</Button>
           <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, child.on_hold ? "unhold" : "hold")}>{t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")}</Button>

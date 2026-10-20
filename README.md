@@ -1,6 +1,3 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
-
 # OCG 0.5.0
 
 OCG is a local, single-operator host that runs durable Provider Jobs against a

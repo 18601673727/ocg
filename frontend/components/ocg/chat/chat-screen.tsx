@@ -37,7 +37,7 @@ type QueueState = { queue: QueuedChatMessage[]; paused: boolean };
 
 export interface ChatScreenProps {
   session: ChatSession;
-  onOpenConversation?: (conversation: string) => void;
+  onOpenConversation: (conversation: string) => void;
   execution: JobExecution | null;
   runtimeStatus: RuntimeStatus;
   onComposerIntent: (intent: ComposerIntent) => Promise<void> | void;
@@ -254,7 +254,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
     <OcgAssistantProvider sessionId={session.id} projectId={session.projectId ?? ""}>
       <ChatComposerContext.Provider value={composerValue}>
         <div className={cn("flex h-full min-h-0 w-full flex-col", busy && "[&_[data-slot=aui-thread-viewport]]:scroll-smooth")}>
-          <ConversationChildrenStrip key={session.sessionId} turn={session.sessionId} onOpen={onOpenConversation} />
+          <ConversationChildrenStrip key={session.id} turn={session.sessionId} onOpen={onOpenConversation} />
           <Thread components={THREAD_COMPONENTS} autoFocus />
         </div>
       </ChatComposerContext.Provider>

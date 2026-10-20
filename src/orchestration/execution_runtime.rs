@@ -1650,8 +1650,14 @@ async fn dispatch_runtime(
                 let claimed = if scope == ClaimScope::Stored {
                     async {
                         let clock = crate::storage::promotion_clock();
-                        if database.recurrence_due(clock).await? {
-                            database.boundary_b(clock).await?;
+                        match database.recurrence_due(clock).await {
+                            Ok(true) => {
+                                if let Err(error) = database.boundary_b(clock).await {
+                                    log::error!("recurrence promotion failed: {error}");
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => log::error!("recurrence due read failed: {error}"),
                         }
                         database.claim_batch().await
                     }
@@ -2646,7 +2652,7 @@ pub(crate) fn fit_conversation(
 async fn run_started_provider_job(
     database: DatabaseHandle,
     mut plan: ProviderTask,
-    (started, _offered): (StartedJob, Option<Vec<ToolWire>>),
+    (started, mut offered): (StartedJob, Option<Vec<ToolWire>>),
     tool_may_have_run: &Cell<bool>,
     scheduler: Option<StopHandle>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
@@ -2719,6 +2725,15 @@ async fn run_started_provider_job(
         if grant.is_some() {
             return refused(ExecutionRuntimeError::WorkspaceGrantUnsupported.to_string()).await;
         }
+        offered = match plan
+            .tools
+            .as_ref()
+            .map(|tools| tools.offer.wires())
+            .transpose()
+        {
+            Ok(offered) => offered,
+            Err(error) => return refused(error.to_string()).await,
+        };
     }
     if job_record.kind.is_stored()
         && configuration
@@ -2731,16 +2746,16 @@ async fn run_started_provider_job(
             Ok(tools) => Some(tools),
             Err(error) => return refused(error.to_string()).await,
         };
+        offered = match plan
+            .tools
+            .as_ref()
+            .map(|tools| tools.offer.wires())
+            .transpose()
+        {
+            Ok(offered) => offered,
+            Err(error) => return refused(error.to_string()).await,
+        };
     }
-    let offered = match plan
-        .tools
-        .as_ref()
-        .map(|tools| tools.offer.wires())
-        .transpose()
-    {
-        Ok(offered) => offered,
-        Err(error) => return refused(error.to_string()).await,
-    };
     let Some(input_record) = database.job_input(input).await? else {
         return refused("submitted Job input disappeared".to_owned()).await;
     };

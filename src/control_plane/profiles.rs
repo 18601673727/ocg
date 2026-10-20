@@ -206,10 +206,17 @@ enum WireProfileRequest {
         #[serde(default)]
         llm_targets: Vec<String>,
         #[serde(default)]
-        dispatch_to: Vec<String>,
-        #[serde(default)]
-        default_model: Option<String>,
+        dispatch_to: Option<Vec<String>>,
+        #[serde(default, deserialize_with = "optional_default_model")]
+        default_model: Option<Option<String>>,
     },
+}
+
+fn optional_default_model<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 fn valid_single_line(text: &str, max_bytes: usize) -> bool {
@@ -785,13 +792,26 @@ pub(super) async fn save_profile(
                 }
             }
             parsed_targets.sort();
+            let prior = if let Some(id) = existing_id {
+                let record = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
+                let ConfigBody::Agent(agent) = record.body else {
+                    return Err(WRONG_PROFILE_KIND);
+                };
+                agent
+            } else {
+                AgentConfig::default()
+            };
             let invalid_dispatch = Refusal::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_dispatch_to",
                 "dispatch_to must name unique Agent Profiles",
             );
-            let mut parsed_dispatch = Vec::new();
-            for raw in dispatch_to {
+            let mut parsed_dispatch = if dispatch_to.is_none() {
+                prior.dispatch_to
+            } else {
+                Vec::new()
+            };
+            for raw in dispatch_to.unwrap_or_default() {
                 let id = profile_id(&raw)
                     .map(ConfigId::from)
                     .map_err(|_| invalid_dispatch)?;
@@ -814,13 +834,16 @@ pub(super) async fn save_profile(
                 "invalid_default_model",
                 "default_model must be one of llm_targets",
             );
-            let default_model = default_model
-                .map(|raw| {
-                    profile_id(&raw)
-                        .map(ConfigId::from)
-                        .map_err(|_| invalid_default)
-                })
-                .transpose()?;
+            let default_model = match default_model {
+                None => prior.default_model.filter(|id| parsed_targets.contains(id)),
+                Some(value) => value
+                    .map(|raw| {
+                        profile_id(&raw)
+                            .map(ConfigId::from)
+                            .map_err(|_| invalid_default)
+                    })
+                    .transpose()?,
+            };
             if default_model.is_some_and(|id| !parsed_targets.contains(&id)) {
                 return Err(invalid_default);
             }
@@ -888,6 +911,12 @@ mod tests {
             let agent = reply.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
             assert_eq!(agent["dispatch_to"], json!([target]));
             assert_eq!(agent["default_model"], model);
+            let id = profile_id(reply.body["profile_id"].as_str().unwrap()).unwrap();
+            let renamed = json!({"kind":"agent","name":"renamed","llm_targets":[model]});
+            let updated = save_profile(&database, Some(id), &serde_json::to_vec(&renamed).unwrap()).await.unwrap();
+            let kept = updated.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
+            assert_eq!(kept["dispatch_to"], json!([target]));
+            assert_eq!(kept["default_model"], model);
             body["dispatch_to"] = json!([model]);
             assert!(matches!(save_profile(&database, None, &serde_json::to_vec(&body).unwrap()).await, Err(refusal) if refusal.code == "invalid_dispatch_to"));
             body["dispatch_to"] = json!([target]);

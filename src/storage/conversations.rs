@@ -750,16 +750,44 @@ impl Batch {
                 "not a turn of this conversation",
             ));
         }
-        // K3 refuses an approved call without a definite outcome;
+        // K3 refuses an approved call without a definite outcome.
         if matches!(by, Actor::Agent { .. })
             && self.step(|tx| {
+                let inputs = tx.open_table(TURN_INPUTS)?;
+                let mut root = turn;
+                let mut ancestors = BTreeSet::new();
+                loop {
+                    if !ancestors.insert(root) {
+                        return Err(StorageError::corrupted("retry ancestry cycle"));
+                    }
+                    let mut original = None;
+                    for entry in inputs.range((root.get(), 0)..=(root.get(), u32::MAX))? {
+                        if let Entry::RetryOf { turn, .. } =
+                            TurnEntry::decode(entry?.1.value())?.entry
+                        {
+                            original = Some(turn);
+                            break;
+                        }
+                    }
+                    match original {
+                        Some(turn) => root = turn,
+                        None => break,
+                    }
+                }
+                let retries = tx.open_table(RETRIES)?;
+                let mut pending = vec![root.get()];
+                let mut visited = BTreeSet::new();
                 let mut count = 0;
-                for row in tx
-                    .open_table(RETRIES)?
-                    .range((turn.get(), 0)..=(turn.get(), u64::MAX))?
-                {
-                    if row?.1.value() {
-                        count += 1;
+                while let Some(original) = pending.pop() {
+                    if !visited.insert(original) {
+                        continue;
+                    }
+                    for row in retries.range((original, 0)..=(original, u64::MAX))? {
+                        let (key, agent) = row?;
+                        if agent.value() {
+                            count += 1;
+                        }
+                        pending.push(key.value().1);
                     }
                 }
                 Ok(count >= 2)
@@ -2513,6 +2541,56 @@ mod tests {
     }
 
     #[test]
+    fn recurring_objective_is_progress_but_a_joined_job_message_wakes_the_parent() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("dispatch-iteration-message");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let (child, first) = fixture.dispatch(turn, 0, agent, false, Some(60), vec![]);
+        fixture.finish(first, OutcomeKind::Completed);
+        let notices = wait(fixture.database.notices(parent, 0, 100)).unwrap();
+        assert!(notices.iter().any(|(_, notice)| notice.class == NoticeClass::Progress
+            && matches!(notice.body, NoticeBody::Event { child: id, event: NoticeEvent::IterationCompleted, reference } if id == child && reference == first)));
+        assert_eq!(
+            wait(fixture.database.conversation_turns(parent, None, 10))
+                .unwrap()
+                .len(),
+            1
+        );
+        let due = match fixture.recurrence(child).phase {
+            RecurrencePhase::WaitingDue { due } => due,
+            phase => panic!("expected due: {phase:?}"),
+        };
+        wait(fixture.database.boundary_b(due + 1)).unwrap();
+        let iteration = fixture.recurrence(child).current_turn;
+        let reply = fixture.apply(
+            turn,
+            1,
+            JobToolCall::JobMessage {
+                conversation: child.to_string(),
+                text: "please reply".into(),
+            },
+        );
+        assert_eq!(reply["turn"], iteration.to_string());
+        assert_eq!(
+            wait(fixture.database.turn_entries(iteration))
+                .unwrap()
+                .len(),
+            2
+        );
+        fixture.complete_claimed(turn);
+        fixture.finish(iteration, OutcomeKind::Completed);
+        let turns = wait(fixture.database.conversation_turns(parent, None, 10)).unwrap();
+        let attention = turns.iter().find(|row| wait(fixture.database.turn_entries(row.id)).unwrap().iter().any(|(_, entry)| matches!(entry.entry,
+            Entry::Notice { child: id, event: NoticeEvent::IterationCompleted, reference } if id == child && reference == iteration))).expect("parent attention entry");
+        assert!(
+            wait(fixture.database.claim_batch())
+                .unwrap()
+                .contains(&attention.id)
+        );
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn recurrence_continues_after_failure_uses_bounded_context_and_halts_on_close_or_model_removal()
     {
         let fixture = Fixture::new("dispatch-recurrence");
@@ -2606,19 +2684,21 @@ mod tests {
         );
         wait(fixture.database.unhold(child, Actor::User)).unwrap();
         fixture.finish(first, OutcomeKind::Failed);
+        let mut original = first;
         for index in 2..4 {
             let value = fixture.apply(
                 turn,
                 index,
                 JobToolCall::JobRetry {
-                    turn: first.to_string(),
+                    turn: original.to_string(),
                 },
             );
             let retry = JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap());
             fixture.finish(retry, OutcomeKind::Failed);
+            original = retry;
         }
         let tool = JobToolCall::JobRetry {
-            turn: first.to_string(),
+            turn: original.to_string(),
         };
         let call = fixture.admit(turn, 4, &tool);
         assert!(matches!(

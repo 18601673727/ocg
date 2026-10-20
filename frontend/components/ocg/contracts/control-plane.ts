@@ -779,6 +779,10 @@ export function decodeProfiles(input: unknown) {
         behavior: rawBehavior as ControlAgentBehavior,
         llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,
           (target, targetPath) => identity(target, targetPath, "profile:")),
+        dispatch_to: agent.dispatch_to === undefined ? undefined : listOf(agent.dispatch_to, `${path}.dispatch_to`,
+          (target, targetPath) => identity(target, targetPath, "profile:")),
+        default_model: agent.default_model === undefined ? undefined : agent.default_model === null ? null
+          : identity(agent.default_model, `${path}.default_model`, "profile:"),
         editable: boolean(agent.editable, `${path}.editable`),
         blocking_jobs: listOf(agent.blocking_jobs, `${path}.blocking_jobs`,
           (job, jobPath) => identity(job, jobPath, "job:")),
