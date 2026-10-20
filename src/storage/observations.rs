@@ -57,12 +57,12 @@ fn job_events(rx: &ReadTransaction, job: JobId) -> Result<Vec<RequestEventRecord
 pub(super) fn metrics_of(
     job: JobId,
     target: &Option<LlmTarget>,
-    events: Vec<RequestEventRecord>,
+    events: &[RequestEventRecord],
 ) -> Vec<MetricsRecord> {
     let mut records: Vec<MetricsRecord> = Vec::new();
     let mut last_measurement: Option<(RequestNumber, u32, Timestamp, Timestamp)> = None;
     for event in events {
-        match event.payload {
+        match &event.payload {
             RequestPayload::Measurement { measurements } => {
                 last_measurement = Some((
                     event.request,
@@ -76,7 +76,7 @@ pub(super) fn metrics_of(
                     request: event.request,
                     target: target.clone(),
                     observed_at: event.observed_at,
-                    measurements,
+                    measurements: measurements.clone(),
                     token: None,
                     recorded_at: event.recorded_at,
                 });
@@ -86,8 +86,8 @@ pub(super) fn metrics_of(
                 finality,
             } => {
                 let annotation = TokenAnnotation {
-                    eligibility,
-                    finality,
+                    eligibility: *eligibility,
+                    finality: *finality,
                 };
                 let pairs =
                     last_measurement.is_some_and(|(request, seq, observed_at, recorded_at)| {
@@ -117,6 +117,29 @@ pub(super) fn metrics_of(
         }
     }
     records
+}
+
+/// Reduces one request's events to its Token sample. An evidence error drops
+/// only this request, and is logged once with the Job, the request and the
+/// error; no sample is then returned. Both the mutation and the rebuild path
+/// use this rule, so they cannot disagree about a request.
+pub(super) fn usage_sample_of(
+    job: JobId,
+    request: RequestNumber,
+    target: &Option<LlmTarget>,
+    events: &[RequestEventRecord],
+) -> Option<crate::token_usage::TokenRequestSample> {
+    let records = metrics_of(job, target, events);
+    match crate::token_usage::TokenRequestSample::from_metrics(&records) {
+        Ok(sample) => sample,
+        Err(error) => {
+            log::warn!(
+                "dropping Token usage of {job} request {}: {error}",
+                request.get()
+            );
+            None
+        }
+    }
 }
 
 fn availability_of(
@@ -157,7 +180,7 @@ pub(crate) fn read_job_metrics(
 ) -> Result<Vec<MetricsRecord>, StorageError> {
     let rx = read(database)?;
     let target = frozen_llm_target(&rx, job)?;
-    let records = metrics_of(job, &target, job_events(&rx, job)?);
+    let records = metrics_of(job, &target, &job_events(&rx, job)?);
     Ok(records
         .into_iter()
         .filter(|record| after.is_none_or(|after| record.id > after))
@@ -414,7 +437,7 @@ pub(crate) fn read_metrics(
             None => {
                 let target = cache.get(&job).cloned().flatten();
                 jobs.entry(job)
-                    .or_insert(metrics_of(job, &target, job_events(&rx, job)?))
+                    .or_insert(metrics_of(job, &target, &job_events(&rx, job)?))
             }
         };
         let id = MetricsId::new(pair(event.request, event.seq));
@@ -563,15 +586,13 @@ pub(crate) fn read_provider_request(
                     return Err(StorageError::corrupted("request has multiple Sent events"));
                 }
                 dropped_turns = dropped.unwrap_or_default();
-                sent = Some((
-                    messages
-                        .into_iter()
-                        .map(&value)
-                        .collect::<Result<Vec<_>, _>>()?,
-                    #[allow(clippy::needless_borrows_for_generic_args)]
-                    tools.map(&value).transpose()?,
-                    value(parameters)?,
-                ));
+                let request_parameters = value(parameters)?;
+                let request_messages = messages
+                    .into_iter()
+                    .map(&value)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let request_tools = tools.map(value).transpose()?;
+                sent = Some((request_messages, request_tools, request_parameters));
             }
             RequestPayload::Received { digest } => response = Some(value(digest)?),
             _ => {}

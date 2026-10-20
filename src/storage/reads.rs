@@ -888,15 +888,14 @@ pub(crate) fn read_conversations(
     })
 }
 
-pub(crate) fn queue_counts(database: &Database) -> (u64, u64, u64) {
-    if let Ok(rx) = read(database) {
-        let p = rx.open_table(PENDING).ok().and_then(|t| t.len().ok()).unwrap_or(0);
-        let r = rx.open_table(READY).ok().and_then(|t| t.len().ok()).unwrap_or(0);
-        let d = rx.open_table(DELAYED).ok().and_then(|t| t.len().ok()).unwrap_or(0);
-        (p, r, d)
-    } else {
-        (0, 0, 0)
-    }
+/// The number of Jobs in each readiness queue. A failed read is an error, so
+/// a caller never reports a queue as empty when it could not be read.
+pub(crate) fn queue_counts(database: &Database) -> Result<(u64, u64, u64), StorageError> {
+    let rx = read(database)?;
+    let pending = rx.open_table(PENDING)?.len()?;
+    let ready = rx.open_table(READY)?.len()?;
+    let delayed = rx.open_table(DELAYED)?.len()?;
+    Ok((pending, ready, delayed))
 }
 
 pub(crate) fn read_tool_stats(
@@ -949,18 +948,60 @@ type UsageCounters = (u64, u64, u64, u64, u64, u64, u64);
 
 pub(crate) fn read_usage_summary(
     database: &Database,
-    filter: &crate::token_usage::UsageSummaryFilter,
-) -> Result<crate::token_usage::UsageSummaryResponse, StorageError> {
+    filter: &crate::persistence::UsageSummaryFilter,
+) -> Result<crate::persistence::UsageSummaryResponse, StorageError> {
+    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse, UsageSummaryRow};
+
     let rx = read(database)?;
     let table = rx.open_table(USAGE_TOTALS)?;
+    // `from_us` is inclusive and rounds down to its bucket; `until_us` is
+    // exclusive and rounds up, so the buckets scanned are exactly those an
+    // instant in `[from_us, until_us)` falls in. The last bucket is
+    // `ceil(until_us / HOUR) - 1`.
     let from_hour = filter
         .from_us
-        .map(|us| us.div_euclid(3_600_000_000))
+        .map(|us| us.div_euclid(HOUR))
         .unwrap_or(i64::MIN);
-    let until_hour = filter
-        .until_us
-        .map(|us| us.div_euclid(3_600_000_000))
-        .unwrap_or(i64::MAX);
+    let until_end = match filter.until_us {
+        None => None,
+        Some(us) => {
+            let hour = us.div_euclid(HOUR);
+            Some(if us.rem_euclid(HOUR) == 0 {
+                hour
+            } else {
+                hour.checked_add(1).ok_or_else(|| {
+                    StorageError::corrupted("usage summary until_us overflows its hour bucket")
+                })?
+            })
+        }
+    };
+    let until_end_us = match until_end {
+        Some(hour) => Some(hour.checked_mul(HOUR).ok_or_else(|| {
+            StorageError::corrupted("usage summary until_us overflows its hour bucket")
+        })?),
+        None => None,
+    };
+    let until_hour = match until_end {
+        Some(hour) => hour - 1,
+        None => i64::MAX,
+    };
+
+    let requested_from_us = match filter.from_us {
+        Some(us) => Some(us.div_euclid(HOUR).checked_mul(HOUR).ok_or_else(|| {
+            StorageError::corrupted("usage summary from_us underflows its hour bucket")
+        })?),
+        None => None,
+    };
+
+    if from_hour > until_hour {
+        return Ok(UsageSummaryResponse {
+            from_us: requested_from_us.unwrap_or(0),
+            until_us: until_end_us.unwrap_or(0),
+            complete: true,
+            resume_from_us: None,
+            rows: Vec::new(),
+        });
+    }
 
     let start = (from_hour, 0, 0, [0u8; 32]);
     let end = (until_hour, u64::MAX, u64::MAX, [0xffu8; 32]);
@@ -980,7 +1021,9 @@ pub(crate) fn read_usage_summary(
         if let Some(cur) = current_hour {
             if hour != cur {
                 if scanned_rows >= MAX_USAGE_SCAN {
-                    resume_from_us = Some(hour * 3_600_000_000);
+                    resume_from_us = Some(hour.checked_mul(HOUR).ok_or_else(|| {
+                        StorageError::corrupted("usage summary resume point overflows")
+                    })?);
                     break;
                 }
                 current_hour = Some(hour);
@@ -1016,12 +1059,8 @@ pub(crate) fn read_usage_summary(
     let mut model_cache: std::collections::HashMap<(u64, [u8; 32]), Option<String>> =
         std::collections::HashMap::new();
     let mut rows = Vec::with_capacity(grouped.len());
-    let mut all_complete = resume_from_us.is_none();
 
     for ((agent, provider, model_hash), (reqs, comp, inp, out, cr, cw, reas)) in grouped {
-        if comp < reqs {
-            all_complete = false;
-        }
         let model = match model_cache.entry((provider, model_hash)) {
             std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
             std::collections::hash_map::Entry::Vacant(e) => {
@@ -1030,7 +1069,7 @@ pub(crate) fn read_usage_summary(
                 resolved
             }
         };
-        rows.push(crate::token_usage::UsageSummaryRow {
+        rows.push(UsageSummaryRow {
             agent,
             provider,
             model,
@@ -1044,26 +1083,26 @@ pub(crate) fn read_usage_summary(
         });
     }
 
-    let effective_from_us = filter
-        .from_us
-        .map(|us| us.div_euclid(3_600_000_000) * 3_600_000_000)
-        .or_else(|| earliest_hour.map(|h| h * 3_600_000_000))
+    let effective_from_us = requested_from_us
+        .or_else(|| earliest_hour.map(|hour| hour.saturating_mul(HOUR)))
         .unwrap_or(0);
 
-    let effective_until_us = if let Some(resume) = resume_from_us {
-        resume
-    } else {
-        filter
-            .until_us
-            .map(|us| (us.div_euclid(3_600_000_000) + 1) * 3_600_000_000)
-            .or_else(|| latest_hour.map(|h| (h + 1) * 3_600_000_000))
-            .unwrap_or(0)
+    let effective_until_us = match resume_from_us {
+        Some(resume) => resume,
+        None => match until_end_us {
+            Some(until) => until,
+            None => latest_hour
+                .and_then(|hour| hour.checked_add(1))
+                .map_or(0, |hour| hour.saturating_mul(HOUR)),
+        },
     };
 
-    Ok(crate::token_usage::UsageSummaryResponse {
+    Ok(UsageSummaryResponse {
         from_us: effective_from_us,
         until_us: effective_until_us,
-        complete: all_complete,
+        // Complete says the scan finished, not that every request's usage is
+        // final. `resume_from_us` is set exactly when it did not finish.
+        complete: resume_from_us.is_none(),
         resume_from_us,
         rows,
     })

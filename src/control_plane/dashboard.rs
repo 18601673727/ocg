@@ -215,7 +215,8 @@ pub(super) async fn tool_stats(shared: &Shared) -> Result<Reply, Refusal> {
 
 pub(super) fn usage_summary_query(
     query: &str,
-) -> Result<crate::token_usage::UsageSummaryFilter, Refusal> {
+) -> Result<crate::persistence::UsageSummaryFilter, Refusal> {
+    use crate::persistence::USAGE_SUMMARY_HOUR_MICROS as HOUR;
     let mut values = pairs(query)?;
     let from_us = values
         .remove("from_us")
@@ -230,18 +231,32 @@ pub(super) fn usage_summary_query(
     {
         return Err(INVALID_REQUEST);
     }
+    // The bounds are rounded to the hour buckets the summary scans; a bound
+    // whose bucket is not an `i64` is refused here rather than overflowing.
+    if let Some(from) = from_us
+        && from.div_euclid(HOUR).checked_mul(HOUR).is_none()
+    {
+        return Err(INVALID_REQUEST);
+    }
+    if let Some(until) = until_us {
+        let hour = until.div_euclid(HOUR);
+        let end_hour = if until.rem_euclid(HOUR) == 0 {
+            Some(hour)
+        } else {
+            hour.checked_add(1)
+        };
+        if end_hour.and_then(|hour| hour.checked_mul(HOUR)).is_none() {
+            return Err(INVALID_REQUEST);
+        }
+    }
     let agent = values
         .remove("agent")
-        .map(|value| {
-            super::profiles::profile_id(value)
-                .map(|id| id.get())
-                .or_else(|_| decimal::<u64>(value).ok_or(INVALID_REQUEST))
-        })
+        .map(|value| super::profiles::profile_id(value).map(|id| id.get()))
         .transpose()?;
     if !values.is_empty() {
         return Err(INVALID_REQUEST);
     }
-    Ok(crate::token_usage::UsageSummaryFilter {
+    Ok(crate::persistence::UsageSummaryFilter {
         from_us,
         until_us,
         agent,
@@ -250,16 +265,35 @@ pub(super) fn usage_summary_query(
 
 pub(super) async fn usage_summary(
     shared: &Shared,
-    filter: crate::token_usage::UsageSummaryFilter,
+    filter: crate::persistence::UsageSummaryFilter,
 ) -> Result<Reply, Refusal> {
     let summary = shared.database.usage_summary(filter).await?;
+    let rows = summary
+        .rows
+        .iter()
+        .map(|row| {
+            json!({
+                // 0 is "no Agent"; it is never a Profile id.
+                "agent": (row.agent != 0).then(|| format!("profile:{}", row.agent)),
+                "provider": format!("llm_provider:{}", row.provider),
+                "model": row.model,
+                "requests": row.requests,
+                "complete_requests": row.complete_requests,
+                "input_tokens": row.input_tokens,
+                "output_tokens": row.output_tokens,
+                "cache_read_tokens": row.cache_read_tokens,
+                "cache_write_tokens": row.cache_write_tokens,
+                "reasoning_tokens": row.reasoning_tokens,
+            })
+        })
+        .collect::<Vec<_>>();
     let val = json!({
         "api_version": API_VERSION,
         "from_us": summary.from_us,
         "until_us": summary.until_us,
         "complete": summary.complete,
         "resume_from_us": summary.resume_from_us,
-        "rows": summary.rows,
+        "rows": rows,
     });
     bounded(shared, val)
 }
@@ -427,10 +461,15 @@ mod tests {
         assert_eq!(filter.until_us, Some(200));
         assert_eq!(filter.agent, Some(42));
 
-        let filter = usage_summary_query("agent=42").expect("decimal agent");
-        assert_eq!(filter.agent, Some(42));
-
+        assert!(
+            usage_summary_query("agent=42").is_err(),
+            "an agent is named profile:N, never a bare number"
+        );
         assert!(usage_summary_query("from_us=200&until_us=100").is_err());
+        assert!(
+            usage_summary_query(&format!("until_us={}", i64::MAX)).is_err(),
+            "a bound whose hour bucket is not representable is refused"
+        );
         assert!(usage_summary_query("model=gpt-4o").is_err());
         assert!(usage_summary_query("unknown=1").is_err());
     }

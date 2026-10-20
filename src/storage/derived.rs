@@ -112,48 +112,7 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         }
         tool_call_ids.push((job, record.tool_call_id, request, index));
     }
-    let mut usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue> = BTreeMap::new();
-    let mut job_events_map: BTreeMap<u64, Vec<crate::persistence::RequestEventRecord>> = BTreeMap::new();
-    for entry in tx.open_table(REQUEST_EVENTS)?.iter()? {
-        let (key, bytes) = entry?;
-        let (job, request, seq) = key.value();
-        if let Some(req) = crate::persistence::RequestNumber::new(request) {
-            let event = rows::decode_request_event(JobId::new(job), req, seq, bytes.value())?;
-            job_events_map.entry(job).or_default().push(event);
-        }
-    }
-    for (job_id, events) in job_events_map {
-        let Some(job_row) = jobs.get(&job_id) else { continue };
-        let Some(execution) = &job_row.execution else { continue };
-        let agent = usage_agent(job_row);
-        let provider = execution.llm.provider.id.get();
-        let model_hash = *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes();
-        let target = Some(LlmTarget {
-            llm_profile: execution.llm.model.id.into(),
-            frozen: execution.llm.clone(),
-        });
-        let records = observations::metrics_of(JobId::new(job_id), &target, events);
-        if let Ok(samples) = crate::token_usage::TokenRequestSample::per_request(&records) {
-            for sample in samples {
-                let hour = sample.observed_at.as_unix_micros().div_euclid(3_600_000_000);
-                let key = (hour, agent, provider, model_hash);
-                let entry = usage_totals.entry(key).or_insert((0, 0, 0, 0, 0, 0, 0));
-                let complete = if sample.usage == crate::token_usage::TokenUsageState::Complete { 1 } else { 0 };
-                let input = sample.input.value().unwrap_or(0) as u64;
-                let output = sample.output.value().unwrap_or(0) as u64;
-                let cache_read = sample.cache_read.value().unwrap_or(0) as u64;
-                let cache_write = sample.cache_write.value().unwrap_or(0) as u64;
-                let reasoning = sample.reasoning.value().unwrap_or(0) as u64;
-                entry.0 = entry.0.saturating_add(1);
-                entry.1 = entry.1.saturating_add(complete);
-                entry.2 = entry.2.saturating_add(input);
-                entry.3 = entry.3.saturating_add(output);
-                entry.4 = entry.4.saturating_add(cache_read);
-                entry.5 = entry.5.saturating_add(cache_write);
-                entry.6 = entry.6.saturating_add(reasoning);
-            }
-        }
-    }
+    let usage_totals = usage_totals_from_events(&tx.open_table(REQUEST_EVENTS)?, &jobs)?;
     Ok(Authoritative {
         jobs,
         states,
@@ -162,6 +121,88 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         tool_stats,
         usage_totals,
     })
+}
+
+/// One ordered pass over the request events, grouped by (Job, request): the
+/// events of one request are contiguous in table order, so each group is
+/// reduced on its own as the pass meets its first event of the next request.
+/// Nothing else is kept, so the pass holds one request's events, never the
+/// whole table.
+fn usage_totals_from_events(
+    table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
+    jobs: &BTreeMap<u64, JobRow>,
+) -> Result<BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>, StorageError> {
+    let mut totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue> = BTreeMap::new();
+    let mut current: Option<(u64, u32)> = None;
+    let mut events: Vec<crate::persistence::RequestEventRecord> = Vec::new();
+    for entry in table.iter()? {
+        let (key, bytes) = entry?;
+        let (job, request, seq) = key.value();
+        if current != Some((job, request)) {
+            if let Some((job, request)) = current {
+                add_usage(&mut totals, jobs, job, request, &events)?;
+            }
+            events.clear();
+            current = Some((job, request));
+        }
+        if let Some(request) = RequestNumber::new(request) {
+            events.push(rows::decode_request_event(
+                JobId::new(job),
+                request,
+                seq,
+                bytes.value(),
+            )?);
+        }
+    }
+    if let Some((job, request)) = current {
+        add_usage(&mut totals, jobs, job, request, &events)?;
+    }
+    Ok(totals)
+}
+
+/// Adds one request's sample, per the shared Token rule, to the usage
+/// totals: an evidence error drops only this request, logged by the rule.
+fn add_usage(
+    totals: &mut BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
+    jobs: &BTreeMap<u64, JobRow>,
+    job: u64,
+    request: u32,
+    events: &[crate::persistence::RequestEventRecord],
+) -> Result<(), StorageError> {
+    let Some(job_row) = jobs.get(&job) else {
+        return Ok(());
+    };
+    let Some(execution) = &job_row.execution else {
+        return Ok(());
+    };
+    let Some(request) = RequestNumber::new(request) else {
+        return Ok(());
+    };
+    let target = Some(LlmTarget {
+        llm_profile: execution.llm.model.id.into(),
+        frozen: execution.llm.clone(),
+    });
+    let Some(sample) = observations::usage_sample_of(JobId::new(job), request, &target, events)
+    else {
+        return Ok(());
+    };
+    let hour = sample.observed_at.as_unix_micros().div_euclid(crate::persistence::USAGE_SUMMARY_HOUR_MICROS);
+    let key = (
+        hour,
+        usage_agent(job_row),
+        execution.llm.provider.id.get(),
+        *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),
+    );
+    let entry = totals.entry(key).or_insert((0, 0, 0, 0, 0, 0, 0));
+    let complete = u64::from(sample.usage == crate::token_usage::TokenUsageState::Complete);
+    entry.0 = entry.0.saturating_add(1);
+    entry.1 = entry.1.saturating_add(complete);
+    entry.2 = entry.2.saturating_add(u64::from(sample.input.value().unwrap_or(0)));
+    entry.3 = entry.3.saturating_add(u64::from(sample.output.value().unwrap_or(0)));
+    entry.4 = entry.4.saturating_add(u64::from(sample.cache_read.value().unwrap_or(0)));
+    entry.5 = entry.5.saturating_add(u64::from(sample.cache_write.value().unwrap_or(0)));
+    entry.6 = entry.6.saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
+    Ok(())
 }
 
 /// Computes every derived table. `clock` is the promotion clock, which splits
@@ -717,14 +758,15 @@ mod tests {
         }))
         .unwrap();
 
-        // Check summary so far
-        let summary = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter::default())).unwrap();
+        // Check summary so far: the scan finished, though the usage is not final.
+        let summary = wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default())).unwrap();
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].requests, 1);
         assert_eq!(summary.rows[0].complete_requests, 0);
         assert_eq!(summary.rows[0].input_tokens, 10);
         assert_eq!(summary.rows[0].output_tokens, 5);
-        assert!(!summary.complete);
+        assert!(summary.complete, "complete says the scan finished");
+        assert_eq!(summary.resume_from_us, None);
 
         // 2. Final metrics for the same request
         wait(database.record_metrics(NewMetrics {
@@ -743,7 +785,7 @@ mod tests {
         }))
         .unwrap();
 
-        let summary = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter::default())).unwrap();
+        let summary = wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default())).unwrap();
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].requests, 1);
         assert_eq!(summary.rows[0].complete_requests, 1);
@@ -791,7 +833,7 @@ mod tests {
         .unwrap();
 
         // Filter by agent_1
-        let summary_agent1 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+        let summary_agent1 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
             from_us: None,
             until_us: None,
             agent: Some(agent_1.get()),
@@ -802,7 +844,7 @@ mod tests {
         assert_eq!(summary_agent1.rows[0].input_tokens, 10);
 
         // Filter by agent_2
-        let summary_agent2 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+        let summary_agent2 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
             from_us: None,
             until_us: None,
             agent: Some(agent_2.get()),
@@ -812,20 +854,33 @@ mod tests {
         assert_eq!(summary_agent2.rows[0].agent, agent_2.get());
         assert_eq!(summary_agent2.rows[0].input_tokens, 20);
 
-        // Filter by hour 1 only: [3_600_000_000, 3_600_000_000]
-        let summary_hour1 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+        // An empty range: `until_us` is exclusive, so equal bounds cover no
+        // instant and no bucket, even when the bound starts an hour.
+        let summary_empty = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
             from_us: Some(3_600_000_000),
             until_us: Some(3_600_000_000),
+            agent: None,
+        }))
+        .unwrap();
+        assert!(summary_empty.rows.is_empty());
+        assert!(summary_empty.complete);
+        assert_eq!(summary_empty.resume_from_us, None);
+
+        // Hour 1 only: [3_600_000_000, 7_200_000_000) rounds up to a bucket
+        // end exclusive of hour 2.
+        let summary_hour1 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
+            from_us: Some(3_600_000_000),
+            until_us: Some(7_200_000_000),
             agent: None,
         }))
         .unwrap();
         assert_eq!(summary_hour1.rows.len(), 1);
         assert_eq!(summary_hour1.rows[0].agent, agent_1.get());
 
-        // Filter by hour 2 only: [7_200_000_000, 7_200_000_000]
-        let summary_hour2 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+        // Hour 2 only: [7_200_000_000, 10_800_000_000).
+        let summary_hour2 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
             from_us: Some(7_200_000_000),
-            until_us: Some(7_200_000_000),
+            until_us: Some(10_800_000_000),
             agent: None,
         }))
         .unwrap();

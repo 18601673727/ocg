@@ -1510,6 +1510,7 @@ fn main() -> Result<()> {
         "section": options.section,
         "iterations_per_client": if is_provider { Value::Null } else { json!(options.iterations) },
         "jobs": if is_large_load { options.provider_jobs } else { options.jobs },
+        "obs_jobs": if is_observability { json!(observability_jobs(&options)) } else { Value::Null },
         "files": applied(json!(options.files)),
         "clients": options.clients,
         "payloads": applied(json!(options.payloads)),
@@ -1939,12 +1940,19 @@ fn provider_record(options: &Options) -> Result<()> {
     })
 }
 
-fn observability(options: &Options) -> Result<()> {
-    let obs_jobs = if options.section == "observability" && options.jobs == 1_000 {
+/// The Job count the observability section uses. Its default load is the
+/// provider-record one, so `--jobs 1000` (every other section's default)
+/// means `--jobs 100000` here.
+fn observability_jobs(options: &Options) -> usize {
+    if options.jobs == 1_000 {
         options.provider_jobs
     } else {
         options.jobs
-    };
+    }
+}
+
+fn observability(options: &Options) -> Result<()> {
+    let obs_jobs = observability_jobs(options);
     let storage_dir = options.directory.clone();
     let client_sizes = options.clients.clone();
     let iterations = options.iterations.max(10);
@@ -1953,9 +1961,9 @@ fn observability(options: &Options) -> Result<()> {
         use ntex::web::{self, App, HttpResponse, HttpServer};
         use ocg::openai_compatible::{ChatMessage, ChatToolCallWire};
         use ocg::persistence::{
-            NewAvailabilityStat, NewProviderAnswer, NewToolEvidence, RequestNumber,
-            Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolOutcome,
-            ToolPayload,
+            AgentBehavior, AgentConfig, NewAvailabilityStat, NewProviderAnswer, NewToolEvidence,
+            RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+            ToolOutcome, ToolPayload,
         };
         use ocg::provider_execution::{
             self, EnvironmentCredentialResolver, ProviderExecutionConfig,
@@ -2044,6 +2052,24 @@ fn observability(options: &Options) -> Result<()> {
             .run();
             let mock_finished = ntex::rt::spawn(mock.clone());
             let target = executor(&handle)?;
+            // Half the Jobs carry one Agent, so a usage summary filtered by
+            // it scans a table holding both Agent and Agent-less work.
+            let agent = block_on(handle.create_config(NewConfig {
+                name: "benchmark agent".into(),
+                body: ConfigBody::Agent(AgentConfig {
+                    instructions: Some("benchmark".into()),
+                    behavior: AgentBehavior::General,
+                    models: vec![target.configuration.llm_profile.into()],
+                    ..Default::default()
+                }),
+            }))?;
+            let agent_target = Target {
+                configuration: ExecutionConfiguration {
+                    agent_profile: Some(agent.into()),
+                    ..target.configuration
+                },
+                ..target
+            };
             let next = Arc::new(AtomicUsize::new(0));
             let durable_before = handle.durable_commits();
             let started = Instant::now();
@@ -2062,7 +2088,8 @@ fn observability(options: &Options) -> Result<()> {
                             break;
                         }
                         let began = Instant::now();
-                        let id = handle.create_job(job(&handle, target)).await?;
+                        let job_target = if index.is_multiple_of(2) { agent_target } else { target };
+                        let id = handle.create_job(job(&handle, job_target)).await?;
                         job_commits.push(began.elapsed());
 
                         let began = Instant::now();
@@ -2219,7 +2246,7 @@ fn observability(options: &Options) -> Result<()> {
                                     spawns: false,
                                 };
                                 let began = Instant::now();
-                                handle.record_tool_decision(evidence).await?;
+                                handle.bench_record_tool_decision(evidence).await?;
                                 tool_decide_commits.push(began.elapsed());
 
                                 let outcome = ToolOutcome::Completed {
@@ -2228,7 +2255,7 @@ fn observability(options: &Options) -> Result<()> {
                                     )),
                                 };
                                 let began = Instant::now();
-                                handle.record_tool_outcome(call_ref, outcome).await?;
+                                handle.bench_record_tool_outcome(call_ref, outcome).await?;
                                 tool_outcome_commits.push(began.elapsed());
 
                                 conversation.messages.push(ChatMessage::tool(
@@ -2297,13 +2324,42 @@ fn observability(options: &Options) -> Result<()> {
             })?;
             report("observability.tool_stats", &parameters, tool_stats_samples, Some(elapsed_tool_stats));
 
-            let filter = ocg::token_usage::UsageSummaryFilter::default();
+            let filter = ocg::persistence::UsageSummaryFilter::default();
+            // The unfiltered summary returns one row per (hour, Agent,
+            // Provider, model) key, which is also how many rows the scan
+            // examined when it finished.
+            let scanned = block_on(handle.usage_summary(filter.clone()))?;
+            let rows_scanned = scanned.rows.len();
             let (usage_samples, elapsed_usage) = measure(iterations, || {
                 Ok(block_on(handle.usage_summary(filter.clone()))?)
             })?;
             report("observability.usage_summary", &parameters, usage_samples, Some(elapsed_usage));
 
-            let filter_30d = ocg::token_usage::UsageSummaryFilter {
+            let agent_parameters = json!({
+                "jobs": obs_jobs,
+                "agent_jobs": obs_jobs.div_ceil(2),
+                "clients": clients,
+                "iterations": iterations,
+                "rows_scanned": rows_scanned,
+                "complete": scanned.complete,
+                "resume_from_us": scanned.resume_from_us,
+            });
+            let agent_filter = ocg::persistence::UsageSummaryFilter {
+                from_us: None,
+                until_us: None,
+                agent: Some(agent.get()),
+            };
+            let (usage_agent_samples, elapsed_agent_usage) = measure(iterations, || {
+                Ok(block_on(handle.usage_summary(agent_filter.clone()))?)
+            })?;
+            report(
+                "observability.usage_summary_agent",
+                &agent_parameters,
+                usage_agent_samples,
+                Some(elapsed_agent_usage),
+            );
+
+            let filter_30d = ocg::persistence::UsageSummaryFilter {
                 from_us: Some(1_700_000_000_000_000),
                 until_us: Some(1_700_000_000_000_000 + 2_592_000_000_000),
                 agent: None,
@@ -2313,7 +2369,7 @@ fn observability(options: &Options) -> Result<()> {
             })?;
             report("observability.usage_summary_30d", &parameters, usage_30d_samples, Some(elapsed_30d_usage));
 
-            let filter_1d = ocg::token_usage::UsageSummaryFilter {
+            let filter_1d = ocg::persistence::UsageSummaryFilter {
                 from_us: Some(1_700_000_000_000_000),
                 until_us: Some(1_700_000_000_000_000 + 86_400_000_000),
                 agent: None,
@@ -2348,6 +2404,7 @@ fn observability(options: &Options) -> Result<()> {
                     "database_bytes": database_bytes(&directory)?,
                     "write_elapsed_s": write_elapsed.as_secs_f64(),
                     "peak_memory_bytes": peak_memory_bytes(),
+                    "peak_memory_metric": "whole-process ru_maxrss, includes fixture setup and warmup",
                 })
             );
 
@@ -2356,13 +2413,15 @@ fn observability(options: &Options) -> Result<()> {
                 ("output_flush", commits.output_flush),
                 ("answer", commits.answer),
                 ("delivered", commits.delivered),
-                ("usage", commits.usage),
                 ("not_delivered", commits.not_delivered),
             ] {
                 if !samples.is_empty() {
                     report(&format!("observability.{kind}_commit"), &parameters, samples, None);
                 }
             }
+            // Each observe commit is one record_metrics call; its samples are
+            // reported as that command's latency.
+            report("observability.record_metrics", &parameters, commits.usage, None);
             report("observability.job_commit", &parameters, job_commits, None);
             report("observability.tool_decide_commit", &parameters, tool_decide_commits, None);
             report("observability.tool_outcome_commit", &parameters, tool_outcome_commits, None);
@@ -2386,7 +2445,7 @@ fn observability(options: &Options) -> Result<()> {
                         return Err(format!("mismatched total admitted tool calls: {total_admitted}").into());
                     }
                     let summary = block_on(
-                        reopened_handle.usage_summary(ocg::token_usage::UsageSummaryFilter::default())
+                        reopened_handle.usage_summary(ocg::persistence::UsageSummaryFilter::default())
                     )?;
                     let total_requests: u64 = summary.rows.iter().map(|r| r.requests).sum();
                     if total_requests != (obs_jobs * 3) as u64 {
@@ -2400,6 +2459,7 @@ fn observability(options: &Options) -> Result<()> {
                 "clients": clients,
                 "database_file_bytes": file_size,
                 "peak_memory_bytes": peak_memory,
+                "peak_memory_metric": "whole-process ru_maxrss, includes fixture setup and warmup",
             });
             report(
                 "observability.unclean_open",
@@ -2417,6 +2477,7 @@ fn observability(options: &Options) -> Result<()> {
                     "database_file_bytes": file_size,
                     "duration_ms": reopen_duration.as_secs_f64() * 1000.0,
                     "peak_memory_bytes": peak_memory,
+                    "peak_memory_metric": "whole-process ru_maxrss, includes fixture setup and warmup",
                 })
             );
 

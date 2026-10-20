@@ -784,14 +784,16 @@ impl Batch {
     }
 
     /// Appends an event to a request, as its next (gapless) one, and indexes
-    /// it by the Connection and Model its Job froze.
+    /// it by the Connection and Model its Job froze. The event is returned so
+    /// a caller that reduces the request right after can feed the reduction
+    /// without reading the table again.
     pub(crate) fn insert_request_event(
         &mut self,
         job: JobId,
         request: RequestNumber,
         observed_at: Timestamp,
         payload: RequestPayload,
-    ) -> Result<u32, BatchError> {
+    ) -> Result<RequestEventRecord, BatchError> {
         let row = self.require_job(job)?;
         let seq = self.step(|tx| {
             let events = tx.open_table(REQUEST_EVENTS)?;
@@ -840,17 +842,21 @@ impl Batch {
             }
             Ok(())
         })?;
-        Ok(seq)
+        Ok(event)
     }
 
+    /// The request's events as stored now, and its Token sample reduced from
+    /// them. The events are returned so the caller can reduce the request
+    /// again after appending to it, without a second read of the table.
     pub(crate) fn usage_sample(
         &mut self,
         job: JobId,
         request: RequestNumber,
-    ) -> Result<Option<crate::token_usage::TokenRequestSample>, BatchError> {
+    ) -> Result<(Option<crate::token_usage::TokenRequestSample>, Vec<RequestEventRecord>), BatchError>
+    {
         let row = self.require_job(job)?;
         let Some(execution) = &row.execution else {
-            return Ok(None);
+            return Ok((None, Vec::new()));
         };
         let target = Some(LlmTarget {
             llm_profile: execution.llm.model.id.into(),
@@ -869,18 +875,24 @@ impl Batch {
             Ok(events)
         })?;
         if events.is_empty() {
-            return Ok(None);
+            return Ok((None, events));
         }
-        let records = observations::metrics_of(job, &target, events);
-        Ok(crate::token_usage::TokenRequestSample::from_metrics(&records).ok().flatten())
+        let sample = observations::usage_sample_of(job, request, &target, &events);
+        Ok((sample, events))
     }
 
+    /// Replaces the request's usage bucket with the sample its events now
+    /// reduce to. `events` is what the first read returned and `inserted` the
+    /// events this transaction just appended; they are reduced as one list.
     pub(crate) fn update_usage_total(
         &mut self,
         job: JobId,
         request: RequestNumber,
         old_sample: Option<crate::token_usage::TokenRequestSample>,
+        mut events: Vec<RequestEventRecord>,
+        inserted: Vec<RequestEventRecord>,
     ) -> Result<(), BatchError> {
+        events.extend(inserted);
         let row = self.require_job(job)?;
         let Some(execution) = &row.execution else {
             return Ok(());
@@ -892,23 +904,10 @@ impl Batch {
             llm_profile: execution.llm.model.id.into(),
             frozen: execution.llm.clone(),
         });
-        let events = self.step(|tx| {
-            let table = tx.open_table(REQUEST_EVENTS)?;
-            let mut events = Vec::new();
-            for entry in table.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))? {
-                let (key, bytes) = entry?;
-                let (_, req, seq) = key.value();
-                if let Some(r) = RequestNumber::new(req) {
-                    events.push(decode_request_event(job, r, seq, bytes.value())?);
-                }
-            }
-            Ok(events)
-        })?;
         if events.is_empty() {
             return Ok(());
         }
-        let records = observations::metrics_of(job, &target, events);
-        let new_sample = crate::token_usage::TokenRequestSample::from_metrics(&records).ok().flatten();
+        let new_sample = observations::usage_sample_of(job, request, &target, &events);
 
         if old_sample == new_sample {
             return Ok(());

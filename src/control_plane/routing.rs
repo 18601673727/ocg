@@ -12,7 +12,7 @@ pub(super) enum Route {
         limit: usize,
     },
     Usage(dashboard::ObservationQuery),
-    UsageSummary(crate::token_usage::UsageSummaryFilter),
+    UsageSummary(crate::persistence::UsageSummaryFilter),
     ToolStats,
     Availability(dashboard::ObservationQuery),
     Logs(dashboard::LogQuery),

@@ -209,7 +209,6 @@ impl Command {
     pub(super) fn execute(
         self,
         database: &Database,
-        _shared: &Shared,
         operation: OperationId,
         commit: Commit,
     ) -> Executed {

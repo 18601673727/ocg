@@ -100,10 +100,7 @@ impl DatabaseHandle {
         let database_bytes = std::fs::metadata(&db_file).map(|m| m.len()).ok();
         let available_bytes = fs4::available_space(&self.shared.database_directory).ok();
 
-        let queue_counts = match self
-            .read(|database| Ok(storage::queue_counts(database)))
-            .await
-        {
+        let queue_counts = match self.read(storage::queue_counts).await {
             Ok(counts) => (Some(counts.0), Some(counts.1), Some(counts.2)),
             Err(error) => {
                 log::debug!("failed to read database vitals queue counts: {error}");
@@ -148,8 +145,8 @@ impl DatabaseHandle {
 
     pub async fn usage_summary(
         &self,
-        filter: crate::token_usage::UsageSummaryFilter,
-    ) -> Result<crate::token_usage::UsageSummaryResponse, DatabaseError> {
+        filter: crate::persistence::UsageSummaryFilter,
+    ) -> Result<crate::persistence::UsageSummaryResponse, DatabaseError> {
         self.read(move |database| storage::read_usage_summary(database, &filter)).await
     }
 
@@ -1279,7 +1276,7 @@ impl DatabaseHandle {
     /// execution path of the Job, while it executes it, may record it; a
     /// handler is invoked only once its admission is durable, which is when
     /// this returns `Ok`. See [`persistence::record_tool_decision`].
-    pub async fn record_tool_decision(
+    pub(crate) async fn record_tool_decision(
         &self,
         evidence: NewToolEvidence,
     ) -> Result<(), DatabaseError> {
@@ -1293,7 +1290,7 @@ impl DatabaseHandle {
     /// Records, once, what is known of an admitted call's execution. Only
     /// the trusted execution path of the Job, while it executes it, may
     /// record it.
-    pub async fn record_tool_outcome(
+    pub(crate) async fn record_tool_outcome(
         &self,
         call: ToolCallRef,
         outcome: ToolOutcome,
@@ -1304,6 +1301,27 @@ impl DatabaseHandle {
             reply,
         })
         .await
+    }
+
+    /// [`Self::record_tool_decision`] for the backend benchmark, which drives
+    /// the trusted execution path itself. Not part of the API.
+    #[doc(hidden)]
+    pub async fn bench_record_tool_decision(
+        &self,
+        evidence: NewToolEvidence,
+    ) -> Result<(), DatabaseError> {
+        self.record_tool_decision(evidence).await
+    }
+
+    /// [`Self::record_tool_outcome`] for the backend benchmark, which drives
+    /// the trusted execution path itself. Not part of the API.
+    #[doc(hidden)]
+    pub async fn bench_record_tool_outcome(
+        &self,
+        call: ToolCallRef,
+        outcome: ToolOutcome,
+    ) -> Result<(), DatabaseError> {
+        self.record_tool_outcome(call, outcome).await
     }
 
     /// Records, once, a verified conclusion about an admitted call whose

@@ -698,10 +698,11 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
             });
         }
     }
-    let old_sample = batch.usage_sample(metrics.job, metrics.request)?;
+    let (old_sample, events) = batch.usage_sample(metrics.job, metrics.request)?;
     let mut id = None;
+    let mut inserted = Vec::new();
     if !metrics.measurements.is_empty() {
-        let seq = batch.insert_request_event(
+        let event = batch.insert_request_event(
             metrics.job,
             metrics.request,
             metrics.observed_at,
@@ -709,10 +710,11 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
                 measurements: metrics.measurements,
             },
         )?;
-        id = Some(request_record_id(metrics.request, seq));
+        id = Some(request_record_id(event.request, event.seq));
+        inserted.push(event);
     }
     if let Some(token) = metrics.token {
-        let seq = batch.insert_request_event(
+        let event = batch.insert_request_event(
             metrics.job,
             metrics.request,
             metrics.observed_at,
@@ -721,9 +723,10 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
                 finality: token.finality,
             },
         )?;
-        id.get_or_insert(request_record_id(metrics.request, seq));
+        id.get_or_insert(request_record_id(event.request, event.seq));
+        inserted.push(event);
     }
-    batch.update_usage_total(metrics.job, metrics.request, old_sample)?;
+    batch.update_usage_total(metrics.job, metrics.request, old_sample, events, inserted)?;
     Ok(MetricsId::new(id.unwrap_or(0)))
 }
 
@@ -750,7 +753,7 @@ pub(crate) fn record_availability_stat(
             "records no response or failure",
         ));
     }
-    let seq = batch.insert_request_event(
+    let event = batch.insert_request_event(
         stat.job,
         stat.request,
         stat.observed_at,
@@ -762,7 +765,7 @@ pub(crate) fn record_availability_stat(
         },
     )?;
     Ok(AvailabilityStatId::new(request_record_id(
-        stat.request,
-        seq,
+        event.request,
+        event.seq,
     )))
 }

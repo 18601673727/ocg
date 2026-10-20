@@ -856,7 +856,7 @@ impl WriteWorker {
                 envelope.started.store(true, Ordering::SeqCst);
                 let mut ran = envelope
                     .command
-                    .execute(&opened.database, &shared, operation, commit);
+                    .execute(&opened.database, operation, commit);
                 failure = ran.failure.take();
                 executed.push((
                     ran,
@@ -886,7 +886,7 @@ impl WriteWorker {
         // transaction, and a group of them made all of theirs durable together.
         let commit_duration_us = commit_started.elapsed().as_micros() as u64;
         if !executed.is_empty() {
-            self.shared.durable_commits.fetch_add(1, Ordering::Relaxed);
+            self.shared.durable_commits.fetch_add(1, Ordering::SeqCst);
             self.shared.commit_us_total.fetch_add(commit_duration_us, Ordering::Relaxed);
             self.shared.commit_us_max.fetch_max(commit_duration_us, Ordering::Relaxed);
         }

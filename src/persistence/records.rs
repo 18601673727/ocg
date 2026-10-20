@@ -907,3 +907,56 @@ pub struct ExecutionPool {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
+
+/// Aggregated statistics of one tool's admissions and execution outcomes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolStatRecord {
+    pub name: String,
+    pub admitted: u64,
+    pub refused_arguments: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub duration_us_total: u64,
+    pub duration_us_max: u64,
+}
+
+/// The width of one usage summary bucket: one hour. A summary rounds its
+/// lower bound down to a bucket and its upper bound up, so the buckets it
+/// covers are those an instant in `[from_us, until_us)` falls in.
+pub const USAGE_SUMMARY_HOUR_MICROS: i64 = 3_600_000_000;
+
+/// One aggregated row in a token usage summary breakdown. `agent` is 0 for
+/// work submitted without an Agent; the route reports it as `profile:N` or
+/// `null`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageSummaryRow {
+    pub agent: u64,
+    pub provider: u64,
+    pub model: Option<String>,
+    pub requests: u64,
+    pub complete_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+}
+
+/// The aggregated token usage summary response. `complete` says the scan
+/// finished; `resume_from_us` is set exactly when it did not.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageSummaryResponse {
+    pub from_us: i64,
+    pub until_us: i64,
+    pub complete: bool,
+    pub resume_from_us: Option<i64>,
+    pub rows: Vec<UsageSummaryRow>,
+}
+
+/// Optional filters for querying usage summaries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageSummaryFilter {
+    pub from_us: Option<i64>,
+    pub until_us: Option<i64>,
+    pub agent: Option<u64>,
+}

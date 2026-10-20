@@ -212,6 +212,7 @@ pub(super) async fn open(
 struct Slot(Arc<Shared>);
 
 impl Slot {
+    // fetch_update is deprecated on 1.99; its replacement is newer than our MSRV.
     #[allow(deprecated)]
     fn take(shared: &Arc<Shared>) -> Result<Self, Refusal> {
         shared

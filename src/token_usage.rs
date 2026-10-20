@@ -391,39 +391,6 @@ impl TokenRequestSample {
     }
 }
 
-/// One aggregated row in a token usage summary breakdown.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UsageSummaryRow {
-    pub agent: u64,
-    pub provider: u64,
-    pub model: Option<String>,
-    pub requests: u64,
-    pub complete_requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
-    pub reasoning_tokens: u64,
-}
-
-/// The aggregated token usage summary response.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UsageSummaryResponse {
-    pub from_us: i64,
-    pub until_us: i64,
-    pub complete: bool,
-    pub resume_from_us: Option<i64>,
-    pub rows: Vec<UsageSummaryRow>,
-}
-
-/// Optional filters for querying usage summaries.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UsageSummaryFilter {
-    pub from_us: Option<i64>,
-    pub until_us: Option<i64>,
-    pub agent: Option<u64>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::RequestEligibility::{Eligible, Excluded};
