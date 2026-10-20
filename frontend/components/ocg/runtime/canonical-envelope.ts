@@ -22,7 +22,7 @@
 
 import type { ProjectId } from "../project/domain";
 import { CANONICAL_API_VERSION, ContractError, decodeExecutionState } from "../contracts";
-import type { CanonicalExecutionState, } from "../contracts";
+import type { CanonicalExecutionState } from "../contracts";
 import type { JobExecution } from "../execution/domain";
 import { assembleJobExecution } from "../execution/domain";
 import { isNonNegativeInteger, isRecord } from "@/lib/narrow";

@@ -200,9 +200,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.earlier.set(id, pageTurns(new Set(), undefined, page).next);
     } else if (held.size > 0 && page.has_more && !page.turns.some(turn => held.has(turn.job.id))) {
       const pageIds = new Set(page.turns.map(turn => turn.job.id));
+      const attachments = new Set<string>();
       for (const [jobId, turn] of this.turns) {
-        if (turn.sessionId === id && !pageIds.has(jobId) && !this.streams.has(jobId)) this.turns.delete(jobId);
+        if (turn.sessionId !== id || pageIds.has(jobId) || this.streams.has(jobId)) continue;
+        for (const imageId of turn.input.attachments) attachments.add(imageId);
+        this.turns.delete(jobId);
       }
+      for (const turn of this.turns.values()) {
+        for (const imageId of turn.input.attachments) attachments.delete(imageId);
+      }
+      for (const imageId of attachments) this.images.delete(imageId);
       this.earlier.set(id, pageTurns(new Set(), undefined, page).next);
     }
     this.tips.set(id, job);

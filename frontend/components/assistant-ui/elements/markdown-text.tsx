@@ -12,8 +12,7 @@ import { MarkdownBody } from "@/components/ocg/markdown/markdown-body";
  * The assistant-ui runtime hands this component the message part itself, so
  * `text` and the part's stream `status` are the inputs — not an implicit
  * context lookup. Rendering is delegated to the shared Chat Markdown pipeline
- * so an assistant message, a reasoning trace and a legacy Chat message all
- * parse identically.
+ * so an assistant message and a reasoning trace parse identically.
  */
 export type MarkdownTextProps = Pick<TextMessagePartProps, "text"> &
   Partial<Pick<TextMessagePartProps, "status">> & {

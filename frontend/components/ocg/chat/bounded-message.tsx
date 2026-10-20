@@ -12,9 +12,8 @@ import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./messa
  * reader scrolls up inside it.
  *
  * This is the single bounded-message presentation shared by every Chat
- * surface: the legacy ChatView rows and the assistant-ui Thread messages both
- * render through it, so long messages stay bounded and expandable on the
- * active surface too.
+ * surface: the assistant-ui Thread messages render through it, so long
+ * messages stay bounded and expandable on the active surface too.
  */
 export function BoundedMessage({ streaming, children }: { streaming: boolean; children: React.ReactNode }) {
   const { t } = useI18n();
