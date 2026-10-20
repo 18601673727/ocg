@@ -6,12 +6,12 @@ use crate::openai_compatible::ChatFinishReason;
 use crate::persistence::{
     AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
     ClaimRecord, CleanupKind, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, ContentDigest,
-    DependencyCondition, EffectConclusion, ExecutionOperation, JobId, JobOutputId, JobOutputRecord,
-    LlmParameters, LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason,
-    OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord,
-    Recorded, RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
-    SubmissionRecord, SuspensionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
-    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
+    EffectConclusion, ExecutionOperation, JobId, JobOutputId, JobOutputRecord, LlmParameters,
+    LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause,
+    OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord, Recorded,
+    RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
+    SubmissionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
     WithheldReason,
 };
 use crate::token_usage::{RequestEligibility, UsageFinality};
@@ -22,15 +22,8 @@ use crate::token_usage::{RequestEligibility, UsageFinality};
 pub(crate) struct JobRow {
     pub(crate) id: JobId,
     pub(crate) created_at: Timestamp,
-    pub(crate) eligible_at: Option<Timestamp>,
-    pub(crate) name: Option<String>,
     pub(crate) parent_id: Option<JobId>,
     pub(crate) kind: JobKind,
-    pub(crate) objective: Option<String>,
-    pub(crate) attachments: Vec<AttachmentId>,
-    pub(crate) dependencies: Vec<(JobId, DependencyCondition)>,
-    pub(crate) previous: Option<JobId>,
-    pub(crate) submission: Option<SubmissionKey>,
 }
 
 pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u64 {
@@ -39,42 +32,19 @@ pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u64 {
         JobKind::Turn {
             execution: TurnExecution::Frozen(execution),
             plan_source: PlanSource::Process { .. },
+            ..
         } => execution.agent_ref.map_or(0, |agent| agent.id.get()),
         JobKind::Turn { .. } => parent.map_or(0, |parent| usage_agent(parent, None)),
     }
 }
 
 impl JobRow {
-    pub(crate) fn waits_on(&self) -> impl Iterator<Item = (JobId, DependencyCondition)> + '_ {
-        self.dependencies.iter().copied().chain(
-            self.previous
-                .map(|previous| (previous, DependencyCondition::Settled)),
-        )
-    }
-
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);
         e.u64(self.id.get());
         e.job_kind(&self.kind);
         e.ts(self.created_at);
-        e.ots(self.eligible_at);
-        e.ostr(&self.name);
-        e.ou64(self.parent_id.map(|p| p.get()));
-        e.ostr(&self.objective);
-        e.u32(self.attachments.len() as u32);
-        for a in &self.attachments {
-            e.u64(a.get());
-        }
-        e.u32(self.dependencies.len() as u32);
-        for (d, cond) in &self.dependencies {
-            e.u64(d.get());
-            e.u8(match cond {
-                DependencyCondition::Success => 1,
-                DependencyCondition::Settled => 2,
-            });
-        }
-        e.ou64(self.previous.map(JobId::get));
-        e.opt(&self.submission, |e, s| e.0.extend_from_slice(s.as_bytes()));
+        e.ou64(self.parent_id.map(JobId::get));
         e.0
     }
 
@@ -83,51 +53,13 @@ impl JobRow {
         let id = JobId::new(d.u64()?);
         let kind = d.job_kind()?;
         let created_at = d.ts()?;
-        let eligible_at = d.ots()?;
-        let name = d.ostr()?;
         let parent_id = d.ou64()?.map(JobId::new);
-        let objective = d.ostr()?;
-        let att_len = d.u32()? as usize;
-        let mut attachments = Vec::with_capacity(att_len);
-        for _ in 0..att_len {
-            attachments.push(AttachmentId::new(d.u64()?));
-        }
-        let dep_len = d.u32()? as usize;
-        let mut dependencies = Vec::with_capacity(dep_len);
-        for _ in 0..dep_len {
-            let j = JobId::new(d.u64()?);
-            let c = match d.u8()? {
-                1 => DependencyCondition::Success,
-                2 => DependencyCondition::Settled,
-                code => {
-                    return Err(StorageError::corrupted(format!(
-                        "invalid dependency condition code {code}"
-                    )));
-                }
-            };
-            dependencies.push((j, c));
-        }
-        let previous = d.ou64()?.map(JobId::new);
-        let submission = d.opt(|d| {
-            let bytes = d.take(32)?;
-            let arr: [u8; 32] = bytes
-                .try_into()
-                .map_err(|_| StorageError::corrupted("invalid submission key"))?;
-            Ok(SubmissionKey::from_digest(arr))
-        })?;
         d.end()?;
         Ok(JobRow {
             id,
             created_at,
-            eligible_at,
-            name,
             parent_id,
             kind,
-            objective,
-            attachments,
-            dependencies,
-            previous,
-            submission,
         })
     }
 }
@@ -136,11 +68,9 @@ impl JobRow {
 pub(crate) struct JobStateRow {
     pub(crate) job_id: JobId,
     pub(crate) claim: Option<ClaimRecord>,
-    pub(crate) suspension: Option<SuspensionRecord>,
     pub(crate) outcome: Option<OutcomeRecord>,
     pub(crate) stop_confirmed_at: Option<Timestamp>,
     pub(crate) stop_confirmed_by: Option<StopProof>,
-    pub(crate) children_closed_at: Option<Timestamp>,
 }
 
 impl JobStateRow {
@@ -179,11 +109,6 @@ impl JobStateRow {
             e.ostr(&c.boot_id);
             e.u32(c.notice_seq);
         });
-        e.opt(&self.suspension, |e, s| {
-            e.ts(s.since);
-            e.u64(s.wait_generation);
-            e.u64(s.owner_epoch);
-        });
         e.opt(&self.outcome, |e, o| {
             e.u8(o.kind as u8);
             e.ts(o.at);
@@ -209,7 +134,6 @@ impl JobStateRow {
         });
         e.ots(self.stop_confirmed_at);
         e.opt(&self.stop_confirmed_by, |e, proof| e.u8(*proof as u8));
-        e.ots(self.children_closed_at);
         e.0
     }
 
@@ -240,13 +164,6 @@ impl JobStateRow {
                 host_id,
                 boot_id,
                 notice_seq,
-            })
-        })?;
-        let suspension = d.opt(|d| {
-            Ok(SuspensionRecord {
-                since: d.ts()?,
-                wait_generation: d.u64()?,
-                owner_epoch: d.u64()?,
             })
         })?;
         let outcome = d.opt(|d| {
@@ -286,16 +203,13 @@ impl JobStateRow {
                 _ => return Err(StorageError::corrupted("invalid stop proof")),
             })
         })?;
-        let children_closed_at = d.ots()?;
         d.end()?;
         Ok(JobStateRow {
             job_id,
             claim,
-            suspension,
             outcome,
             stop_confirmed_at,
             stop_confirmed_by,
-            children_closed_at,
         })
     }
 }
@@ -626,8 +540,14 @@ pub(crate) struct ConversationRow {
     pub(crate) hidden_at: Option<Timestamp>,
     pub(crate) on_hold: Option<u32>,
     pub(crate) loop_count: u8,
-    pub(crate) closed_by: Option<Actor>,
-    pub(crate) closed_running: bool,
+    pub(crate) closing: Option<Closing>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Closing {
+    pub(crate) at: Timestamp,
+    pub(crate) by: Actor,
+    pub(crate) running: bool,
 }
 
 impl ConversationRow {
@@ -637,8 +557,11 @@ impl ConversationRow {
         e.ots(self.hidden_at);
         e.ou32(self.on_hold);
         e.u8(self.loop_count);
-        e.opt(&self.closed_by, Enc::actor);
-        e.bool(self.closed_running);
+        e.opt(&self.closing, |e, closing| {
+            e.ts(closing.at);
+            e.actor(&closing.by);
+            e.bool(closing.running);
+        });
         e.0
     }
 
@@ -649,8 +572,13 @@ impl ConversationRow {
             hidden_at: d.ots()?,
             on_hold: d.ou32()?,
             loop_count: d.u8()?,
-            closed_by: d.opt(Dec::actor)?,
-            closed_running: d.bool()?,
+            closing: d.opt(|d| {
+                Ok(Closing {
+                    at: d.ts()?,
+                    by: d.actor()?,
+                    running: d.bool()?,
+                })
+            })?,
         };
         d.end()?;
         Ok(row)

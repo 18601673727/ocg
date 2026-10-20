@@ -444,10 +444,12 @@ impl Enc {
                 self.bool(*keep_open);
             }
             JobKind::Turn {
+                name,
                 execution,
                 plan_source,
             } => {
                 self.u8(1);
+                self.ostr(name);
                 match execution {
                     TurnExecution::Frozen(frozen) => {
                         self.u8(0);
@@ -459,11 +461,34 @@ impl Enc {
                     }
                 };
                 match plan_source {
-                    PlanSource::Stored => self.u8(0),
-                    PlanSource::Process { project, grant } => {
+                    PlanSource::Stored {
+                        previous,
+                        dependencies,
+                    } => {
+                        self.u8(0);
+                        self.ou64(previous.map(JobId::get));
+                        self.u32(dependencies.len() as u32);
+                        for (job, condition) in dependencies {
+                            self.u64(job.get());
+                            self.u8(condition.code());
+                        }
+                    }
+                    PlanSource::Process {
+                        project,
+                        grant,
+                        eligible_at,
+                        objective,
+                        attachments,
+                    } => {
                         self.u8(1);
                         self.ou64(project.map(ProjectId::get));
                         self.ostr(grant);
+                        self.ots(*eligible_at);
+                        self.ostr(objective);
+                        self.u32(attachments.len() as u32);
+                        for attachment in attachments {
+                            self.u64(attachment.get());
+                        }
                     }
                 }
             }
@@ -573,16 +598,39 @@ impl Dec<'_> {
                 keep_open: self.bool()?,
             },
             1 => JobKind::Turn {
+                name: self.ostr()?,
                 execution: match self.u8()? {
                     0 => TurnExecution::Frozen(self.frozen_execution()?),
                     1 => TurnExecution::Ref(JobId::new(self.u64()?)),
                     _ => return Err(StorageError::corrupted("invalid execution")),
                 },
                 plan_source: match self.u8()? {
-                    0 => PlanSource::Stored,
+                    0 => {
+                        let previous = self.ou64()?.map(JobId::new);
+                        let mut dependencies = Vec::new();
+                        for _ in 0..self.u32()? {
+                            dependencies.push((
+                                JobId::new(self.u64()?),
+                                self.code(DependencyCondition::from_code)?,
+                            ));
+                        }
+                        PlanSource::Stored {
+                            previous,
+                            dependencies,
+                        }
+                    }
                     1 => PlanSource::Process {
                         project: self.ou64()?.map(ProjectId::new),
                         grant: self.ostr()?,
+                        eligible_at: self.ots()?,
+                        objective: self.ostr()?,
+                        attachments: {
+                            let mut attachments = Vec::new();
+                            for _ in 0..self.u32()? {
+                                attachments.push(AttachmentId::new(self.u64()?));
+                            }
+                            attachments
+                        },
                     },
                     _ => return Err(StorageError::corrupted("invalid plan source")),
                 },

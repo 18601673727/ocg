@@ -383,8 +383,6 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
                 at: now,
                 cause: Some(OutcomeCause::Abandoned),
             });
-            state.children_closed_at.get_or_insert(now);
-            state.suspension = None;
             batch.put_job_state(state.job_id, &state)?;
             abandoned.push(state.job_id);
             unconfirmed.push(state);
@@ -518,7 +516,6 @@ mod tests {
                 eligible_at: None,
                 parent: database.genesis(),
                 project: None,
-                dependencies: Vec::new(),
                 input: JobInputDraft::default(),
                 configuration: Some(execution_configuration(&database)),
                 previous: None,
@@ -529,11 +526,8 @@ mod tests {
                 ..spec.clone()
             }))
             .expect("child");
-            let waiter = wait(database.create_job(NewJob {
-                dependencies: Vec::new(),
-                ..spec.clone()
-            }))
-            .expect("blocked root");
+            let waiter =
+                wait(database.create_job(NewJob { ..spec.clone() })).expect("blocked root");
             let delayed = wait(database.create_job(NewJob {
                 eligible_at: Some(Timestamp::from_unix_micros(
                     Timestamp::now().as_unix_micros() + 3_600_000_000,

@@ -21,6 +21,15 @@ fn read_job_row(rx: &ReadTransaction, id: JobId) -> Result<Option<JobRow>, Stora
         .transpose()
 }
 
+fn read_conversation(rx: &ReadTransaction, id: JobId) -> Result<ConversationRow, StorageError> {
+    Ok(rx
+        .open_table(CONVERSATIONS)?
+        .get(id.get())?
+        .map(|bytes| ConversationRow::decode(bytes.value()))
+        .transpose()?
+        .unwrap_or_default())
+}
+
 fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobStateRow, StorageError> {
     rx.open_table(JOB_STATES)?
         .get(id.get())?
@@ -36,6 +45,7 @@ pub(super) fn turn_execution(
     let JobKind::Turn {
         execution,
         plan_source,
+        ..
     } = &row.kind
     else {
         return Err(StorageError::corrupted("expected a turn"));
@@ -64,7 +74,7 @@ pub(super) fn turn_execution(
         PlanSource::Process { project, .. } => {
             (*project, execution.agent_ref.map(|agent| agent.id))
         }
-        PlanSource::Stored => {
+        PlanSource::Stored { .. } => {
             let conversation = row
                 .parent_id
                 .ok_or_else(|| StorageError::corrupted("stored turn has no conversation"))?;
@@ -115,10 +125,14 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
     .flatten()
     .max()
     .unwrap_or(row.created_at);
+    let children_closed_at = if row.kind.is_conversation() {
+        read_conversation(rx, id)?.closing.map(|closing| closing.at)
+    } else {
+        state.outcome.as_ref().map(|outcome| outcome.at)
+    };
     Ok(JobRecord {
         id,
-        name: row.name,
-        eligible_at: row.eligible_at,
+        name: row.kind.name().map(str::to_owned),
         started_at: state.claim.as_ref().map(|claim| claim.started_at),
         completed_at: at(OutcomeKind::Completed),
         failed_at: at(OutcomeKind::Failed),
@@ -132,18 +146,14 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
         parent: row.parent_id.unwrap_or(JobId::new(0)),
         parent_id: row.parent_id,
         conversation: row.kind.is_stored().then_some(row.parent_id).flatten(),
-        kind: row.kind,
-        objective: row.objective,
-        attachments: row.attachments,
-        dependencies: row.dependencies,
-        submission: row.submission,
+        objective: row.kind.objective().map(str::to_owned),
         configuration,
         assigned_executor: state.claim.as_ref().map(|claim| claim.pool_id.into()),
-        previous: row.previous,
+        previous: row.kind.previous(),
         claim: state.claim,
-        suspension: state.suspension,
         outcome: state.outcome,
-        children_closed_at: state.children_closed_at,
+        children_closed_at,
+        kind: row.kind,
         subtree_settled,
     })
 }
@@ -378,12 +388,12 @@ fn input_of(rx: &ReadTransaction, row: JobRow) -> Result<JobInputRecord, Storage
     };
     Ok(JobInputRecord {
         id: JobInputId::new(row.id.get()),
-        objective: row.objective,
+        objective: row.kind.objective().map(str::to_owned),
         submitted_at: Some(row.created_at),
         created_at: row.created_at,
         updated_at: row.created_at,
         configuration: execution,
-        attachments: row.attachments,
+        attachments: row.kind.attachments().to_vec(),
     })
 }
 
@@ -965,7 +975,7 @@ fn conversation_summary(
         title,
         state: if state.outcome.is_some() {
             "settled"
-        } else if state.children_closed_at.is_some() {
+        } else if metadata.closing.is_some() {
             "closing"
         } else {
             "open"
@@ -1339,7 +1349,7 @@ pub(crate) fn read_conversation_turns(
     let mut cursor = match before {
         Some(before) => read_job_row(&rx, before)?
             .filter(|row| row.parent_id == Some(conversation) && row.kind.is_stored())
-            .and_then(|row| row.previous),
+            .and_then(|row| row.kind.previous()),
         None => rx
             .open_table(TIPS)?
             .get(conversation.get())?
@@ -1352,7 +1362,7 @@ pub(crate) fn read_conversation_turns(
         }
         let row =
             read_job_row(&rx, turn)?.ok_or_else(|| StorageError::corrupted("missing turn"))?;
-        cursor = row.previous;
+        cursor = row.kind.previous();
         turns.push(job_record(&rx, row)?);
     }
     Ok(turns)
@@ -1523,7 +1533,7 @@ pub(crate) fn read_turn_context(
                 .or((first != turn).then_some(first)),
             Some((first, _)) if id != first => Some(first),
             Some(_) => None,
-            None => row.previous,
+            None => row.kind.previous(),
         };
         context.turns.push(ContextTurn {
             turn: id,
@@ -1536,7 +1546,7 @@ pub(crate) fn read_turn_context(
     if let Some(conversation) = row.parent_id.filter(|_| row.kind.is_stored()) {
         let state = read_state(&rx, turn)?;
         let through = state.claim.map_or(0, |claim| claim.notice_seq);
-        let mut previous = row.previous;
+        let mut previous = row.kind.previous();
         let mut after = 0;
         while let Some(id) = previous {
             if let Some(claim) = read_state(&rx, id)?.claim {
@@ -1545,7 +1555,8 @@ pub(crate) fn read_turn_context(
             }
             previous = read_job_row(&rx, id)?
                 .ok_or_else(|| StorageError::corrupted("previous turn missing"))?
-                .previous;
+                .kind
+                .previous();
         }
         let mut status_rows = Vec::new();
         let mut live = vec![conversation];
@@ -1558,14 +1569,10 @@ pub(crate) fn read_turn_context(
                 .range((parent.get(), 0)..=(parent.get(), u64::MAX))?
             {
                 let child = JobId::new(entry?.0.value().1);
-                let state = read_state(&rx, child)?;
+                let closing = read_conversation(&rx, child)?.closing;
                 status_rows.push(format!(
                     "{child}: {}",
-                    if state.children_closed_at.is_some() {
-                        "closing"
-                    } else {
-                        "open"
-                    }
+                    if closing.is_some() { "closing" } else { "open" }
                 ));
                 live.push(child);
             }

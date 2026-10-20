@@ -1007,7 +1007,6 @@ mod tests {
                     eligible_at: None,
                     parent: handle.genesis(),
                     project: None,
-                    dependencies: Vec::new(),
                     input: JobInputDraft {
                         objective: Some("Hold the old model".to_owned()),
                         ..JobInputDraft::default()
@@ -1413,7 +1412,6 @@ mod reasoning_parameter_tests {
                     eligible_at: None,
                     parent: handle.genesis(),
                     project: None,
-                    dependencies: vec![],
                     input: JobInputDraft::default(),
                     previous: None,
                     configuration: Some(ExecutionConfiguration {

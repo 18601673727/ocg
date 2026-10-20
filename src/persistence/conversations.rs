@@ -33,10 +33,16 @@ pub enum TurnExecution {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanSource {
-    Stored,
+    Stored {
+        previous: Option<JobId>,
+        dependencies: Vec<(JobId, DependencyCondition)>,
+    },
     Process {
         project: Option<ProjectId>,
         grant: Option<String>,
+        eligible_at: Option<Timestamp>,
+        objective: Option<String>,
+        attachments: Vec<AttachmentId>,
     },
 }
 
@@ -50,6 +56,7 @@ pub enum JobKind {
         keep_open: bool,
     },
     Turn {
+        name: Option<String>,
         execution: TurnExecution,
         plan_source: PlanSource,
     },
@@ -63,9 +70,86 @@ impl JobKind {
         matches!(
             self,
             Self::Turn {
-                plan_source: PlanSource::Stored,
+                plan_source: PlanSource::Stored { .. },
                 ..
             }
+        )
+    }
+    pub fn previous(&self) -> Option<JobId> {
+        match self {
+            Self::Turn {
+                plan_source: PlanSource::Stored { previous, .. },
+                ..
+            } => *previous,
+            Self::Conversation { .. }
+            | Self::Turn {
+                plan_source: PlanSource::Process { .. },
+                ..
+            } => None,
+        }
+    }
+    pub fn dependencies(&self) -> &[(JobId, DependencyCondition)] {
+        match self {
+            Self::Turn {
+                plan_source: PlanSource::Stored { dependencies, .. },
+                ..
+            } => dependencies,
+            Self::Conversation { .. }
+            | Self::Turn {
+                plan_source: PlanSource::Process { .. },
+                ..
+            } => &[],
+        }
+    }
+    pub fn eligible_at(&self) -> Option<Timestamp> {
+        match self {
+            Self::Turn {
+                plan_source: PlanSource::Process { eligible_at, .. },
+                ..
+            } => *eligible_at,
+            Self::Conversation { .. }
+            | Self::Turn {
+                plan_source: PlanSource::Stored { .. },
+                ..
+            } => None,
+        }
+    }
+    pub fn objective(&self) -> Option<&str> {
+        match self {
+            Self::Turn {
+                plan_source: PlanSource::Process { objective, .. },
+                ..
+            } => objective.as_deref(),
+            Self::Conversation { .. }
+            | Self::Turn {
+                plan_source: PlanSource::Stored { .. },
+                ..
+            } => None,
+        }
+    }
+    pub fn attachments(&self) -> &[AttachmentId] {
+        match self {
+            Self::Turn {
+                plan_source: PlanSource::Process { attachments, .. },
+                ..
+            } => attachments,
+            Self::Conversation { .. }
+            | Self::Turn {
+                plan_source: PlanSource::Stored { .. },
+                ..
+            } => &[],
+        }
+    }
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Turn { name, .. } => name.as_deref(),
+            Self::Conversation { .. } => None,
+        }
+    }
+    pub(crate) fn waits_on(&self) -> impl Iterator<Item = (JobId, DependencyCondition)> + '_ {
+        self.dependencies().iter().copied().chain(
+            self.previous()
+                .map(|previous| (previous, DependencyCondition::Settled)),
         )
     }
 }

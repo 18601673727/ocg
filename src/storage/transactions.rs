@@ -81,7 +81,6 @@ impl Batch {
         let job = JobId::new(self.next_id(Sequence::Job)?);
         spec.id = job;
         spec.created_at = self.now;
-        spec.submission = submission.map(|(key, _)| key);
         self.insert_job(&spec)?;
         self.probe = Some(Probe::Job(job));
         self.put_job_state(job, &JobStateRow::new(job))?;
@@ -93,7 +92,7 @@ impl Batch {
             }
             Ok(())
         })?;
-        for (dependency, condition) in spec.waits_on() {
+        for (dependency, condition) in spec.kind.waits_on() {
             if !self.is_subtree_settled(dependency)? {
                 open_dependencies += 1;
                 self.step(|tx| {
@@ -118,11 +117,11 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(CHILDREN)?
                 .insert((parent_key, job.get()), ())?;
-            for attachment in &spec.attachments {
+            for attachment in spec.kind.attachments() {
                 tx.open_table(ATTACHMENT_REFS)?
                     .insert((attachment.get(), job.get()), ())?;
             }
-            if let Some(previous) = spec.previous {
+            if let Some(previous) = spec.kind.previous() {
                 tx.open_table(SUCCESSORS)?
                     .insert(previous.get(), job.get())?;
             }
@@ -133,7 +132,7 @@ impl Batch {
         {
             self.step(|tx| {
                 tx.open_table(TIPS)?.insert(conversation.get(), job.get())?;
-                if let Some(previous) = spec.previous {
+                if let Some(previous) = spec.kind.previous() {
                     tx.open_table(RECENT)?
                         .remove((previous.get(), conversation.get()))?;
                 }
@@ -165,8 +164,8 @@ impl Batch {
     /// appends can keep their source transaction and fall back to a notice.
     pub(crate) fn validate_spec(&mut self, spec: &JobRow) -> Result<(), BatchError> {
         self.check_spec_references(spec)?;
-        for (dependency, _) in &spec.dependencies {
-            if Some(*dependency) == spec.previous {
+        for (dependency, _) in spec.kind.dependencies() {
+            if Some(*dependency) == spec.kind.previous() {
                 continue;
             }
             let sibling = self.require_job(*dependency)?;
@@ -190,12 +189,12 @@ impl Batch {
         }
         if let Some(parent) = spec.parent_id {
             let state = self.require_job_state(parent)?;
-            if state.outcome.is_some() || state.children_closed_at.is_some() {
+            if state.outcome.is_some() || self.conversation(parent)?.closing.is_some() {
                 return self.reject(Violation::ParentClosed(parent));
             }
         }
         let mut previous = None;
-        for (dependency, condition) in spec.waits_on() {
+        for (dependency, condition) in spec.kind.waits_on() {
             if previous.is_some_and(|previous| dependency <= previous) {
                 return self.reject(Violation::InvalidValue(
                     "dependencies",
@@ -218,21 +217,21 @@ impl Batch {
                 }
             }
         }
-        for attachment in &spec.attachments {
+        for attachment in spec.kind.attachments() {
             if !self.require_attachment(*attachment)?.is_available() {
                 return self.reject(Violation::AttachmentCleanedUp(*attachment));
             }
         }
         if spec.kind.is_stored()
             && let Some(conversation) = spec.parent_id
-            && self.tip(conversation)? != spec.previous
+            && self.tip(conversation)? != spec.kind.previous()
         {
             return self.reject(Violation::InvalidValue(
                 "previous",
                 "must be the tip at creation",
             ));
         }
-        if let Some(previous) = spec.previous {
+        if let Some(previous) = spec.kind.previous() {
             let prior = self.require_job(previous)?;
             if prior.parent_id != spec.parent_id || !prior.kind.is_stored() {
                 return self.reject(Violation::InvalidValue(
@@ -402,7 +401,7 @@ impl Batch {
         {
             return Ok(());
         }
-        let eligible_at = row.eligible_at.map(Timestamp::as_unix_micros);
+        let eligible_at = row.kind.eligible_at().map(Timestamp::as_unix_micros);
         let clock = open::promotion_clock();
         self.touched_ready_or_delayed = true;
         self.step(|tx| {
@@ -624,7 +623,7 @@ impl Batch {
                 .get((requirement_key, job.get()))?
                 .is_some();
             let mut delayed = None;
-            if let Some(eligible_at) = row.eligible_at.map(Timestamp::as_unix_micros)
+            if let Some(eligible_at) = row.kind.eligible_at().map(Timestamp::as_unix_micros)
                 && tx
                     .open_table(DELAYED)?
                     .get((eligible_at, job.get()))?
@@ -704,7 +703,7 @@ impl Batch {
     }
 
     fn first_open_dependency(&mut self, row: &JobRow) -> Result<Option<JobId>, BatchError> {
-        for (dependency, _) in row.waits_on() {
+        for (dependency, _) in row.kind.waits_on() {
             if !self.is_subtree_settled(dependency)? {
                 return Ok(Some(dependency));
             }
@@ -935,7 +934,12 @@ impl Batch {
         } else if row.kind.is_stored()
             && let Some(conversation) = row.parent_id
         {
-            if cause.is_none() && self.conversation(conversation)?.closed_running {
+            if cause.is_none()
+                && self
+                    .conversation(conversation)?
+                    .closing
+                    .is_some_and(|closing| closing.running)
+            {
                 cause = Some(OutcomeCause::Closed);
             }
             if matches!(
@@ -990,7 +994,6 @@ impl Batch {
             at: self.now,
             cause,
         });
-        state.children_closed_at.get_or_insert(self.now);
         let mut appended = None;
         if let Some(result) = result
             && kind != OutcomeKind::Unknown
@@ -1099,12 +1102,12 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(PENDING)?.remove(job.get())?;
             tx.open_table(READY)?.remove((requirement_key, job.get()))?;
-            if let Some(eligible_at) = row.eligible_at {
+            if let Some(eligible_at) = row.kind.eligible_at() {
                 tx.open_table(DELAYED)?
                     .remove((eligible_at.as_unix_micros(), job.get()))?;
             }
             let mut waiters = tx.open_table(DEPENDENCY_WAITERS)?;
-            for (dependency, _) in row.waits_on() {
+            for (dependency, _) in row.kind.waits_on() {
                 waiters.remove((dependency.get(), job.get()))?;
             }
             let mut unsettled = tx.open_table(UNSETTLED)?;
@@ -1190,7 +1193,6 @@ impl Batch {
                         at: self.now,
                         cause: Some(OutcomeCause::DependencyImpossible),
                     });
-                    cancelled.children_closed_at.get_or_insert(self.now);
                     self.put_job_state(waiter, &cancelled)?;
                     self.cancel_pending_writes(waiter)?;
                     work.push(waiter);

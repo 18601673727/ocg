@@ -68,7 +68,6 @@ pub struct NewJob {
     pub project: Option<ProjectId>,
     /// The CLI grant stored with a Process plan. Stored turns use the frozen Agent.
     pub process_grant: Option<String>,
-    pub dependencies: Vec<(JobId, DependencyCondition)>,
     pub input: JobInputDraft,
     /// Present for an LLM execution child; absent for orchestrating or
     /// system work.

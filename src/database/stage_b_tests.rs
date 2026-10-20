@@ -62,7 +62,6 @@ fn pending(database: &DatabaseHandle, llm: ProfileId) -> JobId {
         eligible_at: None,
         parent: database.genesis(),
         project: None,
-        dependencies: Vec::new(),
         input: JobInputDraft::default(),
         configuration: Some(ExecutionConfiguration {
             agent_profile: None,
@@ -400,7 +399,6 @@ fn local_job_with_a_spawning_call(
             eligible_at: None,
             parent: database.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: None,

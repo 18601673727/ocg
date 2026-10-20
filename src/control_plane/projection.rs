@@ -362,7 +362,6 @@ mod tests {
             eligible_at: None,
             parent: handle.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: crate::persistence::JobInputDraft {
                 objective: Some("Ready Job".to_owned()),
                 ..Default::default()

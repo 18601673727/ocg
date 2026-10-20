@@ -1,3 +1,4 @@
+use super::rows::Closing;
 use super::*;
 use crate::persistence::{
     ExecutionConfiguration, NewSubmission, OutcomeCause, OutcomeKind, OutcomeRecord, Violation,
@@ -135,8 +136,6 @@ impl Batch {
             JobRow {
                 id: JobId::new(0),
                 created_at: self.now,
-                eligible_at: None,
-                name: None,
                 parent_id: parent,
                 kind: JobKind::Conversation {
                     agent: spec.agent,
@@ -144,11 +143,6 @@ impl Batch {
                     origin: spec.origin,
                     keep_open: spec.keep_open,
                 },
-                objective: None,
-                attachments: Vec::new(),
-                dependencies: Vec::new(),
-                previous: None,
-                submission: None,
             },
         )?;
         self.insert_conversation(conversation, &ConversationRow::default())?;
@@ -349,7 +343,7 @@ impl Batch {
             ));
         }
         let state = self.require_job_state(conversation)?;
-        if state.children_closed_at.is_some() {
+        if self.conversation(conversation)?.closing.is_some() {
             if event {
                 return self.attention_fallback(conversation, entry);
             }
@@ -430,18 +424,15 @@ impl Batch {
             let spec = JobRow {
                 id: JobId::new(0),
                 created_at: self.now,
-                eligible_at: None,
-                name,
                 parent_id: Some(conversation),
                 kind: JobKind::Turn {
+                    name,
                     execution,
-                    plan_source: PlanSource::Stored,
+                    plan_source: PlanSource::Stored {
+                        previous: tip,
+                        dependencies,
+                    },
                 },
-                objective: None,
-                attachments: Vec::new(),
-                dependencies,
-                previous: tip,
-                submission: None,
             };
             self.event_append = event;
             let validation = if event {
@@ -586,11 +577,7 @@ impl Batch {
         by: Actor,
     ) -> Result<ConversationAction, BatchError> {
         self.require_user_conversation(conversation)?;
-        if self
-            .require_job_state(conversation)?
-            .children_closed_at
-            .is_some()
-        {
+        if self.conversation(conversation)?.closing.is_some() {
             return Ok(ConversationAction {
                 conversation,
                 record_seq: None,
@@ -602,24 +589,27 @@ impl Batch {
         let mut running = Vec::new();
         let mut notified = Vec::new();
         for current in &subtree {
-            let mut state = self.require_job_state(*current)?;
-            if state.children_closed_at.is_some() {
+            let mut row = self.conversation(*current)?;
+            if row.closing.is_some() {
                 continue;
             }
             notified.push(*current);
-            state.children_closed_at = Some(self.now);
-            self.put_job_state(*current, &state)?;
-            let mut row = self.conversation(*current)?;
-            row.closed_by.get_or_insert(by.clone());
+            let active = self.active_turn(*current)?;
+            let active = match active {
+                Some(active) if self.require_job_state(active)?.outcome.is_none() => Some(active),
+                Some(_) | None => None,
+            };
+            row.closing = Some(Closing {
+                at: self.now,
+                by: by.clone(),
+                running: active.is_some(),
+            });
+            self.insert_conversation(*current, &row)?;
+            if let Some(active) = active {
+                running.push(active);
+            }
             if let Some(tip) = self.tip(*current)? {
                 let tip_state = self.require_job_state(tip)?;
-                if let Some(active) = self.active_turn(*current)?
-                    && self.require_job_state(active)?.outcome.is_none()
-                {
-                    row.closed_running = true;
-                    running.push(active);
-                }
-                self.insert_conversation(*current, &row)?;
                 if tip_state.claim.is_none() && tip_state.outcome.is_none() {
                     self.finalize(
                         tip,
@@ -629,8 +619,6 @@ impl Batch {
                         false,
                     )?;
                 }
-            } else {
-                self.insert_conversation(*current, &row)?;
             }
             self.halt_recurrence(*current, RecurrenceHalt::Closed)?;
             // K3 voids undecided approvals and questions here.
@@ -719,7 +707,7 @@ impl Batch {
                         transactions::execution_requirement(&self.turn_execution(&turn)?.0);
                     self.step(|tx| {
                         tx.open_table(READY)?.remove((requirement, tip.get()))?;
-                        if let Some(at) = turn.eligible_at {
+                        if let Some(at) = turn.kind.eligible_at() {
                             tx.open_table(DELAYED)?
                                 .remove((at.as_unix_micros(), tip.get()))?;
                         }
@@ -810,10 +798,7 @@ impl Batch {
                     ..
                 }
             )
-            || self
-                .require_job_state(conversation)?
-                .children_closed_at
-                .is_some()
+            || self.conversation(conversation)?.closing.is_some()
         {
             return Ok(false);
         }
@@ -835,11 +820,12 @@ impl Batch {
             return Ok(false);
         }
         // K3 checks for undecided approvals and questions here.
-        let mut state = self.require_job_state(conversation)?;
-        state.children_closed_at = Some(self.now);
-        self.put_job_state(conversation, &state)?;
         let mut row = self.conversation(conversation)?;
-        row.closed_by = Some(Actor::Auto);
+        row.closing = Some(Closing {
+            at: self.now,
+            by: Actor::Auto,
+            running: false,
+        });
         self.insert_conversation(conversation, &row)?;
         self.settle(conversation)?;
         self.notify(conversation, NoticeEvent::ClosedSelf, tip)?;
@@ -876,10 +862,10 @@ impl Batch {
     }
     pub(crate) fn settle_conversation(&mut self, conversation: JobId) -> Result<(), BatchError> {
         let mut state = self.require_job_state(conversation)?;
-        if state.children_closed_at.is_none() || state.outcome.is_some() {
+        let row = self.conversation(conversation)?;
+        if row.closing.is_none() || state.outcome.is_some() {
             return Ok(());
         }
-        let row = self.conversation(conversation)?;
         let tip = self.tip(conversation)?;
         let tip_closed = match tip {
             Some(tip) => self
@@ -899,7 +885,7 @@ impl Batch {
             Some(turn) => self.require_job_state(JobId::new(turn))?.outcome,
             None => None,
         };
-        let outcome = if row.closed_running || tip_closed {
+        let outcome = if row.closing.is_some_and(|closing| closing.running) || tip_closed {
             None
         } else {
             outcome
@@ -927,7 +913,8 @@ mod tests {
     use super::*;
     use crate::database::{DatabaseHandle, DatabaseWorker};
     use crate::persistence::{
-        ExecutionConfiguration, NewExecutor, NewSubmission, RequestFingerprint, ToolCallRef,
+        ClaimRecord, ExecutionConfiguration, NewExecutor, NewSubmission, RequestFingerprint,
+        ToolCallRef,
     };
     use crate::test_support::{data_directory, execution_configuration, wait};
     use std::num::NonZeroU32;
@@ -1111,15 +1098,26 @@ mod tests {
                     keep_open: false,
                 },
                 JobKind::Turn {
+                    name: Some("process".into()),
                     execution: TurnExecution::Frozen(configuration),
                     plan_source: PlanSource::Process {
                         project: Some(ProjectId::new(2)),
                         grant: Some("read".into()),
+                        eligible_at: Some(Timestamp::from_unix_micros(123)),
+                        objective: Some("objective".into()),
+                        attachments: vec![AttachmentId::new(4), AttachmentId::new(3)],
                     },
                 },
                 JobKind::Turn {
+                    name: Some("stored".into()),
                     execution: TurnExecution::Ref(first),
-                    plan_source: PlanSource::Stored,
+                    plan_source: PlanSource::Stored {
+                        previous: Some(first),
+                        dependencies: vec![
+                            (JobId::new(1), DependencyCondition::Success),
+                            (JobId::new(2), DependencyCondition::Settled),
+                        ],
+                    },
                 },
             ];
             for kind in kinds {
@@ -1127,16 +1125,53 @@ mod tests {
                     id: first,
                     kind,
                     created_at: Timestamp::now(),
-                    eligible_at: None,
-                    name: None,
                     parent_id: Some(conversation),
-                    objective: None,
-                    attachments: Vec::new(),
-                    dependencies: Vec::new(),
-                    previous: None,
-                    submission: None,
                 };
                 assert_eq!(JobRow::decode(&row.encode())?, row);
+            }
+            let at = Timestamp::from_unix_micros(456);
+            let state = JobStateRow {
+                job_id: first,
+                claim: Some(ClaimRecord {
+                    started_at: at,
+                    pool_id: ConfigId::new(3),
+                    pool_edit_seq: 2,
+                    capabilities: BTreeSet::from([(
+                        ExecutionOperation::LlmRequest,
+                        Some(LlmTransport::OpenAiChatCompletions),
+                    )]),
+                    epoch: 7,
+                    host_id: Some("host".into()),
+                    boot_id: Some("boot".into()),
+                    notice_seq: 5,
+                }),
+                outcome: Some(OutcomeRecord {
+                    kind: OutcomeKind::Unknown,
+                    at,
+                    cause: Some(OutcomeCause::Closed),
+                }),
+                stop_confirmed_at: Some(at),
+                stop_confirmed_by: Some(StopProof::Proof),
+            };
+            for state in [JobStateRow::new(first), state] {
+                assert_eq!(JobStateRow::decode(&state.encode())?, state);
+            }
+            for closing in [
+                None,
+                Some(Closing {
+                    at,
+                    by: Actor::User,
+                    running: true,
+                }),
+            ] {
+                let row = ConversationRow {
+                    title: Some("title".into()),
+                    hidden_at: Some(at),
+                    on_hold: Some(2),
+                    loop_count: 3,
+                    closing,
+                };
+                assert_eq!(ConversationRow::decode(&row.encode())?, row);
             }
             let call = ToolCallRef {
                 job: first,
@@ -1172,10 +1207,13 @@ mod tests {
             let outcome = run_batch_with(database, 1, Commit::Durable, |batch| {
                 let mut row = batch.require_job(second)?;
                 row.kind = JobKind::Turn {
+                    name: None,
                     execution: TurnExecution::Ref(second),
-                    plan_source: PlanSource::Stored,
+                    plan_source: PlanSource::Stored {
+                        previous: Some(second),
+                        dependencies: Vec::new(),
+                    },
                 };
-                row.previous = Some(second);
                 batch.t1_submit(None, row)
             });
             assert!(matches!(outcome.result, Err(BatchFailure::Rejected(_))));
@@ -1393,7 +1431,6 @@ mod tests {
             eligible_at: None,
             parent: conversation,
             project: None,
-            dependencies: vec![],
             input: Default::default(),
             configuration: Some(fixture.configuration),
             previous: None,
@@ -1650,7 +1687,6 @@ mod tests {
             eligible_at: None,
             parent: fixture.database.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: Default::default(),
             configuration: Some(fixture.configuration),
             previous: None,

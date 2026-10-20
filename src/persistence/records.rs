@@ -6,7 +6,6 @@ use super::*;
 pub struct JobRecord {
     pub id: JobId,
     pub name: Option<String>,
-    pub eligible_at: Option<Timestamp>,
     /// When the Job's claim was made.
     pub started_at: Option<Timestamp>,
     pub completed_at: Option<Timestamp>,
@@ -28,16 +27,12 @@ pub struct JobRecord {
     pub kind: JobKind,
     pub conversation: Option<JobId>,
     pub objective: Option<String>,
-    pub attachments: Vec<AttachmentId>,
-    pub dependencies: Vec<(JobId, DependencyCondition)>,
-    pub submission: Option<SubmissionKey>,
     /// The Agent and Model configs the Job was submitted with, as provenance.
     pub configuration: Option<ExecutionConfiguration>,
     /// The Pool the Job was claimed into.
     pub assigned_executor: Option<ExecutorId>,
     pub previous: Option<JobId>,
     pub claim: Option<ClaimRecord>,
-    pub suspension: Option<SuspensionRecord>,
     pub outcome: Option<OutcomeRecord>,
     pub children_closed_at: Option<Timestamp>,
     /// Whether the Job has no `unsettled` row: it and every Job below it
@@ -102,24 +97,6 @@ pub struct ClaimRecord {
     pub host_id: Option<String>,
     pub boot_id: Option<String>,
     pub notice_seq: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SuspensionRecord {
-    pub since: Timestamp,
-    pub wait_generation: u64,
-    pub owner_epoch: u64,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct JobStateRecord {
-    pub job_id: JobId,
-    pub claim: Option<ClaimRecord>,
-    pub suspension: Option<SuspensionRecord>,
-    pub outcome: Option<OutcomeRecord>,
-    pub stop_confirmed_at: Option<Timestamp>,
-    pub stop_confirmed_by: Option<StopProof>,
-    pub children_closed_at: Option<Timestamp>,
 }
 
 /// A position in the order of Jobs that have been submitted but have not

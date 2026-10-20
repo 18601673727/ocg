@@ -556,7 +556,6 @@ fn job_template(handle: &DatabaseHandle, configuration: ExecutionConfiguration) 
         eligible_at: None,
         parent: handle.genesis(),
         project: None,
-        dependencies: Vec::new(),
         input: JobInputDraft::default(),
         configuration: Some(configuration),
         previous: None,

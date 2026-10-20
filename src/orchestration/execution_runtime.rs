@@ -836,7 +836,6 @@ mod grounding_tests {
                 eligible_at: None,
                 parent: handle.genesis(),
                 project: Some(project),
-                dependencies: vec![],
                 input: JobInputDraft {
                     objective: Some("objective".into()),
                     ..Default::default()
@@ -961,7 +960,6 @@ mod grounding_tests {
                     eligible_at: None,
                     parent: handle.genesis(),
                     project: Some(project),
-                    dependencies: vec![],
                     input: JobInputDraft {
                         objective: Some("test objective".into()),
                         ..Default::default()
@@ -4353,7 +4351,6 @@ mod failure_tests {
             eligible_at: None,
             parent: database.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(execution_configuration(database)),
             previous: None,
@@ -5339,7 +5336,6 @@ mod provider_record_tests {
             eligible_at: None,
             parent: handle.genesis(),
             project: None,
-            dependencies: vec![],
             input: Default::default(),
             previous: None,
             configuration: Some(crate::test_support::execution_configuration(handle)),
@@ -5554,7 +5550,6 @@ mod provider_record_tests {
                     eligible_at: None,
                     parent: handle.genesis(),
                     project: None,
-                    dependencies: vec![],
                     input: JobInputDraft {
                         attachments: vec![attachment],
                         ..Default::default()

@@ -329,7 +329,6 @@ fn job(handle: &DatabaseHandle, target: Target) -> NewJob {
         eligible_at: None,
         parent: handle.genesis(),
         project: None,
-        dependencies: Vec::new(),
         input: JobInputDraft {
             objective: Some("measure backend overhead".into()),
             ..JobInputDraft::default()

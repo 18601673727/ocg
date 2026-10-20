@@ -133,8 +133,8 @@ impl Batch {
         if !self.require_job(parent)?.kind.is_conversation() {
             return Ok(());
         }
-        let first_iteration =
-            self.recurrence(child)?.is_some() && self.require_job(reference)?.previous.is_none();
+        let first_iteration = self.recurrence(child)?.is_some()
+            && self.require_job(reference)?.kind.previous().is_none();
         let causes = self.step(|tx| {
             let mut causes = BTreeSet::new();
             for entry in tx
@@ -231,7 +231,7 @@ impl Batch {
             NoticeEvent::StoppedAbove
         } else if outcome.kind == OutcomeKind::Completed && iteration {
             NoticeEvent::IterationCompleted
-        } else if outcome.kind == OutcomeKind::Completed && row.previous.is_none() {
+        } else if outcome.kind == OutcomeKind::Completed && row.kind.previous().is_none() {
             NoticeEvent::ObjectiveCompleted
         } else {
             NoticeEvent::TurnEnded { kind: outcome.kind }
@@ -264,10 +264,7 @@ impl Batch {
         let row = self.conversation(conversation)?;
         if row.loop_count < 8
             || row.on_hold.is_some()
-            || self
-                .require_job_state(conversation)?
-                .children_closed_at
-                .is_some()
+            || row.closing.is_some()
             || matches!(
                 self.require_job(conversation)?.kind,
                 JobKind::Conversation {

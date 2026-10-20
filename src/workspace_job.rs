@@ -456,7 +456,6 @@ async fn submit(
             eligible_at: None,
             parent: database.genesis(),
             project: Some(config.project),
-            dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: None,

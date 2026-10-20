@@ -126,8 +126,6 @@ pub enum Violation {
     RetryOfUnsettledJob(JobId),
     #[error("{original} already has the unsettled direct retry {retry}")]
     ActiveRetry { original: JobId, retry: JobId },
-    #[error("the dependency on {0} is listed more than once")]
-    DuplicateDependency(JobId),
     #[error("the relationship would create a cycle in the waiting graph through {0:?}")]
     WaitingCycle(Vec<JobId>),
     #[error(

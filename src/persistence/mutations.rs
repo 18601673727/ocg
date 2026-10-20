@@ -19,10 +19,11 @@ fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow
         Some(configuration) => Some(batch.freeze_configuration(configuration)?),
         None => None,
     };
-    let mut dependencies = job.dependencies.clone();
-    dependencies.sort_by_key(|(dependency, _)| *dependency);
-    if let Some(pair) = dependencies.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return batch.reject(Violation::DuplicateDependency(pair[0].0));
+    if stored && job.eligible_at.is_some() {
+        return batch.reject(Violation::InvalidValue(
+            "eligible_at",
+            "a stored turn cannot be delayed",
+        ));
     }
     let Some(frozen) = frozen else {
         return batch.reject(Violation::InvalidValue(
@@ -52,14 +53,19 @@ fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow
     Ok(JobRow {
         id: JobId::new(0),
         created_at: batch.now(),
-        eligible_at: job.eligible_at,
-        name: job.name.clone(),
         parent_id: (job.parent.get() != 0).then_some(job.parent),
         kind: JobKind::Turn {
+            name: job.name.clone(),
             plan_source: if stored {
-                PlanSource::Stored
+                PlanSource::Stored {
+                    previous: job.previous,
+                    dependencies: Vec::new(),
+                }
             } else {
                 PlanSource::Process {
+                    eligible_at: job.eligible_at,
+                    objective: job.input.objective.clone(),
+                    attachments: job.input.attachments.clone(),
                     project: job.project,
                     grant: job.process_grant.clone().or_else(|| {
                         frozen
@@ -71,15 +77,6 @@ fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow
             },
             execution: TurnExecution::Frozen(frozen),
         },
-        objective: (!stored).then(|| job.input.objective.clone()).flatten(),
-        attachments: if stored {
-            Vec::new()
-        } else {
-            job.input.attachments.clone()
-        },
-        dependencies,
-        previous: job.previous,
-        submission: None,
     })
 }
 

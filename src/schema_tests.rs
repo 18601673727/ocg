@@ -43,7 +43,6 @@ fn new_job(handle: &DatabaseHandle, name: &str, parent: JobId) -> NewJob {
         eligible_at: None,
         parent,
         project: None,
-        dependencies: Vec::new(),
         input: JobInputDraft {
             objective: Some(name.into()),
             ..JobInputDraft::default()
@@ -627,13 +626,6 @@ fn job_creation_refuses_missing_endpoints_without_partial_writes() {
                 ..new_job(&handle, "lost", genesis)
             },
             Violation::NotFound(RecordRef::Project(missing_project)),
-        ),
-        (
-            NewJob {
-                dependencies: vec![(missing_job, DependencyCondition::Success)],
-                ..new_job(&handle, "waits", genesis)
-            },
-            Violation::NotFound(RecordRef::Job(missing_job)),
         ),
     ];
     for (job, expected) in attempts {
@@ -4796,24 +4788,6 @@ mod settlement {
 
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
-    }
-
-    #[test]
-    fn k1_refuses_dependencies_other_than_previous() {
-        let (_root, directory) = data_directory("k1-dependency-refusal");
-        let worker = DatabaseWorker::start(&directory).expect("database");
-        let handle = worker.handle();
-        let llm = setup_pool(&handle, 2);
-        let first = job(&handle, llm, "first");
-        assert!(matches!(
-            violation(wait(handle.create_job(NewJob {
-                configuration: llm_only(llm),
-                dependencies: vec![(first, Success)],
-                ..new_job(&handle, "refused", handle.genesis())
-            }))),
-            Violation::InvalidValue("dependencies", _)
-        ));
-        worker.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -10855,33 +10829,6 @@ mod requests_and_tool_loop {
         }
 
         #[test]
-        fn dispatcher_reports_dependency_cancellation_without_executing_the_waiter() {
-            let (_root, directory) = data_directory("dispatcher-impossible");
-            let worker = DatabaseWorker::start(&directory).expect("database");
-            let handle = worker.handle();
-            let (target, requests) = scripted(&handle, "dispatcher-impossible", vec![stalled()]);
-            let runtime = ExecutionRuntime::start(
-                handle.clone(),
-                crate::orchestration::execution_runtime::ClaimScope::Process,
-            )
-            .expect("runtime");
-            let first = admitted(wait(
-                runtime
-                    .scheduler()
-                    .admit_provider(plan(&handle, &target, "first", None)),
-            ));
-            let mut waiter = plan(&handle, &target, "waiter", None);
-            waiter.job.dependencies = vec![(first.job(), DependencyCondition::Success)];
-            assert!(wait(runtime.scheduler().admit_provider(waiter)).is_err());
-            until(|| requests.load(Ordering::SeqCst) == 1);
-            first.request_stop();
-            wait(first.settled()).expect("first stopped");
-            assert_eq!(requests.load(Ordering::SeqCst), 1);
-            wait(runtime.shutdown()).expect("shutdown");
-            worker.shutdown().expect("shutdown");
-        }
-
-        #[test]
         fn dispatcher_cancels_a_durable_pending_job_after_reopening() {
             let (_root, directory) = data_directory("dispatcher-reopen");
             let worker = DatabaseWorker::start(&directory).expect("database");
@@ -10931,26 +10878,7 @@ mod requests_and_tool_loop {
                 wait(handle.create_job(plan(&handle, &target, "root", None).job)).expect("root");
             let mut child = plan(&handle, &target, "child", None).job;
             child.parent = root;
-            let child = wait(handle.create_job(child)).expect("child");
-            let mut depends_on_child = plan(&handle, &target, "root waiter", None).job;
-            depends_on_child.dependencies = vec![(child, DependencyCondition::Settled)];
-            assert!(matches!(
-                wait(handle.create_job(depends_on_child)),
-                Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "dependencies",
-                    _
-                )))
-            ));
-            let mut child_waiter = plan(&handle, &target, "child waiter", None).job;
-            child_waiter.parent = root;
-            child_waiter.dependencies = vec![(root, DependencyCondition::Settled)];
-            assert!(matches!(
-                wait(handle.create_job(child_waiter)),
-                Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "dependencies",
-                    _
-                )))
-            ));
+            wait(handle.create_job(child)).expect("child");
             assert_eq!(wait(handle.jobs(None, 100)).expect("jobs").len(), 2);
             worker.shutdown().expect("shutdown");
         }
@@ -12997,6 +12925,213 @@ mod requests_and_tool_loop {
             assert_eq!(running.control.held().1, 0);
             assert!(jobs_named(&handle, "c2 unknown").len() <= 1);
             running.stop();
+        }
+
+        #[test]
+        fn job_layout_preserves_job_list_and_input_projections() {
+            let (_root, directory) = data_directory("job-layout-projections");
+            let worker = DatabaseWorker::start(&directory).expect("database");
+            let handle = worker.handle();
+            let configuration = crate::test_support::execution_configuration(&handle);
+            let pool = executor(&handle, "layout worker", &[OPENAI]).expect("executor");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
+            let control = ControlPlane::start(
+                config(LONG),
+                handle.clone(),
+                runtime.scheduler(),
+                directory.clone(),
+            )
+            .expect("listener");
+            let running = Running {
+                worker,
+                handle: handle.clone(),
+                runtime,
+                control,
+            };
+            let address = running.address();
+            let (conversation, appended) = wait(handle.open_conversation(
+                None,
+                crate::persistence::ConversationSpec {
+                    name: Some("named first".into()),
+                    agent: None,
+                    project: None,
+                    origin: crate::persistence::Origin::User,
+                    keep_open: true,
+                },
+                crate::persistence::Entry::UserMessage {
+                    text: "first input".into(),
+                    attachments: Vec::new(),
+                },
+                configuration,
+                None,
+            ))
+            .expect("conversation");
+            let first = appended.turn;
+            let list_state = || {
+                let page = get(address, "/api/v1/conversations").json();
+                page["conversations"]
+                    .as_array()
+                    .expect("conversations")
+                    .iter()
+                    .find(|row| row["root_job"] == conversation.to_string())
+                    .expect("listed conversation")["state"]
+                    .clone()
+            };
+            assert_eq!(list_state(), "open");
+            let mut turn = first;
+            for (name, previous) in [("named first", None), ("named successor", Some(first))] {
+                if previous.is_some() {
+                    turn = wait(handle.bench_create_dependent_turn(NewJob {
+                        name: Some(name.into()),
+                        eligible_at: None,
+                        parent: conversation,
+                        project: None,
+                        process_grant: None,
+                        input: JobInputDraft::default(),
+                        configuration: Some(configuration),
+                        previous,
+                    }))
+                    .expect("successor");
+                }
+                let record = job_record(&handle, turn);
+                assert_eq!(
+                    get(address, &format!("/api/v1/jobs/{turn}")).json()["job"],
+                    json!({
+                        "id": turn.to_string(), "name": name, "title": null,
+                        "is_chat": true, "execution_mode": "once",
+                        "input": record.input.to_string(),
+                        "previous": previous.map(|id| id.to_string()),
+                        "kind": "turn", "conversation": conversation.to_string(),
+                        "assigned_executor": null,
+                        "created_at_us": record.created_at.as_unix_micros(),
+                        "updated_at_us": record.created_at.as_unix_micros(),
+                        "started_at_us": null, "paused_at_us": null,
+                        "sterilized_at_us": null,
+                        "settlement": { "state": "unsettled", "settled_at_us": null },
+                        "stop_confirmed_at_us": null,
+                    })
+                );
+                assert!(
+                    wait(handle.claim_execution(crate::persistence::ClaimRequest {
+                        job: turn,
+                        allowed_pools: BTreeSet::from([pool.into()]),
+                    }))
+                    .expect("claim")
+                    .is_ok()
+                );
+                if previous.is_none() {
+                    wait(
+                        handle
+                            .finalize_job(turn, JobFinalization::Completed(result("first answer"))),
+                    )
+                    .expect("first outcome");
+                }
+            }
+            wait(handle.close(conversation, crate::persistence::Actor::User)).expect("close");
+            assert_eq!(list_state(), "closing");
+            let close_at = job_record(&handle, conversation)
+                .children_closed_at
+                .expect("closing time");
+            std::thread::sleep(Duration::from_millis(2));
+            wait(handle.finalize_job(turn, JobFinalization::Completed(result("last answer"))))
+                .expect("last outcome");
+            assert_eq!(list_state(), "settled");
+            let record = job_record(&handle, conversation);
+            let outcome_at = record.cancelled_at.expect("closed while running");
+            assert!(outcome_at > close_at);
+            assert_eq!(
+                get(address, &format!("/api/v1/jobs/{conversation}")).json()["job"],
+                json!({
+                    "id": conversation.to_string(), "name": null, "title": null,
+                    "is_chat": false, "execution_mode": "once",
+                    "input": record.input.to_string(), "previous": null,
+                    "kind": "conversation", "conversation": null, "assigned_executor": null,
+                    "created_at_us": record.created_at.as_unix_micros(),
+                    "updated_at_us": outcome_at.as_unix_micros(),
+                    "started_at_us": null, "paused_at_us": null,
+                    "sterilized_at_us": close_at.as_unix_micros(),
+                    "settlement": { "state": "cancelled", "settled_at_us": outcome_at.as_unix_micros() },
+                    "stop_confirmed_at_us": null,
+                })
+            );
+            let mut attachments = Vec::new();
+            for suffix in *b"ab" {
+                let mut content = b"\x89PNG\r\n\x1a\n".to_vec();
+                content.push(suffix);
+                attachments.push(
+                    wait(
+                        handle.create_user_attachment(crate::persistence::NewAttachment {
+                            content,
+                            mime: "image/png".into(),
+                            display_name: None,
+                        }),
+                    )
+                    .expect("attachment"),
+                );
+            }
+            attachments.reverse();
+            let delayed_at =
+                Timestamp::from_unix_micros(Timestamp::now().as_unix_micros() + 3_600_000_000);
+            let process = wait(handle.create_job(NewJob {
+                name: Some("delayed process".into()),
+                eligible_at: Some(delayed_at),
+                parent: handle.genesis(),
+                project: None,
+                process_grant: None,
+                input: JobInputDraft {
+                    objective: Some("process objective".into()),
+                    attachments: attachments.clone(),
+                },
+                configuration: Some(configuration),
+                previous: None,
+            }))
+            .expect("delayed process");
+            let input = get(address, &format!("/api/v1/jobs/{process}/input"));
+            assert_eq!(input.status, 200);
+            let record = job_record(&handle, process);
+            assert_eq!(
+                input.json(),
+                json!({
+                    "api_version": 1, "job": process.to_string(),
+                    "input": {
+                        "id": record.input.to_string(), "objective": "process objective",
+                        "submitted_at_us": record.created_at.as_unix_micros(),
+                        "attachments": attachments.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                        "configuration": {
+                            "agent_profile": null, "llm_profile": configuration.llm_profile.to_string(),
+                            "model": "fixture", "context_window": null,
+                        },
+                    },
+                })
+            );
+            wait(handle.finalize_job(
+                process,
+                JobFinalization::Cancelled(result("cancelled delay")),
+            ))
+            .expect("process outcome");
+            let record = job_record(&handle, process);
+            let outcome_at = record.cancelled_at.expect("outcome time");
+            assert_eq!(
+                get(address, &format!("/api/v1/jobs/{process}")).json()["job"],
+                json!({
+                    "id": process.to_string(), "name": "delayed process", "title": "process objective",
+                    "is_chat": false, "execution_mode": "once",
+                    "input": record.input.to_string(), "previous": null,
+                    "kind": "turn", "conversation": null, "assigned_executor": null,
+                    "created_at_us": record.created_at.as_unix_micros(),
+                    "updated_at_us": outcome_at.as_unix_micros(),
+                    "started_at_us": null, "paused_at_us": null,
+                    "sterilized_at_us": outcome_at.as_unix_micros(),
+                    "settlement": { "state": "cancelled", "settled_at_us": outcome_at.as_unix_micros() },
+                    "stop_confirmed_at_us": null,
+                })
+            );
+            running.stop();
+            assert_relationships_consistent(&directory);
         }
 
         #[test]
@@ -15526,7 +15661,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 21);
+            assert_eq!(crate::storage::FORMAT_VERSION, 22);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");

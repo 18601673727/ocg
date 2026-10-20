@@ -327,10 +327,10 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
         let state = &auth.states[id];
         let parent = row.parent_id.map_or(0, JobId::get);
         derived.children.insert((parent, *id), ());
-        for attachment in &row.attachments {
+        for attachment in row.kind.attachments() {
             derived.attachment_refs.insert((attachment.get(), *id), ());
         }
-        if let Some(previous) = row.previous {
+        if let Some(previous) = row.kind.previous() {
             derived.successors.insert(previous.get(), *id);
         }
         if row.kind.is_conversation() {
@@ -375,7 +375,7 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
         let mut open_dependencies = 0u32;
         if pending {
             derived.pending.insert(*id, ());
-            for (dependency, condition) in row.waits_on() {
+            for (dependency, condition) in row.kind.waits_on() {
                 if !settled.contains(&dependency.get()) {
                     open_dependencies += 1;
                     derived
@@ -392,7 +392,7 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
                             .is_some_and(|active| *active != *id)
                 })
             {
-                match row.eligible_at.map(Timestamp::as_unix_micros) {
+                match row.kind.eligible_at().map(Timestamp::as_unix_micros) {
                     Some(eligible_at) if eligible_at > clock => {
                         derived.delayed.insert((eligible_at, *id), ());
                     }
@@ -418,13 +418,12 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
             );
         }
         if let Some(claim) = &state.claim {
-            let holds = state.suspension.is_none()
-                && match &state.outcome {
-                    None => true,
-                    Some(outcome) => {
-                        outcome.kind == OutcomeKind::Unknown && state.stop_confirmed_at.is_none()
-                    }
-                };
+            let holds = match &state.outcome {
+                None => true,
+                Some(outcome) => {
+                    outcome.kind == OutcomeKind::Unknown && state.stop_confirmed_at.is_none()
+                }
+            };
             if holds {
                 derived.held.insert(
                     (claim.pool_id.get(), *id),
@@ -794,7 +793,6 @@ mod tests {
             eligible_at: None,
             parent: database.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: None,
@@ -952,7 +950,6 @@ mod tests {
             eligible_at: None,
             parent: database.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: Some(agent_1.into()),
@@ -1037,7 +1034,6 @@ mod tests {
             eligible_at: None,
             parent: database.genesis(),
             project: None,
-            dependencies: Vec::new(),
             input: JobInputDraft::default(),
             configuration: Some(ExecutionConfiguration {
                 agent_profile: Some(agent_2.into()),
