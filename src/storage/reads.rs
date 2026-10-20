@@ -922,50 +922,149 @@ pub(crate) fn read_tool_stats(
     Ok(stats)
 }
 
+pub const MAX_USAGE_SCAN: usize = 100_000;
+
+fn resolve_model_name(
+    rx: &ReadTransaction,
+    provider: u64,
+    model_hash: [u8; 32],
+) -> Result<Option<String>, StorageError> {
+    let scopes = rx.open_table(REQUEST_SCOPES)?;
+    let start = (provider, model_hash, i64::MIN, 0, 0, 0);
+    let end = (provider, model_hash, i64::MAX, u64::MAX, u32::MAX, u32::MAX);
+    for entry in scopes.range(start..=end)? {
+        let (key, _) = entry?;
+        let (_provider, _hash, _obs, job, _req, _seq) = key.value();
+        if let Some(job_row) = read_job_row(rx, JobId::new(job))?
+            && let Some(execution) = job_row.execution
+        {
+            return Ok(Some(execution.llm.config.model));
+        }
+    }
+    Ok(None)
+}
+
+type UsageGroupKey = (u64, u64, [u8; 32]);
+type UsageCounters = (u64, u64, u64, u64, u64, u64, u64);
+
 pub(crate) fn read_usage_summary(
     database: &Database,
     filter: &crate::token_usage::UsageSummaryFilter,
-) -> Result<crate::token_usage::UsageSummaryRecord, StorageError> {
+) -> Result<crate::token_usage::UsageSummaryResponse, StorageError> {
     let rx = read(database)?;
     let table = rx.open_table(USAGE_TOTALS)?;
-    let mut summary = crate::token_usage::UsageSummaryRecord::default();
     let from_hour = filter
         .from_us
-        .map(|us| (us.max(0) as u64) / 3_600_000_000)
-        .unwrap_or(0);
+        .map(|us| us.div_euclid(3_600_000_000))
+        .unwrap_or(i64::MIN);
     let until_hour = filter
         .until_us
-        .map(|us| (us.max(0) as u64) / 3_600_000_000)
-        .unwrap_or(u64::MAX);
-    let target_hash = filter
-        .model
-        .as_deref()
-        .map(|m| *ContentDigest::of(m.as_bytes()).as_bytes());
+        .map(|us| us.div_euclid(3_600_000_000))
+        .unwrap_or(i64::MAX);
 
     let start = (from_hour, 0, 0, [0u8; 32]);
     let end = (until_hour, u64::MAX, u64::MAX, [0xffu8; 32]);
 
-    for entry in table.range(start..=end)? {
+    let mut current_hour: Option<i64> = None;
+    let mut resume_from_us = None;
+    let mut earliest_hour: Option<i64> = None;
+    let mut latest_hour: Option<i64> = None;
+
+    let mut grouped: std::collections::BTreeMap<UsageGroupKey, UsageCounters> =
+        std::collections::BTreeMap::new();
+
+    for (scanned_rows, entry) in table.range(start..=end)?.enumerate() {
         let (key, value) = entry?;
-        let (_hour, agent, _provider, model_hash) = key.value();
+        let (hour, agent, provider, model_hash) = key.value();
+
+        if let Some(cur) = current_hour {
+            if hour != cur {
+                if scanned_rows >= MAX_USAGE_SCAN {
+                    resume_from_us = Some(hour * 3_600_000_000);
+                    break;
+                }
+                current_hour = Some(hour);
+            }
+        } else {
+            current_hour = Some(hour);
+        }
+
+        if earliest_hour.is_none() {
+            earliest_hour = Some(hour);
+        }
+        latest_hour = Some(hour);
+
         if let Some(target_agent) = filter.agent
             && agent != target_agent
         {
             continue;
         }
-        if let Some(target_hash) = target_hash
-            && model_hash != target_hash
-        {
-            continue;
-        }
-        let (requests, input, output, cache_read, cache_write, reasoning, total) = value.value();
-        summary.requests = summary.requests.saturating_add(requests);
-        summary.input_tokens = summary.input_tokens.saturating_add(input);
-        summary.output_tokens = summary.output_tokens.saturating_add(output);
-        summary.cache_read_tokens = summary.cache_read_tokens.saturating_add(cache_read);
-        summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(cache_write);
-        summary.reasoning_tokens = summary.reasoning_tokens.saturating_add(reasoning);
-        summary.total_tokens = summary.total_tokens.saturating_add(total);
+
+        let (reqs, comp, inp, out, cr, cw, reas) = value.value();
+        let slot = grouped
+            .entry((agent, provider, model_hash))
+            .or_insert((0, 0, 0, 0, 0, 0, 0));
+        slot.0 = slot.0.saturating_add(reqs);
+        slot.1 = slot.1.saturating_add(comp);
+        slot.2 = slot.2.saturating_add(inp);
+        slot.3 = slot.3.saturating_add(out);
+        slot.4 = slot.4.saturating_add(cr);
+        slot.5 = slot.5.saturating_add(cw);
+        slot.6 = slot.6.saturating_add(reas);
     }
-    Ok(summary)
+
+    let mut model_cache: std::collections::HashMap<(u64, [u8; 32]), Option<String>> =
+        std::collections::HashMap::new();
+    let mut rows = Vec::with_capacity(grouped.len());
+    let mut all_complete = resume_from_us.is_none();
+
+    for ((agent, provider, model_hash), (reqs, comp, inp, out, cr, cw, reas)) in grouped {
+        if comp < reqs {
+            all_complete = false;
+        }
+        let model = match model_cache.entry((provider, model_hash)) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let resolved = resolve_model_name(&rx, provider, model_hash)?;
+                e.insert(resolved.clone());
+                resolved
+            }
+        };
+        rows.push(crate::token_usage::UsageSummaryRow {
+            agent,
+            provider,
+            model,
+            requests: reqs,
+            complete_requests: comp,
+            input_tokens: inp,
+            output_tokens: out,
+            cache_read_tokens: cr,
+            cache_write_tokens: cw,
+            reasoning_tokens: reas,
+        });
+    }
+
+    let effective_from_us = filter
+        .from_us
+        .map(|us| us.div_euclid(3_600_000_000) * 3_600_000_000)
+        .or_else(|| earliest_hour.map(|h| h * 3_600_000_000))
+        .unwrap_or(0);
+
+    let effective_until_us = if let Some(resume) = resume_from_us {
+        resume
+    } else {
+        filter
+            .until_us
+            .map(|us| (us.div_euclid(3_600_000_000) + 1) * 3_600_000_000)
+            .or_else(|| latest_hour.map(|h| (h + 1) * 3_600_000_000))
+            .unwrap_or(0)
+    };
+
+    Ok(crate::token_usage::UsageSummaryResponse {
+        from_us: effective_from_us,
+        until_us: effective_until_us,
+        complete: all_complete,
+        resume_from_us,
+        rows,
+    })
 }

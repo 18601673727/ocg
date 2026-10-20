@@ -39,6 +39,7 @@ pub(super) struct Shared {
     pub(super) scheduler_wake: SchedulerWake,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) active_policy: SystemPolicy,
+    pub(super) database_directory: PathBuf,
     pub(super) log_directory: PathBuf,
     pub(super) log_files: Arc<crate::logger::LogFiles>,
     pub(super) cleanup_worker: Arc<AtomicBool>,
@@ -68,11 +69,15 @@ pub(super) struct Shared {
     /// exactly one, so this counts durable commits too, and dividing the
     /// commands submitted by it gives the mean group size.
     pub(super) durable_commits: AtomicU64,
-    pub(super) commits: AtomicU64,
+    /// Total microseconds spent in durable group commits.
     pub(super) commit_us_total: AtomicU64,
+    /// Maximum microseconds spent in any single durable group commit.
     pub(super) commit_us_max: AtomicU64,
+    /// Successful non-empty claim_batch calls.
     pub(super) claims: AtomicU64,
+    /// Total round-trip microseconds spent in successful claim_batch calls.
     pub(super) claim_us_total: AtomicU64,
+    /// Maximum round-trip microseconds spent in any successful claim_batch call.
     pub(super) claim_us_max: AtomicU64,
     /// The Jobs this worker's start settled as abandoned by an earlier
     /// opening; see [`DatabaseHandle::abandoned_at_open`].

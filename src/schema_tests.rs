@@ -3336,32 +3336,40 @@ mod control_plane {
             assert!(address.ip().is_loopback());
             let health = get(address, "/api/v1/health");
             assert_eq!(health.status, 200);
-            let mut health_val = health.json();
-            assert!(health_val["database"]["commits"].is_u64());
-            assert!(health_val["database"]["durable_commits"].is_u64());
-            assert!(health_val["database"]["commit_us_total"].is_u64());
-            assert!(health_val["database"]["commit_us_max"].is_u64());
-            assert!(health_val["claims"]["claims"].is_u64());
-            assert!(health_val["claims"]["claim_us_total"].is_u64());
-            assert!(health_val["claims"]["claim_us_max"].is_u64());
-            assert!(health_val["queue"]["pending"].is_u64());
-            assert!(health_val["queue"]["ready"].is_u64());
-            assert!(health_val["queue"]["delayed"].is_u64());
-            assert!(health_val["process"]["memory_rss_bytes"].is_u64());
-            assert!(health_val["process"]["memory_rss_peak_bytes"].is_u64());
-            health_val["database"]
-                .as_object_mut()
-                .unwrap()
-                .retain(|k, _| ["status", "accepting_commands", "readable"].contains(&k.as_str()));
-            health_val.as_object_mut().unwrap().remove("claims");
-            health_val.as_object_mut().unwrap().remove("queue");
-            health_val.as_object_mut().unwrap().remove("process");
+            let health_json = health.json();
+            assert!(health_json["database"]["database_bytes"].as_u64().is_some());
+            assert!(health_json["database"]["available_bytes"].as_u64().is_some());
+            assert!(health_json["database"]["durable_commits"].as_u64().is_some());
             assert_eq!(
-                health_val,
+                health_json,
                 json!({
                     "api_version": 1,
                     "host": "running",
-                    "database": {"status": "open", "accepting_commands": true, "readable": true},
+                    "database": {
+                        "status": "open",
+                        "accepting_commands": true,
+                        "readable": true,
+                        "database_bytes": health_json["database"]["database_bytes"],
+                        "available_bytes": health_json["database"]["available_bytes"],
+                        "durable_commits": health_json["database"]["durable_commits"],
+                        "commit_us_mean": health_json["database"]["commit_us_mean"],
+                        "commit_us_max": health_json["database"]["commit_us_max"],
+                    },
+                    "claims": {
+                        "count": health_json["claims"]["count"],
+                        "mean_us": health_json["claims"]["mean_us"],
+                        "max_us": health_json["claims"]["max_us"],
+                    },
+                    "queue": {
+                        "pending": health_json["queue"]["pending"],
+                        "ready": health_json["queue"]["ready"],
+                        "delayed": health_json["queue"]["delayed"],
+                        "commands_waiting": 0,
+                    },
+                    "process": {
+                        "rss_bytes": health_json["process"]["rss_bytes"],
+                        "peak_rss_bytes": health_json["process"]["peak_rss_bytes"],
+                    },
                     "quarantined": [],
                 })
             );

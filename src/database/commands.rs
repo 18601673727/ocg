@@ -209,7 +209,7 @@ impl Command {
     pub(super) fn execute(
         self,
         database: &Database,
-        shared: &Shared,
+        _shared: &Shared,
         operation: OperationId,
         commit: Commit,
     ) -> Executed {
@@ -245,23 +245,16 @@ impl Command {
             ),
             Self::ClaimExecution { request, reply } => {
                 let mut refusal = ClaimRefusal::RecipeInvalid;
-                let started = Instant::now();
                 let outcome =
                     storage::run_batch_declinable(database, operation.epoch, commit, |batch| {
                         match persistence::claim_execution(batch, request)? {
-                            Ok(grant) => {
-                                shared.claims.fetch_add(1, Ordering::SeqCst);
-                                Ok(Some(grant))
-                            }
+                            Ok(grant) => Ok(Some(grant)),
                             Err(reason) => {
                                 refusal = reason;
                                 Ok(None)
                             }
                         }
                     });
-                let duration_us = started.elapsed().as_micros() as u64;
-                shared.claim_us_total.fetch_add(duration_us, Ordering::Relaxed);
-                shared.claim_us_max.fetch_max(duration_us, Ordering::Relaxed);
                 let declined = matches!(outcome.result, Ok(None));
                 let outcome = storage::BatchOutcome {
                     result: outcome.result.map(|grant| match grant {
@@ -288,15 +281,7 @@ impl Command {
                 commit,
                 Kind::ClaimExecution,
                 reply,
-                |batch| {
-                    let started = Instant::now();
-                    let claims = batch.claim_batch()?;
-                    let duration_us = started.elapsed().as_micros() as u64;
-                    shared.claims.fetch_add(claims.len() as u64, Ordering::SeqCst);
-                    shared.claim_us_total.fetch_add(duration_us, Ordering::Relaxed);
-                    shared.claim_us_max.fetch_max(duration_us, Ordering::Relaxed);
-                    Ok(claims)
-                },
+                |batch| batch.claim_batch(),
             ),
             Self::CreateExecutionPool { pool, reply } => run(
                 database,

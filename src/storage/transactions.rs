@@ -740,16 +740,18 @@ impl Batch {
             Ok(tx
                 .open_table(TOOL_STATS)?
                 .get(name)?
-                .map(|found| found.value())
-                .unwrap_or((0, 0, 0, 0, 0, 0)))
+                .map(|found| found.value()))
         })?;
-        let mut updated_stats = current_stats;
+        let mut stats_changed = false;
+        let mut updated_stats = current_stats.unwrap_or((0, 0, 0, 0, 0, 0));
         match &decision {
             ToolDecision::Admitted(_) => {
                 updated_stats.0 = updated_stats.0.saturating_add(1);
+                stats_changed = true;
             }
             ToolDecision::Refused(ToolCallRefusal::InvalidArguments) => {
                 updated_stats.1 = updated_stats.1.saturating_add(1);
+                stats_changed = true;
             }
             ToolDecision::Refused(
                 ToolCallRefusal::Malformed
@@ -781,7 +783,9 @@ impl Batch {
                 (call.job.get(), tool_call_id),
                 (call.request.get(), call.index),
             )?;
-            tx.open_table(TOOL_STATS)?.insert(name, updated_stats)?;
+            if stats_changed || current_stats.is_some() {
+                tx.open_table(TOOL_STATS)?.insert(name, updated_stats)?;
+            }
             if let Some(totals) = updated_totals {
                 tx.open_table(TOOL_TOTALS)?.insert(call.job.get(), totals)?;
             }
@@ -816,6 +820,8 @@ impl Batch {
                 .unwrap_or((0, 0, 0, 0, 0, 0)))
         })?;
         let mut updated_stats = current_stats;
+        // Duration semantics: admission commit -> outcome commit (includes the
+        // admission's durable commit), never spanning a restart.
         let duration_us = self
             .now
             .as_unix_micros()
@@ -824,11 +830,10 @@ impl Batch {
         updated_stats.4 = updated_stats.4.saturating_add(duration_us);
         updated_stats.5 = updated_stats.5.max(duration_us);
         match &outcome {
-            ToolOutcome::Completed { .. } => {
+            ToolOutcome::Completed { .. } | ToolOutcome::CompletedWithheld { .. } => {
                 updated_stats.2 = updated_stats.2.saturating_add(1);
             }
-            ToolOutcome::CompletedWithheld { .. }
-            | ToolOutcome::NotApplied { .. }
+            ToolOutcome::NotApplied { .. }
             | ToolOutcome::NotInvoked { .. }
             | ToolOutcome::Uncertain { .. } => {
                 updated_stats.3 = updated_stats.3.saturating_add(1);

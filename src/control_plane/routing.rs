@@ -296,13 +296,7 @@ pub(super) async fn respond(
         }
         Route::Usage(query) => dashboard::usage(shared, query).await,
         Route::UsageSummary(filter) => dashboard::usage_summary(shared, filter).await,
-        Route::ToolStats => {
-            let stats = database.tool_stats().await?;
-            Ok(Reply::ok(json!({
-                "api_version": API_VERSION,
-                "tool_stats": stats,
-            })))
-        }
+        Route::ToolStats => dashboard::tool_stats(shared).await,
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,
         Route::Job(job) => {

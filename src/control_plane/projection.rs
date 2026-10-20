@@ -11,7 +11,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         DatabaseStatus::Closed => "closed",
     };
     let readable = database.job(database.genesis()).await.is_ok();
-    let vitals = database.vitals();
+    let vitals = database.vitals().await;
     let quarantined = match database.unresolved_executions().await {
         Ok(unresolved) => unresolved
             .into_iter()
@@ -35,24 +35,26 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             "status": status,
             "accepting_commands": status == "open",
             "readable": readable,
-            "commits": vitals.commits,
+            "database_bytes": vitals.database_bytes,
+            "available_bytes": vitals.available_bytes,
             "durable_commits": vitals.durable_commits,
-            "commit_us_total": vitals.commit_us_total,
+            "commit_us_mean": vitals.commit_us_mean,
             "commit_us_max": vitals.commit_us_max,
         },
         "claims": {
-            "claims": vitals.claims,
-            "claim_us_total": vitals.claim_us_total,
-            "claim_us_max": vitals.claim_us_max,
+            "count": vitals.claims_count,
+            "mean_us": vitals.claim_us_mean,
+            "max_us": vitals.claim_us_max,
         },
         "queue": {
             "pending": vitals.queue_pending,
             "ready": vitals.queue_ready,
             "delayed": vitals.queue_delayed,
+            "commands_waiting": vitals.commands_waiting,
         },
         "process": {
-            "memory_rss_bytes": vitals.memory_rss_bytes,
-            "memory_rss_peak_bytes": vitals.memory_rss_peak_bytes,
+            "rss_bytes": vitals.rss_bytes,
+            "peak_rss_bytes": vitals.peak_rss_bytes,
         },
         "quarantined": quarantined,
     })
@@ -361,24 +363,39 @@ mod tests {
         let (_data, directory) = data_directory("health", "vitals");
         let worker = DatabaseWorker::start(&directory).expect("start");
         let handle = worker.handle();
+        let configuration = crate::test_support::execution_configuration(&handle);
+        let _job = wait(handle.create_job(crate::persistence::NewJob {
+            name: None,
+            eligible_at: None,
+            parent: handle.genesis(),
+            project: None,
+            dependencies: Vec::new(),
+            input: crate::persistence::JobInputDraft {
+                objective: Some("Ready Job".to_owned()),
+                ..Default::default()
+            },
+            configuration: Some(configuration),
+            previous: None,
+        }))
+        .expect("create job");
+
         let value = wait(health(&handle));
         assert_eq!(value["api_version"], 1);
         assert_eq!(value["host"], "running");
         assert_eq!(value["database"]["status"], "open");
         assert_eq!(value["database"]["accepting_commands"], true);
         assert_eq!(value["database"]["readable"], true);
-        assert!(value["database"]["commits"].is_u64());
-        assert!(value["database"]["durable_commits"].is_u64());
-        assert!(value["database"]["commit_us_total"].is_u64());
+        assert!(value["database"]["database_bytes"].as_u64().expect("database_bytes") > 0);
+        assert!(value["database"]["available_bytes"].as_u64().expect("available_bytes") > 0);
+        assert!(value["database"]["durable_commits"].as_u64().expect("durable_commits") >= 1);
         assert!(value["database"]["commit_us_max"].is_u64());
-        assert!(value["claims"]["claims"].is_u64());
-        assert!(value["claims"]["claim_us_total"].is_u64());
-        assert!(value["claims"]["claim_us_max"].is_u64());
+        assert!(value["claims"]["count"].is_u64());
+        assert!(value["claims"]["max_us"].is_u64());
         assert!(value["queue"]["pending"].is_u64());
-        assert!(value["queue"]["ready"].is_u64());
+        assert!(value["queue"]["ready"].as_u64().expect("queue_ready") >= 1);
         assert!(value["queue"]["delayed"].is_u64());
-        assert!(value["process"]["memory_rss_bytes"].is_u64());
-        assert!(value["process"]["memory_rss_peak_bytes"].is_u64());
+        assert!(value["queue"]["commands_waiting"].is_u64());
+        assert!(value["process"]["peak_rss_bytes"].as_u64().expect("peak_rss_bytes") > 0);
         assert_eq!(value["quarantined"], json!([]));
         worker.shutdown().expect("shutdown");
     }

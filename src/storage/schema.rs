@@ -47,10 +47,15 @@ pub(super) const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
     TableDefinition::new("tool_call_id");
 pub(super) const TOOL_TOTALS: TableDefinition<u64, (u64, u64)> =
     TableDefinition::new("tool_total");
+/// (admitted, refused_arguments, completed, failed, duration_us_total, duration_us_max)
+/// Duration semantics: admission commit -> outcome commit (includes the
+/// admission's durable commit), never spanning a restart.
 pub(crate) type ToolStatValue = (u64, u64, u64, u64, u64, u64);
 pub(super) const TOOL_STATS: TableDefinition<&str, ToolStatValue> =
     TableDefinition::new("tool_stat");
-pub(crate) type UsageTotalKey = (u64, u64, u64, [u8; 32]);
+/// (hour: i64, agent: u64, provider: u64, model_hash: [u8; 32])
+pub(crate) type UsageTotalKey = (i64, u64, u64, [u8; 32]);
+/// (requests, complete_requests, input, output, cache_read, cache_write, reasoning)
 pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) const USAGE_TOTALS: TableDefinition<UsageTotalKey, UsageTotalValue> =
     TableDefinition::new("usage_total");

@@ -1597,6 +1597,7 @@ struct ProviderBenchSink<'a> {
     recorder: ocg::provider_execution::RequestRecorder,
     commits: &'a mut ProviderCommits,
     gap: Option<String>,
+    observed_at: Option<ocg::persistence::Timestamp>,
 }
 
 impl ProviderBenchSink<'_> {
@@ -1693,12 +1694,13 @@ impl ocg::provider_execution::ProviderOutputSink for ProviderBenchSink<'_> {
                 ),
             };
             let database = self.database.clone();
+            let observed_at = self.observed_at.unwrap_or(observed.observed_at);
             if let Err(error) = Self::commit(
                 commits,
                 database.record_metrics(ocg::persistence::NewMetrics {
                     job: self.job,
                     request: self.request,
-                    observed_at: observed.observed_at,
+                    observed_at,
                     measurements,
                     token: Some(token),
                 }),
@@ -1804,6 +1806,7 @@ fn provider_record(options: &Options) -> Result<()> {
                         let mut sink = ProviderBenchSink {
                             database: handle.clone(), job: id, request: RequestNumber::FIRST,
                             recorder: Default::default(), commits: &mut commits, gap: None,
+                            observed_at: None,
                         };
                         for round in 0..3 {
                             let response = provider_execution::execute_conversation(&frozen, &conversation,
@@ -1981,6 +1984,8 @@ fn observability(options: &Options) -> Result<()> {
                         .ok_or_else(|| {
                             ntex::web::error::ErrorBadRequest("invalid Job index")
                         })?;
+                    let tool_names = ["lookup", "search", "calculate"];
+                    let tool_name = tool_names[(index + round) % tool_names.len()];
                     let choice = if round < 2 {
                         json!({
                             "index": 0,
@@ -1992,7 +1997,7 @@ fn observability(options: &Options) -> Result<()> {
                                     "id": format!("call-{index}-{round}"),
                                     "type": "function",
                                     "function": {
-                                        "name": "lookup",
+                                        "name": tool_name,
                                         "arguments": "{}"
                                     }
                                 }]
@@ -2077,6 +2082,44 @@ fn observability(options: &Options) -> Result<()> {
                             .frozen;
                         frozen.llm.provider.endpoint =
                             Some(format!("http://{provider_address}/v1"));
+                        let tool_declarations = vec![
+                            serde_json::from_value(json!({
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "description": "A shared lookup tool",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {},
+                                        "additionalProperties": false
+                                    }
+                                }
+                            }))?,
+                            serde_json::from_value(json!({
+                                "type": "function",
+                                "function": {
+                                    "name": "search",
+                                    "description": "A shared search tool",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {},
+                                        "additionalProperties": false
+                                    }
+                                }
+                            }))?,
+                            serde_json::from_value(json!({
+                                "type": "function",
+                                "function": {
+                                    "name": "calculate",
+                                    "description": "A shared calculate tool",
+                                    "parameters": {
+                                        "type": "object",
+                                        "properties": {},
+                                        "additionalProperties": false
+                                    }
+                                }
+                            }))?,
+                        ];
                         let mut conversation = ocg::openai_compatible::ChatConversation {
                             messages: vec![
                                 ChatMessage::system("Shared system instructions. ".repeat(160)),
@@ -2092,20 +2135,10 @@ fn observability(options: &Options) -> Result<()> {
                                 ),
                                 ChatMessage::user(format!("Current question for Job {index}.")),
                             ],
-                            tools: vec![serde_json::from_value(json!({
-                                "type": "function",
-                                "function": {
-                                    "name": "lookup",
-                                    "description": "A shared lookup tool",
-                                    "parameters": {
-                                        "type": "object",
-                                        "properties": {},
-                                        "additionalProperties": false
-                                    }
-                                }
-                            }))?],
+                            tools: tool_declarations,
                             ..Default::default()
                         };
+                        let offset_us = (index as i64 * 2_592_000_000_000) / (obs_jobs.max(1) as i64);
                         let mut sink = ProviderBenchSink {
                             database: handle.clone(),
                             job: id,
@@ -2113,8 +2146,13 @@ fn observability(options: &Options) -> Result<()> {
                             recorder: Default::default(),
                             commits: &mut commits,
                             gap: None,
+                            observed_at: Some(Timestamp::from_unix_micros(1_700_000_000_000_000 + offset_us)),
                         };
                         for round in 0..3 {
+                            let round_observed_at = Timestamp::from_unix_micros(
+                                1_700_000_000_000_000 + offset_us + (round as i64 * 60_000_000),
+                            );
+                            sink.observed_at = Some(round_observed_at);
                             let response = provider_execution::execute_conversation(
                                 &frozen,
                                 &conversation,
@@ -2146,7 +2184,7 @@ fn observability(options: &Options) -> Result<()> {
                                 stat: NewAvailabilityStat {
                                     job: id,
                                     request: sink.request,
-                                    observed_at: Timestamp::now(),
+                                    observed_at: round_observed_at,
                                     observation: provider_execution::success_observation(&response),
                                 },
                                 measurements: provider_execution::metrics(&response),
@@ -2170,7 +2208,7 @@ fn observability(options: &Options) -> Result<()> {
                                 let evidence = NewToolEvidence {
                                     call: call_ref,
                                     tool_call_id: call.id.clone(),
-                                    name: "lookup".into(),
+                                    name: call.name.clone(),
                                     decision: ToolDecision::Admitted(ToolAdmission {
                                         handler_version: "workspace_run_command-6".into(),
                                         effect: ToolEffect::ReadOnly,
@@ -2251,7 +2289,7 @@ fn observability(options: &Options) -> Result<()> {
                 "iterations": iterations,
             });
 
-            let (vitals_samples, elapsed_vitals) = measure(iterations, || Ok(handle.vitals()))?;
+            let (vitals_samples, elapsed_vitals) = measure(iterations, || Ok(block_on(handle.vitals())))?;
             report("observability.vitals", &parameters, vitals_samples, Some(elapsed_vitals));
 
             let (tool_stats_samples, elapsed_tool_stats) = measure(iterations, || {
@@ -2264,6 +2302,26 @@ fn observability(options: &Options) -> Result<()> {
                 Ok(block_on(handle.usage_summary(filter.clone()))?)
             })?;
             report("observability.usage_summary", &parameters, usage_samples, Some(elapsed_usage));
+
+            let filter_30d = ocg::token_usage::UsageSummaryFilter {
+                from_us: Some(1_700_000_000_000_000),
+                until_us: Some(1_700_000_000_000_000 + 2_592_000_000_000),
+                agent: None,
+            };
+            let (usage_30d_samples, elapsed_30d_usage) = measure(iterations, || {
+                Ok(block_on(handle.usage_summary(filter_30d.clone()))?)
+            })?;
+            report("observability.usage_summary_30d", &parameters, usage_30d_samples, Some(elapsed_30d_usage));
+
+            let filter_1d = ocg::token_usage::UsageSummaryFilter {
+                from_us: Some(1_700_000_000_000_000),
+                until_us: Some(1_700_000_000_000_000 + 86_400_000_000),
+                agent: None,
+            };
+            let (usage_1d_samples, elapsed_1d_usage) = measure(iterations, || {
+                Ok(block_on(handle.usage_summary(filter_1d.clone()))?)
+            })?;
+            report("observability.usage_summary_1d", &parameters, usage_1d_samples, Some(elapsed_1d_usage));
 
             let provider_commits = commits.sent.len()
                 + commits.output_flush.len()
@@ -2314,19 +2372,25 @@ fn observability(options: &Options) -> Result<()> {
             let (reopen_duration, file_size, peak_memory) =
                 stop_unclean_and_reopen(&directory, worker, |reopened_handle| {
                     let stats = block_on(reopened_handle.tool_stats())?;
-                    let lookup = stats
-                        .iter()
-                        .find(|s| s.name == "lookup")
-                        .ok_or("missing lookup tool in rebuilt stats")?;
-                    if lookup.admitted != (obs_jobs * 2) as u64
-                        || lookup.completed != (obs_jobs * 2) as u64 {
-                        return Err(format!("mismatched tool stats: {lookup:?}").into());
+                    for name in ["lookup", "search", "calculate"] {
+                        let stat = stats
+                            .iter()
+                            .find(|s| s.name == name)
+                            .ok_or_else(|| format!("missing {name} tool in rebuilt stats"))?;
+                        if stat.admitted == 0 || stat.completed != stat.admitted {
+                            return Err(format!("mismatched tool stats for {name}: {stat:?}").into());
+                        }
+                    }
+                    let total_admitted: u64 = stats.iter().map(|s| s.admitted).sum();
+                    if total_admitted != (obs_jobs * 2) as u64 {
+                        return Err(format!("mismatched total admitted tool calls: {total_admitted}").into());
                     }
                     let summary = block_on(
                         reopened_handle.usage_summary(ocg::token_usage::UsageSummaryFilter::default())
                     )?;
-                    if summary.requests != (obs_jobs * 3) as u64 {
-                        return Err(format!("mismatched usage total requests: {}", summary.requests).into());
+                    let total_requests: u64 = summary.rows.iter().map(|r| r.requests).sum();
+                    if total_requests != (obs_jobs * 3) as u64 {
+                        return Err(format!("mismatched usage total requests: {total_requests}").into());
                     }
                     Ok(())
                 })?;

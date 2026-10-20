@@ -2,79 +2,62 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Vitals {
-    pub commits: u64,
+    pub database_bytes: Option<u64>,
+    pub available_bytes: Option<u64>,
     pub durable_commits: u64,
-    pub commit_us_total: u64,
+    pub commit_us_mean: Option<u64>,
     pub commit_us_max: u64,
-    pub claims: u64,
-    pub claim_us_total: u64,
+    pub claims_count: u64,
+    pub claim_us_mean: Option<u64>,
     pub claim_us_max: u64,
-    pub queue_pending: u64,
-    pub queue_ready: u64,
-    pub queue_delayed: u64,
-    pub memory_rss_bytes: u64,
-    pub memory_rss_peak_bytes: u64,
+    pub queue_pending: Option<u64>,
+    pub queue_ready: Option<u64>,
+    pub queue_delayed: Option<u64>,
+    pub commands_waiting: u64,
+    pub rss_bytes: Option<u64>,
+    pub peak_rss_bytes: Option<u64>,
 }
 
-fn process_memory() -> (u64, u64) {
-    let mut peak = 0u64;
+fn process_memory() -> (Option<u64>, Option<u64>) {
+    let mut peak = None;
     #[cfg(unix)]
     {
         let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) } == 0 {
             #[cfg(target_os = "macos")]
             {
-                peak = rusage.ru_maxrss.max(0) as u64;
+                peak = Some(rusage.ru_maxrss.max(0) as u64);
             }
             #[cfg(not(target_os = "macos"))]
             {
-                peak = (rusage.ru_maxrss.max(0) as u64).saturating_mul(1024);
+                peak = Some((rusage.ru_maxrss.max(0) as u64).saturating_mul(1024));
             }
         }
     }
 
+    #[allow(unused_mut)]
+    let mut current = None;
     #[cfg(target_os = "linux")]
     {
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            let mut current = 0u64;
             for line in status.lines() {
                 if let Some(rest) = line.strip_prefix("VmRSS:") {
                     let parts: Vec<&str> = rest.split_whitespace().collect();
                     if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
-                        current = kb.saturating_mul(1024);
+                        current = Some(kb.saturating_mul(1024));
                     }
                 }
                 if let Some(rest) = line.strip_prefix("VmHWM:") {
                     let parts: Vec<&str> = rest.split_whitespace().collect();
                     if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
-                        peak = kb.saturating_mul(1024);
+                        peak = Some(kb.saturating_mul(1024));
                     }
                 }
             }
-            if current > 0 {
-                return (current, peak);
-            }
         }
     }
 
-    #[cfg(target_os = "macos")]
-    #[allow(deprecated)]
-    unsafe {
-        let mut info: libc::mach_task_basic_info = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
-            / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
-        if libc::task_info(
-            libc::mach_task_self(),
-            libc::MACH_TASK_BASIC_INFO,
-            &mut info as *mut _ as *mut libc::integer_t,
-            &mut count,
-        ) == libc::KERN_SUCCESS
-        {
-            return (info.resident_size, peak);
-        }
-    }
-
-    (peak, peak)
+    (current, peak)
 }
 
 impl DatabaseHandle {
@@ -109,31 +92,53 @@ impl DatabaseHandle {
     /// durable commit failed is counted here too, and the callers of those
     /// commands are told their outcome is unknown.
     pub fn durable_commits(&self) -> u64 {
-        self.shared.durable_commits.load(Ordering::SeqCst)
+        self.shared.durable_commits.load(Ordering::Relaxed)
     }
 
-    pub fn vitals(&self) -> Vitals {
-        let (queue_pending, queue_ready, queue_delayed) = match self.shared.database.read() {
-            Ok(guard) => match guard.as_ref() {
-                Some(opened) => storage::queue_counts(&opened.database),
-                None => (0, 0, 0),
-            },
-            Err(_) => (0, 0, 0),
+    pub async fn vitals(&self) -> Vitals {
+        let db_file = crate::storage::database_file(&self.shared.database_directory);
+        let database_bytes = std::fs::metadata(&db_file).map(|m| m.len()).ok();
+        let available_bytes = fs4::available_space(&self.shared.database_directory).ok();
+
+        let queue_counts = match self
+            .read(|database| Ok(storage::queue_counts(database)))
+            .await
+        {
+            Ok(counts) => (Some(counts.0), Some(counts.1), Some(counts.2)),
+            Err(error) => {
+                log::debug!("failed to read database vitals queue counts: {error}");
+                (None, None, None)
+            }
         };
-        let (memory_rss_bytes, memory_rss_peak_bytes) = process_memory();
+
+        let commands_waiting = self.sender.len() as u64;
+        let (rss_bytes, peak_rss_bytes) = process_memory();
+
+        let durable_commits = self.shared.durable_commits.load(Ordering::Relaxed);
+        let commit_us_total = self.shared.commit_us_total.load(Ordering::Relaxed);
+        let commit_us_max = self.shared.commit_us_max.load(Ordering::Relaxed);
+        let commit_us_mean = commit_us_total.checked_div(durable_commits);
+
+        let claims_count = self.shared.claims.load(Ordering::Relaxed);
+        let claim_us_total = self.shared.claim_us_total.load(Ordering::Relaxed);
+        let claim_us_max = self.shared.claim_us_max.load(Ordering::Relaxed);
+        let claim_us_mean = claim_us_total.checked_div(claims_count);
+
         Vitals {
-            commits: self.shared.commits.load(Ordering::SeqCst),
-            durable_commits: self.shared.durable_commits.load(Ordering::SeqCst),
-            commit_us_total: self.shared.commit_us_total.load(Ordering::Relaxed),
-            commit_us_max: self.shared.commit_us_max.load(Ordering::Relaxed),
-            claims: self.shared.claims.load(Ordering::SeqCst),
-            claim_us_total: self.shared.claim_us_total.load(Ordering::Relaxed),
-            claim_us_max: self.shared.claim_us_max.load(Ordering::Relaxed),
-            queue_pending,
-            queue_ready,
-            queue_delayed,
-            memory_rss_bytes,
-            memory_rss_peak_bytes,
+            database_bytes,
+            available_bytes,
+            durable_commits,
+            commit_us_mean,
+            commit_us_max,
+            claims_count,
+            claim_us_mean,
+            claim_us_max,
+            queue_pending: queue_counts.0,
+            queue_ready: queue_counts.1,
+            queue_delayed: queue_counts.2,
+            commands_waiting,
+            rss_bytes,
+            peak_rss_bytes,
         }
     }
 
@@ -144,7 +149,7 @@ impl DatabaseHandle {
     pub async fn usage_summary(
         &self,
         filter: crate::token_usage::UsageSummaryFilter,
-    ) -> Result<crate::token_usage::UsageSummaryRecord, DatabaseError> {
+    ) -> Result<crate::token_usage::UsageSummaryResponse, DatabaseError> {
         self.read(move |database| storage::read_usage_summary(database, &filter)).await
     }
 
@@ -584,7 +589,15 @@ impl DatabaseHandle {
     /// and a compatible Pool with room are free. The Jobs it returns are
     /// claimed once this returns; execution starts only after the commit.
     pub async fn claim_batch(&self) -> Result<Vec<JobId>, DatabaseError> {
-        self.submit(|reply| Command::ClaimBatch { reply }).await
+        let started = Instant::now();
+        let jobs = self.submit(|reply| Command::ClaimBatch { reply }).await?;
+        if !jobs.is_empty() {
+            let duration_us = started.elapsed().as_micros() as u64;
+            self.shared.claims.fetch_add(1, Ordering::Relaxed);
+            self.shared.claim_us_total.fetch_add(duration_us, Ordering::Relaxed);
+            self.shared.claim_us_max.fetch_max(duration_us, Ordering::Relaxed);
+        }
+        Ok(jobs)
     }
 
     pub async fn frozen_pool_binding(

@@ -698,6 +698,7 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
             });
         }
     }
+    let old_sample = batch.usage_sample(metrics.job, metrics.request)?;
     let mut id = None;
     if !metrics.measurements.is_empty() {
         let seq = batch.insert_request_event(
@@ -722,7 +723,7 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
         )?;
         id.get_or_insert(request_record_id(metrics.request, seq));
     }
-    batch.update_usage_total(metrics.job, metrics.request)?;
+    batch.update_usage_total(metrics.job, metrics.request, old_sample)?;
     Ok(MetricsId::new(id.unwrap_or(0)))
 }
 

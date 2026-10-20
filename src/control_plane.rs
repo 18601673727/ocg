@@ -43,8 +43,9 @@
 //!
 //! Routes, all versioned under `/api/v1`:
 //!
-//! - `GET /api/v1/health`: what the host can establish: it is running, and
-//!   whether the database reads and accepts commands. Nothing about
+//! - `GET /api/v1/health`: what the host can establish: it is running,
+//!   whether the database reads and accepts commands, database vitals,
+//!   claim timing, queue lengths, and process memory. Nothing about
 //!   Providers or credentials.
 //! - `GET /api/v1/jobs/{job}`: the Job's persisted lifecycle, with `job`
 //!   written as OCG writes it, `job:<n>`.

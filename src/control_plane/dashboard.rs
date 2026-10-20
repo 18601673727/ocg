@@ -185,6 +185,34 @@ pub(super) async fn usage(shared: &Shared, query: ObservationQuery) -> Result<Re
     )
 }
 
+pub(super) async fn tool_stats(shared: &Shared) -> Result<Reply, Refusal> {
+    let stats = shared.database.tool_stats().await?;
+    let tools = stats
+        .into_iter()
+        .map(|stat| {
+            let finished = stat.completed.saturating_add(stat.failed);
+            let duration_us_mean = stat.duration_us_total.checked_div(finished);
+            json!({
+                "name": stat.name,
+                "admitted": stat.admitted,
+                "refused_arguments": stat.refused_arguments,
+                "completed": stat.completed,
+                "failed": stat.failed,
+                "open": stat.admitted.saturating_sub(stat.completed).saturating_sub(stat.failed),
+                "duration_us_mean": duration_us_mean,
+                "duration_us_max": stat.duration_us_max,
+            })
+        })
+        .collect::<Vec<_>>();
+    bounded(
+        shared,
+        json!({
+            "api_version": API_VERSION,
+            "tools": tools,
+        }),
+    )
+}
+
 pub(super) fn usage_summary_query(
     query: &str,
 ) -> Result<crate::token_usage::UsageSummaryFilter, Refusal> {
@@ -204,9 +232,12 @@ pub(super) fn usage_summary_query(
     }
     let agent = values
         .remove("agent")
-        .map(|value| decimal::<u64>(value).ok_or(INVALID_REQUEST))
+        .map(|value| {
+            super::profiles::profile_id(value)
+                .map(|id| id.get())
+                .or_else(|_| decimal::<u64>(value).ok_or(INVALID_REQUEST))
+        })
         .transpose()?;
-    let model = values.remove("model").map(str::to_owned);
     if !values.is_empty() {
         return Err(INVALID_REQUEST);
     }
@@ -214,7 +245,6 @@ pub(super) fn usage_summary_query(
         from_us,
         until_us,
         agent,
-        model,
     })
 }
 
@@ -223,10 +253,14 @@ pub(super) async fn usage_summary(
     filter: crate::token_usage::UsageSummaryFilter,
 ) -> Result<Reply, Refusal> {
     let summary = shared.database.usage_summary(filter).await?;
-    let mut val = serde_json::to_value(&summary).map_err(|_| INTERNAL)?;
-    val["api_version"] = json!(API_VERSION);
-    val["summary"] = json!(&summary);
-    val["usage_summary"] = json!(&summary);
+    let val = json!({
+        "api_version": API_VERSION,
+        "from_us": summary.from_us,
+        "until_us": summary.until_us,
+        "complete": summary.complete,
+        "resume_from_us": summary.resume_from_us,
+        "rows": summary.rows,
+    });
     bounded(shared, val)
 }
 
@@ -386,16 +420,18 @@ mod tests {
         assert_eq!(filter.from_us, None);
         assert_eq!(filter.until_us, None);
         assert_eq!(filter.agent, None);
-        assert_eq!(filter.model, None);
 
-        let filter = usage_summary_query("from_us=100&until_us=200&agent=42&model=gpt-4o")
-            .expect("full query");
+        let filter = usage_summary_query("from_us=100&until_us=200&agent=profile:42")
+            .expect("profile query");
         assert_eq!(filter.from_us, Some(100));
         assert_eq!(filter.until_us, Some(200));
         assert_eq!(filter.agent, Some(42));
-        assert_eq!(filter.model.as_deref(), Some("gpt-4o"));
+
+        let filter = usage_summary_query("agent=42").expect("decimal agent");
+        assert_eq!(filter.agent, Some(42));
 
         assert!(usage_summary_query("from_us=200&until_us=100").is_err());
+        assert!(usage_summary_query("model=gpt-4o").is_err());
         assert!(usage_summary_query("unknown=1").is_err());
     }
 }

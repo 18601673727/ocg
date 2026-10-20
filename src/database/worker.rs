@@ -220,6 +220,7 @@ impl DatabaseWorker {
                     scheduler_wake,
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
                     active_policy: policy,
+                    database_directory: directory.to_path_buf(),
                     log_directory,
                     log_files: Arc::new(crate::logger::LogFiles::default()),
                     cleanup_worker: Arc::new(AtomicBool::new(false)),
@@ -230,7 +231,6 @@ impl DatabaseWorker {
                     epoch: AtomicU64::new(epoch),
                     next_operation: AtomicU64::new(next_operation),
                     durable_commits: AtomicU64::new(0),
-                    commits: AtomicU64::new(0),
                     commit_us_total: AtomicU64::new(0),
                     commit_us_max: AtomicU64::new(0),
                     claims: AtomicU64::new(0),
@@ -886,8 +886,7 @@ impl WriteWorker {
         // transaction, and a group of them made all of theirs durable together.
         let commit_duration_us = commit_started.elapsed().as_micros() as u64;
         if !executed.is_empty() {
-            self.shared.commits.fetch_add(executed.len() as u64, Ordering::SeqCst);
-            self.shared.durable_commits.fetch_add(1, Ordering::SeqCst);
+            self.shared.durable_commits.fetch_add(1, Ordering::Relaxed);
             self.shared.commit_us_total.fetch_add(commit_duration_us, Ordering::Relaxed);
             self.shared.commit_us_max.fetch_max(commit_duration_us, Ordering::Relaxed);
         }

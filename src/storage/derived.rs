@@ -62,11 +62,17 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
             totals.0 = totals.0.saturating_add(admission.arguments.len() as u64);
             totals.1 = totals.1.saturating_add(admission.parameters.len() as u64);
         }
-        let stats = tool_stats.entry(record.name.clone()).or_insert((0, 0, 0, 0, 0, 0));
+        let mut count_changed = false;
+        let mut admitted_inc = 0;
+        let mut refused_inc = 0;
         match &record.decision.fact {
-            crate::persistence::ToolDecision::Admitted(_) => stats.0 = stats.0.saturating_add(1),
+            crate::persistence::ToolDecision::Admitted(_) => {
+                admitted_inc = 1;
+                count_changed = true;
+            }
             crate::persistence::ToolDecision::Refused(crate::storage::ToolCallRefusal::InvalidArguments) => {
-                stats.1 = stats.1.saturating_add(1);
+                refused_inc = 1;
+                count_changed = true;
             }
             crate::persistence::ToolDecision::Refused(
                 crate::storage::ToolCallRefusal::Malformed
@@ -79,23 +85,28 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
                 | crate::storage::ToolCallRefusal::UnsupportedSchema,
             ) => {}
         }
-        if let Some(outcome) = &record.outcome {
-            let duration_us = outcome
-                .at
-                .as_unix_micros()
-                .saturating_sub(record.decision.at.as_unix_micros())
-                .max(0) as u64;
-            stats.4 = stats.4.saturating_add(duration_us);
-            stats.5 = stats.5.max(duration_us);
-            match &outcome.fact {
-                crate::persistence::ToolOutcome::Completed { .. } => {
-                    stats.2 = stats.2.saturating_add(1);
-                }
-                crate::persistence::ToolOutcome::CompletedWithheld { .. }
-                | crate::persistence::ToolOutcome::NotApplied { .. }
-                | crate::persistence::ToolOutcome::NotInvoked { .. }
-                | crate::persistence::ToolOutcome::Uncertain { .. } => {
-                    stats.3 = stats.3.saturating_add(1);
+        if count_changed || record.outcome.is_some() {
+            let stats = tool_stats.entry(record.name.clone()).or_insert((0, 0, 0, 0, 0, 0));
+            stats.0 = stats.0.saturating_add(admitted_inc);
+            stats.1 = stats.1.saturating_add(refused_inc);
+            if let Some(outcome) = &record.outcome {
+                let duration_us = outcome
+                    .at
+                    .as_unix_micros()
+                    .saturating_sub(record.decision.at.as_unix_micros())
+                    .max(0) as u64;
+                stats.4 = stats.4.saturating_add(duration_us);
+                stats.5 = stats.5.max(duration_us);
+                match &outcome.fact {
+                    crate::persistence::ToolOutcome::Completed { .. }
+                    | crate::persistence::ToolOutcome::CompletedWithheld { .. } => {
+                        stats.2 = stats.2.saturating_add(1);
+                    }
+                    crate::persistence::ToolOutcome::NotApplied { .. }
+                    | crate::persistence::ToolOutcome::NotInvoked { .. }
+                    | crate::persistence::ToolOutcome::Uncertain { .. } => {
+                        stats.3 = stats.3.saturating_add(1);
+                    }
                 }
             }
         }
@@ -124,22 +135,22 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         let records = observations::metrics_of(JobId::new(job_id), &target, events);
         if let Ok(samples) = crate::token_usage::TokenRequestSample::per_request(&records) {
             for sample in samples {
-                let hour = (sample.observed_at.as_unix_micros().max(0) as u64) / 3_600_000_000;
+                let hour = sample.observed_at.as_unix_micros().div_euclid(3_600_000_000);
                 let key = (hour, agent, provider, model_hash);
                 let entry = usage_totals.entry(key).or_insert((0, 0, 0, 0, 0, 0, 0));
+                let complete = if sample.usage == crate::token_usage::TokenUsageState::Complete { 1 } else { 0 };
                 let input = sample.input.value().unwrap_or(0) as u64;
                 let output = sample.output.value().unwrap_or(0) as u64;
                 let cache_read = sample.cache_read.value().unwrap_or(0) as u64;
                 let cache_write = sample.cache_write.value().unwrap_or(0) as u64;
                 let reasoning = sample.reasoning.value().unwrap_or(0) as u64;
-                let total = sample.total.unwrap_or(0);
                 entry.0 = entry.0.saturating_add(1);
-                entry.1 = entry.1.saturating_add(input);
-                entry.2 = entry.2.saturating_add(output);
-                entry.3 = entry.3.saturating_add(cache_read);
-                entry.4 = entry.4.saturating_add(cache_write);
-                entry.5 = entry.5.saturating_add(reasoning);
-                entry.6 = entry.6.saturating_add(total);
+                entry.1 = entry.1.saturating_add(complete);
+                entry.2 = entry.2.saturating_add(input);
+                entry.3 = entry.3.saturating_add(output);
+                entry.4 = entry.4.saturating_add(cache_read);
+                entry.5 = entry.5.saturating_add(cache_write);
+                entry.6 = entry.6.saturating_add(reasoning);
             }
         }
     }
@@ -450,7 +461,7 @@ mod tests {
         {
             let mut table = tx.open_table(USAGE_TOTALS).expect("open");
             table
-                .insert((1, 1, 1, [0u8; 32]), (1, 10, 20, 0, 0, 0, 30))
+                .insert((1, 1, 1, [0u8; 32]), (1, 1, 10, 20, 0, 0, 0))
                 .expect("insert");
         }
         tx.commit().expect("commit");
@@ -473,5 +484,359 @@ mod tests {
             problems_after.is_empty(),
             "expected clean, got: {problems_after:?}"
         );
+    }
+
+    fn provision(database: &crate::database::DatabaseHandle) -> (crate::persistence::ExecutionPoolId, crate::persistence::ProfileId) {
+        use crate::persistence::*;
+        use crate::test_support::wait;
+        use std::collections::BTreeSet;
+        use std::num::NonZeroU32;
+        let connection = wait(database.create_config(NewConfig {
+            name: "conn".into(),
+            body: ConfigBody::Connection(ConnectionConfig {
+                protocol: LlmTransport::OpenAiChatCompletions,
+                endpoint: None,
+                credential_ref: None,
+            }),
+        }))
+        .unwrap();
+        let llm = wait(database.create_config(NewConfig {
+            name: "model".into(),
+            body: ConfigBody::Model(ModelConfig {
+                connection_id: connection,
+                model: "m-1".into(),
+                context_window: None,
+                parameters: Default::default(),
+                declared_capabilities: Default::default(),
+            }),
+        }))
+        .unwrap();
+        let pool = wait(database.create_execution_pool(NewExecutionPool {
+            name: "pool".into(),
+            config: ExecutionPoolConfig {
+                concurrency_limit: NonZeroU32::new(16).unwrap(),
+                capabilities: CapabilitySet {
+                    operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
+                    llm_protocols: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+                },
+            },
+            enabled: true,
+        }))
+        .unwrap();
+        (pool, llm.into())
+    }
+
+    #[test]
+    fn tool_stats_counter_lifecycle_and_rebuild_clean() {
+        use crate::database::DatabaseWorker;
+        use crate::persistence::*;
+        use crate::test_support::wait;
+        use std::collections::BTreeSet;
+
+        let (_data, directory) = data_directory("derived", "tool-counter-lifecycle");
+        let worker = DatabaseWorker::start(&directory).expect("worker");
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+        let job = wait(database.create_job(NewJob {
+            name: None,
+            eligible_at: None,
+            parent: database.genesis(),
+            project: None,
+            dependencies: Vec::new(),
+            input: JobInputDraft::default(),
+            configuration: Some(ExecutionConfiguration {
+                agent_profile: None,
+                llm_profile: llm,
+            }),
+            previous: None,
+        }))
+        .unwrap();
+        wait(database.claim_execution(ClaimRequest {
+            job,
+            allowed_pools: BTreeSet::from([pool]),
+        }))
+        .unwrap()
+        .unwrap();
+
+        let request = RequestNumber::FIRST;
+        wait(database.record_metrics(NewMetrics {
+            job,
+            request,
+            observed_at: Timestamp::now(),
+            measurements: Measurements {
+                ttfb_ms: Some(1),
+                ..Measurements::default()
+            },
+            token: None,
+        }))
+        .unwrap();
+
+        let admission = ToolAdmission {
+            handler_version: "workspace_run_command-6".into(),
+            effect: ToolEffect::ReadOnly,
+            parameters: "{}".into(),
+            arguments: ToolPayload::new("{}"),
+            authorization: AuthorizationBasis::RegistryGrant,
+        };
+
+        // Call 1: Admitted -> Completed
+        let call1 = ToolCallRef { job, request, index: 0 };
+        wait(database.record_tool_decision(NewToolEvidence {
+            call: call1,
+            tool_call_id: "c-1".into(),
+            name: "tool_a".into(),
+            spawns: false,
+            decision: ToolDecision::Admitted(admission.clone()),
+        }))
+        .unwrap();
+        wait(database.record_tool_outcome(
+            call1,
+            ToolOutcome::Completed {
+                result: ToolPayload::new("{}"),
+            },
+        ))
+        .unwrap();
+
+        // Call 2: Admitted -> NotApplied
+        let call2 = ToolCallRef { job, request, index: 1 };
+        wait(database.record_tool_decision(NewToolEvidence {
+            call: call2,
+            tool_call_id: "c-2".into(),
+            name: "tool_a".into(),
+            spawns: false,
+            decision: ToolDecision::Admitted(admission),
+        }))
+        .unwrap();
+        wait(database.record_tool_outcome(
+            call2,
+            ToolOutcome::NotApplied {
+                message: "skipped".into(),
+            },
+        ))
+        .unwrap();
+
+        // Call 3: Refused (InvalidArguments)
+        let call3 = ToolCallRef { job, request, index: 2 };
+        wait(database.record_tool_decision(NewToolEvidence {
+            call: call3,
+            tool_call_id: "c-3".into(),
+            name: "tool_a".into(),
+            spawns: false,
+            decision: ToolDecision::Refused(crate::storage::ToolCallRefusal::InvalidArguments),
+        }))
+        .unwrap();
+
+        let stats = wait(database.tool_stats()).unwrap();
+        let stat = stats.iter().find(|s| s.name == "tool_a").expect("tool_a");
+        assert_eq!(stat.admitted, 2);
+        assert_eq!(stat.refused_arguments, 1);
+        assert_eq!(stat.completed, 1);
+        assert_eq!(stat.failed, 1);
+        let open = stat.admitted - stat.completed - stat.failed;
+        assert_eq!(open, 0);
+
+        worker.shutdown().unwrap();
+        let opened = crate::storage::open(directory.database_path())
+            .unwrap_or_else(|_| panic!("open"));
+        let inconsistencies = relationship_inconsistencies(&opened.database).unwrap();
+        assert!(inconsistencies.is_empty(), "expected clean, got: {inconsistencies:?}");
+    }
+
+    #[test]
+    fn usage_totals_cumulative_then_final_and_agent_hour_filtering() {
+        use crate::database::DatabaseWorker;
+        use crate::openai_compatible::NormalizedUsage;
+        use crate::persistence::*;
+        use crate::test_support::wait;
+        use std::collections::BTreeSet;
+
+        let (_data, directory) = data_directory("derived", "usage-filtering");
+        let worker = DatabaseWorker::start(&directory).expect("worker");
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+
+        let agent_1 = wait(database.create_config(NewConfig {
+            name: "agent-1".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                instructions: Some("agent 1".into()),
+                behavior: AgentBehavior::Chat,
+                models: vec![llm.into()],
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+
+        let agent_2 = wait(database.create_config(NewConfig {
+            name: "agent-2".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                instructions: Some("agent 2".into()),
+                behavior: AgentBehavior::Chat,
+                models: vec![llm.into()],
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+
+        let job_1 = wait(database.create_job(NewJob {
+            name: None,
+            eligible_at: None,
+            parent: database.genesis(),
+            project: None,
+            dependencies: Vec::new(),
+            input: JobInputDraft::default(),
+            configuration: Some(ExecutionConfiguration {
+                agent_profile: Some(agent_1.into()),
+                llm_profile: llm,
+            }),
+            previous: None,
+        }))
+        .unwrap();
+        wait(database.claim_execution(ClaimRequest {
+            job: job_1,
+            allowed_pools: BTreeSet::from([pool]),
+        }))
+        .unwrap()
+        .unwrap();
+
+        let t0 = Timestamp::from_unix_micros(3_600_000_000); // Hour 1
+
+        // 1. Cumulative metrics
+        wait(database.record_metrics(NewMetrics {
+            job: job_1,
+            request: RequestNumber::FIRST,
+            observed_at: t0,
+            measurements: Measurements {
+                usage: NormalizedUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            token: Some(crate::token_usage::TokenAnnotation::eligible(crate::token_usage::UsageFinality::Cumulative)),
+        }))
+        .unwrap();
+
+        // Check summary so far
+        let summary = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter::default())).unwrap();
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].requests, 1);
+        assert_eq!(summary.rows[0].complete_requests, 0);
+        assert_eq!(summary.rows[0].input_tokens, 10);
+        assert_eq!(summary.rows[0].output_tokens, 5);
+        assert!(!summary.complete);
+
+        // 2. Final metrics for the same request
+        wait(database.record_metrics(NewMetrics {
+            job: job_1,
+            request: RequestNumber::FIRST,
+            observed_at: t0,
+            measurements: Measurements {
+                usage: NormalizedUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(8),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            token: Some(crate::token_usage::TokenAnnotation::eligible(crate::token_usage::UsageFinality::Final)),
+        }))
+        .unwrap();
+
+        let summary = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter::default())).unwrap();
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].requests, 1);
+        assert_eq!(summary.rows[0].complete_requests, 1);
+        assert_eq!(summary.rows[0].input_tokens, 10);
+        assert_eq!(summary.rows[0].output_tokens, 8);
+        assert!(summary.complete);
+
+        // 3. Second request 1 hour later under agent_2
+        let job_2 = wait(database.create_job(NewJob {
+            name: None,
+            eligible_at: None,
+            parent: database.genesis(),
+            project: None,
+            dependencies: Vec::new(),
+            input: JobInputDraft::default(),
+            configuration: Some(ExecutionConfiguration {
+                agent_profile: Some(agent_2.into()),
+                llm_profile: llm,
+            }),
+            previous: None,
+        }))
+        .unwrap();
+        wait(database.claim_execution(ClaimRequest {
+            job: job_2,
+            allowed_pools: BTreeSet::from([pool]),
+        }))
+        .unwrap()
+        .unwrap();
+
+        let t1 = Timestamp::from_unix_micros(7_200_000_000); // Hour 2
+        wait(database.record_metrics(NewMetrics {
+            job: job_2,
+            request: RequestNumber::FIRST,
+            observed_at: t1,
+            measurements: Measurements {
+                usage: NormalizedUsage {
+                    input_tokens: Some(20),
+                    output_tokens: Some(15),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            token: Some(crate::token_usage::TokenAnnotation::eligible(crate::token_usage::UsageFinality::Final)),
+        }))
+        .unwrap();
+
+        // Filter by agent_1
+        let summary_agent1 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+            from_us: None,
+            until_us: None,
+            agent: Some(agent_1.get()),
+        }))
+        .unwrap();
+        assert_eq!(summary_agent1.rows.len(), 1);
+        assert_eq!(summary_agent1.rows[0].agent, agent_1.get());
+        assert_eq!(summary_agent1.rows[0].input_tokens, 10);
+
+        // Filter by agent_2
+        let summary_agent2 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+            from_us: None,
+            until_us: None,
+            agent: Some(agent_2.get()),
+        }))
+        .unwrap();
+        assert_eq!(summary_agent2.rows.len(), 1);
+        assert_eq!(summary_agent2.rows[0].agent, agent_2.get());
+        assert_eq!(summary_agent2.rows[0].input_tokens, 20);
+
+        // Filter by hour 1 only: [3_600_000_000, 3_600_000_000]
+        let summary_hour1 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+            from_us: Some(3_600_000_000),
+            until_us: Some(3_600_000_000),
+            agent: None,
+        }))
+        .unwrap();
+        assert_eq!(summary_hour1.rows.len(), 1);
+        assert_eq!(summary_hour1.rows[0].agent, agent_1.get());
+
+        // Filter by hour 2 only: [7_200_000_000, 7_200_000_000]
+        let summary_hour2 = wait(database.usage_summary(crate::token_usage::UsageSummaryFilter {
+            from_us: Some(7_200_000_000),
+            until_us: Some(7_200_000_000),
+            agent: None,
+        }))
+        .unwrap();
+        assert_eq!(summary_hour2.rows.len(), 1);
+        assert_eq!(summary_hour2.rows[0].agent, agent_2.get());
+
+        worker.shutdown().unwrap();
+
+        let opened = crate::storage::open(directory.database_path())
+            .unwrap_or_else(|_| panic!("open"));
+        let problems = relationship_inconsistencies(&opened.database).unwrap();
+        assert!(problems.is_empty(), "expected clean, got: {problems:?}");
     }
 }
