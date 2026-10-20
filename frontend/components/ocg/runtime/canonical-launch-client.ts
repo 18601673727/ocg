@@ -5,7 +5,7 @@ import type { CreateSessionInput, ScenarioId } from "./runtime-types";
 import { createHttpCanonicalControlClient, ControlTransportError, type ControlSubmission, type HttpCanonicalControlClient, type JobStreamSubscription } from "./control-client";
 import { jobTranscript } from "../chat/job-transcript-model";
 
-type Turn = { sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string; toolError?: string };
+type Turn = { entries?: ControlConversationTurn["entries"]; sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string; toolError?: string };
 type Pending = { key: string; signature: string; submission: ControlSubmission; admittedJob?: string };
 type StreamEntry = { subscription: JobStreamSubscription | null; timer: ReturnType<typeof setTimeout> | null; stopped: boolean };
 
@@ -74,7 +74,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           (item.tip_created_at_us < local.job.created_at_us ||
             (item.tip_created_at_us === local.job.created_at_us && Number(item.tip_job.slice(4)) < Number(known.slice(4))))) continue;
         this.tips.set(id, item.tip_job);
-        const session: ChatSession = { id, sessionId: item.tip_job, title: item.title, agentProfile: item.agent, workType: "research", updatedAt: new Date(item.tip_created_at_us / 1000).toISOString() };
+        const session: ChatSession = { id, sessionId: item.tip_job, title: item.title, agentProfile: item.agent ?? undefined, workType: "research", updatedAt: new Date(item.tip_created_at_us / 1000).toISOString() };
         this.emit({ type: current ? "conversation.session-updated" : "conversation.session-created", session });
       }
       if (!page.has_more) break;
@@ -166,23 +166,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   private async readConversation(job: string): Promise<string> {
     await this.refresh?.catch(() => {});
-    let conversation = await this.control.readJobConversation(job, this.lifetime.signal);
-    const root = conversation.turns[0].job.id;
-    if (!this.roots.has(root) && !this.hiddenRoots.has(root)) await this.refreshConversations();
+    const record = await this.control.readJob(job, this.lifetime.signal);
+    const root = record.kind === "conversation" ? record.id : record.conversation;
+    if (!root) throw new Error("This Job is a process turn with no conversation.");
+    const page = await this.control.readConversationTurns(root, undefined, 20, this.lifetime.signal);
+    const conversation = { ...page, turns: [...page.turns].reverse() };
     const hiddenBefore = this.hiddenRoots.has(root);
     const id = this.roots.get(root) ?? root;
-    const listed = this.roots.has(root) && !hiddenBefore && !this.unlisted.has(id);
-    if (!listed) {
-      this.roots.set(root, id);
-      this.unlisted.add(id);
-    }
-    const listedTip = listed ? this.tips.get(id) : undefined;
-    if (listedTip && !conversation.turns.some(t => t.job.id === listedTip)) {
-      job = listedTip;
-      conversation = await this.control.readJobConversation(job, this.lifetime.signal);
-    }
+    if (!this.roots.has(root)) this.roots.set(root, id);
+    job = conversation.turns.at(-1)?.job.id ?? job;
     if (!this.getSnapshot().sessions.some(session => session.id === id)) {
-      this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0].input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
+      this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0]?.input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
     }
     // Read each turn's attachments and tool evidence as well as its stored text.
     await Promise.all(conversation.turns.map(async turn => {
@@ -218,12 +212,15 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private publish(sessionId: string) {
     if (this.disposed || !this.getSnapshot().sessions.some(session => session.id === sessionId)) return;
     const turns = [...this.turns.values()].filter(turn => turn.sessionId === sessionId).sort((a, b) => a.job.created_at_us - b.job.created_at_us || Number(a.job.id.slice(4)) - Number(b.job.id.slice(4)));
-    const messages: ChatMessage[] = turns.flatMap(turn => jobTranscript(turn.job.id, turn.input.objective, turn.outputs, turn.job.settlement, turn.job.settlement.state === "unsettled").map(message => ({
+    const messages: ChatMessage[] = turns.flatMap(turn => {
+      const users: ChatMessage[] = (turn.entries ?? []).filter(entry => entry.kind === "user_message").map(entry => ({ id: `${turn.job.id}:entry:${entry.seq}`, jobId: turn.job.id, commandId: turn.job.id, role: "user", content: entry.text ?? "", status: "completed", createdAt: new Date(entry.at_us / 1000).toISOString(), images: entry.attachments.flatMap(id => this.images.get(id) ?? []) }));
+      return [...users, ...jobTranscript(turn.job.id, turn.entries ? null : turn.input.objective, turn.outputs, turn.job.settlement, turn.job.settlement.state === "unsettled").map(message => ({
       id: message.id, jobId: turn.job.id, commandId: turn.job.id, role: message.role, content: message.content,
       status: message.status,
       createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
       ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, failureReason: turn.error ?? turn.toolError ?? message.detail ?? (message.status === "unknown" ? (turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") : undefined) }),
-    })));
+    }))];
+    });
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
   }
 
@@ -330,19 +327,18 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
-    await this.submit(sessionId, input, this.pending.get(sessionId)?.submission.previous ?? (this.pending.has(sessionId) ? undefined : this.tips.get(sessionId)));
+    await this.submit(sessionId, input, this.pending.get(sessionId)?.submission.conversation ?? (this.pending.has(sessionId) ? undefined : [...this.roots].find(([, id]) => id === sessionId)?.[0]));
   }
 
-  private async submit(sessionId: string, input: SendMessageInput, previous?: string) {
+  private async submit(sessionId: string, input: SendMessageInput, conversation?: string) {
     if (this.hiding.has(sessionId)) throw new Error("Wait for this conversation to finish hiding before sending.");
     if (!this.getSnapshot().sessions.some(session => session.id === sessionId)) throw new Error("Conversation presentation is no longer available.");
     if (this.sending.has(sessionId)) throw new Error("This turn is being submitted.");
-    if ([...this.turns.values()].some(turn => turn.sessionId === sessionId && turn.job.settlement.state === "unsettled")) throw new Error("Stop the running turn or wait for settlement before sending a follow-up.");
     const selection = input.selection ?? this.selections.get(sessionId);
     if (!selection?.agentProfile || !selection.llmProfile || !selection.executor) throw new Error("Select an Agent, Model and Executor before sending.");
-    const predecessor = previous ? this.turns.get(previous) : undefined;
+    const predecessor = this.turns.get(this.tips.get(sessionId) ?? "");
     if (predecessor?.input.configuration?.agent_profile && predecessor.input.configuration.agent_profile !== selection.agentProfile) throw new Error("A follow-up keeps the conversation's Agent. Start a new conversation to change Agents.");
-    const submission: ControlSubmission = { agent_profile: selection.agentProfile, llm_profile: selection.llmProfile, executor: selection.executor, objective: input.content, ...(previous ? { previous } : selection.project ? { project: selection.project } : {}), attachments: input.images?.map(image => image.id) ?? [] };
+    const submission: ControlSubmission = { agent_profile: selection.agentProfile, llm_profile: selection.llmProfile, executor: selection.executor, objective: input.content, ...(conversation ? { conversation } : selection.project ? { project: selection.project } : {}), attachments: input.images?.map(image => image.id) ?? [] };
     const signature = JSON.stringify(submission);
     const held = this.pending.get(sessionId);
     if (held && held.signature !== signature) throw new Error("The previous admission is unresolved. Resend the unchanged message to resolve its existing Idempotency-Key.");
@@ -361,10 +357,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (!session) throw new Error("Conversation presentation is no longer available.");
       this.tips.set(sessionId, job);
       for (const image of input.images ?? []) this.images.set(image.id, image);
-      if (!previous) this.roots.set(job, sessionId);
-      this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: selection.agentProfile, title: previous ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
+      const admitted = await this.control.readJob(job);
+      if (admitted.conversation) this.roots.set(admitted.conversation, sessionId);
+      this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: selection.agentProfile, title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
       const [record, frozen, outputs, tools] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), this.control.readAllJobTools(job)]);
-      const turn: Turn = { sessionId, job: record, input: frozen, outputs: outputs.outputs, tools };
+      const page = record.conversation ? await this.control.readConversationTurns(record.conversation, undefined, 20, this.lifetime.signal) : null;
+      const stored = page?.turns.find(turn => turn.job.id === job);
+      const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools };
       while (outputs.has_more) {
         const page = await this.control.readOutputs(job, { afterSeq: turn.outputs.at(-1)?.seq, limit: 100 });
         turn.outputs.push(...page.outputs);
@@ -379,7 +378,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       void this.refreshConversations().catch(error => this.report(error));
     } catch (error) {
       if (!pending.admittedJob && error instanceof ControlTransportError && ((error.status >= 400 && error.status < 500) || error.status === 503)) this.pending.delete(sessionId);
-      if (previous && this.unlisted.has(sessionId) && error instanceof ControlTransportError && error.status === 422 && error.code === "configuration_refused") throw new Error("Open this conversation's latest turn from Jobs to continue.");
+      if (conversation && this.unlisted.has(sessionId) && error instanceof ControlTransportError && error.status === 422 && error.code === "configuration_refused") throw new Error("Open this conversation's latest turn from Jobs to continue.");
       throw error;
     } finally { this.sending.delete(sessionId); }
   }
@@ -387,14 +386,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   override async retryMessage(sessionId: string, messageId: string): Promise<void> {
     const message = this.getSnapshot().messagesBySession[sessionId]?.find(message => message.id === messageId);
     const turn = message?.jobId ? this.turns.get(message.jobId) : undefined;
-    if (!turn || turn.job.settlement.state !== "failed" || (this.tips.get(sessionId) !== turn.job.id && this.pending.get(sessionId)?.submission.previous !== turn.job.id)) throw new Error("Only the latest failed turn can be retried.");
-    await this.submit(sessionId, { content: turn.input.objective ?? "", images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) }, turn.job.id);
+    if (!turn || turn.job.settlement.state !== "failed" || (this.tips.get(sessionId) !== turn.job.id && this.pending.get(sessionId)?.submission.conversation !== turn.job.conversation)) throw new Error("Only the latest failed turn can be retried.");
+    await this.submit(sessionId, { content: turn.input.objective ?? "", images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) }, turn.job.conversation ?? undefined);
   }
 
   override async cancel(sessionId: string): Promise<void> {
     const job = this.tips.get(sessionId);
     if (!job) throw new Error("No admitted turn to stop.");
-    const result = await this.control.stopJob(job, this.lifetime.signal);
+    const result = await this.control.stopConversation(this.turns.get(job)?.job.conversation ?? job, this.lifetime.signal);
     const turn = this.turns.get(job);
     if (turn) { turn.error = result.status === "requested" ? "Stop requested; awaiting the host's settlement." : "The host reports this turn already settled."; this.publish(sessionId); }
   }

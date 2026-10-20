@@ -21,14 +21,17 @@ use crate::persistence::{
     self, AppendedOutput, AttachmentId, AttachmentOrigin, AttachmentRecord, AvailabilityStatId,
     AvailabilityStatRecord, CleanupKind, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
     ContentDigest, ConversationEdit, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId,
-    ExecutorId, JobFinalization, JobId, JobInputId, JobOutputRecord, JobRecord, JobRetry,
-    MetricsId, MetricsRecord, NewAttachment, NewAvailabilityStat, NewConfig, NewExecutionPool,
-    NewExecutor, NewJob, NewJobOutput, NewMetrics, NewProject, NewProviderAnswer, NewSentRequest,
-    NewSubmission, NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage,
-    ObservedModel, ObservedModelFilter, ObservedModelPage, OperationId, OperationKind,
-    ProjectCommand, ProjectId, ProjectRecord, ProviderRequestRecord, PublishedAttachment,
-    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
-    ToolOutcome, ToolReconciliation, Violation,
+    ExecutorId, JobFinalization, JobId, JobInputId, JobOutputRecord, JobRecord, MetricsId,
+    MetricsRecord, NewAttachment, NewAvailabilityStat, NewConfig, NewExecutionPool, NewExecutor,
+    NewJob, NewJobOutput, NewMetrics, NewProject, NewProviderAnswer, NewSentRequest, NewSubmission,
+    NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
+    ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, ProjectCommand, ProjectId,
+    ProjectRecord, ProviderRequestRecord, PublishedAttachment, RequestNumber, SubmissionKey,
+    SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome,
+    ToolReconciliation, Violation,
+};
+use crate::persistence::{
+    Actor, Appended, ConversationAction, ConversationSpec, Entry, ExecutionConfiguration, StopProof,
 };
 use crate::persistence::{
     ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding, PendingCapturePage,

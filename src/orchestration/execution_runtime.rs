@@ -295,8 +295,6 @@ pub enum ExecutionRuntimeError {
     SchedulerQueueFull,
     #[error("claimed Job {0} has no frozen pool binding")]
     MissingPoolBinding(JobId),
-    #[error("claimed Job {0} has no execution plan in this opening")]
-    MissingExecutionPlan(JobId),
     #[error("database operation failed: {0}")]
     Database(#[from] DatabaseError),
     #[error("executor {0} is not registered")]
@@ -467,6 +465,7 @@ struct RuntimeState {
     stopping: bool,
     closed: bool,
     current: BTreeMap<JobId, CancellationToken>,
+    stops: BTreeMap<JobId, Arc<Mutex<Option<crate::persistence::StopCause>>>>,
 }
 
 struct PendingExecution {
@@ -554,7 +553,7 @@ async fn resolve_project(
     use crate::orchestration::blocking::{self, Kind};
     use crate::orchestration::workspace_read::Workspace;
 
-    let Some(id) = job.project else {
+    let Some(id) = database.turn_execution(job.id).await?.1 else {
         return Ok(None);
     };
     let project = database
@@ -612,9 +611,20 @@ mod grounding_tests {
         let model = wait(handle.config(configuration.llm_profile.into()))
             .expect("read")
             .expect("model");
-        let ConfigBody::Model(model) = model.body else {
+        let ConfigBody::Model(mut model) = model.body else {
             panic!("model")
         };
+        model
+            .declared_capabilities
+            .insert(crate::persistence::ModelCapability::Tools);
+        wait(handle.update_config(
+            configuration.llm_profile.into(),
+            NewConfig {
+                name: "fixture-model".into(),
+                body: ConfigBody::Model(model.clone()),
+            },
+        ))
+        .expect("model tools");
         let endpoint = "https://chat-grounding.invalid/v1";
         wait(handle.update_config(
             model.connection_id,
@@ -649,23 +659,58 @@ mod grounding_tests {
         .expect("executor");
         let mut previous = None;
         for (index, granted) in [true, true, false].into_iter().enumerate() {
-            let job = wait(handle.create_claimed_fixture(
-                NewJob {
-                    name: None,
-                    eligible_at: None,
-                    parent: handle.genesis(),
-                    project: Some(project),
-                    dependencies: vec![],
-                    input: JobInputDraft {
-                        objective: Some("objective".into()),
-                        ..Default::default()
-                    },
-                    configuration: Some(configuration),
-                    previous,
+            let mut live = agent_body.clone();
+            live.tool_grant = granted.then(|| "read".into());
+            wait(handle.update_config(
+                agent,
+                NewConfig {
+                    name: "chat".into(),
+                    body: ConfigBody::Agent(live),
                 },
-                executor,
             ))
-            .expect("claim");
+            .expect("set grant before T1");
+            let entry = crate::persistence::Entry::UserMessage {
+                text: "objective".into(),
+                attachments: Vec::new(),
+            };
+            let job = if let Some(previous) = previous {
+                let conversation = wait(handle.job(previous))
+                    .expect("read")
+                    .expect("turn")
+                    .conversation
+                    .expect("conversation");
+                wait(handle.append(conversation, entry, Some(configuration), None))
+                    .expect("append")
+                    .turn
+            } else {
+                wait(handle.open_conversation(
+                    None,
+                    crate::persistence::ConversationSpec {
+                        name: None,
+                        agent: Some(agent),
+                        project: Some(project),
+                        origin: crate::persistence::Origin::User,
+                        keep_open: true,
+                    },
+                    entry,
+                    configuration,
+                    None,
+                ))
+                .expect("open")
+                .1
+                .turn
+            };
+            assert_eq!(
+                wait(handle.job_configuration(job))
+                    .expect("read frozen")
+                    .expect("frozen")
+                    .frozen
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.tool_grant.as_deref()),
+                granted.then_some("read")
+            );
+            wait(handle.claim_fixture(job, executor)).expect("claim");
             // Change the live grant after T1; execution must use the frozen one.
             let mut edited = agent_body.clone();
             edited.tool_grant = if granted { None } else { Some("read".into()) };
@@ -782,6 +827,7 @@ mod grounding_tests {
         .expect("executor");
         let job = wait(handle.create_claimed_fixture(
             NewJob {
+                process_grant: None,
                 name: None,
                 eligible_at: None,
                 parent: handle.genesis(),
@@ -838,8 +884,11 @@ mod grounding_tests {
     fn grounding_includes_grant_and_agents_md_in_system_messages() {
         let (_data, directory) = data_directory("chat", "agents-md-grounding");
         let (_root, root) = temporary_directory("chat", "agents-md-workspace");
-        std::fs::write(root.join("AGENTS.md"), "# Project Instructions\nFollow these rules.\n")
-            .expect("write AGENTS.md");
+        std::fs::write(
+            root.join("AGENTS.md"),
+            "# Project Instructions\nFollow these rules.\n",
+        )
+        .expect("write AGENTS.md");
         let workspace = Workspace::authorize(&root, &directory).expect("authorize");
         let workspace_tools = WorkspaceTools::new(directory.clone());
         let worker = DatabaseWorker::start(&directory).expect("start");
@@ -901,6 +950,7 @@ mod grounding_tests {
             .expect("executor");
             let job = wait(handle.create_claimed_fixture(
                 NewJob {
+                    process_grant: None,
                     name: None,
                     eligible_at: None,
                     parent: handle.genesis(),
@@ -993,7 +1043,8 @@ mod grounding_tests {
             assert_eq!(read_agents_md(&test_workspace).await, None);
 
             // Non-UTF-8: skipped and logged
-            std::fs::write(root.join("AGENTS.md"), b"hello \xff\xfe world").expect("write non-utf8");
+            std::fs::write(root.join("AGENTS.md"), b"hello \xff\xfe world")
+                .expect("write non-utf8");
             assert_eq!(read_agents_md(&test_workspace).await, None);
             std::fs::remove_file(root.join("AGENTS.md")).expect("remove non-utf8");
 
@@ -1042,10 +1093,26 @@ fn lock(state: &SharedState) -> std::sync::MutexGuard<'_, RuntimeState> {
 #[derive(Clone)]
 pub struct SchedulerHandle {
     sender: flume::Sender<Box<Submission>>,
+    notifications: flume::Sender<SchedulerMessage>,
     state: SharedState,
 }
 
 impl SchedulerHandle {
+    #[cfg(test)]
+    pub(crate) fn running_count(&self) -> usize {
+        lock(&self.state).current.len()
+    }
+    pub fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
+        let mut state = lock(&self.state);
+        let stopped = state.stops.entry(turn).or_default();
+        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause);
+        if let Some(cancellation) = state.current.get(&turn) {
+            cancellation.cancel();
+        }
+        drop(state);
+        self.notifications.send(SchedulerMessage::Stop(turn)).ok();
+    }
+
     /// Creates a pending Job through T1 and returns after that commit. Its
     /// receipt has no result yet; dispatch and finalization run separately.
     pub async fn schedule(
@@ -1119,16 +1186,6 @@ impl SchedulerHandle {
         submission: NewSubmission,
     ) -> Result<AdmittedJob, AdmissionError> {
         self.admit(plan, Some(submission), None).await
-    }
-
-    pub(crate) async fn admit_workspace_provider(
-        &self,
-        plan: ProviderExecutionPlan,
-        submission: NewSubmission,
-        workspace_tools: WorkspaceTools,
-    ) -> Result<AdmittedJob, AdmissionError> {
-        self.admit(plan, Some(submission), Some(workspace_tools))
-            .await
     }
 
     async fn admit(
@@ -1274,11 +1331,22 @@ pub struct ExecutionRuntime {
     finished: Option<ntex::rt::JoinHandle<Result<(), ExecutionRuntimeError>>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimScope {
+    Stored,
+    Process,
+}
+
 impl ExecutionRuntime {
-    pub fn start(database: DatabaseHandle) -> Result<Self, ExecutionRuntimeError> {
+    pub fn start(
+        database: DatabaseHandle,
+        scope: ClaimScope,
+    ) -> Result<Self, ExecutionRuntimeError> {
         #[cfg(test)]
         if ntex::rt::System::try_current().is_none() {
-            return crate::test_support::on_system(move || async move { Self::start(database) });
+            return crate::test_support::on_system(
+                move || async move { Self::start(database, scope) },
+            );
         }
 
         let wake = database
@@ -1290,6 +1358,7 @@ impl ExecutionRuntime {
         let shutdown = CancellationToken::default();
         let finished = ntex::rt::spawn(dispatch_runtime(
             database,
+            scope,
             wake,
             sender.clone(),
             receiver,
@@ -1300,6 +1369,7 @@ impl ExecutionRuntime {
         Ok(Self {
             scheduler: SchedulerHandle {
                 sender: admission,
+                notifications: sender,
                 state,
             },
             shutdown,
@@ -1337,8 +1407,10 @@ impl Drop for ExecutionRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_runtime(
     database: DatabaseHandle,
+    scope: ClaimScope,
     wake: crate::database::SchedulerWakeSubscription,
     sender: flume::Sender<SchedulerMessage>,
     receiver: flume::Receiver<SchedulerMessage>,
@@ -1504,7 +1576,9 @@ async fn dispatch_runtime(
                 }
                 let mut retry_next = BTreeSet::new();
                 for job in std::mem::take(&mut unconfirmed_stopped) {
-                    let result = database.confirm_job_stopped(job).await;
+                    let result = database
+                        .confirm_job_stopped(job, crate::persistence::StopProof::Proof)
+                        .await;
                     if retry_stop_confirmation(&result) {
                         retry_next.insert(job);
                     }
@@ -1551,7 +1625,33 @@ async fn dispatch_runtime(
             SchedulerMessage::Claim(reply) => {
                 // Admission and claim requests share this task so a committed
                 // grant cannot overtake registration of its execution context.
-                let batch = match database.claim_batch().await {
+                let claimed = if scope == ClaimScope::Stored {
+                    database.claim_batch().await
+                } else {
+                    let mut grants = Vec::new();
+                    let mut failure = None;
+                    for execution in pending.values() {
+                        match database
+                            .claim_execution(crate::persistence::ClaimRequest {
+                                job: execution.started.job,
+                                allowed_pools: BTreeSet::from([execution.started.executor.into()]),
+                            })
+                            .await
+                        {
+                            Ok(Ok(_)) => grants.push(execution.started.job),
+                            Ok(Err(_)) => {}
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    }
+                    match failure {
+                        Some(error) => Err(error),
+                        None => Ok(grants),
+                    }
+                };
+                let batch = match claimed {
                     Ok(grants) => {
                         let next_due = match database.next_scheduled_delay().await {
                             Ok(due) => due,
@@ -1578,12 +1678,24 @@ async fn dispatch_runtime(
             }
             SchedulerMessage::Stop(job) => {
                 stop_pending(&database, job, &mut pending, &state).await;
+                // A committed Stop may reach us after Finished removed its task.
+                // Keep the cause through a grant race, but do not retain terminal Jobs.
+                if database
+                    .job(job)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|record| record.any_terminal())
+                {
+                    lock(&state).stops.remove(&job);
+                }
             }
             SchedulerMessage::Finished(job) => {
                 if let Some(task) = running.remove(&job) {
                     finish_grant(&database, job, task).await;
                 }
                 lock(&state).current.remove(&job);
+                lock(&state).stops.remove(&job);
             }
         }
     }
@@ -1639,6 +1751,7 @@ async fn dispatch_runtime(
         finish_grant(&database, job, task).await;
     }
     lock(&state).current.clear();
+    lock(&state).stops.clear();
     Ok(())
 }
 
@@ -1772,6 +1885,21 @@ pub(crate) fn claim_error_finalization(
     tool_may_have_run: bool,
 ) -> JobFinalization {
     match error {
+        ExecutionRuntimeError::NotSettled {
+            source: DatabaseError::Rejected(violation),
+            ..
+        }
+        | ExecutionRuntimeError::ToolLoopNotSettled {
+            source: DatabaseError::Rejected(violation),
+            ..
+        } if !matches!(violation, Violation::JobAlreadyFinalized(_)) => {
+            JobFinalization::Failed(FinalResult {
+                summary: Some(violation.to_string()),
+                code: None,
+                goal_reached: Some(false),
+                value: None,
+            })
+        }
         ExecutionRuntimeError::NotSettled { settlement, .. } => (**settlement).clone(),
         _ if tool_may_have_run => JobFinalization::Unknown,
         ExecutionRuntimeError::ToolLoopNotSettled { stop, .. } if stop.is_unknown() => {
@@ -1817,7 +1945,16 @@ fn spawn_grant(
     state: &SharedState,
     running: &mut BTreeMap<JobId, RunningExecution>,
 ) {
-    let database = database.clone();
+    let cause = lock(state).stops.entry(job).or_default().clone();
+    let database = database.with_stop_cause(cause.clone());
+    if cause
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some()
+        && let Some(execution) = &execution
+    {
+        execution.cancellation.cancel();
+    }
     let notify = NotifyFinished {
         job,
         sender: sender.clone(),
@@ -1831,13 +1968,60 @@ fn spawn_grant(
             execution.cancellation.cancel();
         }
     }
+    let state = state.clone();
     let task = ntex::rt::spawn(async move {
         let _notify = notify;
         JobTask(Box::pin(async move {
             let tool_may_have_run = Cell::new(false);
             let result = async {
-                let execution =
-                    execution.ok_or(ExecutionRuntimeError::MissingExecutionPlan(job))?;
+                let execution = match execution {
+                    Some(execution) => execution,
+                    None => {
+                        let cancellation = CancellationToken::default();
+                        {
+                            let mut state = lock(&state);
+                            if state.stopping
+                                || state.stops.get(&job).is_some_and(|cause| {
+                                    cause
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner)
+                                        .is_some()
+                                })
+                            {
+                                cancellation.cancel();
+                            }
+                            state.current.insert(job, cancellation.clone());
+                        }
+                        let binding = database
+                            .frozen_pool_binding(job)
+                            .await?
+                            .ok_or(ExecutionRuntimeError::MissingPoolBinding(job))?;
+                        PendingExecution {
+                            started: StartedJob {
+                                job,
+                                input: JobInputId::new(job.get()),
+                                executor: binding.pool.into(),
+                            },
+                            execution: PendingPlan::Provider(
+                                ProviderTask {
+                                    workspace_tools: Some(WorkspaceTools::new(
+                                        database.data_directory(),
+                                    )),
+                                    credential_resolver: database.credential_resolver(),
+                                    provider_config: ProviderExecutionConfig {
+                                        cancellation: cancellation.clone(),
+                                        ..ProviderExecutionConfig::default()
+                                    },
+                                    tools: None,
+                                },
+                                None,
+                            ),
+                            cancellation,
+                            done: CancellationToken::default(),
+                            reply: None,
+                        }
+                    }
+                };
                 let binding = database
                     .frozen_pool_binding(job)
                     .await?
@@ -2030,7 +2214,10 @@ pub(crate) fn assemble_conversation(
         {
             messages.push(user_msg);
         }
-        messages.push(ChatMessage::assistant(Some(assistant_text.clone()), Vec::new()));
+        messages.push(ChatMessage::assistant(
+            Some(assistant_text.clone()),
+            Vec::new(),
+        ));
     }
 
     if let Some(user_msg) = provider_execution::objective_conversation_with_images(
@@ -2131,14 +2318,20 @@ impl ContextLimits {
     pub(crate) fn for_profile(config: &crate::persistence::LlmConfig) -> Self {
         Self {
             context_window: config.context_window,
-            max_tokens: Some(config.parameters.max_completion_tokens.or(config.parameters.max_tokens).unwrap_or(4096)),
+            max_tokens: Some(
+                config
+                    .parameters
+                    .max_completion_tokens
+                    .or(config.parameters.max_tokens)
+                    .unwrap_or(4096),
+            ),
         }
     }
 }
 
 pub(crate) struct PriorTurnMessages {
     pub(crate) user: Option<ChatMessage>,
-    pub(crate) assistant: ChatMessage,
+    pub(crate) assistant: Option<ChatMessage>,
 }
 
 #[cfg(unix)]
@@ -2157,7 +2350,8 @@ async fn read_agents_md(
             Err(Refusal::NotFound) => return Ok(None),
             Err(e) => return Err(format!("failed to locate AGENTS.md: {e}")),
         };
-        let file = match workspace_read::open_within(&parent, name, Step::File, MAX_AGENTS_MD_BYTES) {
+        let file = match workspace_read::open_within(&parent, name, Step::File, MAX_AGENTS_MD_BYTES)
+        {
             Ok(f) => f,
             Err(Refusal::NotFound) => return Ok(None),
             Err(e) => return Err(format!("failed to open AGENTS.md: {e}")),
@@ -2240,7 +2434,9 @@ fn assemble_final_conversation(
         if let Some(user) = turn.user {
             messages.push(user);
         }
-        messages.push(turn.assistant);
+        if let Some(assistant) = turn.assistant {
+            messages.push(assistant);
+        }
     }
     if let Some(current) = current_message {
         messages.push(current);
@@ -2255,7 +2451,7 @@ fn assemble_final_conversation(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_conversation(
     frozen: &FrozenExecutionConfig,
-    prior_turns: Vec<(Option<String>, Vec<ImageInput>, String)>,
+    prior_turns: Vec<(Option<String>, Vec<ImageInput>, Option<String>)>,
     current_objective: Option<&str>,
     current_images: &[ImageInput],
     project: Option<&ProjectRecord>,
@@ -2275,7 +2471,8 @@ pub(crate) fn fit_conversation(
             )
             .messages
             .pop();
-            let assistant = ChatMessage::assistant(Some(assistant_text), Vec::new());
+            let assistant =
+                assistant_text.map(|text| ChatMessage::assistant(Some(text), Vec::new()));
             PriorTurnMessages { user, assistant }
         })
         .collect();
@@ -2302,25 +2499,35 @@ pub(crate) fn fit_conversation(
 
     // 2. Estimate token weights once for prior turns and the rest (system, notice, current turn, tools, max_tokens).
     let tools_bytes: usize = tools.iter().map(tool_bytes).sum();
-    let (current_bytes, current_images_count) =
-        current_user_message.as_ref().map_or((0, 0), message_weights);
+    let (current_bytes, current_images_count) = current_user_message
+        .as_ref()
+        .map_or((0, 0), message_weights);
 
-    let system_without_notice_bytes: usize =
-        system_without_notice.iter().map(|m| message_weights(m).0).sum();
-    let system_with_notice_bytes: usize =
-        system_with_notice.iter().map(|m| message_weights(m).0).sum();
+    let system_without_notice_bytes: usize = system_without_notice
+        .iter()
+        .map(|m| message_weights(m).0)
+        .sum();
+    let system_with_notice_bytes: usize = system_with_notice
+        .iter()
+        .map(|m| message_weights(m).0)
+        .sum();
 
-    let rest_without_notice_bytes =
-        system_without_notice_bytes.saturating_add(current_bytes).saturating_add(tools_bytes);
-    let rest_with_notice_bytes =
-        system_with_notice_bytes.saturating_add(current_bytes).saturating_add(tools_bytes);
+    let rest_without_notice_bytes = system_without_notice_bytes
+        .saturating_add(current_bytes)
+        .saturating_add(tools_bytes);
+    let rest_with_notice_bytes = system_with_notice_bytes
+        .saturating_add(current_bytes)
+        .saturating_add(tools_bytes);
 
     let prior_weights: Vec<(usize, usize)> = prior_messages
         .iter()
         .map(|turn| {
             let (user_b, user_img) = turn.user.as_ref().map_or((0, 0), message_weights);
-            let (asst_b, asst_img) = message_weights(&turn.assistant);
-            (user_b.saturating_add(asst_b), user_img.saturating_add(asst_img))
+            let (asst_b, asst_img) = turn.assistant.as_ref().map_or((0, 0), message_weights);
+            (
+                user_b.saturating_add(asst_b),
+                user_img.saturating_add(asst_img),
+            )
         })
         .collect();
 
@@ -2429,23 +2636,29 @@ async fn run_started_provider_job(
         .and_then(|agent| agent.tool_grant.as_deref());
     if let Some(tools) = &plan.workspace_tools {
         #[cfg(unix)]
-        if let Some(grant) = grant {
-            // A Job without a grant uses no root, so a removed root must not fail it.
+        if grant.is_some() || job_record.kind.is_stored() {
             let resolved =
                 match resolve_project(&database, tools.data_directory(), &job_record).await {
                     Ok(resolved) => resolved,
                     Err(ProjectUnavailable::Database(error)) => return Err(error.into()),
                     Err(error) => return refused(error.to_string()).await,
                 };
-            let Some((record, workspace)) = resolved else {
+            if let Some((record, workspace)) = resolved {
+                if let Some(grant) = grant {
+                    match build_tools(&workspace, grant, &record.commands) {
+                        Ok(built) => plan.tools = Some(built),
+                        Err(error) => return refused(error.to_string()).await,
+                    }
+                    agents_md = read_agents_md(&workspace).await;
+                } else {
+                    plan.tools = None;
+                }
+                project = grant.map(|_| record);
+            } else if grant.is_some() {
                 return refused(ProjectUnavailable::Required.to_string()).await;
-            };
-            match build_tools(&workspace, grant, &record.commands) {
-                Ok(built) => plan.tools = Some(built),
-                Err(error) => return refused(error.to_string()).await,
+            } else {
+                plan.tools = None;
             }
-            agents_md = read_agents_md(&workspace).await;
-            project = Some(record);
         } else {
             plan.tools = None;
         }
@@ -2466,87 +2679,66 @@ async fn run_started_provider_job(
     let Some(input_record) = database.job_input(input).await? else {
         return refused("submitted Job input disappeared".to_owned()).await;
     };
-    // Nothing is sent unless every Attachment can be.
-    let images = match attachment_images(&database, &input_record.attachments).await {
-        Ok(images) => images,
-        Err(AttachmentImageError::Attachment(AttachmentError::Database(error))) => {
-            return Err(error.into());
+    let context_limits = ContextLimits::for_profile(&configuration.frozen.llm.config);
+    let mut prior_attachments = Vec::new();
+    let mut prior_turns = Vec::new();
+    let mut current_objective = input_record.objective.clone();
+    let mut current_attachments = input_record.attachments.clone();
+    let mut context_omitted = false;
+    let mut tree_status = String::new();
+    if job_record.conversation.is_some() {
+        let budget = context_limits.context_window.map_or(usize::MAX, |window| {
+            window.saturating_sub(context_limits.max_tokens.unwrap_or(4096)) as usize
+        });
+        let mut context = database.read_turn_context(job, budget).await?;
+        context_omitted = context.omitted;
+        tree_status = context.tree_status;
+        if let Some(current) = context.turns.pop() {
+            debug_assert_eq!(current.turn, job);
+            current_objective = Some(format!("{}{}", context.attention, current.text));
+            current_attachments = current
+                .attachments
+                .into_iter()
+                .rev()
+                .take(crate::openai_compatible::image::MAX_REQUEST_IMAGES)
+                .collect();
+            current_attachments.reverse();
         }
+        let mut images_left = crate::openai_compatible::image::MAX_REQUEST_IMAGES
+            .saturating_sub(current_attachments.len());
+        let mut prior = Vec::new();
+        for turn in context.turns.into_iter().rev() {
+            let mut attachments: Vec<_> = turn
+                .attachments
+                .into_iter()
+                .rev()
+                .take(images_left)
+                .collect();
+            attachments.reverse();
+            images_left = images_left.saturating_sub(attachments.len());
+            prior.push((turn.text, attachments, turn.answer));
+        }
+        for (text, attachments, answer) in prior.into_iter().rev() {
+            let images = attachment_images(&database, &attachments)
+                .await
+                .map_err(|error| ExecutionRuntimeError::Provider(error.to_string()))?;
+            prior_attachments.push(attachments);
+            prior_turns.push((Some(text), images, answer));
+        }
+    }
+    let images = match attachment_images(&database, &current_attachments).await {
+        Ok(images) => images,
         Err(error) => {
             return refused(format!("the input's attachments cannot be sent: {error}")).await;
         }
     };
-    let mut prior_attachments = Vec::new();
-    let mut prior_turns = Vec::new();
-    if let Some(first_previous) = job_record.previous {
-        const MAX_CONVERSATION_TURNS: usize = 64;
-        let genesis = database.genesis();
-        let mut visited = std::collections::BTreeSet::new();
-        visited.insert(job);
-        let mut cursor = Some(first_previous);
-        while let Some(current) = cursor {
-            if visited.len() >= MAX_CONVERSATION_TURNS {
-                return refused("conversation exceeds the maximum number of turns".to_owned())
-                    .await;
-            }
-            if !visited.insert(current) {
-                return refused("conversation contains a cycle of previous Jobs".to_owned()).await;
-            }
-            let Some(ancestor) = database.job(current).await? else {
-                return refused(format!("previous Job {current} does not exist")).await;
-            };
-            if current == genesis
-                || ancestor.parent != genesis
-                || database.job_configuration(current).await?.is_none()
-            {
-                return refused(format!(
-                    "previous Job {current} cannot be used as conversation context"
-                ))
-                .await;
-            }
-            if !ancestor.settled() {
-                return refused(format!("previous Job {current} has not finished")).await;
-            }
-            cursor = ancestor.previous;
-            if ancestor.completed_at.is_none() {
-                continue;
-            }
-            let Some(ancestor_input) = database.job_input_for_job(current).await? else {
-                return refused(format!("previous Job {current} input disappeared")).await;
-            };
-            let ancestor_images =
-                match attachment_images(&database, &ancestor_input.attachments).await {
-                    Ok(imgs) => imgs,
-                    Err(AttachmentImageError::Attachment(AttachmentError::Database(error))) => {
-                        return Err(error.into());
-                    }
-                    Err(error) => {
-                        return refused(format!(
-                            "previous Job {current} attachments cannot be sent: {error}"
-                        ))
-                        .await;
-                    }
-                };
-            let assistant_text = match database.latest_output(current).await? {
-                Some(output) if output.kind == crate::persistence::OutputKind::Result => {
-                    output.summary.unwrap_or_default()
-                }
-                _ => return refused(format!("previous Job {current} has no final answer")).await,
-            };
-            prior_attachments.push(ancestor_input.attachments);
-            prior_turns.push((ancestor_input.objective, ancestor_images, assistant_text));
-        }
-        prior_turns.reverse();
-        prior_attachments.reverse();
-    }
-
     let context_limits = ContextLimits::for_profile(&configuration.frozen.llm.config);
     let tools_wire = offered.unwrap_or_default();
 
     let mut conversation = match fit_conversation(
         &configuration.frozen,
         prior_turns,
-        input_record.objective.as_deref(),
+        current_objective.as_deref(),
         &images,
         project.as_ref(),
         grant,
@@ -2574,10 +2766,20 @@ async fn run_started_provider_job(
         }
     };
 
+    if context_omitted {
+        conversation
+            .messages
+            .insert(0, ChatMessage::system(OMITTED_NOTICE));
+    }
+    if !tree_status.is_empty() {
+        conversation
+            .messages
+            .insert(0, ChatMessage::system(std::mem::take(&mut tree_status)));
+    }
     let mut attachments = prior_attachments
         .into_iter()
         .skip(conversation.dropped_turns as usize)
-        .chain([input_record.attachments]);
+        .chain([current_attachments]);
     for (index, message) in conversation.messages.iter().enumerate() {
         if message.role == ChatRole::User {
             conversation
@@ -2683,7 +2885,7 @@ pub(crate) mod provider_seam {
             .insert(name.to_owned(), Box::new(hook));
     }
 
-    pub(super) fn before_creation(name: Option<&str>) {
+    pub(crate) fn before_creation(name: Option<&str>) {
         let Some(name) = name else { return };
         if let Some(hook) = HOOKS
             .lock()
@@ -2865,16 +3067,7 @@ pub(crate) async fn run_provider_job(
         &mut DatabaseOutputSink,
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-    run_provider_job_with_window(
-        run,
-        conversation,
-        tools,
-        None,
-        None,
-        cancellation,
-        exchange,
-    )
-    .await
+    run_provider_job_with_window(run, conversation, tools, None, None, cancellation, exchange).await
 }
 
 #[cfg(test)]
@@ -3627,9 +3820,9 @@ pub(crate) async fn finish_provider_job(
                 value: Some(provider_execution::result_value(&result)),
             });
             let settled = match database.finalize_job(job, settlement.clone()).await {
-                Err(DatabaseError::Rejected(
-                    violation @ Violation::UnsatisfiedDependency { .. },
-                )) => {
+                Err(DatabaseError::Rejected(violation))
+                    if !matches!(violation, Violation::JobAlreadyFinalized(_)) =>
+                {
                     settlement = JobFinalization::Failed(FinalResult {
                         summary: Some(format!(
                             "the Provider answered, but the Job cannot complete: {violation}"
@@ -3972,6 +4165,7 @@ mod failure_tests {
 
     fn spec(database: &DatabaseHandle) -> NewJob {
         NewJob {
+            process_grant: None,
             name: Some("failure fixture".into()),
             eligible_at: None,
             parent: database.genesis(),
@@ -4213,6 +4407,54 @@ mod failure_tests {
     }
 
     #[test]
+    fn permanent_finalization_refusal_fails_once_and_releases_the_slot() {
+        let (_root, directory) = data_directory("dispatcher-errors", "permanent-finalization");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let executor = executor(&database);
+        let job = wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+        on_system(move || async move {
+            let error = ExecutionRuntimeError::NotSettled {
+                source: DatabaseError::Rejected(Violation::InvalidValue(
+                    "result",
+                    "permanently invalid",
+                )),
+                observations: None,
+                settlement: Box::new(JobFinalization::Completed(FinalResult {
+                    summary: Some("invalid".into()),
+                    code: None,
+                    goal_reached: None,
+                    value: None,
+                })),
+            };
+            finalize_claim_error(&database, job, &error, false).await;
+            assert!(
+                database
+                    .job(job)
+                    .await
+                    .expect("read")
+                    .expect("job")
+                    .failed_at
+                    .is_some()
+            );
+            assert!(database.occupancy().await.expect("slots").is_empty());
+            assert!(
+                database
+                    .job_outputs(job, None, 20)
+                    .await
+                    .expect("output")
+                    .last()
+                    .expect("result")
+                    .summary
+                    .as_ref()
+                    .expect("summary")
+                    .contains("permanently invalid")
+            );
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
     fn a_full_read_queue_after_claim_finalizes_failed_and_releases_capacity() {
         let (_root, directory) = data_directory("dispatcher-errors", "read-queue");
         let worker = DatabaseWorker::start(&directory).expect("database");
@@ -4291,9 +4533,15 @@ mod failure_tests {
                     .is_some()
             );
             assert!(database.occupancy().await.expect("slots").is_empty());
-            assert_eq!(
-                database.claim_batch().await.expect("later claim"),
-                vec![stopped]
+            assert!(
+                database
+                    .claim_execution(crate::persistence::ClaimRequest {
+                        job: stopped,
+                        allowed_pools: BTreeSet::from([executor.into()])
+                    })
+                    .await
+                    .expect("process claim")
+                    .is_ok()
             );
             spawn_grant(
                 stopped,
@@ -4369,35 +4617,156 @@ mod failure_tests {
     }
 
     #[test]
-    fn a_grant_without_its_admitting_process_plan_is_failed_without_execution() {
-        let (_root, directory) = data_directory("dispatcher-errors", "missing-plan");
+    fn stored_turn_runs_after_reopen_and_process_scope_leaves_it_pending() {
+        use crate::persistence::{ConversationSpec, Entry, NewProject, Origin};
+        let (_root, directory) = data_directory("dispatcher-errors", "stored-restart");
+        let (_workspace, root) =
+            crate::test_support::temporary_directory("dispatcher-errors", "stored-project");
         let worker = DatabaseWorker::start(&directory).expect("database");
         let database = worker.handle();
-        let executor = executor(&database);
-        let job = wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+        let pool = executor(&database);
+        let configuration = execution_configuration(&database);
+        let model = wait(database.config(configuration.llm_profile.into()))
+            .expect("read")
+            .expect("model");
+        let crate::persistence::ConfigBody::Model(model) = model.body else {
+            panic!("model");
+        };
+        wait(database.update_config(
+            model.connection_id,
+            crate::persistence::NewConfig {
+                name: "stored provider".into(),
+                body: crate::persistence::ConfigBody::Connection(
+                    crate::persistence::ConnectionConfig {
+                        protocol: crate::persistence::LlmTransport::OpenAiChatCompletions,
+                        endpoint: Some("https://stored-restart.invalid/v1".into()),
+                        credential_ref: None,
+                    },
+                ),
+            },
+        ))
+        .expect("test endpoint");
+        let project = wait(database.create_project(NewProject {
+            name: "project".into(),
+            description: None,
+            root: root.to_string_lossy().into_owned(),
+            commands: Vec::new(),
+        }))
+        .expect("project");
+        let (_, appended) = wait(database.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: None,
+                project: Some(project),
+                origin: Origin::User,
+                keep_open: true,
+            },
+            Entry::UserMessage {
+                text: "survive restart".into(),
+                attachments: Vec::new(),
+            },
+            configuration,
+            None,
+        ))
+        .expect("stored turn");
+        let frozen = wait(database.job_configuration(appended.turn))
+            .expect("configuration")
+            .expect("frozen")
+            .frozen;
+        let endpoint = frozen
+            .llm
+            .provider
+            .endpoint
+            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".into());
+        worker.shutdown().expect("close before claim");
+        let worker = DatabaseWorker::start(&directory).expect("reopen");
+        let database = worker.handle();
+        let process_database = database.clone();
         on_system(move || async move {
-            let (sender, messages) = flume::unbounded();
-            let mut running = BTreeMap::new();
-            spawn_grant(
-                job,
-                None,
-                &database,
-                &sender,
-                &SharedState::default(),
-                &mut running,
-            );
-            messages.recv_async().await.expect("finished");
-            finish_grant(&database, job, running.remove(&job).expect("task")).await;
-            assert!(
-                database
-                    .job(job)
+            let runtime = ExecutionRuntime::start(process_database.clone(), ClaimScope::Process)
+                .expect("process runtime");
+            let created = runtime
+                .scheduler()
+                .schedule(ExecutionPlan {
+                    executor_id: pool,
+                    input: JobInputDraft::default(),
+                    job: spec(&process_database),
+                    outcome: JobOutcome::Completed,
+                    result: FinalResult {
+                        summary: Some("process".into()),
+                        code: None,
+                        goal_reached: None,
+                        value: None,
+                    },
+                })
+                .await
+                .expect("process admission");
+            ntex::time::timeout(Duration::from_secs(5), async {
+                while !process_database
+                    .job(created.job)
                     .await
                     .expect("read")
-                    .expect("Job")
-                    .failed_at
+                    .expect("process")
+                    .any_terminal()
+                {
+                    ntex::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("process finished");
+            assert!(
+                process_database
+                    .job(appended.turn)
+                    .await
+                    .expect("read")
+                    .expect("stored")
+                    .awaits_start()
+            );
+            runtime.shutdown().await.expect("shutdown process");
+        });
+        worker.shutdown().expect("reopen between scopes");
+        let worker = DatabaseWorker::start(&directory).expect("stored reopen");
+        let database = worker.handle();
+        provider_seam::install(&endpoint, |conversation| {
+            assert!(
+                serde_json::to_string(conversation)
+                    .expect("request")
+                    .contains("survive restart")
+            );
+            provider_seam::Response {
+                gate: None,
+                steps: vec![crate::provider_execution::scripted::Step::Chunk(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"restarted answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )],
+            }
+        });
+        on_system(move || async move {
+            let runtime = ExecutionRuntime::start(database.clone(), ClaimScope::Stored)
+                .expect("stored runtime");
+            ntex::time::timeout(Duration::from_secs(5), async {
+                while !database
+                    .job(appended.turn)
+                    .await
+                    .expect("read")
+                    .expect("stored")
+                    .any_terminal()
+                {
+                    ntex::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("stored finished");
+            assert!(
+                database
+                    .job(appended.turn)
+                    .await
+                    .expect("read")
+                    .expect("stored")
+                    .completed_at
                     .is_some()
             );
-            assert!(database.occupancy().await.expect("slots").is_empty());
+            runtime.shutdown().await.expect("shutdown stored");
         });
         worker.shutdown().expect("shutdown");
     }
@@ -4411,6 +4780,7 @@ mod failure_tests {
         let (sender, receiver) = flume::bounded(64);
         let scheduler = SchedulerHandle {
             sender,
+            notifications: flume::unbounded().0,
             state: SharedState::default(),
         };
         for index in 0..65 {
@@ -4468,6 +4838,7 @@ mod provider_record_tests {
 
     fn job(handle: &DatabaseHandle) -> JobId {
         wait(handle.create_job(NewJob {
+            process_grant: None,
             name: None,
             eligible_at: None,
             parent: handle.genesis(),
@@ -4682,6 +5053,7 @@ mod provider_record_tests {
                 .expect("attachment");
             let job = handle
                 .create_job(NewJob {
+                    process_grant: None,
                     name: None,
                     eligible_at: None,
                     parent: handle.genesis(),

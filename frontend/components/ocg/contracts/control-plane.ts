@@ -72,6 +72,8 @@ function jobRecord(input: unknown) {
   }
   return {
     id: identity(job.id, "job.id", "job:"),
+    kind: job.kind === "conversation" ? "conversation" as const : job.kind === "turn" ? "turn" as const : (() => { throw new ContractError("job.kind", "conversation or turn"); })(),
+    conversation: job.conversation === null ? null : identity(job.conversation, "job.conversation", "job:"),
     name: job.name === null ? null : string(job.name, "job.name"),
     title: job.title === undefined || job.title === null ? null : string(job.title, "job.title"),
     is_chat: typeof job.is_chat === "boolean" ? job.is_chat : false,
@@ -198,9 +200,11 @@ function conversationRecord(input: unknown) {
   return {
     root_job: identity(c.root_job, "conversation.root_job", "job:"),
     tip_job: identity(c.tip_job, "conversation.tip_job", "job:"),
-    agent: identity(c.agent, "conversation.agent", "profile:"),
+    agent: c.agent === null ? null : identity(c.agent, "conversation.agent", "profile:"),
     title: string(c.title, "conversation.title"),
-    turn_count: integer(c.turn_count, "conversation.turn_count"),
+    state: c.state === "open" || c.state === "closing" || c.state === "settled" ? c.state : (() => { throw new ContractError("conversation.state", "open, closing or settled"); })(),
+    on_hold: c.on_hold === null ? null : { by: record(record(c.on_hold, "conversation.on_hold").by, "conversation.on_hold.by") },
+    project: c.project === null ? null : identity(c.project, "conversation.project", "project:"),
     tip_settlement_state: string(c.tip_settlement_state, "conversation.tip_settlement_state"),
     tip_created_at_us: integer(c.tip_created_at_us, "conversation.tip_created_at_us"),
   };
@@ -435,20 +439,16 @@ export function decodeAdmission(input: unknown) {
   if ((status === "admitted") !== (job !== null)) {
     throw new ContractError("admission.job", "a Job exactly when the key was admitted");
   }
-  return { status, job };
+  return { status, job, conversation: status === "admitted" ? identity(admission.conversation, "admission.conversation", "job:") : null, seq: status === "admitted" ? integer(admission.seq, "admission.seq") : null, joined: status === "admitted" ? boolean(admission.joined, "admission.joined") : false, model: status === "admitted" ? string(admission.model, "admission.model") : null, kept: admission.kept === true };
 }
 
 /** What a stop request reached: never how the Job will settle. */
 export function decodeStop(input: unknown, jobId: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  const stop = record(envelope.stop, "stop");
-  if (stop.job !== jobId) throw new ContractError("stop.job", "the requested Job");
-  const status = stop.status;
-  if (status !== "requested" && status !== "already_settled") {
-    throw new ContractError("stop.status", "requested or already_settled");
-  }
-  return { job: jobId, status };
+  if (envelope.conversation !== jobId) throw new ContractError("conversation", "the requested conversation");
+  const status = string(envelope.status, "status");
+  return { conversation: jobId, status, record_seq: envelope.record_seq === null ? null : integer(envelope.record_seq, "record_seq") };
 }
 
 /** The browser's own session: its CSRF token while signed in. */
@@ -508,27 +508,27 @@ export function decodeJobInput(input: unknown, jobId: string) {
  * Reconstructs the bounded conversation ending at `jobId` from
  * `GET /api/v1/jobs/{job}/conversation`, ordered from oldest turn to `jobId`.
  */
-export function decodeJobConversation(input: unknown, jobId: string) {
+export function decodeConversationTurns(input: unknown, conversationId: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  if (envelope.job !== jobId) throw new ContractError("job", "the requested Job");
+  if (envelope.conversation !== conversationId) throw new ContractError("conversation", "the requested conversation");
   const turns = listOf(envelope.turns, "turns", (entry, path) => {
     const turn = record(entry, path);
     const job = jobRecord(turn.job);
-    const frozenInput = jobInputRecord(turn.input, `${path}.input`, job.id);
-    const outputs = listOf(turn.outputs, `${path}.outputs`, (output) => outputRecord(output));
-    return { job, input: frozenInput, outputs };
+    const entries = listOf(turn.entries, `${path}.entries`, (input, path) => {
+      const entry = record(input, path);
+      const kind = string(entry.kind, `${path}.kind`);
+      if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
+      return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path, "attachment:")), at_us: integer(entry.at_us, `${path}.at_us`) };
+    });
+    const userEntries = entries.filter(entry => entry.kind === "user_message");
+    const frozenInput = jobInputRecord({ id: `job_input:${job.id.slice(4)}`, objective: userEntries.map(entry => entry.text ?? "").join("\n"), submitted_at_us: job.created_at_us, attachments: userEntries.flatMap(entry => entry.attachments), configuration: turn.configuration }, `${path}.input`, job.id);
+    const outputs = listOf(turn.outputs, `${path}.outputs`, output => outputRecord(output));
+    return { job, entries, input: frozenInput, outputs };
   });
-  if (turns.length === 0 || turns[turns.length - 1].job.id !== jobId) {
-    throw new ContractError("turns", "a non-empty conversation ending at the requested Job");
-  }
-  return {
-    job: jobId,
-    turns,
-  };
+  return { conversation: conversationId, turns, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:") };
 }
-
-export type ControlConversation = ReturnType<typeof decodeJobConversation>;
+export type ControlConversation = ReturnType<typeof decodeConversationTurns>;
 export type ControlConversationTurn = ControlConversation["turns"][number];
 
 export type ControlToolGrant = "read" | "edit" | "code" | null;

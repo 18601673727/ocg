@@ -2,9 +2,8 @@
 //!
 //! A submission is idempotent under the client's `Idempotency-Key`. The key
 //! is recorded, as a SHA-256 digest with the fingerprint of its normalized
-//! request, by the transaction that creates and locally starts its Job; see
-//! [`DatabaseHandle::create_submitted_job`]. That record is the only
-//! authority on whether a key created a Job: a key names at most one Job,
+//! request, by the transaction that opens a conversation or appends an entry.
+//! That record is the only authority on whether a key appended input: a key names one (turn, seq),
 //! and only a committed one, in this process and after any restart.
 //!
 //! What only this process knows is kept in a [`Registry`] owned by the
@@ -23,8 +22,6 @@
 //!   never submitted again while that is possible. It is settled by the
 //!   record, once a read finds it, or by a reopening of the database, after
 //!   which a creation of the earlier opening can no longer commit;
-//! - the stop of each Job this listener admitted, until its execution has
-//!   returned.
 //!
 //! An admission belongs to a task of the listener's runtime, never to the
 //! request that started it: a client that disconnects, or whose wait ends,
@@ -42,20 +39,19 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    API_VERSION, DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, JOB_NOT_FOUND, Refusal, Reply,
-    SHUTTING_DOWN, Shared, decimal,
+    API_VERSION, DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN,
+    Shared, decimal,
 };
 use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::openai_compatible::image::MAX_REQUEST_IMAGES;
 use crate::orchestration::execution_runtime::{
-    AdmissionError, AttachmentImageError, ExecutionRuntimeError, JobStop, ProviderExecutionPlan,
-    attachment_images,
+    AttachmentImageError, ExecutionRuntimeError, attachment_images,
 };
 use crate::persistence::{
     AttachmentId, AttachmentOrigin, ConfigBody, ConfigRecord, ExecutionConfiguration, ExecutorId,
-    JobId, JobInputDraft, JobRecord, ModelCapability, NewJob, NewSubmission, ProfileId, ProjectId,
-    RequestFingerprint, SubmissionKey, SubmissionRecord, Violation,
+    JobId, ModelCapability, NewSubmission, ProfileId, ProjectId, RequestFingerprint, SubmissionKey,
+    SubmissionRecord, Violation,
 };
 
 /// The request header that names a submission.
@@ -163,31 +159,6 @@ const STORAGE_REFUSED: Refusal = Refusal::new(
     "storage_refused",
     "storage refused the Job; nothing was admitted",
 );
-const NOT_STOPPABLE: Refusal = Refusal::new(
-    StatusCode::CONFLICT,
-    "not_stoppable",
-    "the Job has no execution that this process can stop",
-);
-const PREVIOUS_JOB_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "previous_job_not_found",
-    "no such previous Job; nothing was submitted",
-);
-const INVALID_PREVIOUS_JOB: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "invalid_previous_job",
-    "the previous Job cannot be used as conversation context; nothing was submitted",
-);
-const PREVIOUS_JOB_NOT_COMPLETED: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "previous_job_not_completed",
-    "the previous turn has not finished",
-);
-const CONVERSATION_TOO_LONG: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "conversation_too_long",
-    "the conversation exceeds the maximum number of turns; nothing was submitted",
-);
 const VISION_NOT_SUPPORTED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "vision_not_supported",
@@ -224,9 +195,6 @@ const ATTACHMENT_UNAVAILABLE: Refusal = Refusal::new(
     "an Attachment's content is no longer available; nothing was submitted",
 );
 
-/// The most turns a Job-linked conversation may traverse.
-pub(crate) const MAX_CONVERSATION_TURNS: usize = 64;
-
 /// A validated submission: an existing LLM Profile and Executor, by their
 /// persisted identities, an objective and, optionally, an Agent Profile
 /// that targets the LLM Profile, a Job name, a Project, and a completed
@@ -240,7 +208,7 @@ pub(super) struct JobRequest {
     executor: ExecutorId,
     objective: String,
     name: Option<String>,
-    previous: Option<JobId>,
+    conversation: Option<JobId>,
     /// The Project the Job works in. A follow-up that names none takes its
     /// previous turn's.
     project: Option<ProjectId>,
@@ -253,13 +221,14 @@ pub(super) struct JobRequest {
 struct WireRequest {
     #[serde(default)]
     agent_profile: Option<String>,
-    llm_profile: String,
+    #[serde(default)]
+    llm_profile: Option<String>,
     executor: String,
     objective: String,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    previous: Option<String>,
+    conversation: Option<String>,
     #[serde(default)]
     project: Option<String>,
     #[serde(default)]
@@ -285,7 +254,12 @@ impl JobRequest {
     /// fields, none repeated, each within its bounds.
     pub(super) fn parse(body: &[u8]) -> Result<Self, Refusal> {
         let wire: WireRequest = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
-        let llm_profile = identity(&wire.llm_profile, "profile:").ok_or(INVALID_BODY)?;
+        let llm_profile = wire
+            .llm_profile
+            .as_deref()
+            .map(|model| identity(model, "profile:").ok_or(INVALID_BODY))
+            .transpose()?
+            .unwrap_or(0);
         let executor = identity(&wire.executor, "executor:").ok_or(INVALID_BODY)?;
         let agent_profile = wire
             .agent_profile
@@ -293,8 +267,8 @@ impl JobRequest {
             .map(|agent| identity(agent, "profile:").ok_or(INVALID_BODY))
             .transpose()?
             .map(ProfileId::new);
-        let previous = wire
-            .previous
+        let conversation = wire
+            .conversation
             .as_deref()
             .map(|prev| identity(prev, "job:").ok_or(INVALID_BODY))
             .transpose()?
@@ -331,7 +305,7 @@ impl JobRequest {
             executor: ExecutorId::new(executor),
             objective: wire.objective,
             name: wire.name,
-            previous,
+            conversation,
             project,
             attachments,
         })
@@ -362,7 +336,7 @@ impl JobRequest {
             context.update(&[2]);
             context.update(&agent.get().to_le_bytes());
         }
-        if let Some(previous) = self.previous {
+        if let Some(previous) = self.conversation {
             context.update(&[3]);
             context.update(&previous.get().to_le_bytes());
         }
@@ -469,7 +443,6 @@ fn join(waiters: &mut Vec<Waiter>, fingerprint: RequestFingerprint) -> flume::Re
 struct State {
     unresolved: HashMap<SubmissionKey, Unresolved>,
     /// The stop of each Job admitted here whose execution has not returned.
-    running: HashMap<JobId, JobStop>,
     next_generation: u64,
 }
 
@@ -639,27 +612,6 @@ impl Registry {
         }
     }
 
-    fn run(&self, stop: JobStop) {
-        self.state().running.insert(stop.job(), stop);
-    }
-
-    fn returned(&self, job: JobId) {
-        self.state().running.remove(&job);
-    }
-
-    fn stop_of(&self, job: JobId) -> Option<JobStop> {
-        self.state()
-            .running
-            .get(&job)
-            .filter(|stop| stop.job() == job)
-            .cloned()
-    }
-
-    #[cfg(test)]
-    pub(super) fn running(&self) -> usize {
-        self.state().running.len()
-    }
-
     #[cfg(test)]
     pub(super) fn unresolved(&self) -> usize {
         self.state().unresolved.len()
@@ -764,7 +716,7 @@ pub(super) async fn submit(
                     Reconciled::Recorded(record) if record.fingerprint == fingerprint => {
                         return Ok(Reply::new(
                             StatusCode::OK,
-                            admission("admitted", Some(record.job)),
+                            admitted_value(shared, key, record.job).await?,
                         ));
                     }
                     Reconciled::Recorded(_) => return Err(KEY_CONFLICT),
@@ -791,7 +743,7 @@ pub(super) async fn submit(
                 } else {
                     StatusCode::OK
                 },
-                admission("admitted", Some(job)),
+                admitted_value(shared, key, job).await?,
             )),
             Ok(Ok(Outcome::Conflict)) => Err(KEY_CONFLICT),
             Ok(Ok(Outcome::Refused(refusal))) => Err(refusal),
@@ -828,7 +780,7 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
         None => shared.database.submission(key).await?,
     };
     Ok(Reply::ok(match found {
-        Some(record) => admission("admitted", Some(record.job)),
+        Some(record) => admitted_value(shared, key, record.job).await?,
         None => admission("not_found", None),
     }))
 }
@@ -903,54 +855,69 @@ async fn admit(
             return finish(Outcome::Refused(refusal));
         }
     }
+    let mut request = request;
+    if let Err(refusal) = normalize(&shared.database, &mut request).await {
+        return finish(Outcome::Refused(refusal));
+    }
     let project = match check_configuration(&shared.database, &request).await {
         Ok(project) => project,
         Err(refusal) => return finish(Outcome::Refused(refusal)),
     };
-    let plan = plan(&shared.database, request, project);
-    let admitted = shared
-        .scheduler
-        .admit_workspace_provider(
-            plan,
-            NewSubmission { key, fingerprint },
-            shared.workspace_tools.clone(),
-        )
-        .await;
+    let configuration = ExecutionConfiguration {
+        agent_profile: request.agent_profile,
+        llm_profile: request.llm_profile,
+    };
+    let first = crate::persistence::Entry::UserMessage {
+        text: request.objective,
+        attachments: request.attachments,
+    };
+    let submission = Some(NewSubmission { key, fingerprint });
+    #[cfg(test)]
+    crate::orchestration::execution_runtime::provider_seam::before_creation(
+        request.name.as_deref(),
+    );
+    let admitted = match request.conversation {
+        Some(conversation) => shared
+            .database
+            .append(conversation, first, Some(configuration), submission)
+            .await
+            .map(|appended| appended.turn),
+        None => shared
+            .database
+            .open_conversation(
+                None,
+                crate::persistence::ConversationSpec {
+                    name: request.name.clone(),
+                    agent: request.agent_profile.map(Into::into),
+                    project,
+                    origin: crate::persistence::Origin::User,
+                    keep_open: true,
+                },
+                first,
+                configuration,
+                submission,
+            )
+            .await
+            .map(|(_, appended)| appended.turn),
+    };
     match admitted {
-        Ok(admitted) => {
-            let job = admitted.job();
-            registry.run(admitted.stop_handle());
-            log::info!("control plane admitted {job}");
-            finish(Outcome::Admitted { job, created: true });
-            // The record is the settlement's authority; this only releases
-            // the stop once nothing is left to stop.
-            admitted.settled().await.ok();
-            registry.returned(job);
+        Ok(job) => finish(Outcome::Admitted { job, created: true }),
+        Err(DatabaseError::Rejected(Violation::SubmissionKeyUsed { job, same_request })) => {
+            finish(if same_request {
+                Outcome::Admitted {
+                    job,
+                    created: false,
+                }
+            } else {
+                Outcome::Conflict
+            })
         }
-        Err(AdmissionError::NotAdmitted(ExecutionRuntimeError::Database(
-            DatabaseError::Rejected(Violation::SubmissionKeyUsed { job, same_request }),
-        ))) => finish(if same_request {
-            Outcome::Admitted {
-                job,
-                created: false,
-            }
-        } else {
-            Outcome::Conflict
-        }),
-        Err(AdmissionError::NotAdmitted(error)) => finish(Outcome::Refused(not_admitted(&error))),
-        Err(AdmissionError::Uncertain(error)) => {
-            // The creation's own epoch when it is known, else this one: an
-            // attempt of this admission was issued in it or before.
-            let epoch = match &error {
-                ExecutionRuntimeError::Database(DatabaseError::OutcomeUnknown {
-                    operation,
-                    ..
-                }) => operation.epoch(),
-                _ => shared.database.epoch(),
-            };
-            log::warn!("whether a control plane submission created its Job is unknown: {error}");
-            registry.uncertain(key, generation, epoch);
+        Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
+            registry.uncertain(key, generation, operation.epoch())
         }
+        Err(error) => finish(Outcome::Refused(not_admitted(
+            &ExecutionRuntimeError::Database(error),
+        ))),
     }
 }
 
@@ -972,7 +939,6 @@ pub(super) async fn check_configuration(
         }) => model,
         _ => return Err(PROFILE_NOT_FOUND),
     };
-    let mut chat = false;
     let mut tool_grant = false;
     if let Some(agent_profile) = request.agent_profile {
         match database.config(agent_profile.into()).await? {
@@ -983,7 +949,6 @@ pub(super) async fn check_configuration(
                 if !agent.models.contains(&request.llm_profile.into()) {
                     return Err(AGENT_TARGET_MISMATCH);
                 }
-                chat = agent.behavior == crate::persistence::AgentBehavior::Chat;
                 tool_grant = agent.tool_grant.is_some();
             }
             _ => return Err(AGENT_PROFILE_NOT_FOUND),
@@ -1002,58 +967,7 @@ pub(super) async fn check_configuration(
     // Every image the conversation's one Provider request will carry: the
     // earlier turns' first, then this one's.
     let mut images: Vec<AttachmentId> = Vec::new();
-    let mut project = request.project;
-    if let Some(previous) = request.previous {
-        // A conversation continues with the Agent of its earlier turn, and
-        // that Agent holds conversations.
-        if !chat {
-            return Err(INVALID_PREVIOUS_JOB);
-        }
-        let genesis = database.genesis();
-        let mut visited = std::collections::BTreeSet::new();
-        let mut cursor = Some(previous);
-        let mut prior_turns = 0usize;
-        while let Some(current) = cursor {
-            prior_turns += 1;
-            if prior_turns >= MAX_CONVERSATION_TURNS {
-                return Err(CONVERSATION_TOO_LONG);
-            }
-            if current == genesis || !visited.insert(current) {
-                return Err(INVALID_PREVIOUS_JOB);
-            }
-            let Some(record) = database.job(current).await? else {
-                return Err(if current == previous {
-                    PREVIOUS_JOB_NOT_FOUND
-                } else {
-                    INVALID_PREVIOUS_JOB
-                });
-            };
-            if record.parent != genesis
-                || database.job_configuration(current).await?.is_none()
-                || record.agent_id.map(Into::into) != request.agent_profile
-            {
-                return Err(INVALID_PREVIOUS_JOB);
-            }
-            if !record.settled() {
-                return Err(PREVIOUS_JOB_NOT_COMPLETED);
-            }
-            if current == previous {
-                if request
-                    .project
-                    .is_some_and(|named| Some(named) != record.project)
-                {
-                    return Err(PROJECT_MISMATCH);
-                }
-                project = record.project;
-            }
-            if record.completed_at.is_some()
-                && let Some(input) = database.job_input(record.input).await?
-            {
-                images.extend(input.attachments);
-            }
-            cursor = record.previous;
-        }
-    }
+    let project = request.project;
     match project {
         Some(project) => {
             if database.project(project).await?.is_none() {
@@ -1095,41 +1009,6 @@ pub(super) async fn check_configuration(
     }
 }
 
-/// The Provider plan of a checked request, a child of the Genesis
-/// Job, with the credential resolved as the Profile's Provider names it.
-/// Its images are referenced by Attachment identity; their bytes stay in the
-/// attachment store. Workspace tools are selected after T1 from the frozen
-/// grant, so an Agent edit racing admission cannot change the Job's access.
-pub(super) fn plan(
-    database: &DatabaseHandle,
-    request: JobRequest,
-    project: Option<ProjectId>,
-) -> ProviderExecutionPlan {
-    let mut plan = ProviderExecutionPlan::environment_credentials(
-        request.executor,
-        JobInputDraft {
-            objective: Some(request.objective),
-            attachments: request.attachments,
-            ..JobInputDraft::default()
-        },
-        NewJob {
-            name: request.name,
-            eligible_at: None,
-            parent: database.genesis(),
-            project,
-            dependencies: Vec::new(),
-            input: JobInputDraft::default(),
-            configuration: Some(ExecutionConfiguration {
-                agent_profile: request.agent_profile,
-                llm_profile: request.llm_profile,
-            }),
-            previous: request.previous,
-        },
-    );
-    plan.credential_resolver = database.credential_resolver();
-    plan
-}
-
 /// Why a plan known not to have created its Job was refused, without what
 /// failed inside.
 fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
@@ -1163,48 +1042,167 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
     }
 }
 
-fn settled(record: &JobRecord) -> bool {
-    record.completed_at.is_some()
-        || record.failed_at.is_some()
-        || record.cancelled_at.is_some()
-        || record.unknown_at.is_some()
-}
-
-fn stop_reply(status: StatusCode, job: JobId, result: &str) -> Reply {
-    Reply::new(
-        status,
-        json!({
-            "api_version": API_VERSION,
-            "stop": {"job": job.to_string(), "status": result},
-        }),
+fn conversation_refusal(code: &'static str) -> Refusal {
+    Refusal::new(
+        if code == "conversation_not_found" {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::UNPROCESSABLE_ENTITY
+        },
+        code,
+        "conversation action refused",
     )
 }
 
-/// Requests the stop of `job`'s execution, if this listener admitted it
-/// and it has not returned: `202 Accepted`, `requested`, says the request
-/// reached that execution, never how the Job settles. A Job whose outcome is
-/// recorded is `already_settled`; any other has no execution here to stop.
-pub(super) async fn stop(shared: &Shared, job: JobId) -> Result<Reply, Refusal> {
-    let record = shared.database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
-    if settled(&record) {
-        return Ok(stop_reply(StatusCode::OK, job, "already_settled"));
+async fn normalize(database: &DatabaseHandle, request: &mut JobRequest) -> Result<(), Refusal> {
+    if let Some(conversation) = request.conversation {
+        if request.project.is_some() {
+            return Err(conversation_refusal("project_fixed"));
+        }
+        let row = database
+            .job(conversation)
+            .await?
+            .ok_or(conversation_refusal("conversation_not_found"))?;
+        let crate::persistence::JobKind::Conversation {
+            agent,
+            project,
+            origin,
+            ..
+        } = row.kind
+        else {
+            return Err(conversation_refusal("conversation_not_found"));
+        };
+        if matches!(origin, crate::persistence::Origin::System) {
+            return Err(conversation_refusal("system_conversation"));
+        }
+        if row.outcome.is_some() {
+            return Err(conversation_refusal("conversation_closed"));
+        }
+        if row.children_closed_at.is_some() {
+            return Err(conversation_refusal("conversation_closing"));
+        }
+        if request.agent_profile.is_some() && request.agent_profile.map(Into::into) != agent {
+            return Err(conversation_refusal("agent_mismatch"));
+        }
+        request.agent_profile = agent.map(Into::into);
+        request.project = project;
+        if request.llm_profile.get() == 0 {
+            let tip = database
+                .conversation_turns(conversation, None, 1)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(INTERNAL)?;
+            request.llm_profile = database
+                .job_configuration(tip.id)
+                .await?
+                .ok_or(INTERNAL)?
+                .llm_profile;
+        }
+    } else if request.llm_profile.get() == 0 {
+        return Err(INVALID_BODY);
     }
-    if let Some(stop) = shared.submissions.stop_of(job) {
-        stop.request();
-        log::info!("control plane requested the stop of {job}");
-        return Ok(stop_reply(StatusCode::ACCEPTED, job, "requested"));
+    Ok(())
+}
+
+pub(super) async fn action(
+    shared: &Shared,
+    conversation: JobId,
+    action: &str,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    use crate::persistence::{Actor, StopCause};
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
+    let object = value.as_object().ok_or(INVALID_BODY)?;
+    if action == "retry" {
+        if object.len() != 1 {
+            return Err(INVALID_BODY);
+        }
+        let turn = super::routing::job_id(
+            object
+                .get("turn")
+                .and_then(Value::as_str)
+                .ok_or(INVALID_BODY)?,
+        )?;
+        let appended = shared
+            .database
+            .retry(conversation, turn, Actor::User)
+            .await
+            .map_err(action_error)?;
+        return Ok(Reply::ok(
+            json!({ "api_version": API_VERSION, "conversation": conversation.to_string(), "turn": appended.turn.to_string(), "seq": appended.seq, "joined": appended.joined }),
+        ));
     }
-    // Its execution may have returned since the first read.
-    let record = shared.database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
-    if settled(&record) {
-        Ok(stop_reply(StatusCode::OK, job, "already_settled"))
-    } else {
-        Err(NOT_STOPPABLE)
+    if !object.is_empty() {
+        return Err(INVALID_BODY);
+    }
+    let result = match action {
+        "stop" => shared.database.stop_turn(conversation, Actor::User).await,
+        "close" => shared.database.close(conversation, Actor::User).await,
+        "hold" => shared.database.hold(conversation, Actor::User).await,
+        "unhold" => shared.database.unhold(conversation, Actor::User).await,
+        _ => return Err(INVALID_BODY),
+    }
+    .map_err(action_error)?;
+    for running in &result.running {
+        shared.scheduler.stop(
+            *running,
+            if action == "close" {
+                StopCause::Closed
+            } else {
+                StopCause::Stopped(result.record_seq.ok_or(INTERNAL)?)
+            },
+        );
+    }
+    let changed = action != "stop"
+        || !result.running.is_empty()
+        || if let Some(record) = result.record_seq {
+            shared
+                .database
+                .conversation_turns(conversation, None, 1)
+                .await?
+                .first()
+                .and_then(|turn| turn.outcome.as_ref())
+                .is_some_and(|outcome| {
+                    outcome.cause == Some(crate::persistence::OutcomeCause::Stopped { record })
+                })
+        } else {
+            action != "stop"
+        };
+    Ok(Reply::new(
+        if changed {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        json!({ "api_version": API_VERSION, "conversation": conversation.to_string(), "status": if changed { "requested" } else { "already_settled" }, "record_seq": result.record_seq }),
+    ))
+}
+fn action_error(error: DatabaseError) -> Refusal {
+    match error {
+        DatabaseError::Rejected(Violation::InvalidValue(code, _)) => conversation_refusal(code),
+        DatabaseError::Rejected(Violation::NotFound(_)) => {
+            conversation_refusal("conversation_not_found")
+        }
+        error => error.into(),
     }
 }
 
+async fn admitted_value(shared: &Shared, key: SubmissionKey, job: JobId) -> Result<Value, Refusal> {
+    let record = shared.database.submission(key).await?.ok_or(INTERNAL)?;
+    let turn = shared.database.job(job).await?.ok_or(INTERNAL)?;
+    let frozen = shared
+        .database
+        .job_configuration(job)
+        .await?
+        .ok_or(INTERNAL)?;
+    Ok(
+        json!({ "api_version": API_VERSION, "admission": { "status": "admitted", "job": job.to_string(), "conversation": turn.conversation.map(|conversation| conversation.to_string()), "seq": record.seq, "joined": record.seq > 1, "model": frozen.frozen.llm.config.model, "kept": turn.cancelled_at.is_some() } }),
+    )
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn headers(values: &[&str]) -> HeaderMap {
@@ -1216,6 +1214,66 @@ mod tests {
             );
         }
         headers
+    }
+
+    pub(in crate::control_plane) fn store_fixture(
+        handle: &DatabaseHandle,
+        mut request: JobRequest,
+        submission: NewSubmission,
+    ) -> JobId {
+        use crate::persistence::{ConversationSpec, Entry, Origin};
+        crate::test_support::wait(normalize(handle, &mut request)).expect("normalize");
+        let project = crate::test_support::wait(check_configuration(handle, &request))
+            .expect("configuration");
+        let configuration = ExecutionConfiguration {
+            agent_profile: request.agent_profile,
+            llm_profile: request.llm_profile,
+        };
+        let entry = Entry::UserMessage {
+            text: request.objective,
+            attachments: request.attachments,
+        };
+        match request.conversation {
+            Some(conversation) => {
+                crate::test_support::wait(handle.append(
+                    conversation,
+                    entry,
+                    Some(configuration),
+                    Some(submission),
+                ))
+                .expect("append")
+                .turn
+            }
+            None => {
+                crate::test_support::wait(handle.open_conversation(
+                    None,
+                    ConversationSpec {
+                        name: request.name.clone(),
+                        agent: request.agent_profile.map(Into::into),
+                        project,
+                        origin: Origin::User,
+                        keep_open: true,
+                    },
+                    entry,
+                    configuration,
+                    Some(submission),
+                ))
+                .expect("open")
+                .1
+                .turn
+            }
+        }
+    }
+    pub(in crate::control_plane) fn await_fixture(handle: &DatabaseHandle, job: JobId) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::test_support::wait(handle.job(job))
+            .expect("read")
+            .expect("job")
+            .any_terminal()
+        {
+            assert!(std::time::Instant::now() < deadline, "turn did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -1264,7 +1322,7 @@ mod tests {
             br#"{"llm_profile":"profile:3","executor":"executor:3","objective":"Say hi"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","name":"n"}"#,
             br#"{"agent_profile":"profile:2","llm_profile":"profile:3","executor":"executor:2","objective":"Say hi"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","previous":"job:2"}"#,
+            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","conversation":"job:2"}"#,
         ] {
             let other = JobRequest::parse(other).expect("valid");
             assert_ne!(request.fingerprint(), other.fingerprint(), "{other:?}");
@@ -1290,8 +1348,8 @@ mod tests {
             br#"{"agent_profile":"executor:2","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:03","executor":"executor:2","objective":"o"}"#,
             br#"{"llm_profile":"profile:3","executor":"job:2","objective":"o"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","previous":"2"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","previous":"job:02"}"#,
+            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","conversation":"2"}"#,
+            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","conversation":"job:02"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","tools":[]}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","endpoint":"https://x"}"#,
             br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","objective":"p"}"#,
@@ -1395,16 +1453,29 @@ mod tests {
             wait(check_configuration(&handle, &request)),
             Err(TOOLS_NOT_SUPPORTED)
         );
-        let mut plan = plan(&handle, request.clone(), Some(project));
-        plan.job.input = plan.input;
         let key = digest_key(b"tools-capability-test");
         let before = wait(handle.jobs(None, 100)).expect("jobs").len();
-        let error = wait(handle.create_submitted_job(
-            plan.job,
-            NewSubmission {
+        let error = wait(handle.open_conversation(
+            None,
+            crate::persistence::ConversationSpec {
+                name: request.name.clone(),
+                agent: request.agent_profile.map(Into::into),
+                project: Some(project),
+                origin: crate::persistence::Origin::User,
+                keep_open: true,
+            },
+            crate::persistence::Entry::UserMessage {
+                text: request.objective.clone(),
+                attachments: request.attachments.clone(),
+            },
+            ExecutionConfiguration {
+                agent_profile: request.agent_profile,
+                llm_profile: request.llm_profile,
+            },
+            Some(NewSubmission {
                 key,
                 fingerprint: request.fingerprint(),
-            },
+            }),
         ))
         .expect_err("T1 refuses the changed profile");
         assert!(matches!(
@@ -1441,8 +1512,11 @@ mod tests {
         let (_root, directory) = data_directory("submissions", "multi-turn-chat");
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
-        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
-        let scheduler = runtime.scheduler();
+        let runtime = ExecutionRuntime::start(
+            handle.clone(),
+            crate::orchestration::execution_runtime::ClaimScope::Stored,
+        )
+        .expect("start runtime");
 
         let executor = wait(handle.create_executor(NewExecutor {
             name: "local-llm".to_owned(),
@@ -1529,24 +1603,22 @@ mod tests {
                 "llm_profile": llm_id.to_string(),
                 "executor": executor.to_string(),
                 "objective": objective,
-                "previous": previous.map(|id| id.to_string()),
+                "conversation": previous.and_then(|id| wait(handle.job(id)).expect("read").expect("turn").conversation).map(|id| id.to_string()),
             });
             let request = JobRequest::parse(&serde_json::to_vec(&body).expect("json"))
                 .expect("parse request");
             wait(check_configuration(&handle, &request)).expect("valid configuration");
             let fingerprint = request.fingerprint();
             let sub_key = digest_key(key.as_bytes());
-            let plan = plan(&handle, request, None);
-            let admitted = wait(scheduler.admit_submitted_provider(
-                plan,
+            let job = store_fixture(
+                &handle,
+                request,
                 NewSubmission {
                     key: sub_key,
                     fingerprint,
                 },
-            ))
-            .expect("admit provider job");
-            let job = admitted.job();
-            wait(admitted.settled()).expect("job settled");
+            );
+            await_fixture(&handle, job);
             job
         };
 
@@ -1578,8 +1650,18 @@ mod tests {
         );
         assert_eq!(sent[2]["messages"][5]["content"], "Spell it backwards.");
 
-        let conversation = wait(catalog::job_conversation(&handle, job3)).expect("conversation");
-        let turns = conversation.body["turns"].as_array().expect("turns");
+        let root = wait(handle.job(job3))
+            .expect("read")
+            .expect("turn")
+            .conversation
+            .expect("conversation");
+        let conversation =
+            wait(catalog::conversation_turns(&handle, root, None, 20)).expect("conversation");
+        let mut turns = conversation.body["turns"]
+            .as_array()
+            .expect("turns")
+            .clone();
+        turns.reverse();
         assert_eq!(turns.len(), 3);
         assert_eq!(turns[0]["job"]["id"], job1.to_string());
         assert_eq!(turns[0]["job"]["previous"], Value::Null);
@@ -1587,40 +1669,6 @@ mod tests {
         assert_eq!(turns[1]["job"]["previous"], job1.to_string());
         assert_eq!(turns[2]["job"]["id"], job3.to_string());
         assert_eq!(turns[2]["job"]["previous"], job2.to_string());
-
-        // Linking to Genesis or a non-existent Job is refused.
-        let genesis_req = JobRequest::parse(
-            serde_json::to_vec(&json!({
-                "agent_profile": agent_id.to_string(),
-                "llm_profile": llm_id.to_string(),
-                "executor": executor.to_string(),
-                "objective": "Bad link",
-                "previous": handle.genesis().to_string(),
-            }))
-            .expect("json")
-            .as_slice(),
-        )
-        .expect("parse");
-        assert_eq!(
-            wait(check_configuration(&handle, &genesis_req)).err(),
-            Some(INVALID_PREVIOUS_JOB)
-        );
-        let missing_req = JobRequest::parse(
-            serde_json::to_vec(&json!({
-                "agent_profile": agent_id.to_string(),
-                "llm_profile": llm_id.to_string(),
-                "executor": executor.to_string(),
-                "objective": "Missing link",
-                "previous": "job:999999",
-            }))
-            .expect("json")
-            .as_slice(),
-        )
-        .expect("parse");
-        assert_eq!(
-            wait(check_configuration(&handle, &missing_req)).err(),
-            Some(PREVIOUS_JOB_NOT_FOUND)
-        );
 
         wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");

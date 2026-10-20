@@ -55,7 +55,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
                 <span className="min-w-0">
                   <span className="font-mono">{record.id}</span>
                   <span className="ml-3 break-words">
-                    {record.is_chat && record.title ? record.title : (record.name ?? t("jobs.unnamed"))}
+                    {(record.kind === "turn" && record.conversation !== null) && record.title ? record.title : (record.name ?? t("jobs.unnamed"))}
                   </span>
                 </span>
                 <span className="flex flex-wrap gap-3 text-xs text-muted-foreground">
@@ -63,7 +63,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
                   <time>{new Date(record.created_at_us / 1000).toLocaleString()}</time>
                 </span>
               </button>
-              {record.is_chat && onOpenChat ? (
+              {(record.kind === "turn" && record.conversation !== null) && onOpenChat ? (
                 <Button
                   type="button"
                   variant="outline"

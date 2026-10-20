@@ -9,10 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ocg::data_directory::DataDirectory;
 use ocg::database::{DatabaseHandle, DatabaseWorker};
 use ocg::persistence::{
-    CapabilitySet, ConfigBody, ConnectionConfig, DependencyCondition, ExecutionConfiguration,
-    ExecutionOperation, ExecutionPoolConfig, ExecutorId, FinalResult, IntermediateOutputKind,
-    JobFinalization, JobId, JobInputDraft, LlmTransport, ModelConfig, NewConfig, NewExecutionPool,
-    NewExecutor, NewJob, NewJobOutput, OutcomeCause, OutcomeKind,
+    CapabilitySet, ConfigBody, ConnectionConfig, ExecutionConfiguration, ExecutionOperation,
+    ExecutionPoolConfig, ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId,
+    JobInputDraft, LlmTransport, ModelConfig, NewConfig, NewExecutionPool, NewExecutor, NewJob,
+    NewJobOutput,
 };
 use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use serde_json::{Value, json};
@@ -175,8 +175,10 @@ impl Options {
                 _ => return Err(format!("unknown argument: {argument}; use --help").into()),
             }
         }
-        if !matches!(options.section.as_str(), "scheduler" | "provider-record" | "observability")
-            && (options.jobs > 4_000 || options.files > 4_000)
+        if !matches!(
+            options.section.as_str(),
+            "scheduler" | "provider-record" | "observability"
+        ) && (options.jobs > 4_000 || options.files > 4_000)
         {
             return Err("--jobs and --files must be at most 4000 (production limits)".into());
         }
@@ -322,6 +324,7 @@ fn create_claimed(handle: &DatabaseHandle, target: Target) -> Result<JobId> {
 
 fn job(handle: &DatabaseHandle, target: Target) -> NewJob {
     NewJob {
+        process_grant: None,
         name: Some("benchmark".into()),
         eligible_at: None,
         parent: handle.genesis(),
@@ -517,26 +520,38 @@ fn admit_jobs(
     let mut samples = Vec::with_capacity(count);
     let started = Instant::now();
     for i in 0..count {
-        let spec = if with_dependencies && i % 2 == 1 {
-            let prereq = job_ids[i - 1];
-            NewJob {
-                name: Some("benchmark".into()),
-                eligible_at: None,
-                parent: handle.genesis(),
-                project: None,
-                dependencies: vec![(prereq, DependencyCondition::Success)],
-                input: JobInputDraft {
-                    objective: Some("measure scheduler overhead".into()),
-                    ..JobInputDraft::default()
-                },
-                configuration: Some(target.configuration),
-                previous: None,
-            }
-        } else {
-            job(handle, target)
-        };
         let began = Instant::now();
-        let id = block_on(handle.create_job(spec))?;
+        let id = if with_dependencies && i % 2 == 1 {
+            let previous = job_ids[i - 1];
+            let conversation = block_on(handle.job(previous))?
+                .and_then(|job| job.conversation)
+                .ok_or("benchmark turn has no conversation")?;
+            // Direct T1 preserves a synthetic dependency queue; interactive append would join the unclaimed tip.
+            block_on(handle.create_job(NewJob {
+                parent: conversation,
+                previous: Some(previous),
+                ..job(handle, target)
+            }))?
+        } else {
+            block_on(handle.open_conversation(
+                None,
+                ocg::persistence::ConversationSpec {
+                    name: None,
+                    agent: target.configuration.agent_profile.map(Into::into),
+                    project: None,
+                    origin: ocg::persistence::Origin::User,
+                    keep_open: true,
+                },
+                ocg::persistence::Entry::UserMessage {
+                    text: "measure scheduler overhead".into(),
+                    attachments: Vec::new(),
+                },
+                target.configuration,
+                None,
+            ))?
+            .1
+            .turn
+        };
         samples.push(began.elapsed());
         job_ids.push(id);
     }
@@ -604,6 +619,7 @@ fn peak_memory_bytes() -> Option<u64> {
 fn stop_unclean_and_reopen(
     directory: &DataDirectory,
     worker: DatabaseWorker,
+    expected: (u64, u64, u64, u64),
     check: impl FnOnce(&DatabaseHandle) -> Result<()>,
 ) -> Result<(Duration, u64, Option<u64>)> {
     worker.shutdown()?;
@@ -624,22 +640,6 @@ fn stop_unclean_and_reopen(
     let duration = began.elapsed();
     let peak_memory = peak_memory_bytes();
 
-    let pending_page = block_on(reopened.handle().pending_jobs(None, 1))?;
-    if !pending_page.visited.is_empty() {
-        return Err(format!(
-            "expected no pending jobs after reopen, found at least {}",
-            pending_page.visited.len()
-        )
-        .into());
-    }
-    let claimed = block_on(reopened.handle().claim_batch())?;
-    if !claimed.is_empty() {
-        return Err(format!(
-            "expected no claimable jobs after reopen, found {}",
-            claimed.len()
-        )
-        .into());
-    }
     check(&reopened.handle())?;
 
     reopened.shutdown()?;
@@ -652,19 +652,13 @@ fn stop_unclean_and_reopen(
         let delayed_table: TableDefinition<(i64, u64), ()> = TableDefinition::new("delayed");
         let waiters_table: TableDefinition<(u64, u64), u8> =
             TableDefinition::new("dependency_waiter");
-        let unsettled_table: TableDefinition<u64, (u32, u32)> =
-            TableDefinition::new("unsettled");
+        let unsettled_table: TableDefinition<u64, (u32, u32)> = TableDefinition::new("unsettled");
         let pending_count = tx.open_table(pending_table)?.len()?;
         let ready_count = tx.open_table(ready_table)?.len()?;
         let delayed_count = tx.open_table(delayed_table)?.len()?;
         let waiters_count = tx.open_table(waiters_table)?.len()?;
         let unsettled_count = tx.open_table(unsettled_table)?.len()?;
-        if pending_count != 0
-            || ready_count != 0
-            || delayed_count != 0
-            || waiters_count != 0
-            || unsettled_count != 0
-        {
+        if (pending_count, ready_count, delayed_count, unsettled_count) != expected {
             return Err(format!(
                 "jobs still pending after reopen: pending={pending_count}, ready={ready_count}, delayed={delayed_count}, waiters={waiters_count}, unsettled={unsettled_count}"
             )
@@ -765,7 +759,7 @@ fn scheduler(options: &Options) -> Result<()> {
             admit_jobs(&handle, target, count, true)?;
         let parameters_dependent = json!({
             "jobs": count,
-            "dependencies": true,
+            "dependencies": "previous",
             "pools": 4,
             "slots": 16,
         });
@@ -792,11 +786,15 @@ fn scheduler(options: &Options) -> Result<()> {
         );
 
         // 4: Stop without clean shutdown and reopen it (after all jobs completed)
-        let (reopen_duration, file_size, peak_memory) =
-            stop_unclean_and_reopen(&directory, worker, |_| Ok(()))?;
+        let (reopen_duration, file_size, peak_memory) = stop_unclean_and_reopen(
+            &directory,
+            worker,
+            (0, 0, 0, count.div_ceil(2) as u64),
+            |_| Ok(()),
+        )?;
         let reopen_params = json!({
             "jobs": count,
-            "dependencies": true,
+            "dependencies": "previous",
             "work_queued": false,
             "database_file_bytes": file_size,
             "peak_memory_bytes": peak_memory,
@@ -823,56 +821,44 @@ fn scheduler(options: &Options) -> Result<()> {
 
         // 5: Work still queued: admit N Jobs (half dependent), claim none,
         // stop without clean shutdown, time reopen, report peak memory,
-        // and check after reopen that no Job is still pending.
+        // and check after reopen that stored turns remain pending.
         let root = TemporaryRoot::new(&options.directory)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let worker = DatabaseWorker::start(&directory)?;
         let handle = worker.handle();
         let target = setup_scheduler_pools(&handle)?;
 
-        let (queued_job_ids, _admit_samples, _elapsed) =
-            admit_jobs(&handle, target, count, true)?;
+        let (queued_job_ids, _admit_samples, _elapsed) = admit_jobs(&handle, target, count, true)?;
 
         let (queued_reopen_duration, queued_file_size, queued_peak_memory) =
-            stop_unclean_and_reopen(&directory, worker, |handle| {
-                if let Some(first_id) = queued_job_ids.first() {
-                    let record = block_on(handle.job(*first_id))?
-                        .ok_or("first job not found after reopen")?;
-                    let outcome = record
-                        .outcome
-                        .ok_or("first job missing outcome after reopen")?;
-                    if outcome.kind != OutcomeKind::Cancelled
-                        || outcome.cause != Some(OutcomeCause::Abandoned)
+            stop_unclean_and_reopen(
+                &directory,
+                worker,
+                (
+                    count as u64,
+                    count.div_ceil(2) as u64,
+                    0,
+                    (count + count.div_ceil(2)) as u64,
+                ),
+                |handle| {
+                    for id in queued_job_ids
+                        .first()
+                        .into_iter()
+                        .chain(queued_job_ids.last())
                     {
-                        return Err(format!(
-                            "first job expected Cancelled(Abandoned), got {:?}",
-                            outcome
-                        )
-                        .into());
+                        let record =
+                            block_on(handle.job(*id))?.ok_or("queued turn missing after reopen")?;
+                        if !record.awaits_start() {
+                            return Err("queued stored turn did not survive reopen".into());
+                        }
                     }
-                }
-                if let Some(last_id) = queued_job_ids.last() {
-                    let record = block_on(handle.job(*last_id))?
-                        .ok_or("last job not found after reopen")?;
-                    let outcome = record
-                        .outcome
-                        .ok_or("last job missing outcome after reopen")?;
-                    if outcome.kind != OutcomeKind::Cancelled
-                        || outcome.cause != Some(OutcomeCause::Abandoned)
-                    {
-                        return Err(format!(
-                            "last job expected Cancelled(Abandoned), got {:?}",
-                            outcome
-                        )
-                        .into());
-                    }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
 
         let queued_reopen_params = json!({
             "jobs": count,
-            "dependencies": true,
+            "dependencies": "previous",
             "work_queued": true,
             "database_file_bytes": queued_file_size,
             "peak_memory_bytes": queued_peak_memory,
@@ -1496,11 +1482,7 @@ fn main() -> Result<()> {
     // Null means the section did not apply the option, so a reader is not
     // left reading a declared parameter that describes no work.
     let applied = |value: Value| {
-        if is_large_load {
-            Value::Null
-        } else {
-            value
-        }
+        if is_large_load { Value::Null } else { value }
     };
     println!(
         "{}",
@@ -1857,7 +1839,7 @@ fn provider_record(options: &Options) -> Result<()> {
             ids.sort_unstable_by_key(|(index, _)| *index);
             let write_elapsed = started.elapsed();
             let durable_commits = handle.durable_commits() - durable_before;
-            let runtime = ExecutionRuntime::start(handle.clone())?;
+            let runtime = ExecutionRuntime::start(handle.clone(), ocg::orchestration::execution_runtime::ClaimScope::Stored)?;
             const TOKEN: &str = "provider-record-benchmark-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ";
             let control = ControlPlane::start(ControlPlaneConfig::new(0, TOKEN)?, handle.clone(), runtime.scheduler(), directory.clone())?;
             let client = ntex::client::Client::builder().build(ntex::SharedCfg::default()).await?;
@@ -2429,7 +2411,7 @@ fn observability(options: &Options) -> Result<()> {
             drop(handle);
 
             let (reopen_duration, file_size, peak_memory) =
-                stop_unclean_and_reopen(&directory, worker, |reopened_handle| {
+                stop_unclean_and_reopen(&directory, worker, (0, 0, 0, 0), |reopened_handle| {
                     let stats = block_on(reopened_handle.tool_stats())?;
                     for name in ["lookup", "search", "calculate"] {
                         let stat = stats

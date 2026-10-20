@@ -3,7 +3,7 @@ use super::*;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
-pub(crate) const FORMAT_VERSION: u32 = 19;
+pub(crate) const FORMAT_VERSION: u32 = 20;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;
@@ -41,12 +41,22 @@ pub(super) const HELD_SLOTS: TableDefinition<(u64, u64), (u64, bool)> =
     TableDefinition::new("held_slot");
 pub(super) const CHILDREN: TableDefinition<(u64, u64), ()> = TableDefinition::new("children");
 pub(super) const SUCCESSORS: TableDefinition<u64, u64> = TableDefinition::new("successor");
-pub(super) const CHAT_THREADS: TableDefinition<(u64, u64), ()> =
-    TableDefinition::new("chat_thread");
+pub(super) const TURN_INPUTS: TableDefinition<(u64, u32), &[u8]> =
+    TableDefinition::new("turn_input");
+pub(super) const NOTICES: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("notice");
+pub(super) const TIPS: TableDefinition<u64, u64> = TableDefinition::new("tip");
+pub(super) const RECENT: TableDefinition<(u64, u64), ()> = TableDefinition::new("recent");
+pub(super) const CHILD_CONVERSATIONS: TableDefinition<(u64, u64), ()> =
+    TableDefinition::new("child_conversation");
+pub(super) const LIVE_CHILDREN: TableDefinition<(u64, u64), ()> =
+    TableDefinition::new("live_child");
+pub(super) const USER_ENTRY_AT: TableDefinition<u64, i64> = TableDefinition::new("user_entry_at");
+pub(super) const ACTIVE_TURNS: TableDefinition<u64, u64> = TableDefinition::new("active_turn");
+pub(super) const ANSWER_TIPS: TableDefinition<u64, (u64, u64)> = TableDefinition::new("answer_tip");
+pub(super) const NOTICE_READ: TableDefinition<u64, u32> = TableDefinition::new("notice_read");
 pub(super) const TOOL_CALL_IDS: TableDefinition<(u64, &str), (u32, u32)> =
     TableDefinition::new("tool_call_id");
-pub(super) const TOOL_TOTALS: TableDefinition<u64, (u64, u64)> =
-    TableDefinition::new("tool_total");
+pub(super) const TOOL_TOTALS: TableDefinition<u64, (u64, u64)> = TableDefinition::new("tool_total");
 /// (admitted, refused_arguments, completed, failed, duration_us_total, duration_us_max)
 /// Duration semantics: admission commit -> outcome commit (includes the
 /// admission's durable commit), never spanning a restart.

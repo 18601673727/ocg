@@ -18,7 +18,16 @@ pub(super) enum Route {
     Logs(dashboard::LogQuery),
     Job(JobId),
     JobInput(JobId),
-    JobConversation(JobId),
+    ConversationTurns {
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    },
+    ConversationNotices {
+        conversation: JobId,
+        after: u32,
+        limit: usize,
+    },
     ProviderRequest(JobId, RequestNumber),
     AgentProfiles {
         before: Option<ProfileId>,
@@ -53,7 +62,7 @@ pub(super) enum Route {
     },
     Submit,
     Admission,
-    Stop(JobId),
+    ConversationAction(JobId, &'static str),
     AttachmentUpload,
     Attachment(AttachmentId),
     AttachmentContent(AttachmentId),
@@ -85,7 +94,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Logs(_)
             | Route::Job(_)
             | Route::JobInput(_)
-            | Route::JobConversation(_)
+            | Route::ConversationTurns { .. }
+            | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
             | Route::Tools { .. }
             | Route::AgentProfiles { .. }
@@ -103,7 +113,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Events { .. }
             | Route::Admission
             | Route::Submit
-            | Route::Stop(_)
+            | Route::ConversationAction(..)
             | Route::AttachmentUpload
             | Route::Attachment(_)
             | Route::AttachmentContent(_)
@@ -126,9 +136,19 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     if request.method() == Method::POST {
         return match segments.as_slice() {
             ["jobs"] => no_query(query).map(|()| Route::Submit),
-            ["jobs", job, "stop"] => {
-                let job = job_id(job)?;
-                no_query(query).map(|()| Route::Stop(job))
+            ["conversations", conversation, action]
+                if matches!(*action, "stop" | "close" | "hold" | "unhold" | "retry") =>
+            {
+                let conversation = job_id(conversation)?;
+                let action = match *action {
+                    "stop" => "stop",
+                    "close" => "close",
+                    "hold" => "hold",
+                    "unhold" => "unhold",
+                    "retry" => "retry",
+                    _ => return Err(NOT_FOUND),
+                };
+                no_query(query).map(|()| Route::ConversationAction(conversation, action))
             }
             ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
             ["provider-models"] => no_query(query).map(|()| Route::ProviderModels),
@@ -202,9 +222,28 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::JobInput(job))
         }
-        ["jobs", job, "conversation"] => {
-            let job = job_id(job)?;
-            no_query(query).map(|()| Route::JobConversation(job))
+        ["conversations", conversation, "turns"] => {
+            let conversation = job_id(conversation)?;
+            let (before, limit) = catalog::page_query(query, job_id)?;
+            Ok(Route::ConversationTurns {
+                conversation,
+                before,
+                limit,
+            })
+        }
+        ["conversations", conversation, "notices"] => {
+            let conversation = job_id(conversation)?;
+            let (after, limit) = output_query(query)?;
+            let after = after
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| INVALID_REQUEST)?
+                .unwrap_or(0);
+            Ok(Route::ConversationNotices {
+                conversation,
+                after,
+                limit,
+            })
         }
         ["agent-profiles"] => catalog::agent_profile_query(query)
             .map(|(before, limit)| Route::AgentProfiles { before, limit }),
@@ -306,7 +345,16 @@ pub(super) async fn respond(
             ))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
-        Route::JobConversation(job) => catalog::job_conversation(database, job).await,
+        Route::ConversationTurns {
+            conversation,
+            before,
+            limit,
+        } => catalog::conversation_turns(database, conversation, before, limit).await,
+        Route::ConversationNotices {
+            conversation,
+            after,
+            limit,
+        } => catalog::conversation_notices(database, conversation, after, limit).await,
         Route::ProviderRequest(job, request) => {
             let record = database
                 .provider_request(job, request)
@@ -370,7 +418,10 @@ pub(super) async fn respond(
             let key = submissions::idempotency_key(request.headers())?;
             submissions::lookup(shared, key).await
         }
-        Route::Stop(job) => submissions::stop(shared, job).await,
+        Route::ConversationAction(conversation, action) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            submissions::action(shared, conversation, action, &body).await
+        }
         Route::AttachmentUpload => {
             let body = read_body(payload, MAX_ATTACHMENT_UPLOAD_BYTES).await?;
             attachments::upload(database, &body).await

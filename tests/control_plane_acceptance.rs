@@ -356,12 +356,17 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
     until(|| silent.accepted.load(Ordering::SeqCst));
     let stop = request(
         address,
-        &format!("POST /api/v1/jobs/{running}/stop"),
+        &format!(
+            "POST /api/v1/conversations/{}/stop",
+            job(address, &running)["conversation"]
+                .as_str()
+                .expect("conversation")
+        ),
         None,
-        None,
+        Some("{}"),
     );
     assert_eq!(stop.status, 202, "{}", stop.body);
-    assert_eq!(stop.body["stop"]["status"], "requested");
+    assert_eq!(stop.body["status"], "requested");
     until(|| !job(address, &running)["stop_confirmed_at_us"].is_null());
     let record = job(address, &running);
     assert_eq!(
@@ -370,11 +375,16 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
     );
     let again = request(
         address,
-        &format!("POST /api/v1/jobs/{running}/stop"),
+        &format!(
+            "POST /api/v1/conversations/{}/stop",
+            job(address, &running)["conversation"]
+                .as_str()
+                .expect("conversation")
+        ),
         None,
-        None,
+        Some("{}"),
     );
-    assert_eq!(again.body["stop"]["status"], "already_settled");
+    assert_eq!(again.body["status"], "already_settled");
     daemon.stop();
 
     // After a restart, the keys still name their Jobs, and replays run
@@ -388,11 +398,16 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
     assert_eq!(job(address, &running)["settlement"]["state"], "unknown");
     let stop = request(
         address,
-        &format!("POST /api/v1/jobs/{running}/stop"),
+        &format!(
+            "POST /api/v1/conversations/{}/stop",
+            job(address, &running)["conversation"]
+                .as_str()
+                .expect("conversation")
+        ),
         None,
-        None,
+        Some("{}"),
     );
-    assert_eq!(stop.body["stop"]["status"], "already_settled");
+    assert_eq!(stop.body["status"], "already_settled");
     // Jobs are numbered in order: none after it repeats either submission.
     let last = running[4..].parse::<u64>().expect("a number");
     for later in last + 1..last + 32 {

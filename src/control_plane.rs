@@ -92,12 +92,10 @@
 //! - `GET /api/v1/admissions`: what the request's `Idempotency-Key`
 //!   created: `{"admission": {"status", "job"}}`, with `status` one of
 //!   `admitted` (with its Job), `pending`, `uncertain` or `not_found`.
-//! - `POST /api/v1/jobs/{job}/stop`: requests the stop of a Job this
-//!   listener admitted: `202` `requested` once the request reached its
-//!   execution, `200` `already_settled` once its outcome is recorded, `409`
-//!   `not_stoppable` for a Job with no execution here, such as one of an
-//!   earlier process. A requested stop is not an outcome: the Job's record
-//!   says how it settled.
+//! - `POST /api/v1/conversations/{conversation}/{stop|close|hold|unhold|retry}`:
+//!   manages the durable conversation; Stop cancels its current and waiting
+//!   turns, while Close closes the live subtree. Turns and notices are paged
+//!   through `GET /api/v1/conversations/{conversation}/turns` and `/notices`.
 //! - `POST /api/v1/session`: signs the operator's browser in under the
 //!   pairing code this run printed for a headless listener, and sets its
 //!   session cookie; `GET /api/v1/session` reports that session and the CSRF
@@ -223,7 +221,7 @@ impl ControlPlane {
     #[cfg(test)]
     pub(crate) fn held(&self) -> (usize, usize) {
         (
-            self.shared.submissions.running(),
+            self.shared.scheduler.running_count(),
             self.shared.submissions.unresolved(),
         )
     }

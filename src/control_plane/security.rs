@@ -10,6 +10,11 @@ fn member(rest: &str, collection: &str) -> bool {
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+fn conversation_action(rest: &str) -> bool {
+    let mut segments = rest.split('/');
+    matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry"), None) if !id.is_empty())
+}
+
 /// Whether `path` names a route that is submitted to with `POST`: Job
 /// submission, a Job's stop, a Profile, Project, Pool or conversation
 /// change, or an image upload.
@@ -17,9 +22,7 @@ fn takes_post(path: &str) -> bool {
     match path.strip_prefix("/api/v1/") {
         Some("jobs" | "profiles" | "projects" | "provider-models" | "attachments") => true,
         Some(rest) => {
-            rest.strip_prefix("jobs/")
-                .and_then(|rest| rest.strip_suffix("/stop"))
-                .is_some_and(|job| !job.contains('/'))
+            conversation_action(rest)
                 || MEMBER_COLLECTIONS
                     .iter()
                     .any(|collection| member(rest, collection))
@@ -34,10 +37,11 @@ fn json_post_limit(path: &str) -> Option<usize> {
     match path.strip_prefix("/api/v1/") {
         Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
         Some("jobs" | "profiles" | "projects" | "provider-models") => Some(MAX_SUBMISSION_BYTES),
-        Some(rest) => MEMBER_COLLECTIONS
-            .iter()
-            .any(|collection| member(rest, collection))
-            .then_some(MAX_SUBMISSION_BYTES),
+        Some(rest) => (conversation_action(rest)
+            || MEMBER_COLLECTIONS
+                .iter()
+                .any(|collection| member(rest, collection)))
+        .then_some(MAX_SUBMISSION_BYTES),
         None => None,
     }
 }

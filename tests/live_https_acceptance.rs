@@ -551,6 +551,7 @@ fn register_targets(
 
 fn job_template(handle: &DatabaseHandle, configuration: ExecutionConfiguration) -> NewJob {
     NewJob {
+        process_grant: None,
         name: Some("live acceptance request".into()),
         eligible_at: None,
         parent: handle.genesis(),
@@ -655,7 +656,11 @@ async fn run_writer_async(mode: Mode, directory: &Path) {
         live_config(|name| std::env::var(name).ok())
             .unwrap_or_else(|blocker| panic!("NOT VERIFIED: {blocker}"))
     });
-    let execution = ExecutionRuntime::start(handle.clone()).expect("start the execution runtime");
+    let execution = ExecutionRuntime::start(
+        handle.clone(),
+        ocg::orchestration::execution_runtime::ClaimScope::Process,
+    )
+    .expect("start the execution runtime");
 
     let (job, execution_error, telemetry_gap) = match &live {
         Some(config) => {

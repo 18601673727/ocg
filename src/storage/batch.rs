@@ -75,6 +75,7 @@ impl<T> BatchOutcome<T> {
 }
 
 pub(crate) struct Batch {
+    pub(crate) event_append: bool,
     pub(super) tx: WriteTransaction,
     pub(super) failed: Option<Failure>,
     pub(super) now: Timestamp,
@@ -258,6 +259,7 @@ pub(super) fn finish_abort<T>(tx: WriteTransaction, failure: Failure) -> BatchOu
 impl Batch {
     pub(super) fn new(tx: WriteTransaction, epoch: u64) -> Self {
         Self {
+            event_append: false,
             tx,
             failed: None,
             now: Timestamp::now(),
@@ -815,13 +817,25 @@ impl Batch {
             recorded_at: self.now,
             payload,
         };
-        let scope = row.execution.as_ref().filter(|_| !matches!(event.payload,
-            RequestPayload::Sent { .. } | RequestPayload::Received { .. })).map(|execution| {
-            (
-                execution.llm.provider.id.get(),
-                *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),
-            )
-        });
+        let execution = if row.kind.is_conversation() {
+            None
+        } else {
+            Some(self.turn_execution(&row)?.0)
+        };
+        let scope = execution
+            .as_ref()
+            .filter(|_| {
+                !matches!(
+                    event.payload,
+                    RequestPayload::Sent { .. } | RequestPayload::Received { .. }
+                )
+            })
+            .map(|execution| {
+                (
+                    execution.llm.provider.id.get(),
+                    *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),
+                )
+            });
         self.step(|tx| {
             tx.open_table(REQUEST_EVENTS)?.insert(
                 (job.get(), request.get(), seq),
@@ -852,12 +866,18 @@ impl Batch {
         &mut self,
         job: JobId,
         request: RequestNumber,
-    ) -> Result<(Option<crate::token_usage::TokenRequestSample>, Vec<RequestEventRecord>), BatchError>
-    {
+    ) -> Result<
+        (
+            Option<crate::token_usage::TokenRequestSample>,
+            Vec<RequestEventRecord>,
+        ),
+        BatchError,
+    > {
         let row = self.require_job(job)?;
-        let Some(execution) = &row.execution else {
+        if row.kind.is_conversation() {
             return Ok((None, Vec::new()));
-        };
+        }
+        let execution = self.turn_execution(&row)?.0;
         let target = Some(LlmTarget {
             llm_profile: execution.llm.model.id.into(),
             frozen: execution.llm.clone(),
@@ -865,7 +885,9 @@ impl Batch {
         let events = self.step(|tx| {
             let table = tx.open_table(REQUEST_EVENTS)?;
             let mut events = Vec::new();
-            for entry in table.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))? {
+            for entry in
+                table.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+            {
                 let (key, bytes) = entry?;
                 let (_, req, seq) = key.value();
                 if let Some(r) = RequestNumber::new(req) {
@@ -894,10 +916,15 @@ impl Batch {
     ) -> Result<(), BatchError> {
         events.extend(inserted);
         let row = self.require_job(job)?;
-        let Some(execution) = &row.execution else {
+        if row.kind.is_conversation() {
             return Ok(());
+        }
+        let execution = self.turn_execution(&row)?.0;
+        let parent = match row.parent_id {
+            Some(parent) => self.job(parent)?,
+            None => None,
         };
-        let agent = usage_agent(&row);
+        let agent = usage_agent(&row, parent.as_ref());
         let provider = execution.llm.provider.id.get();
         let model_hash = *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes();
         let target = Some(LlmTarget {
@@ -921,31 +948,49 @@ impl Batch {
                 let current_val = table.get(key)?.map(|c| c.value()).ok_or_else(|| {
                     StorageError::corrupted(format!("missing usage bucket for {key:?}"))
                 })?;
-                let old_complete = if old.usage == crate::token_usage::TokenUsageState::Complete { 1 } else { 0 };
-                let reqs = current_val.0.checked_sub(1).ok_or_else(|| {
-                    StorageError::corrupted("usage total requests underflow")
-                })?;
+                let old_complete = if old.usage == crate::token_usage::TokenUsageState::Complete {
+                    1
+                } else {
+                    0
+                };
+                let reqs = current_val
+                    .0
+                    .checked_sub(1)
+                    .ok_or_else(|| StorageError::corrupted("usage total requests underflow"))?;
                 if reqs == 0 {
                     let comp = current_val.1.checked_sub(old_complete).ok_or_else(|| {
                         StorageError::corrupted("usage total complete_requests underflow")
                     })?;
-                    let inp = current_val.2.checked_sub(old.input.value().unwrap_or(0) as u64).ok_or_else(|| {
-                        StorageError::corrupted("usage total input underflow")
-                    })?;
-                    let out = current_val.3.checked_sub(old.output.value().unwrap_or(0) as u64).ok_or_else(|| {
-                        StorageError::corrupted("usage total output underflow")
-                    })?;
-                    let cr = current_val.4.checked_sub(old.cache_read.value().unwrap_or(0) as u64).ok_or_else(|| {
-                        StorageError::corrupted("usage total cache_read underflow")
-                    })?;
-                    let cw = current_val.5.checked_sub(old.cache_write.value().unwrap_or(0) as u64).ok_or_else(|| {
-                        StorageError::corrupted("usage total cache_write underflow")
-                    })?;
-                    let reas = current_val.6.checked_sub(old.reasoning.value().unwrap_or(0) as u64).ok_or_else(|| {
-                        StorageError::corrupted("usage total reasoning underflow")
-                    })?;
+                    let inp = current_val
+                        .2
+                        .checked_sub(old.input.value().unwrap_or(0) as u64)
+                        .ok_or_else(|| StorageError::corrupted("usage total input underflow"))?;
+                    let out = current_val
+                        .3
+                        .checked_sub(old.output.value().unwrap_or(0) as u64)
+                        .ok_or_else(|| StorageError::corrupted("usage total output underflow"))?;
+                    let cr = current_val
+                        .4
+                        .checked_sub(old.cache_read.value().unwrap_or(0) as u64)
+                        .ok_or_else(|| {
+                            StorageError::corrupted("usage total cache_read underflow")
+                        })?;
+                    let cw = current_val
+                        .5
+                        .checked_sub(old.cache_write.value().unwrap_or(0) as u64)
+                        .ok_or_else(|| {
+                            StorageError::corrupted("usage total cache_write underflow")
+                        })?;
+                    let reas = current_val
+                        .6
+                        .checked_sub(old.reasoning.value().unwrap_or(0) as u64)
+                        .ok_or_else(|| {
+                            StorageError::corrupted("usage total reasoning underflow")
+                        })?;
                     if comp != 0 || inp != 0 || out != 0 || cr != 0 || cw != 0 || reas != 0 {
-                        return Err(StorageError::corrupted("usage total non-zero counters when requests reached 0"));
+                        return Err(StorageError::corrupted(
+                            "usage total non-zero counters when requests reached 0",
+                        ));
                     }
                     table.remove(key)?;
                 } else {
@@ -954,21 +999,36 @@ impl Batch {
                         current_val.1.checked_sub(old_complete).ok_or_else(|| {
                             StorageError::corrupted("usage total complete_requests underflow")
                         })?,
-                        current_val.2.checked_sub(old.input.value().unwrap_or(0) as u64).ok_or_else(|| {
-                            StorageError::corrupted("usage total input underflow")
-                        })?,
-                        current_val.3.checked_sub(old.output.value().unwrap_or(0) as u64).ok_or_else(|| {
-                            StorageError::corrupted("usage total output underflow")
-                        })?,
-                        current_val.4.checked_sub(old.cache_read.value().unwrap_or(0) as u64).ok_or_else(|| {
-                            StorageError::corrupted("usage total cache_read underflow")
-                        })?,
-                        current_val.5.checked_sub(old.cache_write.value().unwrap_or(0) as u64).ok_or_else(|| {
-                            StorageError::corrupted("usage total cache_write underflow")
-                        })?,
-                        current_val.6.checked_sub(old.reasoning.value().unwrap_or(0) as u64).ok_or_else(|| {
-                            StorageError::corrupted("usage total reasoning underflow")
-                        })?,
+                        current_val
+                            .2
+                            .checked_sub(old.input.value().unwrap_or(0) as u64)
+                            .ok_or_else(|| {
+                                StorageError::corrupted("usage total input underflow")
+                            })?,
+                        current_val
+                            .3
+                            .checked_sub(old.output.value().unwrap_or(0) as u64)
+                            .ok_or_else(|| {
+                                StorageError::corrupted("usage total output underflow")
+                            })?,
+                        current_val
+                            .4
+                            .checked_sub(old.cache_read.value().unwrap_or(0) as u64)
+                            .ok_or_else(|| {
+                                StorageError::corrupted("usage total cache_read underflow")
+                            })?,
+                        current_val
+                            .5
+                            .checked_sub(old.cache_write.value().unwrap_or(0) as u64)
+                            .ok_or_else(|| {
+                                StorageError::corrupted("usage total cache_write underflow")
+                            })?,
+                        current_val
+                            .6
+                            .checked_sub(old.reasoning.value().unwrap_or(0) as u64)
+                            .ok_or_else(|| {
+                                StorageError::corrupted("usage total reasoning underflow")
+                            })?,
                     );
                     table.insert(key, updated)?;
                 }
@@ -976,16 +1036,33 @@ impl Batch {
             if let Some(new) = new_sample {
                 let hour = new.observed_at.as_unix_micros().div_euclid(3_600_000_000);
                 let key = (hour, agent, provider, model_hash);
-                let current_val = table.get(key)?.map(|v| v.value()).unwrap_or((0, 0, 0, 0, 0, 0, 0));
-                let new_complete = if new.usage == crate::token_usage::TokenUsageState::Complete { 1 } else { 0 };
+                let current_val = table
+                    .get(key)?
+                    .map(|v| v.value())
+                    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
+                let new_complete = if new.usage == crate::token_usage::TokenUsageState::Complete {
+                    1
+                } else {
+                    0
+                };
                 let updated = (
                     current_val.0.saturating_add(1),
                     current_val.1.saturating_add(new_complete),
-                    current_val.2.saturating_add(new.input.value().unwrap_or(0) as u64),
-                    current_val.3.saturating_add(new.output.value().unwrap_or(0) as u64),
-                    current_val.4.saturating_add(new.cache_read.value().unwrap_or(0) as u64),
-                    current_val.5.saturating_add(new.cache_write.value().unwrap_or(0) as u64),
-                    current_val.6.saturating_add(new.reasoning.value().unwrap_or(0) as u64),
+                    current_val
+                        .2
+                        .saturating_add(new.input.value().unwrap_or(0) as u64),
+                    current_val
+                        .3
+                        .saturating_add(new.output.value().unwrap_or(0) as u64),
+                    current_val
+                        .4
+                        .saturating_add(new.cache_read.value().unwrap_or(0) as u64),
+                    current_val
+                        .5
+                        .saturating_add(new.cache_write.value().unwrap_or(0) as u64),
+                    current_val
+                        .6
+                        .saturating_add(new.reasoning.value().unwrap_or(0) as u64),
                 );
                 table.insert(key, updated)?;
             }

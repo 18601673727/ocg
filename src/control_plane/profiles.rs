@@ -899,6 +899,7 @@ mod tests {
             // A Job submitted with both Profiles freezes what they hold.
             let job = handle
                 .create_job(NewJob {
+                    process_grant: None,
                     name: None,
                     eligible_at: None,
                     parent: handle.genesis(),
@@ -1236,13 +1237,16 @@ mod provider_network_tests {
                 })
                 .await
                 .expect("saved Connection");
-            scripted::install_http("https://credential-ref.example/v1/models", |authorization| {
-                assert_eq!(
-                    authorization.expect("authorization").as_bytes(),
-                    b"Bearer saved-secret"
-                );
-                Ok((200, br#"{"data":[{"id":"m"}]}"#.to_vec()))
-            });
+            scripted::install_http(
+                "https://credential-ref.example/v1/models",
+                |authorization| {
+                    assert_eq!(
+                        authorization.expect("authorization").as_bytes(),
+                        b"Bearer saved-secret"
+                    );
+                    Ok((200, br#"{"data":[{"id":"m"}]}"#.to_vec()))
+                },
+            );
             let request = serde_json::to_vec(&json!({
                 "endpoint": "https://credential-ref.example/v1",
                 "credential_ref": "SAVED_REF",
@@ -1260,19 +1264,14 @@ mod provider_network_tests {
         let worker = DatabaseWorker::start(&directory).expect("database");
         let database = worker.handle();
         on_system(move || async move {
-            let body = serde_json::to_vec(
-                &json!({"error": {"message": "x".repeat(4 * 1024)}}),
-            )
-            .expect("JSON");
+            let body = serde_json::to_vec(&json!({"error": {"message": "x".repeat(4 * 1024)}}))
+                .expect("JSON");
             scripted::install_http("https://cap.example/v1/models", move |_| {
                 Ok((401, body.clone()))
             });
-            let reply = provider_models(
-                &database,
-                br#"{"endpoint":"https://cap.example/v1"}"#,
-            )
-            .await
-            .expect("refusal");
+            let reply = provider_models(&database, br#"{"endpoint":"https://cap.example/v1"}"#)
+                .await
+                .expect("refusal");
             assert_eq!(reply.body["error"]["code"], "provider_rejected");
             assert_eq!(reply.body["error"]["status_code"], 401);
             let echoed = reply.body["error"]["message"].as_str().expect("message");
@@ -1306,6 +1305,7 @@ mod reasoning_parameter_tests {
                 profile_id(saved.body["profile_id"].as_str().expect("id")).expect("profile");
             let job = handle
                 .create_job(NewJob {
+                    process_grant: None,
                     name: None,
                     eligible_at: None,
                     parent: handle.genesis(),
@@ -1377,9 +1377,35 @@ mod reasoning_parameter_tests {
             let mut limits = ContextLimits::for_profile(&frozen.llm.config);
             assert_eq!(limits.max_tokens, Some(8192));
             limits.context_window = Some(8193);
-            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, None, None, vec![], limits).is_none());
+            assert!(
+                fit_conversation(
+                    &frozen,
+                    vec![],
+                    Some("hello"),
+                    &[],
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    limits
+                )
+                .is_none()
+            );
             limits.context_window = Some(8194);
-            assert!(fit_conversation(&frozen, vec![], Some("hello"), &[], None, None, None, vec![], limits).is_some());
+            assert!(
+                fit_conversation(
+                    &frozen,
+                    vec![],
+                    Some("hello"),
+                    &[],
+                    None,
+                    None,
+                    None,
+                    vec![],
+                    limits
+                )
+                .is_some()
+            );
             let listed = list_profiles(&handle).await.expect("GET profiles");
             assert_eq!(
                 listed.body["llm_profiles"][0]["parameters"]["reasoning_effort"],

@@ -29,6 +29,61 @@ fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobStateRow, StorageErr
         .ok_or_else(|| StorageError::corrupted(format!("{id} has no job_state")))
 }
 
+pub(super) fn turn_execution(
+    jobs: &impl ReadableTable<u64, &'static [u8]>,
+    row: &JobRow,
+) -> Result<(FrozenExecutionConfig, Option<ProjectId>, Option<ConfigId>), StorageError> {
+    let JobKind::Turn {
+        execution,
+        plan_source,
+    } = &row.kind
+    else {
+        return Err(StorageError::corrupted("expected a turn"));
+    };
+    let execution = match execution {
+        TurnExecution::Frozen(execution) => execution.clone(),
+        TurnExecution::Ref(owner) => {
+            let bytes = jobs
+                .get(owner.get())?
+                .ok_or_else(|| StorageError::corrupted("missing execution owner"))?;
+            let owner = JobRow::decode(bytes.value())?;
+            match owner.kind {
+                JobKind::Turn {
+                    execution: TurnExecution::Frozen(execution),
+                    ..
+                } if owner.parent_id == row.parent_id => execution,
+                _ => {
+                    return Err(StorageError::corrupted(
+                        "execution reference must name a Frozen turn in this conversation",
+                    ));
+                }
+            }
+        }
+    };
+    let (project, agent) = match plan_source {
+        PlanSource::Process { project, .. } => {
+            (*project, execution.agent_ref.map(|agent| agent.id))
+        }
+        PlanSource::Stored => {
+            let conversation = row
+                .parent_id
+                .ok_or_else(|| StorageError::corrupted("stored turn has no conversation"))?;
+            let bytes = jobs
+                .get(conversation.get())?
+                .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
+            match JobRow::decode(bytes.value())?.kind {
+                JobKind::Conversation { project, agent, .. } => (project, agent),
+                JobKind::Turn { .. } => {
+                    return Err(StorageError::corrupted(
+                        "stored turn parent must be a conversation",
+                    ));
+                }
+            }
+        }
+    };
+    Ok((execution, project, agent))
+}
+
 /// A Job assembled from its spec, its state and the derived tables.
 pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord, StorageError> {
     let id = row.id;
@@ -41,13 +96,15 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
             .map(|outcome| outcome.at)
     };
     let subtree_settled = rx.open_table(UNSETTLED)?.get(id.get())?.is_none();
-    let configuration = row
-        .execution
-        .as_ref()
-        .map(|execution| ExecutionConfiguration {
-            agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
-            llm_profile: execution.llm.model.id.into(),
-        });
+    let execution = if row.kind.is_conversation() {
+        None
+    } else {
+        Some(turn_execution(&rx.open_table(JOBS)?, &row)?.0)
+    };
+    let configuration = execution.as_ref().map(|execution| ExecutionConfiguration {
+        agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
+        llm_profile: execution.llm.model.id.into(),
+    });
     let updated_at = [
         Some(row.created_at),
         state.claim.as_ref().map(|claim| claim.started_at),
@@ -68,26 +125,21 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
         cancelled_at: at(OutcomeKind::Cancelled),
         unknown_at: at(OutcomeKind::Unknown),
         stop_confirmed_at: state.stop_confirmed_at,
+        stop_confirmed_by: state.stop_confirmed_by,
         created_at: row.created_at,
         updated_at,
         input: JobInputId::new(id.get()),
         parent: row.parent_id.unwrap_or(JobId::new(0)),
         parent_id: row.parent_id,
-        agent_id: row.agent_id,
-        execution: row.execution,
+        conversation: row.kind.is_stored().then_some(row.parent_id).flatten(),
+        kind: row.kind,
         objective: row.objective,
         attachments: row.attachments,
         dependencies: row.dependencies,
-        max_depth: row.max_depth,
-        max_children: row.max_children,
-        max_descendants: row.max_descendants,
-        retry_of: row.retry_of,
-        continues: row.continues,
         submission: row.submission,
-        project: row.project,
         configuration,
         assigned_executor: state.claim.as_ref().map(|claim| claim.pool_id.into()),
-        previous: row.continues,
+        previous: row.previous,
         claim: state.claim,
         suspension: state.suspension,
         outcome: state.outcome,
@@ -189,6 +241,12 @@ pub(crate) fn read_outputs(
     limit: usize,
 ) -> Result<Vec<JobOutputRecord>, StorageError> {
     let rx = read(database)?;
+    if read_job_row(&rx, job)?.is_some_and(|row| row.kind.is_conversation()) {
+        if after_seq.is_some_and(|seq| seq >= 1) || limit == 0 {
+            return Ok(Vec::new());
+        }
+        return Ok(conversation_result(&rx, job)?.into_iter().collect());
+    }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     let start = after_seq.map_or(0, |seq| {
         u32::try_from(seq).map_or(0, |seq| seq.saturating_add(1))
@@ -210,6 +268,9 @@ pub(crate) fn read_latest_output(
     job: JobId,
 ) -> Result<Option<JobOutputRecord>, StorageError> {
     let rx = read(database)?;
+    if read_job_row(&rx, job)?.is_some_and(|row| row.kind.is_conversation()) {
+        return conversation_result(&rx, job);
+    }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     outputs
         .range((job.get(), 0)..=(job.get(), u32::MAX))?
@@ -217,6 +278,62 @@ pub(crate) fn read_latest_output(
         .transpose()?
         .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
         .transpose()
+}
+
+fn conversation_result(
+    rx: &ReadTransaction,
+    conversation: JobId,
+) -> Result<Option<JobOutputRecord>, StorageError> {
+    let state = read_state(rx, conversation)?;
+    if state.outcome.is_none() {
+        return Ok(None);
+    }
+    let mut summary = String::new();
+    let mut value = None;
+    let answered = rx
+        .open_table(ANSWER_TIPS)?
+        .get(conversation.get())?
+        .map(|tips| tips.value().1)
+        .filter(|turn| *turn != 0);
+    if let Some(turn) = answered
+        && let Some((key, bytes)) = rx
+            .open_table(JOB_OUTPUTS)?
+            .range((turn, 0)..=(turn, u32::MAX))?
+            .next_back()
+            .transpose()?
+    {
+        let output = decode_output(key.value(), bytes.value())?;
+        summary = output.summary.unwrap_or_default();
+        value = output.value;
+    }
+    let after = rx
+        .open_table(NOTICE_READ)?
+        .get(conversation.get())?
+        .map_or(0, |seq| seq.value());
+    if after < u32::MAX {
+        for entry in rx
+            .open_table(NOTICES)?
+            .range((conversation.get(), after + 1)..=(conversation.get(), u32::MAX))?
+        {
+            let notice = Notice::decode(entry?.1.value())?;
+            if matches!(notice.class, NoticeClass::Attention | NoticeClass::Progress) {
+                summary.push_str(&format!("\nUnread notice: {:?}", notice.body));
+            }
+        }
+    }
+    Ok(Some(JobOutputRecord {
+        id: JobOutputId::new(1),
+        job: conversation,
+        seq: 1,
+        kind: OutputKind::Result,
+        summary: Some(summary),
+        code: None,
+        goal_reached: None,
+        value,
+        created_at: state
+            .outcome
+            .map_or(Timestamp::from_unix_micros(0), |outcome| outcome.at),
+    }))
 }
 
 pub(crate) fn read_tool_evidence(
@@ -253,19 +370,21 @@ pub(crate) fn read_tool_evidence(
 
 /// The input of a Job is part of its spec, so it is read from the Job. The
 /// identity of the input is the Job's.
-fn input_of(row: JobRow) -> JobInputRecord {
-    JobInputRecord {
+fn input_of(rx: &ReadTransaction, row: JobRow) -> Result<JobInputRecord, StorageError> {
+    let execution = if row.kind.is_conversation() {
+        None
+    } else {
+        Some(turn_execution(&rx.open_table(JOBS)?, &row)?.0)
+    };
+    Ok(JobInputRecord {
         id: JobInputId::new(row.id.get()),
         objective: row.objective,
-        max_depth: row.max_depth,
-        max_children_per_job: row.max_children,
-        max_total_descendants: row.max_descendants,
         submitted_at: Some(row.created_at),
         created_at: row.created_at,
         updated_at: row.created_at,
-        configuration: row.execution,
+        configuration: execution,
         attachments: row.attachments,
-    }
+    })
 }
 
 pub(crate) fn read_job_input(
@@ -280,7 +399,9 @@ pub(crate) fn read_job_input_for_job(
     job: JobId,
 ) -> Result<Option<JobInputRecord>, StorageError> {
     let rx = read(database)?;
-    Ok(read_job_row(&rx, job)?.map(input_of))
+    read_job_row(&rx, job)?
+        .map(|row| input_of(&rx, row))
+        .transpose()
 }
 
 pub(crate) fn read_job_configuration(
@@ -288,9 +409,13 @@ pub(crate) fn read_job_configuration(
     job: JobId,
 ) -> Result<Option<SubmittedConfiguration>, StorageError> {
     let rx = read(database)?;
-    let Some(execution) = read_job_row(&rx, job)?.and_then(|row| row.execution) else {
+    let Some(row) = read_job_row(&rx, job)? else {
         return Ok(None);
     };
+    if row.kind.is_conversation() {
+        return Ok(None);
+    }
+    let execution = turn_execution(&rx.open_table(JOBS)?, &row)?.0;
     Ok(Some(SubmittedConfiguration {
         agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
         llm_profile: execution.llm.model.id.into(),
@@ -643,9 +768,13 @@ pub(crate) fn read_job_compatible_executors(
     job: JobId,
 ) -> Result<Vec<ExecutorId>, StorageError> {
     let rx = read(database)?;
-    let Some(execution) = read_job_row(&rx, job)?.and_then(|row| row.execution) else {
+    let Some(row) = read_job_row(&rx, job)? else {
         return Ok(Vec::new());
     };
+    if row.kind.is_conversation() {
+        return Ok(Vec::new());
+    }
+    let execution = turn_execution(&rx.open_table(JOBS)?, &row)?.0;
     pools_offering(&rx, execution.llm.provider.transport)
 }
 
@@ -750,14 +879,14 @@ pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool,
 pub struct ConversationEntry {
     pub root_job: JobId,
     pub tip_job: JobId,
-    pub agent: ConfigId,
+    pub agent: Option<ConfigId>,
     pub title: String,
     pub project: Option<ProjectId>,
-    pub turn_count: u32,
+    pub state: String,
+    pub on_hold: Option<Actor>,
     pub tip_settlement_state: String,
     pub tip_created_at: Timestamp,
 }
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConversationsPage {
     pub conversations: Vec<ConversationEntry>,
@@ -771,119 +900,110 @@ pub(crate) fn read_conversations(
     limit: usize,
 ) -> Result<ConversationsPage, StorageError> {
     let rx = read(database)?;
-    let threads_table = rx.open_table(CHAT_THREADS)?;
-    let successors_table = rx.open_table(SUCCESSORS)?;
-    let conversations_table = rx.open_table(CONVERSATIONS)?;
-
-    struct ThreadInfo {
-        root_job: JobId,
-        tip_job: JobId,
-        agent: ConfigId,
-        turn_count: u32,
-    }
-
-    let mut threads = Vec::new();
-    for entry in threads_table.iter()? {
-        let (key, _) = entry?;
-        let (agent_id, root_id) = key.value();
-        let root_job = JobId::new(root_id);
-        let hidden = conversations_table
-            .get(root_id)?
-            .map(|bytes| ConversationRow::decode(bytes.value()))
-            .transpose()?
-            .is_some_and(|row| row.hidden_at.is_some());
-        if hidden {
-            continue;
-        }
-        let agent = ConfigId::new(agent_id);
-        let mut tip = root_id;
-        let mut turn_count = 1u32;
-        while let Some(succ) = successors_table.get(tip)? {
-            tip = succ.value();
-            turn_count += 1;
-        }
-        let tip_job = JobId::new(tip);
-        if let Some(before_id) = before
-            && tip_job >= before_id
-        {
-            continue;
-        }
-        threads.push(ThreadInfo {
-            root_job,
-            tip_job,
-            agent,
-            turn_count,
-        });
-    }
-
-    // Newest activity first: sort descending by tip_job
-    threads.sort_by_key(|thread| std::cmp::Reverse(thread.tip_job));
-
+    let recent = rx.open_table(RECENT)?;
+    let mut conversations = Vec::new();
     let limit = limit.clamp(1, 100);
-    let has_more = threads.len() > limit;
-    let slice = if has_more {
-        &threads[..limit]
-    } else {
-        &threads[..]
-    };
-    let next_before = if has_more {
-        slice.last().map(|t| t.tip_job)
-    } else {
-        None
-    };
-
-    let mut conversations = Vec::with_capacity(slice.len());
-    for t in slice {
-        let root_row = read_job_row(&rx, t.root_job)?;
-        let stored_title = conversations_table
-            .get(t.root_job.get())?
+    for item in recent
+        .range(..(before.map_or(u64::MAX, JobId::get), 0))?
+        .rev()
+        .take(limit + 1)
+    {
+        let (tip, conversation) = item?.0.value();
+        let conversation = JobId::new(conversation);
+        let tip = JobId::new(tip);
+        let row = read_job_row(&rx, conversation)?
+            .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
+        let JobKind::Conversation { agent, project, .. } = row.kind else {
+            return Err(StorageError::corrupted(
+                "recent entry is not a conversation",
+            ));
+        };
+        let metadata = rx
+            .open_table(CONVERSATIONS)?
+            .get(conversation.get())?
             .map(|bytes| ConversationRow::decode(bytes.value()))
             .transpose()?
-            .and_then(|row| row.title);
-        let title = match (
-            stored_title,
-            root_row.as_ref().and_then(|r| r.objective.as_deref()),
-        ) {
-            (Some(title), _) => title,
-            (None, Some(obj)) => match obj.char_indices().nth(80) {
-                Some((idx, _)) => obj[..idx].to_string(),
-                None => obj.to_string(),
-            },
-            (None, None) => String::new(),
+            .ok_or_else(|| StorageError::corrupted("missing conversation state"))?;
+        let title = match metadata.title {
+            Some(title) => title,
+            None => {
+                let first = rx
+                    .open_table(CHILDREN)?
+                    .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                    .next()
+                    .transpose()?
+                    .map(|entry| entry.0.value().1);
+                match first {
+                    Some(first) => rx
+                        .open_table(TURN_INPUTS)?
+                        .range((first, 0)..=(first, u32::MAX))?
+                        .next()
+                        .transpose()?
+                        .map(|entry| TurnEntry::decode(entry.1.value()))
+                        .transpose()?
+                        .map(|entry| match entry.entry {
+                            Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => {
+                                text.chars().take(80).collect()
+                            }
+                            _ => String::new(),
+                        })
+                        .unwrap_or_default(),
+                    None => String::new(),
+                }
+            }
         };
-
-        let tip_row = read_job_row(&rx, t.tip_job)?;
-        let tip_created_at = tip_row
-            .as_ref()
-            .map(|r| r.created_at)
-            .unwrap_or_else(|| Timestamp::from_unix_micros(0));
-
-        let tip_state = read_state(&rx, t.tip_job)?;
-        let tip_settlement_state = match tip_state.outcome.as_ref() {
-            None => "unsettled".to_string(),
-            Some(outcome) => match outcome.kind {
-                OutcomeKind::Completed => "completed".to_string(),
-                OutcomeKind::Failed => "failed".to_string(),
-                OutcomeKind::Cancelled => "cancelled".to_string(),
-                OutcomeKind::Unknown => "unknown".to_string(),
-            },
-        };
-
+        let state = read_state(&rx, conversation)?;
+        let on_hold = metadata
+            .on_hold
+            .map(|seq| {
+                rx.open_table(NOTICES)?
+                    .get((conversation.get(), seq))?
+                    .map(|bytes| Notice::decode(bytes.value()))
+                    .transpose()
+            })
+            .transpose()?
+            .flatten()
+            .and_then(|notice| match notice.body {
+                NoticeBody::Record { by, .. } => Some(by),
+                _ => None,
+            });
+        let tip_state = read_state(&rx, tip)?;
+        let tip_row =
+            read_job_row(&rx, tip)?.ok_or_else(|| StorageError::corrupted("missing tip"))?;
         conversations.push(ConversationEntry {
-            root_job: t.root_job,
-            tip_job: t.tip_job,
-            agent: t.agent,
+            root_job: conversation,
+            tip_job: tip,
+            agent,
+            project,
             title,
-            project: root_row.as_ref().and_then(|r| r.project),
-            turn_count: t.turn_count,
-            tip_settlement_state,
-            tip_created_at,
+            state: if state.outcome.is_some() {
+                "settled"
+            } else if state.children_closed_at.is_some() {
+                "closing"
+            } else {
+                "open"
+            }
+            .to_owned(),
+            on_hold,
+            tip_settlement_state: tip_state
+                .outcome
+                .map_or("unsettled", |outcome| match outcome.kind {
+                    OutcomeKind::Completed => "completed",
+                    OutcomeKind::Failed => "failed",
+                    OutcomeKind::Cancelled => "cancelled",
+                    OutcomeKind::Unknown => "unknown",
+                })
+                .to_owned(),
+            tip_created_at: tip_row.created_at,
         });
     }
-
+    let has_more = conversations.len() > limit;
+    conversations.truncate(limit);
     Ok(ConversationsPage {
+        next_before: has_more
+            .then(|| conversations.last().map(|entry| entry.tip_job))
+            .flatten(),
         conversations,
-        next_before,
         has_more,
     })
 }
@@ -934,9 +1054,8 @@ fn resolve_model_name(
     for entry in scopes.range(start..=end)? {
         let (key, _) = entry?;
         let (_provider, _hash, _obs, job, _req, _seq) = key.value();
-        if let Some(job_row) = read_job_row(rx, JobId::new(job))?
-            && let Some(execution) = job_row.execution
-        {
+        if let Some(job_row) = read_job_row(rx, JobId::new(job))? {
+            let execution = turn_execution(&rx.open_table(JOBS)?, &job_row)?.0;
             return Ok(Some(execution.llm.config.model));
         }
     }
@@ -950,7 +1069,9 @@ pub(crate) fn read_usage_summary(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,
 ) -> Result<crate::persistence::UsageSummaryResponse, StorageError> {
-    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse, UsageSummaryRow};
+    use crate::persistence::{
+        USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse, UsageSummaryRow,
+    };
 
     let rx = read(database)?;
     let table = rx.open_table(USAGE_TOTALS)?;
@@ -1106,4 +1227,304 @@ pub(crate) fn read_usage_summary(
         resume_from_us,
         rows,
     })
+}
+
+pub(crate) fn read_turn_execution(
+    database: &Database,
+    turn: JobId,
+) -> Result<(FrozenExecutionConfig, Option<ProjectId>, Option<ConfigId>), StorageError> {
+    let rx = read(database)?;
+    let row = read_job_row(&rx, turn)?.ok_or_else(|| StorageError::corrupted("turn missing"))?;
+    turn_execution(&rx.open_table(JOBS)?, &row)
+}
+
+pub(crate) fn read_turn_entries(
+    database: &Database,
+    turn: JobId,
+) -> Result<Vec<(u32, TurnEntry)>, StorageError> {
+    let rx = read(database)?;
+    turn_entries(&rx, turn)
+}
+fn turn_entries(rx: &ReadTransaction, turn: JobId) -> Result<Vec<(u32, TurnEntry)>, StorageError> {
+    rx.open_table(TURN_INPUTS)?
+        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+        .map(|entry| {
+            let (key, value) = entry?;
+            Ok((key.value().1, TurnEntry::decode(value.value())?))
+        })
+        .collect()
+}
+pub(crate) fn read_notices(
+    database: &Database,
+    conversation: JobId,
+    after: u32,
+    limit: usize,
+) -> Result<Vec<(u32, Notice)>, StorageError> {
+    let rx = read(database)?;
+    if after == u32::MAX {
+        return Ok(Vec::new());
+    }
+    rx.open_table(NOTICES)?
+        .range((conversation.get(), after + 1)..=(conversation.get(), u32::MAX))?
+        .take(limit.min(MAX_PAGE))
+        .map(|entry| {
+            let (key, value) = entry?;
+            Ok((key.value().1, Notice::decode(value.value())?))
+        })
+        .collect()
+}
+pub(crate) fn read_conversation_turns(
+    database: &Database,
+    conversation: JobId,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Vec<JobRecord>, StorageError> {
+    let rx = read(database)?;
+    let Some(row) = read_job_row(&rx, conversation)? else {
+        return Ok(Vec::new());
+    };
+    if !row.kind.is_conversation() {
+        return Ok(Vec::new());
+    }
+    let mut cursor = match before {
+        Some(before) => read_job_row(&rx, before)?
+            .filter(|row| row.parent_id == Some(conversation) && row.kind.is_stored())
+            .and_then(|row| row.previous),
+        None => rx
+            .open_table(TIPS)?
+            .get(conversation.get())?
+            .map(|tip| JobId::new(tip.value())),
+    };
+    let mut turns = Vec::new();
+    while let Some(turn) = cursor {
+        if turns.len() >= limit.min(101) {
+            break;
+        }
+        let row =
+            read_job_row(&rx, turn)?.ok_or_else(|| StorageError::corrupted("missing turn"))?;
+        cursor = row.previous;
+        turns.push(job_record(&rx, row)?);
+    }
+    Ok(turns)
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextTurn {
+    pub turn: JobId,
+    pub text: String,
+    pub attachments: Vec<AttachmentId>,
+    pub answer: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct TurnContext {
+    pub turns: Vec<ContextTurn>,
+    pub omitted: bool,
+    pub attention: String,
+    pub tree_status: String,
+}
+
+fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageError> {
+    Ok(match entry {
+        Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => text.clone(),
+        Entry::Notice {
+            child,
+            event,
+            reference,
+        } => {
+            let answer = rx
+                .open_table(JOB_OUTPUTS)?
+                .range((reference.get(), 0)..=(reference.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, value)| decode_output(key.value(), value.value()))
+                .transpose()?
+                .filter(|output| output.kind == OutputKind::Result)
+                .and_then(|output| output.summary)
+                .unwrap_or_default();
+            format!("{child}: {event:?}; answer from {reference}: {answer}")
+        }
+        Entry::RetryOf { turn, .. } => {
+            let mut text = format!(
+                "Retry {turn}. Its started tool calls below are uncertain; do not replay them automatically."
+            );
+            for (_, original) in turn_entries(rx, *turn)? {
+                if !matches!(original.entry, Entry::RetryOf { .. }) {
+                    text.push('\n');
+                    text.push_str(&entry_text(rx, &original.entry)?);
+                }
+            }
+            for call in job_tool_evidence(&rx.open_table(TOOL_CALLS)?, *turn)? {
+                if call.admission().is_some()
+                    && call.outcome.as_ref().is_none_or(|outcome| {
+                        matches!(
+                            outcome.fact,
+                            crate::persistence::ToolOutcome::Uncertain { .. }
+                        )
+                    })
+                {
+                    text.push_str(&format!(
+                        "\nUncertain: request {}, index {}, tool {}, arguments {}",
+                        call.call.request.get(),
+                        call.call.index,
+                        call.name,
+                        call.admission()
+                            .map(|admission| admission.arguments.as_str())
+                            .unwrap_or("{}")
+                    ));
+                }
+            }
+            text
+        }
+        Entry::Decision { approval } => {
+            format!("Decision for {}:{}/{}", approval.0, approval.1, approval.2)
+        }
+        Entry::Iteration { n } => format!("Iteration {n}"),
+    })
+}
+pub(crate) fn read_turn_context(
+    database: &Database,
+    turn: JobId,
+    budget_tokens: usize,
+) -> Result<TurnContext, StorageError> {
+    let rx = read(database)?;
+    let row = read_job_row(&rx, turn)?.ok_or_else(|| StorageError::corrupted("turn missing"))?;
+    let mut context = TurnContext {
+        turns: Vec::new(),
+        omitted: false,
+        attention: String::new(),
+        tree_status: String::new(),
+    };
+    let mut cursor = Some(turn);
+    let mut used = 0usize;
+    while let Some(id) = cursor {
+        let row = read_job_row(&rx, id)?
+            .ok_or_else(|| StorageError::corrupted("previous turn missing"))?;
+        let mut text = String::new();
+        let mut attachments = Vec::new();
+        for (_, entry) in turn_entries(&rx, id)? {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&entry_text(&rx, &entry.entry)?);
+            if let Entry::UserMessage {
+                attachments: images,
+                ..
+            } = entry.entry
+            {
+                attachments.extend(images);
+            }
+        }
+        let state = read_state(&rx, id)?;
+        let answer = if state
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Cancelled)
+        {
+            None
+        } else {
+            rx.open_table(JOB_OUTPUTS)?
+                .range((id.get(), 0)..=(id.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, value)| decode_output(key.value(), value.value()))
+                .transpose()?
+                .filter(|output| output.kind == OutputKind::Result)
+                .and_then(|output| output.summary)
+        };
+        let weight = (text.len() + answer.as_ref().map_or(0, String::len) + 16).div_ceil(3)
+            + attachments.len() * 1600;
+        if used.saturating_add(weight) > budget_tokens && id != turn {
+            context.omitted = true;
+            break;
+        }
+        used = used.saturating_add(weight);
+        cursor = row.previous;
+        context.turns.push(ContextTurn {
+            turn: id,
+            text,
+            attachments,
+            answer,
+        });
+    }
+    context.turns.reverse();
+    if let Some(conversation) = row.parent_id.filter(|_| row.kind.is_stored()) {
+        let state = read_state(&rx, turn)?;
+        let through = state.claim.map_or(0, |claim| claim.notice_seq);
+        let mut previous = row.previous;
+        let mut after = 0;
+        while let Some(id) = previous {
+            if let Some(claim) = read_state(&rx, id)?.claim {
+                after = claim.notice_seq;
+                break;
+            }
+            previous = read_job_row(&rx, id)?
+                .ok_or_else(|| StorageError::corrupted("previous turn missing"))?
+                .previous;
+        }
+        let mut status_rows = Vec::new();
+        let mut live = vec![conversation];
+        let mut offset = 0;
+        while offset < live.len() {
+            let parent = live[offset];
+            offset += 1;
+            for entry in rx
+                .open_table(LIVE_CHILDREN)?
+                .range((parent.get(), 0)..=(parent.get(), u64::MAX))?
+            {
+                let child = JobId::new(entry?.0.value().1);
+                let state = read_state(&rx, child)?;
+                status_rows.push(format!(
+                    "{child}: {}",
+                    if state.children_closed_at.is_some() {
+                        "closing"
+                    } else {
+                        "open"
+                    }
+                ));
+                live.push(child);
+            }
+        }
+        if after < through {
+            for entry in rx
+                .open_table(NOTICES)?
+                .range((conversation.get(), after + 1)..=(conversation.get(), through))?
+            {
+                let notice = Notice::decode(entry?.1.value())?;
+                if notice.class == NoticeClass::Attention {
+                    if let NoticeBody::Event {
+                        child,
+                        event,
+                        reference,
+                    } = notice.body
+                    {
+                        context.attention.push_str(&entry_text(
+                            &rx,
+                            &Entry::Notice {
+                                child,
+                                event,
+                                reference,
+                            },
+                        )?);
+                        context.attention.push('\n');
+                    }
+                } else {
+                    status_rows.push(format!("{:?}", notice.body));
+                }
+            }
+        }
+        let mut remaining = 0;
+        for line in status_rows {
+            if context.tree_status.len() + line.len() + 30 <= 3072 {
+                context.tree_status.push_str(&line);
+                context.tree_status.push('\n');
+            } else {
+                remaining += 1;
+            }
+        }
+        if remaining > 0 {
+            context
+                .tree_status
+                .push_str(&format!("and {remaining} more"));
+        }
+    }
+    Ok(context)
 }

@@ -116,6 +116,7 @@ pub struct DatabaseWorker {
 /// database thread.
 #[derive(Clone)]
 pub struct DatabaseHandle {
+    pub(super) stop_cause: Option<Arc<std::sync::Mutex<Option<crate::persistence::StopCause>>>>,
     pub(super) sender: flume::Sender<Message>,
     pub(super) read_sender: flume::Sender<ReadMessage>,
     pub(super) control_sender: flume::Sender<Control>,
@@ -157,7 +158,8 @@ impl DatabaseWorker {
         let log_directory = data_directory.logs_path().to_path_buf();
         let attachment_directory = data_directory.attachments_path().to_path_buf();
         let directory = data_directory.database_path().to_path_buf();
-        let paths = disk_protection::protected_paths(data_directory);
+        let data_directory = data_directory.clone();
+        let paths = disk_protection::protected_paths(&data_directory);
         let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
         let (control_sender, control) = flume::bounded(CONTROL_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = flume::bounded(1);
@@ -217,6 +219,7 @@ impl DatabaseWorker {
                 let credentials_path = directory.join("credentials.json");
                 let credentials = load_credentials_file(&credentials_path);
                 let shared = Arc::new(Shared {
+                    data_directory: data_directory.clone(),
                     scheduler_wake,
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
                     active_policy: policy,
@@ -294,6 +297,7 @@ impl DatabaseWorker {
         let (read_sender, read_receiver) = flume::bounded(READ_QUEUE_CAPACITY);
         let mut worker = Self {
             handle: DatabaseHandle {
+                stop_cause: None,
                 sender,
                 read_sender,
                 control_sender,
@@ -887,8 +891,12 @@ impl WriteWorker {
         let commit_duration_us = commit_started.elapsed().as_micros() as u64;
         if !executed.is_empty() {
             self.shared.durable_commits.fetch_add(1, Ordering::SeqCst);
-            self.shared.commit_us_total.fetch_add(commit_duration_us, Ordering::Relaxed);
-            self.shared.commit_us_max.fetch_max(commit_duration_us, Ordering::Relaxed);
+            self.shared
+                .commit_us_total
+                .fetch_add(commit_duration_us, Ordering::Relaxed);
+            self.shared
+                .commit_us_max
+                .fetch_max(commit_duration_us, Ordering::Relaxed);
         }
         for (ran, outcome_unknown) in &executed {
             if *outcome_unknown {

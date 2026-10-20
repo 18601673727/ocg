@@ -11,6 +11,8 @@ use crate::storage::{Batch, BatchError};
 use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
 mod availability;
+mod conversations;
+pub use conversations::*;
 mod execution;
 mod identity;
 mod mutations;
@@ -30,8 +32,8 @@ pub use availability::{
 };
 pub use execution::{
     AppendedOutput, DependencyCondition, DependencyState, ExecutionConfiguration, FinalResult,
-    IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, JobRetry, NewExecutor,
-    NewJob, NewJobOutput, OutputKind,
+    IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, NewExecutor, NewJob,
+    NewJobOutput, OutputKind,
 };
 pub use identity::{
     AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,
@@ -43,8 +45,8 @@ pub(crate) use mutations::{
     cleanup_attachment, confirm_job_stopped, create_attachment, create_config,
     create_execution_pool, create_executor, create_job, create_project, create_submitted_job,
     finalize_job, reconcile_tool_effect, record_availability_stat, record_metrics,
-    record_tool_decision, record_tool_outcome, retry_job, set_conversation,
-    set_execution_pool_enabled, update_config, update_execution_pool, update_project,
+    record_tool_decision, record_tool_outcome, set_conversation, set_execution_pool_enabled,
+    update_config, update_execution_pool, update_project,
 };
 pub use mutations::{is_handler_version, sanitize_display_name};
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
@@ -69,8 +71,7 @@ pub use tool_evidence::{
     MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES,
     MAX_STORED_TOOL_SCHEMAS_PER_JOB_BYTES, NewToolEvidence, NotInvokedReason, Recorded,
     ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
-    ToolOutcomeKind, ToolPayload, ToolReconciliation, UncertainCause,
-    WithheldReason,
+    ToolOutcomeKind, ToolPayload, ToolReconciliation, UncertainCause, WithheldReason,
 };
 use tool_evidence::{MAX_RECONCILER_BYTES, MAX_RECONCILIATION_TEXT_BYTES};
 

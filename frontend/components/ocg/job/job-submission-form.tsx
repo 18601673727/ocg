@@ -78,7 +78,7 @@ export function JobSubmissionForm({
   client,
   onJob,
   target,
-  previousJob,
+  conversation,
   disabledReason,
 }: {
   client: HttpCanonicalControlClient;
@@ -87,7 +87,7 @@ export function JobSubmissionForm({
   // selector. Absent in the Jobs view: they are typed by identity.
   target?: SubmissionTarget | null;
   // When continuing a multi-turn conversation in Chat, names the completed predecessor Job.
-  previousJob?: string | null;
+  conversation?: string | null;
   // Explains why the next turn cannot be sent yet (e.g. while the current Job is running).
   disabledReason?: string | null;
 }) {
@@ -330,8 +330,8 @@ export function JobSubmissionForm({
               executor: target ? target.executor : executor.trim(),
               objective,
               ...(name.trim() ? { name: name.trim() } : {}),
-              ...(previousJob ? { previous: previousJob } : {}),
-              ...(!previousJob && chat && target?.project ? { project: target.project } : {}),
+              ...(conversation ? { conversation } : {}),
+              ...(!conversation && chat && target?.project ? { project: target.project } : {}),
               ...(granted && chosenProject ? { project: chosenProject.id } : {}),
               ...(attachmentIds.length > 0 ? { attachments: attachmentIds } : {}),
             };
@@ -403,12 +403,12 @@ export function JobSubmissionForm({
     <section className="flex flex-col gap-4 rounded-lg border border-border bg-card p-5 text-card-foreground">
       <header className="flex flex-col gap-1">
         <h2 className="font-heading text-lg">
-          {chat ? (previousJob ? "Send follow-up message" : "Send a message") : "Submit a Job"}
+          {chat ? (conversation ? "Send follow-up message" : "Send a message") : "Submit a Job"}
         </h2>
         <p className="text-xs text-muted-foreground">
           {chat
-            ? previousJob
-              ? `This message will be submitted as a new Job linked to ${previousJob}, carrying the conversation's prior exchanges as context.`
+            ? conversation
+              ? `This message will be submitted as a new Job linked to ${conversation}, carrying the conversation's prior exchanges as context.`
               : "The message becomes one Job of the selected Agent. One Idempotency-Key names it through every retry."
             : "An existing LLM Profile and Executor, by their canonical identities, and an objective. One Idempotency-Key names this submission through every retry."}
         </p>

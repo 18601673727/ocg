@@ -325,7 +325,7 @@ function JobWatchBody({
     setStopBusy(true);
     setStop(null);
     try {
-      const result = await client.stopJob(jobId);
+      const result = await client.stopConversation(job?.conversation ?? jobId);
       setStop(
         result.status === "requested"
           ? t("job.stop.requested")

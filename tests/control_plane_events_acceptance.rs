@@ -444,11 +444,16 @@ fn the_executable_streams_job_outputs_live_and_replays_them() {
     }
     let stop = request(
         address,
-        &format!("POST /api/v1/jobs/{running}/stop"),
+        &format!(
+            "POST /api/v1/conversations/{}/stop",
+            job(address, &running)["conversation"]
+                .as_str()
+                .expect("conversation")
+        ),
         None,
-        None,
+        Some("{}"),
     );
-    assert_eq!(stop["stop"]["status"], "requested", "{stop}");
+    assert_eq!(stop["status"], "requested", "{stop}");
     let (delivered, stopped) = stopping.until_settled();
     assert_eq!(stopped["settlement"]["state"], "unknown");
     assert!(stopped["stop_confirmed_at_us"].is_i64());

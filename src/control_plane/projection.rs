@@ -86,13 +86,7 @@ pub(super) fn settlement_json(record: &JobRecord) -> Result<Value, Refusal> {
 /// The Job's lifecycle as recorded, with its [`settlement_json`].
 pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
     let settlement = settlement_json(record)?;
-    let is_chat = record.previous.is_some()
-        || record.continues.is_some()
-        || record
-            .execution
-            .as_ref()
-            .and_then(|execution| execution.agent.as_ref())
-            .is_some_and(|agent| agent.behavior == crate::persistence::AgentBehavior::Chat);
+    let is_chat = record.conversation.is_some();
     Ok(json!({
         "id": record.id.to_string(),
         "name": record.name,
@@ -102,7 +96,8 @@ pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
         "execution_mode": "once",
         "input": record.input.to_string(),
         "previous": record.previous.map(|previous| previous.to_string()),
-        "project": record.project.map(|project| project.to_string()),
+        "kind": if record.kind.is_conversation() { "conversation" } else { "turn" },
+        "conversation": record.conversation.map(|conversation| conversation.to_string()),
         "assigned_executor": record.assigned_executor.map(|executor| executor.to_string()),
         "created_at_us": record.created_at.as_unix_micros(),
         "updated_at_us": record.updated_at.as_unix_micros(),
@@ -254,13 +249,11 @@ pub(super) fn tool_json(record: &ToolEvidenceRecord) -> Value {
                 NotInvokedReason::Refused(r) => Some(r.as_str()),
                 NotInvokedReason::Cancelled => Some("cancelled before invocation"),
             },
-            ToolOutcome::Uncertain { message, cause } => {
-                message.as_deref().or(match cause {
-                    UncertainCause::TimedOut => Some("timed out"),
-                    UncertainCause::Cancelled => Some("cancelled"),
-                    UncertainCause::HandlerReported => Some("handler reported failure"),
-                })
-            }
+            ToolOutcome::Uncertain { message, cause } => message.as_deref().or(match cause {
+                UncertainCause::TimedOut => Some("timed out"),
+                UncertainCause::Cancelled => Some("cancelled"),
+                UncertainCause::HandlerReported => Some("handler reported failure"),
+            }),
         },
         None => None,
     };
@@ -365,6 +358,7 @@ mod tests {
         let handle = worker.handle();
         let configuration = crate::test_support::execution_configuration(&handle);
         let _job = wait(handle.create_job(crate::persistence::NewJob {
+            process_grant: None,
             name: None,
             eligible_at: None,
             parent: handle.genesis(),
@@ -385,9 +379,24 @@ mod tests {
         assert_eq!(value["database"]["status"], "open");
         assert_eq!(value["database"]["accepting_commands"], true);
         assert_eq!(value["database"]["readable"], true);
-        assert!(value["database"]["database_bytes"].as_u64().expect("database_bytes") > 0);
-        assert!(value["database"]["available_bytes"].as_u64().expect("available_bytes") > 0);
-        assert!(value["database"]["durable_commits"].as_u64().expect("durable_commits") >= 1);
+        assert!(
+            value["database"]["database_bytes"]
+                .as_u64()
+                .expect("database_bytes")
+                > 0
+        );
+        assert!(
+            value["database"]["available_bytes"]
+                .as_u64()
+                .expect("available_bytes")
+                > 0
+        );
+        assert!(
+            value["database"]["durable_commits"]
+                .as_u64()
+                .expect("durable_commits")
+                >= 1
+        );
         assert!(value["database"]["commit_us_max"].is_u64());
         assert!(value["claims"]["count"].is_u64());
         assert!(value["claims"]["max_us"].is_u64());
@@ -395,7 +404,12 @@ mod tests {
         assert!(value["queue"]["ready"].as_u64().expect("queue_ready") >= 1);
         assert!(value["queue"]["delayed"].is_u64());
         assert!(value["queue"]["commands_waiting"].is_u64());
-        assert!(value["process"]["peak_rss_bytes"].as_u64().expect("peak_rss_bytes") > 0);
+        assert!(
+            value["process"]["peak_rss_bytes"]
+                .as_u64()
+                .expect("peak_rss_bytes")
+                > 0
+        );
         assert_eq!(value["quarantined"], json!([]));
         worker.shutdown().expect("shutdown");
     }
@@ -517,7 +531,9 @@ mod tests {
             name: "workspace_run_command".into(),
             spawns: false,
             decision: Recorded {
-                fact: ToolDecision::Refused(crate::openai_compatible::ToolCallRefusal::Unauthorized),
+                fact: ToolDecision::Refused(
+                    crate::openai_compatible::ToolCallRefusal::Unauthorized,
+                ),
                 at: Timestamp::now(),
             },
             outcome: None,

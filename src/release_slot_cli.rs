@@ -44,7 +44,9 @@ pub fn run(
                     return Err("aborted by operator".into());
                 }
             }
-            database.confirm_job_stopped(job).await?;
+            database
+                .confirm_job_stopped(job, crate::persistence::StopProof::Operator)
+                .await?;
             Ok(())
         }
         .await;

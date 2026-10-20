@@ -13,6 +13,8 @@ pub(super) const TAG_TOOL_CALL: u8 = 7;
 pub(super) const TAG_REQUEST_EVENT: u8 = 8;
 pub(super) const TAG_PROJECT: u8 = 9;
 pub(super) const TAG_CONVERSATION: u8 = 10;
+pub(super) const TAG_TURN_INPUT: u8 = 11;
+pub(super) const TAG_NOTICE: u8 = 12;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 
@@ -393,3 +395,240 @@ codes!(UncertainCause { UncertainCause::TimedOut = 1, UncertainCause::Cancelled 
 codes!(EffectConclusion { EffectConclusion::Applied = 1, EffectConclusion::NotApplied = 2 });
 codes!(AttachmentOrigin { AttachmentOrigin::UserProvided = 1, AttachmentOrigin::ModelProduced = 2 });
 codes!(CleanupKind { CleanupKind::Manual = 1, CleanupKind::Automatic = 2 });
+
+impl Enc {
+    pub(super) fn call_ref(&mut self, call: &crate::persistence::ToolCallRef) {
+        self.u64(call.job.get());
+        self.u32(call.request.get());
+        self.u32(call.index);
+    }
+    pub(super) fn actor(&mut self, actor: &Actor) {
+        match actor {
+            Actor::Auto => self.u8(0),
+            Actor::Agent { conversation } => {
+                self.u8(1);
+                self.u64(conversation.get());
+            }
+            Actor::User => self.u8(2),
+            Actor::Loop => self.u8(3),
+        }
+    }
+    pub(super) fn job_kind(&mut self, kind: &JobKind) {
+        match kind {
+            JobKind::Conversation {
+                agent,
+                project,
+                origin,
+                keep_open,
+            } => {
+                self.u8(0);
+                self.ou64(agent.map(ConfigId::get));
+                self.ou64(project.map(ProjectId::get));
+                match origin {
+                    Origin::User => self.u8(0),
+                    Origin::Agent { call } => {
+                        self.u8(1);
+                        self.call_ref(call);
+                    }
+                    Origin::System => self.u8(2),
+                };
+                self.bool(*keep_open);
+            }
+            JobKind::Turn {
+                execution,
+                plan_source,
+            } => {
+                self.u8(1);
+                match execution {
+                    TurnExecution::Frozen(frozen) => {
+                        self.u8(0);
+                        self.frozen_execution(frozen);
+                    }
+                    TurnExecution::Ref(owner) => {
+                        self.u8(1);
+                        self.u64(owner.get());
+                    }
+                };
+                match plan_source {
+                    PlanSource::Stored => self.u8(0),
+                    PlanSource::Process { project, grant } => {
+                        self.u8(1);
+                        self.ou64(project.map(ProjectId::get));
+                        self.ostr(grant);
+                    }
+                }
+            }
+        }
+    }
+    pub(super) fn notice_event(&mut self, event: &NoticeEvent) {
+        match event {
+            NoticeEvent::ClosedSelf => self.u8(0),
+            NoticeEvent::ClosedAbove => self.u8(1),
+            NoticeEvent::StoppedAbove => self.u8(2),
+            NoticeEvent::TurnEnded { kind } => {
+                self.u8(3);
+                self.u8(*kind as u8);
+            }
+            NoticeEvent::Requested => self.u8(4),
+            NoticeEvent::Stalled => self.u8(5),
+            NoticeEvent::ObjectiveCompleted => self.u8(6),
+            NoticeEvent::MessageCompleted => self.u8(7),
+            NoticeEvent::AgentTurnCompleted => self.u8(8),
+            NoticeEvent::IterationCompleted => self.u8(9),
+            NoticeEvent::RecurrenceHalted => self.u8(10),
+        }
+    }
+    pub(super) fn entry(&mut self, entry: &Entry) {
+        match entry {
+            Entry::UserMessage { text, attachments } => {
+                self.u8(0);
+                self.str(text);
+                self.u32(attachments.len() as u32);
+                for attachment in attachments {
+                    self.u64(attachment.get());
+                }
+            }
+            Entry::AgentMessage { text, call } => {
+                self.u8(1);
+                self.str(text);
+                self.call_ref(call);
+            }
+            Entry::Notice {
+                child,
+                event,
+                reference,
+            } => {
+                self.u8(2);
+                self.u64(child.get());
+                self.notice_event(event);
+                self.u64(reference.get());
+            }
+            Entry::Decision {
+                approval: (turn, request, index),
+            } => {
+                self.u8(3);
+                self.u64(turn.get());
+                self.u32(*request);
+                self.u32(*index);
+            }
+            Entry::RetryOf { turn, by } => {
+                self.u8(4);
+                self.u64(turn.get());
+                self.actor(by);
+            }
+            Entry::Iteration { n } => {
+                self.u8(5);
+                self.u64(*n);
+            }
+        }
+    }
+}
+impl Dec<'_> {
+    pub(super) fn call_ref(&mut self) -> DecodeResult<crate::persistence::ToolCallRef> {
+        Ok(crate::persistence::ToolCallRef {
+            job: JobId::new(self.u64()?),
+            request: RequestNumber::new(self.u32()?)
+                .ok_or_else(|| StorageError::corrupted("invalid request"))?,
+            index: self.u32()?,
+        })
+    }
+    pub(super) fn actor(&mut self) -> DecodeResult<Actor> {
+        Ok(match self.u8()? {
+            0 => Actor::Auto,
+            1 => Actor::Agent {
+                conversation: JobId::new(self.u64()?),
+            },
+            2 => Actor::User,
+            3 => Actor::Loop,
+            _ => return Err(StorageError::corrupted("invalid actor")),
+        })
+    }
+    pub(super) fn job_kind(&mut self) -> DecodeResult<JobKind> {
+        Ok(match self.u8()? {
+            0 => JobKind::Conversation {
+                agent: self.ou64()?.map(ConfigId::new),
+                project: self.ou64()?.map(ProjectId::new),
+                origin: match self.u8()? {
+                    0 => Origin::User,
+                    1 => Origin::Agent {
+                        call: self.call_ref()?,
+                    },
+                    2 => Origin::System,
+                    _ => return Err(StorageError::corrupted("invalid origin")),
+                },
+                keep_open: self.bool()?,
+            },
+            1 => JobKind::Turn {
+                execution: match self.u8()? {
+                    0 => TurnExecution::Frozen(self.frozen_execution()?),
+                    1 => TurnExecution::Ref(JobId::new(self.u64()?)),
+                    _ => return Err(StorageError::corrupted("invalid execution")),
+                },
+                plan_source: match self.u8()? {
+                    0 => PlanSource::Stored,
+                    1 => PlanSource::Process {
+                        project: self.ou64()?.map(ProjectId::new),
+                        grant: self.ostr()?,
+                    },
+                    _ => return Err(StorageError::corrupted("invalid plan source")),
+                },
+            },
+            _ => return Err(StorageError::corrupted("invalid job kind")),
+        })
+    }
+    pub(super) fn notice_event(&mut self) -> DecodeResult<NoticeEvent> {
+        Ok(match self.u8()? {
+            0 => NoticeEvent::ClosedSelf,
+            1 => NoticeEvent::ClosedAbove,
+            2 => NoticeEvent::StoppedAbove,
+            3 => NoticeEvent::TurnEnded {
+                kind: match self.u8()? {
+                    1 => OutcomeKind::Completed,
+                    2 => OutcomeKind::Failed,
+                    3 => OutcomeKind::Cancelled,
+                    4 => OutcomeKind::Unknown,
+                    _ => return Err(StorageError::corrupted("invalid outcome")),
+                },
+            },
+            4 => NoticeEvent::Requested,
+            5 => NoticeEvent::Stalled,
+            6 => NoticeEvent::ObjectiveCompleted,
+            7 => NoticeEvent::MessageCompleted,
+            8 => NoticeEvent::AgentTurnCompleted,
+            9 => NoticeEvent::IterationCompleted,
+            10 => NoticeEvent::RecurrenceHalted,
+            _ => return Err(StorageError::corrupted("invalid notice event")),
+        })
+    }
+    pub(super) fn entry(&mut self) -> DecodeResult<Entry> {
+        Ok(match self.u8()? {
+            0 => {
+                let text = self.str()?;
+                let n = self.u32()?;
+                let mut attachments = Vec::new();
+                for _ in 0..n {
+                    attachments.push(AttachmentId::new(self.u64()?));
+                }
+                Entry::UserMessage { text, attachments }
+            }
+            1 => Entry::AgentMessage {
+                text: self.str()?,
+                call: self.call_ref()?,
+            },
+            2 => Entry::Notice {
+                child: JobId::new(self.u64()?),
+                event: self.notice_event()?,
+                reference: JobId::new(self.u64()?),
+            },
+            3 => Entry::Decision {
+                approval: (JobId::new(self.u64()?), self.u32()?, self.u32()?),
+            },
+            4 => Entry::RetryOf {
+                turn: JobId::new(self.u64()?),
+                by: self.actor()?,
+            },
+            5 => Entry::Iteration { n: self.u64()? },
+            _ => return Err(StorageError::corrupted("invalid entry")),
+        })
+    }
+}

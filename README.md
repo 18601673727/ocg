@@ -103,14 +103,48 @@ curl -X POST http://127.0.0.1:7840/api/v1/projects \
   a body that names `root` is refused. `GET /api/v1/projects` lists Projects
   newest first with `before=project:<n>` and `limit`. There is no delete.
 - A Job names its Project when it is submitted (`"project": "project:<n>"`); a
-  follow-up to a conversation takes its previous turn's and may not name
-  another.
+  conversation fixes its Project at creation. Follow-up messages name the
+  conversation and omit `project`.
 
 Pools and conversations have routes too: `GET /api/v1/pools` lists every Pool,
 and `POST /api/v1/pools/{execution_pool}` sets `{"concurrency_limit": n}` or
 `{"enabled": bool}` (lowering the limit stops new claims; running Jobs
 continue); `POST /api/v1/conversations/{job}` sends `{"title": "..."}` or
 `{"hidden": true}`, and hiding is permanent.
+
+## Conversations and turns
+
+A conversation is a long-lived parent that owns its Agent, Project and child
+turns. `POST /api/v1/jobs` opens a conversation with its first user message;
+its admission reply names `conversation`, `job`, `seq`, `joined` and the frozen
+`model`. Send another message with `"conversation": "job:N"`. Messages can be
+sent while an answer runs: the first creates a waiting turn, and more messages
+join that turn until it is claimed. A joined message uses that turn's frozen
+model. The Agent stays fixed; an omitted Model uses the tip's Model.
+
+`GET /api/v1/conversations` lists visible root conversations by newest tip,
+with `state` (`open`, `closing`, `settled`), `on_hold` and `project`.
+`GET /api/v1/conversations/job:N/turns?limit=20&before=job:M` pages turns newest
+first (maximum 100), including each input entry, outputs and uncertain calls.
+`GET /api/v1/conversations/job:N/notices?after_seq=0&limit=20` reads notice rows.
+
+Send `{}` to `POST /api/v1/conversations/job:N/stop` to stop the current answer.
+Queued messages remain in the chain for the next turn to read; Stop leaves the
+conversation open. Send `{}` to `/close` to close its whole subtree: it accepts
+no new turns and settles once every running execution is confirmed stopped.
+An idle conversation settles in the Close transaction. `/hold` prevents new
+claims in the subtree; `/unhold` places eligible waiting turns again. Hold does
+not stop an answer already running. `/retry` accepts `{"turn":"job:M"}` and
+appends a retry reference; started calls with uncertain outcomes are disclosed
+and never automatically replayed. System conversations are managed in Settings.
+
+Unclaimed stored turns survive clean shutdown and crashes. `ocg serve` claims
+them after restart using their frozen configuration and their Project's current
+commands. A running turn abandoned by a crash becomes Unknown; when its stop
+cannot be proven, its quarantined slot stalls the conversation until the stop
+is confirmed. CLI process turns belong to their admitting process and are
+cancelled if reopened without a claim. The stored format is 20, with no migration;
+recreate data directories made by earlier versions.
 
 ## Sign a browser in
 

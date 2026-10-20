@@ -19,7 +19,7 @@ use crate::persistence::{
     AvailabilityRequestSample, AvailabilityStatRecord, ConfigBody, ConfigId, ConfigKind,
     ConnectionConfig, ConversationEdit, DependencyCondition, ExecutionConfiguration, ExecutorId,
     FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome,
-    JobRecord, JobRetry, LlmParameters, LlmProviderId, LlmTransport, Measurements, MetricsRecord,
+    JobRecord, LlmParameters, LlmProviderId, LlmTransport, Measurements, MetricsRecord,
     MixedRequests, ModelCapability, ModelConfig, NewAvailabilityStat, NewConfig, NewExecutor,
     NewJob, NewJobOutput, NewMetrics, NewProject, ObservationFilter, OutputKind, ProfileId,
     ProjectCommand, ProjectId, RecordRef, RejectionCause, RequestNumber, TimeRange, Timestamp,
@@ -38,6 +38,7 @@ fn data_directory(name: &str) -> (TestRoot, DataDirectory) {
 
 fn new_job(handle: &DatabaseHandle, name: &str, parent: JobId) -> NewJob {
     NewJob {
+        process_grant: None,
         name: Some(name.into()),
         eligible_at: None,
         parent,
@@ -49,6 +50,17 @@ fn new_job(handle: &DatabaseHandle, name: &str, parent: JobId) -> NewJob {
         },
         configuration: Some(crate::test_support::execution_configuration(handle)),
         previous: None,
+    }
+}
+
+fn process_project(job: &JobRecord) -> Option<ProjectId> {
+    match &job.kind {
+        crate::persistence::JobKind::Turn {
+            plan_source: crate::persistence::PlanSource::Process { project, .. },
+            ..
+        }
+        | crate::persistence::JobKind::Conversation { project, .. } => *project,
+        _ => None,
     }
 }
 
@@ -71,7 +83,11 @@ fn provider_progress_skips_empty_text_and_preserves_whitespace() {
     }
     let outputs = wait(handle.job_outputs(job, None, 10)).expect("outputs");
     assert_eq!(outputs.len(), 3);
-    for (output, (seq, text)) in outputs.iter().zip([(1, " \t\n"), (2, "\u{2003}"), (3, " answer \n")]) {
+    for (output, (seq, text)) in
+        outputs
+            .iter()
+            .zip([(1, " \t\n"), (2, "\u{2003}"), (3, " answer \n")])
+    {
         assert_eq!(output.seq, seq);
         assert_eq!(output.summary.as_deref(), Some(text));
     }
@@ -436,7 +452,6 @@ fn nodes_and_relationships_round_trip_through_reopening() {
     let dependent = create_job(
         &handle,
         NewJob {
-            dependencies: vec![(parent, DependencyCondition::Settled)],
             project: Some(beta),
             ..new_job(&handle, "dependent", genesis)
         },
@@ -529,7 +544,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
         .find(|job| job.id == parent)
         .expect("parent persisted");
     assert_eq!(
-        (parent_record.parent, parent_record.project),
+        (parent_record.parent, process_project(parent_record)),
         (genesis, Some(alpha))
     );
     assert_eq!(parent_record.assigned_executor, None, "nothing claimed it");
@@ -538,7 +553,7 @@ fn nodes_and_relationships_round_trip_through_reopening() {
     assert_eq!(
         jobs.iter()
             .find(|job| job.id == dependent)
-            .map(|job| job.project),
+            .map(process_project),
         Some(Some(beta))
     );
     assert_eq!(
@@ -617,7 +632,10 @@ fn job_creation_refuses_missing_endpoints_without_partial_writes() {
                 dependencies: vec![(missing_job, DependencyCondition::Success)],
                 ..new_job(&handle, "waits", genesis)
             },
-            Violation::NotFound(RecordRef::Job(missing_job)),
+            Violation::InvalidValue(
+                "dependencies",
+                "K1 supports only the previous turn dependency",
+            ),
         ),
     ];
     for (job, expected) in attempts {
@@ -656,10 +674,11 @@ fn a_job_has_one_project_that_its_children_do_not_inherit() {
         },
     );
     let project_of = |job| {
-        wait(handle.job(job))
-            .expect("read job")
-            .expect("job exists")
-            .project
+        process_project(
+            &wait(handle.job(job))
+                .expect("read job")
+                .expect("job exists"),
+        )
     };
     assert_eq!(project_of(parent), Some(alpha));
     assert_eq!(
@@ -739,73 +758,6 @@ fn project_roots_never_overlap_and_an_update_keeps_the_root() {
 }
 
 /// Runs `job` as a settled turn of a conversation.
-fn settled_turn(handle: &DatabaseHandle, executor: ExecutorId, job: NewJob) -> JobId {
-    let job = create_job(handle, job);
-    wait(handle.claim_fixture(job, executor)).expect("start the turn");
-    wait(handle.finalize_job(job, JobFinalization::Completed(result("answer")))).expect("settle");
-    job
-}
-
-#[test]
-fn a_granted_agent_needs_a_project_that_its_conversation_and_retries_keep() {
-    let (_root, directory) = data_directory("granted-project");
-    let worker = DatabaseWorker::start(&directory).expect("start database");
-    let handle = worker.handle();
-    let provider = provider(&handle, "granted");
-    let llm = llm_profile(
-        &handle,
-        provider,
-        llm_config("model-a", &[ModelCapability::Chat, ModelCapability::Tools]),
-    );
-    let agent: ProfileId = wait(handle.create_config(NewConfig {
-        name: "granted".into(),
-        body: ConfigBody::Agent(AgentConfig {
-            behavior: AgentBehavior::Chat,
-            models: vec![llm.into()],
-            tool_grant: Some("read".into()),
-            ..Default::default()
-        }),
-    }))
-    .expect("agent")
-    .into();
-    let executor = executor(&handle, "worker", &[OPENAI]).expect("executor");
-    let (alpha, beta) = (project(&handle, "alpha"), project(&handle, "beta"));
-    let turn = |project, previous| NewJob {
-        project,
-        previous,
-        configuration: configuration(agent, llm),
-        ..new_job(&handle, "turn", handle.genesis())
-    };
-
-    assert_eq!(
-        violation(wait(handle.create_job(turn(None, None)))),
-        Violation::ProjectRequired
-    );
-    let first = settled_turn(&handle, executor, turn(Some(alpha), None));
-    assert_eq!(
-        violation(wait(handle.create_job(turn(Some(beta), Some(first))))),
-        Violation::ProjectMismatch
-    );
-    let second = settled_turn(&handle, executor, turn(Some(alpha), Some(first)));
-    let retry = wait(handle.retry_job(JobRetry {
-        original: second,
-        parent: handle.genesis(),
-        name: None,
-        eligible_at: None,
-        dependencies: Vec::new(),
-        acknowledge_repeated_effects: false,
-    }))
-    .expect("retry");
-    let project_of = |job| {
-        wait(handle.job(job))
-            .expect("read")
-            .expect("exists")
-            .project
-    };
-    assert_eq!(project_of(second), Some(alpha));
-    assert_eq!(project_of(retry), Some(alpha), "a retry keeps the Project");
-    worker.shutdown().expect("shutdown");
-}
 
 #[test]
 fn a_renamed_conversation_shows_its_title_and_a_hidden_one_leaves_the_list() {
@@ -815,14 +767,38 @@ fn a_renamed_conversation_shows_its_title_and_a_hidden_one_leaves_the_list() {
     let Configured { targeted, agent } = configured(&handle);
     let executor = executor(&handle, "worker", &[OPENAI]).expect("executor");
     let alpha = project(&handle, "alpha");
-    let turn = |project, previous| NewJob {
-        project,
-        previous,
-        configuration: configuration(agent, targeted),
-        ..new_job(&handle, "turn", handle.genesis())
-    };
-    let root = settled_turn(&handle, executor, turn(Some(alpha), None));
-    let tip = settled_turn(&handle, executor, turn(Some(alpha), Some(root)));
+    let configuration = configuration(agent, targeted).expect("configuration");
+    let (root, first) = wait(handle.open_conversation(
+        None,
+        crate::persistence::ConversationSpec {
+            name: None,
+            agent: Some(agent.into()),
+            project: Some(alpha),
+            origin: crate::persistence::Origin::User,
+            keep_open: true,
+        },
+        crate::persistence::Entry::UserMessage {
+            text: "turn".into(),
+            attachments: Vec::new(),
+        },
+        configuration,
+        None,
+    ))
+    .expect("open");
+    wait(handle.claim_fixture(first.turn, executor)).expect("claim");
+    wait(handle.finalize_job(first.turn, JobFinalization::Completed(result("first"))))
+        .expect("finish");
+    let tip = wait(handle.append(
+        root,
+        crate::persistence::Entry::UserMessage {
+            text: "next".into(),
+            attachments: Vec::new(),
+        },
+        Some(configuration),
+        None,
+    ))
+    .expect("append")
+    .turn;
     let listed = || {
         wait(handle.conversations(None, 10))
             .expect("list")
@@ -3141,7 +3117,7 @@ mod control_plane {
 
     use super::*;
     use crate::control_plane::ControlPlaneConfig;
-    use crate::host::{HostContext, Phase, run_controlled_reporting};
+    use crate::host::{HostContext, Phase, run_process_controlled_reporting};
     use crate::persistence::{IntermediateOutputKind, JobFinalization, NewJobOutput};
 
     const TOKEN: &str = "T0k3n-For-The-Control-Plane_Tests.0123456789~abc";
@@ -3228,7 +3204,7 @@ mod control_plane {
         let report = std::thread::scope(|scope| {
             scope
                 .spawn(move || {
-                    run_controlled_reporting(
+                    run_process_controlled_reporting(
                         directory,
                         false,
                         control,
@@ -3314,7 +3290,8 @@ mod control_plane {
             wait(handle.claim_fixture(confirmed, test_executor(handle))).expect("start");
             progress(handle, confirmed, "partial answer");
             wait(handle.finalize_job(confirmed, JobFinalization::Unknown)).expect("unknown");
-            let _ = wait(handle.confirm_job_stopped(confirmed));
+            let _ =
+                wait(handle.confirm_job_stopped(confirmed, crate::persistence::StopProof::Proof));
             // Unknown, its stop never confirmed.
             let unconfirmed = llm_job(handle, llm);
             wait(handle.claim_fixture(unconfirmed, test_executor(handle))).expect("start");
@@ -3338,8 +3315,16 @@ mod control_plane {
             assert_eq!(health.status, 200);
             let health_json = health.json();
             assert!(health_json["database"]["database_bytes"].as_u64().is_some());
-            assert!(health_json["database"]["available_bytes"].as_u64().is_some());
-            assert!(health_json["database"]["durable_commits"].as_u64().is_some());
+            assert!(
+                health_json["database"]["available_bytes"]
+                    .as_u64()
+                    .is_some()
+            );
+            assert!(
+                health_json["database"]["durable_commits"]
+                    .as_u64()
+                    .is_some()
+            );
             assert_eq!(
                 health_json,
                 json!({
@@ -3958,8 +3943,7 @@ mod lifecycle_closure {
         CleanupConfig, FilesystemConfig, ProtectedArea, ProtectionReason, SpaceShortage,
     };
     use crate::orchestration::execution_runtime::ProviderExecutionPlan;
-    use crate::persistence::DependencyCondition::{Settled, Success};
-    use crate::persistence::DependencyState::{Impossible, Waiting};
+    use crate::persistence::DependencyState::Waiting;
     use crate::provider_execution::{
         CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
     };
@@ -4089,7 +4073,7 @@ mod lifecycle_closure {
         // In format 16, profiles are always editable (no lock checks).
         for job in settled {
             assert!(matches!(
-                wait(handle.confirm_job_stopped(job)),
+                wait(handle.confirm_job_stopped(job, crate::persistence::StopProof::Proof)),
                 Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_)))
             ));
         }
@@ -4280,7 +4264,11 @@ mod lifecycle_closure {
         let handle = worker.handle();
         let (endpoint, _accepted) = silent_provider(1);
         let setup = silent_setup(&handle, endpoint);
-        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let runtime = ExecutionRuntime::start(
+            handle.clone(),
+            crate::orchestration::execution_runtime::ClaimScope::Process,
+        )
+        .expect("start runtime");
         let receipt = match wait(runtime.scheduler().schedule_provider(provider_plan(
             &handle,
             &setup,
@@ -4310,7 +4298,11 @@ mod lifecycle_closure {
         let handle = worker.handle();
         let (endpoint, accepted) = silent_provider(1);
         let setup = silent_setup(&handle, endpoint);
-        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let runtime = ExecutionRuntime::start(
+            handle.clone(),
+            crate::orchestration::execution_runtime::ClaimScope::Process,
+        )
+        .expect("start runtime");
         let scheduler = runtime.scheduler();
 
         // A request that would wait two minutes for a response head.
@@ -4389,129 +4381,52 @@ mod lifecycle_closure {
     }
 
     /// A started Job settled with `finalization`.
-    fn settled_job(handle: &DatabaseHandle, name: &str, finalization: JobFinalization) -> JobId {
-        let job = create_job(handle, new_job(handle, name, handle.genesis()));
-        wait(handle.claim_fixture(job, test_executor(handle))).expect("start");
-        wait(handle.finalize_job(job, finalization)).expect("settle");
-        job
-    }
 
     #[test]
     fn execution_starts_only_once_every_dependency_is_satisfied() {
         let (_root, directory) = data_directory("start-gate");
-        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let worker = DatabaseWorker::start(&directory).expect("database");
         let handle = worker.handle();
-        let completed = settled_job(
-            &handle,
-            "completed",
-            JobFinalization::Completed(result("done")),
-        );
-        let failed = settled_job(&handle, "failed", JobFinalization::Failed(result("failed")));
-        let waiting = create_job(&handle, new_job(&handle, "waiting", handle.genesis()));
-        let dependent = |dependencies: &[(JobId, DependencyCondition)]| {
-            create_job(
-                &handle,
-                NewJob {
-                    dependencies: dependencies.to_vec(),
-                    ..new_job(&handle, "dependent", handle.genesis())
-                },
-            )
-        };
-
-        for dependencies in [
-            &[(completed, Success)][..],
-            &[(failed, Settled)],
-            &[(completed, Success), (failed, Settled)],
-        ] {
-            let job = dependent(dependencies);
-            wait(handle.claim_fixture(job, test_executor(&handle)))
-                .expect("a satisfied Job starts");
-            let local = dependent(dependencies);
-            wait(handle.claim_fixture(local, test_executor(&handle)))
-                .expect("a satisfied Job starts locally");
-            for job in [job, local] {
-                assert!(record(&handle, job).started_at.is_some());
-                wait(handle.finalize_job(job, JobFinalization::Completed(result("done"))))
-                    .expect("and completes");
-            }
-        }
-
-        let refused_creation = violation(wait(handle.create_job(NewJob {
-            dependencies: vec![(failed, Success)],
-            ..new_job(&handle, "impossible dependent", handle.genesis())
-        })));
-        assert!(matches!(
-            refused_creation,
-            Violation::UnsatisfiedDependency { prerequisite, state: Impossible, .. } if prerequisite == failed
-        ));
-
-        let cases = [
-            (&[(waiting, Success)][..], waiting, Waiting),
-            (
-                &[(completed, Success), (waiting, Settled)],
-                waiting,
-                Waiting,
-            ),
-        ];
-        let mut refused = Vec::new();
-        for (dependencies, prerequisite, state) in cases {
-            let job = dependent(dependencies);
-            let before = record(&handle, job);
-            let expected = Violation::UnsatisfiedDependency {
-                job,
-                prerequisite,
-                state,
-            };
-            assert_eq!(
-                violation(wait(handle.claim_fixture(job, test_executor(&handle)))),
-                expected
-            );
-            assert_eq!(
-                violation(wait(handle.claim_fixture(job, test_executor(&handle)))),
-                expected
-            );
-            assert_eq!(
-                record(&handle, job),
-                before,
-                "a refused start changes nothing"
-            );
-            refused.push((job, state));
-        }
-
-        // A waiting Job starts once its dependency is satisfied; an
-        // impossible one is closed only by an explicit failure.
-        wait(handle.claim_fixture(waiting, test_executor(&handle)))
-            .expect("start the prerequisite");
-        wait(handle.finalize_job(waiting, JobFinalization::Completed(result("done"))))
-            .expect("complete the prerequisite");
-        for (job, state) in refused {
-            if state == Waiting {
-                wait(handle.claim_fixture(job, test_executor(&handle)))
-                    .expect("the waiting Job now starts");
-                assert!(record(&handle, job).started_at.is_some());
-                wait(handle.finalize_job(job, JobFinalization::Completed(result("done"))))
-                    .expect("and completes");
-            } else {
-                assert!(matches!(
-                    violation(wait(handle.claim_fixture(job, test_executor(&handle)))),
-                    Violation::UnsatisfiedDependency { .. }
-                ));
-                let unchanged = record(&handle, job);
-                assert!(unchanged.started_at.is_none() && unchanged.failed_at.is_none());
-                wait(
-                    handle
-                        .finalize_job(job, JobFinalization::Failed(result("prerequisite failed"))),
-                )
-                .expect("an explicit failure closes it");
-            }
-        }
-        worker.shutdown().expect("shutdown");
-
-        let worker = DatabaseWorker::start(&directory).expect("restart");
+        let (_, llm) = llm_setup(&handle, "previous-gate");
+        let (conversation, first) = wait(handle.open_conversation(
+            None,
+            crate::persistence::ConversationSpec {
+                name: None,
+                agent: None,
+                project: None,
+                origin: crate::persistence::Origin::User,
+                keep_open: true,
+            },
+            crate::persistence::Entry::UserMessage {
+                text: "first".into(),
+                attachments: vec![],
+            },
+            llm_only(llm).expect("configuration"),
+            None,
+        ))
+        .expect("open");
+        wait(handle.claim_fixture(first.turn, test_executor(&handle))).expect("claim");
+        let next = wait(handle.append(
+            conversation,
+            crate::persistence::Entry::UserMessage {
+                text: "next".into(),
+                attachments: vec![],
+            },
+            None,
+            None,
+        ))
+        .expect("append");
         assert!(
-            worker.handle().abandoned_at_open().is_empty(),
-            "no refused start left a claim"
+            matches!(violation(wait(handle.claim_fixture(next.turn, test_executor(&handle)))), Violation::UnsatisfiedDependency { prerequisite, state: Waiting, .. } if prerequisite == first.turn)
         );
+        assert!(record(&handle, next.turn).claim.is_none());
+        wait(handle.finalize_job(first.turn, JobFinalization::Failed(result("failed"))))
+            .expect("settled previous");
+        wait(handle.claim_fixture(next.turn, test_executor(&handle)))
+            .expect("Settled permits failure");
+        assert!(wait(handle.claim_fixture(next.turn, test_executor(&handle))).is_err());
+        wait(handle.finalize_job(next.turn, JobFinalization::Completed(result("done"))))
+            .expect("finish");
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
     }
@@ -4703,13 +4618,25 @@ mod settlement {
     }
 
     fn job(handle: &DatabaseHandle, llm: ProfileId, name: &str) -> JobId {
-        create_job(
-            handle,
-            NewJob {
-                configuration: llm_only(llm),
-                ..new_job(handle, name, JobId::new(0))
+        wait(handle.open_conversation(
+            None,
+            crate::persistence::ConversationSpec {
+                name: Some(name.into()),
+                agent: None,
+                project: None,
+                origin: crate::persistence::Origin::User,
+                keep_open: true,
             },
-        )
+            crate::persistence::Entry::UserMessage {
+                text: name.into(),
+                attachments: vec![],
+            },
+            llm_only(llm).expect("configuration"),
+            None,
+        ))
+        .expect("open")
+        .1
+        .turn
     }
 
     fn dependent(
@@ -4717,14 +4644,20 @@ mod settlement {
         llm: ProfileId,
         name: &str,
         prerequisite: JobId,
-        condition: DependencyCondition,
+        _condition: DependencyCondition,
     ) -> JobId {
         create_job(
             handle,
             NewJob {
                 configuration: llm_only(llm),
-                dependencies: vec![(prerequisite, condition)],
-                ..new_job(handle, name, JobId::new(0))
+                previous: Some(prerequisite),
+                ..new_job(
+                    handle,
+                    name,
+                    record(handle, prerequisite)
+                        .conversation
+                        .expect("conversation"),
+                )
             },
         )
     }
@@ -4788,38 +4721,21 @@ mod settlement {
     }
 
     #[test]
-    fn format_16_settlement_success_dependency_impossible_cancels_waiter() {
-        let (_root, directory) = data_directory("f16-settle-failed-waiter");
-        let worker = DatabaseWorker::start(&directory).expect("start database");
+    fn k1_refuses_dependencies_other_than_previous() {
+        let (_root, directory) = data_directory("k1-dependency-refusal");
+        let worker = DatabaseWorker::start(&directory).expect("database");
         let handle = worker.handle();
         let llm = setup_pool(&handle, 2);
-
-        let job_a = job(&handle, llm, "job-a");
-        let job_b = dependent(&handle, llm, "job-b", job_a, Success);
-
-        let grants = wait(handle.claim_batch()).expect("claim batch");
-        assert_eq!(grants, vec![job_a]);
-
-        // Fail Job A; SETTLE detects that Success dependency on Job A is impossible,
-        // and automatically cancels Job B
-        wait(handle.finalize_job(job_a, JobFinalization::Failed(result("A failed"))))
-            .expect("finalize A");
-
-        let rec_a = record(&handle, job_a);
-        assert!(rec_a.failed_at.is_some());
-
-        let rec_b = record(&handle, job_b);
-        assert!(
-            rec_b.cancelled_at.is_some(),
-            "waiter Job B was cancelled by SETTLE"
-        );
-
-        // Job B was cancelled and settled, so claim batch has no work
-        let grants_empty = wait(handle.claim_batch()).expect("claim batch");
-        assert!(grants_empty.is_empty());
-
+        let first = job(&handle, llm, "first");
+        assert!(matches!(
+            violation(wait(handle.create_job(NewJob {
+                configuration: llm_only(llm),
+                dependencies: vec![(first, Success)],
+                ..new_job(&handle, "refused", handle.genesis())
+            }))),
+            Violation::InvalidValue("dependencies", _)
+        ));
         worker.shutdown().expect("shutdown");
-        assert_relationships_consistent(&directory);
     }
 
     #[test]
@@ -4868,8 +4784,7 @@ mod settlement {
                 ..new_job(&handle, "child", parent)
             },
         );
-        let grants_c = wait(handle.claim_batch()).expect("claim child");
-        assert_eq!(grants_c, vec![child]);
+        wait(handle.claim_fixture(child, test_executor(&handle))).expect("claim process child");
 
         // Finalize parent while child is still open -> coerced to Unknown under I6
         wait(handle.finalize_job(parent, JobFinalization::Completed(result("P done"))))
@@ -4964,7 +4879,8 @@ mod settlement {
         let j4 = job(&handle, llm, "j4");
         assert_eq!(wait(handle.claim_batch()).expect("claim"), vec![j4]);
         assert_eq!(pool_of(j4), second_pool.into(), "the held slot is not free");
-        wait(handle.confirm_job_stopped(j1)).expect("confirm");
+        wait(handle.confirm_job_stopped(j1, crate::persistence::StopProof::Proof))
+            .expect("confirm");
         wait(handle.finalize_job(j4, JobFinalization::Completed(result("j4 done"))))
             .expect("finalize j4");
         let j5 = job(&handle, llm, "j5");
@@ -6326,7 +6242,11 @@ mod requests_and_tool_loop {
         let executor = executor(&handle, "llm worker", &[OPENAI]).expect("register");
         let markers = || wait(handle.jobs(None, 1_000)).expect("Jobs").len();
         let before = markers();
-        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let runtime = ExecutionRuntime::start(
+            handle.clone(),
+            crate::orchestration::execution_runtime::ClaimScope::Process,
+        )
+        .expect("start runtime");
         let mut plan = ProviderExecutionPlan::environment_credentials(
             executor,
             JobInputDraft::default(),
@@ -6558,7 +6478,11 @@ mod requests_and_tool_loop {
         let offer = registry.offer(&["add"]).expect("offer");
         registry.revoke("add").expect("revoke");
         let jobs = wait(handle.jobs(None, 1_000)).expect("jobs").len();
-        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+        let runtime = ExecutionRuntime::start(
+            handle.clone(),
+            crate::orchestration::execution_runtime::ClaimScope::Process,
+        )
+        .expect("start runtime");
         let mut plan = ProviderExecutionPlan::environment_credentials(
             executor,
             JobInputDraft::default(),
@@ -6728,18 +6652,6 @@ mod requests_and_tool_loop {
                 .stop_confirmed_at
                 .is_some()
         );
-    }
-
-    fn retry_of(original: JobId, llm: ProfileId, acknowledge_repeated_effects: bool) -> JobRetry {
-        let _ = llm;
-        JobRetry {
-            original,
-            parent: JobId::new(0),
-            name: Some("retry".into()),
-            eligible_at: None,
-            dependencies: Vec::new(),
-            acknowledge_repeated_effects,
-        }
     }
 
     /// A configuration whose disk checks never lock, so only the protection
@@ -7365,13 +7277,7 @@ mod requests_and_tool_loop {
                     && !record.is_applied(),
                 "{case}: an admission without an outcome stays unresolved after the restart"
             );
-            for acknowledge in [false, true] {
-                assert_eq!(
-                    violation(wait(handle.retry_job(retry_of(run.job, llm, acknowledge)))),
-                    Violation::UnresolvedToolEffect(record.call),
-                    "{case}: no acknowledgement reaches the unresolved effect"
-                );
-            }
+
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 ran,
@@ -7591,20 +7497,8 @@ mod requests_and_tool_loop {
             if kind == ToolOutcomeKind::Uncertain {
                 assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
                 assert_eq!(receipt.result, None);
-                assert_eq!(
-                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    Violation::UnresolvedToolEffect(tool_call(run.job, 1, 1)),
-                    "{second}"
-                );
             } else {
                 assert!(job.failed_at.is_some(), "{second}");
-                assert_eq!(
-                    violation(wait(handle.retry_job(retry_of(run.job, llm, false)))),
-                    Violation::RepeatedEffectNotAcknowledged(tool_call(run.job, 1, 0)),
-                    "{second}: the first call's effect happened"
-                );
-                wait(handle.retry_job(retry_of(run.job, llm, true)))
-                    .expect("an acknowledged retry");
             }
             assert!(blocking(&handle, llm).iter().all(|held| *held != run.job));
         }
@@ -7695,8 +7589,7 @@ mod requests_and_tool_loop {
                 );
                 assert!(!record.is_unresolved() && !record.is_applied());
                 assert!(job_record(&handle, run.job).failed_at.is_some());
-                wait(handle.retry_job(retry_of(run.job, llm, false)))
-                    .expect("a call never invoked repeats nothing");
+
                 worker.shutdown().expect("shutdown");
             }
             assert_relationships_consistent(&directory);
@@ -7791,212 +7684,6 @@ mod requests_and_tool_loop {
             worker.handle().abandoned_at_open().is_empty(),
             "every local claim was released"
         );
-        worker.shutdown().expect("shutdown");
-        assert_relationships_consistent(&directory);
-    }
-
-    #[test]
-    fn a_retry_never_repeats_an_unresolved_effect_and_repeats_a_known_one_only_when_acknowledged() {
-        let (_root, directory) = data_directory("tool-evidence-retry");
-        let worker = DatabaseWorker::start(&directory).expect("start database");
-        let handle = worker.handle();
-        let (_provider, llm) = llm_setup(&handle, "model-a");
-        // A settled original whose one call, if any, had this effect and outcome.
-        let original = |effect: Option<ToolEffect>, outcome: Option<ToolOutcome>| {
-            let run = observed_run(&handle, llm, 1);
-            let call = tool_call(run.job, 1, 0);
-            if let Some(effect) = effect {
-                wait(handle.record_tool_decision(admitted(call, "c", effect))).expect("admit");
-                if let Some(outcome) = outcome.clone() {
-                    wait(handle.record_tool_outcome(call, outcome)).expect("record");
-                }
-            }
-            if effect.is_none() || outcome.as_ref().is_some_and(ToolOutcome::is_definite) {
-                wait(handle.finalize_job(run.job, JobFinalization::Completed(result("done"))))
-                    .expect("complete");
-            } else {
-                settle_unknown(&handle, run.job);
-            }
-            (run.job, call)
-        };
-        use ToolEffect::{Idempotent, NonIdempotent, ReadOnly};
-        let not_applied = ToolOutcome::NotApplied {
-            message: "no effect".into(),
-        };
-        let withheld = ToolOutcome::CompletedWithheld {
-            reason: WithheldReason::TooLarge,
-        };
-        let not_invoked = ToolOutcome::NotInvoked {
-            reason: NotInvokedReason::Refused(ToolCallRefusal::Unauthorized),
-        };
-        type Expected = Option<fn(ToolCallRef) -> Violation>;
-        let unresolved: Expected = Some(Violation::UnresolvedToolEffect);
-        let unacknowledged: Expected = Some(Violation::RepeatedEffectNotAcknowledged);
-        /// A case, its original's call, if any, and its outcome, whether the
-        /// retry acknowledges repeated effects, and its expected refusal.
-        type Case = (
-            &'static str,
-            Option<ToolEffect>,
-            Option<ToolOutcome>,
-            bool,
-            Expected,
-        );
-        let cases: Vec<Case> = vec![
-            ("no tool effect", None, None, false, None),
-            (
-                "a read-only call",
-                Some(ReadOnly),
-                Some(completed("{}")),
-                false,
-                None,
-            ),
-            (
-                "an uncertain read-only call",
-                Some(ReadOnly),
-                None,
-                false,
-                None,
-            ),
-            (
-                "an idempotent call",
-                Some(Idempotent),
-                Some(completed("{}")),
-                false,
-                None,
-            ),
-            (
-                "an unresolved idempotent call",
-                Some(Idempotent),
-                None,
-                true,
-                unresolved,
-            ),
-            (
-                "an uncertain idempotent call",
-                Some(Idempotent),
-                Some(uncertain()),
-                true,
-                unresolved,
-            ),
-            (
-                "a completed effect",
-                Some(NonIdempotent),
-                Some(completed("{}")),
-                false,
-                unacknowledged,
-            ),
-            (
-                "an acknowledged effect",
-                Some(NonIdempotent),
-                Some(completed("{}")),
-                true,
-                None,
-            ),
-            (
-                "a withheld result",
-                Some(NonIdempotent),
-                Some(withheld),
-                false,
-                unacknowledged,
-            ),
-            (
-                "an effect not applied",
-                Some(NonIdempotent),
-                Some(not_applied),
-                false,
-                None,
-            ),
-            (
-                "a call never invoked",
-                Some(NonIdempotent),
-                Some(not_invoked),
-                false,
-                None,
-            ),
-            (
-                "an acknowledged unresolved effect",
-                Some(NonIdempotent),
-                None,
-                true,
-                unresolved,
-            ),
-            (
-                "an acknowledged uncertain effect",
-                Some(NonIdempotent),
-                Some(uncertain()),
-                true,
-                unresolved,
-            ),
-        ];
-        for (case, effect, outcome, acknowledge, expected) in cases {
-            let (job, call) = original(effect, outcome);
-            let retried = wait(handle.retry_job(retry_of(job, llm, acknowledge)));
-            match expected {
-                None => {
-                    let retry = retried.unwrap_or_else(|error| panic!("{case}: {error}"));
-                    assert_eq!(job_record(&handle, retry).retry_of, Some(job), "{case}");
-                }
-                Some(refusal) => {
-                    assert_eq!(violation(retried), refusal(call), "{case}");
-                    assert!(
-                        wait(handle.retries(job)).expect("retries").is_empty(),
-                        "{case}: no retry was created"
-                    );
-                }
-            }
-        }
-
-        // A verified reconciliation resolves the effect as it found it.
-        for (conclusion, expected) in [
-            (EffectConclusion::Applied, unacknowledged),
-            (EffectConclusion::NotApplied, None),
-        ] {
-            let (job, call) = original(Some(NonIdempotent), None);
-            wait(handle.reconcile_tool_effect(call, verified(conclusion))).expect("reconcile");
-            let retried = wait(handle.retry_job(retry_of(job, llm, false)));
-            match expected {
-                None => {
-                    retried.expect("nothing to repeat");
-                }
-                Some(refusal) => {
-                    assert_eq!(violation(retried), refusal(call));
-                    wait(handle.retry_job(retry_of(job, llm, true)))
-                        .expect("an acknowledged retry");
-                }
-            }
-        }
-
-        // Concurrent retries meet the same gate in their own transactions.
-        let concurrently = |job: JobId, acknowledge: bool| {
-            let attempts = [0, 1].map(|_| {
-                let handle = handle.clone();
-                std::thread::spawn(move || wait(handle.retry_job(retry_of(job, llm, acknowledge))))
-            });
-            attempts.map(|attempt| attempt.join().expect("the attempt finished"))
-        };
-        let (job, _) = original(Some(NonIdempotent), Some(completed("{}")));
-        let [first, second] = concurrently(job, true);
-        let (created, refused): (Vec<_>, Vec<_>) =
-            [first, second].into_iter().partition(Result::is_ok);
-        assert_eq!(created.len(), 1, "one acknowledged retry becomes active");
-        assert!(matches!(
-            violation(refused.into_iter().next().expect("the other")),
-            Violation::ActiveRetry { original, .. } if original == job
-        ));
-        for (outcome, acknowledge, refusal) in [
-            (
-                Some(completed("{}")),
-                false,
-                Violation::RepeatedEffectNotAcknowledged as fn(_) -> _,
-            ),
-            (None, true, Violation::UnresolvedToolEffect),
-        ] {
-            let (job, call) = original(Some(NonIdempotent), outcome);
-            for attempt in concurrently(job, acknowledge) {
-                assert_eq!(violation(attempt), refusal(call));
-            }
-            assert!(wait(handle.retries(job)).expect("retries").is_empty());
-        }
         worker.shutdown().expect("shutdown");
         assert_relationships_consistent(&directory);
     }
@@ -8361,197 +8048,6 @@ mod requests_and_tool_loop {
         );
     }
 
-    /// A settled Job whose one call, if any, had this effect and outcome.
-    fn settled_original(
-        handle: &DatabaseHandle,
-        llm: ProfileId,
-        effect: Option<ToolEffect>,
-        outcome: Option<ToolOutcome>,
-    ) -> (JobId, ToolCallRef) {
-        let run = observed_run(handle, llm, 1);
-        let call = tool_call(run.job, 1, 0);
-        if let Some(effect) = effect {
-            wait(handle.record_tool_decision(admitted(call, "c", effect))).expect("admit");
-            if let Some(outcome) = outcome.clone() {
-                wait(handle.record_tool_outcome(call, outcome)).expect("record");
-            }
-        }
-        if effect.is_none() || outcome.as_ref().is_some_and(ToolOutcome::is_definite) {
-            wait(handle.finalize_job(run.job, JobFinalization::Completed(result("done"))))
-                .expect("complete");
-        } else {
-            settle_unknown(handle, run.job);
-        }
-        (run.job, call)
-    }
-
-    /// A retry of `original` that ran no tool and failed, so it is settled.
-    fn failed_retry(
-        handle: &DatabaseHandle,
-        llm: ProfileId,
-        original: JobId,
-        acknowledge: bool,
-    ) -> JobId {
-        let retry = wait(handle.retry_job(retry_of(original, llm, acknowledge))).expect("retry");
-        wait(handle.claim_fixture(retry, test_executor(handle))).expect("start the retry");
-        wait(handle.finalize_job(retry, JobFinalization::Failed(result("no tool ran"))))
-            .expect("fail the retry");
-        retry
-    }
-
-    /// A retry of `original`, which must be refused for `expected` and leave
-    /// nothing behind: no Job and no `retry` row.
-    fn assert_retry_refused(
-        handle: &DatabaseHandle,
-        llm: ProfileId,
-        original: JobId,
-        acknowledge: bool,
-        expected: Violation,
-    ) {
-        let jobs = wait(handle.jobs(None, 1_000)).expect("jobs").len();
-        let retries = wait(handle.retries(original)).expect("retries");
-        assert_eq!(
-            violation(wait(handle.retry_job(retry_of(original, llm, acknowledge)))),
-            expected
-        );
-        assert_eq!(wait(handle.jobs(None, 1_000)).expect("jobs").len(), jobs);
-        assert_eq!(wait(handle.retries(original)).expect("retries"), retries);
-    }
-
-    #[test]
-    fn a_retry_answers_for_the_tool_effects_of_its_whole_retry_lineage() {
-        let (_root, directory) = data_directory("tool-evidence-retry-lineage");
-        let worker = DatabaseWorker::start(&directory).expect("start database");
-        let handle = worker.handle();
-        let (_provider, llm) = llm_setup(&handle, "model-a");
-        use ToolEffect::{Idempotent, NonIdempotent, ReadOnly};
-
-        // An acknowledgement covers only the retry that gave it, however far
-        // down the chain the effect happened.
-        let (first, effect) =
-            settled_original(&handle, llm, Some(NonIdempotent), Some(completed("{}")));
-        let second = failed_retry(&handle, llm, first, true);
-        assert_retry_refused(
-            &handle,
-            llm,
-            second,
-            false,
-            Violation::RepeatedEffectNotAcknowledged(effect),
-        );
-        let third = failed_retry(&handle, llm, second, true);
-        assert_retry_refused(
-            &handle,
-            llm,
-            third,
-            false,
-            Violation::RepeatedEffectNotAcknowledged(effect),
-        );
-        let fourth =
-            wait(handle.retry_job(retry_of(third, llm, true))).expect("an acknowledged retry");
-        assert_eq!(job_record(&handle, fourth).retry_of, Some(third));
-
-        // An unresolved effect is refused whatever the retry acknowledges.
-        let (original, unresolved) = settled_original(&handle, llm, Some(NonIdempotent), None);
-        for acknowledge in [false, true] {
-            assert_retry_refused(
-                &handle,
-                llm,
-                original,
-                acknowledge,
-                Violation::UnresolvedToolEffect(unresolved),
-            );
-        }
-
-        // Effects that can be repeated, or that did not happen, ask for no
-        // acknowledgement anywhere in the chain; a reconciliation counts as
-        // what it found.
-        let reconciled = |conclusion| {
-            let (job, call) = settled_original(&handle, llm, Some(NonIdempotent), None);
-            wait(handle.reconcile_tool_effect(call, verified(conclusion))).expect("reconcile");
-            (job, call)
-        };
-        let unacknowledged = [
-            settled_original(&handle, llm, Some(Idempotent), Some(completed("{}"))).0,
-            settled_original(
-                &handle,
-                llm,
-                Some(NonIdempotent),
-                Some(ToolOutcome::NotApplied {
-                    message: "no effect".into(),
-                }),
-            )
-            .0,
-            settled_original(
-                &handle,
-                llm,
-                Some(NonIdempotent),
-                Some(ToolOutcome::NotInvoked {
-                    reason: NotInvokedReason::Refused(ToolCallRefusal::Unauthorized),
-                }),
-            )
-            .0,
-            settled_original(
-                &handle,
-                llm,
-                Some(NonIdempotent),
-                Some(ToolOutcome::NotInvoked {
-                    reason: NotInvokedReason::Cancelled,
-                }),
-            )
-            .0,
-            reconciled(EffectConclusion::NotApplied).0,
-            settled_original(&handle, llm, Some(ReadOnly), None).0,
-        ];
-        for original in unacknowledged {
-            let middle = failed_retry(&handle, llm, original, false);
-            let retry = wait(handle.retry_job(retry_of(middle, llm, false)))
-                .unwrap_or_else(|error| panic!("a retry of {original}'s chain: {error}"));
-            assert_eq!(job_record(&handle, retry).retry_of, Some(middle));
-        }
-        let (original, applied) = reconciled(EffectConclusion::Applied);
-        let middle = failed_retry(&handle, llm, original, true);
-        assert_retry_refused(
-            &handle,
-            llm,
-            middle,
-            false,
-            Violation::RepeatedEffectNotAcknowledged(applied),
-        );
-        wait(handle.retry_job(retry_of(middle, llm, true))).expect("an acknowledged retry");
-
-        // Concurrent retries of a chain meet the same gate, and at most one
-        // becomes active.
-        let (original, effect) =
-            settled_original(&handle, llm, Some(NonIdempotent), Some(completed("{}")));
-        let middle = failed_retry(&handle, llm, original, true);
-        let concurrently = |acknowledge: bool| {
-            [0, 1]
-                .map(|_| {
-                    let handle = handle.clone();
-                    std::thread::spawn(move || {
-                        wait(handle.retry_job(retry_of(middle, llm, acknowledge)))
-                    })
-                })
-                .map(|attempt| attempt.join().expect("the attempt finished"))
-        };
-        for attempt in concurrently(false) {
-            assert_eq!(
-                violation(attempt),
-                Violation::RepeatedEffectNotAcknowledged(effect)
-            );
-        }
-        assert!(wait(handle.retries(middle)).expect("retries").is_empty());
-        let (created, refused): (Vec<_>, Vec<_>) =
-            concurrently(true).into_iter().partition(Result::is_ok);
-        assert_eq!(created.len(), 1, "one acknowledged retry becomes active");
-        assert!(matches!(
-            violation(refused.into_iter().next().expect("the other")),
-            Violation::ActiveRetry { original, .. } if original == middle
-        ));
-        worker.shutdown().expect("shutdown");
-        assert_relationships_consistent(&directory);
-    }
-
     #[test]
     fn a_cancellation_before_the_handler_is_invoked_keeps_it_from_running() {
         for unstored in [false, true] {
@@ -8640,10 +8136,7 @@ mod requests_and_tool_loop {
                     records[0].call, call,
                     "the same admitted call is still the unresolved one"
                 );
-                assert_eq!(
-                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    Violation::UnresolvedToolEffect(records[0].call)
-                );
+
                 worker.shutdown().expect("shutdown");
             } else {
                 pending
@@ -8672,8 +8165,7 @@ mod requests_and_tool_loop {
                     "a definite outcome: the handler never ran"
                 );
                 assert!(!record.is_unresolved() && !record.is_applied());
-                wait(handle.retry_job(retry_of(run.job, llm, false)))
-                    .expect("nothing to repeat and nothing unresolved");
+
                 worker.shutdown().expect("shutdown");
             }
             assert_relationships_consistent(&directory);
@@ -8718,7 +8210,9 @@ mod requests_and_tool_loop {
             let registry = ToolRegistry::default();
             let workspace = Workspace::authorize(root, directory).expect("authorize");
             workspace_read::register(&registry, workspace).expect("register");
-            registry.authorize(workspace_read::TOOL_NAME).expect("authorize");
+            registry
+                .authorize(workspace_read::TOOL_NAME)
+                .expect("authorize");
             ToolExecution {
                 offer: registry.offer(&[workspace_read::TOOL_NAME]).expect("offer"),
                 limits: ToolLoopLimits::default(),
@@ -9113,8 +8607,12 @@ mod requests_and_tool_loop {
             let workspace = Workspace::authorize(root, directory).expect("authorize the Workspace");
             workspace_read::register(&registry, workspace.clone()).expect("register read");
             workspace_write::register(&registry, workspace).expect("register write");
-            registry.authorize(workspace_read::TOOL_NAME).expect("authorize read");
-            registry.authorize(workspace_write::TOOL_NAME).expect("authorize write");
+            registry
+                .authorize(workspace_read::TOOL_NAME)
+                .expect("authorize read");
+            registry
+                .authorize(workspace_write::TOOL_NAME)
+                .expect("authorize write");
             ToolExecution {
                 offer: registry
                     .offer(&[workspace_read::TOOL_NAME, workspace_write::TOOL_NAME])
@@ -9297,10 +8795,7 @@ mod requests_and_tool_loop {
             );
 
             // Repeating a known write needs an explicit acknowledgement.
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, false)))),
-                Violation::RepeatedEffectNotAcknowledged(write)
-            );
+
             // A restart replays nothing and keeps what was recorded.
             std::fs::write(root.join("notes.txt"), NOTES).expect("restore the file");
             worker.shutdown().expect("shutdown");
@@ -9309,7 +8804,7 @@ mod requests_and_tool_loop {
             assert!(handle.abandoned_at_open().is_empty());
             assert_eq!(evidence(&handle, run.job), records);
             assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
-            wait(handle.retry_job(retry_of(run.job, llm, true))).expect("an acknowledged retry");
+
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -9389,8 +8884,7 @@ mod requests_and_tool_loop {
             assert!(!record.is_applied() && !record.is_unresolved());
             assert_eq!(on_disk(&root, "summary.txt").as_deref(), Some(summary));
             assert!(job_record(&handle, run.job).failed_at.is_some());
-            wait(handle.retry_job(retry_of(run.job, llm, false)))
-                .expect("nothing was applied, so nothing repeats");
+
             worker.shutdown().expect("shutdown");
         }
 
@@ -9436,7 +8930,7 @@ mod requests_and_tool_loop {
             assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
             assert!(job_record(&handle, run.job).failed_at.is_some());
             assert!(blocking(&handle, llm).is_empty());
-            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("nothing to repeat");
+
             worker.shutdown().expect("shutdown");
         }
 
@@ -9488,10 +8982,7 @@ mod requests_and_tool_loop {
             assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(DONE));
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::UnresolvedToolEffect(tool_call(run.job, 1, 0))
-            );
+
             worker.shutdown().expect("shutdown");
         }
 
@@ -9545,11 +9036,7 @@ mod requests_and_tool_loop {
             assert!(job.stop_confirmed_at.is_some(), "no call spawns a process");
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert!(record.outcome.is_none() && record.is_unresolved());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                // Acknowledging does not lift an effect that may have happened.
-                Violation::UnresolvedToolEffect(record.call)
-            );
+
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -9592,7 +9079,7 @@ mod requests_and_tool_loop {
             assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("nothing ran");
+
             worker.shutdown().expect("shutdown");
         }
 
@@ -9644,11 +9131,7 @@ mod requests_and_tool_loop {
                         && record.outcome.is_none()
                         && record.is_unresolved()
                 );
-                assert_eq!(
-                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    // The unresolved effect stays, however often it restarts.
-                    Violation::UnresolvedToolEffect(record.call)
-                );
+
                 worker.shutdown().expect("shutdown");
                 assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
             }
@@ -10008,10 +9491,7 @@ mod requests_and_tool_loop {
             );
 
             // Running the commands again needs an explicit acknowledgement.
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, false)))),
-                Violation::RepeatedEffectNotAcknowledged(tool_call(run.job, 2, 0))
-            );
+
             // A restart replays nothing and keeps what was recorded.
             worker.shutdown().expect("shutdown");
             let worker = DatabaseWorker::start(&directory).expect("restart");
@@ -10056,10 +9536,7 @@ mod requests_and_tool_loop {
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
             assert!(blocking(&handle, llm).is_empty());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::UnresolvedToolEffect(record.call)
-            );
+
             assert_eq!(project.runs(), 1);
             worker.shutdown().expect("shutdown");
         }
@@ -10156,8 +9633,7 @@ mod requests_and_tool_loop {
                 0,
                 "cancellation cannot start a queued command"
             );
-            wait(handle.retry_job(retry_of(run.job, llm, false)))
-                .expect("retry without repeated effects");
+
             drop(permit);
             std::thread::sleep(Duration::from_millis(50));
             assert_eq!(
@@ -10191,10 +9667,7 @@ mod requests_and_tool_loop {
             until(|| project.stopped());
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::UnresolvedToolEffect(record.call)
-            );
+
             worker.shutdown().expect("shutdown");
         }
 
@@ -10227,10 +9700,7 @@ mod requests_and_tool_loop {
             until(|| project.stopped());
             let job = job_record(&handle, run.job);
             assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::UnresolvedToolEffect(record.call)
-            );
+
             worker.shutdown().expect("shutdown");
         }
 
@@ -10313,7 +9783,7 @@ mod requests_and_tool_loop {
             );
             assert!(!record.is_applied() && !record.is_unresolved());
             assert!(job_record(&handle, run.job).failed_at.is_some());
-            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("nothing ran");
+
             assert_eq!(project.runs(), 0);
             assert!(!project.root.join("ran").exists());
             worker.shutdown().expect("shutdown");
@@ -10366,10 +9836,7 @@ mod requests_and_tool_loop {
             assert!(job.stop_confirmed_at.is_none());
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert!(record.outcome.is_none() && record.is_unresolved());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                Violation::RetryOfUnsettledJob(run.job)
-            );
+
             assert_eq!(project.runs(), 1, "nothing ran again");
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
@@ -10418,10 +9885,7 @@ mod requests_and_tool_loop {
                         && record.outcome.is_none()
                         && record.is_unresolved()
                 );
-                assert_eq!(
-                    violation(wait(handle.retry_job(retry_of(run.job, llm, true)))),
-                    Violation::RetryOfUnsettledJob(run.job)
-                );
+
                 worker.shutdown().expect("shutdown");
                 assert_eq!(project.runs(), 1, "no restart runs it again");
             }
@@ -10431,8 +9895,8 @@ mod requests_and_tool_loop {
 
         #[test]
         fn a_group_whose_proof_failed_is_proven_and_released_on_retry() {
-            use std::sync::atomic::{AtomicBool, Ordering};
             use crate::orchestration::blocking::{self, Kind, Process, StopSignal};
+            use std::sync::atomic::{AtomicBool, Ordering};
 
             let (_root, directory) = data_directory("unproven-group-retry");
             let policy =
@@ -10485,8 +9949,8 @@ mod requests_and_tool_loop {
             let mut cmd = std::process::Command::new("sleep");
             cmd.arg("10");
             let stop = StopSignal::new();
-            let process = Process::spawn(cmd, Kind::Command, stop.clone(), Some(job))
-                .expect("spawn process");
+            let process =
+                Process::spawn(cmd, Kind::Command, stop.clone(), Some(job)).expect("spawn process");
             let target_pid = process.group();
 
             let should_succeed = Arc::new(AtomicBool::new(false));
@@ -10519,7 +9983,8 @@ mod requests_and_tool_loop {
             assert_eq!(released, vec![job]);
 
             for job in released {
-                wait(handle.confirm_job_stopped(job)).expect("confirm stop");
+                wait(handle.confirm_job_stopped(job, crate::persistence::StopProof::Proof))
+                    .expect("confirm stop");
             }
             assert!(wait(handle.unresolved_executions()).unwrap().is_empty());
 
@@ -10532,7 +9997,12 @@ mod requests_and_tool_loop {
                 vec!["--yes".to_string(), job.to_string()],
             );
             assert!(unquarantined_err.is_err());
-            assert!(unquarantined_err.unwrap_err().to_string().contains("is not quarantined"));
+            assert!(
+                unquarantined_err
+                    .unwrap_err()
+                    .to_string()
+                    .contains("is not quarantined")
+            );
         }
     }
 
@@ -10924,7 +10394,7 @@ mod requests_and_tool_loop {
                 }
             }
             // Read-only calls repeat no effect, so a retry needs no acknowledgement.
-            wait(handle.retry_job(retry_of(run.job, llm, false))).expect("a retry");
+
             worker.shutdown().expect("shutdown");
             assert_relationships_consistent(&directory);
         }
@@ -11117,7 +10587,11 @@ mod requests_and_tool_loop {
                 .config;
             config.concurrency_limit = NonZeroU32::new(2).expect("two slots");
             wait(handle.update_execution_pool(pool, config.clone())).expect("two slots");
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
             let mut jobs = Vec::new();
             for index in 0..20 {
                 jobs.push(admitted(wait(runtime.scheduler().admit_provider(plan(
@@ -11164,7 +10638,11 @@ mod requests_and_tool_loop {
                 }
                 now(answering("dispatcher continued", (2, 1)))
             });
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
             let first = admitted(wait(
                 runtime
                     .scheduler()
@@ -11203,7 +10681,11 @@ mod requests_and_tool_loop {
             );
             let pool = crate::persistence::ExecutionPoolId::from(target.executor);
             wait(handle.set_execution_pool_enabled(pool, false)).expect("disable");
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
             let submission = NewSubmission {
                 key: SubmissionKey::from_digest([42; 32]),
                 fingerprint: RequestFingerprint::from_digest([17; 32]),
@@ -11259,27 +10741,22 @@ mod requests_and_tool_loop {
             let (target, requests) = scripted(
                 &handle,
                 "dispatcher-readiness",
-                vec![
-                    response,
-                    now(answering("second", (2, 1))),
-                    now(answering("delayed", (2, 1))),
-                ],
+                vec![response, now(answering("delayed", (2, 1)))],
             );
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
             let first = admitted(wait(runtime.scheduler().admit_provider(plan(
                 &handle,
                 &target,
                 "prerequisite",
                 None,
             ))));
-            let mut second = plan(&handle, &target, "waiter", None);
-            second.job.dependencies = vec![(first.job(), DependencyCondition::Success)];
-            let second = admitted(wait(runtime.scheduler().admit_provider(second)));
             until(|| requests.load(Ordering::SeqCst) == 1);
-            assert!(job_record(&handle, second.job()).claim.is_none());
-            open.send(()).expect("complete prerequisite");
+            open.send(()).expect("complete first");
             wait(first.settled()).expect("first");
-            wait(second.settled()).expect("dependency wake");
             let mut delayed = plan(&handle, &target, "delayed", None);
             let began = Instant::now();
             delayed.job.eligible_at = Some(Timestamp::from_unix_micros(
@@ -11289,7 +10766,7 @@ mod requests_and_tool_loop {
             assert!(job_record(&handle, delayed.job()).claim.is_none());
             wait(delayed.settled()).expect("timer promotion");
             assert!(began.elapsed() >= Duration::from_millis(180));
-            assert_eq!(requests.load(Ordering::SeqCst), 3);
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
             wait(runtime.shutdown()).expect("shutdown");
             worker.shutdown().expect("shutdown");
         }
@@ -11300,7 +10777,11 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start(&directory).expect("database");
             let handle = worker.handle();
             let (target, requests) = scripted(&handle, "dispatcher-impossible", vec![stalled()]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
             let first = admitted(wait(
                 runtime
                     .scheduler()
@@ -11308,26 +10789,10 @@ mod requests_and_tool_loop {
             ));
             let mut waiter = plan(&handle, &target, "waiter", None);
             waiter.job.dependencies = vec![(first.job(), DependencyCondition::Success)];
-            let waiter = admitted(wait(runtime.scheduler().admit_provider(waiter)));
+            assert!(wait(runtime.scheduler().admit_provider(waiter)).is_err());
             until(|| requests.load(Ordering::SeqCst) == 1);
             first.request_stop();
             wait(first.settled()).expect("first stopped");
-            let id = waiter.job();
-            let mut settlement = std::pin::pin!(waiter.settled());
-            let deadline = Instant::now() + Duration::from_secs(35);
-            loop {
-                if let Some(result) = poll_once(settlement.as_mut()) {
-                    result.expect("cancelled by dependency, found on the reconcile tick");
-                    break;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "reconciliation must answer the waiter"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            assert!(job_record(&handle, id).cancelled_at.is_some());
-            assert!(job_record(&handle, id).claim.is_none());
             assert_eq!(requests.load(Ordering::SeqCst), 1);
             wait(runtime.shutdown()).expect("shutdown");
             worker.shutdown().expect("shutdown");
@@ -11348,7 +10813,11 @@ mod requests_and_tool_loop {
             worker.shutdown().expect("shutdown");
             let worker = DatabaseWorker::start(&directory).expect("reopen");
             let handle = worker.handle();
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("runtime");
             let record = job_record(&handle, job);
             assert!(record.cancelled_at.is_some() && record.claim.is_none());
             assert_eq!(
@@ -11382,7 +10851,13 @@ mod requests_and_tool_loop {
             let child = wait(handle.create_job(child)).expect("child");
             let mut depends_on_child = plan(&handle, &target, "root waiter", None).job;
             depends_on_child.dependencies = vec![(child, DependencyCondition::Settled)];
-            wait(handle.create_job(depends_on_child)).expect("a root can wait on an older child");
+            assert!(matches!(
+                wait(handle.create_job(depends_on_child)),
+                Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "dependencies",
+                    _
+                )))
+            ));
             let mut child_waiter = plan(&handle, &target, "child waiter", None).job;
             child_waiter.parent = root;
             child_waiter.dependencies = vec![(root, DependencyCondition::Settled)];
@@ -11393,7 +10868,7 @@ mod requests_and_tool_loop {
                     _
                 )))
             ));
-            assert_eq!(wait(handle.jobs(None, 100)).expect("jobs").len(), 3);
+            assert_eq!(wait(handle.jobs(None, 100)).expect("jobs").len(), 2);
             worker.shutdown().expect("shutdown");
         }
 
@@ -11404,7 +10879,11 @@ mod requests_and_tool_loop {
             let handle = worker.handle();
             let (open, response) = gated(answering("the answer", (12, 3)));
             let (target, requests) = scripted(&handle, "admission-early", vec![response]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
 
             let job = admitted(wait(
                 runtime
@@ -11465,7 +10944,11 @@ mod requests_and_tool_loop {
                 ],
             );
             let (registry, calls) = registered(vec![("add", Behavior::Add)]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let scheduler = runtime.scheduler();
             let before = wait(handle.jobs(None, 1_000)).expect("read").len();
 
@@ -11514,7 +10997,11 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start_with_config(&directory, lenient()).expect("start");
             let handle = worker.handle();
             let (target, requests) = scripted(&handle, "admission-refused", Vec::new());
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let scheduler = runtime.scheduler();
             let refused = |result: Result<AdmittedJob, AdmissionError>| match result {
                 Err(AdmissionError::NotAdmitted(error)) => error,
@@ -11616,7 +11103,11 @@ mod requests_and_tool_loop {
                     ..new_job(&handle, "companion", handle.genesis())
                 },
             );
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let failed_group = Arc::new(std::sync::Mutex::new(None));
             let (group, seam_handle) = (failed_group.clone(), handle.clone());
             provider_seam::before_creation_of("unknown commit", move || {
@@ -11683,7 +11174,11 @@ mod requests_and_tool_loop {
                 "admission-stop",
                 vec![stalled(), now(answering("second answer", (3, 1)))],
             );
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let scheduler = runtime.scheduler();
 
             let first = admitted(wait(
@@ -11735,7 +11230,11 @@ mod requests_and_tool_loop {
             let (open, response) = gated(answering("b answered", (3, 1)));
             let (target, requests) =
                 scripted(&handle, "admission-shared-token", vec![stalled(), response]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let scheduler = runtime.scheduler();
             // Two plans of one cloned configuration share one token.
             let upstream = CancellationToken::default();
@@ -11789,7 +11288,11 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start(&directory).expect("start database");
             let handle = worker.handle();
             let (target, requests) = scripted(&handle, "admission-upstream", vec![stalled()]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let scheduler = runtime.scheduler();
             let upstream = CancellationToken::default();
             let sharing = |name: &str| {
@@ -11839,7 +11342,11 @@ mod requests_and_tool_loop {
                 "admission-late-stop",
                 vec![now(answering("done", (3, 1)))],
             );
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let job = admitted(wait(
                 runtime
                     .scheduler()
@@ -11871,7 +11378,11 @@ mod requests_and_tool_loop {
             );
             let (registry, calls) =
                 registered_as(ToolEffect::NonIdempotent, vec![("hang", Behavior::Hang)]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let tools = execution(&registry, &["hang"], ToolLoopLimits::default());
             let job = admitted(wait(runtime.scheduler().admit_provider(plan(
                 &handle,
@@ -11899,11 +11410,7 @@ mod requests_and_tool_loop {
             );
             let job_record = job_record(&handle, id);
             assert!(job_record.unknown_at.is_some() && job_record.cancelled_at.is_none());
-            assert_eq!(
-                violation(wait(handle.retry_job(retry_of(id, target.llm, true)))),
-                Violation::UnresolvedToolEffect(record.call),
-                "the effect stays unresolved"
-            );
+
             wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
         }
@@ -11914,7 +11421,11 @@ mod requests_and_tool_loop {
             let worker = DatabaseWorker::start(&directory).expect("start database");
             let handle = worker.handle();
             let (target, requests) = scripted(&handle, "admission-shutdown", vec![stalled()]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let scheduler = runtime.scheduler();
             let job = admitted(wait(
                 scheduler.admit_provider(plan(&handle, &target, "running", None)),
@@ -11957,7 +11468,11 @@ mod requests_and_tool_loop {
             let handle = worker.handle();
             let (open, response) = gated(answering("finished alone", (4, 2)));
             let (target, _) = scripted(&handle, "admission-dropped", vec![response]);
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let plan = plan(&handle, &target, "unwatched", None);
             let token = plan.provider_config.cancellation.clone();
             let job = admitted(wait(runtime.scheduler().admit_provider(plan)));
@@ -12151,7 +11666,7 @@ mod requests_and_tool_loop {
             }
 
             fn stop(&self) -> String {
-                self.json()["stop"]["status"]
+                self.json()["status"]
                     .as_str()
                     .unwrap_or_else(|| panic!("a stop: {}", self.body))
                     .to_owned()
@@ -12260,12 +11775,15 @@ mod requests_and_tool_loop {
         }
 
         fn stop(address: SocketAddr, job: JobId) -> Answer {
-            let (host, bearer) = (host(address), bearer());
-            send(
+            let record = get(address, &format!("/api/v1/jobs/{job}")).json();
+            let conversation = record["job"]["conversation"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| job.to_string());
+            post(
                 address,
-                &format!("POST /api/v1/jobs/{job}/stop"),
-                &[("Host", &host), ("Authorization", &bearer)],
-                b"",
+                &format!("/api/v1/conversations/{conversation}/stop"),
+                "{}",
             )
         }
 
@@ -12373,7 +11891,11 @@ mod requests_and_tool_loop {
                 let worker =
                     DatabaseWorker::start_with_config(directory, lenient()).expect("start");
                 let handle = worker.handle();
-                let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+                let runtime = ExecutionRuntime::start(
+                    handle.clone(),
+                    crate::orchestration::execution_runtime::ClaimScope::Stored,
+                )
+                .expect("start runtime");
                 let control = ControlPlane::start(
                     config(admission_wait),
                     handle.clone(),
@@ -12618,7 +12140,16 @@ mod requests_and_tool_loop {
             let answer = get(address, &format!("/api/v1/jobs/{with_agent}/input"));
             assert_eq!(answer.status, 200, "{}", answer.body);
             let input = answer.json()["input"].clone();
-            assert_eq!(input["objective"], objective);
+            assert_eq!(input["objective"], Value::Null);
+            let conversation = job_record(&handle, with_agent)
+                .conversation
+                .expect("conversation");
+            let turns = get(
+                address,
+                &format!("/api/v1/conversations/{conversation}/turns"),
+            )
+            .json();
+            assert_eq!(turns["turns"][0]["entries"][0]["text"], objective);
             assert_eq!(input["attachments"], json!([]));
             assert_eq!(
                 input["configuration"],
@@ -12635,7 +12166,7 @@ mod requests_and_tool_loop {
                 assert!(!answer.body.contains(secret), "{secret}: {}", answer.body);
             }
             let plain = get(address, &format!("/api/v1/jobs/{without_agent}/input")).json();
-            assert_eq!(plain["input"]["objective"], "Plain");
+            assert_eq!(plain["input"]["objective"], Value::Null);
             assert_eq!(
                 plain["input"]["configuration"]["agent_profile"],
                 Value::Null
@@ -12952,11 +12483,17 @@ mod requests_and_tool_loop {
                 record.assigned_executor.is_none()
                     || record.assigned_executor == Some(target.executor)
             );
-            assert_eq!(record.parent, handle.genesis());
+            assert_eq!(record.parent_id, record.conversation);
             let input = wait(handle.job_input(record.input))
                 .expect("read")
                 .expect("its input");
-            assert_eq!(input.objective.as_deref(), Some("Say hello"));
+            assert_eq!(
+                wait(handle.turn_entries(job)).expect("entries")[0].1.entry,
+                crate::persistence::Entry::UserMessage {
+                    text: "Say hello".into(),
+                    attachments: Vec::new()
+                }
+            );
             assert!(input.submitted_at.is_some());
             let configuration = wait(handle.job_configuration(job))
                 .expect("read")
@@ -12972,7 +12509,10 @@ mod requests_and_tool_loop {
                 lookup(address, key).admission(),
                 ("admitted".to_owned(), Some(job.to_string()))
             );
-            assert_eq!(running.control.held().0, 1, "its stop is held");
+            assert!(
+                running.control.held().0 <= 1,
+                "at most its one execution is registered"
+            );
 
             open.send(()).expect("let the Provider answer");
             until(|| state(address, job) == "completed");
@@ -13197,8 +12737,8 @@ mod requests_and_tool_loop {
                 );
                 let queued = submit(address, queued_key, &queued_body);
                 assert_eq!((queued.status, queued.job()), (200, queued_id));
-                assert_eq!(state(address, queued_id), "cancelled");
-                assert_eq!(requests.load(Ordering::SeqCst), 2);
+                until(|| state(address, queued_id) == "completed");
+                assert_eq!(requests.load(Ordering::SeqCst), 3);
                 (done, queued_id)
             });
             assert_eq!(done_again, done);
@@ -13213,7 +12753,11 @@ mod requests_and_tool_loop {
             let left = job_record(&handle, left);
             assert!(left.unknown_at.is_some() && left.cancelled_at.is_none());
             worker.shutdown().expect("shutdown");
-            assert_eq!(target.requests(), 2, "nothing ran twice");
+            assert_eq!(
+                target.requests(),
+                3,
+                "the queued turn runs once after restart"
+            );
             assert_relationships_consistent(&directory);
         }
 
@@ -13354,8 +12898,8 @@ mod requests_and_tool_loop {
                     // the lost opening as unknown; nothing executes it again.
                     let replay = submit(address, key, &body);
                     assert_eq!((replay.status, replay.job()), (200, record.id));
-                    until(|| state(address, record.id) == "cancelled");
-                    assert_eq!(target.requests(), 0);
+                    until(|| state(address, record.id) == "completed");
+                    assert_eq!(target.requests(), 1);
                 }
                 "not_found" => {
                     assert!(jobs.is_empty(), "no Job: {jobs:?}");
@@ -13370,6 +12914,86 @@ mod requests_and_tool_loop {
             assert_eq!(running.control.held().1, 0);
             assert!(jobs_named(&handle, "c2 unknown").len() <= 1);
             running.stop();
+        }
+
+        #[test]
+        fn conversation_http_queues_joins_stops_pages_and_closes() {
+            let (_root, directory) = data_directory("k1-conversation-http");
+            let running = Running::start(&directory, LONG);
+            let handle = running.handle.clone();
+            let address = running.address();
+            let target = target(
+                &handle,
+                "k1-conversation-http",
+                vec![stalled(), now(answering("continued", (3, 1)))],
+            );
+            let opened = submit(
+                address,
+                "k1-http-open-00000001",
+                &target.body("Long request", "first"),
+            );
+            assert_eq!(opened.status, 201);
+            let first = opened.job();
+            let conversation = opened.json()["admission"]["conversation"]
+                .as_str()
+                .expect("conversation")
+                .to_owned();
+            until(|| target.requests() == 1);
+            let body = |text: &str| {
+                json!({"conversation":conversation,"objective":text,"executor":target.executor.to_string()}).to_string()
+            };
+            let queued = submit(address, "k1-http-queue-0000001", &body("queued message"));
+            let waiting = queued.job();
+            assert_ne!(waiting, first);
+            let joined = submit(address, "k1-http-join-00000001", &body("joined message"));
+            assert_eq!(joined.job(), waiting);
+            assert_eq!(joined.json()["admission"]["joined"], true);
+            assert_eq!(joined.json()["admission"]["seq"], 2);
+            assert_eq!(stop(address, first).status, 202);
+            until(|| job_record(&handle, first).stop_confirmed_at.is_some());
+            assert_eq!(state(address, waiting), "cancelled");
+            let replay = submit(address, "k1-http-queue-0000001", &body("queued message"));
+            assert_eq!(replay.json()["admission"]["kept"], true);
+            let next = submit(address, "k1-http-next-00000001", &body("continue"));
+            until(|| state(address, next.job()) == "completed");
+            let page = get(
+                address,
+                &format!("/api/v1/conversations/{conversation}/turns?limit=2"),
+            )
+            .json();
+            assert_eq!(page["turns"].as_array().expect("turns").len(), 2);
+            assert_eq!(page["has_more"], true);
+            assert_eq!(
+                page["turns"][1]["entries"]
+                    .as_array()
+                    .expect("entries")
+                    .len(),
+                2
+            );
+            let older = get(
+                address,
+                &format!("/api/v1/conversations/{conversation}/turns?before={waiting}&limit=2"),
+            )
+            .json();
+            assert_eq!(older["turns"][0]["job"]["id"], first.to_string());
+            assert!(
+                get(address, "/api/v1/conversations")
+                    .body
+                    .contains(&conversation)
+            );
+            assert_eq!(
+                post(
+                    address,
+                    &format!("/api/v1/conversations/{conversation}/close"),
+                    "{}"
+                )
+                .status,
+                202
+            );
+            let closed = get(address, &format!("/api/v1/jobs/{conversation}")).json();
+            assert_ne!(closed["job"]["settlement"]["state"], "unsettled");
+            running.stop();
+            assert_relationships_consistent(&directory);
         }
 
         #[test]
@@ -13400,7 +13024,13 @@ mod requests_and_tool_loop {
                 (stopped.status, stopped.stop().as_str()),
                 (202, "requested")
             );
-            assert_eq!(stopped.json()["stop"]["job"], first.to_string());
+            assert_eq!(
+                stopped.json()["conversation"],
+                job_record(&handle, first)
+                    .conversation
+                    .expect("conversation")
+                    .to_string()
+            );
             until(|| job_record(&handle, first).stop_confirmed_at.is_some());
             let record = job_record(&handle, first);
             assert!(
@@ -13437,14 +13067,14 @@ mod requests_and_tool_loop {
             let refused = stop(address, foreign);
             assert_eq!(
                 (refused.status, refused.error().as_str()),
-                (409, "not_stoppable")
+                (404, "conversation_not_found")
             );
             assert!(!settled(&job_record(&handle, foreign)));
             for job in [JobId::new(999_999), handle.genesis()] {
                 let missing = stop(address, job);
                 assert_eq!(
                     (missing.status, missing.error().as_str()),
-                    (404, "job_not_found")
+                    (404, "conversation_not_found")
                 );
             }
             until(|| running.control.held() == (0, 0));
@@ -13572,11 +13202,11 @@ mod requests_and_tool_loop {
                 ("Content-Length", length.as_str()),
             ];
             // Authentication, Host and Origin, on every new route.
-            let stop_line = format!("POST /api/v1/jobs/{}/stop", handle.genesis());
+            let stop_line = format!("POST /api/v1/conversations/{}/stop", handle.genesis());
             for (line, sent) in [
                 (submit_line, body.as_bytes()),
                 ("GET /api/v1/admissions", b"".as_slice()),
-                (stop_line.as_str(), b"".as_slice()),
+                (stop_line.as_str(), b"{}".as_slice()),
             ] {
                 let length = sent.len().to_string();
                 let mut common = vec![
@@ -13789,10 +13419,10 @@ mod requests_and_tool_loop {
                     malformed.as_bytes(),
                 );
             }
-            // A stop carries no body.
+            // Conversation actions accept JSON and require its media type.
             refused(
-                413,
-                "body_not_accepted",
+                415,
+                "unsupported_media_type",
                 &stop_line,
                 &[
                     ("Host", &host),
@@ -14139,7 +13769,11 @@ mod requests_and_tool_loop {
                 let worker =
                     DatabaseWorker::start_with_config(directory, lenient()).expect("start");
                 let handle = worker.handle();
-                let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+                let runtime = ExecutionRuntime::start(
+                    handle.clone(),
+                    crate::orchestration::execution_runtime::ClaimScope::Stored,
+                )
+                .expect("start runtime");
                 let scheduler = runtime.scheduler();
                 let control =
                     ControlPlane::start(config, handle.clone(), scheduler, directory.clone())
@@ -14905,7 +14539,8 @@ mod requests_and_tool_loop {
                 assert_eq!(event.comment.as_deref(), Some("heartbeat"), "{event:?}");
                 heartbeats += 1;
             }
-            wait(handle.confirm_job_stopped(unconfirmed)).expect("confirm");
+            wait(handle.confirm_job_stopped(unconfirmed, crate::persistence::StopProof::Proof))
+                .expect("confirm");
             let settlement = stream.event().settlement(unconfirmed);
             assert_eq!(settlement["settlement"]["state"], "unknown");
             assert!(settlement["stop_confirmed_at_us"].is_i64());
@@ -15692,7 +15327,6 @@ mod requests_and_tool_loop {
                     input: JobInputDraft {
                         objective: Some(OBJECTIVE.to_owned()),
                         attachments,
-                        ..JobInputDraft::default()
                     },
                     ..new_job(handle, "vision", handle.genesis())
                 },
@@ -15807,7 +15441,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 19);
+            assert_eq!(crate::storage::FORMAT_VERSION, 20);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");
@@ -16014,7 +15648,6 @@ mod requests_and_tool_loop {
                     input: JobInputDraft {
                         objective: Some(OBJECTIVE.to_owned()),
                         attachments,
-                        ..JobInputDraft::default()
                     },
                     ..new_job(&handle, "vision", handle.genesis())
                 }))
@@ -17068,28 +16701,9 @@ mod requests_and_tool_loop {
             let expected = image_body(&[format!("data:image/png;base64,{PNG_BASE64}")]);
             assert_eq!(persisted_body(&handle, run.job).expect("a body"), expected);
 
-            let retry = wait(handle.retry_job(JobRetry {
-                acknowledge_repeated_effects: false,
-                ..retry_of(run.job, llm, false)
-            }))
-            .expect("retry");
-            let retried = wait(handle.job_input_for_job(retry))
-                .expect("read")
-                .expect("input");
             assert_eq!(
-                (retried.objective, retried.attachments),
-                (input.objective, input.attachments),
-                "the same objective and Attachments"
-            );
-            assert_eq!(persisted_body(&handle, retry).expect("a body"), expected);
-            assert_eq!(
-                wait(handle.attachments(None, 10)).expect("list").len(),
-                1,
-                "no new Attachment"
-            );
-            assert_eq!(
-                wait(handle.attachment_inputs(id)).expect("read"),
-                [run.input, JobInputId::new(retry.get())]
+                wait(handle.attachment_inputs(id)).expect("references"),
+                [run.input]
             );
             assert_eq!(stored_names(&directory).len(), 1);
             worker.shutdown().expect("shutdown");
@@ -17109,7 +16723,11 @@ mod requests_and_tool_loop {
                 llm_config("model-v", &[ModelCapability::Chat]),
             );
             let executor = executor(&handle, "llm worker", &[OPENAI]).expect("register");
-            let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Process,
+            )
+            .expect("start runtime");
             let schedule = |attachments: Vec<AttachmentId>, timeout: Duration| {
                 wait(
                     runtime
@@ -17119,7 +16737,6 @@ mod requests_and_tool_loop {
                             input: JobInputDraft {
                                 objective: Some(OBJECTIVE.to_owned()),
                                 attachments,
-                                ..JobInputDraft::default()
                             },
                             job: NewJob {
                                 configuration: llm_only(llm),
@@ -17147,7 +16764,12 @@ mod requests_and_tool_loop {
                 "image/png",
                 "c.png",
             );
-            let svg = attach(&handle, b"<svg></svg>".to_vec(), "image/svg+xml", "vector.svg");
+            let svg = attach(
+                &handle,
+                b"<svg></svg>".to_vec(),
+                "image/svg+xml",
+                "vector.svg",
+            );
             std::fs::remove_file(content_path(&directory, &attachment(&handle, missing)))
                 .expect("remove");
             std::fs::write(
@@ -17342,7 +16964,9 @@ mod requests_and_tool_loop {
                     Some(4096),
                     &cancellation,
                     async |_conv: &ChatConversation, _sink: &mut DatabaseOutputSink| {
-                        panic!("provider exchange should not be called when context window exceeded");
+                        panic!(
+                            "provider exchange should not be called when context window exceeded"
+                        );
                     },
                 )
                 .await
@@ -17459,7 +17083,7 @@ mod requests_and_tool_loop {
                 id: "call_abc".to_owned(),
                 tool_type: Some("function".to_owned()),
                 function: crate::openai_compatible::ChatFunctionCallWire {
-                    name: "lookup_data".to_owned(), // 11 bytes
+                    name: "lookup_data".to_owned(),            // 11 bytes
                     arguments: "{\"key\":\"val\"}".to_owned(), // 13 bytes
                 },
             };
@@ -17496,7 +17120,10 @@ mod requests_and_tool_loop {
             };
             let expected_bytes = 2 + tool_bytes;
             let expected_tokens = (expected_bytes.div_ceil(3) as u64) + 4096;
-            assert_eq!(estimate_request_tokens(&conv_with_tool, None), expected_tokens);
+            assert_eq!(
+                estimate_request_tokens(&conv_with_tool, None),
+                expected_tokens
+            );
 
             // Verify description specifically contributes to the tokens
             let mut tool_without_desc = tool.clone();
@@ -17524,9 +17151,9 @@ mod requests_and_tool_loop {
                 .expect("configured")
                 .frozen;
 
-            let turn0 = (Some("a".repeat(200)), Vec::new(), "b".repeat(200));
-            let turn1 = (Some("c".repeat(200)), Vec::new(), "d".repeat(200));
-            let turn2 = (Some("e".repeat(200)), Vec::new(), "f".repeat(200));
+            let turn0 = (Some("a".repeat(200)), Vec::new(), Some("b".repeat(200)));
+            let turn1 = (Some("c".repeat(200)), Vec::new(), Some("d".repeat(200)));
+            let turn2 = (Some("e".repeat(200)), Vec::new(), Some("f".repeat(200)));
             let prior_turns = vec![turn0, turn1, turn2];
             let current_objective = "current turn question";
 
@@ -17554,7 +17181,10 @@ mod requests_and_tool_loop {
                         _ => false,
                     })
             });
-            assert!(!has_notice, "omitted notice must not be included when all turns fit");
+            assert!(
+                !has_notice,
+                "omitted notice must not be included when all turns fit"
+            );
 
             // Measure tokens required for full conversation and for dropped versions
             let full_tokens = estimate_request_tokens(&conv_full, Some(10));
@@ -17584,7 +17214,10 @@ mod requests_and_tool_loop {
                         _ => false,
                     })
             });
-            assert!(has_notice_drop_1, "omitted notice must be included when turns are dropped");
+            assert!(
+                has_notice_drop_1,
+                "omitted notice must be included when turns are dropped"
+            );
             // Verify turn 0 text is not present, but turn 1 and 2 are present
             let all_text = format!("{:?}", conv_drop_1.messages);
             assert!(!all_text.contains(&"a".repeat(200)));
@@ -17609,7 +17242,10 @@ mod requests_and_tool_loop {
                 Vec::new(),
                 limits_too_small,
             );
-            assert!(conv_none.is_none(), "must return None when current turn alone exceeds window");
+            assert!(
+                conv_none.is_none(),
+                "must return None when current turn alone exceeds window"
+            );
 
             worker.shutdown().expect("shutdown");
         }

@@ -1,14 +1,15 @@
 use std::collections::BTreeSet;
 
+use super::codec::{TAG_NOTICE, TAG_TURN_INPUT};
 use super::*;
 use crate::openai_compatible::ChatFinishReason;
 use crate::persistence::{
     AgentBehavior, AgentConfig, AttachmentCleanup, AttachmentId, AttachmentOrigin,
     AttachmentRecord, AuthorizationBasis, ClaimRecord, CleanupKind, ConfigBody, ConfigId,
     ConfigKind, ConnectionConfig, ContentDigest, DependencyCondition, EffectConclusion,
-    ExecutionOperation, FrozenExecutionConfig, JobId, JobOutputId, JobOutputRecord, LlmParameters,
-    LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause,
-    OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord, Recorded,
+    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, LlmParameters, LlmTransport,
+    Measurements, ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause, OutcomeKind,
+    OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord, Recorded,
     RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
     SubmissionRecord, SuspensionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
     ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
@@ -25,34 +26,41 @@ pub(crate) struct JobRow {
     pub(crate) eligible_at: Option<Timestamp>,
     pub(crate) name: Option<String>,
     pub(crate) parent_id: Option<JobId>,
-    pub(crate) agent_id: Option<ConfigId>,
-    pub(crate) execution: Option<FrozenExecutionConfig>,
+    pub(crate) kind: JobKind,
     pub(crate) objective: Option<String>,
     pub(crate) attachments: Vec<AttachmentId>,
     pub(crate) dependencies: Vec<(JobId, DependencyCondition)>,
-    pub(crate) max_depth: Option<u32>,
-    pub(crate) max_children: Option<u32>,
-    pub(crate) max_descendants: Option<u32>,
-    pub(crate) retry_of: Option<JobId>,
-    pub(crate) continues: Option<JobId>,
+    pub(crate) previous: Option<JobId>,
     pub(crate) submission: Option<SubmissionKey>,
-    pub(crate) project: Option<ProjectId>,
 }
 
-pub(crate) fn usage_agent(row: &JobRow) -> u64 {
-    row.agent_id.map_or(0, |id| id.get())
+pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u64 {
+    match &row.kind {
+        JobKind::Conversation { agent, .. } => agent.map_or(0, ConfigId::get),
+        JobKind::Turn {
+            execution: TurnExecution::Frozen(execution),
+            plan_source: PlanSource::Process { .. },
+        } => execution.agent_ref.map_or(0, |agent| agent.id.get()),
+        JobKind::Turn { .. } => parent.map_or(0, |parent| usage_agent(parent, None)),
+    }
 }
 
 impl JobRow {
+    pub(crate) fn waits_on(&self) -> impl Iterator<Item = (JobId, DependencyCondition)> + '_ {
+        self.previous
+            .map(|previous| (previous, DependencyCondition::Settled))
+            .into_iter()
+            .chain(self.dependencies.iter().copied())
+    }
+
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);
         e.u64(self.id.get());
+        e.job_kind(&self.kind);
         e.ts(self.created_at);
         e.ots(self.eligible_at);
         e.ostr(&self.name);
         e.ou64(self.parent_id.map(|p| p.get()));
-        e.ou64(self.agent_id.map(|a| a.get()));
-        e.opt(&self.execution, Enc::frozen_execution);
         e.ostr(&self.objective);
         e.u32(self.attachments.len() as u32);
         for a in &self.attachments {
@@ -66,25 +74,19 @@ impl JobRow {
                 DependencyCondition::Settled => 2,
             });
         }
-        e.ou32(self.max_depth);
-        e.ou32(self.max_children);
-        e.ou32(self.max_descendants);
-        e.ou64(self.retry_of.map(|r| r.get()));
-        e.ou64(self.continues.map(|c| c.get()));
+        e.ou64(self.previous.map(JobId::get));
         e.opt(&self.submission, |e, s| e.0.extend_from_slice(s.as_bytes()));
-        e.ou64(self.project.map(|p| p.get()));
         e.0
     }
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB)?;
         let id = JobId::new(d.u64()?);
+        let kind = d.job_kind()?;
         let created_at = d.ts()?;
         let eligible_at = d.ots()?;
         let name = d.ostr()?;
         let parent_id = d.ou64()?.map(JobId::new);
-        let agent_id = d.ou64()?.map(ConfigId::new);
-        let execution = d.opt(Dec::frozen_execution)?;
         let objective = d.ostr()?;
         let att_len = d.u32()? as usize;
         let mut attachments = Vec::with_capacity(att_len);
@@ -106,11 +108,7 @@ impl JobRow {
             };
             dependencies.push((j, c));
         }
-        let max_depth = d.ou32()?;
-        let max_children = d.ou32()?;
-        let max_descendants = d.ou32()?;
-        let retry_of = d.ou64()?.map(JobId::new);
-        let continues = d.ou64()?.map(JobId::new);
+        let previous = d.ou64()?.map(JobId::new);
         let submission = d.opt(|d| {
             let bytes = d.take(32)?;
             let arr: [u8; 32] = bytes
@@ -118,7 +116,6 @@ impl JobRow {
                 .map_err(|_| StorageError::corrupted("invalid submission key"))?;
             Ok(SubmissionKey::from_digest(arr))
         })?;
-        let project = d.ou64()?.map(ProjectId::new);
         d.end()?;
         Ok(JobRow {
             id,
@@ -126,18 +123,12 @@ impl JobRow {
             eligible_at,
             name,
             parent_id,
-            agent_id,
-            execution,
+            kind,
             objective,
             attachments,
             dependencies,
-            max_depth,
-            max_children,
-            max_descendants,
-            retry_of,
-            continues,
+            previous,
             submission,
-            project,
         })
     }
 }
@@ -149,6 +140,7 @@ pub(crate) struct JobStateRow {
     pub(crate) suspension: Option<SuspensionRecord>,
     pub(crate) outcome: Option<OutcomeRecord>,
     pub(crate) stop_confirmed_at: Option<Timestamp>,
+    pub(crate) stop_confirmed_by: Option<StopProof>,
     pub(crate) children_closed_at: Option<Timestamp>,
 }
 
@@ -186,6 +178,7 @@ impl JobStateRow {
             e.u64(c.epoch);
             e.ostr(&c.host_id);
             e.ostr(&c.boot_id);
+            e.u32(c.notice_seq);
         });
         e.opt(&self.suspension, |e, s| {
             e.ts(s.since);
@@ -207,12 +200,16 @@ impl JobStateRow {
                 OutcomeCause::Abandoned => {
                     e.u8(3);
                 }
-                OutcomeCause::DependencyImpossible => {
-                    e.u8(4);
+                OutcomeCause::DependencyImpossible => e.u8(4),
+                OutcomeCause::Stopped { record } => {
+                    e.u8(5);
+                    e.u32(*record);
                 }
+                OutcomeCause::Closed => e.u8(6),
             });
         });
         e.ots(self.stop_confirmed_at);
+        e.opt(&self.stop_confirmed_by, |e, proof| e.u8(*proof as u8));
         e.ots(self.children_closed_at);
         e.0
     }
@@ -234,6 +231,7 @@ impl JobStateRow {
             let epoch = d.u64()?;
             let host_id = d.ostr()?;
             let boot_id = d.ostr()?;
+            let notice_seq = d.u32()?;
             Ok(ClaimRecord {
                 started_at,
                 pool_id,
@@ -242,6 +240,7 @@ impl JobStateRow {
                 epoch,
                 host_id,
                 boot_id,
+                notice_seq,
             })
         })?;
         let suspension = d.opt(|d| {
@@ -269,6 +268,8 @@ impl JobStateRow {
                 2 => Ok(OutcomeCause::Text(d.str()?)),
                 3 => Ok(OutcomeCause::Abandoned),
                 4 => Ok(OutcomeCause::DependencyImpossible),
+                5 => Ok(OutcomeCause::Stopped { record: d.u32()? }),
+                6 => Ok(OutcomeCause::Closed),
                 code => Err(StorageError::corrupted(format!(
                     "invalid outcome cause {code}"
                 ))),
@@ -276,6 +277,16 @@ impl JobStateRow {
             Ok(OutcomeRecord { kind, at, cause })
         })?;
         let stop_confirmed_at = d.ots()?;
+        let stop_confirmed_by = d.opt(|d| {
+            Ok(match d.u8()? {
+                0 => StopProof::Proof,
+                1 => StopProof::Reboot,
+                2 => StopProof::Settled,
+                3 => StopProof::User,
+                4 => StopProof::Operator,
+                _ => return Err(StorageError::corrupted("invalid stop proof")),
+            })
+        })?;
         let children_closed_at = d.ots()?;
         d.end()?;
         Ok(JobStateRow {
@@ -284,6 +295,7 @@ impl JobStateRow {
             suspension,
             outcome,
             stop_confirmed_at,
+            stop_confirmed_by,
             children_closed_at,
         })
     }
@@ -521,6 +533,7 @@ pub(super) fn encode_submission(record: &SubmissionRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_SUBMISSION);
     e.0.extend_from_slice(record.fingerprint.as_bytes());
     e.u64(record.job.get());
+    e.u32(record.seq);
     e.ts(record.recorded_at);
     e.0
 }
@@ -531,12 +544,14 @@ pub(super) fn decode_submission(key: &[u8], bytes: &[u8]) -> DecodeResult<Submis
     let mut d = Dec::new(bytes, TAG_SUBMISSION)?;
     let fingerprint = RequestFingerprint::from_digest(d.take(32)?.try_into().expect("32 bytes"));
     let job = JobId::new(d.u64()?);
+    let seq = d.u32()?;
     let recorded_at = d.ts()?;
     d.end()?;
     Ok(SubmissionRecord {
         key: SubmissionKey::from_digest(key),
         fingerprint,
         job,
+        seq,
         recorded_at,
     })
 }
@@ -642,6 +657,10 @@ pub(super) fn decode_project_root(bytes: &[u8]) -> DecodeResult<(ProjectId, Stri
 pub(crate) struct ConversationRow {
     pub(crate) title: Option<String>,
     pub(crate) hidden_at: Option<Timestamp>,
+    pub(crate) on_hold: Option<u32>,
+    pub(crate) loop_count: u8,
+    pub(crate) closed_by: Option<Actor>,
+    pub(crate) closed_running: bool,
 }
 
 impl ConversationRow {
@@ -649,6 +668,10 @@ impl ConversationRow {
         let mut e = Enc::new(TAG_CONVERSATION);
         e.ostr(&self.title);
         e.ots(self.hidden_at);
+        e.ou32(self.on_hold);
+        e.u8(self.loop_count);
+        e.opt(&self.closed_by, Enc::actor);
+        e.bool(self.closed_running);
         e.0
     }
 
@@ -657,6 +680,10 @@ impl ConversationRow {
         let row = Self {
             title: d.ostr()?,
             hidden_at: d.ots()?,
+            on_hold: d.ou32()?,
+            loop_count: d.u8()?,
+            closed_by: d.opt(Dec::actor)?,
+            closed_running: d.bool()?,
         };
         d.end()?;
         Ok(row)
@@ -991,4 +1018,76 @@ pub(super) fn decode_request_event(
         recorded_at,
         payload,
     })
+}
+
+impl TurnEntry {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_TURN_INPUT);
+        e.entry(&self.entry);
+        e.ts(self.at);
+        e.0
+    }
+    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_TURN_INPUT)?;
+        let row = Self {
+            entry: d.entry()?,
+            at: d.ts()?,
+        };
+        d.end()?;
+        Ok(row)
+    }
+}
+impl Notice {
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_NOTICE);
+        e.u8(self.class as u8);
+        match &self.body {
+            NoticeBody::Event {
+                child,
+                event,
+                reference,
+            } => {
+                e.u8(0);
+                e.u64(child.get());
+                e.notice_event(event);
+                e.u64(reference.get());
+            }
+            NoticeBody::Record { event, by, at } => {
+                e.u8(1);
+                e.u8(*event as u8);
+                e.actor(by);
+                e.ts(*at);
+            }
+        };
+        e.0
+    }
+    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_NOTICE)?;
+        let class = match d.u8()? {
+            0 => NoticeClass::Attention,
+            1 => NoticeClass::Progress,
+            2 => NoticeClass::Record,
+            _ => return Err(StorageError::corrupted("invalid notice class")),
+        };
+        let body = match d.u8()? {
+            0 => NoticeBody::Event {
+                child: JobId::new(d.u64()?),
+                event: d.notice_event()?,
+                reference: JobId::new(d.u64()?),
+            },
+            1 => NoticeBody::Record {
+                event: match d.u8()? {
+                    0 => RecordEvent::Hold,
+                    1 => RecordEvent::Unhold,
+                    2 => RecordEvent::Stop,
+                    _ => return Err(StorageError::corrupted("invalid record event")),
+                },
+                by: d.actor()?,
+                at: d.ts()?,
+            },
+            _ => return Err(StorageError::corrupted("invalid notice body")),
+        };
+        d.end()?;
+        Ok(Self { class, body })
+    }
 }

@@ -208,7 +208,7 @@ mod tests {
 
     use super::*;
     use crate::control_plane::profiles;
-    use crate::control_plane::submissions::{JobRequest, check_configuration, digest_key, plan};
+    use crate::control_plane::submissions::{JobRequest, check_configuration, digest_key};
     use crate::database::DatabaseWorker;
     use crate::openai_compatible::image::tests::PNG_BASE64;
     use crate::orchestration::execution_runtime::{
@@ -224,8 +224,11 @@ mod tests {
         let (_root, directory) = data_directory("attachments", "vision-upload");
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
-        let runtime = ExecutionRuntime::start(handle.clone()).expect("start runtime");
-        let scheduler = runtime.scheduler();
+        let runtime = ExecutionRuntime::start(
+            handle.clone(),
+            crate::orchestration::execution_runtime::ClaimScope::Stored,
+        )
+        .expect("start runtime");
 
         // 1. Invalid uploads
         let invalid_mime = json!({
@@ -403,17 +406,15 @@ mod tests {
 
         let fingerprint = vision_job_req.fingerprint();
         let sub_key = digest_key(b"vision-test-key-00000001");
-        let plan = plan(&handle, vision_job_req, None);
-        let admitted = wait(scheduler.admit_submitted_provider(
-            plan,
+        let job = crate::control_plane::submissions::tests::store_fixture(
+            &handle,
+            vision_job_req,
             NewSubmission {
                 key: sub_key,
                 fingerprint,
             },
-        ))
-        .expect("admit vision job");
-        let job = admitted.job();
-        wait(admitted.settled()).expect("vision job settled");
+        );
+        crate::control_plane::submissions::tests::await_fixture(&handle, job);
 
         // Verify sent payload contains image_url
         let sent = seen_conversations.lock().unwrap().clone();

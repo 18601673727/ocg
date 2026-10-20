@@ -175,6 +175,8 @@ pub enum Error {
     Attachment(#[from] AttachmentError),
     #[error("workspace_read_file is not enabled: {0}")]
     Workspace(#[from] WorkspaceError),
+    #[error("workspace authorization worker: {0}")]
+    WorkspaceWorker(String),
     #[error("workspace_read_file cannot be offered: {0}")]
     Tools(#[from] ToolRegistryError),
     #[error("database: {0}")]
@@ -280,7 +282,14 @@ async fn prepare(
         .project(config.project)
         .await?
         .ok_or(Error::ProjectMissing(config.project))?;
-    let workspace = Workspace::authorize(Path::new(&project.root), data_directory)?;
+    let authorize_root = project.root.clone();
+    let authorize_directory = data_directory.clone();
+    let workspace =
+        ocg::orchestration::blocking::run(ocg::orchestration::blocking::Kind::File, move || {
+            Workspace::authorize(Path::new(&authorize_root), &authorize_directory)
+        })
+        .await
+        .map_err(|reason| Error::WorkspaceWorker(reason.to_owned()))??;
     if workspace.root() != Path::new(&project.root) {
         return Err(Error::ProjectRootChanged);
     }
@@ -374,7 +383,9 @@ async fn prepare(
 /// type.
 fn load_image(workspace: &Workspace, path: &str) -> Result<ImageInput, Error> {
     let declared = declared_type(path).ok_or_else(|| {
-        Error::Image("only .png, .jpg, .jpeg, .gif and .webp files can be sent as images".to_owned())
+        Error::Image(
+            "only .png, .jpg, .jpeg, .gif and .webp files can be sent as images".to_owned(),
+        )
     })?;
     let bytes = workspace
         .read_binary(path, MAX_IMAGE_BYTES)
@@ -431,9 +442,16 @@ async fn submit(
         input: JobInputDraft {
             objective: Some(config.objective),
             attachments,
-            ..JobInputDraft::default()
         },
         job: NewJob {
+            process_grant: match config.mode {
+                Mode::Vision => None,
+                Mode::Read => Some("read".into()),
+                #[cfg(unix)]
+                Mode::Edit => Some("edit".into()),
+                #[cfg(unix)]
+                Mode::Code => Some("code".into()),
+            },
             name: Some(format!("{command} one-shot")),
             eligible_at: None,
             parent: database.genesis(),

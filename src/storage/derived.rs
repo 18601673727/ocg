@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::*;
-use crate::persistence::{AgentBehavior, OutcomeKind};
+use crate::persistence::OutcomeKind;
 
 /// What every derived table must hold, given the authoritative rows.
 #[derive(Default)]
@@ -21,7 +21,14 @@ pub(super) struct Derived {
     held: BTreeMap<(u64, u64), (u64, bool)>,
     children: BTreeMap<(u64, u64), ()>,
     successors: BTreeMap<u64, u64>,
-    chat_threads: BTreeMap<(u64, u64), ()>,
+    tips: BTreeMap<u64, u64>,
+    recent: BTreeMap<(u64, u64), ()>,
+    child_conversations: BTreeMap<(u64, u64), ()>,
+    live_children: BTreeMap<(u64, u64), ()>,
+    user_entry_at: BTreeMap<u64, i64>,
+    notice_read: BTreeMap<u64, u32>,
+    answer_tips: BTreeMap<u64, (u64, u64)>,
+    active_turns: BTreeMap<u64, u64>,
     tool_call_ids: BTreeMap<(u64, String), (u32, u32)>,
     tool_totals: BTreeMap<u64, (u64, u64)>,
     tool_stats: BTreeMap<String, schema::ToolStatValue>,
@@ -33,6 +40,11 @@ pub(super) struct Derived {
 struct Authoritative {
     jobs: BTreeMap<u64, JobRow>,
     states: BTreeMap<u64, JobStateRow>,
+    conversations: BTreeMap<u64, ConversationRow>,
+    inputs: BTreeMap<(u64, u32), TurnEntry>,
+    result_turns: BTreeSet<u64>,
+    executions: BTreeMap<u64, FrozenExecutionConfig>,
+    held_conversations: BTreeSet<u64>,
     tool_call_ids: Vec<(u64, String, u32, u32)>,
     tool_totals: BTreeMap<u64, (u64, u64)>,
     tool_stats: BTreeMap<String, schema::ToolStatValue>,
@@ -49,6 +61,58 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
     for entry in tx.open_table(JOB_STATES)?.iter()? {
         let (key, bytes) = entry?;
         states.insert(key.value(), JobStateRow::decode(bytes.value())?);
+    }
+    let mut conversations = BTreeMap::new();
+    for entry in tx.open_table(CONVERSATIONS)?.iter()? {
+        let (key, bytes) = entry?;
+        conversations.insert(key.value(), ConversationRow::decode(bytes.value())?);
+    }
+    let mut result_turns = BTreeSet::new();
+    for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
+        let (key, bytes) = entry?;
+        if decode_output(key.value(), bytes.value())?.kind == OutputKind::Result {
+            result_turns.insert(key.value().0);
+        }
+    }
+    let mut inputs = BTreeMap::new();
+    for entry in tx.open_table(TURN_INPUTS)?.iter()? {
+        let (key, bytes) = entry?;
+        inputs.insert(key.value(), TurnEntry::decode(bytes.value())?);
+    }
+    let mut executions = BTreeMap::new();
+    let mut held_conversations = BTreeSet::new();
+    let mut subtree_holds = BTreeSet::new();
+    for (id, row) in &jobs {
+        if !row.kind.is_conversation() {
+            executions.insert(*id, reads::turn_execution(&tx.open_table(JOBS)?, row)?.0);
+            continue;
+        }
+        if row
+            .parent_id
+            .is_some_and(|parent| subtree_holds.contains(&parent.get()))
+        {
+            held_conversations.insert(*id);
+            subtree_holds.insert(*id);
+        }
+        if let Some(metadata) = conversations.get(id)
+            && let Some(seq) = metadata.on_hold
+        {
+            held_conversations.insert(*id);
+            let hold = tx
+                .open_table(NOTICES)?
+                .get((*id, seq))?
+                .map(|bytes| Notice::decode(bytes.value()))
+                .transpose()?;
+            if !matches!(
+                hold.map(|notice| notice.body),
+                Some(NoticeBody::Record {
+                    by: Actor::Loop,
+                    ..
+                })
+            ) {
+                subtree_holds.insert(*id);
+            }
+        }
     }
     let mut tool_call_ids = Vec::new();
     let mut tool_totals: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
@@ -70,7 +134,9 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
                 admitted_inc = 1;
                 count_changed = true;
             }
-            crate::persistence::ToolDecision::Refused(crate::storage::ToolCallRefusal::InvalidArguments) => {
+            crate::persistence::ToolDecision::Refused(
+                crate::storage::ToolCallRefusal::InvalidArguments,
+            ) => {
                 refused_inc = 1;
                 count_changed = true;
             }
@@ -86,7 +152,9 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
             ) => {}
         }
         if count_changed || record.outcome.is_some() {
-            let stats = tool_stats.entry(record.name.clone()).or_insert((0, 0, 0, 0, 0, 0));
+            let stats = tool_stats
+                .entry(record.name.clone())
+                .or_insert((0, 0, 0, 0, 0, 0));
             stats.0 = stats.0.saturating_add(admitted_inc);
             stats.1 = stats.1.saturating_add(refused_inc);
             if let Some(outcome) = &record.outcome {
@@ -112,10 +180,16 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         }
         tool_call_ids.push((job, record.tool_call_id, request, index));
     }
-    let usage_totals = usage_totals_from_events(&tx.open_table(REQUEST_EVENTS)?, &jobs)?;
+    let usage_totals =
+        usage_totals_from_events(&tx.open_table(REQUEST_EVENTS)?, &jobs, &executions)?;
     Ok(Authoritative {
         jobs,
         states,
+        conversations,
+        inputs,
+        result_turns,
+        executions,
+        held_conversations,
         tool_call_ids,
         tool_totals,
         tool_stats,
@@ -131,6 +205,7 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
 fn usage_totals_from_events(
     table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
     jobs: &BTreeMap<u64, JobRow>,
+    executions: &BTreeMap<u64, FrozenExecutionConfig>,
 ) -> Result<BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>, StorageError> {
     let mut totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue> = BTreeMap::new();
     let mut current: Option<(u64, u32)> = None;
@@ -140,7 +215,7 @@ fn usage_totals_from_events(
         let (job, request, seq) = key.value();
         if current != Some((job, request)) {
             if let Some((job, request)) = current {
-                add_usage(&mut totals, jobs, job, request, &events)?;
+                add_usage(&mut totals, jobs, executions, job, request, &events)?;
             }
             events.clear();
             current = Some((job, request));
@@ -155,7 +230,7 @@ fn usage_totals_from_events(
         }
     }
     if let Some((job, request)) = current {
-        add_usage(&mut totals, jobs, job, request, &events)?;
+        add_usage(&mut totals, jobs, executions, job, request, &events)?;
     }
     Ok(totals)
 }
@@ -165,6 +240,7 @@ fn usage_totals_from_events(
 fn add_usage(
     totals: &mut BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
     jobs: &BTreeMap<u64, JobRow>,
+    executions: &BTreeMap<u64, FrozenExecutionConfig>,
     job: u64,
     request: u32,
     events: &[crate::persistence::RequestEventRecord],
@@ -172,7 +248,7 @@ fn add_usage(
     let Some(job_row) = jobs.get(&job) else {
         return Ok(());
     };
-    let Some(execution) = &job_row.execution else {
+    let Some(execution) = executions.get(&job) else {
         return Ok(());
     };
     let Some(request) = RequestNumber::new(request) else {
@@ -186,10 +262,16 @@ fn add_usage(
     else {
         return Ok(());
     };
-    let hour = sample.observed_at.as_unix_micros().div_euclid(crate::persistence::USAGE_SUMMARY_HOUR_MICROS);
+    let hour = sample
+        .observed_at
+        .as_unix_micros()
+        .div_euclid(crate::persistence::USAGE_SUMMARY_HOUR_MICROS);
     let key = (
         hour,
-        usage_agent(job_row),
+        usage_agent(
+            job_row,
+            job_row.parent_id.and_then(|parent| jobs.get(&parent.get())),
+        ),
         execution.llm.provider.id.get(),
         *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes(),
     );
@@ -197,11 +279,21 @@ fn add_usage(
     let complete = u64::from(sample.usage == crate::token_usage::TokenUsageState::Complete);
     entry.0 = entry.0.saturating_add(1);
     entry.1 = entry.1.saturating_add(complete);
-    entry.2 = entry.2.saturating_add(u64::from(sample.input.value().unwrap_or(0)));
-    entry.3 = entry.3.saturating_add(u64::from(sample.output.value().unwrap_or(0)));
-    entry.4 = entry.4.saturating_add(u64::from(sample.cache_read.value().unwrap_or(0)));
-    entry.5 = entry.5.saturating_add(u64::from(sample.cache_write.value().unwrap_or(0)));
-    entry.6 = entry.6.saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
+    entry.2 = entry
+        .2
+        .saturating_add(u64::from(sample.input.value().unwrap_or(0)));
+    entry.3 = entry
+        .3
+        .saturating_add(u64::from(sample.output.value().unwrap_or(0)));
+    entry.4 = entry
+        .4
+        .saturating_add(u64::from(sample.cache_read.value().unwrap_or(0)));
+    entry.5 = entry
+        .5
+        .saturating_add(u64::from(sample.cache_write.value().unwrap_or(0)));
+    entry.6 = entry
+        .6
+        .saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
     Ok(())
 }
 
@@ -218,6 +310,13 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
             .states
             .get(id)
             .ok_or_else(|| StorageError::corrupted(format!("job:{id} has no job_state")))?;
+        if row.kind.is_stored()
+            && state.claim.is_some()
+            && !state.locally_stopped()
+            && let Some(conversation) = row.parent_id
+        {
+            derived.active_turns.insert(conversation.get(), *id);
+        }
         if state.locally_stopped() && open_children.get(id).copied().unwrap_or(0) == 0 {
             settled.insert(*id);
         } else if let Some(parent) = row.parent_id {
@@ -231,37 +330,52 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
         for attachment in &row.attachments {
             derived.attachment_refs.insert((attachment.get(), *id), ());
         }
-        if let Some(original) = row.retry_of {
-            derived.retries.insert((original.get(), *id), ());
-        }
-        if let Some(previous) = row.continues {
+        if let Some(previous) = row.previous {
             derived.successors.insert(previous.get(), *id);
-            if let Some(first) = auth.jobs.get(&previous.get())
-                && first.continues.is_none()
-                && let Some(agent) = first.agent_id
-            {
+        }
+        if row.kind.is_conversation() {
+            if let Some(parent) = row.parent_id {
+                derived.child_conversations.insert((parent.get(), *id), ());
+                if !settled.contains(id) {
+                    derived.live_children.insert((parent.get(), *id), ());
+                }
+            }
+        } else if row.kind.is_stored()
+            && let Some(conversation) = row.parent_id
+        {
+            derived.tips.insert(conversation.get(), *id);
+            if let Some(claim) = &state.claim {
                 derived
-                    .chat_threads
-                    .insert((agent.get(), previous.get()), ());
+                    .notice_read
+                    .entry(conversation.get())
+                    .and_modify(|seq| *seq = (*seq).max(claim.notice_seq))
+                    .or_insert(claim.notice_seq);
             }
         }
-        if row.continues.is_none()
-            && let Some(agent) = row.agent_id
-            && row
-                .execution
-                .as_ref()
-                .and_then(|execution| execution.agent.as_ref())
-                .is_some_and(|agent| agent.behavior == AgentBehavior::Chat)
+        if row.kind.is_stored()
+            && let Some(conversation) = row.parent_id
+            && let Some(outcome) = &state.outcome
         {
-            derived
-                .chat_threads
-                .insert((agent.get(), *id), ());
+            let tips = derived
+                .answer_tips
+                .entry(conversation.get())
+                .or_insert((0, 0));
+            if outcome.kind != OutcomeKind::Cancelled {
+                tips.0 = *id;
+            }
+            if auth.result_turns.contains(id) {
+                tips.1 = *id;
+            }
+            if *tips == (0, 0) {
+                derived.answer_tips.remove(&conversation.get());
+            }
         }
-        let pending = state.claim.is_none() && state.outcome.is_none();
+        let pending =
+            !row.kind.is_conversation() && state.claim.is_none() && state.outcome.is_none();
         let mut open_dependencies = 0u32;
         if pending {
             derived.pending.insert(*id, ());
-            for (dependency, condition) in &row.dependencies {
+            for (dependency, condition) in row.waits_on() {
                 if !settled.contains(&dependency.get()) {
                     open_dependencies += 1;
                     derived
@@ -269,15 +383,27 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
                         .insert((dependency.get(), *id), condition.code());
                 }
             }
-            if open_dependencies == 0 {
+            if open_dependencies == 0
+                && !row.parent_id.is_some_and(|parent| {
+                    auth.held_conversations.contains(&parent.get())
+                        || derived
+                            .active_turns
+                            .get(&parent.get())
+                            .is_some_and(|active| *active != *id)
+                })
+            {
                 match row.eligible_at.map(Timestamp::as_unix_micros) {
                     Some(eligible_at) if eligible_at > clock => {
                         derived.delayed.insert((eligible_at, *id), ());
                     }
                     _ => {
-                        derived
-                            .ready
-                            .insert((transactions::job_requirement(row), *id), ());
+                        derived.ready.insert(
+                            (
+                                transactions::execution_requirement(&auth.executions[id]),
+                                *id,
+                            ),
+                            (),
+                        );
                     }
                 }
             }
@@ -305,6 +431,40 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
                     (claim.epoch, state.outcome.is_some()),
                 );
             }
+        }
+    }
+    for (conversation, tip) in &derived.tips {
+        if auth.jobs[conversation].parent_id.is_none()
+            && auth
+                .conversations
+                .get(conversation)
+                .is_some_and(|row| row.hidden_at.is_none())
+        {
+            derived.recent.insert((*tip, *conversation), ());
+        }
+    }
+    for ((turn, _), input) in &auth.inputs {
+        match &input.entry {
+            Entry::UserMessage { attachments, .. } => {
+                for attachment in attachments {
+                    derived
+                        .attachment_refs
+                        .insert((attachment.get(), *turn), ());
+                }
+                if let Some(conversation) = auth.jobs[turn].parent_id {
+                    derived
+                        .user_entry_at
+                        .entry(conversation.get())
+                        .or_insert(input.at.as_unix_micros());
+                }
+            }
+            Entry::RetryOf { turn: original, .. } => {
+                derived.retries.insert((original.get(), *turn), ());
+            }
+            Entry::AgentMessage { .. }
+            | Entry::Notice { .. }
+            | Entry::Decision { .. }
+            | Entry::Iteration { .. } => {}
         }
     }
     for (job, id, request, index) in &auth.tool_call_ids {
@@ -370,9 +530,36 @@ pub(super) fn rebuild(
     note("held_slot", sync!(tx, HELD_SLOTS, derived.held), true);
     note("children", sync!(tx, CHILDREN, derived.children), true);
     note("successor", sync!(tx, SUCCESSORS, derived.successors), true);
+    note("tip", sync!(tx, TIPS, derived.tips), true);
+    note("recent", sync!(tx, RECENT, derived.recent), true);
     note(
-        "chat_thread",
-        sync!(tx, CHAT_THREADS, derived.chat_threads),
+        "child_conversation",
+        sync!(tx, CHILD_CONVERSATIONS, derived.child_conversations),
+        true,
+    );
+    note(
+        "live_child",
+        sync!(tx, LIVE_CHILDREN, derived.live_children),
+        true,
+    );
+    note(
+        "user_entry_at",
+        sync!(tx, USER_ENTRY_AT, derived.user_entry_at),
+        true,
+    );
+    note(
+        "notice_read",
+        sync!(tx, NOTICE_READ, derived.notice_read),
+        true,
+    );
+    note(
+        "answer_tip",
+        sync!(tx, ANSWER_TIPS, derived.answer_tips),
+        true,
+    );
+    note(
+        "active_turn",
+        sync!(tx, ACTIVE_TURNS, derived.active_turns),
         true,
     );
     note("retry", sync!(tx, RETRIES, derived.retries), true);
@@ -381,7 +568,11 @@ pub(super) fn rebuild(
         sync!(tx, ATTACHMENT_REFS, derived.attachment_refs),
         true,
     );
-    note("tool_total", sync!(tx, TOOL_TOTALS, derived.tool_totals), true);
+    note(
+        "tool_total",
+        sync!(tx, TOOL_TOTALS, derived.tool_totals),
+        true,
+    );
     // The tool call ids carry text, so they are compared as owned keys.
     let mut current = BTreeMap::new();
     for entry in tx.open_table(TOOL_CALL_IDS)?.iter()? {
@@ -458,8 +649,8 @@ mod tests {
     #[test]
     fn tool_stats_rebuild_detects_difference() {
         let (_data, directory) = data_directory("derived", "tool-stats-rebuild");
-        let opened = crate::storage::open(directory.database_path())
-            .unwrap_or_else(|_| panic!("open"));
+        let opened =
+            crate::storage::open(directory.database_path()).unwrap_or_else(|_| panic!("open"));
 
         // Corrupt TOOL_STATS by adding an extra entry
         let tx = opened.database.begin_write().expect("tx");
@@ -494,8 +685,8 @@ mod tests {
     #[test]
     fn usage_totals_rebuild_detects_difference() {
         let (_data, directory) = data_directory("derived", "usage-totals-rebuild");
-        let opened = crate::storage::open(directory.database_path())
-            .unwrap_or_else(|_| panic!("open"));
+        let opened =
+            crate::storage::open(directory.database_path()).unwrap_or_else(|_| panic!("open"));
 
         // Corrupt USAGE_TOTALS by adding an extra entry
         let tx = opened.database.begin_write().expect("tx");
@@ -527,7 +718,12 @@ mod tests {
         );
     }
 
-    fn provision(database: &crate::database::DatabaseHandle) -> (crate::persistence::ExecutionPoolId, crate::persistence::ProfileId) {
+    fn provision(
+        database: &crate::database::DatabaseHandle,
+    ) -> (
+        crate::persistence::ExecutionPoolId,
+        crate::persistence::ProfileId,
+    ) {
         use crate::persistence::*;
         use crate::test_support::wait;
         use std::collections::BTreeSet;
@@ -579,6 +775,7 @@ mod tests {
         let database = worker.handle();
         let (pool, llm) = provision(&database);
         let job = wait(database.create_job(NewJob {
+            process_grant: None,
             name: None,
             eligible_at: None,
             parent: database.genesis(),
@@ -621,7 +818,11 @@ mod tests {
         };
 
         // Call 1: Admitted -> Completed
-        let call1 = ToolCallRef { job, request, index: 0 };
+        let call1 = ToolCallRef {
+            job,
+            request,
+            index: 0,
+        };
         wait(database.record_tool_decision(NewToolEvidence {
             call: call1,
             tool_call_id: "c-1".into(),
@@ -639,7 +840,11 @@ mod tests {
         .unwrap();
 
         // Call 2: Admitted -> NotApplied
-        let call2 = ToolCallRef { job, request, index: 1 };
+        let call2 = ToolCallRef {
+            job,
+            request,
+            index: 1,
+        };
         wait(database.record_tool_decision(NewToolEvidence {
             call: call2,
             tool_call_id: "c-2".into(),
@@ -657,7 +862,11 @@ mod tests {
         .unwrap();
 
         // Call 3: Refused (InvalidArguments)
-        let call3 = ToolCallRef { job, request, index: 2 };
+        let call3 = ToolCallRef {
+            job,
+            request,
+            index: 2,
+        };
         wait(database.record_tool_decision(NewToolEvidence {
             call: call3,
             tool_call_id: "c-3".into(),
@@ -677,10 +886,13 @@ mod tests {
         assert_eq!(open, 0);
 
         worker.shutdown().unwrap();
-        let opened = crate::storage::open(directory.database_path())
-            .unwrap_or_else(|_| panic!("open"));
+        let opened =
+            crate::storage::open(directory.database_path()).unwrap_or_else(|_| panic!("open"));
         let inconsistencies = relationship_inconsistencies(&opened.database).unwrap();
-        assert!(inconsistencies.is_empty(), "expected clean, got: {inconsistencies:?}");
+        assert!(
+            inconsistencies.is_empty(),
+            "expected clean, got: {inconsistencies:?}"
+        );
     }
 
     #[test]
@@ -719,6 +931,7 @@ mod tests {
         .unwrap();
 
         let job_1 = wait(database.create_job(NewJob {
+            process_grant: None,
             name: None,
             eligible_at: None,
             parent: database.genesis(),
@@ -754,12 +967,16 @@ mod tests {
                 },
                 ..Default::default()
             },
-            token: Some(crate::token_usage::TokenAnnotation::eligible(crate::token_usage::UsageFinality::Cumulative)),
+            token: Some(crate::token_usage::TokenAnnotation::eligible(
+                crate::token_usage::UsageFinality::Cumulative,
+            )),
         }))
         .unwrap();
 
         // Check summary so far: the scan finished, though the usage is not final.
-        let summary = wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default())).unwrap();
+        let summary =
+            wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default()))
+                .unwrap();
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].requests, 1);
         assert_eq!(summary.rows[0].complete_requests, 0);
@@ -781,11 +998,15 @@ mod tests {
                 },
                 ..Default::default()
             },
-            token: Some(crate::token_usage::TokenAnnotation::eligible(crate::token_usage::UsageFinality::Final)),
+            token: Some(crate::token_usage::TokenAnnotation::eligible(
+                crate::token_usage::UsageFinality::Final,
+            )),
         }))
         .unwrap();
 
-        let summary = wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default())).unwrap();
+        let summary =
+            wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default()))
+                .unwrap();
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].requests, 1);
         assert_eq!(summary.rows[0].complete_requests, 1);
@@ -795,6 +1016,7 @@ mod tests {
 
         // 3. Second request 1 hour later under agent_2
         let job_2 = wait(database.create_job(NewJob {
+            process_grant: None,
             name: None,
             eligible_at: None,
             parent: database.genesis(),
@@ -828,27 +1050,33 @@ mod tests {
                 },
                 ..Default::default()
             },
-            token: Some(crate::token_usage::TokenAnnotation::eligible(crate::token_usage::UsageFinality::Final)),
+            token: Some(crate::token_usage::TokenAnnotation::eligible(
+                crate::token_usage::UsageFinality::Final,
+            )),
         }))
         .unwrap();
 
         // Filter by agent_1
-        let summary_agent1 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
-            from_us: None,
-            until_us: None,
-            agent: Some(agent_1.get()),
-        }))
+        let summary_agent1 = wait(
+            database.usage_summary(crate::persistence::UsageSummaryFilter {
+                from_us: None,
+                until_us: None,
+                agent: Some(agent_1.get()),
+            }),
+        )
         .unwrap();
         assert_eq!(summary_agent1.rows.len(), 1);
         assert_eq!(summary_agent1.rows[0].agent, agent_1.get());
         assert_eq!(summary_agent1.rows[0].input_tokens, 10);
 
         // Filter by agent_2
-        let summary_agent2 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
-            from_us: None,
-            until_us: None,
-            agent: Some(agent_2.get()),
-        }))
+        let summary_agent2 = wait(
+            database.usage_summary(crate::persistence::UsageSummaryFilter {
+                from_us: None,
+                until_us: None,
+                agent: Some(agent_2.get()),
+            }),
+        )
         .unwrap();
         assert_eq!(summary_agent2.rows.len(), 1);
         assert_eq!(summary_agent2.rows[0].agent, agent_2.get());
@@ -856,11 +1084,13 @@ mod tests {
 
         // An empty range: `until_us` is exclusive, so equal bounds cover no
         // instant and no bucket, even when the bound starts an hour.
-        let summary_empty = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
-            from_us: Some(3_600_000_000),
-            until_us: Some(3_600_000_000),
-            agent: None,
-        }))
+        let summary_empty = wait(
+            database.usage_summary(crate::persistence::UsageSummaryFilter {
+                from_us: Some(3_600_000_000),
+                until_us: Some(3_600_000_000),
+                agent: None,
+            }),
+        )
         .unwrap();
         assert!(summary_empty.rows.is_empty());
         assert!(summary_empty.complete);
@@ -868,29 +1098,33 @@ mod tests {
 
         // Hour 1 only: [3_600_000_000, 7_200_000_000) rounds up to a bucket
         // end exclusive of hour 2.
-        let summary_hour1 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
-            from_us: Some(3_600_000_000),
-            until_us: Some(7_200_000_000),
-            agent: None,
-        }))
+        let summary_hour1 = wait(
+            database.usage_summary(crate::persistence::UsageSummaryFilter {
+                from_us: Some(3_600_000_000),
+                until_us: Some(7_200_000_000),
+                agent: None,
+            }),
+        )
         .unwrap();
         assert_eq!(summary_hour1.rows.len(), 1);
         assert_eq!(summary_hour1.rows[0].agent, agent_1.get());
 
         // Hour 2 only: [7_200_000_000, 10_800_000_000).
-        let summary_hour2 = wait(database.usage_summary(crate::persistence::UsageSummaryFilter {
-            from_us: Some(7_200_000_000),
-            until_us: Some(10_800_000_000),
-            agent: None,
-        }))
+        let summary_hour2 = wait(
+            database.usage_summary(crate::persistence::UsageSummaryFilter {
+                from_us: Some(7_200_000_000),
+                until_us: Some(10_800_000_000),
+                agent: None,
+            }),
+        )
         .unwrap();
         assert_eq!(summary_hour2.rows.len(), 1);
         assert_eq!(summary_hour2.rows[0].agent, agent_2.get());
 
         worker.shutdown().unwrap();
 
-        let opened = crate::storage::open(directory.database_path())
-            .unwrap_or_else(|_| panic!("open"));
+        let opened =
+            crate::storage::open(directory.database_path()).unwrap_or_else(|_| panic!("open"));
         let problems = relationship_inconsistencies(&opened.database).unwrap();
         assert!(problems.is_empty(), "expected clean, got: {problems:?}");
     }

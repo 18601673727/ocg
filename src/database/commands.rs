@@ -105,9 +105,46 @@ pub(super) enum Command {
         submission: NewSubmission,
         reply: Reply<JobId>,
     },
-    RetryJob {
-        retry: JobRetry,
-        reply: Reply<JobId>,
+    Open {
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        submission: Option<NewSubmission>,
+        reply: Reply<(JobId, Appended)>,
+    },
+    Append {
+        conversation: JobId,
+        entry: Entry,
+        freeze: Option<ExecutionConfiguration>,
+        submission: Option<NewSubmission>,
+        reply: Reply<Appended>,
+    },
+    StopTurn {
+        conversation: JobId,
+        by: Actor,
+        reply: Reply<ConversationAction>,
+    },
+    Close {
+        conversation: JobId,
+        by: Actor,
+        reply: Reply<ConversationAction>,
+    },
+    Hold {
+        conversation: JobId,
+        by: Actor,
+        reply: Reply<ConversationAction>,
+    },
+    Unhold {
+        conversation: JobId,
+        by: Actor,
+        reply: Reply<ConversationAction>,
+    },
+    Retry {
+        conversation: JobId,
+        turn: JobId,
+        by: Actor,
+        reply: Reply<Appended>,
     },
     AppendJobOutput {
         job: JobId,
@@ -116,6 +153,7 @@ pub(super) enum Command {
     },
     FinalizeJob {
         job: JobId,
+        cause: Option<crate::persistence::OutcomeCause>,
         finalization: JobFinalization,
         reply: Reply<Option<AppendedOutput>>,
     },
@@ -159,6 +197,7 @@ pub(super) enum Command {
     },
     ConfirmJobStopped {
         job: JobId,
+        proof: StopProof,
         reply: Reply<()>,
     },
     // Observations are boxed so they do not size every queued command.
@@ -326,14 +365,67 @@ impl Command {
                 reply,
                 |batch| persistence::create_submitted_job(batch, job, submission),
             ),
-            Self::RetryJob { retry, reply } => run(
+            Self::Open {
+                parent,
+                spec,
+                first,
+                configuration,
+                submission,
+                reply,
+            } => run(database, operation, commit, Kind::Open, reply, |batch| {
+                batch.open_conversation(parent, spec, first, configuration, submission)
+            }),
+            Self::Append {
+                conversation,
+                entry,
+                freeze,
+                submission,
+                reply,
+            } => run(database, operation, commit, Kind::Append, reply, |batch| {
+                batch.require_user_conversation(conversation)?;
+                batch.append(conversation, entry, freeze, submission, false)
+            }),
+            Self::StopTurn {
+                conversation,
+                by,
+                reply,
+            } => run(
                 database,
                 operation,
                 commit,
-                Kind::RetryJob,
+                Kind::StopTurn,
                 reply,
-                |batch| persistence::retry_job(batch, retry),
+                |batch| batch.stop_turn(conversation, by),
             ),
+            Self::Close {
+                conversation,
+                by,
+                reply,
+            } => run(database, operation, commit, Kind::Close, reply, |batch| {
+                batch.close(conversation, by)
+            }),
+            Self::Hold {
+                conversation,
+                by,
+                reply,
+            } => run(database, operation, commit, Kind::Hold, reply, |batch| {
+                batch.hold(conversation, by, false)
+            }),
+            Self::Unhold {
+                conversation,
+                by,
+                reply,
+            } => run(database, operation, commit, Kind::Unhold, reply, |batch| {
+                batch.hold(conversation, by, true)
+            }),
+            Self::Retry {
+                conversation,
+                turn,
+                by,
+                reply,
+            } => run(database, operation, commit, Kind::Retry, reply, |batch| {
+                batch.retry(conversation, turn, by)
+            }),
             Self::AppendJobOutput { job, output, reply } => run(
                 database,
                 operation,
@@ -345,6 +437,7 @@ impl Command {
             Self::FinalizeJob {
                 job,
                 finalization,
+                cause,
                 reply,
             } => run(
                 database,
@@ -352,7 +445,7 @@ impl Command {
                 commit,
                 Kind::FinalizeJob,
                 reply,
-                |batch| persistence::finalize_job(batch, job, finalization),
+                |batch| persistence::finalize_job(batch, job, finalization, cause),
             ),
             Self::CreateExecutor { executor, reply } => run(
                 database,
@@ -424,13 +517,13 @@ impl Command {
                 reply,
                 |batch| persistence::cleanup_attachment(batch, id, kind),
             ),
-            Self::ConfirmJobStopped { job, reply } => run(
+            Self::ConfirmJobStopped { job, proof, reply } => run(
                 database,
                 operation,
                 commit,
                 Kind::ConfirmJobStopped,
                 reply,
-                |batch| persistence::confirm_job_stopped(batch, job),
+                |batch| persistence::confirm_job_stopped(batch, job, proof),
             ),
             Self::RecordMetrics { metrics, reply } => run(
                 database,
@@ -517,7 +610,14 @@ impl Command {
             Self::CreateJob { job, .. } | Self::CreateSubmittedJob { job, .. } => {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
-            Self::RetryJob { retry, .. } => text_bytes(&retry.name),
+            Self::Open { first, .. } | Self::Append { entry: first, .. } => {
+                byte_count(format!("{first:?}").len())
+            }
+            Self::StopTurn { .. }
+            | Self::Close { .. }
+            | Self::Hold { .. }
+            | Self::Unhold { .. }
+            | Self::Retry { .. } => 4096,
             Self::ConfirmJobStopped { .. } => 0,
             // The record rewritten keeps its length; the allowance covers it.
             Self::CleanupAttachment { .. } => 0,
@@ -617,9 +717,15 @@ impl Command {
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
             Self::SetExecutionPoolEnabled { reply, .. }
             | Self::UpdateExecutionPool { reply, .. } => refuse(reply, error),
-            Self::CreateJob { reply, .. }
-            | Self::CreateSubmittedJob { reply, .. }
-            | Self::RetryJob { reply, .. } => refuse(reply, error),
+            Self::CreateJob { reply, .. } | Self::CreateSubmittedJob { reply, .. } => {
+                refuse(reply, error)
+            }
+            Self::Open { reply, .. } => refuse(reply, error),
+            Self::Append { reply, .. } | Self::Retry { reply, .. } => refuse(reply, error),
+            Self::StopTurn { reply, .. }
+            | Self::Close { reply, .. }
+            | Self::Hold { reply, .. }
+            | Self::Unhold { reply, .. } => refuse(reply, error),
             Self::AppendJobOutput { reply, .. } => refuse(reply, error),
             Self::FinalizeJob { reply, .. } => refuse(reply, error),
             Self::CreateExecutor { reply, .. } => refuse(reply, error),

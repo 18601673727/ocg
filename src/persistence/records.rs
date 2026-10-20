@@ -16,6 +16,7 @@ pub struct JobRecord {
     /// When the trusted execution path confirmed that an unknown-outcome
     /// Job's execution has actually stopped. The outcome stays unknown.
     pub stop_confirmed_at: Option<Timestamp>,
+    pub stop_confirmed_by: Option<StopProof>,
     pub created_at: Timestamp,
     /// The latest time one of the Job's lifecycle facts was recorded.
     pub updated_at: Timestamp,
@@ -24,18 +25,12 @@ pub struct JobRecord {
     /// The parent Job; 0 for a top-level Job.
     pub parent: JobId,
     pub parent_id: Option<JobId>,
-    pub agent_id: Option<ConfigId>,
-    pub execution: Option<FrozenExecutionConfig>,
+    pub kind: JobKind,
+    pub conversation: Option<JobId>,
     pub objective: Option<String>,
     pub attachments: Vec<AttachmentId>,
     pub dependencies: Vec<(JobId, DependencyCondition)>,
-    pub max_depth: Option<u32>,
-    pub max_children: Option<u32>,
-    pub max_descendants: Option<u32>,
-    pub retry_of: Option<JobId>,
-    pub continues: Option<JobId>,
     pub submission: Option<SubmissionKey>,
-    pub project: Option<ProjectId>,
     /// The Agent and Model configs the Job was submitted with, as provenance.
     pub configuration: Option<ExecutionConfiguration>,
     /// The Pool the Job was claimed into.
@@ -86,6 +81,8 @@ pub enum OutcomeCause {
     Text(String),
     Abandoned,
     DependencyImpossible,
+    Stopped { record: u32 },
+    Closed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +101,7 @@ pub struct ClaimRecord {
     pub epoch: u64,
     pub host_id: Option<String>,
     pub boot_id: Option<String>,
+    pub notice_seq: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +118,7 @@ pub struct JobStateRecord {
     pub suspension: Option<SuspensionRecord>,
     pub outcome: Option<OutcomeRecord>,
     pub stop_confirmed_at: Option<Timestamp>,
+    pub stop_confirmed_by: Option<StopProof>,
     pub children_closed_at: Option<Timestamp>,
 }
 
@@ -152,9 +151,6 @@ pub struct PendingJobsPage {
 pub struct JobInputRecord {
     pub id: JobInputId,
     pub objective: Option<String>,
-    pub max_depth: Option<u32>,
-    pub max_children_per_job: Option<u32>,
-    pub max_total_descendants: Option<u32>,
     pub submitted_at: Option<Timestamp>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -285,6 +281,7 @@ pub struct SubmissionRecord {
     pub key: SubmissionKey,
     pub fingerprint: RequestFingerprint,
     pub job: JobId,
+    pub seq: u32,
     /// When the Job was created with it.
     pub recorded_at: Timestamp,
 }

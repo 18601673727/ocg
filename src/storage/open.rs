@@ -301,7 +301,16 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(HELD_SLOTS)?;
     tx.open_table(CHILDREN)?;
     tx.open_table(SUCCESSORS)?;
-    tx.open_table(CHAT_THREADS)?;
+    tx.open_table(TURN_INPUTS)?;
+    tx.open_table(NOTICES)?;
+    tx.open_table(TIPS)?;
+    tx.open_table(RECENT)?;
+    tx.open_table(CHILD_CONVERSATIONS)?;
+    tx.open_table(LIVE_CHILDREN)?;
+    tx.open_table(USER_ENTRY_AT)?;
+    tx.open_table(NOTICE_READ)?;
+    tx.open_table(ANSWER_TIPS)?;
+    tx.open_table(ACTIVE_TURNS)?;
     tx.open_table(TOOL_CALL_IDS)?;
     tx.open_table(TOOL_TOTALS)?;
     tx.open_table(TOOL_STATS)?;
@@ -383,7 +392,14 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
     }
     // Newer waiters cancel first, so all receive Abandoned rather than a dependency failure.
     for job in pending.into_iter().rev() {
-        if batch.require_job_state(job)?.outcome.is_none() {
+        if matches!(
+            batch.require_job(job)?.kind,
+            JobKind::Turn {
+                plan_source: PlanSource::Process { .. },
+                ..
+            }
+        ) && batch.require_job_state(job)?.outcome.is_none()
+        {
             batch.finalize(
                 job,
                 OutcomeKind::Cancelled,
@@ -421,9 +437,29 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
         }
         if confirmed {
             state.stop_confirmed_at = Some(now);
+            state.stop_confirmed_by = Some(if batch.no_live_process(job)? {
+                StopProof::Proof
+            } else {
+                StopProof::Reboot
+            });
             batch.put_job_state(job, &state)?;
+            let row = batch.require_job(job)?;
+            if row.kind.is_stored()
+                && let Some(conversation) = row.parent_id
+            {
+                batch.step(|tx| {
+                    tx.open_table(ACTIVE_TURNS)?.remove(conversation.get())?;
+                    Ok(())
+                })?;
+            }
         }
+        let row = batch.require_job(job)?;
+        batch.index_answer(&row, OutcomeKind::Unknown, false)?;
         batch.settle(job)?;
+        if abandoned.contains(&job) {
+            batch.turn_ended(job)?;
+        }
+        // K2 reconciles admitted job_* calls with no outcome as NotApplied here.
     }
     Ok(abandoned)
 }
@@ -432,7 +468,7 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
 mod tests {
     use super::*;
     use crate::database::DatabaseWorker;
-    use crate::persistence::{DependencyCondition, JobInputDraft, NewJob};
+    use crate::persistence::{JobInputDraft, NewJob};
     use crate::test_support::{data_directory, execution_configuration, wait};
     use redb::ReadableTableMetadata;
 
@@ -444,6 +480,7 @@ mod tests {
             let worker = DatabaseWorker::start(&directory).expect("database");
             let database = worker.handle();
             let spec = NewJob {
+                process_grant: None,
                 name: None,
                 eligible_at: None,
                 parent: database.genesis(),
@@ -460,7 +497,7 @@ mod tests {
             }))
             .expect("child");
             let waiter = wait(database.create_job(NewJob {
-                dependencies: vec![(child, DependencyCondition::Success)],
+                dependencies: Vec::new(),
                 ..spec.clone()
             }))
             .expect("blocked root");

@@ -139,7 +139,9 @@ impl DatabaseHandle {
         }
     }
 
-    pub async fn tool_stats(&self) -> Result<Vec<crate::persistence::ToolStatRecord>, DatabaseError> {
+    pub async fn tool_stats(
+        &self,
+    ) -> Result<Vec<crate::persistence::ToolStatRecord>, DatabaseError> {
         self.read(storage::read_tool_stats).await
     }
 
@@ -147,7 +149,8 @@ impl DatabaseHandle {
         &self,
         filter: crate::persistence::UsageSummaryFilter,
     ) -> Result<crate::persistence::UsageSummaryResponse, DatabaseError> {
-        self.read(move |database| storage::read_usage_summary(database, &filter)).await
+        self.read(move |database| storage::read_usage_summary(database, &filter))
+            .await
     }
 
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
@@ -168,6 +171,10 @@ impl DatabaseHandle {
 
     pub(crate) fn cleanup_worker(&self) -> Arc<AtomicBool> {
         self.shared.cleanup_worker.clone()
+    }
+
+    pub(crate) fn data_directory(&self) -> DataDirectory {
+        self.shared.data_directory.clone()
     }
 
     pub(crate) fn log_directory(&self) -> &std::path::Path {
@@ -508,6 +515,56 @@ impl DatabaseHandle {
         self.shared.genesis
     }
 
+    pub(crate) async fn turn_execution(
+        &self,
+        turn: JobId,
+    ) -> Result<
+        (
+            crate::persistence::FrozenExecutionConfig,
+            Option<ProjectId>,
+            Option<ConfigId>,
+        ),
+        DatabaseError,
+    > {
+        self.read(move |database| storage::read_turn_execution(database, turn))
+            .await
+    }
+    pub(crate) async fn read_turn_context(
+        &self,
+        turn: JobId,
+        budget: usize,
+    ) -> Result<storage::TurnContext, DatabaseError> {
+        self.read(move |database| storage::read_turn_context(database, turn, budget))
+            .await
+    }
+    pub async fn turn_entries(
+        &self,
+        turn: JobId,
+    ) -> Result<Vec<(u32, crate::persistence::TurnEntry)>, DatabaseError> {
+        self.read(move |database| storage::read_turn_entries(database, turn))
+            .await
+    }
+    pub async fn conversation_turns(
+        &self,
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_conversation_turns(database, conversation, before, limit)
+        })
+        .await
+    }
+    pub async fn notices(
+        &self,
+        conversation: JobId,
+        after: u32,
+        limit: usize,
+    ) -> Result<Vec<(u32, crate::persistence::Notice)>, DatabaseError> {
+        self.read(move |database| storage::read_notices(database, conversation, after, limit))
+            .await
+    }
+
     pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
         self.read(move |database| storage::read_job(database, job))
             .await
@@ -591,8 +648,12 @@ impl DatabaseHandle {
         if !jobs.is_empty() {
             let duration_us = started.elapsed().as_micros() as u64;
             self.shared.claims.fetch_add(1, Ordering::Relaxed);
-            self.shared.claim_us_total.fetch_add(duration_us, Ordering::Relaxed);
-            self.shared.claim_us_max.fetch_max(duration_us, Ordering::Relaxed);
+            self.shared
+                .claim_us_total
+                .fetch_add(duration_us, Ordering::Relaxed);
+            self.shared
+                .claim_us_max
+                .fetch_max(duration_us, Ordering::Relaxed);
         }
         Ok(jobs)
     }
@@ -942,10 +1003,101 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Creates a new Job that retries `retry.original`; see [`JobRetry`].
-    pub async fn retry_job(&self, retry: JobRetry) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::RetryJob { retry, reply })
-            .await
+    pub async fn open_conversation(
+        &self,
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        submission: Option<NewSubmission>,
+    ) -> Result<(JobId, Appended), DatabaseError> {
+        self.submit(|reply| Command::Open {
+            parent,
+            spec,
+            first,
+            configuration,
+            submission,
+            reply,
+        })
+        .await
+    }
+    pub async fn append(
+        &self,
+        conversation: JobId,
+        entry: Entry,
+        freeze: Option<ExecutionConfiguration>,
+        submission: Option<NewSubmission>,
+    ) -> Result<Appended, DatabaseError> {
+        self.submit(|reply| Command::Append {
+            conversation,
+            entry,
+            freeze,
+            submission,
+            reply,
+        })
+        .await
+    }
+    pub async fn stop_turn(
+        &self,
+        conversation: JobId,
+        by: Actor,
+    ) -> Result<ConversationAction, DatabaseError> {
+        self.submit(|reply| Command::StopTurn {
+            conversation,
+            by,
+            reply,
+        })
+        .await
+    }
+    pub async fn close(
+        &self,
+        conversation: JobId,
+        by: Actor,
+    ) -> Result<ConversationAction, DatabaseError> {
+        self.submit(|reply| Command::Close {
+            conversation,
+            by,
+            reply,
+        })
+        .await
+    }
+    pub async fn hold(
+        &self,
+        conversation: JobId,
+        by: Actor,
+    ) -> Result<ConversationAction, DatabaseError> {
+        self.submit(|reply| Command::Hold {
+            conversation,
+            by,
+            reply,
+        })
+        .await
+    }
+    pub async fn unhold(
+        &self,
+        conversation: JobId,
+        by: Actor,
+    ) -> Result<ConversationAction, DatabaseError> {
+        self.submit(|reply| Command::Unhold {
+            conversation,
+            by,
+            reply,
+        })
+        .await
+    }
+    pub async fn retry(
+        &self,
+        conversation: JobId,
+        turn: JobId,
+        by: Actor,
+    ) -> Result<Appended, DatabaseError> {
+        self.submit(|reply| Command::Retry {
+            conversation,
+            turn,
+            by,
+            reply,
+        })
+        .await
     }
 
     pub async fn append_job_output(
@@ -957,14 +1109,34 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) fn with_stop_cause(
+        &self,
+        cause: Arc<std::sync::Mutex<Option<crate::persistence::StopCause>>>,
+    ) -> Self {
+        let mut handle = self.clone();
+        handle.stop_cause = Some(cause);
+        handle
+    }
+
     pub async fn finalize_job(
         &self,
         job: JobId,
         finalization: JobFinalization,
     ) -> Result<Option<AppendedOutput>, DatabaseError> {
+        let cause = self
+            .stop_cause
+            .as_ref()
+            .and_then(|cause| *cause.lock().unwrap_or_else(PoisonError::into_inner))
+            .map(|cause| match cause {
+                crate::persistence::StopCause::Stopped(record) => {
+                    crate::persistence::OutcomeCause::Stopped { record }
+                }
+                crate::persistence::StopCause::Closed => crate::persistence::OutcomeCause::Closed,
+            });
         self.submit(|reply| Command::FinalizeJob {
             job,
             finalization,
+            cause,
             reply,
         })
         .await
@@ -1216,8 +1388,12 @@ impl DatabaseHandle {
     /// releasing the slot it holds; the outcome stays unknown. Only the
     /// trusted execution path that observed the termination may call this,
     /// so it is not part of the public API.
-    pub(crate) async fn confirm_job_stopped(&self, job: JobId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::ConfirmJobStopped { job, reply })
+    pub(crate) async fn confirm_job_stopped(
+        &self,
+        job: JobId,
+        proof: StopProof,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::ConfirmJobStopped { job, proof, reply })
             .await
     }
 

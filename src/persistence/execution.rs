@@ -51,9 +51,6 @@ pub enum DependencyState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobInputDraft {
     pub objective: Option<String>,
-    pub max_depth: Option<u32>,
-    pub max_children_per_job: Option<u32>,
-    pub max_total_descendants: Option<u32>,
     /// The Attachments the input carries, in order. Each must exist and must
     /// not be cleaned up; see [`AttachmentRecord`].
     pub attachments: Vec<AttachmentId>,
@@ -69,12 +66,14 @@ pub struct NewJob {
     /// [`crate::database::DatabaseHandle::genesis`].
     pub parent: JobId,
     pub project: Option<ProjectId>,
+    /// The CLI grant stored with a Process plan. Stored turns use the frozen Agent.
+    pub process_grant: Option<String>,
     pub dependencies: Vec<(JobId, DependencyCondition)>,
     pub input: JobInputDraft,
     /// Present for an LLM execution child; absent for orchestrating or
     /// system work.
     pub configuration: Option<ExecutionConfiguration>,
-    /// The Chat turn this Job continues.
+    /// The conversation tip this directly constructed turn follows.
     pub previous: Option<JobId>,
 }
 
@@ -86,25 +85,6 @@ pub struct NewJob {
 pub struct ExecutionConfiguration {
     pub agent_profile: Option<ProfileId>,
     pub llm_profile: ProfileId,
-}
-
-/// An explicit retry creates a new Job that copies its original's spec
-/// (D-3), frozen execution included, so a retry cannot silently switch model
-/// or Provider. The original is left exactly as it was.
-#[derive(Clone, Debug, PartialEq)]
-pub struct JobRetry {
-    pub original: JobId,
-    /// The retry's parent; 0 for a top-level Job.
-    pub parent: JobId,
-    pub name: Option<String>,
-    pub eligible_at: Option<Timestamp>,
-    pub dependencies: Vec<(JobId, DependencyCondition)>,
-    /// Accepts that the retry may repeat a non-idempotent tool effect the
-    /// original, or any Job it retries in turn, is known to have had. It
-    /// covers this retry only. It promises no deduplication, grants
-    /// no tool anything, and never admits a retry over an effect that is
-    /// still unresolved. Leave it `false` unless the user accepted that.
-    pub acknowledge_repeated_effects: bool,
 }
 
 /// `value` carries a machine-readable payload, such as the conclusion of a

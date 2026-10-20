@@ -4,7 +4,7 @@
 //! stable business ID with an explicit, versioned encoding. Authoritative
 //! tables hold the facts; derived tables (`pending`, `ready`, `delayed`,
 //! `dependency_waiter`, `unsettled`, `held_slot`, `children`, `successor`,
-//! `chat_thread`, `tool_call_id` and the later ones) are written by the
+//! `tip`, `recent`, `live_child`, `tool_call_id` and the later ones) are written by the
 //! [`Batch`] operation that writes their source, in the same transaction, so
 //! none is an authority of its own. After an unclean shutdown the open
 //! procedure compares them with their definitions and rebuilds the ones that
@@ -32,6 +32,11 @@ use crate::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
 };
 use crate::persistence::{
+    Actor, Appended, ConversationAction, ConversationSpec, Entry, EntryKind, JobKind, Notice,
+    NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind, PlanSource, RecordEvent, StopProof,
+    TurnEntry, TurnExecution,
+};
+use crate::persistence::{
     AgentBehavior, AgentConfig, AttachmentId, AttachmentOrigin, AttachmentRecord,
     AuthorizationBasis, CapacityScope, CleanupKind, ConfigId, ConfigRef, ContentDigest,
     DependencyCondition, EffectConclusion, ExecutionOperation, ExecutionPool, ExecutionPoolId,
@@ -47,7 +52,9 @@ use crate::token_usage::RequestEligibility;
 
 mod batch;
 mod codec;
+mod conversations;
 mod derived;
+mod notices;
 mod observations;
 mod open;
 mod pending;
@@ -85,21 +92,24 @@ use reads::read;
 #[cfg(test)]
 pub(crate) use reads::record_attachment_cleanup;
 pub(crate) use reads::{
-    UnresolvedExecution, content_available, probe_committed, read_attachment,
+    TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,
+    read_turn_execution,
+};
+pub(crate) use reads::{
+    UnresolvedExecution, content_available, probe_committed, queue_counts, read_attachment,
     read_attachment_inputs, read_attachments, read_children, read_compatible_executors,
     read_config, read_configs, read_conversations, read_execution_pool, read_execution_pools,
-    read_executor, read_executors, read_job, read_job_compatible_executors,
-    read_job_configuration, read_job_input, read_job_input_for_job, read_jobs,
-    read_latest_output, read_occupancy, read_outputs, read_pending_jobs, read_pool_binding,
-    read_project, read_projects, read_retries, read_submission,
-    read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_summary,
-    queue_counts, unneeded_content,
+    read_executor, read_executors, read_job, read_job_compatible_executors, read_job_configuration,
+    read_job_input, read_job_input_for_job, read_jobs, read_latest_output, read_occupancy,
+    read_outputs, read_pending_jobs, read_pool_binding, read_project, read_projects, read_retries,
+    read_submission, read_tool_evidence, read_tool_stats, read_unresolved_executions,
+    read_usage_summary, unneeded_content,
 };
 pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow, usage_agent};
 use rows::{
-    decode_attachment, decode_output, decode_project, decode_project_root, decode_submission, decode_tool_evidence,
-    encode_attachment, encode_output, encode_project, encode_submission, encode_tool_evidence,
-    job_tool_evidence, tool_call_key, tool_call_ref,
+    decode_attachment, decode_output, decode_project, decode_project_root, decode_submission,
+    decode_tool_evidence, encode_attachment, encode_output, encode_project, encode_submission,
+    encode_tool_evidence, job_tool_evidence, tool_call_key, tool_call_ref,
 };
 use schema::*;
 pub(crate) use schema::{

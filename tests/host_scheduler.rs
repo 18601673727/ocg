@@ -51,6 +51,7 @@ fn plan(
             ..JobInputDraft::default()
         },
         job: NewJob {
+            process_grant: None,
             name: Some("host-submitted work".into()),
             eligible_at: None,
             parent: context.database().genesis(),
@@ -152,6 +153,7 @@ fn a_host_level_caller_submits_through_the_host_owned_scheduler() {
         executor_id: executor,
         input: JobInputDraft::default(),
         job: NewJob {
+            process_grant: None,
             name: Some("too late".into()),
             eligible_at: None,
             parent: receipt.job,

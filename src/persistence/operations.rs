@@ -37,7 +37,13 @@ pub enum OperationKind {
     AppendJobOutput,
     FinalizeJob,
     CreateExecutor,
-    RetryJob,
+    Open,
+    Append,
+    StopTurn,
+    Close,
+    Hold,
+    Unhold,
+    Retry,
     CreateProject,
     UpdateProject,
     SetConversation,
@@ -98,8 +104,6 @@ pub enum Violation {
     },
     #[error("{0} already exists")]
     DuplicateId(RecordRef),
-    #[error("{predecessor} already has the successor {tip}; a conversation does not fork")]
-    ConversationForked { predecessor: JobId, tip: JobId },
     #[error("{0} is already finalized")]
     JobAlreadyFinalized(JobId),
     #[error("{0} has a terminal outcome and accepts no more outputs")]

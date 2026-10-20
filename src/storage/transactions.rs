@@ -32,16 +32,12 @@ pub(super) fn requirement(
 /// What a Pool must offer to run the Job: an LLM request over the protocol
 /// of the Connection it froze. A Job without an execution needs nothing a
 /// Pool offers.
-pub(super) fn job_requirement(job: &JobRow) -> u16 {
-    match &job.execution {
-        Some(execution) => requirement(
-            Some(ExecutionOperation::LlmRequest),
-            Some(execution.llm.provider.transport),
-        ),
-        None => 0,
-    }
+pub(super) fn execution_requirement(execution: &FrozenExecutionConfig) -> u16 {
+    requirement(
+        Some(ExecutionOperation::LlmRequest),
+        Some(execution.llm.provider.transport),
+    )
 }
-
 /// A Pool as the claim batch sees it.
 struct OpenPool {
     id: ConfigId,
@@ -80,63 +76,7 @@ impl Batch {
                 same_request: recorded.fingerprint == fingerprint,
             });
         }
-        self.check_spec_references(&spec)?;
-        if spec.parent_id.is_some() && !spec.dependencies.is_empty() {
-            return self.reject(Violation::InvalidValue(
-                "dependencies",
-                "only a Job without a parent may have dependencies",
-            ));
-        }
-        if let Some(parent) = spec.parent_id {
-            let state = self.require_job_state(parent)?;
-            if state.outcome.is_some() || state.children_closed_at.is_some() {
-                return self.reject(Violation::ParentClosed(parent));
-            }
-        }
-        let mut previous = None;
-        for (dependency, condition) in &spec.dependencies {
-            if previous.is_some_and(|previous| *dependency <= previous) {
-                return self.reject(Violation::InvalidValue(
-                    "dependencies",
-                    "must be sorted by Job and unique",
-                ));
-            }
-            previous = Some(*dependency);
-            self.require_job(*dependency)?;
-            if self.is_subtree_settled(*dependency)? {
-                let completed = self
-                    .require_job_state(*dependency)?
-                    .outcome
-                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
-                if *condition == DependencyCondition::Success && !completed {
-                    return self.reject(Violation::UnsatisfiedDependency {
-                        job: JobId::new(0),
-                        prerequisite: *dependency,
-                        state: DependencyState::Impossible,
-                    });
-                }
-            }
-        }
-        for attachment in &spec.attachments {
-            if !self.require_attachment(*attachment)?.is_available() {
-                return self.reject(Violation::AttachmentCleanedUp(*attachment));
-            }
-        }
-        for lineage in [spec.retry_of, spec.continues].into_iter().flatten() {
-            self.require_job(lineage)?;
-        }
-        if spec.execution.is_none() {
-            return self.reject(Violation::InvalidValue(
-                "execution",
-                "a Job must have an execution",
-            ));
-        }
-        let pending = self.step(|tx| Ok(tx.open_table(PENDING)?.len()?))?;
-        if pending + 1 > P_MAX {
-            return self.reject(Violation::PendingJobsLimit {
-                max_pending_jobs: P_MAX,
-            });
-        }
+        self.validate_spec(&spec)?;
 
         let job = JobId::new(self.next_id(Sequence::Job)?);
         spec.id = job;
@@ -148,11 +88,13 @@ impl Batch {
 
         let mut open_dependencies = 0u32;
         self.step(|tx| {
-            tx.open_table(PENDING)?.insert(job.get(), ())?;
+            if !spec.kind.is_conversation() {
+                tx.open_table(PENDING)?.insert(job.get(), ())?;
+            }
             Ok(())
         })?;
-        for (dependency, condition) in &spec.dependencies {
-            if !self.is_subtree_settled(*dependency)? {
+        for (dependency, condition) in spec.waits_on() {
+            if !self.is_subtree_settled(dependency)? {
                 open_dependencies += 1;
                 self.step(|tx| {
                     tx.open_table(DEPENDENCY_WAITERS)?
@@ -169,7 +111,7 @@ impl Batch {
         if let Some(parent) = spec.parent_id {
             self.adjust_open_children(parent, 1)?;
         }
-        if open_dependencies == 0 {
+        if open_dependencies == 0 && !spec.kind.is_conversation() {
             self.place(job)?;
         }
         let parent_key = spec.parent_id.map_or(0, JobId::get);
@@ -180,28 +122,31 @@ impl Batch {
                 tx.open_table(ATTACHMENT_REFS)?
                     .insert((attachment.get(), job.get()), ())?;
             }
-            if let Some(original) = spec.retry_of {
-                tx.open_table(RETRIES)?
-                    .insert((original.get(), job.get()), ())?;
-            }
-            if spec.continues.is_none()
-                && let Some(agent) = spec.agent_id
-                && spec
-                    .execution
-                    .as_ref()
-                    .and_then(|execution| execution.agent.as_ref())
-                    .is_some_and(|agent| agent.behavior == AgentBehavior::Chat)
-            {
-                tx.open_table(CHAT_THREADS)?
-                    .insert((agent.get(), job.get()), ())?;
+            if let Some(previous) = spec.previous {
+                tx.open_table(SUCCESSORS)?
+                    .insert(previous.get(), job.get())?;
             }
             Ok(())
         })?;
+        if spec.kind.is_stored()
+            && let Some(conversation) = spec.parent_id
+        {
+            self.step(|tx| {
+                tx.open_table(TIPS)?.insert(conversation.get(), job.get())?;
+                if let Some(previous) = spec.previous {
+                    tx.open_table(RECENT)?
+                        .remove((previous.get(), conversation.get()))?;
+                }
+                Ok(())
+            })?;
+            self.refresh_recent(conversation)?;
+        }
         if let Some((key, fingerprint)) = submission {
             let record = SubmissionRecord {
                 key,
                 fingerprint,
                 job,
+                seq: 0,
                 recorded_at: self.now,
             };
             self.step(|tx| {
@@ -216,78 +161,145 @@ impl Batch {
         Ok(job)
     }
 
-    /// T1_CONTINUE: T1_SUBMIT of a Chat turn that continues `predecessor`.
-    pub(crate) fn t1_continue(
-        &mut self,
-        submission: Option<(SubmissionKey, RequestFingerprint)>,
-        mut spec: JobRow,
-        predecessor: JobId,
-    ) -> Result<JobId, BatchError> {
-        let previous = self.require_job(predecessor)?;
-        if previous.agent_id != spec.agent_id {
+    /// All T1 refusals occur before allocating or writing any rows. Event
+    /// appends can keep their source transaction and fall back to a notice.
+    pub(crate) fn validate_spec(&mut self, spec: &JobRow) -> Result<(), BatchError> {
+        self.check_spec_references(spec)?;
+        if !spec.dependencies.is_empty() {
             return self.reject(Violation::InvalidValue(
-                "agent",
-                "a continuation names the Agent of its predecessor",
+                "dependencies",
+                "K1 supports only the previous turn dependency",
             ));
         }
-        if previous.project != spec.project {
-            return self.reject(Violation::ProjectMismatch);
+        if let Some(parent) = spec.parent_id {
+            let state = self.require_job_state(parent)?;
+            if state.outcome.is_some() || state.children_closed_at.is_some() {
+                return self.reject(Violation::ParentClosed(parent));
+            }
         }
-        let is_chat = |row: &JobRow| {
-            row.execution
-                .as_ref()
-                .and_then(|execution| execution.agent.as_ref())
-                .is_some_and(|agent| agent.behavior == AgentBehavior::Chat)
-        };
-        if !is_chat(&previous) || !is_chat(&spec) {
+        let mut previous = None;
+        for (dependency, condition) in spec.waits_on() {
+            if previous.is_some_and(|previous| dependency <= previous) {
+                return self.reject(Violation::InvalidValue(
+                    "dependencies",
+                    "must be sorted by Job and unique",
+                ));
+            }
+            previous = Some(dependency);
+            self.require_job(dependency)?;
+            if self.is_subtree_settled(dependency)? {
+                let completed = self
+                    .require_job_state(dependency)?
+                    .outcome
+                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+                if condition == DependencyCondition::Success && !completed {
+                    return self.reject(Violation::UnsatisfiedDependency {
+                        job: JobId::new(0),
+                        prerequisite: dependency,
+                        state: DependencyState::Impossible,
+                    });
+                }
+            }
+        }
+        for attachment in &spec.attachments {
+            if !self.require_attachment(*attachment)?.is_available() {
+                return self.reject(Violation::AttachmentCleanedUp(*attachment));
+            }
+        }
+        if spec.kind.is_stored()
+            && let Some(conversation) = spec.parent_id
+            && self.tip(conversation)? != spec.previous
+        {
             return self.reject(Violation::InvalidValue(
-                "behavior",
-                "both turns of a conversation have Chat behavior",
+                "previous",
+                "must be the tip at creation",
             ));
         }
-        if !self.is_subtree_settled(predecessor)? {
-            return self.reject(Violation::RetryOfUnsettledJob(predecessor));
+        if let Some(previous) = spec.previous {
+            let prior = self.require_job(previous)?;
+            if prior.parent_id != spec.parent_id || !prior.kind.is_stored() {
+                return self.reject(Violation::InvalidValue(
+                    "previous",
+                    "must name the prior turn of this conversation",
+                ));
+            }
+            let tip = self.tip(spec.parent_id.ok_or_else(|| {
+                BatchError(Failure::Storage(StorageError::corrupted(
+                    "missing conversation",
+                )))
+            })?)?;
+            if tip != Some(previous) {
+                return self.reject(Violation::InvalidValue("previous", "must be the tip"));
+            }
+            if self.step(|tx| Ok(tx.open_table(SUCCESSORS)?.get(previous.get())?.is_some()))? {
+                return self.reject(Violation::InvalidValue(
+                    "previous",
+                    "already has a successor",
+                ));
+            }
         }
-        let tip = self.step(|tx| {
-            Ok(tx
-                .open_table(SUCCESSORS)?
-                .get(predecessor.get())?
-                .map(|tip| tip.value()))
-        })?;
-        if let Some(tip) = tip {
-            return self.reject(Violation::ConversationForked {
-                predecessor,
-                tip: JobId::new(tip),
+        let pending = self.step(|tx| Ok(tx.open_table(PENDING)?.len()?))?;
+        if !spec.kind.is_conversation() && pending + 1 > P_MAX && !self.event_append {
+            return self.reject(Violation::PendingJobsLimit {
+                max_pending_jobs: P_MAX,
             });
         }
-        spec.continues = Some(predecessor);
-        let job = self.t1_submit(submission, spec)?;
-        self.step(|tx| {
-            tx.open_table(SUCCESSORS)?
-                .insert(predecessor.get(), job.get())?;
-            if previous.continues.is_none()
-                && let Some(agent) = previous.agent_id
-            {
-                tx.open_table(CHAT_THREADS)?
-                    .insert((agent.get(), predecessor.get()), ())?;
-            }
-            Ok(())
-        })?;
-        Ok(job)
+
+        Ok(())
     }
 
-    /// Checks that every config a spec names exists with the kind its field
-    /// requires (I17).
     fn check_spec_references(&mut self, spec: &JobRow) -> Result<(), BatchError> {
-        if let Some(agent) = spec.agent_id {
-            self.require_config_kind(agent, ConfigKind::Agent)?;
-        }
-        if let Some(execution) = &spec.execution {
-            if let Some(agent) = &execution.agent_ref {
-                self.require_config_kind(agent.id, ConfigKind::Agent)?;
+        match &spec.kind {
+            JobKind::Conversation {
+                agent,
+                project,
+                origin,
+                ..
+            } => {
+                if agent.is_none() && !matches!(origin, Origin::User) {
+                    return self.reject(Violation::InvalidValue(
+                        "agent",
+                        "this origin requires an Agent",
+                    ));
+                }
+                if let Some(agent) = agent {
+                    self.require_config_kind(*agent, ConfigKind::Agent)?;
+                }
+                if let Some(project) = project {
+                    self.require_project(*project)?;
+                }
             }
-            self.require_config_kind(execution.llm.model.id, ConfigKind::Model)?;
-            self.require_config_kind(execution.llm.provider.id.into(), ConfigKind::Connection)?;
+            JobKind::Turn { .. } => {
+                if let JobKind::Turn {
+                    execution: TurnExecution::Ref(owner),
+                    ..
+                } = &spec.kind
+                {
+                    let owner = self.require_job(*owner)?;
+                    if !matches!(
+                        owner.kind,
+                        JobKind::Turn {
+                            execution: TurnExecution::Frozen(_),
+                            ..
+                        }
+                    ) || owner.parent_id != spec.parent_id
+                    {
+                        return self.reject(Violation::InvalidValue(
+                            "execution",
+                            "reference must name a Frozen owner in this conversation",
+                        ));
+                    }
+                }
+                let (execution, _, agent) = self.turn_execution(spec)?;
+                if spec.kind.is_stored() && execution.agent_ref.map(|agent| agent.id) != agent {
+                    return self.reject(Violation::InvalidValue(
+                        "agent",
+                        "frozen Agent differs from the conversation",
+                    ));
+                }
+                self.require_config_kind(execution.llm.model.id, ConfigKind::Model)?;
+                self.require_config_kind(execution.llm.provider.id.into(), ConfigKind::Connection)?;
+            }
         }
         Ok(())
     }
@@ -357,25 +369,22 @@ impl Batch {
         })
     }
 
-    /// The Jobs that retry `original`.
-    pub(crate) fn retries(&mut self, original: JobId) -> Result<Vec<JobId>, BatchError> {
-        self.step(|tx| {
-            let table = tx.open_table(RETRIES)?;
-            let mut retries = Vec::new();
-            for entry in table.range((original.get(), 0)..=(original.get(), u64::MAX))? {
-                retries.push(JobId::new(entry?.0.value().1));
-            }
-            Ok(retries)
-        })
-    }
-
     // ---- placement (8.10) ---------------------------------------------------------
 
     /// PLACE: a pending Job with no open dependency becomes `ready`, or
     /// `delayed` until its `eligible_at`.
     pub(crate) fn place(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
-        let requirement = job_requirement(&row);
+        let requirement = execution_requirement(&self.turn_execution(&row)?.0);
+        if self.is_held(&row)?
+            || (row.kind.is_stored()
+                && row.parent_id.is_some()
+                && self
+                    .active_turn(row.parent_id.expect("stored parent"))?
+                    .is_some_and(|active| active != job))
+        {
+            return Ok(());
+        }
         let eligible_at = row.eligible_at.map(Timestamp::as_unix_micros);
         let clock = open::promotion_clock();
         self.touched_ready_or_delayed = true;
@@ -406,7 +415,7 @@ impl Batch {
         })?;
         for (eligible_at, job) in due {
             let row = self.require_job(JobId::new(job))?;
-            let requirement = job_requirement(&row);
+            let requirement = execution_requirement(&self.turn_execution(&row)?.0);
             self.touched_ready_or_delayed = true;
             self.step(|tx| {
                 tx.open_table(DELAYED)?.remove((eligible_at, job))?;
@@ -476,11 +485,17 @@ impl Batch {
             for key in offered {
                 let first = self.step(|tx| {
                     let ready = tx.open_table(READY)?;
-                    let first = ready
-                        .range((key, 0)..=(key, u64::MAX))?
-                        .next()
-                        .transpose()?
-                        .map(|(entry, _)| entry.value().1);
+                    let jobs = tx.open_table(JOBS)?;
+                    let mut first = None;
+                    for entry in ready.range((key, 0)..=(key, u64::MAX))? {
+                        let id = entry?.0.value().1;
+                        if let Some(row) = jobs.get(id)?
+                            && JobRow::decode(row.value())?.kind.is_stored()
+                        {
+                            first = Some(id);
+                            break;
+                        }
+                    }
                     Ok(first)
                 })?;
                 if let Some(job) = first
@@ -530,6 +545,21 @@ impl Batch {
         capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
     ) -> Result<(), BatchError> {
         let mut state = self.require_job_state(job)?;
+        let row = self.require_job(job)?;
+        let conversation = row.kind.is_stored().then_some(row.parent_id).flatten();
+        let notice_seq = match conversation {
+            Some(conversation) => self.last_notice_seq(conversation)?,
+            None => 0,
+        };
+        if let Some(conversation) = conversation {
+            self.step(|tx| {
+                tx.open_table(ACTIVE_TURNS)?
+                    .insert(conversation.get(), job.get())?;
+                tx.open_table(NOTICE_READ)?
+                    .insert(conversation.get(), notice_seq)?;
+                Ok(())
+            })?;
+        }
         state.claim = Some(ClaimRecord {
             started_at: self.now,
             pool_id: pool,
@@ -538,6 +568,7 @@ impl Batch {
             epoch: self.epoch,
             host_id: self.host_id.clone(),
             boot_id: self.boot_id.clone(),
+            notice_seq,
         });
         self.put_job_state(job, &state)?;
         let epoch = self.epoch;
@@ -569,7 +600,7 @@ impl Batch {
             return Ok(Err(ClaimRefusal::EmptyAllowedPools));
         }
         self.promote()?;
-        let requirement_key = job_requirement(&row);
+        let requirement_key = execution_requirement(&self.turn_execution(&row)?.0);
         let (ready, delayed) = self.step(|tx| {
             let ready = tx
                 .open_table(READY)?
@@ -656,9 +687,9 @@ impl Batch {
     }
 
     fn first_open_dependency(&mut self, row: &JobRow) -> Result<Option<JobId>, BatchError> {
-        for (dependency, _) in &row.dependencies {
-            if !self.is_subtree_settled(*dependency)? {
-                return Ok(Some(*dependency));
+        for (dependency, _) in row.waits_on() {
+            if !self.is_subtree_settled(dependency)? {
+                return Ok(Some(dependency));
             }
         }
         Ok(None)
@@ -873,12 +904,74 @@ impl Batch {
         &mut self,
         job: JobId,
         mut kind: OutcomeKind,
-        cause: Option<OutcomeCause>,
+        mut cause: Option<OutcomeCause>,
         result: Option<FinalResult>,
     ) -> Result<(OutcomeKind, Option<u32>), BatchError> {
         let mut state = self.require_job_state(job)?;
         if state.outcome.is_some() {
             return self.reject(Violation::JobAlreadyFinalized(job));
+        }
+        let row = self.require_job(job)?;
+        if row.kind.is_stored()
+            && let Some(conversation) = row.parent_id
+        {
+            if cause.is_none() {
+                if self.conversation(conversation)?.closed_running {
+                    cause = Some(OutcomeCause::Closed);
+                } else if let Some(started_at) = state.claim.as_ref().map(|claim| claim.started_at)
+                {
+                    cause = self.step(|tx| {
+                        for entry in tx
+                            .open_table(NOTICES)?
+                            .range((conversation.get(), 0)..=(conversation.get(), u32::MAX))?
+                            .rev()
+                        {
+                            let (key, value) = entry?;
+                            if let NoticeBody::Record {
+                                event: RecordEvent::Stop,
+                                at,
+                                ..
+                            } = Notice::decode(value.value())?.body
+                                && at >= started_at
+                            {
+                                return Ok(Some(OutcomeCause::Stopped {
+                                    record: key.value().1,
+                                }));
+                            }
+                        }
+                        Ok(None)
+                    })?;
+                }
+            }
+            if matches!(
+                cause,
+                Some(OutcomeCause::Stopped { .. } | OutcomeCause::Closed)
+            ) {
+                let sent = self.step(|tx| {
+                    for entry in tx
+                        .open_table(REQUEST_EVENTS)?
+                        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+                    {
+                        let (key, bytes) = entry?;
+                        let (_, request, seq) = key.value();
+                        let Some(request) = RequestNumber::new(request) else {
+                            continue;
+                        };
+                        if matches!(
+                            rows::decode_request_event(job, request, seq, bytes.value())?.payload,
+                            crate::persistence::RequestPayload::Sent { .. }
+                        ) {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                })?;
+                kind = if sent || !self.no_live_process(job)? {
+                    OutcomeKind::Unknown
+                } else {
+                    OutcomeKind::Cancelled
+                };
+            }
         }
         if state.claim.is_none() && kind != OutcomeKind::Cancelled {
             return self.reject(Violation::InvalidValue(
@@ -918,6 +1011,7 @@ impl Batch {
         }
         if kind == OutcomeKind::Unknown && self.no_live_process(job)? {
             state.stop_confirmed_at = Some(self.now);
+            state.stop_confirmed_by = Some(StopProof::Proof);
         }
         if let Some(claim) = &state.claim {
             let pool = claim.pool_id.get();
@@ -938,15 +1032,32 @@ impl Batch {
         } else {
             self.cancel_pending_writes(job)?;
         }
+        if row.kind.is_stored()
+            && let Some(conversation) = row.parent_id
+            && (kind != OutcomeKind::Unknown || state.stop_confirmed_at.is_some())
+        {
+            self.step(|tx| {
+                let mut active = tx.open_table(ACTIVE_TURNS)?;
+                if active
+                    .get(conversation.get())?
+                    .is_some_and(|active| active.value() == job.get())
+                {
+                    active.remove(conversation.get())?;
+                }
+                Ok(())
+            })?;
+        }
         self.put_job_state(job, &state)?;
+        self.index_answer(&row, kind, appended.is_some())?;
         self.settle(job)?;
+        self.turn_ended(job)?;
         self.probe = Some(Probe::Outcome(job));
         Ok((kind, appended))
     }
 
     /// CONFIRM_STOP: the stop of an Unknown Job is proven, so its slot is
     /// released.
-    pub(crate) fn confirm_stop(&mut self, job: JobId) -> Result<(), BatchError> {
+    pub(crate) fn confirm_stop(&mut self, job: JobId, proof: StopProof) -> Result<(), BatchError> {
         let mut state = self.require_job_state(job)?;
         match &state.outcome {
             None => return self.reject(Violation::StopNeedsOutcome(job)),
@@ -959,6 +1070,7 @@ impl Batch {
             return self.reject(Violation::StopAlreadyConfirmed(job));
         }
         state.stop_confirmed_at = Some(self.now);
+        state.stop_confirmed_by = Some(proof);
         if let Some(claim) = &state.claim {
             let pool = claim.pool_id.get();
             self.freed_capacity = true;
@@ -967,15 +1079,28 @@ impl Batch {
                 Ok(())
             })?;
         }
+        let row = self.require_job(job)?;
+        if row.kind.is_stored()
+            && let Some(conversation) = row.parent_id
+        {
+            self.step(|tx| {
+                tx.open_table(ACTIVE_TURNS)?.remove(conversation.get())?;
+                Ok(())
+            })?;
+        }
         self.put_job_state(job, &state)?;
-        self.settle(job)
+        self.settle(job)?;
+        if let Some(conversation) = self.require_job(job)?.parent_id {
+            self.auto_close_check(conversation)?;
+        }
+        Ok(())
     }
 
     /// CANCEL_PENDING_WRITES: a Job cancelled before its claim leaves every
     /// readiness table.
     pub(crate) fn cancel_pending_writes(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
-        let requirement_key = job_requirement(&row);
+        let requirement_key = execution_requirement(&self.turn_execution(&row)?.0);
         self.step(|tx| {
             tx.open_table(PENDING)?.remove(job.get())?;
             tx.open_table(READY)?.remove((requirement_key, job.get()))?;
@@ -984,7 +1109,7 @@ impl Batch {
                     .remove((eligible_at.as_unix_micros(), job.get()))?;
             }
             let mut waiters = tx.open_table(DEPENDENCY_WAITERS)?;
-            for (dependency, _) in &row.dependencies {
+            for (dependency, _) in row.waits_on() {
                 waiters.remove((dependency.get(), job.get()))?;
             }
             let mut unsettled = tx.open_table(UNSETTLED)?;
@@ -1011,8 +1136,15 @@ impl Batch {
             let Some((_, open_children)) = counts else {
                 continue;
             };
+            let row = self.require_job(job)?;
+            if row.kind.is_conversation() && open_children == 0 {
+                self.settle_conversation(job)?;
+            }
             let state = self.require_job_state(job)?;
             if !state.locally_stopped() || open_children > 0 {
+                if row.kind.is_conversation() {
+                    self.place_waiting_tip(job)?;
+                }
                 continue;
             }
             self.step(|tx| {
@@ -1067,9 +1199,18 @@ impl Batch {
                     self.put_job_state(waiter, &cancelled)?;
                     self.cancel_pending_writes(waiter)?;
                     work.push(waiter);
+                    self.turn_ended(waiter)?;
                 }
             }
-            if let Some(parent) = self.require_job(job)?.parent_id {
+            if let Some(parent) = row.parent_id {
+                if row.kind.is_conversation() {
+                    self.step(|tx| {
+                        tx.open_table(LIVE_CHILDREN)?
+                            .remove((parent.get(), job.get()))?;
+                        Ok(())
+                    })?;
+                    self.auto_close_check(parent)?;
+                }
                 self.adjust_open_children(parent, -1)?;
                 work.push(parent);
             }

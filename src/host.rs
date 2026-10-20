@@ -159,9 +159,12 @@ pub(crate) fn run_reporting<F>(
 where
     F: Future<Output = ()> + 'static,
 {
-    run_hosted_reporting(data_directory, signals, move |context: HostContext| {
-        until_stopped(context.database)
-    })
+    run_controlled_reporting(
+        data_directory,
+        signals,
+        None,
+        move |context: HostContext| until_stopped(context.database),
+    )
 }
 
 pub(crate) fn run_hosted_reporting<F>(
@@ -172,7 +175,13 @@ pub(crate) fn run_hosted_reporting<F>(
 where
     F: Future<Output = ()> + 'static,
 {
-    run_controlled_reporting(data_directory, signals, None, until_stopped)
+    run_scoped_reporting(
+        data_directory,
+        signals,
+        None,
+        crate::orchestration::execution_runtime::ClaimScope::Process,
+        until_stopped,
+    )
 }
 
 /// Like [`run_hosted`], also serving the local Control Plane `control`
@@ -197,6 +206,44 @@ pub(crate) fn run_controlled_reporting<F>(
     data_directory: &DataDirectory,
     signals: bool,
     control: Option<ControlPlaneConfig>,
+    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+) -> HostReport
+where
+    F: Future<Output = ()> + 'static,
+{
+    run_scoped_reporting(
+        data_directory,
+        signals,
+        control,
+        crate::orchestration::execution_runtime::ClaimScope::Stored,
+        until_stopped,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_process_controlled_reporting<F>(
+    data_directory: &DataDirectory,
+    signals: bool,
+    control: Option<ControlPlaneConfig>,
+    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+) -> HostReport
+where
+    F: Future<Output = ()> + 'static,
+{
+    run_scoped_reporting(
+        data_directory,
+        signals,
+        control,
+        crate::orchestration::execution_runtime::ClaimScope::Process,
+        until_stopped,
+    )
+}
+
+fn run_scoped_reporting<F>(
+    data_directory: &DataDirectory,
+    signals: bool,
+    control: Option<ControlPlaneConfig>,
+    scope: crate::orchestration::execution_runtime::ClaimScope,
     until_stopped: impl FnOnce(HostContext) -> F + 'static,
 ) -> HostReport
 where
@@ -229,6 +276,7 @@ where
         .build(ntex::rt::DefaultRuntime)
         .block_on(serve(
             database.handle(),
+            scope,
             control,
             workspace_tools,
             until_stopped,
@@ -279,6 +327,7 @@ fn protection_notice(
 /// database after it.
 async fn serve<F>(
     handle: DatabaseHandle,
+    scope: crate::orchestration::execution_runtime::ClaimScope,
     control: Option<ControlPlaneConfig>,
     workspace_tools: crate::orchestration::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
@@ -287,7 +336,7 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
-    let execution = match ExecutionRuntime::start(handle.clone()) {
+    let execution = match ExecutionRuntime::start(handle.clone(), scope) {
         Ok(execution) => execution,
         Err(error) => {
             report.fail(Phase::Startup, error);

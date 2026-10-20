@@ -814,10 +814,45 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_job_is_a_separate_sample_even_with_shared_input() {
+    fn a_retry_of_turn_is_a_separate_usage_sample() {
+        use crate::database::DatabaseWorker;
+        use crate::persistence::{Actor, ConversationSpec, Entry, JobFinalization, Origin};
+        use crate::test_support::{data_directory, execution_configuration, wait};
+        let (_root, directory) = data_directory("token-usage", "retry-of");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let (conversation, first) = wait(database.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            Entry::UserMessage {
+                text: "original".into(),
+                attachments: vec![],
+            },
+            execution_configuration(&database),
+            None,
+        ))
+        .expect("open");
+        let executor = wait(database.create_executor(crate::persistence::NewExecutor {
+            name: "retry worker".into(),
+            concurrency_limit: std::num::NonZeroU32::MIN,
+            llm_transports: [crate::persistence::LlmTransport::OpenAiChatCompletions].into(),
+        }))
+        .expect("executor");
+        wait(database.claim_fixture(first.turn, executor)).expect("claim");
+        wait(database.finalize_job(first.turn, JobFinalization::Unknown)).expect("unknown");
+        let next = wait(database.retry(conversation, first.turn, Actor::User)).expect("retry");
+        assert!(
+            matches!(wait(database.turn_entries(next.turn)).expect("entries")[0].1.entry, Entry::RetryOf { turn, .. } if turn == first.turn)
+        );
         let (first_try, retry) = (
-            metrics(1, JobId::new(1), 100, io(10, 10)),
-            metrics(2, JobId::new(2), 200, io(10, 10)),
+            metrics(1, first.turn, 100, io(10, 10)),
+            metrics(2, next.turn, 200, io(10, 10)),
         );
         let (a, b) = (
             sample(&[(&first_try, Eligible, Final)]),
@@ -829,6 +864,7 @@ mod tests {
             reduce(&[(&first_try, Eligible, Final), (&retry, Eligible, Final)]).is_err(),
             "the two Jobs are never reduced together"
         );
+        worker.shutdown().expect("shutdown");
     }
 
     #[test]

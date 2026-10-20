@@ -36,6 +36,7 @@ pub(super) fn admitted(admission: &Admission) -> Result<(), DatabaseError> {
 }
 
 pub(super) struct Shared {
+    pub(super) data_directory: DataDirectory,
     pub(super) scheduler_wake: SchedulerWake,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) active_policy: SystemPolicy,

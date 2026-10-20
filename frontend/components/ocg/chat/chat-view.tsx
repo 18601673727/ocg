@@ -301,7 +301,7 @@ export function ChatComposer({
             queueing,
             submitting,
             cancelling,
-            sendDisabled: busy || !canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat"),
+            sendDisabled: !canSend || submitting || cancelling || (!chatReady && parseComposerIntent(draft).kind === "chat"),
             steerDisabled: !canSend || !chatReady || submitting || cancelling,
             onAttach: () => fileInput.current?.click(),
             onSteer: () => void submit("steer"),

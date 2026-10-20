@@ -12,7 +12,7 @@ import {
   decodeAvailability,
   decodeLogs,
   decodeJob,
-  decodeJobConversation,
+  decodeConversationTurns,
   decodeJobInput,
   decodeJobEvent,
   decodeJobTools,
@@ -88,12 +88,12 @@ export type HttpCanonicalControlClientOptions = {
 export type ControlSubmission = {
   // An Agent Profile that targets `llm_profile`; its instructions are frozen with the Job.
   agent_profile?: string;
-  llm_profile: string;
+  llm_profile?: string;
   executor: string;
   objective: string;
   name?: string;
   // A completed predecessor Job whose conversation history precedes this turn.
-  previous?: string;
+  conversation?: string;
   // The Project the Job works in; an Agent with a Workspace grant requires one on a conversation's first turn.
   project?: string;
   // Image Attachments to send with the objective.
@@ -131,6 +131,11 @@ export type ControlProfileWriteRequest =
     };
 
 export type ControlSubmissionResult = {
+  conversation: string | null;
+  seq: number | null;
+  joined: boolean;
+  model: string | null;
+  kept: boolean;
   status: "admitted" | "pending";
   job: string | null;
   // Whether this request created the Job, rather than replay its key.
@@ -479,9 +484,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
 
     /** The bounded conversation ending at `job`, reconstructed from persisted Job `previous` links. */
-    async readJobConversation(job: string, signal?: AbortSignal) {
-      jobIdentity(job);
-      return decodeJobConversation((await send("GET", `/api/v1/jobs/${job}/conversation`, { signal })).input, job);
+    async readConversationTurns(conversation: string, before?: string, limit = 20, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      if (before) jobIdentity(before);
+      const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
+      const answer = await send("GET", `/api/v1/conversations/${conversation}/turns${query}`, { signal });
+      return decodeConversationTurns(answer.input, conversation);
     },
 
     /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */
@@ -641,9 +649,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
      */
     async submitJob(submission: ControlSubmission, key: string, signal?: AbortSignal) {
       if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile", "profile:");
-      identity(submission.llm_profile, "llm_profile", "profile:");
+      if (submission.llm_profile !== undefined) identity(submission.llm_profile, "llm_profile", "profile:");
       identity(submission.executor, "executor", "executor:");
-      if (submission.previous !== undefined) jobIdentity(submission.previous);
+      if (submission.conversation !== undefined) jobIdentity(submission.conversation);
       if (submission.project !== undefined) identity(submission.project, "project", "project:");
       if (submission.attachments !== undefined) {
         for (const [index, att] of submission.attachments.entries()) {
@@ -665,6 +673,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return {
         status: admission.status,
         job: admission.job,
+        conversation: admission.conversation, seq: admission.seq, joined: admission.joined, model: admission.model, kept: admission.kept,
         created: answer.status === 201,
       } satisfies ControlSubmissionResult;
     },
@@ -703,10 +712,15 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
 
     /** Requests the stop of one Job this listener admitted. */
-    async stopJob(job: string, signal?: AbortSignal) {
-      jobIdentity(job);
-      const answer = await send("POST", `/api/v1/jobs/${job}/stop`, { sign: true, signal });
-      return decodeStop(answer.input, job);
+    async stopConversation(conversation: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      const answer = await send("POST", `/api/v1/conversations/${conversation}/stop`, { body: {}, sign: true, signal });
+      return decodeStop(answer.input, conversation);
+    },
+    async closeConversation(conversation: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      const answer = await send("POST", `/api/v1/conversations/${conversation}/close`, { body: {}, sign: true, signal });
+      return decodeStop(answer.input, conversation);
     },
 
     /** Signs the browser in under this run's pairing code. */

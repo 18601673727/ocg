@@ -31,7 +31,11 @@ pub(super) fn frozen_llm_target(
     else {
         return Ok(None);
     };
-    Ok(row.execution.map(|execution| LlmTarget {
+    if row.kind.is_conversation() {
+        return Ok(None);
+    }
+    let execution = reads::turn_execution(&rx.open_table(JOBS)?, &row)?.0;
+    Ok(Some(LlmTarget {
         llm_profile: execution.llm.model.id.into(),
         frozen: execution.llm,
     }))

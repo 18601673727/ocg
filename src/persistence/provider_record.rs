@@ -59,7 +59,7 @@ pub(crate) fn record_sent_request(
     batch: &mut Batch,
     sent: NewSentRequest,
 ) -> mutations::OpResult<()> {
-    if batch.require_job(sent.job)?.execution.is_none() {
+    if batch.require_job(sent.job)?.kind.is_conversation() {
         return batch.reject(Violation::NotAnLlmExecution(sent.job));
     }
     batch.require_executing_here(sent.job)?;

@@ -17,32 +17,67 @@ fn spec_of(batch: &mut Batch, job: &NewJob) -> Result<JobRow, BatchError> {
     if let Some(pair) = dependencies.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return batch.reject(Violation::DuplicateDependency(pair[0].0));
     }
+    let Some(frozen) = frozen else {
+        return batch.reject(Violation::InvalidValue(
+            "execution",
+            "a process turn requires execution",
+        ));
+    };
+    if let Some(project) = job.project {
+        batch.require_project(project)?;
+    }
+    let stored = job.parent.get() != 0 && batch.require_job(job.parent)?.kind.is_conversation();
+    if !stored && job.previous.is_some() {
+        return batch.reject(Violation::InvalidValue(
+            "previous",
+            "a process turn has no conversation",
+        ));
+    }
+    if (job.process_grant.is_some()
+        || frozen
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.tool_grant.is_some()))
+        && !stored
+        && job.project.is_none()
+    {
+        return batch.reject(Violation::ProjectRequired);
+    }
     Ok(JobRow {
         id: JobId::new(0),
         created_at: batch.now(),
         eligible_at: job.eligible_at,
         name: job.name.clone(),
         parent_id: (job.parent.get() != 0).then_some(job.parent),
-        agent_id: job
-            .configuration
-            .and_then(|c| c.agent_profile)
-            .map(Into::into),
-        execution: frozen,
-        objective: job.input.objective.clone(),
-        attachments: job.input.attachments.clone(),
+        kind: JobKind::Turn {
+            plan_source: if stored {
+                PlanSource::Stored
+            } else {
+                PlanSource::Process {
+                    project: job.project,
+                    grant: job.process_grant.clone().or_else(|| {
+                        frozen
+                            .agent
+                            .as_ref()
+                            .and_then(|agent| agent.tool_grant.clone())
+                    }),
+                }
+            },
+            execution: TurnExecution::Frozen(frozen),
+        },
+        objective: (!stored).then(|| job.input.objective.clone()).flatten(),
+        attachments: if stored {
+            Vec::new()
+        } else {
+            job.input.attachments.clone()
+        },
         dependencies,
-        max_depth: job.input.max_depth,
-        max_children: job.input.max_children_per_job,
-        max_descendants: job.input.max_total_descendants,
-        retry_of: None,
-        continues: job.previous,
+        previous: job.previous,
         submission: None,
-        project: job.project,
     })
 }
 
-/// T1: submits a Job, or the next turn of a conversation when it continues a
-/// predecessor. The Job is pending; the claim batch grants it later.
+/// T1 constructs a spec directly. Interactive messages use append instead.
 pub(crate) fn create_job(batch: &mut Batch, job: NewJob) -> OpResult<JobId> {
     submit(batch, job, None)
 }
@@ -53,35 +88,19 @@ fn submit(
     submission: Option<NewSubmission>,
 ) -> Result<JobId, BatchError> {
     let spec = spec_of(batch, &job)?;
-    if submission.is_some()
-        && let Some(execution) = &spec.execution
-        && execution
-            .agent
-            .as_ref()
-            .is_some_and(|agent| agent.tool_grant.is_some())
-        && !execution
-            .llm
-            .config
-            .declared_capabilities
-            .contains(&ModelCapability::Tools)
-    {
-        return batch.reject(Violation::ToolsNotSupported);
-    }
-    if let Some(project) = spec.project {
-        batch.require_project(project)?;
-    } else if spec
-        .execution
-        .as_ref()
-        .and_then(|execution| execution.agent.as_ref())
-        .is_some_and(|agent| agent.tool_grant.is_some())
-    {
-        return batch.reject(Violation::ProjectRequired);
-    }
     let submission = submission.map(|submission| (submission.key, submission.fingerprint));
-    match job.previous {
-        Some(previous) => batch.t1_continue(submission, spec, previous),
-        None => batch.t1_submit(submission, spec),
+    let stored = spec.kind.is_stored();
+    let turn = batch.t1_submit(submission, spec)?;
+    if stored {
+        batch.insert_turn_input(
+            turn,
+            Entry::UserMessage {
+                text: job.input.objective.unwrap_or_default(),
+                attachments: job.input.attachments,
+            },
+        )?;
     }
+    Ok(turn)
 }
 
 pub(crate) fn create_submitted_job(
@@ -90,43 +109,6 @@ pub(crate) fn create_submitted_job(
     submission: NewSubmission,
 ) -> OpResult<JobId> {
     submit(batch, job, Some(submission))
-}
-
-/// Creates a new Job that retries `retry.original`. The original Job is not
-/// touched.
-///
-/// Only an original whose subtree has settled may be retried, and only while
-/// none of its direct retries has an unsettled subtree; both are checked in
-/// the transaction that creates the retry, so concurrent retries cannot both
-/// become active. The original's tool effects are checked in the same
-/// transaction, see [`require_repeatable_tool_effects`].
-pub(crate) fn retry_job(batch: &mut Batch, retry: JobRetry) -> OpResult<JobId> {
-    let original = retry.original;
-    let mut spec = batch.require_job(original)?;
-    if !batch.is_subtree_settled(original)? {
-        return batch.reject(Violation::RetryOfUnsettledJob(original));
-    }
-    for existing in batch.retries(original)? {
-        if !batch.is_subtree_settled(existing)? {
-            return batch.reject(Violation::ActiveRetry {
-                original,
-                retry: existing,
-            });
-        }
-    }
-    require_repeatable_tool_effects(batch, original, retry.acknowledge_repeated_effects)?;
-    let mut dependencies = retry.dependencies;
-    dependencies.sort_by_key(|(dependency, _)| *dependency);
-    if let Some(pair) = dependencies.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return batch.reject(Violation::DuplicateDependency(pair[0].0));
-    }
-    spec.name = retry.name.or(spec.name);
-    spec.eligible_at = retry.eligible_at;
-    spec.parent_id = (retry.parent.get() != 0).then_some(retry.parent);
-    spec.dependencies = dependencies;
-    spec.retry_of = Some(original);
-    spec.continues = None;
-    batch.t1_submit(None, spec)
 }
 
 /// T2 for one named Job: claims it into the first of `request.allowed_pools`
@@ -181,6 +163,7 @@ pub(crate) fn finalize_job(
     batch: &mut Batch,
     job: JobId,
     finalization: JobFinalization,
+    cause: Option<OutcomeCause>,
 ) -> OpResult<Option<AppendedOutput>> {
     let (kind, result) = match finalization {
         JobFinalization::Unknown => (OutcomeKind::Unknown, None),
@@ -188,7 +171,7 @@ pub(crate) fn finalize_job(
         JobFinalization::Failed(result) => (OutcomeKind::Failed, Some(result)),
         JobFinalization::Cancelled(result) => (OutcomeKind::Cancelled, Some(result)),
     };
-    let (_, appended) = batch.finalize(job, kind, None, result)?;
+    let (_, appended) = batch.finalize(job, kind, cause, result)?;
     Ok(appended.map(|seq| AppendedOutput {
         output: JobOutputId::new(u64::from(seq)),
         seq: i64::from(seq),
@@ -201,8 +184,8 @@ pub(crate) fn finalize_job(
 /// timeout, a cancel request, a disabled Pool or a restart is not such an
 /// observation. The unknown outcome stays as it is. The stop is local: it
 /// says nothing of an effect a tool call had outside OCG.
-pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId) -> OpResult<()> {
-    batch.confirm_stop(job)
+pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId, proof: StopProof) -> OpResult<()> {
+    batch.confirm_stop(job, proof)
 }
 
 // ---- tool calls -------------------------------------------------------------------------
@@ -325,43 +308,6 @@ pub(crate) fn reconcile_tool_effect(
         at: batch.now(),
     });
     batch.put_tool_evidence(&record)
-}
-
-/// Refuses a retry of `original` while a tool call of it, or of any Job it
-/// retries in turn through `retry_of`, that may change something outside OCG
-/// is unresolved, whatever the retry acknowledges; and a retry that could
-/// repeat a non-idempotent effect one of them is known to have had unless
-/// this retry acknowledges that. An earlier retry's acknowledgement is its
-/// own: a retry of a retry repeats the effects of the whole chain.
-pub(super) fn require_repeatable_tool_effects(
-    batch: &mut Batch,
-    original: JobId,
-    acknowledged: bool,
-) -> Result<(), BatchError> {
-    let mut unacknowledged = None;
-    let mut lineage = vec![original];
-    let mut cursor = original;
-    while let Some(earlier) = batch.require_job(cursor)?.retry_of {
-        lineage.push(earlier);
-        cursor = earlier;
-    }
-    for job in lineage {
-        for record in batch.job_tool_evidence(job)? {
-            let Some(effect) = record.admission().map(|admission| admission.effect) else {
-                continue;
-            };
-            if record.is_unresolved() && effect != ToolEffect::ReadOnly {
-                return batch.reject(Violation::UnresolvedToolEffect(record.call));
-            }
-            if record.is_applied() && effect == ToolEffect::NonIdempotent && !acknowledged {
-                unacknowledged.get_or_insert(record.call);
-            }
-        }
-    }
-    match unacknowledged {
-        Some(call) => batch.reject(Violation::RepeatedEffectNotAcknowledged(call)),
-        None => Ok(()),
-    }
 }
 
 /// Whether `version` can identify a handler's behavior: 1 to
@@ -622,19 +568,13 @@ pub(crate) fn update_project(
 
 // ---- conversations --------------------------------------------------------------------------
 
-/// The one place that decides which Jobs are conversations: a Job with Chat
-/// behavior that continues nothing.
+/// Conversation edits apply only to specs of kind Conversation.
 fn require_conversation(batch: &mut Batch, id: JobId) -> OpResult<()> {
     let row = match batch.job(id)? {
         Some(row) => row,
         None => return batch.reject(Violation::NotFound(RecordRef::Job(id))),
     };
-    let chat = row
-        .execution
-        .as_ref()
-        .and_then(|execution| execution.agent.as_ref())
-        .is_some_and(|agent| agent.behavior == AgentBehavior::Chat);
-    if chat && row.continues.is_none() {
+    if row.kind.is_conversation() {
         Ok(())
     } else {
         batch.reject(Violation::NotFound(RecordRef::Job(id)))
@@ -655,7 +595,8 @@ pub(crate) fn set_conversation(
         ConversationEdit::Hide if row.hidden_at.is_some() => return Ok(()),
         ConversationEdit::Hide => row.hidden_at = Some(batch.now()),
     }
-    batch.insert_conversation(root, &row)
+    batch.insert_conversation(root, &row)?;
+    batch.refresh_recent(root)
 }
 
 // ---- request events -------------------------------------------------------------------------
@@ -675,7 +616,7 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
         ));
     }
     if let Some(token) = metrics.token {
-        if job.execution.is_none() {
+        if job.kind.is_conversation() {
             return batch.reject(Violation::NotAnLlmExecution(metrics.job));
         }
         if token.eligibility == RequestEligibility::Excluded
@@ -744,7 +685,7 @@ pub(crate) fn record_availability_stat(
     stat: NewAvailabilityStat,
 ) -> OpResult<AvailabilityStatId> {
     let job = batch.require_job(stat.job)?;
-    if job.execution.is_none() {
+    if job.kind.is_conversation() {
         return batch.reject(Violation::NotAnLlmExecution(stat.job));
     }
     if stat.observation.is_empty() {

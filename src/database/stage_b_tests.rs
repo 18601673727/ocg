@@ -57,6 +57,7 @@ fn narrow_pool(database: &DatabaseHandle, name: &str) -> ExecutionPoolId {
 
 fn pending(database: &DatabaseHandle, llm: ProfileId) -> JobId {
     wait(database.create_job(NewJob {
+        process_grant: None,
         name: None,
         eligible_at: None,
         parent: database.genesis(),
@@ -135,7 +136,7 @@ fn consuming_claim_emits_neither_generation_unknown_release_and_recovery_are_dur
     // A process of the Job may be alive, so the slot is quarantined, not freed.
     assert_eq!(wait(database.occupancy()).unwrap(), vec![(pool, job)]);
     let unknown_generation = wake.capacity_generation();
-    wait(database.confirm_job_stopped(job)).unwrap();
+    wait(database.confirm_job_stopped(job, crate::persistence::StopProof::Proof)).unwrap();
     assert!(wake.capacity_generation() > unknown_generation);
     assert!(wait(database.occupancy()).unwrap().is_empty());
     let released = (wake.dirty_generation(), wake.capacity_generation());
@@ -158,7 +159,7 @@ fn stop_confirmation_distinguishes_unsettled_and_completed_jobs() {
     .unwrap()
     .unwrap();
     assert!(matches!(
-        wait(database.confirm_job_stopped(job)),
+        wait(database.confirm_job_stopped(job, crate::persistence::StopProof::Proof)),
         Err(DatabaseError::Rejected(Violation::StopNeedsOutcome(id))) if id == job
     ));
     wait(database.finalize_job(
@@ -172,7 +173,7 @@ fn stop_confirmation_distinguishes_unsettled_and_completed_jobs() {
     ))
     .unwrap();
     assert!(matches!(
-        wait(database.confirm_job_stopped(job)),
+        wait(database.confirm_job_stopped(job, crate::persistence::StopProof::Proof)),
         Err(DatabaseError::Rejected(Violation::StopNeedsUnknownOutcome(id))) if id == job
     ));
     worker.shutdown().unwrap();
@@ -394,6 +395,7 @@ fn local_job_with_a_spawning_call(
 ) -> JobId {
     let job = wait(database.create_claimed_fixture(
         NewJob {
+            process_grant: None,
             name: None,
             eligible_at: None,
             parent: database.genesis(),

@@ -24,7 +24,7 @@ const STARTUP_GRACE: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy)]
-pub(crate) enum Kind {
+pub enum Kind {
     Command,
     Cpu,
     File,
@@ -347,10 +347,7 @@ impl Process {
         self.group
     }
 
-    pub(crate) fn finish(
-        self,
-        stop_requested: impl Fn() -> bool,
-    ) -> Result<Finished, FinishError> {
+    pub(crate) fn finish(self, stop_requested: impl Fn() -> bool) -> Result<Finished, FinishError> {
         let mut term_sent = false;
         let mut deadline = None;
         let mut wait_error = None;
@@ -453,7 +450,7 @@ impl Process {
 
 /// Runs synchronous work on a dedicated worker so neither the ntex executor
 /// nor its blocking pool waits for a permit or filesystem operation.
-pub(crate) async fn run<T, F>(kind: Kind, work: F) -> Result<T, &'static str>
+pub async fn run<T, F>(kind: Kind, work: F) -> Result<T, &'static str>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
