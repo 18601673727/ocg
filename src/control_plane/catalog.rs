@@ -164,6 +164,38 @@ pub(super) fn entry_json(seq: u32, entry: &crate::persistence::TurnEntry) -> Val
     value["at_us"] = json!(entry.at.as_unix_micros());
     value
 }
+pub(super) async fn conversation_children(
+    database: &DatabaseHandle,
+    conversation: JobId,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Reply, Refusal> {
+    let row = database.job(conversation).await?.ok_or(JOB_NOT_FOUND)?;
+    if !row.kind.is_conversation() {
+        return Err(JOB_NOT_FOUND);
+    }
+    let records = database
+        .conversation_children(conversation, before, limit + 1)
+        .await?;
+    let has_more = records.len() > limit;
+    let mut children = Vec::new();
+    for record in records.iter().take(limit) {
+        let c = &record.conversation;
+        let recurrence = record.recurrence.as_ref().map(|row| {
+            use crate::persistence::RecurrencePhase;
+            let (phase, due) = match row.phase {
+                RecurrencePhase::Active => ("active", None),
+                RecurrencePhase::WaitingDue { due } => ("waiting_due", Some(due)),
+                RecurrencePhase::Halted { .. } => ("halted", None),
+            };
+            json!({"interval_s":row.interval_s, "phase":phase, "due_us":due})
+        });
+        children.push(json!({"id":c.root_job.to_string(), "title":c.title, "agent":c.agent.map(|id| ProfileId::from(id).to_string()), "state":c.state, "on_hold":c.on_hold.as_ref().map(|by| json!({"by":actor_json(by)})), "keep_open":record.keep_open, "recurrence":recurrence}));
+    }
+    Ok(Reply::ok(
+        json!({"api_version":API_VERSION,"conversation":conversation.to_string(),"children":children,"has_more":has_more,"next_before":if has_more { records.get(limit.saturating_sub(1)).map(|record| record.conversation.root_job.to_string()) } else { None }}),
+    ))
+}
 pub(super) async fn conversation_turns(
     database: &DatabaseHandle,
     conversation: JobId,

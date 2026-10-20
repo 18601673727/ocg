@@ -79,6 +79,7 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::Hold
         | OperationKind::Unhold
         | OperationKind::Retry
+        | OperationKind::ApplyJobTool
         | OperationKind::AssignJobExecutor
         | OperationKind::FinalizeJob
         | OperationKind::ConfirmJobStopped
@@ -93,7 +94,8 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         // Tool effects gate confirmed finalization and repeatable retries.
         | OperationKind::RecordToolOutcome
         | OperationKind::ReconcileToolEffect => true,
-        OperationKind::Open
+        OperationKind::BoundaryB
+        | OperationKind::Open
         | OperationKind::Append
         | OperationKind::ClaimExecution
         | OperationKind::SaveJobInput
@@ -137,6 +139,8 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::Hold
         | OperationKind::Unhold
         | OperationKind::Retry
+        | OperationKind::ApplyJobTool
+        | OperationKind::BoundaryB
         | OperationKind::AssignJobExecutor
         | OperationKind::CreateExecutor
         | OperationKind::CreateLlmProvider

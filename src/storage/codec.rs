@@ -86,6 +86,10 @@ impl Enc {
         }
         self.ou64(agent.default_model.map(ConfigId::get));
         self.ostr(&agent.tool_grant);
+        self.u32(agent.dispatch_to.len() as u32);
+        for agent in &agent.dispatch_to {
+            self.u64(agent.get());
+        }
     }
     pub(super) fn config_ref(&mut self, config: &ConfigRef) {
         self.u64(config.id.get());
@@ -267,12 +271,17 @@ impl<'a> Dec<'a> {
         }
         let default_model = self.ou64()?.map(ConfigId::new);
         let tool_grant = self.ostr()?;
+        let mut dispatch_to = Vec::new();
+        for _ in 0..self.u32()? {
+            dispatch_to.push(ConfigId::new(self.u64()?));
+        }
         Ok(AgentConfig {
             instructions,
             behavior,
             models,
             default_model,
             tool_grant,
+            dispatch_to,
         })
     }
     pub(super) fn config_ref(&mut self) -> DecodeResult<ConfigRef> {
@@ -472,8 +481,13 @@ impl Enc {
             NoticeEvent::Requested => self.u8(4),
             NoticeEvent::Stalled => self.u8(5),
             NoticeEvent::ObjectiveCompleted => self.u8(6),
-            NoticeEvent::MessageCompleted => self.u8(7),
-            NoticeEvent::AgentTurnCompleted => self.u8(8),
+            NoticeEvent::WaitersBlocked { waiting } => {
+                self.u8(7);
+                self.u32(waiting.len() as u32);
+                for conversation in waiting {
+                    self.u64(conversation.get());
+                }
+            }
             NoticeEvent::IterationCompleted => self.u8(9),
             NoticeEvent::RecurrenceHalted => self.u8(10),
         }
@@ -593,8 +607,13 @@ impl Dec<'_> {
             4 => NoticeEvent::Requested,
             5 => NoticeEvent::Stalled,
             6 => NoticeEvent::ObjectiveCompleted,
-            7 => NoticeEvent::MessageCompleted,
-            8 => NoticeEvent::AgentTurnCompleted,
+            7 => {
+                let mut waiting = Vec::new();
+                for _ in 0..self.u32()? {
+                    waiting.push(JobId::new(self.u64()?));
+                }
+                NoticeEvent::WaitersBlocked { waiting }
+            }
             9 => NoticeEvent::IterationCompleted,
             10 => NoticeEvent::RecurrenceHalted,
             _ => return Err(StorageError::corrupted("invalid notice event")),

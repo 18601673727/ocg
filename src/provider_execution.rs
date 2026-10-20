@@ -3558,6 +3558,7 @@ pub(crate) mod tests {
         let objective = objective_conversation(
             &FrozenExecutionConfig {
                 agent: Some(crate::persistence::AgentConfig {
+                    dispatch_to: Vec::new(),
                     instructions: Some("be brief".to_owned()),
                     ..Default::default()
                 }),

@@ -316,6 +316,8 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(TOOL_STATS)?;
     tx.open_table(USAGE_TOTALS)?;
     tx.open_table(RETRIES)?;
+    tx.open_table(RECURRENCES)?;
+    tx.open_table(RECURRENCE_DUE)?;
     tx.open_table(ATTACHMENT_REFS)?;
     tx.open_table(REQUEST_SCOPES)?;
     Ok(())
@@ -456,11 +458,41 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
         }
         let row = batch.require_job(job)?;
         batch.index_answer(&row, OutcomeKind::Unknown, false)?;
+        let unresolved = batch.step(|tx| {
+            let mut calls = Vec::new();
+            for entry in tx
+                .open_table(TOOL_CALLS)?
+                .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+            {
+                let (key, bytes) = entry?;
+                let record = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
+                if record
+                    .admission()
+                    .is_some_and(|admission| admission.handler_version.starts_with("job_"))
+                    && record.outcome.is_none()
+                    && record.reconciliation.is_none()
+                {
+                    calls.push(record);
+                }
+            }
+            Ok(calls)
+        })?;
+        for mut record in unresolved {
+            record.reconciliation = Some(crate::persistence::Recorded {
+                fact: crate::persistence::ToolReconciliation {
+                    conclusion: EffectConclusion::NotApplied,
+                    reconciler: "open".into(),
+                    evidence: "effect commits only with its outcome".into(),
+                    explanation: "the host stopped before the call's transaction".into(),
+                },
+                at: batch.now(),
+            });
+            batch.put_tool_evidence(&record)?;
+        }
         batch.settle(job)?;
         if abandoned.contains(&job) {
             batch.turn_ended(job)?;
         }
-        // K2 reconciles admitted job_* calls with no outcome as NotApplied here.
     }
     Ok(abandoned)
 }

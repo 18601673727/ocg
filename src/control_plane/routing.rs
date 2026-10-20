@@ -18,6 +18,11 @@ pub(super) enum Route {
     Logs(dashboard::LogQuery),
     Job(JobId),
     JobInput(JobId),
+    ConversationChildren {
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    },
     ConversationTurns {
         conversation: JobId,
         before: Option<JobId>,
@@ -94,6 +99,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Logs(_)
             | Route::Job(_)
             | Route::JobInput(_)
+            | Route::ConversationChildren { .. }
             | Route::ConversationTurns { .. }
             | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
@@ -222,6 +228,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::JobInput(job))
         }
+        ["conversations", conversation, "children"] => {
+            let conversation = job_id(conversation)?;
+            let (before, limit) = catalog::page_query(query, job_id)?;
+            Ok(Route::ConversationChildren {
+                conversation,
+                before,
+                limit,
+            })
+        }
         ["conversations", conversation, "turns"] => {
             let conversation = job_id(conversation)?;
             let (before, limit) = catalog::page_query(query, job_id)?;
@@ -345,6 +360,11 @@ pub(super) async fn respond(
             ))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
+        Route::ConversationChildren {
+            conversation,
+            before,
+            limit,
+        } => catalog::conversation_children(database, conversation, before, limit).await,
         Route::ConversationTurns {
             conversation,
             before,

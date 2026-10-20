@@ -11,6 +11,8 @@ import { ActivityPulse } from "../activity-pulse";
 import { useI18n, runtimeStatusDetail } from "../i18n";
 import type { ChatMessage, ChatSession, RuntimeStatus } from "../types";
 import { ModelSelector } from "./model-selector";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import type { ControlChildConversation } from "../contracts";
 import type { ChatModelSelection } from "../contracts";
 import type { QueuedChatMessage } from "../types";
 import { retryInput } from "./retry";
@@ -439,6 +441,7 @@ export function ChatView({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      <ConversationChildrenStrip key={session.sessionId} turn={session.sessionId} />
       <div className="relative flex min-h-0 flex-1 flex-col">
         <div ref={scrollRef} onScroll={() => {
           const el = scrollRef.current;
@@ -525,4 +528,78 @@ export function ChatView({
       />
     </div>
   );
+}
+
+export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen?: (conversation: string) => void }) {
+  const { control } = useOcgRuntime();
+  const { t } = useI18n();
+  const [children, setChildren] = useState<ControlChildConversation[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [pages, setPages] = useState(1);
+  const [revision, setRevision] = useState(0);
+  const [pending, setPending] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const lock = useRef(false);
+  useEffect(() => {
+    if (!control || !turn) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const record = await control.readJob(turn, controller.signal);
+        const conversation = record.kind === "conversation" ? record.id : record.conversation;
+        if (!conversation) return;
+        const items: ControlChildConversation[] = [];
+        let before: string | undefined;
+        let more = false;
+        for (let page = 0; page < pages; page++) {
+          const reply = await control.readChildren(conversation, before, 20, controller.signal);
+          items.push(...reply.children);
+          more = reply.has_more;
+          before = reply.next_before ?? undefined;
+          if (!more) break;
+        }
+        if (!controller.signal.aborted) { setChildren(items); setHasMore(more); setError(null); }
+      } catch (cause) {
+        if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        if (!controller.signal.aborted) timer = setTimeout(() => void refresh(), 2000);
+      }
+    };
+    void refresh();
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [control, turn, pages, revision]);
+
+  async function act(child: ControlChildConversation, action: "stop" | "close" | "hold" | "unhold") {
+    if (!control || lock.current) return;
+    lock.current = true;
+    setPending(child.id);
+    setError(null);
+    try {
+      if (action === "stop") await control.stopConversation(child.id);
+      else if (action === "close") await control.closeConversation(child.id);
+      else if (action === "hold") await control.holdConversation(child.id);
+      else await control.unholdConversation(child.id);
+      setRevision(value => value + 1);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
+    finally { lock.current = false; setPending(null); }
+  }
+  if (!control || (!children.length && !error)) return null;
+  return <section className="shrink-0 border-b border-border px-3 py-2" aria-label={t("chat.children")}>
+    <div className="flex max-h-40 gap-2 overflow-auto">
+      {children.map(child => <div key={child.id} className="min-w-56 rounded-md border border-border px-3 py-2 text-xs">
+        <p className="max-w-72 truncate font-medium" title={child.title}>{child.title || child.id}</p>
+        <p className="text-muted-foreground">{child.id} · {child.agent} · {t(`chat.child.${child.state}`)}{child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}</p>
+        {child.recurrence && <p className="text-muted-foreground">{t("chat.child.every", { seconds: child.recurrence.interval_s })} · {t(`chat.child.${child.recurrence.phase}`)}{child.recurrence.due_us !== null ? ` · ${new Date(child.recurrence.due_us / 1000).toLocaleString()}` : ""}</p>}
+        <div className="mt-1 flex gap-1">
+          {onOpen ? <Button size="xs" variant="ghost" onClick={() => onOpen(child.id)}>{t("common.open")}</Button> : <a className="px-2 py-1 underline" href={`/?job=${encodeURIComponent(child.id)}`}>{t("common.open")}</a>}
+          <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, "stop")}>{t("chat.child.stop")}</Button>
+          <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, "close")}>{t("common.close")}</Button>
+          <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, child.on_hold ? "unhold" : "hold")}>{t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")}</Button>
+        </div>
+      </div>)}
+      {hasMore && <Button size="sm" variant="ghost" onClick={() => setPages(value => value + 1)}>{t("chat.child.more")}</Button>}
+    </div>
+    {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+  </section>;
 }

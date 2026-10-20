@@ -639,6 +639,7 @@ mod grounding_tests {
         ))
         .expect("provider endpoint");
         let agent_body = AgentConfig {
+            dispatch_to: Vec::new(),
             instructions: Some("Agent instructions".into()),
             behavior: AgentBehavior::Chat,
             models: vec![configuration.llm_profile.into()],
@@ -768,6 +769,7 @@ mod grounding_tests {
                         None,
                     ),
                     &Cell::new(false),
+                    None,
                 )
                 .await
             })
@@ -778,6 +780,7 @@ mod grounding_tests {
                 NewConfig {
                     name: "chat".into(),
                     body: ConfigBody::Agent(AgentConfig {
+                        dispatch_to: Vec::new(),
                         tool_grant: if index == 0 {
                             Some("read".into())
                         } else {
@@ -811,6 +814,7 @@ mod grounding_tests {
         let agent = wait(handle.create_config(NewConfig {
             name: "chat".into(),
             body: ConfigBody::Agent(AgentConfig {
+                dispatch_to: Vec::new(),
                 behavior: AgentBehavior::Chat,
                 models: vec![configuration.llm_profile.into()],
                 tool_grant: Some("read".into()),
@@ -864,6 +868,7 @@ mod grounding_tests {
                     None,
                 ),
                 &Cell::new(false),
+                None,
             )
             .await
         })
@@ -930,6 +935,7 @@ mod grounding_tests {
             ("code", "read, edit and run commands"),
         ] {
             let agent_body = AgentConfig {
+                dispatch_to: Vec::new(),
                 instructions: Some("Agent instructions".into()),
                 behavior: AgentBehavior::Chat,
                 models: vec![configuration.llm_profile.into()],
@@ -1023,6 +1029,7 @@ mod grounding_tests {
                         None,
                     ),
                     &Cell::new(false),
+                    None,
                 )
                 .await
             })
@@ -1097,11 +1104,12 @@ pub struct SchedulerHandle {
     state: SharedState,
 }
 
-impl SchedulerHandle {
-    #[cfg(test)]
-    pub(crate) fn running_count(&self) -> usize {
-        lock(&self.state).current.len()
-    }
+#[derive(Clone)]
+pub(crate) struct StopHandle {
+    notifications: flume::Sender<SchedulerMessage>,
+    state: SharedState,
+}
+impl StopHandle {
     pub fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
         let mut state = lock(&self.state);
         let stopped = state.stops.entry(turn).or_default();
@@ -1111,6 +1119,20 @@ impl SchedulerHandle {
         }
         drop(state);
         self.notifications.send(SchedulerMessage::Stop(turn)).ok();
+    }
+}
+
+impl SchedulerHandle {
+    #[cfg(test)]
+    pub(crate) fn running_count(&self) -> usize {
+        lock(&self.state).current.len()
+    }
+    pub fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
+        StopHandle {
+            notifications: self.notifications.clone(),
+            state: self.state.clone(),
+        }
+        .stop(turn, cause);
     }
 
     /// Creates a pending Job through T1 and returns after that commit. Its
@@ -1626,7 +1648,14 @@ async fn dispatch_runtime(
                 // Admission and claim requests share this task so a committed
                 // grant cannot overtake registration of its execution context.
                 let claimed = if scope == ClaimScope::Stored {
-                    database.claim_batch().await
+                    async {
+                        let clock = crate::storage::promotion_clock();
+                        if database.recurrence_due(clock).await? {
+                            database.boundary_b(clock).await?;
+                        }
+                        database.claim_batch().await
+                    }
+                    .await
                 } else {
                     let mut grants = Vec::new();
                     let mut failure = None;
@@ -1978,6 +2007,10 @@ fn spawn_grant(
             execution.cancellation.cancel();
         }
     }
+    let scheduler = StopHandle {
+        notifications: sender.clone(),
+        state: state.clone(),
+    };
     let state = state.clone();
     let task = ntex::rt::spawn(async move {
         let _notify = notify;
@@ -2087,6 +2120,7 @@ fn spawn_grant(
                             plan,
                             (started, offered),
                             &tool_may_have_run,
+                            Some(scheduler),
                         )
                         .await
                     }
@@ -2612,8 +2646,9 @@ pub(crate) fn fit_conversation(
 async fn run_started_provider_job(
     database: DatabaseHandle,
     mut plan: ProviderTask,
-    (started, mut offered): (StartedJob, Option<Vec<ToolWire>>),
+    (started, _offered): (StartedJob, Option<Vec<ToolWire>>),
     tool_may_have_run: &Cell<bool>,
+    scheduler: Option<StopHandle>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let StartedJob {
         executor,
@@ -2684,16 +2719,28 @@ async fn run_started_provider_job(
         if grant.is_some() {
             return refused(ExecutionRuntimeError::WorkspaceGrantUnsupported.to_string()).await;
         }
-        offered = match plan
-            .tools
+    }
+    if job_record.kind.is_stored()
+        && configuration
+            .frozen
+            .agent
             .as_ref()
-            .map(|tools| tools.offer.wires())
-            .transpose()
-        {
-            Ok(offered) => offered,
+            .is_some_and(|agent| !agent.dispatch_to.is_empty())
+    {
+        plan.tools = match super::job_tools::add(plan.tools.take()) {
+            Ok(tools) => Some(tools),
             Err(error) => return refused(error.to_string()).await,
         };
     }
+    let offered = match plan
+        .tools
+        .as_ref()
+        .map(|tools| tools.offer.wires())
+        .transpose()
+    {
+        Ok(offered) => offered,
+        Err(error) => return refused(error.to_string()).await,
+    };
     let Some(input_record) = database.job_input(input).await? else {
         return refused("submitted Job input disappeared".to_owned()).await;
     };
@@ -2812,6 +2859,7 @@ async fn run_started_provider_job(
     let config = &plan.provider_config;
     run_provider_job_inner(
         ProviderRun {
+            scheduler,
             database,
             executor,
             input,
@@ -3062,6 +3110,7 @@ pub async fn attachment_images(
 
 /// The Job a provider execution settles.
 pub(crate) struct ProviderRun {
+    pub(crate) scheduler: Option<StopHandle>,
     pub(crate) database: DatabaseHandle,
     pub(crate) executor: ExecutorId,
     pub(crate) input: JobInputId,
@@ -3216,6 +3265,7 @@ async fn run_provider_job_inner(
         let answered = match (tools, next) {
             (Some(tools), Some(_)) => {
                 let site = CallSite {
+                    scheduler: run.scheduler.as_ref(),
                     database: &run.database,
                     job: run.job,
                     request: sink.request,
@@ -3302,6 +3352,7 @@ struct CallSite<'a> {
     database: &'a DatabaseHandle,
     job: JobId,
     request: RequestNumber,
+    scheduler: Option<&'a StopHandle>,
 }
 
 impl CallSite<'_> {
@@ -3506,6 +3557,100 @@ async fn answer_calls(
         // is first polled, leaves its outcome uncertain.
         if cancellation.is_cancelled() {
             return Err(cancelled_before_invocation(site, reference).await);
+        }
+        if dispatch.version.starts_with("job_") {
+            let parsed = serde_json::from_value::<super::job_tools::JobToolCall>(
+                serde_json::json!({"name":call.name,"arguments":dispatch.arguments}),
+            );
+            let applied = match parsed {
+                Ok(tool) => site.database.apply_job_tool(reference, tool).await,
+                Err(_) => Ok(
+                    serde_json::json!({"refused":"invalid_arguments","reason":"job tool arguments do not match its schema"}),
+                ),
+            };
+            let result = match applied {
+                Ok(result) => result,
+                Err(DatabaseError::Rejected(violation))
+                    if !matches!(
+                        violation,
+                        Violation::NotExecutingLocally(_)
+                            | Violation::ToolOutcomeAlreadyRecorded(_)
+                            | Violation::ToolCallNotFound(_)
+                            | Violation::ToolCallNotAdmitted(_)
+                    ) =>
+                {
+                    let code = match &violation {
+                        Violation::InvalidValue(code, _) => *code,
+                        Violation::ParentClosed(_) => "parent_closed",
+                        Violation::ToolsNotSupported => "tools_not_supported",
+                        Violation::ProjectRequired => "project_required",
+                        _ => "job_tool_refused",
+                    };
+                    serde_json::json!({"refused":code,"reason":violation.to_string()})
+                }
+                Err(error) => {
+                    return Err(Stopped {
+                        stop: ToolLoopStop::EvidenceNotRecorded {
+                            index,
+                            outcome: None,
+                        },
+                        evidence: Some(error),
+                    });
+                }
+            };
+            if result.get("refused").is_some() {
+                if let Err(error) = site
+                    .database
+                    .record_tool_outcome(
+                        reference,
+                        ToolOutcome::Completed {
+                            result: ToolPayload::new(result.to_string()),
+                        },
+                    )
+                    .await
+                {
+                    return Err(Stopped {
+                        stop: ToolLoopStop::EvidenceNotRecorded {
+                            index,
+                            outcome: None,
+                        },
+                        evidence: Some(error),
+                    });
+                }
+            } else if let Some(scheduler) = site.scheduler
+                && let Some(running) = result.get("running").and_then(serde_json::Value::as_array)
+            {
+                for turn in running {
+                    if let Some(id) = turn
+                        .as_str()
+                        .and_then(|id| id.strip_prefix("job:"))
+                        .and_then(|id| id.parse::<u64>().ok())
+                    {
+                        let cause = if call.name == "job_close" {
+                            crate::persistence::StopCause::Closed
+                        } else {
+                            let Some(record) = result
+                                .get("record_seq")
+                                .and_then(serde_json::Value::as_u64)
+                                .and_then(|record| u32::try_from(record).ok())
+                            else {
+                                continue;
+                            };
+                            crate::persistence::StopCause::Stopped(record)
+                        };
+                        scheduler.stop(JobId::new(id), cause);
+                    }
+                }
+            }
+            let answer = result.to_string();
+            let total = budget.result_bytes.saturating_add(answer.len());
+            if answer.len() > limits.max_tool_result_bytes || total > limits.max_tool_results_bytes
+            {
+                return Err(ToolLoopStop::ResultTooLarge { index }.into());
+            }
+            budget.result_bytes = total;
+            answers.push(answer);
+            continue;
         }
         tool_may_have_run.set(true);
         let handler = dispatch.handler;
@@ -4386,6 +4531,7 @@ mod failure_tests {
                 };
                 run_provider_job(
                     ProviderRun {
+                        scheduler: None,
                         database: handle,
                         executor,
                         input: JobInputId::new(job.get()),
@@ -4987,6 +5133,166 @@ mod failure_tests {
         assert_eq!(receiver.len(), 64);
         assert!(wait(database.jobs(None, 100)).expect("jobs").is_empty());
         worker.shutdown().expect("shutdown");
+    }
+    #[test]
+    fn admitted_dispatch_crash_reopens_not_applied_without_a_child() {
+        use crate::persistence::{
+            AgentConfig, ConfigBody, ConversationSpec, Entry, ModelCapability, NewConfig, Origin,
+        };
+        use crate::test_support::on_system;
+        let (_root, directory) = data_directory("dispatcher-errors", "dispatch-crash");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let pool = executor(&database);
+        let mut configuration = execution_configuration(&database);
+        let record = wait(database.config(configuration.llm_profile.into()))
+            .unwrap()
+            .unwrap();
+        let ConfigBody::Model(mut model) = record.body else {
+            panic!("model");
+        };
+        model.declared_capabilities.insert(ModelCapability::Tools);
+        let endpoint = "https://dispatch-crash.invalid/v1";
+        wait(database.update_config(
+            model.connection_id,
+            NewConfig {
+                name: "crash provider".into(),
+                body: ConfigBody::Connection(crate::persistence::ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(endpoint.into()),
+                    credential_ref: None,
+                }),
+            },
+        ))
+        .unwrap();
+        wait(database.update_config(
+            record.id,
+            NewConfig {
+                name: "tool model".into(),
+                body: ConfigBody::Model(model),
+            },
+        ))
+        .unwrap();
+        let target = wait(database.create_config(NewConfig {
+            name: "target".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                models: vec![configuration.llm_profile.into()],
+                default_model: Some(configuration.llm_profile.into()),
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        let dispatcher = wait(database.create_config(NewConfig {
+            name: "dispatcher".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                models: vec![configuration.llm_profile.into()],
+                dispatch_to: vec![target],
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        configuration.agent_profile = Some(dispatcher.into());
+        let (conversation, appended) = wait(database.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: Some(dispatcher),
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            Entry::UserMessage {
+                text: "dispatch".into(),
+                attachments: vec![],
+            },
+            configuration,
+            None,
+        ))
+        .unwrap();
+        wait(database.claim_fixture(appended.turn, pool)).unwrap();
+        let chunk = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"dispatch","type":"function","function":{"name":"job_dispatch","arguments":serde_json::json!({"agent":crate::persistence::ProfileId::from(target).to_string(),"objective":"child"}).to_string()}}]},"finish_reason":"tool_calls"}]})
+        );
+        let chunk: &'static str = Box::leak(chunk.into_boxed_str());
+        provider_seam::install(endpoint, move |request| {
+            assert!(
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.function.name == "job_dispatch")
+            );
+            provider_seam::Response {
+                gate: None,
+                steps: vec![crate::provider_execution::scripted::Step::Chunk(chunk)],
+            }
+        });
+        let run_database = database.clone();
+        on_system(move || async move {
+            struct Crash<F>(Pin<Box<F>>);
+            impl<F: Future> Future for Crash<F> {
+                type Output = bool;
+                fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<bool> {
+                    match catch_unwind(AssertUnwindSafe(|| self.0.as_mut().poll(context))) {
+                        Ok(Poll::Pending) => Poll::Pending,
+                        Ok(Poll::Ready(_)) => Poll::Ready(false),
+                        Err(_) => Poll::Ready(true),
+                    }
+                }
+            }
+            dispatch_seam::install(move |point, call| {
+                if call.job == appended.turn && point == dispatch_seam::Point::Admitted {
+                    panic!("host crash at admitted dispatch");
+                }
+            });
+            let possible_effect = Cell::new(false);
+            let crashed = Crash(Box::pin(run_started_provider_job(
+                run_database,
+                ProviderTask {
+                    workspace_tools: None,
+                    credential_resolver: Arc::new(EnvironmentCredentialResolver),
+                    provider_config: ProviderExecutionConfig::default(),
+                    tools: None,
+                },
+                (
+                    StartedJob {
+                        job: appended.turn,
+                        input: JobInputId::new(appended.turn.get()),
+                        executor: pool,
+                    },
+                    None,
+                ),
+                &possible_effect,
+                None,
+            )))
+            .await;
+            assert!(crashed);
+        });
+        let evidence = wait(database.tool_evidence(appended.turn, None, 10)).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert!(evidence[0].outcome.is_none());
+        assert!(
+            wait(database.conversation_children(conversation, None, 10))
+                .unwrap()
+                .is_empty()
+        );
+        worker.shutdown().unwrap();
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let database = worker.handle();
+        let evidence = wait(database.tool_evidence(appended.turn, None, 10)).unwrap();
+        let reconciliation = &evidence[0].reconciliation.as_ref().unwrap().fact;
+        assert_eq!(
+            reconciliation.conclusion,
+            crate::persistence::EffectConclusion::NotApplied
+        );
+        assert_eq!(reconciliation.reconciler, "open");
+        assert!(!evidence[0].is_unresolved());
+        assert!(
+            wait(database.conversation_children(conversation, None, 10))
+                .unwrap()
+                .is_empty()
+        );
+        worker.shutdown().unwrap();
     }
 }
 

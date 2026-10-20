@@ -119,6 +119,7 @@ export type CreateSessionInput = {
 export interface OcgRuntimeClient {
   /** The runtime that answers Chat for this client. Never inferred from a scenario name. */
   readonly authority: RuntimeAuthority;
+  isListedConversation?(sessionId: string): boolean;
   openConversation?(job: string): Promise<string>;
   refreshConversations?(): Promise<void>;
   setChatSelection?(sessionId: string, selection: import("../contracts").ChatModelSelection): void;

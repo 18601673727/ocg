@@ -92,7 +92,6 @@ pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
         "name": record.name,
         "title": record.objective.as_deref(),
         "is_chat": is_chat,
-        // Every Job runs once; recurrence is not part of this format.
         "execution_mode": "once",
         "input": record.input.to_string(),
         "previous": record.previous.map(|previous| previous.to_string()),

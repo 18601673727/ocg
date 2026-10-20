@@ -557,6 +557,7 @@ pub struct AgentConfig {
     pub behavior: AgentBehavior,
     pub models: Vec<ConfigId>,
     pub default_model: Option<ConfigId>,
+    pub dispatch_to: Vec<ConfigId>,
     pub tool_grant: Option<String>,
 }
 
@@ -567,6 +568,7 @@ impl Default for AgentConfig {
             behavior: AgentBehavior::General,
             models: Vec::new(),
             default_model: None,
+            dispatch_to: Vec::new(),
             tool_grant: None,
         }
     }

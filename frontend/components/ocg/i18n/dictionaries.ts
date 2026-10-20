@@ -8,6 +8,23 @@ import type { Locale } from "./locale";
  * plural forms (`one` / `other`) since Chinese does not pluralize.
  */
 export const en = {
+  "chat.children": "Child conversations",
+  "chat.child.open": "Open",
+  "chat.child.closing": "Closing",
+  "chat.child.settled": "Settled",
+  "chat.child.hold.user": "Held by you",
+  "chat.child.hold.agent": "Held by Agent",
+  "chat.child.hold.loop": "Loop paused",
+  "chat.child.hold.auto": "Held",
+  "chat.child.every": "Every {seconds}s",
+  "chat.child.active": "Running iteration",
+  "chat.child.waiting_due": "Waiting",
+  "chat.child.halted": "Halted",
+  "chat.child.stop": "Stop",
+  "chat.child.hold": "Hold",
+  "chat.child.unhold": "Unhold",
+  "chat.child.more": "More",
+
   "chat.openInJobs": "Open in Jobs",
   "chat.agent": "Agent",
   "chat.executor": "Executor",
@@ -1451,6 +1468,23 @@ export type I18nKey = keyof typeof en;
 export type Dictionary = Record<I18nKey, string>;
 
 export const zh: Dictionary = {
+  "chat.children": "子对话",
+  "chat.child.open": "开放",
+  "chat.child.closing": "关闭中",
+  "chat.child.settled": "已结束",
+  "chat.child.hold.user": "由你暂停",
+  "chat.child.hold.agent": "由代理暂停",
+  "chat.child.hold.loop": "循环已暂停",
+  "chat.child.hold.auto": "已暂停",
+  "chat.child.every": "每 {seconds} 秒",
+  "chat.child.active": "迭代执行中",
+  "chat.child.waiting_due": "等待下次",
+  "chat.child.halted": "已停止",
+  "chat.child.stop": "停止",
+  "chat.child.hold": "暂停",
+  "chat.child.unhold": "继续",
+  "chat.child.more": "更多",
+
   "chat.openInJobs": "在 Jobs 中打开",
   "chat.agent": "智能体",
   "chat.executor": "执行器",

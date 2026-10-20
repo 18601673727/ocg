@@ -228,6 +228,7 @@ fn agent_profile(
     wait(handle.create_config(NewConfig {
         name: "assistant".into(),
         body: ConfigBody::Agent(AgentConfig {
+            dispatch_to: Vec::new(),
             instructions: Some(instructions.into()),
             behavior: AgentBehavior::Chat,
             models: llm_targets.into_iter().map(Into::into).collect(),
@@ -632,10 +633,7 @@ fn job_creation_refuses_missing_endpoints_without_partial_writes() {
                 dependencies: vec![(missing_job, DependencyCondition::Success)],
                 ..new_job(&handle, "waits", genesis)
             },
-            Violation::InvalidValue(
-                "dependencies",
-                "K1 supports only the previous turn dependency",
-            ),
+            Violation::NotFound(RecordRef::Job(missing_job)),
         ),
     ];
     for (job, expected) in attempts {
@@ -5402,6 +5400,7 @@ mod requests_and_tool_loop {
             let mut sent = Vec::new();
             let settled = run_provider_job(
                 ProviderRun {
+                    scheduler: None,
                     database: handle,
                     executor: run.executor,
                     input: run.input,
@@ -10243,6 +10242,7 @@ mod requests_and_tool_loop {
                 let mut sent = Vec::new();
                 let settled = run_provider_job(
                     ProviderRun {
+                        scheduler: None,
                         database: handle,
                         executor: run.executor,
                         input: run.input,
@@ -14999,6 +14999,7 @@ mod requests_and_tool_loop {
                 let mut respond = Some(respond);
                 let settled = run_provider_job(
                     ProviderRun {
+                        scheduler: None,
                         database: handle,
                         executor: run.executor,
                         input: run.input,
@@ -15486,6 +15487,7 @@ mod requests_and_tool_loop {
                 let mut steps = Some(steps);
                 run_provider_job(
                     ProviderRun {
+                        scheduler: None,
                         database: handle,
                         executor: run.executor,
                         input: run.input,
@@ -15524,7 +15526,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 20);
+            assert_eq!(crate::storage::FORMAT_VERSION, 21);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");
@@ -17031,6 +17033,7 @@ mod requests_and_tool_loop {
             let (registry, _calls) = echo_registry(ToolEffect::NonIdempotent, json!({"ok": true}));
 
             let provider_run = ProviderRun {
+                scheduler: None,
                 database: handle.clone(),
                 executor: run.executor,
                 input: run.input,

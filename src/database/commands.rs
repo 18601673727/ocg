@@ -109,6 +109,15 @@ pub(super) enum Command {
         submission: NewSubmission,
         reply: Reply<JobId>,
     },
+    ApplyJobTool {
+        call: ToolCallRef,
+        tool: crate::orchestration::job_tools::JobToolCall,
+        reply: Reply<serde_json::Value>,
+    },
+    BoundaryB {
+        clock: i64,
+        reply: Reply<()>,
+    },
     Open {
         parent: Option<JobId>,
         spec: ConversationSpec,
@@ -378,6 +387,22 @@ impl Command {
                 reply,
                 |batch| persistence::create_submitted_job(batch, job, submission),
             ),
+            Self::ApplyJobTool { call, tool, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::ApplyJobTool,
+                reply,
+                |batch| batch.apply_job_tool(call, tool),
+            ),
+            Self::BoundaryB { clock, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::BoundaryB,
+                reply,
+                |batch| batch.boundary_b(clock),
+            ),
             Self::Open {
                 parent,
                 spec,
@@ -386,7 +411,7 @@ impl Command {
                 submission,
                 reply,
             } => run(database, operation, commit, Kind::Open, reply, |batch| {
-                batch.open_conversation(parent, spec, first, configuration, submission)
+                batch.open_conversation(parent, spec, first, configuration, submission, Vec::new())
             }),
             Self::Append {
                 conversation,
@@ -620,7 +645,10 @@ impl Command {
             Self::ClaimExecution { request, .. } => {
                 byte_count(request.allowed_pools.len()).saturating_mul(8)
             }
-            Self::ClaimBatch { .. } => 4096,
+            Self::ClaimBatch { .. } | Self::BoundaryB { .. } => 4096,
+            Self::ApplyJobTool { tool, .. } => {
+                byte_count(format!("{tool:?}").len()).saturating_add(4096)
+            }
             Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
             Self::SetExecutionPoolEnabled { .. } | Self::UpdateExecutionPool { .. } => 64,
             Self::CreateJob { job, .. }
@@ -670,7 +698,11 @@ impl Command {
             Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {
                 byte_count(config.name.len()).saturating_add(match &config.body {
                     ConfigBody::Agent(agent) => text_bytes(&agent.instructions)
-                        .saturating_add(text_bytes(&agent.tool_grant)),
+                        .saturating_add(text_bytes(&agent.tool_grant))
+                        .saturating_add(
+                            byte_count(agent.models.len().saturating_add(agent.dispatch_to.len()))
+                                .saturating_mul(8),
+                        ),
                     ConfigBody::Model(model) => byte_count(model.model.len()),
                     ConfigBody::Connection(connection) => text_bytes(&connection.endpoint)
                         .saturating_add(text_bytes(&connection.credential_ref)),
@@ -732,6 +764,8 @@ impl Command {
             Self::CreateClaimedFixture { reply, .. } => refuse(reply, error),
             Self::ClaimExecution { reply, .. } => refuse(reply, error),
             Self::ClaimBatch { reply, .. } => refuse(reply, error),
+            Self::ApplyJobTool { reply, .. } => refuse(reply, error),
+            Self::BoundaryB { reply, .. } => refuse(reply, error),
             Self::CreateExecutionPool { reply, .. } => refuse(reply, error),
             Self::SetExecutionPoolEnabled { reply, .. }
             | Self::UpdateExecutionPool { reply, .. } => refuse(reply, error),

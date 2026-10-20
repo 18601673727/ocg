@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { decodeAdmission, decodeConversationTurns, decodeConversations, decodeStop } from "../components/ocg/contracts/control-plane";
+import { decodeChildren, decodeAdmission, decodeConversationTurns, decodeConversations, decodeStop } from "../components/ocg/contracts/control-plane";
 
 const admission = decodeAdmission({ api_version: 1, admission: { status: "admitted", job: "job:3", conversation: "job:1", seq: 2, joined: true, model: "frozen", kept: false } });
 assert.equal(admission.conversation, "job:1");
@@ -12,4 +12,10 @@ const list = decodeConversations({ api_version: 1, conversations: [{ root_job: "
 assert.equal(list.conversations[0].on_hold?.by.kind, "user");
 assert.equal(list.conversations[0].state, "open");
 assert.throws(() => decodeConversationTurns({ api_version: 1, conversation: "job:2", turns: [], has_more: false, next_before: null }, "job:1"));
-console.log("conversation contract: 1 test passed");
+const children = decodeChildren({ api_version: 1, conversation: "job:1", children: [{ id: "job:4", title: "Recurring child", agent: "profile:2", state: "open", on_hold: { by: { kind: "loop" } }, keep_open: true, recurrence: { interval_s: 60, phase: "waiting_due", due_us: 123 } }], has_more: true, next_before: "job:4" }, "job:1");
+assert.equal(children.children[0].recurrence?.interval_s, 60);
+assert.equal(children.children[0].on_hold?.by.kind, "loop");
+assert.equal(children.next_before, "job:4");
+assert.throws(() => decodeChildren({ api_version: 1, conversation: "job:2", children: [], has_more: false, next_before: null }, "job:1"));
+assert.throws(() => decodeChildren({ api_version: 1, conversation: "job:1", children: [{ ...children.children[0], recurrence: { interval_s: 1, phase: "active", due_us: null } }], has_more: false, next_before: null }, "job:1"));
+console.log("conversation contract: 2 tests passed");

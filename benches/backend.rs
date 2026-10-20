@@ -2039,6 +2039,7 @@ fn observability(options: &Options) -> Result<()> {
             let agent = block_on(handle.create_config(NewConfig {
                 name: "benchmark agent".into(),
                 body: ConfigBody::Agent(AgentConfig {
+                    dispatch_to: Vec::new(),
                     instructions: Some("benchmark".into()),
                     behavior: AgentBehavior::General,
                     models: vec![target.configuration.llm_profile.into()],

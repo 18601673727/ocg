@@ -361,6 +361,15 @@ impl Batch {
                 self.require_config_kind(model.connection_id, ConfigKind::Connection)?;
             }
             ConfigBody::Agent(agent) => {
+                if agent.dispatch_to.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return self.reject(Violation::InvalidValue(
+                        "dispatch_to",
+                        "must be sorted and unique",
+                    ));
+                }
+                for target in &agent.dispatch_to {
+                    self.require_config_kind(*target, ConfigKind::Agent)?;
+                }
                 for model in &agent.models {
                     self.require_config_kind(*model, ConfigKind::Model)?;
                 }

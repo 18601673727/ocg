@@ -85,6 +85,7 @@ impl Batch {
         first: Entry,
         configuration: ExecutionConfiguration,
         submission: Option<NewSubmission>,
+        dependencies: Vec<(JobId, DependencyCondition)>,
     ) -> Result<(JobId, Appended), BatchError> {
         if let Some(parent) = parent {
             let parent_row = self.require_job(parent)?;
@@ -167,6 +168,7 @@ impl Batch {
             submission,
             false,
             spec.name,
+            dependencies,
         )?;
         Ok((conversation, appended))
     }
@@ -228,7 +230,8 @@ impl Batch {
             }
         }
         let at = self.now;
-        self.step(|tx| {
+        let (seq, first_user) = self.step(|tx| {
+            let mut first_user = false;
             let mut table = tx.open_table(TURN_INPUTS)?;
             let seq = table
                 .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
@@ -254,20 +257,45 @@ impl Batch {
                         let mut user = tx.open_table(USER_ENTRY_AT)?;
                         if user.get(conversation.get())?.is_none() {
                             user.insert(conversation.get(), at.as_unix_micros())?;
+                            first_user = true;
                         }
                     }
                 }
-                Entry::RetryOf { turn: original, .. } => {
-                    tx.open_table(RETRIES)?
-                        .insert((original.get(), turn.get()), ())?;
+                Entry::RetryOf { turn: original, by } => {
+                    tx.open_table(RETRIES)?.insert(
+                        (original.get(), turn.get()),
+                        matches!(by, Actor::Agent { .. }),
+                    )?;
                 }
                 Entry::AgentMessage { .. }
                 | Entry::Notice { .. }
                 | Entry::Decision { .. }
                 | Entry::Iteration { .. } => {}
             }
-            Ok(seq)
-        })
+            Ok((seq, first_user))
+        })?;
+        if first_user && let Some(conversation) = row.parent_id {
+            let waiting = self.step(|tx| {
+                let jobs = tx.open_table(JOBS)?;
+                let mut waiting = BTreeSet::new();
+                for entry in tx
+                    .open_table(DEPENDENCY_WAITERS)?
+                    .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                {
+                    let waiter = JobId::new(entry?.0.value().1);
+                    if let Some(bytes) = jobs.get(waiter.get())?
+                        && let Some(parent) = JobRow::decode(bytes.value())?.parent_id
+                    {
+                        waiting.insert(parent);
+                    }
+                }
+                Ok(waiting.into_iter().collect::<Vec<_>>())
+            })?;
+            if !waiting.is_empty() {
+                self.notify(conversation, NoticeEvent::WaitersBlocked { waiting }, turn)?;
+            }
+        }
+        Ok(seq)
     }
     pub(crate) fn append(
         &mut self,
@@ -277,7 +305,15 @@ impl Batch {
         submission: Option<NewSubmission>,
         event: bool,
     ) -> Result<Appended, BatchError> {
-        self.append_named(conversation, entry, freeze, submission, event, None)
+        self.append_named(
+            conversation,
+            entry,
+            freeze,
+            submission,
+            event,
+            None,
+            Vec::new(),
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn append_named(
@@ -288,6 +324,7 @@ impl Batch {
         submission: Option<NewSubmission>,
         event: bool,
         name: Option<String>,
+        dependencies: Vec<(JobId, DependencyCondition)>,
     ) -> Result<Appended, BatchError> {
         if let Some(submission) = &submission
             && let Some(existing) = self.submission(submission.key)?
@@ -338,13 +375,12 @@ impl Batch {
         } else {
             let execution = match freeze {
                 Some(configuration) => {
-                    let frozen = self.freeze_configuration(configuration)?;
-                    if frozen
-                        .agent
-                        .as_ref()
-                        .is_some_and(|agent| agent.tool_grant.is_some())
-                    {
-                        if !frozen
+                    let frozen = (|| {
+                        let frozen = self.freeze_configuration(configuration)?;
+                        let agent = frozen.agent.as_ref();
+                        if agent.is_some_and(|agent| {
+                            agent.tool_grant.is_some() || !agent.dispatch_to.is_empty()
+                        }) && !frozen
                             .llm
                             .config
                             .declared_capabilities
@@ -352,10 +388,20 @@ impl Batch {
                         {
                             return self.reject(Violation::ToolsNotSupported);
                         }
-                        if matches!(row.kind, JobKind::Conversation { project: None, .. }) {
+                        if agent.is_some_and(|agent| agent.tool_grant.is_some())
+                            && matches!(row.kind, JobKind::Conversation { project: None, .. })
+                        {
                             return self.reject(Violation::ProjectRequired);
                         }
-                    }
+                        Ok(frozen)
+                    })();
+                    let frozen = match frozen {
+                        Err(BatchError(Failure::Rejected(_))) if event => {
+                            self.failed = None;
+                            return self.attention_fallback(conversation, entry);
+                        }
+                        result => result?,
+                    };
                     TurnExecution::Frozen(frozen)
                 }
                 None => {
@@ -393,7 +439,7 @@ impl Batch {
                 },
                 objective: None,
                 attachments: Vec::new(),
-                dependencies: Vec::new(),
+                dependencies,
                 previous: tip,
                 submission: None,
             };
@@ -416,7 +462,21 @@ impl Batch {
             self.event_append = false;
             submitted?
         };
+        let user_message = matches!(entry, Entry::UserMessage { .. });
+        let attention = event && matches!(entry, Entry::Notice { .. });
         let seq = self.insert_turn_input(turn, entry)?;
+        if user_message {
+            let mut row = self.conversation(conversation)?;
+            if row.loop_count != 0 {
+                row.loop_count = 0;
+                self.insert_conversation(conversation, &row)?;
+            }
+            if self.loop_held(conversation)? {
+                self.hold(conversation, Actor::User, true)?;
+            }
+        } else if attention {
+            self.loop_hold_if_needed(conversation)?;
+        }
         if let Some(submission) = submission {
             let record = SubmissionRecord {
                 key: submission.key,
@@ -572,7 +632,8 @@ impl Batch {
             } else {
                 self.insert_conversation(*current, &row)?;
             }
-            // K2 halts recurrences here; K3 voids undecided approvals and questions here.
+            self.halt_recurrence(*current, RecurrenceHalt::Closed)?;
+            // K3 voids undecided approvals and questions here.
         }
         for current in subtree.into_iter().rev() {
             self.settle(current)?;
@@ -689,7 +750,26 @@ impl Batch {
                 "not a turn of this conversation",
             ));
         }
-        // K3 refuses an approved call without a definite outcome; K2 bounds agent retries.
+        // K3 refuses an approved call without a definite outcome;
+        if matches!(by, Actor::Agent { .. })
+            && self.step(|tx| {
+                let mut count = 0;
+                for row in tx
+                    .open_table(RETRIES)?
+                    .range((turn.get(), 0)..=(turn.get(), u64::MAX))?
+                {
+                    if row?.1.value() {
+                        count += 1;
+                    }
+                }
+                Ok(count >= 2)
+            })?
+        {
+            return self.reject(Violation::InvalidValue(
+                "retry_limit",
+                "at most two agent retries per original turn",
+            ));
+        }
         self.append(conversation, Entry::RetryOf { turn, by }, None, None, false)
     }
     pub(crate) fn auto_close_check(&mut self, conversation: JobId) -> Result<bool, BatchError> {
@@ -874,6 +954,7 @@ mod tests {
             let agent = wait(self.database.create_config(crate::persistence::NewConfig {
                 name: "child Agent".into(),
                 body: crate::persistence::ConfigBody::Agent(AgentConfig {
+                    dispatch_to: Vec::new(),
                     models: vec![self.configuration.llm_profile.into()],
                     ..Default::default()
                 }),
@@ -1673,6 +1754,7 @@ mod tests {
                 .create_config(crate::persistence::NewConfig {
                     name: "system Agent".into(),
                     body: crate::persistence::ConfigBody::Agent(AgentConfig {
+                        dispatch_to: Vec::new(),
                         models: vec![fixture.configuration.llm_profile.into()],
                         ..Default::default()
                     }),
@@ -1906,8 +1988,7 @@ mod tests {
             NoticeEvent::Requested,
             NoticeEvent::Stalled,
             NoticeEvent::ObjectiveCompleted,
-            NoticeEvent::MessageCompleted,
-            NoticeEvent::AgentTurnCompleted,
+            NoticeEvent::WaitersBlocked { waiting: vec![job] },
             NoticeEvent::IterationCompleted,
             NoticeEvent::RecurrenceHalted,
             NoticeEvent::TurnEnded {
@@ -2037,5 +2118,515 @@ mod tests {
             [queued.turn]
         );
         fixture.worker.shutdown().expect("shutdown");
+    }
+    impl Fixture {
+        fn dispatch_parent(&self) -> (JobId, JobId, ConfigId) {
+            use crate::persistence::{ConfigBody, NewConfig};
+            let mut model = wait(self.database.config(self.configuration.llm_profile.into()))
+                .unwrap()
+                .unwrap();
+            if let ConfigBody::Model(body) = &mut model.body {
+                body.declared_capabilities.insert(ModelCapability::Tools);
+            }
+            wait(self.database.update_config(
+                model.id,
+                NewConfig {
+                    name: model.name,
+                    body: model.body,
+                },
+            ))
+            .unwrap();
+            let target = wait(self.database.create_config(NewConfig {
+                name: "dispatch target".into(),
+                body: ConfigBody::Agent(AgentConfig {
+                    models: vec![self.configuration.llm_profile.into()],
+                    default_model: Some(self.configuration.llm_profile.into()),
+                    ..Default::default()
+                }),
+            }))
+            .unwrap();
+            let agent = wait(self.database.create_config(NewConfig {
+                name: "dispatcher".into(),
+                body: ConfigBody::Agent(AgentConfig {
+                    dispatch_to: vec![target],
+                    models: vec![self.configuration.llm_profile.into()],
+                    ..Default::default()
+                }),
+            }))
+            .unwrap();
+            let (parent, appended) = wait(self.database.open_conversation(
+                None,
+                ConversationSpec {
+                    name: None,
+                    agent: Some(agent),
+                    project: None,
+                    origin: Origin::User,
+                    keep_open: true,
+                },
+                message("dispatch"),
+                ExecutionConfiguration {
+                    agent_profile: Some(agent.into()),
+                    ..self.configuration
+                },
+                None,
+            ))
+            .unwrap();
+            self.claim_observed(appended.turn);
+            (parent, appended.turn, target)
+        }
+        fn claim_observed(&self, turn: JobId) {
+            self.claim(turn);
+            wait(
+                self.database
+                    .record_metrics(crate::persistence::NewMetrics {
+                        job: turn,
+                        request: RequestNumber::FIRST,
+                        measurements: Default::default(),
+                        token: Some(crate::token_usage::TokenAnnotation::eligible(
+                            crate::token_usage::UsageFinality::Cumulative,
+                        )),
+                        observed_at: Timestamp::now(),
+                    }),
+            )
+            .unwrap();
+        }
+        fn admit(
+            &self,
+            turn: JobId,
+            index: u32,
+            tool: &crate::orchestration::job_tools::JobToolCall,
+        ) -> ToolCallRef {
+            use crate::persistence::*;
+            let call = ToolCallRef {
+                job: turn,
+                request: RequestNumber::FIRST,
+                index,
+            };
+            wait(self.database.record_tool_decision(NewToolEvidence {
+                call,
+                tool_call_id: format!("call-{index}"),
+                name: tool.name().into(),
+                decision: ToolDecision::Admitted(ToolAdmission {
+                    handler_version: format!("{}-1", tool.name()),
+                    effect: ToolEffect::NonIdempotent,
+                    parameters: "{}".into(),
+                    arguments: ToolPayload::new("{}"),
+                    authorization: AuthorizationBasis::RegistryGrant,
+                }),
+                spawns: false,
+            }))
+            .unwrap();
+            call
+        }
+        fn apply(
+            &self,
+            turn: JobId,
+            index: u32,
+            tool: crate::orchestration::job_tools::JobToolCall,
+        ) -> serde_json::Value {
+            let call = self.admit(turn, index, &tool);
+            wait(self.database.apply_job_tool(call, tool)).unwrap()
+        }
+        fn dispatch(
+            &self,
+            turn: JobId,
+            index: u32,
+            agent: ConfigId,
+            keep_open: bool,
+            every_seconds: Option<u32>,
+            depends_on: Vec<crate::orchestration::job_tools::JobDependency>,
+        ) -> (JobId, JobId) {
+            let value = self.apply(
+                turn,
+                index,
+                crate::orchestration::job_tools::JobToolCall::JobDispatch {
+                    agent: ProfileId::from(agent).to_string(),
+                    project: None,
+                    objective: "objective".into(),
+                    keep_open,
+                    every_seconds,
+                    depends_on,
+                },
+            );
+            (
+                JobId::new(
+                    value["conversation"].as_str().unwrap()[4..]
+                        .parse()
+                        .unwrap(),
+                ),
+                JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap()),
+            )
+        }
+        fn complete_claimed(&self, turn: JobId) {
+            wait(self.database.finalize_job(
+                turn,
+                crate::persistence::JobFinalization::Completed(result("done")),
+            ))
+            .unwrap();
+        }
+        fn recurrence(&self, conversation: JobId) -> Recurrence {
+            wait(self.database.with_database(move |database| {
+                let rx = database.begin_read()?;
+                Recurrence::decode(
+                    rx.open_table(RECURRENCES)?
+                        .get(conversation.get())?
+                        .unwrap()
+                        .value(),
+                )
+            }))
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn dispatch_tools_refuse_self_and_stop_a_running_child_atomically() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("dispatch-rights");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let tool = JobToolCall::JobStop {
+            conversation: parent.to_string(),
+        };
+        let call = fixture.admit(turn, 0, &tool);
+        let refusal = wait(fixture.database.apply_job_tool(call, tool)).unwrap_err();
+        assert!(
+            matches!(refusal, crate::database::DatabaseError::Rejected(crate::persistence::Violation::InvalidValue("rights", reason)) if !reason.is_empty())
+        );
+        wait(fixture.database.record_tool_outcome(
+            call,
+            crate::persistence::ToolOutcome::Completed {
+                result: crate::persistence::ToolPayload::new(
+                    "{\"refused\":\"rights\",\"reason\":\"strict subtree required\"}",
+                ),
+            },
+        ))
+        .unwrap();
+        let (child, child_turn) = fixture.dispatch(turn, 1, agent, true, None, vec![]);
+        fixture.claim(child_turn);
+        let stopped = fixture.apply(
+            turn,
+            2,
+            JobToolCall::JobStop {
+                conversation: child.to_string(),
+            },
+        );
+        assert_eq!(
+            stopped["running"],
+            serde_json::json!([child_turn.to_string()])
+        );
+        let record = stopped["record_seq"].as_u64().unwrap() as u32;
+        wait(
+            fixture
+                .database
+                .with_stop_cause(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                    crate::persistence::StopCause::Stopped(record),
+                ))))
+                .finalize_job(
+                    child_turn,
+                    crate::persistence::JobFinalization::Cancelled(result("stopped")),
+                ),
+        )
+        .unwrap();
+        assert_eq!(
+            wait(fixture.database.job(child_turn))
+                .unwrap()
+                .unwrap()
+                .outcome
+                .unwrap()
+                .cause,
+            Some(crate::persistence::OutcomeCause::Stopped { record })
+        );
+        assert!(
+            wait(fixture.database.tool_evidence(turn, None, 100))
+                .unwrap()
+                .iter()
+                .all(|call| call.outcome.is_some())
+        );
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn dispatched_sibling_dependency_waits_for_auto_close_and_user_entry_names_waiters() {
+        use crate::orchestration::job_tools::JobDependency;
+        let fixture = Fixture::new("dispatch-dependency");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let (child, child_turn) = fixture.dispatch(turn, 0, agent, false, None, vec![]);
+        let (waiter, waiter_turn) = fixture.dispatch(
+            turn,
+            1,
+            agent,
+            false,
+            None,
+            vec![JobDependency {
+                conversation: child.to_string(),
+                condition: "settled".into(),
+            }],
+        );
+        let grants = wait(fixture.database.claim_batch()).unwrap();
+        assert!(grants.contains(&child_turn));
+        assert!(!grants.contains(&waiter_turn));
+        fixture.complete_claimed(child_turn);
+        assert!(
+            wait(fixture.database.job(child))
+                .unwrap()
+                .unwrap()
+                .settled()
+        );
+        assert!(
+            wait(fixture.database.claim_batch())
+                .unwrap()
+                .contains(&waiter_turn)
+        );
+        let (blocked, _) = fixture.dispatch(turn, 2, agent, false, None, vec![]);
+        let (waiting, _) = fixture.dispatch(
+            turn,
+            3,
+            agent,
+            false,
+            None,
+            vec![JobDependency {
+                conversation: blocked.to_string(),
+                condition: "success".into(),
+            }],
+        );
+        wait(
+            fixture
+                .database
+                .append(blocked, message("use release"), None, None),
+        )
+        .unwrap();
+        let parent_turns = wait(fixture.database.conversation_turns(parent, None, 10)).unwrap();
+        assert!(parent_turns.into_iter().any(|turn| wait(fixture.database.turn_entries(turn.id)).unwrap().iter().any(|(_, entry)| matches!(&entry.entry, Entry::Notice { event: NoticeEvent::WaitersBlocked { waiting: ids }, .. } if ids == &vec![waiting]))));
+        assert_eq!(
+            wait(fixture.database.job(waiter))
+                .unwrap()
+                .unwrap()
+                .parent_id,
+            Some(parent)
+        );
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn agent_messages_wake_the_parent_but_user_messages_in_a_child_do_not() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("dispatch-messages");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let (child, first) = fixture.dispatch(turn, 0, agent, true, None, vec![]);
+        fixture.finish(first, OutcomeKind::Completed);
+        let answer = fixture.apply(
+            turn,
+            1,
+            JobToolCall::JobMessage {
+                conversation: child.to_string(),
+                text: "continue".into(),
+            },
+        );
+        let next = JobId::new(answer["turn"].as_str().unwrap()[4..].parse().unwrap());
+        fixture.finish(next, OutcomeKind::Completed);
+        let pending = wait(fixture.database.conversation_turns(parent, None, 1)).unwrap()[0].id;
+        let before = wait(fixture.database.turn_entries(pending)).unwrap().len();
+        let user = wait(
+            fixture
+                .database
+                .append(child, message("use --release"), None, None),
+        )
+        .unwrap();
+        fixture.finish(user.turn, OutcomeKind::Completed);
+        assert_eq!(
+            wait(fixture.database.turn_entries(pending)).unwrap().len(),
+            before
+        );
+        assert!(
+            wait(fixture.database.job(child))
+                .unwrap()
+                .unwrap()
+                .children_closed_at
+                .is_none()
+        );
+        assert!(wait(fixture.database.turn_entries(pending)).unwrap().iter().any(|(_, entry)| matches!(entry.entry, Entry::Notice { reference, .. } if reference == next)));
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn attention_actions_hold_at_eight_while_children_run_and_user_lifts_it() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("dispatch-loop");
+        let (parent, first, agent) = fixture.dispatch_parent();
+        let (child, child_first) = fixture.dispatch(first, 0, agent, true, None, vec![]);
+        let (_, other) = fixture.dispatch(first, 1, agent, true, None, vec![]);
+        fixture.claim(other);
+        fixture.complete_claimed(first);
+        fixture.finish(child_first, OutcomeKind::Completed);
+        for _ in 0..8 {
+            let current = wait(fixture.database.conversation_turns(parent, None, 1)).unwrap()[0].id;
+            fixture.claim_observed(current);
+            let value = fixture.apply(
+                current,
+                0,
+                JobToolCall::JobMessage {
+                    conversation: child.to_string(),
+                    text: "next round".into(),
+                },
+            );
+            fixture.complete_claimed(current);
+            let next = JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap());
+            fixture.finish(next, OutcomeKind::Completed);
+        }
+        let parent_row = wait(fixture.database.conversations(None, 20))
+            .unwrap()
+            .conversations
+            .into_iter()
+            .find(|row| row.root_job == parent)
+            .unwrap();
+        assert_eq!(parent_row.on_hold, Some(Actor::Loop));
+        assert!(wait(fixture.database.claim_batch()).unwrap().is_empty());
+        assert!(
+            wait(fixture.database.job(other))
+                .unwrap()
+                .unwrap()
+                .outcome
+                .is_none()
+        );
+        let joined = wait(
+            fixture
+                .database
+                .append(parent, message("continue please"), None, None),
+        )
+        .unwrap();
+        assert!(joined.joined);
+        assert!(
+            wait(fixture.database.claim_batch())
+                .unwrap()
+                .contains(&joined.turn)
+        );
+        assert_eq!(
+            wait(fixture.database.conversations(None, 20))
+                .unwrap()
+                .conversations
+                .into_iter()
+                .find(|row| row.root_job == parent)
+                .unwrap()
+                .on_hold,
+            None
+        );
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recurrence_continues_after_failure_uses_bounded_context_and_halts_on_close_or_model_removal()
+    {
+        let fixture = Fixture::new("dispatch-recurrence");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let (child, first) = fixture.dispatch(turn, 0, agent, false, Some(60), vec![]);
+        fixture.finish(first, OutcomeKind::Completed);
+        for n in 2..=3 {
+            let due = match fixture.recurrence(child).phase {
+                RecurrencePhase::WaitingDue { due } => due,
+                phase => panic!("expected due: {phase:?}"),
+            };
+            assert!(
+                wait(fixture.database.next_scheduled_delay())
+                    .unwrap()
+                    .unwrap()
+                    .as_secs()
+                    <= 60
+            );
+            wait(fixture.database.boundary_b(due + 1)).unwrap();
+            let recurrence = fixture.recurrence(child);
+            assert_eq!(recurrence.n, n);
+            assert_eq!(recurrence.phase, RecurrencePhase::Active);
+            let context = wait(
+                fixture
+                    .database
+                    .read_turn_context(recurrence.current_turn, 10000),
+            )
+            .unwrap();
+            assert!(context.turns.len() <= 3);
+            assert!(context.turns[0].text.contains("objective"));
+            fixture.finish(
+                recurrence.current_turn,
+                if n == 2 {
+                    OutcomeKind::Failed
+                } else {
+                    OutcomeKind::Completed
+                },
+            );
+        }
+        wait(fixture.database.close(child, Actor::User)).unwrap();
+        assert_eq!(
+            fixture.recurrence(child).phase,
+            RecurrencePhase::Halted {
+                reason: RecurrenceHalt::Closed
+            }
+        );
+        wait(fixture.database.boundary_b(i64::MAX)).unwrap();
+        assert_eq!(fixture.recurrence(child).n, 3);
+        let (unavailable, first) = fixture.dispatch(turn, 1, agent, true, Some(60), vec![]);
+        fixture.finish(first, OutcomeKind::Completed);
+        wait(fixture.database.update_config(
+            agent,
+            crate::persistence::NewConfig {
+                name: "no models".into(),
+                body: crate::persistence::ConfigBody::Agent(AgentConfig::default()),
+            },
+        ))
+        .unwrap();
+        wait(fixture.database.boundary_b(i64::MAX)).unwrap();
+        wait(fixture.database.boundary_b(i64::MAX)).unwrap();
+        assert_eq!(
+            fixture.recurrence(unavailable).phase,
+            RecurrencePhase::Halted {
+                reason: RecurrenceHalt::ConfigUnavailable
+            }
+        );
+        let rows = wait(fixture.database.conversation_turns(parent, None, 10)).unwrap();
+        let notices = rows.into_iter().flat_map(|row| wait(fixture.database.turn_entries(row.id)).unwrap()).filter(|(_, entry)| matches!(entry.entry, Entry::Notice { child, event: NoticeEvent::RecurrenceHalted, .. } if child == unavailable)).count();
+        assert_eq!(notices, 1);
+        wait(fixture.database.with_database(|database| {
+            assert!(derived::relationship_inconsistencies(database)?.is_empty());
+            Ok(())
+        }))
+        .unwrap();
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn agent_cannot_unhold_user_hold_and_retry_is_bounded() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("dispatch-hold");
+        let (_, turn, agent) = fixture.dispatch_parent();
+        let (child, first) = fixture.dispatch(turn, 0, agent, true, None, vec![]);
+        wait(fixture.database.hold(child, Actor::User)).unwrap();
+        let tool = JobToolCall::JobUnhold {
+            conversation: child.to_string(),
+        };
+        let call = fixture.admit(turn, 1, &tool);
+        assert!(
+            matches!(wait(fixture.database.apply_job_tool(call, tool)), Err(crate::database::DatabaseError::Rejected(crate::persistence::Violation::InvalidValue("hold", reason))) if !reason.is_empty())
+        );
+        wait(fixture.database.unhold(child, Actor::User)).unwrap();
+        fixture.finish(first, OutcomeKind::Failed);
+        for index in 2..4 {
+            let value = fixture.apply(
+                turn,
+                index,
+                JobToolCall::JobRetry {
+                    turn: first.to_string(),
+                },
+            );
+            let retry = JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap());
+            fixture.finish(retry, OutcomeKind::Failed);
+        }
+        let tool = JobToolCall::JobRetry {
+            turn: first.to_string(),
+        };
+        let call = fixture.admit(turn, 4, &tool);
+        assert!(matches!(
+            wait(fixture.database.apply_job_tool(call, tool)),
+            Err(crate::database::DatabaseError::Rejected(
+                crate::persistence::Violation::InvalidValue("retry_limit", _)
+            ))
+        ));
+        fixture.worker.shutdown().unwrap();
     }
 }

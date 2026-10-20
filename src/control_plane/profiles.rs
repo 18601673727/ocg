@@ -205,6 +205,10 @@ enum WireProfileRequest {
         tool_grant: Option<String>,
         #[serde(default)]
         llm_targets: Vec<String>,
+        #[serde(default)]
+        dispatch_to: Vec<String>,
+        #[serde(default)]
+        default_model: Option<String>,
     },
 }
 
@@ -466,6 +470,8 @@ async fn build_profiles_snapshot(
                     "name": record.name,
                     "instructions": agent.instructions,
                     "tool_grant": agent.tool_grant,
+                    "dispatch_to": agent.dispatch_to.iter().map(|id| ProfileId::from(*id).to_string()).collect::<Vec<_>>(),
+                    "default_model": agent.default_model.map(|id| ProfileId::from(id).to_string()),
                     "behavior": match agent.behavior {
                         AgentBehavior::Chat => "chat",
                         AgentBehavior::General => "general",
@@ -728,6 +734,8 @@ pub(super) async fn save_profile(
             behavior,
             tool_grant,
             llm_targets,
+            dispatch_to,
+            default_model,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
@@ -777,13 +785,53 @@ pub(super) async fn save_profile(
                 }
             }
             parsed_targets.sort();
+            let invalid_dispatch = Refusal::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_dispatch_to",
+                "dispatch_to must name unique Agent Profiles",
+            );
+            let mut parsed_dispatch = Vec::new();
+            for raw in dispatch_to {
+                let id = profile_id(&raw)
+                    .map(ConfigId::from)
+                    .map_err(|_| invalid_dispatch)?;
+                if parsed_dispatch.contains(&id)
+                    || !matches!(
+                        database.config(id).await?,
+                        Some(ConfigRecord {
+                            body: ConfigBody::Agent(_),
+                            ..
+                        })
+                    )
+                {
+                    return Err(invalid_dispatch);
+                }
+                parsed_dispatch.push(id);
+            }
+            parsed_dispatch.sort();
+            let invalid_default = Refusal::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_default_model",
+                "default_model must be one of llm_targets",
+            );
+            let default_model = default_model
+                .map(|raw| {
+                    profile_id(&raw)
+                        .map(ConfigId::from)
+                        .map_err(|_| invalid_default)
+                })
+                .transpose()?;
+            if default_model.is_some_and(|id| !parsed_targets.contains(&id)) {
+                return Err(invalid_default);
+            }
             NewConfig {
                 name: name.trim().to_owned(),
                 body: ConfigBody::Agent(AgentConfig {
                     instructions: normalized_instructions,
                     behavior,
                     models: parsed_targets,
-                    default_model: None,
+                    default_model,
+                    dispatch_to: parsed_dispatch,
                     tool_grant,
                 }),
             }
@@ -824,6 +872,32 @@ mod tests {
     use crate::database::DatabaseWorker;
     use crate::persistence::{ExecutionConfiguration, JobInputDraft, NewJob};
     use crate::test_support::data_directory;
+
+    #[test]
+    fn agent_dispatch_and_default_model_round_trip_and_reject_a_model_target() {
+        ntex::rt::System::new("dispatch-profiles", ntex::rt::DefaultRuntime).block_on(async {
+            let (_root, directory) = data_directory("profiles", "dispatch");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let database = worker.handle();
+            let model = save_profile(&database, None, &serde_json::to_vec(&json!({"kind":"llm","name":"model","model":"m","declared_capabilities":["chat","tools"]})).unwrap()).await.unwrap();
+            let model = model.body["profile_id"].as_str().unwrap();
+            let target = save_profile(&database, None, &serde_json::to_vec(&json!({"kind":"agent","name":"target","llm_targets":[model],"default_model":model})).unwrap()).await.unwrap();
+            let target = target.body["profile_id"].as_str().unwrap();
+            let mut body = json!({"kind":"agent","name":"dispatcher","llm_targets":[model],"dispatch_to":[target],"default_model":model});
+            let reply = save_profile(&database, None, &serde_json::to_vec(&body).unwrap()).await.unwrap();
+            let agent = reply.body["agent_profiles"].as_array().unwrap().iter().find(|agent| agent["id"] == reply.body["profile_id"]).unwrap();
+            assert_eq!(agent["dispatch_to"], json!([target]));
+            assert_eq!(agent["default_model"], model);
+            body["dispatch_to"] = json!([model]);
+            assert!(matches!(save_profile(&database, None, &serde_json::to_vec(&body).unwrap()).await, Err(refusal) if refusal.code == "invalid_dispatch_to"));
+            body["dispatch_to"] = json!([target]);
+            body["default_model"] = json!(target);
+            assert!(matches!(save_profile(&database, None, &serde_json::to_vec(&body).unwrap()).await, Err(refusal) if refusal.code == "invalid_default_model"));
+            let model_id: ConfigId = profile_id(model).unwrap().into();
+            assert!(matches!(database.create_config(NewConfig { name: "invalid dispatcher".into(), body: ConfigBody::Agent(AgentConfig { dispatch_to: vec![model_id], ..Default::default() }) }).await, Err(DatabaseError::Rejected(Violation::WrongConfigKind { expected: ConfigKind::Agent, .. }))));
+            worker.shutdown().unwrap();
+        });
+    }
 
     #[test]
     fn profile_crud_computes_providers_redacts_secrets_and_edits_leave_frozen_jobs_alone() {

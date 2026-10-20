@@ -6,6 +6,7 @@ import {
   decodeControlError,
   decodeConversationEdit,
   decodeConversations,
+  decodeChildren,
   decodeHealth,
   decodeJobs,
   decodeUsage,
@@ -129,6 +130,8 @@ export type ControlProfileWriteRequest =
       behavior?: "chat" | "general" | null;
       tool_grant?: "read" | "edit" | "code" | null;
       llm_targets: string[];
+      dispatch_to?: string[];
+      default_model?: string | null;
     };
 
 export type ControlSubmissionResult = {
@@ -491,6 +494,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
       const answer = await send("GET", `/api/v1/conversations/${conversation}/turns${query}`, { signal });
       return decodeConversationTurns(answer.input, conversation);
+    },
+
+    async readChildren(conversation: string, before?: string, limit = 20, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      if (before) jobIdentity(before);
+      const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
+      return decodeChildren((await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal })).input, conversation);
+    },
+    async holdConversation(conversation: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      return decodeStop((await send("POST", `/api/v1/conversations/${conversation}/hold`, { body: {}, sign: true, signal })).input, conversation);
+    },
+    async unholdConversation(conversation: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      return decodeStop((await send("POST", `/api/v1/conversations/${conversation}/unhold`, { body: {}, sign: true, signal })).input, conversation);
     },
 
     async retryConversation(conversation: string, turn: string, signal?: AbortSignal) {

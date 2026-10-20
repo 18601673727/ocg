@@ -66,6 +66,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         if (this.hiddenRoots.has(item.root_job)) continue;
         const id = this.roots.get(item.root_job) ?? item.root_job;
         this.roots.set(item.root_job, id);
+        this.unlisted.delete(id);
         const current = this.getSnapshot().sessions.find(session => session.id === id);
         // A stale list read must not roll an admitted local successor backwards.
         const known = this.tips.get(id);
@@ -156,6 +157,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return { id: attachment.id, name: attachment.display_name ?? request.name, media_type: attachment.mime, url: this.control.attachmentContentUrl(attachment.id) };
   }
 
+  isListedConversation(sessionId: string): boolean { return !this.unlisted.has(sessionId); }
+
   openConversation(job: string): Promise<string> {
     const existing = this.loading.get(job);
     if (existing) return existing;
@@ -165,7 +168,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async readConversation(job: string): Promise<string> {
-    await this.refresh?.catch(() => {});
+    await this.refreshConversations().catch(() => {});
     const record = await this.control.readJob(job, this.lifetime.signal);
     const root = record.kind === "conversation" ? record.id : record.conversation;
     if (!root) throw new Error("This Job is a process turn with no conversation.");
@@ -173,7 +176,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const conversation = { ...page, turns: [...page.turns].reverse() };
     const hiddenBefore = this.hiddenRoots.has(root);
     const id = this.roots.get(root) ?? root;
-    if (!this.roots.has(root)) this.roots.set(root, id);
+    if (!this.roots.has(root)) { this.unlisted.add(id); this.roots.set(root, id); }
     job = conversation.turns.at(-1)?.job.id ?? job;
     if (!this.getSnapshot().sessions.some(session => session.id === id)) {
       this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0]?.input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
@@ -213,7 +216,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.disposed || !this.getSnapshot().sessions.some(session => session.id === sessionId)) return;
     const turns = [...this.turns.values()].filter(turn => turn.sessionId === sessionId).sort((a, b) => a.job.created_at_us - b.job.created_at_us || Number(a.job.id.slice(4)) - Number(b.job.id.slice(4)));
     const messages: ChatMessage[] = turns.flatMap(turn => {
-      const users: ChatMessage[] = (turn.entries ?? []).filter(entry => entry.kind === "user_message").map(entry => ({ id: `${turn.job.id}:entry:${entry.seq}`, jobId: turn.job.id, commandId: turn.job.id, role: "user", content: entry.text ?? "", status: "completed", createdAt: new Date(entry.at_us / 1000).toISOString(), images: entry.attachments.flatMap(id => this.images.get(id) ?? []) }));
+      const users: ChatMessage[] = (turn.entries ?? []).filter(entry => entry.kind === "user_message" || entry.kind === "agent_message").map(entry => ({ id: `${turn.job.id}:entry:${entry.seq}`, jobId: turn.job.id, commandId: turn.job.id, role: "user", content: entry.text ?? "", status: "completed", createdAt: new Date(entry.at_us / 1000).toISOString(), images: entry.attachments.flatMap(id => this.images.get(id) ?? []) }));
       return [...users, ...jobTranscript(turn.job.id, turn.entries ? null : turn.input.objective, turn.outputs, turn.job.settlement, turn.job.settlement.state === "unsettled").map(message => ({
       id: message.id, jobId: turn.job.id, commandId: turn.job.id, role: message.role, content: message.content,
       status: message.status,

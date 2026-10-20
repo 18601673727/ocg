@@ -159,8 +159,7 @@ pub enum NoticeEvent {
     Requested,
     Stalled,
     ObjectiveCompleted,
-    MessageCompleted,
-    AgentTurnCompleted,
+    WaitersBlocked { waiting: Vec<JobId> },
     IterationCompleted,
     RecurrenceHalted,
 }
@@ -193,4 +192,25 @@ pub struct ConversationAction {
 pub enum StopCause {
     Stopped(u32),
     Closed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecurrencePhase {
+    Active,
+    WaitingDue { due: i64 },
+    Halted { reason: RecurrenceHalt },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecurrenceHalt {
+    Closed,
+    ConfigUnavailable,
+    Refused,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recurrence {
+    pub phase: RecurrencePhase,
+    pub n: u64,
+    pub current_turn: JobId,
+    pub previous_turn: Option<JobId>,
+    pub interval_s: u32,
 }

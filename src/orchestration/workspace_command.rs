@@ -85,7 +85,7 @@ use rustix::io::Errno;
 #[cfg(test)]
 use rustix::process::Pid;
 
-use crate::orchestration::blocking::{self, FinishError, Finished, Kind, Process, StopSignal};
+use crate::orchestration::blocking::{FinishError, Finished, Kind, Process, StopSignal};
 use crate::orchestration::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, ToolStart,
@@ -101,12 +101,13 @@ pub const TOOL_NAME: &str = "workspace_run_command";
 const HANDLER_VERSION: &str = "workspace_run_command-6";
 
 /// Longest a command may run before it is stopped.
-pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+pub use super::job_tools::COMMAND_TIMEOUT;
 
 /// How long a stopped command is given to be reaped before the call returns
 /// without it, and how much longer than its command the tool loop gives a
 /// call, so the command's own limit stops it first.
-const STOP_GRACE: Duration = blocking::STOP_GRACE;
+#[cfg(test)]
+const STOP_GRACE: Duration = crate::orchestration::blocking::STOP_GRACE;
 
 /// The most output, of stdout and stderr together, a result carries.
 pub const OUTPUT_BYTES: usize = 12 * 1024;
@@ -962,10 +963,7 @@ pub(crate) fn register(
 /// editing and testing, with every call given as long as a command may run
 /// and a little more, so a command is stopped by its own limit first.
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
-    ToolLoopLimits {
-        handler_timeout: timeout.saturating_add(STOP_GRACE),
-        ..ToolLoopLimits::default()
-    }
+    super::job_tools::coding_limits(timeout)
 }
 
 /// The grant authorized on a Workspace.

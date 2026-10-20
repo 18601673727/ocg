@@ -3,7 +3,7 @@ use super::*;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
-pub(crate) const FORMAT_VERSION: u32 = 20;
+pub(crate) const FORMAT_VERSION: u32 = 21;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;
@@ -69,9 +69,13 @@ pub(crate) type UsageTotalKey = (i64, u64, u64, [u8; 32]);
 pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) const USAGE_TOTALS: TableDefinition<UsageTotalKey, UsageTotalValue> =
     TableDefinition::new("usage_total");
-pub(super) const RETRIES: TableDefinition<(u64, u64), ()> = TableDefinition::new("retry");
+pub(super) const RETRIES: TableDefinition<(u64, u64), bool> = TableDefinition::new("retry");
 pub(super) const ATTACHMENT_REFS: TableDefinition<(u64, u64), ()> =
     TableDefinition::new("attachment_ref");
 type RequestScopeKey = (u64, [u8; 32], i64, u64, u32, u32);
 pub(super) const REQUEST_SCOPES: TableDefinition<RequestScopeKey, ()> =
     TableDefinition::new("request_scope");
+
+pub(super) const RECURRENCES: TableDefinition<u64, &[u8]> = TableDefinition::new("recurrence");
+pub(super) const RECURRENCE_DUE: TableDefinition<(i64, u64), ()> =
+    TableDefinition::new("recurrence_due");

@@ -4,13 +4,12 @@ use super::codec::{TAG_NOTICE, TAG_TURN_INPUT};
 use super::*;
 use crate::openai_compatible::ChatFinishReason;
 use crate::persistence::{
-    AgentBehavior, AgentConfig, AttachmentCleanup, AttachmentId, AttachmentOrigin,
-    AttachmentRecord, AuthorizationBasis, ClaimRecord, CleanupKind, ConfigBody, ConfigId,
-    ConfigKind, ConnectionConfig, ContentDigest, DependencyCondition, EffectConclusion,
-    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, LlmParameters, LlmTransport,
-    Measurements, ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause, OutcomeKind,
-    OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord, Recorded,
-    RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
+    AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
+    ClaimRecord, CleanupKind, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, ContentDigest,
+    DependencyCondition, EffectConclusion, ExecutionOperation, JobId, JobOutputId, JobOutputRecord,
+    LlmParameters, LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason,
+    OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord,
+    Recorded, RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
     SubmissionRecord, SuspensionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
     ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
     WithheldReason,
@@ -47,10 +46,10 @@ pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u64 {
 
 impl JobRow {
     pub(crate) fn waits_on(&self) -> impl Iterator<Item = (JobId, DependencyCondition)> + '_ {
-        self.previous
-            .map(|previous| (previous, DependencyCondition::Settled))
-            .into_iter()
-            .chain(self.dependencies.iter().copied())
+        self.dependencies.iter().copied().chain(
+            self.previous
+                .map(|previous| (previous, DependencyCondition::Settled)),
+        )
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
@@ -351,14 +350,7 @@ impl ConfigRow {
             }
             ConfigBody::Agent(a) => {
                 e.u8(3);
-                e.ostr(&a.instructions);
-                e.u8(a.behavior as u8);
-                e.u32(a.models.len() as u32);
-                for m in &a.models {
-                    e.u64(m.get());
-                }
-                e.ou64(a.default_model.map(|m| m.get()));
-                e.ostr(&a.tool_grant);
+                e.agent_config(a);
             }
             ConfigBody::Pool(p) => {
                 e.u8(4);
@@ -436,32 +428,7 @@ impl ConfigRow {
                     declared_capabilities,
                 })
             }
-            ConfigKind::Agent => {
-                let instructions = d.ostr()?;
-                let behavior = match d.u8()? {
-                    1 => AgentBehavior::Chat,
-                    2 => AgentBehavior::General,
-                    code => {
-                        return Err(StorageError::corrupted(format!(
-                            "invalid agent behavior {code}"
-                        )));
-                    }
-                };
-                let models_len = d.u32()? as usize;
-                let mut models = Vec::with_capacity(models_len);
-                for _ in 0..models_len {
-                    models.push(ConfigId::new(d.u64()?));
-                }
-                let default_model = d.ou64()?.map(ConfigId::new);
-                let tool_grant = d.ostr()?;
-                ConfigBody::Agent(AgentConfig {
-                    instructions,
-                    behavior,
-                    models,
-                    default_model,
-                    tool_grant,
-                })
-            }
+            ConfigKind::Agent => ConfigBody::Agent(d.agent_config()?),
             ConfigKind::Pool => {
                 let cap_len = d.u32()? as usize;
                 let mut capabilities = BTreeSet::new();

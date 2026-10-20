@@ -521,7 +521,7 @@ export function decodeConversationTurns(input: unknown, conversationId: string) 
       if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
       return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path, "attachment:")), at_us: integer(entry.at_us, `${path}.at_us`) };
     });
-    const userEntries = entries.filter(entry => entry.kind === "user_message");
+    const userEntries = entries.filter(entry => entry.kind === "user_message" || entry.kind === "agent_message");
     const frozenInput = jobInputRecord({ id: `job_input:${job.id.slice(4)}`, objective: userEntries.map(entry => entry.text ?? "").join("\n"), submitted_at_us: job.created_at_us, attachments: userEntries.flatMap(entry => entry.attachments), configuration: turn.configuration }, `${path}.input`, job.id);
     const outputs = listOf(turn.outputs, `${path}.outputs`, output => outputRecord(output));
     return { job, entries, input: frozenInput, outputs };
@@ -836,3 +836,36 @@ export function decodeAttachment(input: unknown) {
 
 export type ControlAttachment = ReturnType<typeof decodeAttachment>;
 
+
+function oneOf<T extends string>(value: unknown, path: string, choices: readonly T[]): T {
+  const found = choices.find(choice => choice === value);
+  if (found === undefined) throw new ContractError(path, choices.join(", "));
+  return found;
+}
+
+export function decodeChildren(input: unknown, conversationId: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.conversation !== conversationId) throw new ContractError("conversation", "the requested conversation");
+  const children = listOf(envelope.children, "children", (input, path) => {
+    const child = record(input, path);
+    const state = oneOf(child.state, `${path}.state`, ["open", "closing", "settled"]);
+    if (state !== "open" && state !== "closing" && state !== "settled") throw new ContractError(`${path}.state`, "a conversation state");
+    const hold = child.on_hold === null ? null : record(record(child.on_hold, `${path}.on_hold`).by, `${path}.on_hold.by`);
+    const by = hold === null ? null : oneOf(hold.kind, `${path}.on_hold.by.kind`, ["user", "agent", "loop", "auto"]);
+    if (by !== null && !["user", "agent", "loop", "auto"].includes(by)) throw new ContractError(`${path}.on_hold.by.kind`, "an actor");
+    const recurrence = child.recurrence === null ? null : record(child.recurrence, `${path}.recurrence`);
+    const phase = recurrence === null ? null : oneOf(recurrence.phase, `${path}.recurrence.phase`, ["active", "waiting_due", "halted"]);
+    if (phase !== null && !["active", "waiting_due", "halted"].includes(phase)) throw new ContractError(`${path}.recurrence.phase`, "a recurrence phase");
+    const interval = recurrence === null ? null : integer(recurrence.interval_s, `${path}.recurrence.interval_s`);
+    if (interval !== null && (interval < 60 || interval > 2592000)) throw new ContractError(`${path}.recurrence.interval_s`, "60 to 2592000");
+    return {
+      id: identity(child.id, `${path}.id`, "job:"), title: string(child.title, `${path}.title`),
+      agent: child.agent === null ? null : identity(child.agent, `${path}.agent`, "profile:"), state,
+      on_hold: by === null ? null : { by: { kind: by } }, keep_open: boolean(child.keep_open, `${path}.keep_open`),
+      recurrence: recurrence === null ? null : { interval_s: interval!, phase: phase!, due_us: recurrence.due_us === null ? null : integer(recurrence.due_us, `${path}.recurrence.due_us`) },
+    };
+  });
+  return { conversation: conversationId, children, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:") };
+}
+export type ControlChildConversation = ReturnType<typeof decodeChildren>["children"][number];

@@ -1435,6 +1435,7 @@ pub(super) mod tests {
         let agent = wait(handle.create_config(NewConfig {
             name: "chat".into(),
             body: ConfigBody::Agent(AgentConfig {
+                dispatch_to: Vec::new(),
                 behavior: AgentBehavior::Chat,
                 models: vec![model_id],
                 tool_grant: Some("read".into()),

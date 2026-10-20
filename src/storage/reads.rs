@@ -894,6 +894,140 @@ pub struct ConversationsPage {
     pub has_more: bool,
 }
 
+fn conversation_summary(
+    rx: &ReadTransaction,
+    conversation: JobId,
+    tip: JobId,
+) -> Result<ConversationEntry, StorageError> {
+    let row = read_job_row(rx, conversation)?
+        .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
+    let JobKind::Conversation { agent, project, .. } = row.kind else {
+        return Err(StorageError::corrupted(
+            "recent entry is not a conversation",
+        ));
+    };
+    let metadata = rx
+        .open_table(CONVERSATIONS)?
+        .get(conversation.get())?
+        .map(|bytes| ConversationRow::decode(bytes.value()))
+        .transpose()?
+        .ok_or_else(|| StorageError::corrupted("missing conversation state"))?;
+    let title = match metadata.title {
+        Some(title) => title,
+        None => {
+            let first = rx
+                .open_table(CHILDREN)?
+                .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                .next()
+                .transpose()?
+                .map(|entry| entry.0.value().1);
+            match first {
+                Some(first) => rx
+                    .open_table(TURN_INPUTS)?
+                    .range((first, 0)..=(first, u32::MAX))?
+                    .next()
+                    .transpose()?
+                    .map(|entry| TurnEntry::decode(entry.1.value()))
+                    .transpose()?
+                    .map(|entry| match entry.entry {
+                        Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => {
+                            text.chars().take(80).collect()
+                        }
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default(),
+                None => String::new(),
+            }
+        }
+    };
+    let state = read_state(rx, conversation)?;
+    let on_hold = metadata
+        .on_hold
+        .map(|seq| {
+            rx.open_table(NOTICES)?
+                .get((conversation.get(), seq))?
+                .map(|bytes| Notice::decode(bytes.value()))
+                .transpose()
+        })
+        .transpose()?
+        .flatten()
+        .and_then(|notice| match notice.body {
+            NoticeBody::Record { by, .. } => Some(by),
+            _ => None,
+        });
+    let tip_state = read_state(rx, tip)?;
+    let tip_row = read_job_row(rx, tip)?.ok_or_else(|| StorageError::corrupted("missing tip"))?;
+    Ok(ConversationEntry {
+        root_job: conversation,
+        tip_job: tip,
+        agent,
+        project,
+        title,
+        state: if state.outcome.is_some() {
+            "settled"
+        } else if state.children_closed_at.is_some() {
+            "closing"
+        } else {
+            "open"
+        }
+        .to_owned(),
+        on_hold,
+        tip_settlement_state: tip_state
+            .outcome
+            .map_or("unsettled", |outcome| match outcome.kind {
+                OutcomeKind::Completed => "completed",
+                OutcomeKind::Failed => "failed",
+                OutcomeKind::Cancelled => "cancelled",
+                OutcomeKind::Unknown => "unknown",
+            })
+            .to_owned(),
+        tip_created_at: tip_row.created_at,
+    })
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildConversationEntry {
+    pub conversation: ConversationEntry,
+    pub keep_open: bool,
+    pub recurrence: Option<Recurrence>,
+}
+pub(crate) fn read_conversation_children(
+    database: &Database,
+    parent: JobId,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Vec<ChildConversationEntry>, StorageError> {
+    let rx = read(database)?;
+    let mut children = Vec::new();
+    for entry in rx
+        .open_table(CHILD_CONVERSATIONS)?
+        .range((parent.get(), 0)..(parent.get(), before.map_or(u64::MAX, JobId::get)))?
+        .rev()
+        .take(limit.min(MAX_PAGE))
+    {
+        let child = JobId::new(entry?.0.value().1);
+        let row = read_job_row(&rx, child)?
+            .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
+        let JobKind::Conversation { keep_open, .. } = row.kind else {
+            return Err(StorageError::corrupted("child is not a conversation"));
+        };
+        let tip = rx
+            .open_table(TIPS)?
+            .get(child.get())?
+            .map(|id| JobId::new(id.value()))
+            .ok_or_else(|| StorageError::corrupted("child tip missing"))?;
+        children.push(ChildConversationEntry {
+            conversation: conversation_summary(&rx, child, tip)?,
+            keep_open,
+            recurrence: rx
+                .open_table(RECURRENCES)?
+                .get(child.get())?
+                .map(|bytes| Recurrence::decode(bytes.value()))
+                .transpose()?,
+        });
+    }
+    Ok(children)
+}
+
 pub(crate) fn read_conversations(
     database: &Database,
     before: Option<JobId>,
@@ -911,91 +1045,7 @@ pub(crate) fn read_conversations(
         let (tip, conversation) = item?.0.value();
         let conversation = JobId::new(conversation);
         let tip = JobId::new(tip);
-        let row = read_job_row(&rx, conversation)?
-            .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
-        let JobKind::Conversation { agent, project, .. } = row.kind else {
-            return Err(StorageError::corrupted(
-                "recent entry is not a conversation",
-            ));
-        };
-        let metadata = rx
-            .open_table(CONVERSATIONS)?
-            .get(conversation.get())?
-            .map(|bytes| ConversationRow::decode(bytes.value()))
-            .transpose()?
-            .ok_or_else(|| StorageError::corrupted("missing conversation state"))?;
-        let title = match metadata.title {
-            Some(title) => title,
-            None => {
-                let first = rx
-                    .open_table(CHILDREN)?
-                    .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
-                    .next()
-                    .transpose()?
-                    .map(|entry| entry.0.value().1);
-                match first {
-                    Some(first) => rx
-                        .open_table(TURN_INPUTS)?
-                        .range((first, 0)..=(first, u32::MAX))?
-                        .next()
-                        .transpose()?
-                        .map(|entry| TurnEntry::decode(entry.1.value()))
-                        .transpose()?
-                        .map(|entry| match entry.entry {
-                            Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => {
-                                text.chars().take(80).collect()
-                            }
-                            _ => String::new(),
-                        })
-                        .unwrap_or_default(),
-                    None => String::new(),
-                }
-            }
-        };
-        let state = read_state(&rx, conversation)?;
-        let on_hold = metadata
-            .on_hold
-            .map(|seq| {
-                rx.open_table(NOTICES)?
-                    .get((conversation.get(), seq))?
-                    .map(|bytes| Notice::decode(bytes.value()))
-                    .transpose()
-            })
-            .transpose()?
-            .flatten()
-            .and_then(|notice| match notice.body {
-                NoticeBody::Record { by, .. } => Some(by),
-                _ => None,
-            });
-        let tip_state = read_state(&rx, tip)?;
-        let tip_row =
-            read_job_row(&rx, tip)?.ok_or_else(|| StorageError::corrupted("missing tip"))?;
-        conversations.push(ConversationEntry {
-            root_job: conversation,
-            tip_job: tip,
-            agent,
-            project,
-            title,
-            state: if state.outcome.is_some() {
-                "settled"
-            } else if state.children_closed_at.is_some() {
-                "closing"
-            } else {
-                "open"
-            }
-            .to_owned(),
-            on_hold,
-            tip_settlement_state: tip_state
-                .outcome
-                .map_or("unsettled", |outcome| match outcome.kind {
-                    OutcomeKind::Completed => "completed",
-                    OutcomeKind::Failed => "failed",
-                    OutcomeKind::Cancelled => "cancelled",
-                    OutcomeKind::Unknown => "unknown",
-                })
-                .to_owned(),
-            tip_created_at: tip_row.created_at,
-        });
+        conversations.push(conversation_summary(&rx, conversation, tip)?);
     }
     let has_more = conversations.len() > limit;
     conversations.truncate(limit);
@@ -1341,7 +1391,7 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
                 .filter(|output| output.kind == OutputKind::Result)
                 .and_then(|output| output.summary)
                 .unwrap_or_default();
-            format!("{child}: {event:?}; answer from {reference}: {answer}")
+            format!("Child conversation {child}: {event:?}; result of turn {reference}: {answer}")
         }
         Entry::RetryOf { turn, .. } => {
             let mut text = format!(
@@ -1394,6 +1444,31 @@ pub(crate) fn read_turn_context(
         attention: String::new(),
         tree_status: String::new(),
     };
+    let own_entries = turn_entries(&rx, turn)?;
+    let iteration_only = own_entries
+        .iter()
+        .any(|(_, entry)| matches!(entry.entry, Entry::Iteration { .. }))
+        && !own_entries
+            .iter()
+            .any(|(_, entry)| matches!(entry.entry, Entry::UserMessage { .. }));
+    let iteration_context = if iteration_only && let Some(conversation) = row.parent_id {
+        let recurrence = rx
+            .open_table(RECURRENCES)?
+            .get(conversation.get())?
+            .map(|bytes| Recurrence::decode(bytes.value()))
+            .transpose()?;
+        let first = rx
+            .open_table(CHILDREN)?
+            .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+            .next()
+            .transpose()?
+            .map(|(key, _)| JobId::new(key.value().1));
+        recurrence
+            .zip(first)
+            .map(|(recurrence, first)| (first, recurrence.previous_turn))
+    } else {
+        None
+    };
     let mut cursor = Some(turn);
     let mut used = 0usize;
     while let Some(id) = cursor {
@@ -1401,7 +1476,10 @@ pub(crate) fn read_turn_context(
             .ok_or_else(|| StorageError::corrupted("previous turn missing"))?;
         let mut text = String::new();
         let mut attachments = Vec::new();
-        for (_, entry) in turn_entries(&rx, id)? {
+        for (_, entry) in turn_entries(&rx, id)?.into_iter().filter(|_| {
+            iteration_context
+                .is_none_or(|(first, previous)| Some(id) != previous || id == first || id == turn)
+        }) {
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -1415,9 +1493,11 @@ pub(crate) fn read_turn_context(
             }
         }
         let state = read_state(&rx, id)?;
-        let answer = if state
-            .outcome
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Cancelled)
+        let answer = if iteration_context
+            .is_some_and(|(first, previous)| id == first && previous != Some(id))
+            || state
+                .outcome
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Cancelled)
         {
             None
         } else {
@@ -1437,7 +1517,14 @@ pub(crate) fn read_turn_context(
             break;
         }
         used = used.saturating_add(weight);
-        cursor = row.previous;
+        cursor = match iteration_context {
+            Some((first, previous)) if id == turn => previous
+                .filter(|previous| *previous != turn)
+                .or((first != turn).then_some(first)),
+            Some((first, _)) if id != first => Some(first),
+            Some(_) => None,
+            None => row.previous,
+        };
         context.turns.push(ContextTurn {
             turn: id,
             text,

@@ -33,8 +33,8 @@ use crate::openai_compatible::{
 };
 use crate::persistence::{
     Actor, Appended, ConversationAction, ConversationSpec, Entry, EntryKind, JobKind, Notice,
-    NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind, PlanSource, RecordEvent, StopProof,
-    TurnEntry, TurnExecution,
+    NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind, PlanSource, RecordEvent, Recurrence,
+    RecurrenceHalt, RecurrencePhase, StopProof, TurnEntry, TurnExecution,
 };
 use crate::persistence::{
     AgentBehavior, AgentConfig, AttachmentId, AttachmentOrigin, AttachmentRecord,
@@ -54,11 +54,13 @@ mod batch;
 mod codec;
 mod conversations;
 mod derived;
+mod job_tools;
 mod notices;
 mod observations;
 mod open;
 mod pending;
 mod reads;
+mod recurrences;
 mod rows;
 mod schema;
 mod sequences;
@@ -87,10 +89,10 @@ pub(crate) use open::{OpenError, OpenedFile, database_file, open};
 pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pending_snapshot};
 #[allow(unused_imports)]
 pub(crate) use reads::ConversationEntry;
-pub(crate) use reads::ConversationsPage;
 use reads::read;
 #[cfg(test)]
 pub(crate) use reads::record_attachment_cleanup;
+pub(crate) use reads::{ChildConversationEntry, ConversationsPage, read_conversation_children};
 pub(crate) use reads::{
     TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,
     read_turn_execution,
@@ -198,15 +200,31 @@ storage_from!(
     CommitError
 );
 
+pub(crate) fn recurrence_due(database: &Database, clock: i64) -> Result<bool, StorageError> {
+    let tx = read(database)?;
+    Ok(tx
+        .open_table(RECURRENCE_DUE)?
+        .first()?
+        .is_some_and(|(key, _)| key.value().0 <= clock))
+}
+pub(crate) fn promotion_clock() -> i64 {
+    open::promotion_clock()
+}
+
 pub(crate) fn next_scheduled_delay(
     database: &Database,
 ) -> Result<Option<std::time::Duration>, StorageError> {
     let tx = read(database)?;
-    let delayed = tx.open_table(DELAYED)?;
-    Ok(delayed.first()?.map(|(key, _)| {
-        std::time::Duration::from_micros(
-            key.value().0.saturating_sub(open::promotion_clock()).max(0) as u64,
-        )
+    let delayed = tx
+        .open_table(DELAYED)?
+        .first()?
+        .map(|(key, _)| key.value().0);
+    let recurrence = tx
+        .open_table(RECURRENCE_DUE)?
+        .first()?
+        .map(|(key, _)| key.value().0);
+    Ok(delayed.into_iter().chain(recurrence).min().map(|due| {
+        std::time::Duration::from_micros(due.saturating_sub(open::promotion_clock()).max(0) as u64)
     }))
 }
 

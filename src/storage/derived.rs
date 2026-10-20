@@ -33,7 +33,7 @@ pub(super) struct Derived {
     tool_totals: BTreeMap<u64, (u64, u64)>,
     tool_stats: BTreeMap<String, schema::ToolStatValue>,
     usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
-    retries: BTreeMap<(u64, u64), ()>,
+    retries: BTreeMap<(u64, u64), bool>,
     attachment_refs: BTreeMap<(u64, u64), ()>,
 }
 
@@ -458,8 +458,10 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
                         .or_insert(input.at.as_unix_micros());
                 }
             }
-            Entry::RetryOf { turn: original, .. } => {
-                derived.retries.insert((original.get(), *turn), ());
+            Entry::RetryOf { turn: original, by } => {
+                derived
+                    .retries
+                    .insert((original.get(), *turn), matches!(by, Actor::Agent { .. }));
             }
             Entry::AgentMessage { .. }
             | Entry::Notice { .. }
@@ -563,6 +565,18 @@ pub(super) fn rebuild(
         true,
     );
     note("retry", sync!(tx, RETRIES, derived.retries), true);
+    let mut recurrence_due = BTreeMap::new();
+    for entry in tx.open_table(RECURRENCES)?.iter()? {
+        let (id, bytes) = entry?;
+        if let RecurrencePhase::WaitingDue { due } = Recurrence::decode(bytes.value())?.phase {
+            recurrence_due.insert((due, id.value()), ());
+        }
+    }
+    note(
+        "recurrence_due",
+        sync!(tx, RECURRENCE_DUE, recurrence_due),
+        true,
+    );
     note(
         "attachment_ref",
         sync!(tx, ATTACHMENT_REFS, derived.attachment_refs),
@@ -911,6 +925,7 @@ mod tests {
         let agent_1 = wait(database.create_config(NewConfig {
             name: "agent-1".into(),
             body: ConfigBody::Agent(AgentConfig {
+                dispatch_to: Vec::new(),
                 instructions: Some("agent 1".into()),
                 behavior: AgentBehavior::Chat,
                 models: vec![llm.into()],
@@ -922,6 +937,7 @@ mod tests {
         let agent_2 = wait(database.create_config(NewConfig {
             name: "agent-2".into(),
             body: ConfigBody::Agent(AgentConfig {
+                dispatch_to: Vec::new(),
                 instructions: Some("agent 2".into()),
                 behavior: AgentBehavior::Chat,
                 models: vec![llm.into()],

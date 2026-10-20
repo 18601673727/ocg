@@ -378,6 +378,17 @@ pub(crate) struct Dispatch {
 }
 
 impl ToolOffer {
+    pub(crate) fn with_job_tools(&self) -> Result<Self, ToolRegistryError> {
+        super::job_tools::register(&self.registry)?;
+        let names = self
+            .tools
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .chain(super::job_tools::NAMES)
+            .collect::<Vec<_>>();
+        self.registry.offer(&names)
+    }
+
     /// The definitions to send, read from the registry now. Every selected
     /// tool must still be the registration selected, and still authorized.
     ///

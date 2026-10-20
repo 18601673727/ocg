@@ -544,6 +544,17 @@ impl DatabaseHandle {
         self.read(move |database| storage::read_turn_entries(database, turn))
             .await
     }
+    pub async fn conversation_children(
+        &self,
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<Vec<storage::ChildConversationEntry>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_conversation_children(database, conversation, before, limit)
+        })
+        .await
+    }
     pub async fn conversation_turns(
         &self,
         conversation: JobId,
@@ -1009,6 +1020,22 @@ impl DatabaseHandle {
             .await
     }
 
+    pub async fn apply_job_tool(
+        &self,
+        call: ToolCallRef,
+        tool: crate::orchestration::job_tools::JobToolCall,
+    ) -> Result<serde_json::Value, DatabaseError> {
+        self.submit(|reply| Command::ApplyJobTool { call, tool, reply })
+            .await
+    }
+    pub async fn boundary_b(&self, clock: i64) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::BoundaryB { clock, reply })
+            .await
+    }
+    pub(crate) async fn recurrence_due(&self, clock: i64) -> Result<bool, DatabaseError> {
+        self.read(move |database| storage::recurrence_due(database, clock))
+            .await
+    }
     pub async fn open_conversation(
         &self,
         parent: Option<JobId>,

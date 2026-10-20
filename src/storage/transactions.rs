@@ -165,11 +165,28 @@ impl Batch {
     /// appends can keep their source transaction and fall back to a notice.
     pub(crate) fn validate_spec(&mut self, spec: &JobRow) -> Result<(), BatchError> {
         self.check_spec_references(spec)?;
-        if !spec.dependencies.is_empty() {
-            return self.reject(Violation::InvalidValue(
-                "dependencies",
-                "K1 supports only the previous turn dependency",
-            ));
+        for (dependency, _) in &spec.dependencies {
+            if Some(*dependency) == spec.previous {
+                continue;
+            }
+            let sibling = self.require_job(*dependency)?;
+            let valid = if spec.kind.is_stored()
+                && let Some(conversation) = spec.parent_id
+            {
+                let own = self.require_job(conversation)?;
+                sibling.kind.is_conversation()
+                    && own.parent_id.is_some()
+                    && sibling.parent_id == own.parent_id
+                    && sibling.id < conversation
+            } else {
+                false
+            };
+            if !valid {
+                return self.reject(Violation::InvalidValue(
+                    "dependencies",
+                    "must name the previous turn or an earlier sibling conversation",
+                ));
+            }
         }
         if let Some(parent) = spec.parent_id {
             let state = self.require_job_state(parent)?;

@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # OCG 0.5.0
 
 OCG is a local, single-operator host that runs durable Provider Jobs against a
@@ -63,7 +66,7 @@ The Control Plane binds `127.0.0.1:<OCG_CONTROL_PORT>` and prints
 When a Profile's API key is not in the data directory's credential store, OCG
 reads the environment variable named by that Profile's `credential_ref`.
 
-Chat tools need an Agent with Workspace access and an LLM Profile that declares
+Workspace tools need an Agent with Workspace access and an LLM Profile that declares
 Tools, and every Job of such an Agent names a Project. Tools can reach only that
 Project's root. `OCG_WORKSPACE_ROOT` is no longer read: when it is still set,
 the host logs one warning that it is ignored.
@@ -143,7 +146,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 20, with no migration;
+cancelled if reopened without a claim. The stored format is 21, with no migration;
 recreate data directories made by earlier versions.
 
 ## Sign a browser in
@@ -217,3 +220,34 @@ $OCG_DATA_DIR/
 
 Runtime log files are named `YYYYMMDDHHMMSSZ_runtime_NNN.log`. The default
 policy logs at `info` level, rotates at 10 MiB and keeps logs for 7 days.
+
+## Agent dispatch and recurring conversations
+
+An Agent may name allowed Agent Profiles in `dispatch_to` (sorted, unique
+`profile:N` ids, including itself). Each target needs a `default_model` selected
+from its `llm_targets`. Both fields are accepted and returned by `/api/v1/profiles`.
+Stored turns offer `job_dispatch`, `job_message`, `job_stop`, `job_close`,
+`job_hold`, `job_unhold` and `job_retry` when their frozen Agent has dispatch
+permission. Dispatch needs model Tools support; it does not require a Workspace
+grant. An agent may manage its strict subtree when the target subtree has no
+queued or running user turns, and cannot lift a user or loop hold. Effects commit
+atomically with their tool outcomes; restart reconciles an admitted host call without an outcome
+as NotApplied.
+
+`job_dispatch` accepts `agent`, `objective`, optional `project`, `keep_open`,
+`every_seconds` (60 through 2,592,000), and `depends_on` entries containing a sibling
+`conversation` and `condition` (`settled` or `success`). Ordinary children close
+automatically after completion unless kept open or joined by a user. Recurrences
+stay open, continue after failed iterations, and use the objective plus the
+previous iteration's result as context. Close, a removed model assignment, or a
+refused iteration halts a recurrence. Hold pauses future turns until Unhold.
+
+Eight consecutive attention-woken turns that successfully act on children put
+the parent on a loop hold; children keep running. A user message or Unhold resets
+the count, and a user message lifts a loop hold. Reporting without child actions
+does not consume this bound.
+
+`GET /api/v1/conversations/{job:N}/children?before=job:N&limit=20` pages child
+conversations, including settled children, with title, Agent, state, hold,
+keep-open and recurrence details. The chat's child strip opens a child in the
+same chat view and provides Stop, Close and Hold/Unhold.

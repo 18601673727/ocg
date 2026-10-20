@@ -37,6 +37,8 @@ pub enum OperationKind {
     AppendJobOutput,
     FinalizeJob,
     CreateExecutor,
+    ApplyJobTool,
+    BoundaryB,
     Open,
     Append,
     StopTurn,

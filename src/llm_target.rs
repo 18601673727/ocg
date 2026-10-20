@@ -148,6 +148,7 @@ pub async fn agent_profile(
     llm_profile: ProfileId,
 ) -> Result<ProfileId, DatabaseError> {
     let agent = AgentConfig {
+        dispatch_to: Vec::new(),
         behavior: AgentBehavior::Chat,
         models: vec![llm_profile.into()],
         default_model: Some(llm_profile.into()),
