@@ -118,11 +118,6 @@ export const index: Decoder<number> = (input, path) =>
 export const boolean: Decoder<boolean> = (input, path) =>
   typeof input === "boolean" ? yes(input) : bad(path, "a boolean");
 
-/** A field whose value is a fixed protocol literal, such as `api_version`. */
-export function literal<T extends string>(expected: T): Decoder<T> {
-  return (input, path) => (input === expected ? yes(input as T) : bad(path, `"${expected}"`));
-}
-
 /**
  * Membership in a Rust enum's wire vocabulary.
  *
@@ -189,16 +184,6 @@ export function stringMap<T>(decoder: Decoder<T>): Decoder<Record<string, T>> {
       out[key] = result.value;
     }
     return yes(out);
-  };
-}
-
-/** A single-key wrapper, e.g. serde's externally tagged enum variant. */
-export function wrapped<K extends string, T>(key: K, inner: Decoder<T>): Decoder<{ [P in K]: T }> {
-  return (input, path) => {
-    const rec = record(input, path, "an object");
-    if (!rec.ok) return rec;
-    const result = inner(rec.value[key], join(path, key));
-    return result.ok ? yes({ [key]: result.value } as { [P in K]: T }) : result;
   };
 }
 

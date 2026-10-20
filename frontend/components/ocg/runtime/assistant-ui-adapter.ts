@@ -213,6 +213,7 @@ export function convertOcgMessage(
 
 export type OcgConversationState = {
   messages: ChatMessage[];
+  hasEarlier: boolean;
   isRunning: boolean;
   execution: JobExecution | null;
   sessionId: string | null;
@@ -226,10 +227,13 @@ export function createOcgExternalStoreAdapter(
   onReload?: (parentId: string | null, config: { parentId: string | null; sourceId: string | null; runConfig: { custom?: Record<string, unknown> } }) => Promise<void>,
   onCancel?: () => Promise<void>,
   controlBaseUrl?: string | null,
+  onLoadEarlier?: () => Promise<void>,
 ): import("@assistant-ui/react").ExternalStoreAdapter<ChatMessage> {
   const state = getState();
   return {
     messages: state.messages,
+    hasEarlier: state.hasEarlier,
+    onLoadEarlier,
     isRunning: state.isRunning,
     isLoading: false,
     convertMessage: (message, idx) => {

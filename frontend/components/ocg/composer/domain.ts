@@ -45,35 +45,6 @@ export type ComposerIntent =
   | ComposerJobCreateIntent
   | ComposerUnknownCommandIntent;
 
-/**
- * Command handlers are kept outside the composer presentation. Adding a
- * structured command therefore extends this registry boundary instead of
- * teaching ChatView about the command's business logic.
- */
-export type ComposerIntentHandlers = {
-  chat: (intent: ComposerChatIntent) => void;
-  "job.create": (intent: ComposerJobCreateIntent) => void;
-  "unknown-command"?: (intent: ComposerUnknownCommandIntent) => void;
-};
-
-export function dispatchComposerIntent(
-  intent: ComposerIntent,
-  handlers: ComposerIntentHandlers,
-): void {
-  switch (intent.kind) {
-    case "chat":
-      handlers.chat(intent);
-      return;
-    case "job.create":
-      handlers["job.create"](intent);
-      return;
-    case "unknown-command":
-      handlers["unknown-command"]?.(intent);
-      return;
-  }
-}
-
-
 const JOB_CREATE_PATTERN = /^\/job\s+create(?:\s+([\s\S]*))?$/i;
 const JOB_ONLY_PATTERN = /^\/job\s*$/i;
 
@@ -116,7 +87,6 @@ export function parseComposerIntent(raw: string): ComposerIntent {
     source: "slash-command",
   };
 }
-
 
 /* -------------------------------------------------------------------------- */
 /* Suggestions                                                                */

@@ -4,6 +4,7 @@ import { RuntimeClientBase } from "./mock-client";
 import type { CreateSessionInput, ScenarioId } from "./runtime-types";
 import { createHttpCanonicalControlClient, ControlTransportError, type ControlSubmission, type HttpCanonicalControlClient, type JobStreamSubscription } from "./control-client";
 import { jobTranscript } from "../chat/job-transcript-model";
+import { pageTurns } from "./history-page";
 
 type Turn = { entries?: ControlConversationTurn["entries"]; sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string; toolError?: string };
 type Pending = { key: string; signature: string; submission: ControlSubmission; admittedJob?: string };
@@ -26,6 +27,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly pending = new Map<string, Pending>();
   private readonly sending = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
+  private readonly earlier = new Map<string, string | null>();
+  private readonly loadingEarlier = new Map<string, Promise<void>>();
   private readonly streams = new Map<string, StreamEntry>();
   private refresh: Promise<void> | null = null;
 
@@ -121,6 +124,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.hiddenRoots.add(root);
       this.pending.delete(sessionId);
       this.selections.delete(sessionId);
+      this.earlier.delete(sessionId);
+      this.loadingEarlier.delete(sessionId);
       this.emit({ type: "conversation.session-deleted", sessionId });
       const attachments = new Set<string>();
       for (const [jobId, turn] of this.turns.entries()) {
@@ -182,17 +187,24 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0]?.input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
     }
     // Read each turn's attachments and tool evidence as well as its stored text.
+    const isCurrent = () => !this.disposed && (hiddenBefore || !this.hiddenRoots.has(root));
+    const held = new Set([...this.turns.values()].filter(turn => turn.sessionId === id).map(turn => turn.job.id));
     await Promise.all(conversation.turns.map(async turn => {
-      if (this.streams.has(turn.job.id)) return;
-      const tools = await this.control.readAllJobTools(turn.job.id, this.lifetime.signal);
-      if ((!hiddenBefore && this.hiddenRoots.has(root)) || this.disposed) return;
-      const state: Turn = { sessionId: id, ...turn, tools };
-      const images = await this.readImages(state);
-      if ((!hiddenBefore && this.hiddenRoots.has(root)) || this.disposed) return;
-      for (const image of images) this.images.set(image.id, image);
-      this.turns.set(turn.job.id, state);
+      const loaded = await this.readHistoryTurn(id, turn, isCurrent);
+      if (!loaded || !isCurrent()) return;
+      for (const image of loaded.images) this.images.set(image.id, image);
+      this.turns.set(turn.job.id, loaded.state);
     }));
     if (this.disposed || (!hiddenBefore && this.hiddenRoots.has(root))) return id;
+    if (!this.earlier.has(id)) {
+      this.earlier.set(id, pageTurns(new Set(), undefined, page).next);
+    } else if (held.size > 0 && page.has_more && !page.turns.some(turn => held.has(turn.job.id))) {
+      const pageIds = new Set(page.turns.map(turn => turn.job.id));
+      for (const [jobId, turn] of this.turns) {
+        if (turn.sessionId === id && !pageIds.has(jobId) && !this.streams.has(jobId)) this.turns.delete(jobId);
+      }
+      this.earlier.set(id, pageTurns(new Set(), undefined, page).next);
+    }
     this.tips.set(id, job);
     const session = this.getSnapshot().sessions.find(session => session.id === id);
     if (!session) return id;
@@ -200,6 +212,52 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.publish(id);
     for (const turn of conversation.turns) if (turn.job.settlement.state === "unsettled") this.watch(turn.job.id);
     return id;
+  }
+
+  hasEarlierHistory(sessionId: string): boolean {
+    return !!this.earlier.get(sessionId);
+  }
+
+  loadEarlierHistory(sessionId: string): Promise<void> {
+    const existing = this.loadingEarlier.get(sessionId);
+    if (existing) return existing;
+    const cursor = this.earlier.get(sessionId);
+    if (!cursor || this.disposed) return Promise.resolve();
+    const root = this.sessionRoot(sessionId);
+    const isCurrent = () => !this.disposed && !this.hiddenRoots.has(root) && this.earlier.get(sessionId) === cursor;
+    const task = (async () => {
+      try {
+        const page = await this.control.readConversationTurns(root, cursor, 20, this.lifetime.signal);
+        if (!isCurrent()) return;
+        const held = new Set([...this.turns.values()].filter(turn => turn.sessionId === sessionId).map(turn => turn.job.id));
+        const { add, next } = pageTurns(held, cursor, page);
+        const loaded = await Promise.all(add.map(turn => this.readHistoryTurn(sessionId, turn, isCurrent)));
+        if (!isCurrent()) return;
+        for (const turn of loaded) {
+          if (!turn) continue;
+          for (const image of turn.images) this.images.set(image.id, image);
+          this.turns.set(turn.state.job.id, turn.state);
+        }
+        this.earlier.set(sessionId, next);
+        this.publish(sessionId);
+      } catch (error) {
+        if (isCurrent()) throw error;
+      }
+    })().finally(() => {
+      if (this.loadingEarlier.get(sessionId) === task) this.loadingEarlier.delete(sessionId);
+    });
+    this.loadingEarlier.set(sessionId, task);
+    return task;
+  }
+
+  private async readHistoryTurn(sessionId: string, turn: ControlConversationTurn, isCurrent: () => boolean) {
+    if (this.streams.has(turn.job.id) || !isCurrent()) return null;
+    const tools = await this.control.readAllJobTools(turn.job.id, this.lifetime.signal);
+    if (!isCurrent()) return null;
+    const state: Turn = { sessionId, ...turn, tools };
+    const images = await this.readImages(state);
+    if (!isCurrent()) return null;
+    return { state, images };
   }
 
   private readonly images = new Map<string, ChatImage>();

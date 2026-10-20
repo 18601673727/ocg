@@ -22,7 +22,7 @@
 
 import type { ProjectId } from "../project/domain";
 import { CANONICAL_API_VERSION, ContractError, decodeExecutionState } from "../contracts";
-import type { CanonicalExecutionState, CanonicalJobSnapshot } from "../contracts";
+import type { CanonicalExecutionState, } from "../contracts";
 import type { JobExecution } from "../execution/domain";
 import { assembleJobExecution } from "../execution/domain";
 import { isNonNegativeInteger, isRecord } from "@/lib/narrow";
@@ -201,8 +201,6 @@ export type CanonicalCommandAck = {
   message: string;
 };
 
-export type CanonicalBackendEvent = CanonicalJobSnapshot;
-
 export type CanonicalState = {
   status: CanonicalSyncStatus;
   streamId: string;
@@ -222,21 +220,4 @@ export type CanonicalSnapshotInput = {
   projectId: ProjectId;
   generation?: number;
 };
-
-export function createCanonicalState(): CanonicalState {
-  return {
-    status: "uninitialized",
-    streamId: CANONICAL_STREAM_ID,
-    generation: 0,
-    cursor: 0,
-    projectId: null,
-    jobId: null,
-    projection: null,
-    seenEventIds: [],
-    diagnostics: [],
-    commandAcks: {},
-    resyncRequired: false,
-  };
-}
-
 

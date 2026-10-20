@@ -75,33 +75,6 @@ export function selectTabItems(items: AttentionItem[], tab: AttentionTab): Atten
   }
 }
 
-function matchesQuery(item: AttentionItem, query: string): boolean {
-  const normalized = query.trim().toLowerCase();
-  if (!normalized) return true;
-  const haystack = [
-    item.title,
-    item.summary,
-    item.jobTitle,
-    item.taskTitle,
-    item.providerLabel,
-    item.model,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return normalized.split(/\s+/).every((token) => haystack.includes(token));
-}
-
-export function filterAttentionItems(items: AttentionItem[], filters: AttentionFilters): AttentionItem[] {
-  const scoped = selectTabItems(items, filters.tab);
-  return scoped
-    .filter((item) => (filters.kind === "all" ? true : item.kind === filters.kind))
-    .filter((item) => (filters.severity === "all" ? true : item.severity === filters.severity))
-    .filter((item) => (filters.source === "all" ? true : item.source === filters.source))
-    .filter((item) => matchesQuery(item, filters.query))
-    .slice(0, ATTENTION_RESULT_LIMIT);
-}
-
 export type AttentionSummary = {
   needsAction: number;
   awaitingApproval: number;
@@ -110,19 +83,6 @@ export type AttentionSummary = {
   high: number;
   resolved: number;
 };
-
-/** Compact header metrics. Resolved stays separate from unresolved work. */
-export function selectAttentionSummary(items: AttentionItem[]): AttentionSummary {
-  const unresolved = items.filter(isUnresolved);
-  return {
-    needsAction: unresolved.length,
-    awaitingApproval: unresolved.filter(isApprovalItem).length,
-    blocked: unresolved.filter(isBlockedItem).length,
-    critical: unresolved.filter((item) => item.severity === "critical").length,
-    high: unresolved.filter((item) => item.severity === "high").length,
-    resolved: items.length - unresolved.length,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Derived attention
@@ -168,26 +128,3 @@ export type AttentionQueue = {
   approvals: AttentionItem[];
   history: AttentionItem[];
 };
-
-export function selectAttentionItems(
-  snapshot: RuntimeSnapshot,
-  queue: AttentionQueue,
-): AttentionItem[] {
-  return selectDerivedAttention(snapshot, queue);
-}
-
-export function acknowledgeAttentionItem(items: AttentionItem[], id: string, at: string): AttentionItem[] {
-  return items.map((item) => item.id === id && item.status === "pending" ? { ...item, status: "acknowledged", updatedAt: at } : item);
-}
-
-export function resolveAttentionItem(items: AttentionItem[], id: string, at: string): AttentionItem[] {
-  return items.map((item) => item.id === id && isUnresolved(item) && !item.approval
-    ? { ...item, status: "resolved", updatedAt: at, resolution: { outcome: "resolved", at } }
-    : item);
-}
-
-export function applyAttentionDecision(items: AttentionItem[], id: string, decision: "approved" | "rejected", at: string): AttentionItem[] {
-  return items.map((item) => item.id === id && isApprovalItem(item)
-    ? { ...item, status: decision, updatedAt: at }
-    : item);
-}

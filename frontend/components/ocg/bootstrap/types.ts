@@ -1,24 +1,6 @@
-/**
- * Normalized bootstrap domain for the mock runtime.
- *
- * This module is deliberately presentation-free and secret-free. It owns the
- * setup facts the shell needs before it can show the workspace: how access is
- * established, whether onboarding is pending, and the resource-first inventory
- * used by the wizard. Connections describe reachability only; no credential
- * material is ever represented here.
- */
 
-export type BootstrapEntry = "app" | "login" | "onboarding";
 
 export type BootstrapMode = "firstRun" | "resume" | "migrate" | "recover" | "reconfigure";
-
-export const BOOTSTRAP_MODES: readonly BootstrapMode[] = [
-  "firstRun",
-  "resume",
-  "migrate",
-  "recover",
-  "reconfigure",
-];
 
 export type BootstrapAccessState =
   | "local"

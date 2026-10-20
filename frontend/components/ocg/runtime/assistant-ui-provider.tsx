@@ -48,6 +48,8 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({ children, 
     return runtime.snapshot.messagesBySession[sessionId] ?? [];
   }, [runtime.snapshot.messagesBySession, sessionId]);
 
+  const hasEarlier = runtime.client.hasEarlierHistory?.(sessionId) ?? false;
+
   const execution = useMemo(() => {
     return runtime.snapshot.executionBySession[sessionId] ?? null;
   }, [runtime.snapshot.executionBySession, sessionId]);
@@ -64,12 +66,13 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({ children, 
   const getState = useCallback((): OcgConversationState => {
     return {
       messages,
+      hasEarlier,
       isRunning,
       execution,
       sessionId,
       projectId,
     };
-  }, [messages, isRunning, execution, sessionId, projectId]);
+  }, [messages, hasEarlier, isRunning, execution, sessionId, projectId]);
 
   // Handle new message from user
   const onNew = useCallback(async (message: AppendMessage) => {
@@ -98,6 +101,8 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({ children, 
     await runtime.cancel(sessionId);
   }, [runtime, sessionId]);
 
+  const onLoadEarlier = useCallback(() => runtime.client.loadEarlierHistory?.(sessionId) ?? Promise.resolve(), [runtime.client, sessionId]);
+
   // Create the external store adapter
   const adapter = useMemo(() => {
     return createOcgExternalStoreAdapter(
@@ -106,9 +111,10 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({ children, 
       undefined, // onEdit not supported
       onReload,
       onCancel,
-      controlBaseUrl
+      controlBaseUrl,
+      onLoadEarlier
     );
-  }, [getState, onNew, onReload, onCancel, controlBaseUrl]);
+  }, [getState, onNew, onReload, onCancel, controlBaseUrl, onLoadEarlier]);
 
   // Create the assistant-ui runtime from the external store
   const assistantRuntime = useExternalStoreRuntime(adapter);

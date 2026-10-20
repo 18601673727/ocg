@@ -16,47 +16,13 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-## Runtime scenarios
+## Runtime
 
-The UI currently runs against a local OCG-owned mock runtime. Inspect a fixture with
-`?scenario=`; unknown values fall back to `normal-chat`:
-
-```text
-normal-chat · long-stream · tool-heavy · worker-parallel
-build-failed · retry-success · job-completed · budget-exhausted
-runtime-disconnected · runtime-connecting · runtime-failed · permission-required
-observability-live · resource-ledger
-```
-
-Entry/setup fixtures:
-
-```text
-local-ready · local-first-run
-remote-unauthenticated · remote-session-expired · remote-denied
-remote-authenticated-ready · remote-authenticated-first-run
-onboarding-resume · onboarding-migration · onboarding-recovery
-onboarding-invalid-configuration · onboarding-auth-required
-onboarding-connection-failure · onboarding-discovery · onboarding-ready
-```
-
-The bootstrap scenarios drive the entry gate: local scenarios open the workspace
-directly, remote scenarios without access show the login surface, and pending
-setup opens the seven-stage onboarding wizard. `?scenario=` also works on
-`/login` and `/onboarding`; explicit local scenarios still resolve to the
-workspace. Cloudflare Access is represented as a mock handoff button, and no
-credential is entered or stored.
-
-For example: `http://localhost:3000/?scenario=worker-parallel`.
-
-## Resource ledger
-
-The `resource-ledger` scenario adds a cross-job usage and cost ledger on top
-of the workspace. Open it directly at `/resource-ledger`, which defaults to the
-ledger scenario, or via the ledger action in the topbar. A scenario can still be
-selected explicitly with `?scenario=`, for example
-`http://localhost:3000/resource-ledger?scenario=resource-ledger`. Other
-scenarios have no ledger fixture and the surface shows an explicit empty state
-instead of inventing data.
+Every route renders the same operator console. It talks to the Control
+Plane at the page's own origin and asks for an operator sign-in, so run it
+the way the Control Plane serves it: `pnpm build`, then start OCG with
+`OCG_UI_DIR` set to `frontend/out` (see the repository README). There is no
+`?scenario=` parameter.
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 

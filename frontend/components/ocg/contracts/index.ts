@@ -73,52 +73,10 @@ export { ContractError, decode } from "./decode";
 export type { DecodeResult, Decoder } from "./decode";
 
 export {
-  decodeProfile,
-  decodeProfileView,
-  decodeProvider,
-  tryProfileView,
-} from "./profile-decode";
-
-export {
-  decodeSetupConnectResponse,
-  decodeSetupModelsResponse,
-  decodeSetupBrowseResponse,
-  decodeSetupProjectResponse,
-} from "./setup-decode";
-export type {
-  SetupModel,
-  SetupConnectResponse,
-  SetupModelsResponse,
-  SetupDirectoryEntry,
-  SetupBrowseResponse,
-  SetupProjectResponse,
-} from "./setup-decode";
-
-export {
-  decodeConfigurationAck,
-  decodeChatConversationsResponse,
-  decodeChatMessagesResponse,
-  decodeChatImage,
-  decodeConfigurationEnvelope,
-  decodeConfigurationView,
-  decodeDashboardResponse,
-  decodeJobOperationResponse,
-  decodeJobSpawnResponse,
-  decodeEventsEnvelope,
   decodeExecutionState,
-  decodeJobConfigEnvelope,
-  decodeJobConfigResponse,
-  decodeJobLaunchResponse,
-  decodeJobSnapshot,
-  decodeProjectRecord,
-  decodeProjectResponse,
-  decodeProjectsResponse,
-  tryEventsEnvelope,
 } from "./canonical-decode";
 export type {
-  ATTEMPT_STATES,
   CanonicalAttempt,
-  CanonicalAttemptState,
   CanonicalCall,
   CanonicalDispatchIntent,
   CanonicalEffectKind,
@@ -126,19 +84,10 @@ export type {
   CanonicalExecutionState,
   CanonicalWatchdogAction,
   CanonicalJob,
-  CanonicalJobLaunchAck,
-  CanonicalJobLaunchOutcome,
   CanonicalJobState,
-  ConfigurationAck,
-  EFFECT_KINDS,
-  JOB_LAUNCH_OUTCOMES,
-  JOB_STATES,
 } from "./canonical-decode";
 
 export type { UsageQuantity, UsageTokenTotals, UsageCurrencyCost, UsageCost, ContextCostTotals, UsageTotals, UsageBreakdown, UsageConversationRow, ProjectUsageResponse, ConversationUsageResponse, JobUsageResponse, UsageCompleteness, UsageWindow, UsageCostSource } from "./generated";
-export { decodeProjectUsageResponse, decodeConversationUsageResponse, decodeJobUsageResponse } from "./usage-decode";
-
-export { decodeAuthenticationSession } from "./authentication-decode";
 
 export * from "./control-plane";
 

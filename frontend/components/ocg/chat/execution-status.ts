@@ -184,23 +184,3 @@ export function currentActivity(execution: JobExecution | null | undefined, step
   const running = [...steps].reverse().find(step => step.status === "running");
   return running ?? { id: "provider", kind: "provider", target: "", status: "running" };
 }
-
-/** Whether a Call is a provider round trip or a Native Tool Call, from its durable request. */
-export function callKindOf(call: ExecutionCall): "provider" | "native" | null {
-  const request = parseRequest(`call:${call.callId}`, call.request);
-  return request === null ? null : request.provider ? "provider" : "native";
-}
-
-/** The canonical native tool name, when the Call request identifies one. */
-export function nativeToolNameOf(call: ExecutionCall): string | null {
-  const request = parseRequest(`call:${call.callId}`, call.request);
-  return request && !request.provider ? request.name : null;
-}
-
-/** The reasoning effort a provider dispatch froze, or `null` when its request carried none. */
-export function frozenEffort(execution: JobExecution, dispatchIntentId: string): string | null {
-  const intent = execution.dispatchIntents.find(item => item.dispatchIntentId === dispatchIntentId);
-  if (!intent) return null;
-  const request = parseRequest(`intent:${intent.dispatchIntentId}`, intent.request);
-  return request?.provider ? request.effort : null;
-}

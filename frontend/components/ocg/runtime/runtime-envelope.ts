@@ -183,23 +183,6 @@ export type RuntimeDiagnostic = {
   sessionId?: string;
 };
 
-export type RuntimeErrorCode =
-  | "protocol_incompatible"
-  | "validation_error"
-  | "runtime_unavailable"
-  | "cursor_expired"
-  | "stale_command"
-  | "unknown_resource"
-  | "transport_unavailable";
-
-export type RuntimeError = {
-  code: RuntimeErrorCode;
-  message: string;
-  retryable: boolean;
-  /** Bounded, display-safe details; never secrets or raw executor payloads. */
-  details?: Record<string, string | number | boolean | null>;
-};
-
 export type RuntimeEnvelopeValidation =
   | { ok: true; envelope: AnyRuntimeEnvelope }
   | { ok: false; diagnostic: RuntimeDiagnostic };
@@ -389,78 +372,6 @@ export class RuntimeEnvelopeFactory {
 
   private isoAt(sequence: number): string {
     return new Date(this.baseTimeMs + sequence * 1000).toISOString();
-  }
-}
-
-/* -------------------------------------------------------------------------- */
-/* Mapping back to the presentation event union                               */
-/* -------------------------------------------------------------------------- */
-
-export function toRuntimeEvent(envelope: AnyRuntimeEnvelope): OcgRuntimeEvent {
-  const sessionId = envelope.sessionId ?? "";
-  switch (envelope.type) {
-    case "conversation.session-deleted":
-      return { type: envelope.type, sessionId };
-    case "conversation.queue-updated":
-      return { type: envelope.type, sessionId, queue: envelope.payload.queue, paused: envelope.payload.paused };
-    case "conversation.history-loaded":
-      return { type: envelope.type, sessionId, messages: envelope.payload.messages };
-    case "job.execution-updated":
-      return {
-        type: envelope.type,
-        ...(envelope.sessionId ? { sessionId: envelope.sessionId } : {}),
-        execution: envelope.payload.execution,
-        accounting: envelope.payload.accounting,
-      };
-    case "job.launch-updated":
-      return { type: envelope.type, sessionId, result: envelope.payload.result };
-    case "runtime.status-changed":
-      return { type: envelope.type, status: envelope.payload.status };
-    case "conversation.session-created":
-      return { type: envelope.type, session: envelope.payload.session };
-    case "conversation.session-updated":
-      return { type: envelope.type, session: envelope.payload.session };
-    case "conversation.message-started":
-      return { type: envelope.type, sessionId, message: envelope.payload.message };
-    case "conversation.message-image":
-      return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, image: envelope.payload.image };
-    case "conversation.message-delta":
-      return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, delta: envelope.payload.delta };
-    case "conversation.message-reasoning-delta":
-      return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, delta: envelope.payload.delta };
-    case "conversation.message-round-committed":
-      return {
-        type: envelope.type,
-        sessionId,
-        messageId: envelope.payload.messageId,
-        committedContentLength: envelope.payload.committedContentLength,
-        committedImageCount: envelope.payload.committedImageCount,
-        committedReasoningLength: envelope.payload.committedReasoningLength,
-      };
-    case "conversation.message-completed":
-      return { type: envelope.type, sessionId, message: envelope.payload.message };
-    case "activity.updated":
-      return { type: envelope.type, sessionId, messageId: envelope.payload.messageId, activity: envelope.payload.activity };
-    case "observability.updated":
-      return { type: envelope.type, sessionId, observability: envelope.payload.observability };
-    case "attention.updated":
-      return { type: envelope.type, item: envelope.payload.item };
-    case "ledger.entry-added":
-      return { type: envelope.type, entry: envelope.payload.entry };
-    case "ledger.entry-updated":
-      return { type: envelope.type, entry: envelope.payload.entry };
-    case "log.appended":
-      return { type: envelope.type, entry: envelope.payload.entry };
-    case "bootstrap.updated":
-      return { type: envelope.type, bootstrap: envelope.payload.bootstrap };
-    case "warning":
-      return { type: envelope.type, message: envelope.payload.message };
-    case "error":
-      return { type: envelope.type, message: envelope.payload.message };
-    case "cancelled":
-      return envelope.payload.messageId !== undefined
-        ? { type: envelope.type, sessionId, messageId: envelope.payload.messageId }
-        : { type: envelope.type, sessionId };
   }
 }
 

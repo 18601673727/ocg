@@ -24,19 +24,6 @@ export type AttentionKind =
   | "retry"
   | "escalation";
 
-export const ATTENTION_KINDS: readonly AttentionKind[] = [
-  "approval",
-  "budget",
-  "policy",
-  "permission",
-  "blocked",
-  "runtime-failure",
-  "resource-degraded",
-  "configuration",
-  "retry",
-  "escalation",
-];
-
 export type AttentionLifecycle =
   | "pending"
   | "acknowledged"
@@ -164,13 +151,6 @@ export type AttentionItem = {
 
 export type AttentionTab = "overview" | "approvals" | "blocked" | "resolved";
 
-export const ATTENTION_TABS: readonly AttentionTab[] = [
-  "overview",
-  "approvals",
-  "blocked",
-  "resolved",
-];
-
 const UNRESOLVED: readonly AttentionLifecycle[] = ["pending", "acknowledged"];
 
 export function isUnresolved(item: AttentionItem): boolean {
@@ -184,52 +164,3 @@ export function isApprovalItem(item: AttentionItem): boolean {
 export function isBlockedItem(item: AttentionItem): boolean {
   return item.kind === "blocked" || item.blocked !== null;
 }
-
-/** Display labels kept next to the domain so list + inspector agree. */
-export const ATTENTION_KIND_LABELS: Record<AttentionKind, string> = {
-  approval: "Approval",
-  budget: "Budget",
-  policy: "Policy",
-  permission: "Permission",
-  blocked: "Blocked",
-  "runtime-failure": "Runtime failure",
-  "resource-degraded": "Resource degraded",
-  configuration: "Configuration",
-  retry: "Retry",
-  escalation: "Escalation",
-};
-
-export const ATTENTION_SEVERITY_LABELS: Record<AttentionSeverity, string> = {
-  info: "Info",
-  warning: "Warning",
-  high: "High",
-  critical: "Critical",
-};
-
-export const ATTENTION_STATUS_LABELS: Record<AttentionLifecycle, string> = {
-  pending: "Pending",
-  acknowledged: "Acknowledged",
-  approved: "Approved",
-  rejected: "Rejected",
-  resolved: "Resolved",
-  expired: "Expired",
-  superseded: "Superseded",
-};
-
-export const ATTENTION_SOURCE_LABELS: Record<AttentionSource, string> = {
-  execution: "Execution",
-  runtime: "Runtime",
-  provider: "Provider",
-  resource: "Resource",
-  policy: "Policy",
-  configuration: "Configuration",
-};
-
-export const APPROVAL_TYPE_LABELS: Record<ApprovalType, string> = {
-  "job-launch": "Job launch",
-  "spend-increase": "Spend increase",
-  "provider-use": "Provider use",
-  "external-action": "External action",
-  "retry-escalation": "Retry escalation",
-  "policy-exception": "Policy exception",
-};

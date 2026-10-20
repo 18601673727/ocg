@@ -26,43 +26,6 @@ export type MessageStatus =
   | "unknown"
   | "failed";
 
-/**
- * The lifecycle words a Call admits, drawn from the contract's `CallLifecycle`.
- *
- * `succeeded` is the contract word for a settled Call; `completed` is the
- * display alias this UI uses, since the control surface renders the word
- * `completed` in the substrate column even for a successful outcome.
- */
-export type CallActivityStatus =
-  | "created"
-  | "queued"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled";
-
-/**
- * Maps the contract's canonical state onto the UI-visible vocabulary.
- *
- * `completed` is mapped from `succeeded` to match the substrate's column word;
- * the rest are preserved verbatim so the UI is always readable in the contract's
- * own dialect.
- */
-export function callActivityStatusFrom(state: string): CallActivityStatus {
-  switch (state) {
-    case "created":
-    case "queued":
-    case "running":
-    case "succeeded":
-    case "completed":
-    case "failed":
-    case "cancelled":
-      return state === "succeeded" ? "completed" : state;
-    default:
-      return "completed";
-  }
-}
-
 /** One managed Call shown inline in the conversation. */
 export type CallActivity = {
   id: string;
@@ -154,10 +117,3 @@ export type OcgRuntimeEvent =
   | { type: "warning"; message: string }
   | { type: "error"; message: string }
   | { type: "cancelled"; sessionId: string; messageId?: string };
-
-export const WORK_TYPE_LABEL: Record<WorkType, string> = {
-  research: "Research",
-  coding: "Coding",
-  design: "Design",
-  devops: "DevOps",
-};

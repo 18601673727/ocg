@@ -177,7 +177,3 @@ export function selectCanonical(state: CanonicalState): CanonicalSelectors {
     attemptHistory: execution?.attempts ?? [],
   };
 }
-
-export function selectJobExecution(state: CanonicalState): JobExecution | null {
-  return selectCanonical(state).execution;
-}

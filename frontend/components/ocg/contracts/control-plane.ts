@@ -210,8 +210,6 @@ function conversationRecord(input: unknown) {
   };
 }
 
-export type ControlConversationEntry = ReturnType<typeof conversationRecord>;
-
 export function decodeConversations(input: unknown) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
@@ -223,8 +221,6 @@ export function decodeConversations(input: unknown) {
     has_more: boolean(envelope.has_more, "has_more"),
   };
 }
-
-export type ControlConversations = ReturnType<typeof decodeConversations>;
 
 function observationPage(input: unknown) {
   const envelope = record(input, "response");
@@ -690,7 +686,6 @@ export type ControlPools = ReturnType<typeof decodePools>;
 export type ControlPool = ControlPools["pools"][number];
 export type ControlProjects = ReturnType<typeof decodeProjects>;
 export type ControlProject = ControlProjects["projects"][number];
-export type ControlJobInput = ReturnType<typeof decodeJobInput>;
 export type ControlAgentProfiles = ReturnType<typeof decodeAgentProfiles>;
 export type ControlAgentProfile = ControlAgentProfiles["agent_profiles"][number];
 
@@ -815,7 +810,6 @@ export type ControlAgentBehavior = "chat" | "general";
 export type ControlProfilesSnapshot = ReturnType<typeof decodeProfiles>;
 export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
 export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
-export type ControlProviderProjection = ControlProfilesSnapshot["providers"][number];
 
 /**
  * An image Attachment as `POST /api/v1/attachments` and

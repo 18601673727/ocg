@@ -432,13 +432,6 @@ function callActivity(call: ExecutionCall, jobId: string): CallActivityItem {
   };
 }
 
-export function boundActivity(
-  items: readonly CallActivityItem[],
-  limit = 80,
-): CallActivityItem[] {
-  return items.slice(Math.max(0, items.length - limit));
-}
-
 /* -------------------------------------------------------------------------- */
 /* Job                                                                        */
 /* -------------------------------------------------------------------------- */
@@ -580,66 +573,6 @@ export type JobTreeNode = {
   children: JobTreeNode[];
 };
 
-export type JobTreeProjection = {
-  root: JobTreeNode;
-  /** `false` when the walk stopped at a loaded ancestor short of the canonical root. */
-  reachedRoot: boolean;
-  /** A repeated Job id was found while descending; that branch stopped rather than looping. */
-  cyclic: boolean;
-  /** Descendants of the root this view has actually loaded (excludes the root itself). */
-  loadedDescendantCount: number;
-};
-
-/**
- * The Job's ownership/spawn subtree, built only from already-loaded Project
- * Jobs. Nothing outside `executions` is fetched to complete it: an ancestor or
- * child this view has not loaded yet renders as an unresolved stub instead of
- * triggering a request.
- */
-export function jobTreeOf(
-  execution: JobExecution,
-  executions: readonly JobExecution[],
-): JobTreeProjection {
-  const byId = new Map(executions.map((item) => [item.jobId, item] as const));
-  byId.set(execution.jobId, execution);
-
-  let localRootId = execution.jobId;
-  const ancestry = new Set([localRootId]);
-  for (;;) {
-    const parentId = byId.get(localRootId)?.parentJobId ?? null;
-    if (parentId === null || !byId.has(parentId) || ancestry.has(parentId)) break;
-    localRootId = parentId;
-    ancestry.add(localRootId);
-  }
-
-  let cyclic = false;
-  let loadedDescendantCount = 0;
-  const visited = new Set<string>();
-  function build(jobId: string): JobTreeNode {
-    const loadedJob = byId.get(jobId);
-    if (visited.has(jobId)) {
-      cyclic = true;
-      return { jobId, state: loadedJob?.state ?? null, loaded: loadedJob !== undefined, isCurrent: jobId === execution.jobId, children: [] };
-    }
-    visited.add(jobId);
-    if (loadedJob !== undefined && jobId !== localRootId) loadedDescendantCount += 1;
-    return {
-      jobId,
-      state: loadedJob?.state ?? null,
-      loaded: loadedJob !== undefined,
-      isCurrent: jobId === execution.jobId,
-      children: (loadedJob?.childJobIds ?? []).map(build),
-    };
-  }
-
-  return {
-    root: build(localRootId),
-    reachedRoot: localRootId === execution.rootJobId,
-    cyclic,
-    loadedDescendantCount,
-  };
-}
-
 /* -------------------------------------------------------------------------- */
 /* Recovery (watchdog classification/action/outcome history)                 */
 /* -------------------------------------------------------------------------- */
@@ -752,56 +685,6 @@ export type JobExecution = {
   latestCall: ExecutionCall | null;
   activities: CallActivityItem[];
 };
-
-export type CallFilters = {
-  query?: string;
-  status?: CallStatus;
-  executorId?: string;
-  /** Restrict to one Attempt generation; `undefined` means every generation. */
-  attemptGeneration?: number;
-};
-
-/** Pure Call filter for the dense execution tables. */
-export function filterCalls(
-  calls: readonly ExecutionCall[],
-  filters: CallFilters = {},
-): ExecutionCall[] {
-  const query = filters.query?.trim().toLowerCase();
-  return calls.filter((call) => {
-    if (filters.status !== undefined && call.status !== filters.status) return false;
-    if (filters.executorId !== undefined && call.executorId !== filters.executorId) return false;
-    if (
-      filters.attemptGeneration !== undefined &&
-      call.attemptGeneration !== filters.attemptGeneration
-    ) {
-      return false;
-    }
-    if (!query) return true;
-    return (
-      call.callId.toLowerCase().includes(query) ||
-      (call.executorId?.toLowerCase().includes(query) ?? false) ||
-      call.rawState.toLowerCase().includes(query) ||
-      call.effectKind.toLowerCase().includes(query)
-    );
-  });
-}
-
-/** Calls one Executor ran, in canonical creation order. */
-export function callsForExecutor(
-  calls: readonly ExecutionCall[],
-  executor: ExecutionExecutor,
-): ExecutionCall[] {
-  const ids = new Set(executor.callIds);
-  return calls.filter((call) => ids.has(call.id));
-}
-
-/** Calls owned by one Attempt generation, in canonical creation order. */
-export function callsForGeneration(
-  calls: readonly ExecutionCall[],
-  generation: number,
-): ExecutionCall[] {
-  return calls.filter((call) => call.attemptGeneration === generation);
-}
 
 /**
  * Assembles the read model from validated canonical entities.

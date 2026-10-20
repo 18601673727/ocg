@@ -1,10 +1,7 @@
 import {
-  BOOTSTRAP_MODES,
   ONBOARDING_STAGES,
   type BootstrapAccess,
-  type BootstrapEntry,
   type BootstrapFailure,
-  type BootstrapMode,
   type BootstrapModel,
   type BootstrapOnboarding,
   type BootstrapProfile,
@@ -23,12 +20,6 @@ const ACCESS_REQUIRED_STATES: readonly BootstrapAccess["state"][] = [
 
 export function isOnboardingStageId(value: unknown): value is OnboardingStageId {
   return typeof value === "string" && (ONBOARDING_STAGES as readonly string[]).includes(value);
-}
-
-export function normalizeOnboardingMode(value: unknown): BootstrapMode {
-  return typeof value === "string" && (BOOTSTRAP_MODES as readonly string[]).includes(value)
-    ? (value as BootstrapMode)
-    : "firstRun";
 }
 
 /** Remote access is required before the shell or onboarding can be trusted. */
@@ -50,12 +41,6 @@ export function isOnboardingComplete(state: BootstrapState): boolean {
   return state.onboarding.completedStages.includes("ready");
 }
 
-export function selectBootstrapEntry(state: BootstrapState): BootstrapEntry {
-  if (isAccessRequired(state.access)) return "login";
-  if (state.onboarding && !isOnboardingComplete(state)) return "onboarding";
-  return "app";
-}
-
 /** Unknown or missing stage values degrade to the first stage instead of guessing. */
 export function selectActiveOnboardingStage(state: BootstrapState): OnboardingStageId {
   const stage = state.onboarding?.stage as unknown;
@@ -69,11 +54,6 @@ export function selectStageIndex(stage: OnboardingStageId): number {
 
 export function selectNextStage(stage: OnboardingStageId): OnboardingStageId | null {
   return ONBOARDING_STAGES[selectStageIndex(stage) + 1] ?? null;
-}
-
-export function selectPreviousStage(stage: OnboardingStageId): OnboardingStageId | null {
-  const index = selectStageIndex(stage);
-  return index > 0 ? ONBOARDING_STAGES[index - 1] : null;
 }
 
 export function selectRecommendedProfile(state: BootstrapState): BootstrapProfile | null {
@@ -143,26 +123,6 @@ export type OnboardingProgress = {
   completed: number;
   percent: number;
 };
-
-export function selectOnboardingProgress(state: BootstrapState): OnboardingProgress {
-  const total = ONBOARDING_STAGES.length;
-  const completed = ONBOARDING_STAGES.filter((stage) =>
-    state.onboarding?.completedStages.includes(stage),
-  ).length;
-  const current = selectStageIndex(selectActiveOnboardingStage(state)) + 1;
-  return { current, total, completed, percent: Math.round((completed / total) * 100) };
-}
-
-/**
- * Resume is offered only when a usable access session has saved, unfinished
- * progress. Access-gated and untouched setups are not "resumable".
- */
-export function canResumeOnboarding(state: BootstrapState): boolean {
-  if (!state.onboarding) return false;
-  if (isOnboardingComplete(state)) return false;
-  if (!isAccessUsable(state.access)) return false;
-  return state.onboarding.completedStages.length > 0;
-}
 
 function withStageCompleted(onboarding: BootstrapOnboarding, stage: OnboardingStageId): OnboardingStageId[] {
   return onboarding.completedStages.includes(stage)

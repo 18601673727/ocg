@@ -7,13 +7,10 @@
  */
 
 import type { RuntimeSnapshot } from "../runtime/runtime-types";
-import type { ChatSession } from "../types";
 import type { AttentionItem } from "../attention/domain";
-import type { AttentionQueue } from "../attention/selectors";
 import type { ProjectId } from "./domain";
 import { resolveProjectId } from "./domain";
 import { projectLedgerJobIds, projectSessionIds } from "./fixtures";
-
 
 /** Fixture session IDs for a project plus any registered extra session IDs. */
 export function selectProjectSessionIds(
@@ -22,25 +19,6 @@ export function selectProjectSessionIds(
 ): string[] {
   const id = resolveProjectId(projectId);
   return [...new Set([...projectSessionIds(id), ...extraSessionIds])];
-}
-
-/** Sessions that belong to the project (fixture-owned plus registered). */
-export function selectProjectSessions(
-  sessions: readonly ChatSession[],
-  projectId: ProjectId,
-  extraSessionIds: readonly string[] = [],
-): ChatSession[] {
-  const allowed = new Set(selectProjectSessionIds(projectId, extraSessionIds));
-  return sessions.filter((session) => allowed.has(session.id));
-}
-
-/** Keep a selected session valid when a project projection changes. */
-export function resolveSelectedSessionId(
-  selectedSessionId: string | null | undefined,
-  sessions: readonly ChatSession[],
-): string | null {
-  if (sessions.some((session) => session.id === selectedSessionId)) return selectedSessionId ?? null;
-  return sessions[0]?.id ?? null;
 }
 
 /**
@@ -100,15 +78,4 @@ export function selectProjectAttentionItems(
 ): AttentionItem[] {
   const id = resolveProjectId(projectId);
   return items.filter((item) => item.projectId === id);
-}
-
-/** Project-scoped fixture queue. Never leaks another project's tagged items. */
-export function selectProjectAttentionQueue(
-  queue: AttentionQueue,
-  projectId: ProjectId,
-): AttentionQueue {
-  return {
-    approvals: selectProjectAttentionItems(queue.approvals, projectId),
-    history: selectProjectAttentionItems(queue.history, projectId),
-  };
 }

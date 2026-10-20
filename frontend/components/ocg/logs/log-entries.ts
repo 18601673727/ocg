@@ -35,24 +35,7 @@ export type LogEntry = {
   provenance?: "demo" | "derived" | "snapshot";
 };
 
-export type LogTimeWindow = "all" | "last-5-minutes" | "last-hour" | "last-day";
-
-export type LogFilters = {
-  text?: string;
-  level?: LogLevel | "all";
-  source?: string;
-  jobId?: string;
-  workerId?: string;
-  workerRole?: string;
-  provider?: string;
-  model?: string;
-  timeWindow?: LogTimeWindow;
-};
-
 export const LOG_LEVELS: readonly LogLevel[] = ["trace", "debug", "info", "warn", "error"];
-
-/** How many tail entries a surface keeps. The renderer shows this bound. */
-export const LOG_HISTORY_LIMIT = 120;
 
 const SENSITIVE_FIELD = /api[-_ ]?key|authorization|auth[-_ ]?header|bearer|cookie|credential|jwt|password|secret|token/i;
 
@@ -112,62 +95,4 @@ export function normalizeLogEntry(entry: LogEntry): LogEntry {
     ...(safe.fields ? { fields: safe.fields } : {}),
     redacted: Boolean(entry.redacted || safe.redacted),
   };
-}
-
-export function boundLogEntries(entries: readonly LogEntry[], limit = LOG_HISTORY_LIMIT): LogEntry[] {
-  if (limit <= 0) return [];
-  return entries.slice(Math.max(0, entries.length - limit));
-}
-
-function matchesTimeWindow(entry: LogEntry, entries: readonly LogEntry[], timeWindow: LogTimeWindow): boolean {
-  if (timeWindow === "all") return true;
-  const latest = entries.reduce((max, item) => Math.max(max, Date.parse(item.timestamp)), Number.NEGATIVE_INFINITY);
-  const timestamp = Date.parse(entry.timestamp);
-  const duration = timeWindow === "last-5-minutes"
-    ? 5 * 60_000
-    : timeWindow === "last-hour"
-      ? 60 * 60_000
-      : 24 * 60 * 60_000;
-  return Number.isFinite(timestamp) && Number.isFinite(latest) && timestamp >= latest - duration;
-}
-
-export function filterLogEntries(entries: readonly LogEntry[], filters: LogFilters = {}): LogEntry[] {
-  const query = filters.text?.trim().toLowerCase();
-  const timeWindow = filters.timeWindow ?? "all";
-  return entries.filter((entry) => {
-    const searchable = [
-      entry.message,
-      entry.source,
-      entry.category,
-      entry.jobId,
-      entry.taskId,
-      entry.workerId,
-      entry.workerRole,
-      entry.provider,
-      entry.model,
-      entry.correlationId,
-      entry.sessionId,
-      entry.invocationId,
-    ].filter(Boolean).join(" ").toLowerCase();
-    return (
-      (!query || searchable.includes(query)) &&
-      (!filters.level || filters.level === "all" || entry.level === filters.level) &&
-      (!filters.source || entry.source === filters.source) &&
-      (!filters.jobId || entry.jobId === filters.jobId) &&
-      (!filters.workerId || entry.workerId === filters.workerId) &&
-      (!filters.workerRole || entry.workerRole === filters.workerRole) &&
-      (!filters.provider || entry.provider === filters.provider) &&
-      (!filters.model || entry.model === filters.model) &&
-      matchesTimeWindow(entry, entries, timeWindow)
-    );
-  });
-}
-
-export function newLogCount(
-  currentCount: number,
-  lastSeenCount: number,
-  state: { following: boolean; atBottom: boolean },
-): number {
-  if (state.following && state.atBottom) return 0;
-  return Math.max(0, currentCount - lastSeenCount);
 }

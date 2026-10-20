@@ -121,6 +121,8 @@ export interface OcgRuntimeClient {
   readonly authority: RuntimeAuthority;
   isListedConversation?(sessionId: string): boolean;
   openConversation?(job: string): Promise<string>;
+  hasEarlierHistory?(sessionId: string): boolean;
+  loadEarlierHistory?(sessionId: string): Promise<void>;
   refreshConversations?(): Promise<void>;
   setChatSelection?(sessionId: string, selection: import("../contracts").ChatModelSelection): void;
   getRuntimeStatus(): Promise<RuntimeStatus>;
