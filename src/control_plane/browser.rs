@@ -182,6 +182,14 @@ impl State {
             self.failed.fetch_add(1, Ordering::SeqCst);
             return Err(INVALID_PAIRING);
         }
+        self.begin_session()
+    }
+
+    /// Starts the one session this operator holds without a pairing code.
+    /// Only the web surface uses it: the frontend that this listener serves
+    /// signs itself in, and the code remains for a remote control client of
+    /// a headless listener.
+    pub(super) fn begin_session(&self) -> Result<Reply, Refusal> {
         let id = random_token(ID_BYTES)?;
         let csrf = random_token(ID_BYTES)?;
         let expires_at_us = Timestamp::now().as_unix_micros()

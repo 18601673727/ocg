@@ -8,6 +8,7 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useControlPage } from "../runtime/use-control-page";
 import { JobWatch } from "./job-watch";
 import { isJobIdentity } from "../layout/view-domain";
+import { useI18n } from "../i18n";
 
 export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
   client: HttpCanonicalControlClient;
@@ -16,6 +17,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
   onJob: (job: string) => void;
   onOpenChat?: (job: string) => void;
 }) {
+  const { t } = useI18n();
   const [inspect, setInspect] = useState("");
   const load = useCallback(async (before: string | undefined, signal: AbortSignal) => {
     if (!active) return { items: [], next: null };
@@ -28,13 +30,13 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 px-4 py-6 sm:px-6">
       <section className="rounded-lg border border-border bg-card p-5">
         <div className="mb-3 flex items-center justify-between gap-3">
-          <h2 className="font-heading text-lg">Jobs</h2>
-          <Button variant="outline" size="sm" disabled={page.loading} onClick={page.refresh}>Refresh</Button>
+          <h2 className="font-heading text-lg">{t("jobs.title")}</h2>
+          <Button variant="outline" size="sm" disabled={page.loading} onClick={page.refresh}>{t("common.refresh")}</Button>
         </div>
-        <p className="mb-4 text-sm text-muted-foreground">Saved Jobs, newest first. Open one to inspect its input, output, and settlement.</p>
+        <p className="mb-4 text-sm text-muted-foreground">{t("jobs.description")}</p>
         {page.error ? <p role="alert" className="mb-3 text-sm text-destructive">{page.error}</p> : null}
-        {!page.ready && page.loading ? <p role="status">Loading Jobs…</p> : null}
-        {page.ready && page.items.length === 0 ? <p className="text-sm text-muted-foreground">No Jobs have been recorded.</p> : null}
+        {!page.ready && page.loading ? <p role="status">{t("jobs.loading")}</p> : null}
+        {page.ready && page.items.length === 0 ? <p className="text-sm text-muted-foreground">{t("jobs.empty")}</p> : null}
         <ul className="divide-y divide-border">
           {page.items.map((record) => (
             <li
@@ -53,7 +55,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
                 <span className="min-w-0">
                   <span className="font-mono">{record.id}</span>
                   <span className="ml-3 break-words">
-                    {record.is_chat && record.title ? record.title : (record.name ?? "Unnamed Job")}
+                    {record.is_chat && record.title ? record.title : (record.name ?? t("jobs.unnamed"))}
                   </span>
                 </span>
                 <span className="flex flex-wrap gap-3 text-xs text-muted-foreground">
@@ -72,24 +74,24 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
                     onOpenChat(record.id);
                   }}
                 >
-                  Open in chat
+                  {t("jobs.openInChat")}
                 </Button>
               ) : null}
             </li>
           ))}
         </ul>
-        {page.next ? <Button className="mt-3" variant="outline" disabled={page.loading} onClick={page.loadMore}>{page.loading ? "Loading…" : "Load older Jobs"}</Button> : null}
+        {page.next ? <Button className="mt-3" variant="outline" disabled={page.loading} onClick={page.loadMore}>{page.loading ? t("common.loading") : t("jobs.loadOlder")}</Button> : null}
       </section>
       <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-5">
-        <h2 className="font-heading text-lg">Inspect a Job</h2>
+        <h2 className="font-heading text-lg">{t("jobs.inspectTitle")}</h2>
         <form className="flex items-end gap-2" onSubmit={(event) => {
           event.preventDefault();
           if (isJobIdentity(inspect.trim())) onJob(inspect.trim());
         }}>
-          <label className="flex flex-1 flex-col gap-1.5 text-sm">Job identity
+          <label className="flex flex-1 flex-col gap-1.5 text-sm">{t("jobs.identity")}
             <Input value={inspect} onChange={(event) => setInspect(event.target.value)} placeholder="job:<n>" spellCheck={false} />
           </label>
-          <Button type="submit" variant="outline" disabled={!isJobIdentity(inspect.trim())}>Watch</Button>
+          <Button type="submit" variant="outline" disabled={!isJobIdentity(inspect.trim())}>{t("jobs.watch")}</Button>
         </form>
       </section>
       {job ? <JobWatch key={job} client={client} jobId={job} /> : null}

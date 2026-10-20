@@ -6,13 +6,14 @@ import { STATUS_TEXT } from "@/components/ocg/primitives";
 import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/contracts";
 import { BoundedMessage } from "./bounded-message";
 import type { TranscriptTurn } from "./job-transcript-model";
+import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 
-const STATUS_NOTE: Partial<Record<TranscriptTurn["status"], string>> = {
-  streaming: "Receiving output…",
-  pending: "Waiting for output…",
-  failed: "The Job failed.",
-  cancelled: "The Job was cancelled.",
-  unknown: "The Job's outcome is unknown. Check its record before acting on this output.",
+const STATUS_NOTE: Partial<Record<TranscriptTurn["status"], I18nKey>> = {
+  streaming: "transcript.status.streaming",
+  pending: "transcript.status.pending",
+  failed: "transcript.status.failed",
+  cancelled: "transcript.status.cancelled",
+  unknown: "transcript.status.unknown",
 };
 
 function TurnRow({
@@ -25,6 +26,7 @@ function TurnRow({
   attachmentContentUrl?: (id: string) => string;
 }) {
   const { isCopied, copyToClipboard } = useCopyToClipboard();
+  const { t } = useI18n();
   const isUser = turn.role === "user";
   const note = isUser ? undefined : STATUS_NOTE[turn.status];
   return (
@@ -40,7 +42,7 @@ function TurnRow({
       </span>
       <div className="min-w-0 flex-1">
         <div className="mb-1 flex items-center gap-2">
-          <span className="text-xs font-semibold">{isUser ? userLabel : "Answer"}</span>
+          <span className="text-xs font-semibold">{isUser ? userLabel : t("transcript.answer")}</span>
           {turn.createdAtUs === null ? null : (
             <span className="text-xs text-muted-foreground">
               {new Date(turn.createdAtUs / 1000).toLocaleTimeString()}
@@ -51,9 +53,9 @@ function TurnRow({
             onClick={() => copyToClipboard(turn.content)}
             disabled={turn.content.length === 0}
             className="ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-40"
-            aria-label={isUser ? "Copy the message" : "Copy the answer"}
+            aria-label={isUser ? t("transcript.copyMessage") : t("transcript.copyAnswer")}
           >
-            <span role="status">{isCopied ? "Copied" : "Copy"}</span>
+            <span role="status">{isCopied ? t("common.copied") : t("common.copy")}</span>
           </button>
         </div>
         <div
@@ -102,7 +104,7 @@ function TurnRow({
               {turn.detail}
             </p>
           ) : null}
-          {note ? <span className="mt-1 block text-xs text-muted-foreground">{note}</span> : null}
+          {note ? <span className="mt-1 block text-xs text-muted-foreground">{t(note)}</span> : null}
         </div>
         {!isUser && turn.tools && turn.tools.length > 0 ? (
           <TurnToolCalls
@@ -141,6 +143,22 @@ function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined, isLive: b
   return kind;
 }
 
+function outcomeText(t: TranslateFn, kind: ControlToolOutcomeKind | null | undefined, isLive: boolean): string {
+  if (!kind) return isLive ? t("transcript.outcome.running") : t("transcript.outcome.uncertain");
+  switch (kind) {
+    case "completed":
+      return t("state.completed");
+    case "completed_withheld":
+      return t("transcript.outcome.completedWithheld");
+    case "not_applied":
+      return t("transcript.outcome.notApplied");
+    case "not_invoked":
+      return t("transcript.outcome.notInvoked");
+    case "uncertain":
+      return t("transcript.outcome.uncertain");
+  }
+}
+
 function TurnToolCalls({
   tools,
   isLive,
@@ -148,10 +166,11 @@ function TurnToolCalls({
   tools: readonly ControlToolCall[];
   isLive: boolean;
 }) {
+  const { t } = useI18n();
   return (
     <details className="mt-2.5 rounded-md border border-border bg-muted/20 text-xs">
       <summary className="cursor-pointer select-none px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
-        Tool calls ({tools.length})
+        {t("transcript.toolCalls", { count: tools.length })}
       </summary>
       <div className="flex flex-col gap-2 p-3 pt-0">
         {tools.map((tool) => {
@@ -189,21 +208,21 @@ function TurnToolCalls({
                       "border border-border bg-muted text-muted-foreground",
                   )}
                 >
-                  {outcome}
+                  {outcomeText(t, tool.outcome_kind, isLive)}
                 </span>
               </summary>
               <div className="mt-2 space-y-2 border-t border-border pt-2 font-mono text-xs">
                 {tool.decision !== "admitted" ? (
                   <div className="font-sans text-xs text-destructive">
-                    Decision: {tool.decision}
+                    {t("transcript.decision", { decision: tool.decision })}
                   </div>
                 ) : null}
                 <div>
                   <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
-                    <span>Arguments</span>
+                    <span>{t("transcript.arguments")}</span>
                     {tool.arguments_cut ? (
                       <span className="text-[10px] font-semibold text-amber-500">
-                        (cut to 2 KiB)
+                        {t("transcript.cut")}
                       </span>
                     ) : null}
                   </div>
@@ -213,10 +232,10 @@ function TurnToolCalls({
                 </div>
                 <div>
                   <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
-                    <span>Result</span>
+                    <span>{t("transcript.result")}</span>
                     {tool.result_cut ? (
                       <span className="text-[10px] font-semibold text-amber-500">
-                        (cut to 2 KiB)
+                        {t("transcript.cut")}
                       </span>
                     ) : null}
                   </div>

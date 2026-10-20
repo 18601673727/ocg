@@ -182,7 +182,7 @@ export function OcgSidebar({
   // while the conversation list and New chat serve Chat directly.
   const workbenchNav = canonicalMode ? workspaceNav.filter(item => item.target !== "chat") : [];
   const hasNav = Boolean(onNavigate);
-  const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => (item.target === "jobs" ? "Jobs" : t(item.labelKey));
+  const navLabel = (item: (typeof WORKSPACE_NAV)[number]) => (item.target === "jobs" ? t("nav.jobExecution") : t(item.labelKey));
 
   const renderWorkspaceItem = (item: (typeof WORKSPACE_NAV)[number]) => {
     const Icon = item.icon;

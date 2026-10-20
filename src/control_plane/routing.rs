@@ -67,7 +67,7 @@ pub(super) enum Route {
 /// The session routes are the browser's alone.
 pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal> {
     let allowed = match (caller, &route) {
-        (Caller::Anonymous, Route::SessionCreate) => true,
+        (Caller::Anonymous, Route::SessionCreate | Route::SessionStatus) => true,
         (
             Caller::Programmatic,
             Route::SessionCreate | Route::SessionStatus | Route::SessionRevoke,
@@ -383,6 +383,12 @@ pub(super) async fn respond(
         }
         Route::SessionStatus => match caller {
             Caller::Operator(session) => Ok(Reply::ok(browser::described(session))),
+            // The served frontend signs itself in; a headless listener has
+            // no page to do that from and keeps the pairing code.
+            Caller::Anonymous if shared.assets.is_some() => {
+                let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
+                browser.begin_session()
+            }
             _ => Err(NOT_FOUND),
         },
         Route::SessionRevoke => match caller {

@@ -99,11 +99,12 @@
 //!   earlier process. A requested stop is not an outcome: the Job's record
 //!   says how it settled.
 //! - `POST /api/v1/session`: signs the operator's browser in under the
-//!   pairing code this run printed for its operator, and sets its session
-//!   cookie; `GET /api/v1/session` reports that session and the CSRF
-//!   token its requests carry; `DELETE /api/v1/session` revokes it and
-//!   clears the cookie. The browser's alone: a bearer token reaches none
-//!   of them. See [`browser`].
+//!   pairing code this run printed for a headless listener, and sets its
+//!   session cookie; `GET /api/v1/session` reports that session and the CSRF
+//!   token its requests carry, and, when a frontend is served, begins the
+//!   session itself so the page needs no code; `DELETE /api/v1/session`
+//!   revokes it and clears the cookie. The browser's alone: a bearer token
+//!   reaches none of them. See [`browser`].
 //!
 //! A request is answered with a small JSON body, an error with a fixed
 //! code and message that repeats nothing the request or the database

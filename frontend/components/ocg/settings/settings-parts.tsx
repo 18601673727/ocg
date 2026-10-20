@@ -32,13 +32,13 @@ export function Section({
   );
 }
 
-export function describeError(error: unknown): string {
+export function describeError(error: unknown, t: TranslateFn): string {
   if (error instanceof ControlTransportError) {
     return error.detail
       ? `${error.detail} (${error.code})`
-      : `Request refused (${error.code}, HTTP ${error.status}).`;
+      : t("settings.error.refused", { code: error.code, status: error.status });
   }
-  return error instanceof Error ? error.message : "The request could not be completed.";
+  return error instanceof Error ? error.message : t("settings.error.incomplete");
 }
 
 export function refusalText(
@@ -52,5 +52,5 @@ export function refusalText(
       return t(key, { detail: error.detail });
     }
   }
-  return describeError(error);
+  return describeError(error, t);
 }

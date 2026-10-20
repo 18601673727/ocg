@@ -17,6 +17,7 @@ import {
   type ControlOutput,
   type ControlToolCall,
 } from "@/components/ocg/contracts";
+import { useI18n, type I18nKey, type TranslateFn } from "@/components/ocg/i18n";
 
 type StreamState = "loading" | "live" | "reconnecting" | "settled" | "stream_error" | "closed";
 
@@ -30,13 +31,30 @@ function formatMicros(micros: number | null): string {
   return micros === null ? "—" : new Date(micros / 1000).toLocaleString();
 }
 
-function failureText(failure: { code: string; scope: "read" | "stream" }): string {
-  if (failure.code === "job_not_found") return "No such Job.";
-  if (failure.code === "unauthenticated") return "This session is no longer signed in.";
+function failureText(t: TranslateFn, failure: { code: string; scope: "read" | "stream" }): string {
+  if (failure.code === "job_not_found") return t("job.failure.notFound");
+  if (failure.code === "unauthenticated") return t("job.failure.unauthenticated");
+  if (failure.code === "contract") return t("job.failure.contract");
+  if (failure.code === "unreachable") return t("job.failure.unreachable");
   return failure.scope === "stream"
-    ? `The stream failed (${failure.code}).`
-    : `This Job could not be read (${failure.code}).`;
+    ? t("job.failure.stream", { code: failure.code })
+    : t("job.failure.read", { code: failure.code });
 }
+
+const STATE_KEYS: Record<string, I18nKey> = {
+  loading: "job.state.loading",
+  unavailable: "job.state.unavailable",
+  unsettled: "job.state.unsettled",
+  completed: "state.completed",
+  failed: "state.failed",
+  cancelled: "state.cancelled",
+  unknown: "state.unknown",
+  live: "job.stream.live",
+  reconnecting: "job.stream.reconnecting",
+  settled: "state.settled",
+  stream_error: "job.stream.error",
+  closed: "job.stream.closed",
+};
 
 const TONE: Record<string, string> = {
   loading: "bg-muted text-muted-foreground",
@@ -86,6 +104,7 @@ function JobWatchBody({
   ) => void;
   onRetry: () => void;
 }) {
+  const { t } = useI18n();
   const [job, setJob] = useState<ControlJob | null>(null);
   const [outputs, setOutputs] = useState<ControlOutput[]>([]);
   const [tools, setTools] = useState<ControlToolCall[]>([]);
@@ -309,20 +328,20 @@ function JobWatchBody({
       const result = await client.stopJob(jobId);
       setStop(
         result.status === "requested"
-          ? "The stop was requested of this Job's execution. Its record will say how it settled."
-          : "The Job had already settled.",
+          ? t("job.stop.requested")
+          : t("job.stop.settled"),
       );
     } catch (error) {
       if (error instanceof ControlTransportError) {
         setStop(
           error.code === "not_stoppable"
-            ? "This Job has no execution here to stop."
-            : `The stop was refused (${error.code}).`,
+            ? t("job.stop.notStoppable")
+            : t("job.stop.refused", { code: error.code }),
         );
       } else if (error instanceof ContractError) {
-        setStop("The stop answer did not match the control contract.");
+        setStop(t("job.stop.contract"));
       } else {
-        setStop("OCG could not be reached.");
+        setStop(t("job.stop.unreachable"));
       }
     } finally {
       setStopBusy(false);
@@ -336,24 +355,24 @@ function JobWatchBody({
   const recordFacts = (
     <dl className="grid gap-x-6 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
       <div className="flex justify-between gap-2">
-        <dt>Created</dt>
+        <dt>{t("job.fact.created")}</dt>
         <dd>{formatMicros(job?.created_at_us ?? null)}</dd>
       </div>
       <div className="flex justify-between gap-2">
-        <dt>Started</dt>
+        <dt>{t("job.fact.started")}</dt>
         <dd>{formatMicros(job?.started_at_us ?? null)}</dd>
       </div>
       <div className="flex justify-between gap-2">
-        <dt>Updated</dt>
+        <dt>{t("job.fact.updated")}</dt>
         <dd>{formatMicros(job?.updated_at_us ?? null)}</dd>
       </div>
       <div className="flex justify-between gap-2">
-        <dt>Settled</dt>
+        <dt>{t("job.fact.settled")}</dt>
         <dd>{formatMicros(settlement?.settled_at_us ?? null)}</dd>
       </div>
       {job ? (
         <div className="flex justify-between gap-2">
-          <dt>Input</dt>
+          <dt>{t("job.fact.input")}</dt>
           <dd>
             <code className="font-geist-mono">{job.input}</code>
           </dd>
@@ -361,7 +380,7 @@ function JobWatchBody({
       ) : null}
       {job?.previous ? (
         <div className="flex justify-between gap-2">
-          <dt>Previous Job</dt>
+          <dt>{t("job.fact.previous")}</dt>
           <dd>
             <code className="font-geist-mono">{job.previous}</code>
           </dd>
@@ -369,7 +388,7 @@ function JobWatchBody({
       ) : null}
       {settlement?.state === "unknown" ? (
         <div className="flex justify-between gap-2">
-          <dt>Stop confirmed</dt>
+          <dt>{t("job.fact.stopConfirmed")}</dt>
           <dd>{formatMicros(settlement.stop_confirmed_at_us)}</dd>
         </div>
       ) : null}
@@ -378,7 +397,7 @@ function JobWatchBody({
   const storedOutputs = job ? (
       <details className="flex flex-col gap-2">
         <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-          Stored outputs ({outputs.length})
+          {t("job.storedOutputs", { count: outputs.length })}
         </summary>
         <ol className="mt-2 flex flex-col gap-2">
           {outputs.map((output) => (
@@ -393,7 +412,7 @@ function JobWatchBody({
                 </span>
                 <span>{formatMicros(output.created_at_us)}</span>
                 {output.goal_reached === null ? null : (
-                  <span>{output.goal_reached ? "goal reached" : "goal not reached"}</span>
+                  <span>{output.goal_reached ? t("job.goalReached") : t("job.goalNotReached")}</span>
                 )}
               </div>
               {output.summary ? <p className="text-sm">{output.summary}</p> : null}
@@ -424,11 +443,11 @@ function JobWatchBody({
           input !== null && "attachments" in input ? input.attachments : undefined,
           tools,
         )}
-        userLabel={presentation === "chat" ? "You" : "Objective"}
+        userLabel={presentation === "chat" ? t("job.you") : t("job.objective")}
         attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
       />
       {input !== null && "error" in input ? (
-        <p className="text-xs text-muted-foreground">The objective could not be read ({input.error}).</p>
+        <p className="text-xs text-muted-foreground">{t("job.objectiveUnreadable", { error: input.error })}</p>
       ) : null}
     </>
   ) : null;
@@ -446,10 +465,10 @@ function JobWatchBody({
         </div>
         <div className="flex items-center gap-2">
           <span className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${TONE[badge] ?? TONE.unsettled}`}>
-            {badge}
+            {t(STATE_KEYS[badge] ?? "state.unknown")}
           </span>
           <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-            {stream}
+            {t(STATE_KEYS[stream] ?? "state.unknown")}
           </span>
           <Button
             variant="outline"
@@ -457,16 +476,16 @@ function JobWatchBody({
             onClick={() => void requestStop()}
             disabled={stopBusy || state !== "unsettled"}
           >
-            {stopBusy ? "Requesting…" : "Request stop"}
+            {stopBusy ? t("job.requestingStop") : t("job.requestStop")}
           </Button>
         </div>
       </header>
       {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
       {failure ? (
         <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-destructive">
-          <p>{failureText(failure)}</p>
+          <p>{failureText(t, failure)}</p>
           <Button variant="outline" size="sm" onClick={onRetry}>
-            Retry
+            {t("common.retry")}
           </Button>
         </div>
       ) : null}
@@ -475,7 +494,7 @@ function JobWatchBody({
           {answer}
           <details className="flex flex-col gap-3">
             <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-              Job record
+              {t("job.record")}
             </summary>
             <div className="mt-3 flex flex-col gap-4">
               {recordFacts}

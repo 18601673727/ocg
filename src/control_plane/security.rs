@@ -117,6 +117,16 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
             return Err(NOT_FOUND);
         }
         Caller::Anonymous
+    } else if login
+        && *method == Method::GET
+        && shared.assets.is_some()
+        && headers.get_all(header::AUTHORIZATION).count() == 0
+    {
+        // The frontend this listener serves signs itself in: a browser with
+        // no live session, or one from an earlier run, is answered as
+        // anonymous here so the route can begin one. The pairing code stays
+        // for a headless listener's remote control client.
+        authenticate(headers, shared).unwrap_or(Caller::Anonymous)
     } else {
         authenticate(headers, shared)?
     };

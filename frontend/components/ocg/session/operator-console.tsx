@@ -13,6 +13,7 @@ import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/oper
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
 import { SessionActions } from "../login/access-boundary";
 import { AppShell } from "@/components/ocg/layout/app-shell";
+import { useI18n } from "../i18n";
 
 type Phase = "checking" | "out" | "in" | "unreachable";
 
@@ -20,6 +21,7 @@ type Health = ReturnType<typeof decodeHealth>;
 
 /** The local operator console: one browser session on this machine. */
 export function OperatorConsole() {
+  const { t } = useI18n();
   const [client, setClient] = useState<HttpCanonicalControlClient | null>(null);
   const [phase, setPhase] = useState<Phase>("checking");
   const [session, setSession] = useState<OperatorSession | null>(null);
@@ -101,7 +103,7 @@ export function OperatorConsole() {
       if (!(error instanceof ControlTransportError && error.status === 401)) {
         const code = error instanceof ControlTransportError ? error.code : "invalid_response";
         setSignOutError(
-          `Sign out could not be confirmed (${code}). Your session may still be active. Retry Sign out when the Control Plane is reachable; do not assume this browser is signed out.`,
+          t("session.signOutUnconfirmed", { code }),
         );
         return;
       }
@@ -117,7 +119,7 @@ export function OperatorConsole() {
   if (phase === "checking") {
     return (
       <main className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-        Checking this session…
+        {t("session.checking")}
       </main>
     );
   }
@@ -126,10 +128,10 @@ export function OperatorConsole() {
     return (
       <main className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-4 px-6 py-16">
         <p className="text-sm text-muted-foreground">
-          The OCG Control Plane did not answer. It may be restarting.
+          {t("session.unreachable")}
         </p>
         <Button variant="outline" onClick={() => window.location.reload()}>
-          Try again
+          {t("session.retry")}
         </Button>
       </main>
     );

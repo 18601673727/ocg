@@ -52,12 +52,12 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
         }
       })
       .catch((err: unknown) => {
-        if (!signal?.aborted) setLoadError(describeError(err));
+        if (!signal?.aborted) setLoadError(describeError(err, t));
       })
       .finally(() => {
         if (!signal?.aborted) setLoading(false);
       }),
-    [client]
+    [client, t]
   );
 
   useEffect(() => {

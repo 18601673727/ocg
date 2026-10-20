@@ -11,12 +11,12 @@ export function LanguageSwitcher({
   variant?: "segmented" | "select";
   className?: string;
 }) {
-  const { locale, setLocale } = useI18n();
+  const { locale, setLocale, t } = useI18n();
 
   if (variant === "select") {
     return (
       <label className={cn("inline-flex items-center gap-2 text-xs", className)}>
-        <span className="sr-only">Language</span>
+        <span className="sr-only">{t("language.title")}</span>
         <select
           value={locale}
           onChange={(event) => {
@@ -38,7 +38,7 @@ export function LanguageSwitcher({
   return (
     <div
       role="group"
-      aria-label="Language"
+      aria-label={t("language.title")}
       className={cn("flex flex-wrap gap-2", className)}
     >
       {LOCALES.map((option) => (

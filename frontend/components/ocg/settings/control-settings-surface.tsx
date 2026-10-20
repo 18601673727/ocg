@@ -22,18 +22,18 @@ import { Section, describeError } from "./settings-parts";
 import { ProjectsSection } from "./projects-section";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
-import { LanguageSwitcher, useI18n } from "../i18n";
+import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
 
 type Health = {
   host: string;
   database: { status: string; accepting_commands: boolean; readable: boolean };
 };
 
-const ALL_CAPABILITIES: readonly { value: ControlCapability; label: string }[] = [
-  { value: "chat", label: "Chat" },
-  { value: "vision", label: "Vision" },
-  { value: "tools", label: "Tools" },
-  { value: "reasoning", label: "Reasoning" },
+const ALL_CAPABILITIES: readonly { value: ControlCapability; labelKey: I18nKey }[] = [
+  { value: "chat", labelKey: "settings.llm.capabilityChat" },
+  { value: "vision", labelKey: "settings.llm.capabilityVision" },
+  { value: "tools", labelKey: "settings.llm.capabilityTools" },
+  { value: "reasoning", labelKey: "settings.llm.capabilityReasoning" },
 ];
 
 function ChoiceGroup<T extends string>({
@@ -80,13 +80,14 @@ function SettingRow({
   origin: "browser" | "runtime";
   children: ReactNode;
 }) {
+  const { t } = useI18n();
   return (
     <div className="flex min-w-0 flex-col gap-2 border-b border-border/70 py-3 last:border-b-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
       <div className="min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <h3 className="text-sm font-medium">{label}</h3>
           <Pill tone={origin === "browser" ? "violet" : "sky"} className="text-xs normal-case">
-            {origin === "browser" ? "Browser only" : "Reported by OCG"}
+            {origin === "browser" ? t("settings.origin.browser") : t("settings.origin.runtime")}
           </Pill>
         </div>
         <p className="mt-1 max-w-2xl text-[13px] leading-5 text-muted-foreground">{description}</p>
@@ -155,14 +156,14 @@ export function SettingsSurface({
       }
     } catch (error) {
       if (!signal?.aborted) {
-        setLoadError(describeError(error));
+        setLoadError(describeError(error, t));
       }
     } finally {
       if (!signal?.aborted) {
         setLoadingProfiles(false);
       }
     }
-  }, [client]);
+  }, [client, t]);
 
   useEffect(() => {
     if (!client) return;
@@ -177,7 +178,7 @@ export function SettingsSurface({
         }
       } catch (error) {
         if (!aborted) {
-          setLoadError(describeError(error));
+          setLoadError(describeError(error, t));
           setLoadingProfiles(false);
         }
       }
@@ -186,7 +187,7 @@ export function SettingsSurface({
       aborted = true;
       controller.abort();
     };
-  }, [client]);
+  }, [client, t]);
 
   function resetLlmForm() {
     setEditingLlmId(null);
@@ -233,25 +234,25 @@ export function SettingsSurface({
     const trimmedName = llmName.trim();
     const trimmedModel = llmModel.trim();
     if (!trimmedName) {
-      setLlmError("Profile name is required.");
+      setLlmError(t("settings.llm.validation.name"));
       return;
     }
     if (!trimmedModel) {
-      setLlmError("Model identifier is required.");
+      setLlmError(t("settings.llm.validation.model"));
       return;
     }
     if (llmCapabilities.length === 0) {
-      setLlmError("Select at least one model capability.");
+      setLlmError(t("settings.llm.validation.capabilities"));
       return;
     }
     const parsedTemp = llmTemperature.trim() === "" ? null : Number(llmTemperature.trim());
     if (parsedTemp !== null && (!Number.isFinite(parsedTemp) || parsedTemp < 0 || parsedTemp > 2)) {
-      setLlmError("Temperature must be a number between 0 and 2.");
+      setLlmError(t("settings.llm.validation.temperature"));
       return;
     }
     const parsedTopP = llmTopP.trim() === "" ? null : Number(llmTopP.trim());
     if (parsedTopP !== null && (!Number.isFinite(parsedTopP) || parsedTopP < 0 || parsedTopP > 1)) {
-      setLlmError("Top-p must be a number between 0 and 1.");
+      setLlmError(t("settings.llm.validation.topP"));
       return;
     }
     const parsedMaxTokens = llmMaxTokens.trim() === "" ? null : Number(llmMaxTokens.trim());
@@ -259,7 +260,7 @@ export function SettingsSurface({
       parsedMaxTokens !== null &&
       (!Number.isSafeInteger(parsedMaxTokens) || parsedMaxTokens < 1)
     ) {
-      setLlmError("Max tokens must be a positive integer.");
+      setLlmError(t("settings.llm.validation.maxTokens"));
       return;
     }
 
@@ -287,9 +288,9 @@ export function SettingsSurface({
       const savedId = updated.profile_id ?? editingLlmId ?? "LLM Profile";
       const wasEditing = editingLlmId !== null;
       resetLlmForm();
-      setLlmNotice(`${savedId} ${wasEditing ? "updated" : "created"}.`);
+      setLlmNotice(wasEditing ? t("settings.notice.updated", { id: savedId }) : t("settings.notice.created", { id: savedId }));
     } catch (error) {
-      setLlmError(describeError(error));
+      setLlmError(describeError(error, t));
       if (error instanceof ControlTransportError && error.code === "credential_not_saved") {
         // The Profile was committed even though its key was not; refresh so
         // the catalog shows the saved Profile, and keep the form open so the
@@ -338,11 +339,11 @@ export function SettingsSurface({
 
     const trimmedName = agentName.trim();
     if (!trimmedName) {
-      setAgentError("Agent Profile name is required.");
+      setAgentError(t("settings.agent.validation.name"));
       return;
     }
     if (agentTargets.length === 0) {
-      setAgentError("Select at least one target LLM Profile.");
+      setAgentError(t("settings.agent.validation.targets"));
       return;
     }
 
@@ -363,9 +364,9 @@ export function SettingsSurface({
       const savedId = updated.profile_id ?? editingAgentId ?? "Agent Profile";
       const wasEditing = editingAgentId !== null;
       resetAgentForm();
-      setAgentNotice(`${savedId} ${wasEditing ? "updated" : "created"}.`);
+      setAgentNotice(wasEditing ? t("settings.notice.updated", { id: savedId }) : t("settings.notice.created", { id: savedId }));
     } catch (error) {
-      setAgentError(describeError(error));
+      setAgentError(describeError(error, t));
     } finally {
       setAgentSaving(false);
     }
@@ -379,16 +380,10 @@ export function SettingsSurface({
     <PageSurface className="mx-auto w-full max-w-4xl">
       <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">{t("settings.title")}</h1>
           <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
-            Manage LLM Profiles, Agent Profiles, credentials, and browser preferences.
+            {t("settings.manage")}
           </p>
-        </div>
-        <div role="status" className="rounded-lg border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-          <p className="font-medium text-foreground">
-            {theme.resolvedTheme === "dark" ? "Dark" : "Light"} theme active
-          </p>
-          <p className="mt-1">{theme.hydrated ? "Saved in this browser" : "Loading preferences…"}</p>
         </div>
       </header>
       <div className="flex min-w-0 flex-col gap-4">
@@ -396,8 +391,8 @@ export function SettingsSurface({
           <>
             <Section
               id="settings-llm-profiles"
-              title="LLM Profiles"
-              description="Persisted model configurations, protocol endpoints, capabilities, and write-only credentials."
+              title={t("settings.llm.title")}
+              description={t("settings.llm.description")}
               action={
                 <Button
                   variant="ghost"
@@ -406,7 +401,7 @@ export function SettingsSurface({
                   disabled={loadingProfiles}
                   onClick={() => void refreshProfiles()}
                 >
-                  {loadingProfiles ? "Refreshing…" : "Refresh"}
+                  {loadingProfiles ? t("settings.llm.refreshing") : t("common.refresh")}
                 </Button>
               }
             >
@@ -418,7 +413,7 @@ export function SettingsSurface({
               <div className="divide-y divide-border/70 py-2">
                 {llmProfiles.length === 0 ? (
                   <p className="py-2 text-sm text-muted-foreground">
-                    No LLM Profile is configured yet. Create one below to configure a model and Provider settings.
+                    {t("settings.llm.empty")}
                   </p>
                 ) : (
                   llmProfiles.map((profile) => (
@@ -429,17 +424,22 @@ export function SettingsSurface({
                           <Pill tone="slate" className="text-xs normal-case">{profile.id}</Pill>
                           <Pill tone="sky" className="text-xs normal-case">{profile.model}</Pill>
                           <Pill tone={profile.has_credential ? "emerald" : "amber"} className="text-xs normal-case">
-                            {profile.has_credential ? "Credential ready" : "No credential"}
+                            {profile.has_credential ? t("settings.credentialReady") : t("settings.noCredential")}
                           </Pill>
                           {!profile.editable ? (
                             <Pill tone="amber" className="text-xs normal-case">
-                              Locked ({profile.blocking_jobs.join(", ")})
+                              {t("settings.locked", { jobs: profile.blocking_jobs.join(", ") })}
                             </Pill>
                           ) : null}
                         </div>
                         <p className="text-xs text-muted-foreground">
-                          Protocol: {profile.protocol} · Endpoint: {profile.endpoint ?? "https://api.openai.com/v1/chat/completions (default)"}
-                          {profile.credential_ref ? ` · Credential ref: ${profile.credential_ref}` : ""}
+                          {t("settings.llm.protocol", {
+                            protocol: profile.protocol,
+                            endpoint: profile.endpoint ?? t("settings.llm.defaultEndpoint"),
+                          })}
+                          {profile.credential_ref
+                            ? ` · ${t("settings.credentialRef", { ref: profile.credential_ref })}`
+                            : ""}
                         </p>
                         <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                           {profile.declared_capabilities.map((cap) => (
@@ -449,7 +449,7 @@ export function SettingsSurface({
                           ))}
                           {profile.executors.length > 0 ? (
                             <span className="text-xs text-muted-foreground">
-                              · Executors: {profile.executors.join(", ")}
+                              · {t("settings.llm.executors", { executors: profile.executors.join(", ") })}
                             </span>
                           ) : null}
                         </div>
@@ -462,7 +462,7 @@ export function SettingsSurface({
                           disabled={!profile.editable}
                           onClick={() => startEditLlm(profile)}
                         >
-                          {editingLlmId === profile.id ? "Editing" : "Edit"}
+                          {editingLlmId === profile.id ? t("settings.editing") : t("common.edit")}
                         </Button>
                       </div>
                     </div>
@@ -473,58 +473,64 @@ export function SettingsSurface({
               <form onSubmit={(e) => void handleSaveLlm(e)} className="mt-2 flex flex-col gap-3 border-t border-border pt-4">
                 <div className="flex items-center justify-between gap-2">
                   <h3 className="text-sm font-semibold">
-                    {editingLlmId ? `Edit LLM Profile (${editingLlmId})` : "Create LLM Profile"}
+                    {editingLlmId
+                      ? t("settings.llm.editTitle", { id: editingLlmId })
+                      : t("settings.llm.createTitle")}
                   </h3>
                   {editingLlmId ? (
                     <Button type="button" variant="ghost" size="xs" onClick={resetLlmForm}>
-                      Cancel edit
+                      {t("settings.cancelEdit")}
                     </Button>
                   ) : null}
                 </div>
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    Profile Name
+                    {t("settings.llm.name")}
                     <Input
                       value={llmName}
                       onChange={(e) => setLlmName(e.target.value)}
-                      placeholder="OpenAI GPT-4o"
+                      placeholder={t("settings.llm.namePlaceholder")}
                       spellCheck={false}
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    Model Identifier
+                    {t("settings.llm.model")}
                     <Input
                       value={llmModel}
                       onChange={(e) => setLlmModel(e.target.value)}
-                      placeholder="gpt-4o"
+                      placeholder={t("settings.llm.modelPlaceholder")}
                       spellCheck={false}
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
-                    API Endpoint (HTTPS, optional — leave blank for default OpenAI endpoint)
+                    {t("settings.llm.endpoint")}
                     <Input
                       value={llmEndpoint}
                       onChange={(e) => setLlmEndpoint(e.target.value)}
-                      placeholder="https://api.openai.com/v1/chat/completions"
+                      placeholder={t("settings.llm.endpointPlaceholder")}
                       spellCheck={false}
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    Credential Reference (optional env/key name)
+                    {t("settings.llm.credentialReference")}
                     <Input
                       value={llmCredentialRef}
                       onChange={(e) => setLlmCredentialRef(e.target.value)}
-                      placeholder="OPENAI_API_KEY"
+                      placeholder={t("settings.llm.credentialPlaceholder")}
                       spellCheck={false}
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    API Key Secret (write-only, never shown after save)
+                    {t("settings.llm.apiKey")}
                     <Input
                       type="password"
                       value={llmSecret}
                       onChange={(e) => setLlmSecret(e.target.value)}
-                      placeholder={editingLlmId ? "Leave blank to keep existing credential" : "sk-..."}
+                      placeholder={
+                        editingLlmId
+                          ? t("settings.llm.apiKeyKeep")
+                          : t("settings.llm.apiKeyPlaceholder")
+                      }
                       autoComplete="new-password"
                       spellCheck={false}
                     />
@@ -532,7 +538,7 @@ export function SettingsSurface({
                 </div>
 
                 <fieldset className="flex flex-col gap-1.5">
-                  <legend className="text-xs font-medium text-muted-foreground">Declared Capabilities</legend>
+                  <legend className="text-xs font-medium text-muted-foreground">{t("settings.llm.capabilities")}</legend>
                   <div className="flex flex-wrap gap-3 pt-1">
                     {ALL_CAPABILITIES.map((cap) => (
                       <label key={cap.value} className="flex items-center gap-1.5 text-sm">
@@ -542,7 +548,7 @@ export function SettingsSurface({
                           onChange={() => toggleCapability(cap.value)}
                           className="size-4 accent-primary"
                         />
-                        {cap.label}
+                        {t(cap.labelKey)}
                       </label>
                     ))}
                   </div>
@@ -550,7 +556,7 @@ export function SettingsSurface({
 
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    Temperature (0..2, optional)
+                    {t("settings.llm.temperature")}
                     <Input
                       value={llmTemperature}
                       onChange={(e) => setLlmTemperature(e.target.value)}
@@ -559,7 +565,7 @@ export function SettingsSurface({
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    Top-P (0..1, optional)
+                    {t("settings.llm.topP")}
                     <Input
                       value={llmTopP}
                       onChange={(e) => setLlmTopP(e.target.value)}
@@ -568,7 +574,7 @@ export function SettingsSurface({
                     />
                   </label>
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                    Max Tokens (optional)
+                    {t("settings.llm.maxTokens")}
                     <Input
                       value={llmMaxTokens}
                       onChange={(e) => setLlmMaxTokens(e.target.value)}
@@ -592,10 +598,10 @@ export function SettingsSurface({
                 <div className="flex justify-end gap-2">
                   <Button type="submit" disabled={llmSaving}>
                     {llmSaving
-                      ? "Saving…"
+                      ? t("settings.saving")
                       : editingLlmId
-                        ? "Update LLM Profile"
-                        : "Create LLM Profile"}
+                        ? t("settings.llm.saveUpdate")
+                        : t("settings.llm.saveCreate")}
                   </Button>
                 </div>
               </form>
@@ -603,13 +609,13 @@ export function SettingsSurface({
 
             <Section
               id="settings-agent-profiles"
-              title="Agent Profiles"
-              description="Persisted Agent Profiles with system instructions and allowed target LLM Profiles."
+              title={t("settings.agent.title")}
+              description={t("settings.agent.description")}
             >
               <div className="divide-y divide-border/70 py-2">
                 {agentProfiles.length === 0 ? (
                   <p className="py-2 text-sm text-muted-foreground">
-                    No Agent Profile is configured yet. Create an LLM Profile first, then create an Agent Profile below.
+                    {t("settings.agent.empty")}
                   </p>
                 ) : (
                   agentProfiles.map((agent) => (
@@ -620,23 +626,25 @@ export function SettingsSurface({
                           <Pill tone="slate" className="text-xs normal-case">{agent.id}</Pill>
                           <Pill tone="sky" className="text-xs capitalize">{agent.behavior}</Pill>
                           {agent.tool_grant ? (
-                            <Pill tone="sky" className="text-xs capitalize">Workspace: {agent.tool_grant}</Pill>
+                            <Pill tone="sky" className="text-xs capitalize">
+                              {t("settings.agent.workspace", { grant: agent.tool_grant })}
+                            </Pill>
                           ) : null}
                           {!agent.editable ? (
                             <Pill tone="amber" className="text-xs normal-case">
-                              Locked ({agent.blocking_jobs.join(", ")})
+                              {t("settings.locked", { jobs: agent.blocking_jobs.join(", ") })}
                             </Pill>
                           ) : null}
                         </div>
                         <p className="text-xs text-muted-foreground">
-                          Target LLM Profiles: {agent.llm_targets.join(", ")}
+                          {t("settings.agent.targets", { targets: agent.llm_targets.join(", ") })}
                         </p>
                         {agent.instructions ? (
                           <p className="line-clamp-2 whitespace-pre-wrap text-xs text-muted-foreground">
-                            Instructions: {agent.instructions}
+                            {t("settings.agent.instructions", { instructions: agent.instructions })}
                           </p>
                         ) : (
-                          <p className="text-xs italic text-muted-foreground">No system instructions</p>
+                          <p className="text-xs italic text-muted-foreground">{t("settings.agent.noInstructions")}</p>
                         )}
                       </div>
                       <div className="shrink-0">
@@ -647,7 +655,7 @@ export function SettingsSurface({
                           disabled={!agent.editable}
                           onClick={() => startEditAgent(agent)}
                         >
-                          {editingAgentId === agent.id ? "Editing" : "Edit"}
+                          {editingAgentId === agent.id ? t("settings.editing") : t("common.edit")}
                         </Button>
                       </div>
                     </div>
@@ -658,65 +666,67 @@ export function SettingsSurface({
               <form onSubmit={(e) => void handleSaveAgent(e)} className="mt-2 flex flex-col gap-3 border-t border-border pt-4">
                 <div className="flex items-center justify-between gap-2">
                   <h3 className="text-sm font-semibold">
-                    {editingAgentId ? `Edit Agent Profile (${editingAgentId})` : "Create Agent Profile"}
+                    {editingAgentId
+                      ? t("settings.agent.editTitle", { id: editingAgentId })
+                      : t("settings.agent.createTitle")}
                   </h3>
                   {editingAgentId ? (
                     <Button type="button" variant="ghost" size="xs" onClick={resetAgentForm}>
-                      Cancel edit
+                      {t("settings.cancelEdit")}
                     </Button>
                   ) : null}
                 </div>
                 <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                  Agent Name
+                  {t("settings.agent.name")}
                   <Input
                     value={agentName}
                     onChange={(e) => setAgentName(e.target.value)}
-                    placeholder="Default Assistant"
+                    placeholder={t("settings.agent.namePlaceholder")}
                     spellCheck={false}
                   />
                 </label>
                 <div className="flex flex-col gap-1.5">
-                  <span className="text-xs font-medium text-muted-foreground">Behavior</span>
+                  <span className="text-xs font-medium text-muted-foreground">{t("settings.agent.behavior")}</span>
                   <ChoiceGroup
-                    label="Agent Behavior"
+                    label={t("settings.agent.behavior")}
                     value={agentBehavior}
                     onChange={setAgentBehavior}
                     options={[
-                      { value: "chat", label: "Chat" },
-                      { value: "general", label: "General" },
+                      { value: "chat", label: t("settings.agent.behaviorChat") },
+                      { value: "general", label: t("settings.agent.behaviorGeneral") },
                     ]}
                   />
                 </div>
                 <div className="flex flex-col gap-1.5">
-                  <span className="text-xs font-medium text-muted-foreground">Workspace access</span>
+                  <span className="text-xs font-medium text-muted-foreground">{t("settings.agent.workspaceAccess")}</span>
                   <ChoiceGroup
-                    label="Workspace access"
+                    label={t("settings.agent.workspaceAccess")}
                     value={agentToolGrant}
                     onChange={setAgentToolGrant}
                     options={[
-                      { value: "none", label: "None" },
-                      { value: "read", label: "Read" },
-                      { value: "edit", label: "Edit" },
-                      { value: "code", label: "Code" },
+                      { value: "none", label: t("settings.agent.grantNone") },
+                      { value: "read", label: t("settings.agent.grantRead") },
+                      { value: "edit", label: t("settings.agent.grantEdit") },
+                      { value: "code", label: t("settings.agent.grantCode") },
                     ]}
                   />
                 </div>
                 <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                  System Instructions (optional)
+                  {t("settings.agent.instructionsLabel")}
                   <Textarea
                     value={agentInstructions}
                     onChange={(e) => setAgentInstructions(e.target.value)}
-                    placeholder="You are a concise, accurate assistant."
+                    placeholder={t("settings.agent.instructionsPlaceholder")}
                     rows={3}
                   />
                 </label>
                 <fieldset className="flex flex-col gap-1.5">
                   <legend className="text-xs font-medium text-muted-foreground">
-                    Target LLM Profiles
+                    {t("settings.agent.targetsLabel")}
                   </legend>
                   {llmProfiles.length === 0 ? (
                     <p className="text-xs text-muted-foreground">
-                      Create an LLM Profile above before creating an Agent Profile.
+                      {t("settings.agent.createLlmFirst")}
                     </p>
                   ) : (
                     <div className="flex flex-wrap gap-3 pt-1">
@@ -749,10 +759,10 @@ export function SettingsSurface({
                 <div className="flex justify-end gap-2">
                   <Button type="submit" disabled={agentSaving || llmProfiles.length === 0}>
                     {agentSaving
-                      ? "Saving…"
+                      ? t("settings.saving")
                       : editingAgentId
-                        ? "Update Agent Profile"
-                        : "Create Agent Profile"}
+                        ? t("settings.agent.saveUpdate")
+                        : t("settings.agent.saveCreate")}
                   </Button>
                 </div>
               </form>
@@ -760,12 +770,12 @@ export function SettingsSurface({
 
             <Section
               id="settings-computed-providers"
-              title="Computed Providers"
-              description="Read-only projection derived from LLM Profile configurations. Providers are not managed as a separate CRUD entity."
+              title={t("settings.providers.title")}
+              description={t("settings.providers.description")}
             >
               {providers.length === 0 ? (
                 <p className="py-3 text-sm text-muted-foreground">
-                  No Provider projection yet — create an LLM Profile above.
+                  {t("settings.providers.empty")}
                 </p>
               ) : (
                 <div className="divide-y divide-border/70 py-2">
@@ -773,16 +783,21 @@ export function SettingsSurface({
                     <div key={`${provider.protocol}-${provider.endpoint ?? "default"}-${provider.credential_ref ?? "none"}-${idx}`} className="flex flex-col gap-1 py-2.5 text-xs">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-semibold text-foreground">
-                          {provider.endpoint ?? "https://api.openai.com/v1/chat/completions (default)"}
+                          {provider.endpoint ?? t("settings.llm.defaultEndpoint")}
                         </span>
                         <Pill tone="sky" className="text-[11px] normal-case">{provider.protocol}</Pill>
                         <Pill tone={provider.has_credential ? "emerald" : "amber"} className="text-[11px] normal-case">
-                          {provider.has_credential ? "Credential ready" : "No credential"}
+                          {provider.has_credential ? t("settings.credentialReady") : t("settings.noCredential")}
                         </Pill>
                       </div>
                       <p className="text-muted-foreground">
-                        Models: {provider.models.join(", ")} · Derived from Profiles: {provider.profile_ids.join(", ")}
-                        {provider.credential_ref ? ` · Credential ref: ${provider.credential_ref}` : ""}
+                        {t("settings.providers.derivation", {
+                          models: provider.models.join(", "),
+                          profiles: provider.profile_ids.join(", "),
+                        })}
+                        {provider.credential_ref
+                          ? ` · ${t("settings.credentialRef", { ref: provider.credential_ref })}`
+                          : ""}
                       </p>
                     </div>
                   ))}
@@ -797,8 +812,8 @@ export function SettingsSurface({
 
         <Section
           id="settings-appearance"
-          title="Appearance"
-          description="Presentation preferences, kept in this browser alone."
+          title={t("settings.section.appearance")}
+          description={t("settings.appearance.description")}
           action={
             <Button
               variant="ghost"
@@ -806,40 +821,40 @@ export function SettingsSurface({
               className="h-11 rounded-md tracking-normal normal-case"
               onClick={theme.resetAppearance}
             >
-              Reset
+              {t("common.reset")}
             </Button>
           }
         >
           <SettingRow label={t("settings.language.label")} description={t("settings.language.desc")} origin="browser"><LanguageSwitcher /></SettingRow>
-          <SettingRow label="Theme" description="Follow the system, or fix light or dark." origin="browser">
+          <SettingRow label={t("settings.theme.label")} description={t("settings.theme.desc")} origin="browser">
             <ChoiceGroup
-              label="Theme"
+              label={t("settings.theme.label")}
               value={theme.preferences.theme}
               onChange={theme.setTheme}
               options={[
-                { value: "system", label: "System" },
-                { value: "light", label: "Light" },
-                { value: "dark", label: "Dark" },
+                { value: "system", label: t("settings.theme.system") },
+                { value: "light", label: t("settings.theme.light") },
+                { value: "dark", label: t("settings.theme.dark") },
               ]}
             />
           </SettingRow>
-          <SettingRow label="Accent" description="One of the predefined accents." origin="browser">
+          <SettingRow label={t("settings.accent.label")} description={t("settings.accent.desc")} origin="browser">
             <ChoiceGroup
-              label="Accent"
+              label={t("settings.accent.label")}
               value={theme.preferences.accent}
               onChange={theme.setAccent}
               options={[
-                { value: "ochre", label: "Ochre" },
-                { value: "slate", label: "Slate" },
-                { value: "teal", label: "Teal" },
+                { value: "ochre", label: t("settings.accent.ochre") },
+                { value: "slate", label: t("settings.accent.slate") },
+                { value: "teal", label: t("settings.accent.teal") },
               ]}
             />
           </SettingRow>
         </Section>
         <Section
           id="settings-session"
-          title="Session"
-          description="This browser's sign-in to the local Control Plane."
+          title={t("settings.session.title")}
+          description={t("settings.session.description")}
           action={
             <Button
               variant="outline"
@@ -848,13 +863,13 @@ export function SettingsSurface({
               disabled={signingOut}
               onClick={onSignOut}
             >
-              {signingOut ? "Signing out…" : "Sign out"}
+              {signingOut ? t("settings.session.signingOut") : t("settings.session.signOut")}
             </Button>
           }
         >
           <SettingRow
-            label="Signed in until"
-            description="A session lasts eight hours and ends with the OCG process."
+            label={t("settings.session.expires")}
+            description={t("settings.session.expiresDescription")}
             origin="runtime"
           >
             <span className={value}>
@@ -864,32 +879,46 @@ export function SettingsSurface({
         </Section>
         <Section
           id="settings-control-plane"
-          title="Control Plane"
-          description="What the host establishes about itself, read every few seconds."
+          title={t("settings.control.title")}
+          description={t("settings.control.description")}
         >
-          <SettingRow label="Host" description="Whether the OCG host answers." origin="runtime">
-            <span className={value}>{health ? health.host : "unreachable"}</span>
+          <SettingRow label={t("settings.control.host")} description={t("settings.control.hostDescription")} origin="runtime">
+            <span className={value}>{health ? health.host : t("settings.control.unreachable")}</span>
           </SettingRow>
-          <SettingRow label="Database" description="The state of the persisted store." origin="runtime">
-            <span className={value}>{health ? health.database.status : "unknown"}</span>
+          <SettingRow label={t("settings.control.database")} description={t("settings.control.databaseDescription")} origin="runtime">
+            <span className={value}>{health ? health.database.status : t("common.unknown")}</span>
           </SettingRow>
-          <SettingRow label="Reads" description="Whether Job records can be read." origin="runtime">
-            <span className={value}>{health ? (health.database.readable ? "available" : "unavailable") : "unknown"}</span>
-          </SettingRow>
-          <SettingRow label="Commands" description="Whether new Jobs are accepted." origin="runtime">
+          <SettingRow label={t("settings.control.reads")} description={t("settings.control.readsDescription")} origin="runtime">
             <span className={value}>
-              {health ? (health.database.accepting_commands ? "accepting" : "not accepting") : "unknown"}
+              {health
+                ? health.database.readable
+                  ? t("settings.control.available")
+                  : t("settings.control.unavailable")
+                : t("common.unknown")}
+            </span>
+          </SettingRow>
+          <SettingRow label={t("settings.control.commands")} description={t("settings.control.commandsDescription")} origin="runtime">
+            <span className={value}>
+              {health
+                ? health.database.accepting_commands
+                  ? t("settings.control.accepting")
+                  : t("settings.control.notAccepting")
+                : t("common.unknown")}
             </span>
           </SettingRow>
         </Section>
         <Section
           id="settings-unavailable"
-          title="Not available in this build"
-          description="0.4.5 settings that have no Control Plane contract in 0.5, so they are not shown as controls."
+          title={t("settings.unavailable.title")}
+          description={t("settings.unavailable.description")}
         >
           <ul className="flex list-disc flex-col gap-1.5 py-3 pl-5 text-[13px] leading-5 text-muted-foreground">
-            <li>Workspace and startup preferences: no route owns them.</li>
-            <li>Releasing a quarantined slot: use <code>ocg release-slot &lt;job&gt;</code>; no route exists yet.</li>
+            <li>{t("settings.unavailable.workspace")}</li>
+            <li>
+              {t("settings.unavailable.releaseSlotBefore")}{" "}
+              <code>ocg release-slot &lt;job&gt;</code>
+              {t("settings.unavailable.releaseSlotAfter")}
+            </li>
           </ul>
         </Section>
       </div>

@@ -374,9 +374,11 @@ where
                 log::info!("control plane listening on http://{address}");
                 eprintln!("OCG control plane listening on http://{address}");
             }
-            // The sign-in code is for the operator alone, on this machine:
-            // it is not the bearer token and reveals none of it. Each run
-            // prints its own, and only that one signs a browser in.
+            // The sign-in code is for a remote control client of a headless
+            // listener, on this machine: it is not the bearer token and
+            // reveals none of it. A served frontend signs itself in and
+            // prints no code. Each run prints its own, and only that one
+            // signs a browser in.
             if let Some(pairing) = listener.as_ref().and_then(ControlPlane::pairing_code) {
                 eprintln!("OCG local browser pairing code: {pairing}");
             }

@@ -9,6 +9,7 @@ import {
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/control-client";
 import { ContractError } from "@/components/ocg/contracts";
+import { useI18n } from "../i18n";
 
 export type OperatorSession = {
   csrfToken: string;
@@ -23,6 +24,7 @@ export function OperatorLogin({
   client: HttpCanonicalControlClient;
   onSignedIn: (session: OperatorSession) => void;
 }) {
+  const { t } = useI18n();
   const [pairingCode, setPairingCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
@@ -37,15 +39,15 @@ export function OperatorLogin({
       if (error instanceof ControlTransportError) {
         setFailure(
           error.code === "invalid_pairing_code"
-            ? "That is not this run's pairing code."
+            ? t("login.pairing.invalid")
             : error.code === "pairing_disabled"
-              ? "Too many attempts failed; signing in is closed for this run."
-              : `Sign-in refused (${error.code}).`,
+              ? t("login.pairing.disabled")
+              : t("login.pairing.refused", { code: error.code }),
         );
       } else if (error instanceof ContractError) {
-        setFailure("The sign-in answer did not match the control contract.");
+        setFailure(t("login.pairing.contract"));
       } else {
-        setFailure("OCG could not be reached.");
+        setFailure(t("login.pairing.unreachable"));
       }
     } finally {
       setBusy(false);
@@ -57,8 +59,7 @@ export function OperatorLogin({
       <header className="flex flex-col gap-2">
         <h1 className="font-heading text-2xl tracking-tight">OCG</h1>
         <p className="text-sm text-muted-foreground">
-          Sign in with the pairing code this run printed to its operator, on the
-          machine that runs OCG.
+          {t("login.pairing.description")}
         </p>
       </header>
       <form
@@ -69,11 +70,11 @@ export function OperatorLogin({
         }}
       >
         <label className="flex flex-col gap-1.5 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-          Pairing code
+          {t("login.pairing.code")}
           <Input
             value={pairingCode}
             onChange={(event) => setPairingCode(event.target.value)}
-            placeholder="the code from the OCG console"
+            placeholder={t("login.pairing.placeholder")}
             autoComplete="off"
             spellCheck={false}
             aria-invalid={failure !== null}
@@ -81,7 +82,7 @@ export function OperatorLogin({
         </label>
         {failure ? <p className="text-sm text-destructive">{failure}</p> : null}
         <Button type="submit" disabled={busy || pairingCode.trim().length === 0}>
-          {busy ? "Signing in…" : "Sign in"}
+          {busy ? t("login.pairing.signingIn") : t("login.pairing.signIn")}
         </Button>
       </form>
     </main>

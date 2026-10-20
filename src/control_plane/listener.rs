@@ -87,13 +87,13 @@ impl ControlPlane {
             ),
             None => None,
         };
-        // The browser surface is exactly the one the frontend serves in:
-        // no UI directory, no session.
-        let browser = assets
-            .is_some()
-            .then(browser::State::start)
-            .transpose()
-            .map_err(|_| StartError::Serve(std::io::Error::other("no randomness for sign-in")))?;
+        // A browser surface exists in both modes: the served frontend signs
+        // itself in, while a headless listener prints the pairing code a
+        // remote control client uses.
+        let browser = Some(
+            browser::State::start()
+                .map_err(|_| StartError::Serve(std::io::Error::other("no randomness for sign-in")))?,
+        );
         let shared = Arc::new(Shared {
             database,
             scheduler,
@@ -148,14 +148,20 @@ impl ControlPlane {
         self.address
     }
 
-    /// The pairing code its operator signs a browser in with, when the
-    /// browser surface is served. It is shown to the operator alone, and
-    /// is not the bearer token.
+    /// The pairing code a remote control client signs a browser in with,
+    /// when this listener is headless and serves no frontend. It is shown to
+    /// the operator alone, and is not the bearer token.
     pub fn pairing_code(&self) -> Option<String> {
         self.shared
-            .browser
-            .as_ref()
-            .map(|browser| browser.pairing_code().to_owned())
+            .assets
+            .is_none()
+            .then(|| {
+                self.shared
+                    .browser
+                    .as_ref()
+                    .map(|browser| browser.pairing_code().to_owned())
+            })
+            .flatten()
     }
 
     /// Stops accepting, lets requests in flight finish within a bounded

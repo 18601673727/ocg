@@ -106,8 +106,8 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
   }, [runtime, go]);
 
   async function intent(intent: ComposerIntent) {
-    if (intent.kind !== "chat") throw new Error("Job launch is not available in this view.");
-    if (!session) throw new Error("Create or open a conversation first.");
+    if (intent.kind !== "chat") throw new Error(t("app.jobLaunchUnavailable"));
+    if (!session) throw new Error(t("app.createConversationFirst"));
     await runtime.sendMessage(session.id, { content: intent.text, selection: intent.selection, images: intent.images, mode: intent.mode });
     const updated = runtime.client.getSnapshot().sessions.find(item => item.id === session.id);
     if (updated?.sessionId) {
@@ -133,7 +133,7 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
 
   return <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
     <aside className={cn("hidden shrink-0 border-r border-sidebar-border bg-sidebar lg:flex", collapsed ? "w-16" : "w-72")}>{sidebar}</aside>
-    {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label="Close navigation" className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
+    {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label={t("app.closeNavigation")} className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view}
         onOpenMobileSidebar={() => setMobile(true)} syncStatus={runtime.sync?.status} />
@@ -141,9 +141,9 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
       {signOutError && <p role="alert" className="px-5 text-sm text-destructive">{signOutError}</p>}
       <main className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
         {location.view === "chat" ? <>
-          {runtime.snapshot.status.state === "failed" && <p role="alert" className="px-5 py-2 text-sm text-destructive">{runtime.snapshot.status.detail} <button className="underline" onClick={() => void runtime.client.refreshConversations?.().catch(cause => setError(String(cause)))}>Refresh conversations</button></p>}
-          {error && <p role="alert" className="px-5 py-2 text-sm text-destructive">{error} <button className="underline" onClick={() => setAttempt(value => value + 1)}>Retry loading</button></p>}
-          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">Loading conversation…</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="m-auto flex flex-col items-center gap-4 p-6"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
+          {runtime.snapshot.status.state === "failed" && <p role="alert" className="px-5 py-2 text-sm text-destructive">{runtime.snapshot.status.detail} <button className="underline" onClick={() => void runtime.client.refreshConversations?.().catch(cause => setError(String(cause)))}>{t("app.refreshConversations")}</button></p>}
+          {error && <p role="alert" className="px-5 py-2 text-sm text-destructive">{error} <button className="underline" onClick={() => setAttempt(value => value + 1)}>{t("app.retryLoading")}</button></p>}
+          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">{t("app.loadingConversation")}</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="m-auto flex flex-col items-center gap-4 p-6"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
         </> : null}
         {location.view === "jobs" && <JobsSurface client={client} active job={location.job} onJob={job => go("jobs", job)} onOpenChat={job => { setSessionId(""); go("chat", job); }} />}
         {(location.view === "usage" || location.view === "health") && <ObservationsSurface client={client} kind={location.view} health={health} onJob={job => go("jobs", job)} />}
