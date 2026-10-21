@@ -158,7 +158,7 @@ function assistantParts(
     const refused = !call.outcome_kind && call.decision !== "admitted" && call.decision !== "awaiting_approval" && call.decision !== "awaiting_answer";
     parts.push({ type: "tool-call", toolCallId: call.tool_call_id, toolName: call.name,
       args: checkedArgs, argsText: call.arguments ?? "{}",
-      ...(refused ? { result: t("transcript.outcome.refused") } : call.outcome_kind ? { result: call.result ?? call.outcome_kind } : {}),
+      ...(refused ? { result: `${t("transcript.outcome.refused")}: ${call.decision}` } : call.outcome_kind ? { result: call.result ?? call.outcome_kind } : {}),
       isError: refused || call.outcome_kind === "not_applied" || call.outcome_kind === "not_invoked" || call.outcome_kind === "uncertain",
     });
   }
