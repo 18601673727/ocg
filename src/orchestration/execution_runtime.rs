@@ -4601,6 +4601,21 @@ pub(crate) async fn settle_provider_error(
             value,
         }),
     };
+    let observed_at = Timestamp::now();
+    let mut gap = None;
+    for observation in provider_execution::error_observations(&error) {
+        let recorded = database
+            .record_availability_stat(NewAvailabilityStat {
+                job,
+                request,
+                observed_at,
+                observation,
+            })
+            .await;
+        if let Err(error) = recorded {
+            gap.get_or_insert(error);
+        }
+    }
     let result = match database.finalize_job(job, settlement.clone()).await {
         Ok(result) => result,
         Err(source) => {
@@ -4617,21 +4632,6 @@ pub(crate) async fn settle_provider_error(
         job,
         result,
     };
-    let mut gap = None;
-    let observed_at = Timestamp::now();
-    for observation in provider_execution::error_observations(&error) {
-        let recorded = database
-            .record_availability_stat(NewAvailabilityStat {
-                job,
-                request,
-                observed_at,
-                observation,
-            })
-            .await;
-        if let Err(error) = recorded {
-            gap.get_or_insert(error);
-        }
-    }
     match gap {
         Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
             receipt: Box::new(receipt),

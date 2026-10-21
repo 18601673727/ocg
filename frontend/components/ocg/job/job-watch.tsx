@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { JobTranscript } from "@/components/ocg/chat/job-transcript";
@@ -116,6 +116,13 @@ function JobWatchBody({
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
   const [unknownReason, setUnknownReason] = useState<string | null>(null);
+  // One settlement arrives as both a "job" and a "settlement" event; the
+  // unknown reason is refreshed on whichever arrives first, at most once
+  // per watched Job.
+  const unknownReasonRefreshed = useRef(false);
+  useEffect(() => {
+    unknownReasonRefreshed.current = false;
+  }, [jobId]);
 
   useEffect(() => {
     if (!job && !settlement) return;
@@ -182,6 +189,11 @@ function JobWatchBody({
         () => {},
       );
     };
+    const refreshUnknownReasonOnce = () => {
+      if (unknownReasonRefreshed.current) return;
+      unknownReasonRefreshed.current = true;
+      refreshUnknownReason();
+    };
 
     const listener = (event: JobStreamEvent) => {
       if (!alive) return;
@@ -197,7 +209,7 @@ function JobWatchBody({
           });
           stopPolling();
           requestReload();
-          if (event.job.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReason();
+          if (event.job.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReasonOnce();
         }
       } else if (event.type === "output") {
         if (event.output.seq <= processed) return;
@@ -213,7 +225,7 @@ function JobWatchBody({
         setStream("settled");
         stopPolling();
         requestReload();
-        if (event.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReason();
+        if (event.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReasonOnce();
       } else if (event.type === "stream_error") {
         setFailure({ code: event.error.code, scope: "stream" });
         setStream("stream_error");

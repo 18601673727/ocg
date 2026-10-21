@@ -188,7 +188,9 @@ key or send `GET /api/v1/admissions` with the same `Idempotency-Key` header. Pol
 `GET /api/v1/jobs/{job}` until `job.settlement.state` is `completed`, `failed`,
 `cancelled` or `unknown`, then read the envelope's `result`, `usage` and `unknown_reason`.
 `result` is the newest result output or null; `usage` is null for a conversation
-id or a Job without request events. `unknown_reason` is the last failure's message when the settlement is `unknown`, else null. Usage sums requests and complete requests,
+id or a Job without request events. `unknown_reason` is the failure message of
+the Job's latest request, cut to 2048 bytes, when the settlement is `unknown`,
+else null. Usage sums requests and complete requests,
 input/output, cache-read/cache-write and reasoning tokens; `truncated` reports
 the scan limit. Failed results have a machine-readable `code`:
 `provider_rejected`, `not_delivered`, `build_failed`, `context_window_exceeded`,
