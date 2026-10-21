@@ -138,6 +138,13 @@ impl Batch {
             None,
             true,
         )?;
+        if let Some(mut recurrence) = self.recurrence(conversation)?
+            && recurrence.phase == RecurrencePhase::Active
+            && recurrence.current_turn == approval.job
+        {
+            recurrence.current_turn = appended.turn;
+            self.put_recurrence(conversation, &recurrence, None)?;
+        }
         self.auto_close_check(conversation)?;
         Ok(appended)
     }

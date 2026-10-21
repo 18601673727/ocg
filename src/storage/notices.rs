@@ -219,8 +219,8 @@ impl Batch {
         if outcome.kind == OutcomeKind::Completed
             && self.step(|tx| {
                 for entry in tx.open_table(OPEN_APPROVALS)?.range(
-                    (conversation.get(), turn.get(), 0, 0)
-                        ..=(conversation.get(), turn.get(), u32::MAX, u32::MAX),
+                    (conversation.get(), 0, 0, 0)
+                        ..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX),
                 )? {
                     if entry?.1.value() == 0 {
                         return Ok(true);

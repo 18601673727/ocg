@@ -2010,7 +2010,10 @@ static UNSETTLED: Mutex<Vec<(DatabaseHandle, JobId, JobFinalization)>> = Mutex::
 
 fn retain_unsettled(database: DatabaseHandle, job: JobId, outcome: JobFinalization) {
     let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
-    if !unsettled.iter().any(|(_, retained, _)| *retained == job) {
+    if !unsettled
+        .iter()
+        .any(|(existing, retained, _)| existing.same_database(&database) && *retained == job)
+    {
         unsettled.push((database, job, outcome));
     }
 }

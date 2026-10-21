@@ -758,6 +758,7 @@ fn parameters() -> Value {
 /// The handler of `workspace_write_file`, bound to one authorized Workspace.
 struct WriteFile {
     workspace: Workspace,
+    workers: blocking::WorkerTracker,
 }
 
 impl ToolHandler for WriteFile {
@@ -786,13 +787,8 @@ impl ToolHandler for WriteFile {
     /// Stops the writes of `job` and waits until their workers have ended.
     fn stop(&self, job: JobId) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
         Box::pin(async move {
-            if blocking::stop_job(job).await {
-                Ok(())
-            } else {
-                Err(ToolFailure::uncertain(
-                    "a write was still running when it was stopped",
-                ))
-            }
+            self.workers.stop_job(job).await;
+            Ok(())
         })
     }
 }
@@ -813,15 +809,16 @@ impl WriteFile {
                     let content = content.to_owned();
                     let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
                     let bytes_written = content.len();
-                    blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                        #[cfg(test)]
-                        write_seam::install_boxed(seam);
-                        let _mutation = workspace_read::WorkspaceMutation::begin();
-                        create(&workspace, &path_for_worker, &content, stop)
-                    })
-                    .await
-                    .map_err(ToolFailure::uncertain)?
-                    .map_err(ToolFailure::from)?;
+                    self.workers
+                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                            #[cfg(test)]
+                            write_seam::install_boxed(seam);
+                            let _mutation = workspace_read::WorkspaceMutation::begin();
+                            create(&workspace, &path_for_worker, &content, stop)
+                        })
+                        .await
+                        .map_err(ToolFailure::uncertain)?
+                        .map_err(ToolFailure::from)?;
                     json!({
                         "operation": "create",
                         "path": path,
@@ -834,15 +831,16 @@ impl WriteFile {
                     let expected = expected.to_owned();
                     let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
                     let bytes_written = content.len();
-                    blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                        #[cfg(test)]
-                        write_seam::install_boxed(seam);
-                        let _mutation = workspace_read::WorkspaceMutation::begin();
-                        update(&workspace, &path_for_worker, &expected, &content, stop)
-                    })
-                    .await
-                    .map_err(ToolFailure::uncertain)?
-                    .map_err(ToolFailure::from)?;
+                    self.workers
+                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                            #[cfg(test)]
+                            write_seam::install_boxed(seam);
+                            let _mutation = workspace_read::WorkspaceMutation::begin();
+                            update(&workspace, &path_for_worker, &expected, &content, stop)
+                        })
+                        .await
+                        .map_err(ToolFailure::uncertain)?
+                        .map_err(ToolFailure::from)?;
                     json!({
                         "operation": "update",
                         "path": path,
@@ -853,8 +851,9 @@ impl WriteFile {
                 Operation::Replace { old, new } => {
                     let old = old.to_owned();
                     let new = new.to_owned();
-                    let (offset, before_sha256, after_sha256) =
-                        blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                    let (offset, before_sha256, after_sha256) = self
+                        .workers
+                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
                             #[cfg(test)]
                             write_seam::install_boxed(seam);
                             let _mutation = workspace_read::WorkspaceMutation::begin();
@@ -873,15 +872,16 @@ impl WriteFile {
                 }
                 Operation::Delete { expected } => {
                     let expected = expected.to_owned();
-                    blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                        #[cfg(test)]
-                        write_seam::install_boxed(seam);
-                        let _mutation = workspace_read::WorkspaceMutation::begin();
-                        delete(&workspace, &path_for_worker, &expected, stop)
-                    })
-                    .await
-                    .map_err(ToolFailure::uncertain)?
-                    .map_err(ToolFailure::from)?;
+                    self.workers
+                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                            #[cfg(test)]
+                            write_seam::install_boxed(seam);
+                            let _mutation = workspace_read::WorkspaceMutation::begin();
+                            delete(&workspace, &path_for_worker, &expected, stop)
+                        })
+                        .await
+                        .map_err(ToolFailure::uncertain)?
+                        .map_err(ToolFailure::from)?;
                     json!({
                         "operation": "delete",
                         "path": path,
@@ -905,7 +905,10 @@ pub(crate) fn register(
             "Create a new UTF-8 text file, replace the whole content of an existing one, replace exact text in a file, or delete a file in the authorized Workspace. Operations: `create` {path, content} fails if the file exists. `update` {path, content, expected_content} requires the whole file to match `expected_content`. `replace` {path, old, new} replaces `old` (must occur exactly once) with `new` (up to 8 KiB each, in files up to 1 MiB). `delete` {path, expected_content} deletes a file matching `expected_content` (up to 64 KiB). Directories are never created or deleted.",
         ),
         parameters(),
-        Arc::new(WriteFile { workspace }),
+        Arc::new(WriteFile {
+            workspace,
+            workers: Default::default(),
+        }),
     )
 }
 
@@ -998,6 +1001,7 @@ mod tests {
     fn call(workspace: &Workspace, arguments: Value) -> Result<Value, ToolFailure> {
         let handler = WriteFile {
             workspace: workspace.clone(),
+            workers: Default::default(),
         };
         let result = crate::test_support::wait(handler.call(arguments));
         write_seam::clear();
@@ -1540,6 +1544,7 @@ mod tests {
 
         let handler = WriteFile {
             workspace: authorize(),
+            workers: Default::default(),
         };
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
         assert_eq!(handler.version(), "workspace_write_file-3");
