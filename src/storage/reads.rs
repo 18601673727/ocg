@@ -222,8 +222,12 @@ pub(crate) fn read_job_details(
             .open_table(REQUEST_EVENTS)?
             .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
             .rev()
-            .take(MAX_OBSERVATION_SCAN)
+            .take(MAX_OBSERVATION_SCAN + 1)
         {
+            if scanned == MAX_OBSERVATION_SCAN {
+                usage.truncated = true;
+                break;
+            }
             let (key, bytes) = entry?;
             let (_, request, seq) = key.value();
             let request = RequestNumber::new(request)
@@ -261,7 +265,6 @@ pub(crate) fn read_job_details(
                 events.clear();
             }
         }
-        usage.truncated = scanned == MAX_OBSERVATION_SCAN;
         (scanned != 0).then_some(usage)
     };
     Ok(Some(JobDetails { job, result, usage }))
@@ -1632,47 +1635,31 @@ pub(crate) fn read_turn_context(
             _ => None,
         });
     if context.response_format.is_none() {
+        let mut root = None;
         let mut next = own_entries.iter().find_map(|(_, entry)| match entry.entry {
             Entry::RetryOf { turn, .. } => Some(turn),
             _ => None,
         });
         let mut visited = BTreeSet::from([turn]);
-        let mut remaining = MAX_OBSERVATION_SCAN;
-        let mut root_entries = Vec::new();
         while let Some(current) = next {
             if !visited.insert(current) {
-                break;
+                return Err(StorageError::corrupted("retry ancestry cycle"));
             }
-            root_entries = rx
-                .open_table(TURN_INPUTS)?
-                .range((current.get(), 0)..=(current.get(), u32::MAX))?
-                .rev()
-                .take(remaining)
-                .map(|entry| {
-                    let (key, bytes) = entry?;
-                    Ok((key.value().1, TurnEntry::decode(bytes.value())?))
-                })
-                .collect::<Result<Vec<_>, StorageError>>()?;
-            if root_entries.last().is_none_or(|(seq, _)| *seq != 1) {
-                return Err(StorageError::corrupted(
-                    "retry format read limit reached or input missing",
-                ));
-            }
-            remaining -= root_entries.len();
-            next = root_entries
-                .iter()
-                .rev()
-                .find_map(|(_, entry)| match entry.entry {
-                    Entry::RetryOf { turn, .. } => Some(turn),
-                    _ => None,
-                });
-        }
-        context.response_format = root_entries
-            .iter()
-            .find_map(|(_, entry)| match &entry.entry {
-                Entry::ResponseFormat { format } => Some(format.clone()),
+            let entries = turn_entries(&rx, current)?;
+            next = entries.iter().find_map(|(_, entry)| match entry.entry {
+                Entry::RetryOf { turn, .. } => Some(turn),
                 _ => None,
             });
+            root = Some(entries);
+        }
+        context.response_format =
+            root.into_iter()
+                .flatten()
+                .rev()
+                .find_map(|(_, entry)| match entry.entry {
+                    Entry::ResponseFormat { format } => Some(format),
+                    _ => None,
+                });
     }
     let iteration_only = own_entries
         .iter()

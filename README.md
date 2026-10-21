@@ -184,7 +184,7 @@ a one-shot conversation. A follow-up names `conversation` and cannot set
 `keep_open`. A closed one-shot cannot be retried: submit again with a new key.
 
 After `202`, or if the reply is lost, repeat the same submission with the same
-key or query `GET /api/v1/admissions` with that `Idempotency-Key`. Poll
+key or send `GET /api/v1/admissions` with the same `Idempotency-Key` header. Poll
 `GET /api/v1/jobs/{job}` until `job.settlement.state` is `completed`, `failed`,
 `cancelled` or `unknown`, then read the envelope's `result` and `usage`.
 `result` is the newest result output or null; `usage` is null for a conversation

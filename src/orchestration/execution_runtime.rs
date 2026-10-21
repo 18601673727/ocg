@@ -2810,13 +2810,13 @@ async fn run_started_provider_job(
             current_attachments = current.attachments;
             bytes_left = bytes_left.saturating_sub(current.attachment_bytes.iter().sum::<u64>());
         }
-        let mut images_left = if configuration
+        let vision = configuration
             .frozen
             .llm
             .config
             .declared_capabilities
-            .contains(&crate::persistence::ModelCapability::Vision)
-        {
+            .contains(&crate::persistence::ModelCapability::Vision);
+        let mut images_left = if vision {
             crate::openai_compatible::image::MAX_REQUEST_IMAGES
                 .saturating_sub(current_attachments.len())
         } else {
@@ -2830,7 +2830,7 @@ async fn run_started_provider_job(
                     attachments.push(*attachment);
                     images_left -= 1;
                     bytes_left -= bytes;
-                } else {
+                } else if vision {
                     images_omitted = true;
                 }
             }
