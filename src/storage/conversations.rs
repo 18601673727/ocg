@@ -626,10 +626,18 @@ impl Batch {
     ) -> Result<ConversationAction, BatchError> {
         self.require_user_conversation(conversation)?;
         if self.conversation(conversation)?.closing.is_some() {
+            let mut running = Vec::new();
+            for current in self.live_subtree(conversation)? {
+                if let Some(active) = self.active_turn(current)?
+                    && self.require_job_state(active)?.outcome.is_none()
+                {
+                    running.push(active);
+                }
+            }
             return Ok(ConversationAction {
                 conversation,
                 record_seq: None,
-                running: Vec::new(),
+                running,
                 already: true,
             });
         }
@@ -1482,7 +1490,8 @@ mod tests {
         assert!(!first.already);
         assert_eq!(first.running, [turn]);
         let second = wait(fixture.database.close(child, Actor::User)).expect("close twice");
-        assert!(second.already && second.running.is_empty());
+        assert!(second.already);
+        assert_eq!(second.running, [turn]);
         wait(fixture.database.close(parent, Actor::User)).expect("close parent");
         let notices = wait(fixture.database.notices(parent, 0, 100)).expect("notices");
         assert_eq!(notices.iter().filter(|(_, notice)| matches!(notice.body, NoticeBody::Event { child: found, event: NoticeEvent::ClosedAbove, .. } if found == child)).count(), 1);
