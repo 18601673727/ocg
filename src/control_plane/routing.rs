@@ -61,6 +61,12 @@ pub(super) enum Route {
         after: Option<(RequestNumber, u32)>,
         limit: usize,
     },
+    JobTree {
+        job: JobId,
+        after: Option<JobId>,
+        limit: usize,
+        depth: u8,
+    },
     Events {
         job: JobId,
         after_seq: Option<i64>,
@@ -107,6 +113,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
             | Route::Tools { .. }
+            | Route::JobTree { .. }
             | Route::AgentProfiles { .. }
             | Route::Profiles
             | Route::ProviderModels
@@ -298,6 +305,16 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             let (after, limit) = projection::tools_query(query)?;
             Ok(Route::Tools { job, after, limit })
         }
+        ["jobs", job, "tree"] => {
+            let job = job_id(job)?;
+            let (after, limit, depth) = catalog::tree_query(query)?;
+            Ok(Route::JobTree {
+                job,
+                after,
+                limit,
+                depth,
+            })
+        }
         ["jobs", job, "events"] => {
             let job = job_id(job)?;
             let after_seq = events::cursor(query, request.headers())?;
@@ -450,6 +467,12 @@ pub(super) async fn respond(
         Route::Tools { job, after, limit } => projection::tools(shared, job, after, limit)
             .await
             .map(Reply::ok),
+        Route::JobTree {
+            job,
+            after,
+            limit,
+            depth,
+        } => catalog::job_tree(shared, job, after, limit, depth).await,
         Route::Submit => {
             let key = submissions::idempotency_key(request.headers())?;
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

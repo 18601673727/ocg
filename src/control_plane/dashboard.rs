@@ -44,7 +44,7 @@ pub(super) fn jobs_query(query: &str) -> Result<(Option<JobId>, usize), Refusal>
     Ok((before, limit))
 }
 
-fn bounded(shared: &Shared, value: Value) -> Result<Reply, Refusal> {
+pub(super) fn bounded(shared: &Shared, value: Value) -> Result<Reply, Refusal> {
     if value.to_string().len() > shared.response_bytes {
         return Err(OUTPUT_TOO_LARGE);
     }

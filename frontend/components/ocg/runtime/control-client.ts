@@ -21,6 +21,7 @@ import {
   decodeJobInput,
   decodeJobEvent,
   decodeJobTools,
+  decodeJobTree,
   decodeOutputsPage,
   decodePoolAnswer,
   decodePools,
@@ -506,6 +507,25 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (before) jobIdentity(before);
       const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
       return decodeChildren((await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal })).input, conversation);
+    },
+    /** The tree of the work below a Job: its ancestors, and the nodes below it. */
+    async readJobTree(
+      job: string,
+      settings: { after?: string; limit?: number; depth?: number; signal?: AbortSignal } = {},
+    ) {
+      jobIdentity(job);
+      const limit = settings.limit ?? 50;
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new ContractError("limit", "an integer from 1 to 100");
+      }
+      const depth = settings.depth ?? 2;
+      if (!Number.isSafeInteger(depth) || depth < 1 || depth > 4) {
+        throw new ContractError("depth", "an integer from 1 to 4");
+      }
+      const query = [`limit=${limit}`, `depth=${depth}`];
+      if (settings.after) query.push(`after=${jobIdentity(settings.after)}`);
+      const answer = await send("GET", `/api/v1/jobs/${job}/tree?${query.join("&")}`, { signal: settings.signal });
+      return decodeJobTree(answer.input, job);
     },
     async readCards(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);

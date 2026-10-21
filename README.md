@@ -290,6 +290,14 @@ conversations, including settled children, with title, Agent, state, hold,
 keep-open and recurrence details. The chat's child strip opens a child in the
 same chat view and provides Stop, Close and Hold/Unhold.
 
+`GET /api/v1/jobs/{job:N}/tree?after=job:M&limit=50&depth=2` reads the tree of
+the work below a Job: its ancestors, and its children in creation order, each
+with the state, Agent, model and dependencies the rows that own them hold. The
+root's own children are one page of at most 100; every node deeper than that
+lists at most 20 children, one answer holds at most 300 nodes, and the tree
+expands at most four levels. A node whose `children` is null has children the
+answer did not list: ask for the tree rooted at that node to read them.
+
 Agents also accept `approve: ["commands", "writes", "dispatch", "close"]` on
 `POST /api/v1/profiles`. It defaults to empty; an omitted field on update keeps
 the policy, and `[]` clears it. These classes gate `workspace_run_command`,

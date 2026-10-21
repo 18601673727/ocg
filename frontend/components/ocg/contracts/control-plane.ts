@@ -868,6 +868,142 @@ export function decodeChildren(input: unknown, conversationId: string) {
 }
 export type ControlChildConversation = ReturnType<typeof decodeChildren>["children"][number];
 
+/** Every state a node of a Job tree may be in. */
+export type ControlTreeState =
+  | "open"
+  | "closing"
+  | "settled"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "unknown"
+  | "running"
+  | "waiting"
+  | "queued";
+
+export type ControlTreeNode = {
+  id: string;
+  kind: "conversation" | "turn";
+  parent: string | null;
+  title: string;
+  state: ControlTreeState;
+  created_at_us: number;
+  agent: string | null;
+  agent_name: string | null;
+  model: { llm_profile: string; model: string } | null;
+  on_hold: { by: { kind: "user" | "agent" | "loop" | "auto" } } | null;
+  origin: "user" | "agent" | "system" | null;
+  keep_open: boolean | null;
+  active_turn: string | null;
+  recurrence: {
+    interval_s: number;
+    phase: "active" | "waiting_due" | "halted";
+    due_us: number | null;
+  } | null;
+  conversation: string | null;
+  previous: string | null;
+  depends_on: {
+    job: string;
+    condition: "settled" | "success";
+    state: "waiting" | "satisfied" | "impossible";
+  }[];
+  children: ControlTreeNode[] | null;
+  has_more_children: boolean;
+  next_after: string | null;
+};
+
+const TREE_STATES = [
+  "open",
+  "closing",
+  "settled",
+  "completed",
+  "failed",
+  "cancelled",
+  "unknown",
+  "running",
+  "waiting",
+  "queued",
+] as const;
+
+// The tree is read one level at a time; a deeper answer than the server
+// bounds is refused rather than walked.
+const TREE_MAX_DEPTH = 6;
+
+function treeNode(input: unknown, path: string, depth: number): ControlTreeNode {
+  if (depth > TREE_MAX_DEPTH) throw new ContractError(path, "a tree of at most 6 levels");
+  const node = record(input, path);
+  const model = node.model === null ? null : (() => {
+    const frozen = record(node.model, `${path}.model`);
+    return {
+      llm_profile: identity(frozen.llm_profile, `${path}.model.llm_profile`, "profile:"),
+      model: string(frozen.model, `${path}.model.model`),
+    };
+  })();
+  const hold = node.on_hold === null
+    ? null
+    : record(record(node.on_hold, `${path}.on_hold`).by, `${path}.on_hold.by`);
+  const by = hold === null
+    ? null
+    : oneOf(hold.kind, `${path}.on_hold.by.kind`, ["user", "agent", "loop", "auto"] as const);
+  const origin = node.origin === null
+    ? null
+    : oneOf(node.origin, `${path}.origin`, ["user", "agent", "system"] as const);
+  const recurrence = node.recurrence === null ? null : (() => {
+    const row = record(node.recurrence, `${path}.recurrence`);
+    return {
+      interval_s: integer(row.interval_s, `${path}.recurrence.interval_s`),
+      phase: oneOf(row.phase, `${path}.recurrence.phase`, ["active", "waiting_due", "halted"] as const),
+      due_us: row.due_us === null ? null : integer(row.due_us, `${path}.recurrence.due_us`),
+    };
+  })();
+  return {
+    id: identity(node.id, `${path}.id`, "job:"),
+    kind: oneOf(node.kind, `${path}.kind`, ["conversation", "turn"] as const),
+    parent: node.parent === null ? null : identity(node.parent, `${path}.parent`, "job:"),
+    title: string(node.title, `${path}.title`),
+    state: oneOf(node.state, `${path}.state`, TREE_STATES),
+    created_at_us: integer(node.created_at_us, `${path}.created_at_us`),
+    agent: node.agent === null ? null : identity(node.agent, `${path}.agent`, "profile:"),
+    agent_name: node.agent_name === null ? null : string(node.agent_name, `${path}.agent_name`),
+    model,
+    on_hold: by === null ? null : { by: { kind: by } },
+    origin,
+    keep_open: node.keep_open === null ? null : boolean(node.keep_open, `${path}.keep_open`),
+    active_turn: node.active_turn === null ? null : identity(node.active_turn, `${path}.active_turn`, "job:"),
+    recurrence,
+    conversation: node.conversation === null ? null : identity(node.conversation, `${path}.conversation`, "job:"),
+    previous: node.previous === null ? null : identity(node.previous, `${path}.previous`, "job:"),
+    depends_on: listOf(node.depends_on, `${path}.depends_on`, (entry, entryPath) => {
+      const dependency = record(entry, entryPath);
+      return {
+        job: identity(dependency.job, `${entryPath}.job`, "job:"),
+        condition: oneOf(dependency.condition, `${entryPath}.condition`, ["settled", "success"] as const),
+        state: oneOf(dependency.state, `${entryPath}.state`, ["waiting", "satisfied", "impossible"] as const),
+      };
+    }),
+    children: node.children === null
+      ? null
+      : listOf(node.children, `${path}.children`, (entry, entryPath) => treeNode(entry, entryPath, depth + 1)),
+    has_more_children: boolean(node.has_more_children, `${path}.has_more_children`),
+    next_after: node.next_after === null ? null : identity(node.next_after, `${path}.next_after`, "job:"),
+  };
+}
+
+/**
+ * The tree of the work below a Job, as `GET /api/v1/jobs/{job}/tree` reports
+ * it: the ancestors above the root, and the nodes below it.
+ */
+export function decodeJobTree(input: unknown, job: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  if (envelope.job !== job) throw new ContractError("job", "the requested Job");
+  return {
+    job,
+    ancestors: listOf(envelope.ancestors, "ancestors", (entry, path) => identity(entry, path, "job:")),
+    root: treeNode(envelope.root, "root", 1),
+  };
+}
+
 export type ControlApproval = [number, number, number];
 
 function approvalRef(input: unknown, path: string): ControlApproval {

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useControlPage } from "../runtime/use-control-page";
 import { JobWatch } from "./job-watch";
+import { JobTree } from "./job-tree";
 import { isJobIdentity } from "../layout/view-domain";
 import { useI18n } from "../i18n";
 
@@ -19,12 +20,19 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
 }) {
   const { t } = useI18n();
   const [inspect, setInspect] = useState("");
+  // The tree keeps its own root: picking a Job below it watches that Job
+  // without moving the tree's root.
+  const [treeRoot, setTreeRoot] = useState(job);
   const load = useCallback(async (before: string | undefined, signal: AbortSignal) => {
     if (!active) return { items: [], next: null };
     const page = await client.readJobs({ before, limit: 50, signal });
     return { items: page.jobs, next: page.next_before };
   }, [client, active]);
   const page = useControlPage(load, active);
+  const select = useCallback((next: string) => {
+    setTreeRoot(next);
+    onJob(next);
+  }, [onJob]);
 
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 px-4 py-6 sm:px-6">
@@ -48,7 +56,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
             >
               <button
                 type="button"
-                onClick={() => onJob(record.id)}
+                onClick={() => select(record.id)}
                 aria-current={job === record.id ? "true" : undefined}
                 className="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-3 text-left focus-visible:outline-2 focus-visible:outline-ring"
               >
@@ -86,13 +94,30 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
         <h2 className="font-heading text-lg">{t("jobs.inspectTitle")}</h2>
         <form className="flex items-end gap-2" onSubmit={(event) => {
           event.preventDefault();
-          if (isJobIdentity(inspect.trim())) onJob(inspect.trim());
+          if (isJobIdentity(inspect.trim())) select(inspect.trim());
         }}>
           <label className="flex flex-1 flex-col gap-1.5 text-sm">{t("jobs.identity")}
             <Input value={inspect} onChange={(event) => setInspect(event.target.value)} placeholder="job:<n>" spellCheck={false} />
           </label>
           <Button type="submit" variant="outline" disabled={!isJobIdentity(inspect.trim())}>{t("jobs.watch")}</Button>
         </form>
+      </section>
+      <section className="flex flex-col gap-3 rounded-lg border border-border bg-card p-5">
+        <h2 className="font-heading text-lg">{t("jobs.tree.title")}</h2>
+        <p className="text-sm text-muted-foreground">{t("jobs.tree.description")}</p>
+        {treeRoot ? (
+          <JobTree
+            key={treeRoot}
+            client={client}
+            root={treeRoot}
+            selected={job}
+            onSelect={(next) => onJob(next)}
+            onReroot={(next) => select(next)}
+            onOpenChat={onOpenChat}
+          />
+        ) : (
+          <p className="text-sm text-muted-foreground">{t("jobs.tree.hint")}</p>
+        )}
       </section>
       {job ? <JobWatch key={job} client={client} jobId={job} /> : null}
     </div>

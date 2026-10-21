@@ -710,6 +710,20 @@ impl DatabaseHandle {
             .await
     }
 
+    /// The tree of the work below a Job: the ancestors above it and the
+    /// nodes below it, the root's own children in one page. `None` when the
+    /// root has no Job of its own.
+    pub async fn job_tree(
+        &self,
+        job: JobId,
+        after: Option<JobId>,
+        limit: usize,
+        depth: u8,
+    ) -> Result<Option<crate::storage::JobTree>, DatabaseError> {
+        self.read(move |database| storage::read_job_tree(database, job, after, limit, depth))
+            .await
+    }
+
     /// What a submitted LLM execution child was configured to execute, as
     /// frozen in its input, with the Profiles it was submitted with as
     /// provenance. Later Profile edits do not change it. `None` for a Job

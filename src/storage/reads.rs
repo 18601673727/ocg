@@ -4,8 +4,9 @@ use redb::ReadableTableMetadata;
 
 use super::*;
 use crate::persistence::{
-    ConfigBody, ConfigId, ConfigKind, ConfigRecord, ExecutionConfiguration, ExecutionOperation,
-    ExecutionPoolConfig, FrozenPoolBinding, JobInputRecord, OutcomeKind, SubmittedConfiguration,
+    ConfigBody, ConfigId, ConfigKind, ConfigRecord, DependencyState, ExecutionConfiguration,
+    ExecutionOperation, ExecutionPoolConfig, FrozenPoolBinding, JobInputRecord, OutcomeKind,
+    SubmittedConfiguration,
 };
 
 // ---- typed reads ---------------------------------------------------------------
@@ -331,6 +332,420 @@ pub(crate) fn read_children(
         children.push(JobId::new(entry?.0.value().1));
     }
     Ok(children)
+}
+
+// ---- the tree of the work ---------------------------------------------------------
+
+/// The most children the root's own page lists.
+pub(crate) const TREE_PAGE_MAX: usize = 100;
+/// The most children a node deeper than the root lists.
+pub(crate) const TREE_NESTED: usize = 20;
+/// The most nodes one answer holds, the root included.
+pub(crate) const TREE_NODES_MAX: usize = 300;
+/// The deepest level the tree expands.
+pub(crate) const TREE_DEPTH_MAX: u8 = 4;
+/// The most ancestors a root names.
+const TREE_ANCESTORS_MAX: usize = 8;
+/// The most dependencies one turn waits on.
+const TREE_DEPENDENCIES_MAX: usize = 16;
+/// The most characters of a title.
+const TITLE_CHARS: usize = 80;
+
+/// What one node of the tree is. Every fact is read from the row that owns
+/// it: nothing here is a copy of another row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeFacts {
+    Conversation {
+        title: String,
+        /// `open`, `closing` or `settled`, as the conversation itself computes.
+        state: &'static str,
+        on_hold: Option<Actor>,
+        /// `user`, `agent` or `system`.
+        origin: &'static str,
+        keep_open: bool,
+        /// The turn the conversation is running, with the model it runs with.
+        active_turn: Option<(JobId, ConfigId, String)>,
+        recurrence: Option<Recurrence>,
+    },
+    Turn {
+        title: String,
+        /// `completed`, `failed`, `cancelled`, `unknown`, `running`,
+        /// `waiting` or `queued`.
+        state: &'static str,
+        /// The conversation the turn belongs to.
+        conversation: Option<JobId>,
+        previous: Option<JobId>,
+        /// The LLM Profile the turn runs with, and the model it names.
+        model: (ConfigId, String),
+        depends_on: Vec<(JobId, DependencyCondition, DependencyState)>,
+    },
+}
+
+/// One node of the tree: the Job, what it is, and the children it lists.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNode {
+    pub id: JobId,
+    pub parent_id: Option<JobId>,
+    pub created_at: Timestamp,
+    pub facts: TreeFacts,
+    /// The Agent of the node, with its name when its config row is there.
+    pub agent: Option<(ConfigId, Option<String>)>,
+    /// The children this node lists, as indexes into the tree's nodes.
+    pub children: Option<Vec<usize>>,
+    /// Whether the node has children this answer does not list.
+    pub has_more_children: bool,
+    /// The cursor of the node's next page of children.
+    pub next_after: Option<JobId>,
+}
+
+/// The tree of the work below one Job: its ancestors, and the nodes of the
+/// tree itself, the root first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobTree {
+    pub ancestors: Vec<JobId>,
+    pub nodes: Vec<TreeNode>,
+}
+
+/// One page of a node's children.
+struct ChildPage {
+    listed: Vec<JobId>,
+    has_more: bool,
+    next_after: Option<JobId>,
+}
+
+/// The children of `parent` in creation order, strictly after `after` when
+/// given. The parent is never its own child.
+fn child_page(
+    rx: &ReadTransaction,
+    parent: JobId,
+    after: Option<JobId>,
+    limit: usize,
+) -> Result<ChildPage, StorageError> {
+    let start = after.map_or(0, |after| after.get().saturating_add(1));
+    let mut listed = Vec::new();
+    let mut has_more = false;
+    for entry in rx
+        .open_table(CHILDREN)?
+        .range((parent.get(), start)..=(parent.get(), u64::MAX))?
+    {
+        let child = JobId::new(entry?.0.value().1);
+        if child == parent {
+            continue;
+        }
+        if listed.len() == limit {
+            has_more = true;
+            break;
+        }
+        listed.push(child);
+    }
+    let next_after = has_more.then(|| listed.last().copied()).flatten();
+    Ok(ChildPage {
+        listed,
+        has_more,
+        next_after,
+    })
+}
+
+/// Whether a node has any child at all.
+fn has_children(rx: &ReadTransaction, parent: JobId) -> Result<bool, StorageError> {
+    Ok(rx
+        .open_table(CHILDREN)?
+        .range((parent.get(), 0)..=(parent.get(), u64::MAX))?
+        .next()
+        .transpose()?
+        .is_some())
+}
+
+/// The ancestors of `root`, the topmost first. The Genesis Job is the root of
+/// every tree and is never named.
+fn read_ancestors(rx: &ReadTransaction, root: JobId) -> Result<Vec<JobId>, StorageError> {
+    let mut ancestors = Vec::new();
+    let mut current = read_job_row(rx, root)?.and_then(|row| row.parent_id);
+    while let Some(id) = current {
+        if id.get() == 0 {
+            break;
+        }
+        ancestors.push(id);
+        if ancestors.len() > TREE_ANCESTORS_MAX {
+            return Err(StorageError::corrupted("too many ancestors"));
+        }
+        current = match read_job_row(rx, id)? {
+            Some(row) => row.parent_id,
+            None => return Err(StorageError::corrupted(format!("{id} has no job row"))),
+        };
+    }
+    ancestors.reverse();
+    Ok(ancestors)
+}
+
+/// The name of an Agent, read once per request.
+fn agent_name(
+    rx: &ReadTransaction,
+    agent: ConfigId,
+    names: &mut BTreeMap<ConfigId, Option<String>>,
+) -> Result<Option<String>, StorageError> {
+    if let Some(name) = names.get(&agent) {
+        return Ok(name.clone());
+    }
+    let name = rx
+        .open_table(CONFIGS)?
+        .get(agent.get())?
+        .map(|bytes| ConfigRow::decode(bytes.value()))
+        .transpose()?
+        .map(|row| row.name);
+    names.insert(agent, name.clone());
+    Ok(name)
+}
+
+/// The turn a conversation is running, with the model it runs with. It is the
+/// active turn only while that turn is claimed and has no outcome.
+fn active_turn(
+    rx: &ReadTransaction,
+    conversation: JobId,
+) -> Result<Option<(JobId, ConfigId, String)>, StorageError> {
+    let Some(turn) = rx
+        .open_table(ACTIVE_TURNS)?
+        .get(conversation.get())?
+        .map(|id| JobId::new(id.value()))
+    else {
+        return Ok(None);
+    };
+    let state = read_state(rx, turn)?;
+    if state.claim.is_none() || state.outcome.is_some() {
+        return Ok(None);
+    }
+    let row = read_job_row(rx, turn)?
+        .ok_or_else(|| StorageError::corrupted(format!("{turn} has no job row")))?;
+    let (execution, _, _) = turn_execution(&rx.open_table(JOBS)?, &row)?;
+    Ok(Some((
+        turn,
+        execution.llm.model.id,
+        execution.llm.config.model.clone(),
+    )))
+}
+
+/// How a turn stands: what its outcome says, else whether it runs, else
+/// whether it waits on a dependency, else that it is queued.
+fn turn_state(rx: &ReadTransaction, id: JobId) -> Result<&'static str, StorageError> {
+    let state = read_state(rx, id)?;
+    if let Some(outcome) = &state.outcome {
+        return Ok(match outcome.kind {
+            OutcomeKind::Completed => "completed",
+            OutcomeKind::Failed => "failed",
+            OutcomeKind::Cancelled => "cancelled",
+            OutcomeKind::Unknown => "unknown",
+        });
+    }
+    if state.claim.is_some() {
+        return Ok("running");
+    }
+    let open = rx
+        .open_table(UNSETTLED)?
+        .get(id.get())?
+        .map(|counts| counts.value().0)
+        .unwrap_or(0);
+    Ok(if open > 0 { "waiting" } else { "queued" })
+}
+
+/// How a dependency stands: it waits while the prerequisite has not settled,
+/// and it can never be met once the prerequisite has settled without the
+/// outcome the condition asks for.
+fn dependency_state(
+    rx: &ReadTransaction,
+    dependency: JobId,
+    condition: DependencyCondition,
+) -> Result<DependencyState, StorageError> {
+    if rx.open_table(UNSETTLED)?.get(dependency.get())?.is_some() {
+        return Ok(DependencyState::Waiting);
+    }
+    let state = rx
+        .open_table(JOB_STATES)?
+        .get(dependency.get())?
+        .map(|bytes| JobStateRow::decode(bytes.value()))
+        .transpose()?;
+    let completed = state
+        .as_ref()
+        .and_then(|state| state.outcome.as_ref())
+        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+    Ok(if completed || condition == DependencyCondition::Settled {
+        DependencyState::Satisfied
+    } else {
+        DependencyState::Impossible
+    })
+}
+
+/// A title, as long as the tree shows it.
+fn cap_title(title: &str) -> String {
+    title.chars().take(TITLE_CHARS).collect()
+}
+
+/// The text of a turn's first entry: what it was asked, or nothing when its
+/// first entry is not a message.
+fn first_entry_text(rx: &ReadTransaction, turn: JobId) -> Result<String, StorageError> {
+    Ok(rx
+        .open_table(TURN_INPUTS)?
+        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+        .next()
+        .transpose()?
+        .map(|entry| TurnEntry::decode(entry.1.value()))
+        .transpose()?
+        .map(|entry| match entry.entry {
+            Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => {
+                text.chars().take(TITLE_CHARS).collect()
+            }
+            _ => String::new(),
+        })
+        .unwrap_or_default())
+}
+
+/// One node of the tree: the Job's own row, its state, and what it owns.
+fn tree_node(
+    rx: &ReadTransaction,
+    row: &JobRow,
+    names: &mut BTreeMap<ConfigId, Option<String>>,
+) -> Result<TreeNode, StorageError> {
+    let (facts, agent) = match &row.kind {
+        JobKind::Conversation {
+            origin, keep_open, ..
+        } => {
+            let tip = rx
+                .open_table(TIPS)?
+                .get(row.id.get())?
+                .map(|id| JobId::new(id.value()))
+                .ok_or_else(|| StorageError::corrupted(format!("{} has no tip", row.id)))?;
+            let summary = conversation_summary(rx, row.id, tip)?;
+            let state = match summary.state.as_str() {
+                "open" => "open",
+                "closing" => "closing",
+                "settled" => "settled",
+                _ => return Err(StorageError::corrupted("unknown conversation state")),
+            };
+            let origin = match origin {
+                Origin::User => "user",
+                Origin::Agent { .. } => "agent",
+                Origin::System => "system",
+            };
+            let recurrence = rx
+                .open_table(RECURRENCES)?
+                .get(row.id.get())?
+                .map(|bytes| Recurrence::decode(bytes.value()))
+                .transpose()?;
+            (
+                TreeFacts::Conversation {
+                    title: cap_title(&summary.title),
+                    state,
+                    on_hold: summary.on_hold,
+                    origin,
+                    keep_open: *keep_open,
+                    active_turn: active_turn(rx, row.id)?,
+                    recurrence,
+                },
+                summary.agent,
+            )
+        }
+        JobKind::Turn { name, .. } => {
+            let (execution, _, agent) = turn_execution(&rx.open_table(JOBS)?, row)?;
+            let title = match name {
+                Some(name) => name.clone(),
+                None => match row.kind.objective() {
+                    Some(objective) => objective.to_owned(),
+                    None => first_entry_text(rx, row.id)?,
+                },
+            };
+            let mut depends_on = Vec::new();
+            for (dependency, condition) in
+                row.kind.dependencies().iter().take(TREE_DEPENDENCIES_MAX)
+            {
+                depends_on.push((
+                    *dependency,
+                    *condition,
+                    dependency_state(rx, *dependency, *condition)?,
+                ));
+            }
+            (
+                TreeFacts::Turn {
+                    title: cap_title(&title),
+                    state: turn_state(rx, row.id)?,
+                    conversation: row.kind.is_stored().then_some(row.parent_id).flatten(),
+                    previous: row.kind.previous(),
+                    model: (execution.llm.model.id, execution.llm.config.model.clone()),
+                    depends_on,
+                },
+                agent,
+            )
+        }
+    };
+    let agent = match agent {
+        Some(agent) => Some((agent, agent_name(rx, agent, names)?)),
+        None => None,
+    };
+    Ok(TreeNode {
+        id: row.id,
+        parent_id: row.parent_id,
+        created_at: row.created_at,
+        facts,
+        agent,
+        children: None,
+        has_more_children: false,
+        next_after: None,
+    })
+}
+
+/// The tree of the work below `root`: the ancestors above it, and the nodes
+/// below it, breadth first and in creation order. The root's own children
+/// are one page; every node deeper than that lists only as many children as
+/// the bounds allow.
+pub(crate) fn read_job_tree(
+    database: &Database,
+    root: JobId,
+    after: Option<JobId>,
+    limit: usize,
+    depth: u8,
+) -> Result<Option<JobTree>, StorageError> {
+    let rx = read(database)?;
+    let Some(root_row) = read_job_row(&rx, root)? else {
+        return Ok(None);
+    };
+    let ancestors = read_ancestors(&rx, root)?;
+    let mut names: BTreeMap<ConfigId, Option<String>> = BTreeMap::new();
+    let mut nodes = vec![tree_node(&rx, &root_row, &mut names)?];
+    let page = child_page(&rx, root, after, limit.min(TREE_PAGE_MAX))?;
+    let mut level = Vec::new();
+    for child in page.listed {
+        let row = read_job_row(&rx, child)?
+            .ok_or_else(|| StorageError::corrupted(format!("{child} has no job row")))?;
+        nodes.push(tree_node(&rx, &row, &mut names)?);
+        level.push(nodes.len() - 1);
+    }
+    nodes[0].children = Some(level.clone());
+    nodes[0].has_more_children = page.has_more;
+    nodes[0].next_after = page.next_after;
+    for _ in 2..=depth.min(TREE_DEPTH_MAX) {
+        let mut next = Vec::new();
+        for index in level {
+            if nodes.len() + TREE_NESTED > TREE_NODES_MAX {
+                nodes[index].has_more_children = has_children(&rx, nodes[index].id)?;
+                continue;
+            }
+            let page = child_page(&rx, nodes[index].id, None, TREE_NESTED)?;
+            let mut children = Vec::new();
+            for child in page.listed {
+                let row = read_job_row(&rx, child)?
+                    .ok_or_else(|| StorageError::corrupted(format!("{child} has no job row")))?;
+                nodes.push(tree_node(&rx, &row, &mut names)?);
+                children.push(nodes.len() - 1);
+            }
+            nodes[index].children = Some(children.clone());
+            nodes[index].has_more_children = page.has_more;
+            nodes[index].next_after = page.next_after;
+            next.extend(children);
+        }
+        level = next;
+    }
+    for index in level {
+        nodes[index].has_more_children = has_children(&rx, nodes[index].id)?;
+    }
+    Ok(Some(JobTree { ancestors, nodes }))
 }
 
 pub(crate) fn read_retries(
@@ -1047,20 +1462,7 @@ fn conversation_summary(
                 .transpose()?
                 .map(|entry| entry.0.value().1);
             match first {
-                Some(first) => rx
-                    .open_table(TURN_INPUTS)?
-                    .range((first, 0)..=(first, u32::MAX))?
-                    .next()
-                    .transpose()?
-                    .map(|entry| TurnEntry::decode(entry.1.value()))
-                    .transpose()?
-                    .map(|entry| match entry.entry {
-                        Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => {
-                            text.chars().take(80).collect()
-                        }
-                        _ => String::new(),
-                    })
-                    .unwrap_or_default(),
+                Some(first) => first_entry_text(rx, JobId::new(first))?,
                 None => String::new(),
             }
         }

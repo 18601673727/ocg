@@ -2662,6 +2662,108 @@ mod tests {
     }
 
     #[test]
+    fn job_tree_lists_children_dependencies_and_agents() {
+        use crate::orchestration::job_tools::JobDependency;
+        use crate::persistence::{DependencyCondition, DependencyState};
+        let fixture = Fixture::new("job-tree");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let (child, child_turn) = fixture.dispatch(turn, 0, agent, false, None, vec![]);
+        let (waiter, waiter_turn) = fixture.dispatch(
+            turn,
+            1,
+            agent,
+            false,
+            None,
+            vec![JobDependency {
+                conversation: child.to_string(),
+                condition: "settled".into(),
+            }],
+        );
+        let tree = wait(fixture.database.job_tree(parent, None, 50, 2))
+            .unwrap()
+            .expect("tree");
+        let root = &tree.nodes[0];
+        assert_eq!(root.id, parent);
+        assert_eq!(
+            root.agent.as_ref().and_then(|(_, name)| name.as_deref()),
+            Some("dispatcher")
+        );
+        match &root.facts {
+            TreeFacts::Conversation {
+                state, active_turn, ..
+            } => {
+                assert_eq!(*state, "open");
+                assert_eq!(active_turn.as_ref().map(|(turn, _, _)| *turn), Some(turn));
+            }
+            other => panic!("the root is a conversation: {other:?}"),
+        }
+        let children = root.children.as_ref().expect("the root's children");
+        assert_eq!(children.len(), 3);
+        assert_eq!(tree.nodes[children[0]].id, turn);
+        assert_eq!(tree.nodes[children[1]].id, child);
+        assert_eq!(tree.nodes[children[2]].id, waiter);
+        match &tree.nodes[children[0]].facts {
+            TreeFacts::Turn { state, .. } => assert_eq!(*state, "running"),
+            other => panic!("the first child is a turn: {other:?}"),
+        }
+        for (index, name) in [
+            (children[1], "dispatch target"),
+            (children[2], "dispatch target"),
+        ] {
+            assert_eq!(
+                tree.nodes[index]
+                    .agent
+                    .as_ref()
+                    .and_then(|(_, name)| name.as_deref()),
+                Some(name)
+            );
+        }
+        let child_children = tree.nodes[children[1]]
+            .children
+            .as_ref()
+            .expect("the child's first turn");
+        assert_eq!(tree.nodes[child_children[0]].id, child_turn);
+        let waiter_children = tree.nodes[children[2]]
+            .children
+            .as_ref()
+            .expect("the waiter's first turn");
+        assert_eq!(tree.nodes[waiter_children[0]].id, waiter_turn);
+        match &tree.nodes[waiter_children[0]].facts {
+            TreeFacts::Turn {
+                state, depends_on, ..
+            } => {
+                assert_eq!(*state, "waiting");
+                assert_eq!(
+                    depends_on,
+                    &vec![(
+                        child,
+                        DependencyCondition::Settled,
+                        DependencyState::Waiting
+                    )]
+                );
+            }
+            other => panic!("the waiter's first child is a turn: {other:?}"),
+        }
+        let page = wait(fixture.database.job_tree(parent, None, 1, 2))
+            .unwrap()
+            .expect("tree");
+        assert!(page.nodes[0].has_more_children);
+        assert_eq!(page.nodes[0].next_after, Some(turn));
+        let after = wait(fixture.database.job_tree(parent, Some(turn), 1, 2))
+            .unwrap()
+            .expect("tree");
+        let after_children = after.nodes[0].children.as_ref().expect("children");
+        assert_eq!(after.nodes[after_children[0]].id, child);
+        let shallow = wait(fixture.database.job_tree(parent, None, 50, 1))
+            .unwrap()
+            .expect("tree");
+        let shallow_children = shallow.nodes[0].children.as_ref().expect("children");
+        assert!(shallow.nodes[shallow_children[1]].children.is_none());
+        assert!(shallow.nodes[shallow_children[1]].has_more_children);
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn agent_messages_wake_the_parent_but_user_messages_in_a_child_do_not() {
         use crate::orchestration::job_tools::JobToolCall;
         let fixture = Fixture::new("dispatch-messages");

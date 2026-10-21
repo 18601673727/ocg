@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { decodeChildren, decodeCards, decodeAdmission, decodeConversationTurns, decodeConversations, decodeStop } from "../components/ocg/contracts/control-plane";
+import { decodeChildren, decodeCards, decodeAdmission, decodeConversationTurns, decodeConversations, decodeJobTree, decodeStop } from "../components/ocg/contracts/control-plane";
 
 const admission = decodeAdmission({ api_version: 1, admission: { status: "admitted", job: "job:3", conversation: "job:1", seq: 2, joined: true, model: "frozen", kept: false } });
 assert.equal(admission.conversation, "job:1");
@@ -18,6 +18,35 @@ assert.equal(children.children[0].on_hold?.by.kind, "loop");
 assert.equal(children.next_before, "job:4");
 assert.throws(() => decodeChildren({ api_version: 1, conversation: "job:2", children: [], has_more: false, next_before: null }, "job:1"));
 assert.throws(() => decodeChildren({ api_version: 1, conversation: "job:1", children: [{ ...children.children[0], recurrence: { interval_s: 1, phase: "active", due_us: null } }], has_more: false, next_before: null }, "job:1"));
+
+const tree = decodeJobTree({ api_version: 1, job: "job:1", ancestors: ["job:0"], root: {
+  id: "job:1", kind: "conversation", parent: null, title: "root", state: "open", created_at_us: 1,
+  agent: "profile:2", agent_name: "dispatcher", model: { llm_profile: "profile:3", model: "gpt" },
+  on_hold: { by: { kind: "user" } }, origin: "agent", keep_open: true, active_turn: "job:2",
+  recurrence: { interval_s: 60, phase: "active", due_us: null },
+  conversation: null, previous: null, depends_on: [], children: [{
+    id: "job:2", kind: "turn", parent: "job:1", title: "answer", state: "waiting", created_at_us: 2,
+    agent: "profile:2", agent_name: "dispatcher", model: { llm_profile: "profile:3", model: "gpt" },
+    on_hold: null, origin: null, keep_open: null, active_turn: null, recurrence: null,
+    conversation: "job:1", previous: null,
+    depends_on: [{ job: "job:4", condition: "settled", state: "waiting" }],
+    children: null, has_more_children: false, next_after: null,
+  }, {
+    id: "job:5", kind: "conversation", parent: "job:1", title: "child", state: "open", created_at_us: 3,
+    agent: "profile:2", agent_name: "dispatch target", model: null,
+    on_hold: null, origin: "agent", keep_open: false, active_turn: null, recurrence: null,
+    conversation: null, previous: null, depends_on: [],
+    children: null, has_more_children: true, next_after: null,
+  }], has_more_children: false, next_after: null,
+} }, "job:1");
+assert.equal(tree.root.children?.[0].depends_on[0].job, "job:4");
+assert.equal(tree.root.children?.[0].depends_on[0].state, "waiting");
+assert.equal(tree.root.children?.[0].state, "waiting");
+assert.equal(tree.root.children?.[1].kind, "conversation");
+assert.equal(tree.root.children?.[1].children, null);
+assert.equal(tree.root.children?.[1].has_more_children, true);
+assert.equal(tree.ancestors[0], "job:0");
+assert.throws(() => decodeJobTree({ api_version: 1, job: "job:2", ancestors: [], root: tree.root }, "job:1"));
 
 const cards = decodeCards({ api_version: 1, conversation: "job:1", cards: [
   { kind: "approval", conversation: "job:5", parent: "job:3", approval: [6, 1, 0], tool: "workspace_run_command", arguments: "{}" },

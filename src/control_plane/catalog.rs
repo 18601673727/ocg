@@ -13,13 +13,14 @@ use serde_json::{Value, json};
 
 use super::{
     API_VERSION, INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, NOT_FOUND, Refusal, Reply,
-    decimal, micros, profiles, routing, submissions,
+    Shared, dashboard, decimal, micros, profiles, routing, submissions,
 };
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
-    ConfigBody, ConfigKind, ConversationEdit, JobId, ModelCapability, ProfileId, RecordRef,
-    Violation,
+    ConfigBody, ConfigKind, ConversationEdit, DependencyCondition, DependencyState, JobId,
+    ModelCapability, ProfileId, RecordRef, Recurrence, Violation,
 };
+use crate::storage::{JobTree, TreeFacts, TreeNode};
 
 /// The most one page of Conversations or Projects reads, and the default.
 pub(super) const MAX_CONVERSATION_PAGE: usize = 100;
@@ -55,6 +56,48 @@ pub(super) fn page_query<T>(
 
 pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize), Refusal> {
     page_query(query, routing::job_id)
+}
+
+/// The most children one page of a tree lists, and the default.
+const MAX_TREE_PAGE: usize = 100;
+const DEFAULT_TREE_PAGE: usize = 50;
+/// The deepest level a tree expands, and the default.
+const MAX_TREE_DEPTH: u8 = 4;
+const DEFAULT_TREE_DEPTH: u8 = 2;
+
+/// `after`, `limit` and `depth`, each at most once, and nothing else.
+pub(super) fn tree_query(query: &str) -> Result<(Option<JobId>, usize, u8), Refusal> {
+    let (mut after, mut limit, mut depth) = (None, None, None);
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+            match key {
+                "after" if after.is_none() => {
+                    after = Some(routing::job_id(value)?);
+                }
+                "limit" if limit.is_none() => {
+                    limit = Some(
+                        decimal::<usize>(value)
+                            .filter(|limit| (1..=MAX_TREE_PAGE).contains(limit))
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                "depth" if depth.is_none() => {
+                    depth = Some(
+                        decimal::<u8>(value)
+                            .filter(|depth| (1..=MAX_TREE_DEPTH).contains(depth))
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                _ => return Err(INVALID_REQUEST),
+            }
+        }
+    }
+    Ok((
+        after,
+        limit.unwrap_or(DEFAULT_TREE_PAGE),
+        depth.unwrap_or(DEFAULT_TREE_DEPTH),
+    ))
 }
 
 /// The most Profiles one page of Agent Profiles reads, and the default.
@@ -204,6 +247,136 @@ pub(super) async fn conversation_children(
         json!({"api_version":API_VERSION,"conversation":conversation.to_string(),"children":children,"has_more":has_more,"next_before":if has_more { records.get(limit.saturating_sub(1)).map(|record| record.conversation.root_job.to_string()) } else { None }}),
     ))
 }
+/// The recurrence of a conversation, as the children route reports it.
+fn recurrence_json(row: &Recurrence) -> Value {
+    use crate::persistence::RecurrencePhase;
+    let (phase, due) = match row.phase {
+        RecurrencePhase::Active => ("active", None),
+        RecurrencePhase::WaitingDue { due } => ("waiting_due", Some(due)),
+        RecurrencePhase::Halted { .. } => ("halted", None),
+    };
+    json!({"interval_s":row.interval_s, "phase":phase, "due_us":due})
+}
+
+/// One node of the tree, as the route reports it. The children of a node
+/// are the nodes the tree holds below it.
+fn tree_node_json(node: &TreeNode, tree: &JobTree) -> Value {
+    let agent = node
+        .agent
+        .as_ref()
+        .map(|(id, _)| ProfileId::from(*id).to_string());
+    let agent_name = node.agent.as_ref().and_then(|(_, name)| name.clone());
+    let mut value = match &node.facts {
+        TreeFacts::Conversation {
+            title,
+            state,
+            on_hold,
+            origin,
+            keep_open,
+            active_turn,
+            recurrence,
+        } => {
+            let model = active_turn.as_ref().map(|(_, llm, model)| {
+                json!({"llm_profile": ProfileId::from(*llm).to_string(), "model": model})
+            });
+            json!({
+                "id": node.id.to_string(),
+                "kind": "conversation",
+                "parent": node.parent_id.map(|parent| parent.to_string()),
+                "title": title,
+                "state": state,
+                "created_at_us": node.created_at.as_unix_micros(),
+                "agent": agent,
+                "agent_name": agent_name,
+                "model": model,
+                "on_hold": on_hold.as_ref().map(|by| json!({"by": actor_json(by)})),
+                "origin": origin,
+                "keep_open": keep_open,
+                "active_turn": active_turn.as_ref().map(|(turn, _, _)| turn.to_string()),
+                "recurrence": recurrence.as_ref().map(recurrence_json),
+                "conversation": Value::Null,
+                "previous": Value::Null,
+                "depends_on": Vec::<Value>::new(),
+            })
+        }
+        TreeFacts::Turn {
+            title,
+            state,
+            conversation,
+            previous,
+            model,
+            depends_on,
+        } => json!({
+            "id": node.id.to_string(),
+            "kind": "turn",
+            "parent": node.parent_id.map(|parent| parent.to_string()),
+            "title": title,
+            "state": state,
+            "created_at_us": node.created_at.as_unix_micros(),
+            "agent": agent,
+            "agent_name": agent_name,
+            "model": json!({"llm_profile": ProfileId::from(model.0).to_string(), "model": model.1}),
+            "on_hold": Value::Null,
+            "origin": Value::Null,
+            "keep_open": Value::Null,
+            "active_turn": Value::Null,
+            "recurrence": Value::Null,
+            "conversation": conversation.map(|conversation| conversation.to_string()),
+            "previous": previous.map(|previous| previous.to_string()),
+            "depends_on": depends_on.iter().map(|(job, condition, state)| json!({
+                "job": job.to_string(),
+                "condition": match condition {
+                    DependencyCondition::Success => "success",
+                    DependencyCondition::Settled => "settled",
+                },
+                "state": match state {
+                    DependencyState::Waiting => "waiting",
+                    DependencyState::Satisfied => "satisfied",
+                    DependencyState::Impossible => "impossible",
+                },
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    value["children"] = match &node.children {
+        Some(children) => Value::Array(
+            children
+                .iter()
+                .map(|index| tree_node_json(&tree.nodes[*index], tree))
+                .collect(),
+        ),
+        None => Value::Null,
+    };
+    value["has_more_children"] = json!(node.has_more_children);
+    value["next_after"] = node.next_after.map(|id| id.to_string()).into();
+    value
+}
+
+/// The tree of the work below a Job: its ancestors, and the nodes of the
+/// tree itself. Every fact is read from the row that owns it.
+pub(super) async fn job_tree(
+    shared: &Shared,
+    job: JobId,
+    after: Option<JobId>,
+    limit: usize,
+    depth: u8,
+) -> Result<Reply, Refusal> {
+    let tree = shared
+        .database
+        .job_tree(job, after, limit, depth)
+        .await?
+        .ok_or(JOB_NOT_FOUND)?;
+    let root = tree_node_json(&tree.nodes[0], &tree);
+    dashboard::bounded(
+        shared,
+        json!({
+            "api_version": API_VERSION,
+            "job": job.to_string(),
+            "ancestors": tree.ancestors.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+            "root": root,
+        }),
+    )
+}
+
 pub(super) async fn conversation_turns(
     database: &DatabaseHandle,
     conversation: JobId,
@@ -460,6 +633,30 @@ mod tests {
             "limit",
         ] {
             assert!(agent_profile_query(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_tree_query_names_after_limit_and_depth_once() {
+        let (after, limit, depth) = tree_query("").expect("no query is the first page");
+        assert_eq!(
+            (after, limit, depth),
+            (None, DEFAULT_TREE_PAGE, DEFAULT_TREE_DEPTH)
+        );
+        let (after, limit, depth) =
+            tree_query("after=job:3&limit=5&depth=4").expect("a cursor, a limit and a depth");
+        assert_eq!((after, limit, depth), (Some(JobId::new(3)), 5, 4));
+        for refused in [
+            "limit=0",
+            "limit=101",
+            "depth=0",
+            "depth=5",
+            "after=3",
+            "after=job:1&after=job:2",
+            "before=job:1",
+            "depth",
+        ] {
+            assert!(tree_query(refused).is_err(), "{refused}");
         }
     }
 }
