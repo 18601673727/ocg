@@ -9,6 +9,8 @@ export type TranscriptTurn = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  /** The model's stored reasoning, shown apart from the answer. */
+  reasoning?: string;
   attachments?: readonly string[];
   status: "completed" | "streaming" | "pending" | "failed" | "cancelled" | "unknown";
   /** The Result output's own text where the Job did not complete. */
@@ -22,9 +24,10 @@ export type TranscriptTurn = {
  * text of the Job's frozen input, read from `GET /jobs/{job}/input`; it is
  * drawn only when that text was actually read, never inferred from the Job
  * record's input identity. The answer is the Job's stored Progress outputs in
- * `seq` order, and the Job's settlement alone decides whether it is complete,
- * failed, cancelled or of unknown outcome. A Job is one turn: there is no
- * Conversation entity to read earlier turns from.
+ * `seq` order, the Job's stored Reasoning outputs are carried separately so a
+ * view can show them as thinking, and the Job's settlement alone decides
+ * whether it is complete, failed, cancelled or of unknown outcome. A Job is
+ * one turn: there is no Conversation entity to read earlier turns from.
  */
 export function jobTranscript(
   jobId: string,
@@ -40,6 +43,10 @@ export function jobTranscript(
     .filter((output) => output.kind === "progress")
     .map((output) => output.summary ?? "")
     .join("");
+  const reasoning = outputs
+    .filter((output) => output.kind === "reasoning")
+    .map((output) => output.summary ?? "")
+    .join("");
   const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
   const state = settlement?.state ?? "unsettled";
   const base = {
@@ -47,6 +54,7 @@ export function jobTranscript(
     role: "assistant" as const,
     createdAtUs: outputs.at(-1)?.created_at_us ?? null,
     tools,
+    ...(reasoning ? { reasoning } : {}),
   };
   const hasUserTurn = objective !== null || (attachments && attachments.length > 0);
   const user: TranscriptTurn[] = !hasUserTurn
