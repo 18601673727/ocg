@@ -230,10 +230,12 @@ impl Drop for RunningGroup {
 static RUNNING_GROUPS: Mutex<Vec<(JobId, Pid)>> = Mutex::new(Vec::new());
 
 pub(crate) struct UnprovenGroup {
-    pub(crate) job: JobId,
+    pub(crate) job: Option<JobId>,
     pub(crate) group: Pid,
     pub(crate) sentinel: OwnedFd,
     pub(crate) leader: Child,
+    /// Held until the group is proven empty, so no new command runs beside it.
+    pub(crate) _permit: Permit,
 }
 
 static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
@@ -269,7 +271,7 @@ pub(crate) fn retry_unproven_groups() -> Vec<JobId> {
                 if let Err(error) = entry.leader.wait() {
                     log::warn!("failed to reap unproven process leader: {error}");
                 }
-                candidate_jobs.insert(entry.job);
+                candidate_jobs.extend(entry.job);
             }
             Err(_) => {
                 remaining.push(entry);
@@ -277,7 +279,9 @@ pub(crate) fn retry_unproven_groups() -> Vec<JobId> {
         }
     }
     for entry in &remaining {
-        candidate_jobs.remove(&entry.job);
+        if let Some(job) = entry.job {
+            candidate_jobs.remove(&job);
+        }
     }
     *groups = remaining;
     candidate_jobs.into_iter().collect()
@@ -430,16 +434,14 @@ impl Process {
             }
         }
         if let Err(error) = prove_empty(self.group, &self.sentinel) {
-            if let Some(job) = self.job {
-                record_unproven_group(UnprovenGroup {
-                    job,
-                    group: self.group,
-                    sentinel: self.sentinel,
-                    leader: self.child,
-                });
-            }
+            record_unproven_group(UnprovenGroup {
+                job: self.job,
+                group: self.group,
+                sentinel: self.sentinel,
+                leader: self.child,
+                _permit: self.permit,
+            });
             drop(self.running);
-            drop(self.permit);
             return Err(FinishError::NotProven(error));
         }
         let mut raw_status: libc::c_int = 0;
@@ -699,6 +701,7 @@ fn read_process_stat(path: &std::path::Path) -> std::io::Result<Option<String>> 
         Ok(stat) => Ok(Some(stat)),
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
+                || error.kind() == std::io::ErrorKind::PermissionDenied
                 || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
         {
             Ok(None)
@@ -790,7 +793,7 @@ pub(crate) fn prove_job(job: JobId) -> JobProof {
     let mut live = None;
     let mut remaining = Vec::new();
     for mut entry in groups.drain(..) {
-        if entry.job != job {
+        if entry.job != Some(job) {
             remaining.push(entry);
             continue;
         }

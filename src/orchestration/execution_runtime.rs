@@ -1584,6 +1584,7 @@ async fn dispatch_runtime(
             }
             SchedulerMessage::Reconcile => {
                 reconcile_at = Instant::now() + Duration::from_secs(30);
+                retry_unsettled().await;
                 match ntex::rt::spawn_blocking(blocking::retry_unproven_groups).await {
                     Ok(recovered) => unconfirmed_stopped.extend(recovered),
                     Err(error) => {
@@ -1779,6 +1780,7 @@ async fn dispatch_runtime(
     for (job, task) in running {
         finish_grant(&database, job, task).await;
     }
+    retry_unsettled().await;
     lock(&state).current.clear();
     lock(&state).stops.clear();
     Ok(())
@@ -1981,11 +1983,55 @@ async fn finalize_claim_error(
     } else {
         database.clone()
     };
-    match database.finalize_job(job, outcome).await {
+    match database.finalize_job(job, outcome.clone()).await {
         Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
-        Err(failure) => log::error!(
-            "Job {job} error ({error}) could not be finalized: {failure}; open reconcile will recover it"
-        ),
+        Err(failure) => {
+            log::error!(
+                "Job {job} error ({error}) could not be finalized: {failure}; the finalization is retained for retry"
+            );
+            retain_unsettled(database, job, outcome);
+        }
+    }
+}
+
+/// Finalizations that failed, kept until the database accepts them: a pure
+/// low-space lock never reopens the database, so open reconcile would not
+/// settle them.
+static UNSETTLED: Mutex<Vec<(DatabaseHandle, JobId, JobFinalization)>> = Mutex::new(Vec::new());
+
+fn retain_unsettled(database: DatabaseHandle, job: JobId, outcome: JobFinalization) {
+    let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
+    if !unsettled.iter().any(|(_, retained, _)| *retained == job) {
+        unsettled.push((database, job, outcome));
+    }
+}
+
+/// Retries every retained finalization once. A rejected completion is
+/// downgraded to a failure, so a refused result cannot be retried forever.
+async fn retry_unsettled() {
+    let retained = std::mem::take(&mut *UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner));
+    for (database, job, outcome) in retained {
+        match database.finalize_job(job, outcome.clone()).await {
+            Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
+            Err(DatabaseError::ShuttingDown | DatabaseError::StorageUnavailable(_)) => {}
+            Err(DatabaseError::Rejected(violation)) => {
+                if matches!(outcome, JobFinalization::Completed(_)) {
+                    let failed = JobFinalization::Failed(FinalResult {
+                        summary: Some(violation.to_string()),
+                        code: Some(COMPLETION_REFUSED.to_owned()),
+                        goal_reached: Some(false),
+                        value: None,
+                    });
+                    retain_unsettled(database.without_stop_cause(), job, failed);
+                } else {
+                    log::error!("Job {job} could not be finalized: {violation}");
+                }
+            }
+            Err(failure) => {
+                log::warn!("Job {job} finalization is still unsettled: {failure}");
+                retain_unsettled(database, job, outcome);
+            }
+        }
     }
 }
 
