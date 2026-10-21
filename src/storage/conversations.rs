@@ -811,6 +811,12 @@ impl Batch {
                 "an approved call has no definite outcome or reconciliation",
             ));
         }
+        if self.require_job_state(turn)?.outcome.is_none() {
+            return self.reject(Violation::InvalidValue(
+                "turn",
+                "cannot retry an unfinished turn",
+            ));
+        }
         if matches!(by, Actor::Agent { .. })
             && self.step(|tx| {
                 let inputs = tx.open_table(TURN_INPUTS)?;
@@ -860,6 +866,30 @@ impl Batch {
                 "retry_limit",
                 "at most two agent retries per original turn",
             ));
+        }
+        // A waiting turn takes the entry itself; it may hold only one retry.
+        if let Some(tip) = self.tip(conversation)? {
+            let state = self.require_job_state(tip)?;
+            if state.claim.is_none() && state.outcome.is_none() {
+                let retried = self.step(|tx| {
+                    let inputs = tx.open_table(TURN_INPUTS)?;
+                    for entry in inputs.range((tip.get(), 0)..=(tip.get(), u32::MAX))? {
+                        if matches!(
+                            TurnEntry::decode(entry?.1.value())?.entry,
+                            Entry::RetryOf { .. }
+                        ) {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                })?;
+                if retried {
+                    return self.reject(Violation::InvalidValue(
+                        "retry",
+                        "waiting turn already has a retry",
+                    ));
+                }
+            }
         }
         self.append(conversation, Entry::RetryOf { turn, by }, None, None, false)
     }

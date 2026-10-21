@@ -1677,6 +1677,15 @@ async fn dispatch_runtime(
                         }
                     }
                     match failure {
+                        // Granted claims are committed: dropping them would
+                        // leave their Jobs claimed with no task.
+                        Some(error) if !grants.is_empty() => {
+                            log::warn!(
+                                "process claim sweep interrupted after {} grants: {error}",
+                                grants.len()
+                            );
+                            Ok(grants)
+                        }
                         Some(error) => Err(error),
                         None => Ok(grants),
                     }
