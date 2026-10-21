@@ -5830,7 +5830,7 @@ mod requests_and_tool_loop {
     }
 
     #[test]
-    fn handler_failures_and_limits_stop_the_loop_without_completing_the_job() {
+    fn limits_stop_the_loop_without_completing_the_job() {
         let (_root, directory) = data_directory("tool-loop-limits");
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
@@ -5851,17 +5851,6 @@ mod requests_and_tool_loop {
             usize,
         );
         let cases: Vec<Case> = vec![
-            (
-                "a failing handler",
-                Behavior::Fail,
-                ToolLoopLimits::default(),
-                one(),
-                ToolLoopStop::HandlerFailed {
-                    index: 0,
-                    message: "the tool failed".into(),
-                },
-                1,
-            ),
             (
                 "a result over its limit",
                 Behavior::Big(65),
@@ -5963,6 +5952,50 @@ mod requests_and_tool_loop {
             looped.settled.expect("a loop within its limits completes");
             assert!(job_record(&handle, run.job).completed_at.is_some());
         }
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_failed_handler_answers_its_call_and_the_loop_continues() {
+        let (_root, directory) = data_directory("tool-loop-recovered-failure");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Fail)]);
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![
+                calling(&[add(0, "c", 1, 2)], (1, 1)),
+                answering("I will try another way.", (2, 2)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let receipt = looped.settled.expect("the loop settles");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler ran once");
+        assert_eq!(looped.sent.len(), 2, "the failure is answered");
+        assert_eq!(
+            tool_results(&looped.sent[1]),
+            [(
+                "c".to_owned(),
+                json!({"failed": "not_applied", "reason": "the tool failed"}).to_string()
+            )],
+            "the model is told why the call changed nothing"
+        );
+        let [record] = evidence(&handle, run.job).try_into().expect("one call");
+        assert_eq!(
+            outcome_of(&record),
+            Some(ToolOutcome::NotApplied {
+                message: "the tool failed".into()
+            })
+        );
+        assert!(receipt.result.is_some());
+        let job = job_record(&handle, run.job);
+        assert!(job.completed_at.is_some() && job.failed_at.is_none());
+        assert!(blocking(&handle, llm).is_empty());
         worker.shutdown().expect("shutdown");
     }
 
@@ -6613,6 +6646,20 @@ mod requests_and_tool_loop {
 
     fn evidence(handle: &DatabaseHandle, job: JobId) -> Vec<ToolEvidenceRecord> {
         wait(handle.tool_evidence(job, None, 1_000)).expect("read tool evidence")
+    }
+
+    /// The tool results a conversation sends, by call id, in the order sent.
+    fn tool_results(conversation: &ChatConversation) -> Vec<(String, String)> {
+        conversation
+            .messages
+            .iter()
+            .filter_map(|message| match (&message.tool_call_id, &message.content) {
+                (Some(id), Some(MessageContentWire::Text(text))) => {
+                    Some((id.clone(), text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn tool_call(job: JobId, request: u32, index: u32) -> ToolCallRef {
@@ -7483,25 +7530,18 @@ mod requests_and_tool_loop {
         let handle = worker.handle();
         let (_provider, llm) = llm_setup(&handle, "model-a");
         let cases = [
-            (
-                "fail",
-                ToolLoopStop::HandlerFailed {
-                    index: 1,
-                    message: "the tool failed".into(),
-                },
-                ToolOutcomeKind::NotApplied,
-            ),
+            ("fail", None, ToolOutcomeKind::NotApplied),
             (
                 "unsure",
-                ToolLoopStop::HandlerUncertain {
+                Some(ToolLoopStop::HandlerUncertain {
                     index: 1,
                     message: "the connection dropped".into(),
-                },
+                }),
                 ToolOutcomeKind::Uncertain,
             ),
             (
                 "big",
-                ToolLoopStop::ResultTooLarge { index: 1 },
+                Some(ToolLoopStop::ResultTooLarge { index: 1 }),
                 ToolOutcomeKind::CompletedWithheld,
             ),
         ];
@@ -7516,6 +7556,13 @@ mod requests_and_tool_loop {
                     ("big", Behavior::Big(20_000)),
                 ],
             );
+            let mut responses = vec![calling(
+                &[add(0, "a", 1, 2), call(1, "b", second, r#"{"a":1,"b":2}"#)],
+                (1, 1),
+            )];
+            if expected.is_none() {
+                responses.push(answering("I will try another way.", (1, 1)));
+            }
             let looped = run_loop(
                 &handle,
                 run,
@@ -7524,16 +7571,10 @@ mod requests_and_tool_loop {
                     &["add", "fail", "unsure", "big"],
                     ToolLoopLimits::default(),
                 )),
-                vec![calling(
-                    &[add(0, "a", 1, 2), call(1, "b", second, r#"{"a":1,"b":2}"#)],
-                    (1, 1),
-                )],
+                responses,
                 CancellationToken::default(),
                 |_| {},
             );
-            assert_eq!(looped.sent.len(), 1, "{second}: nothing was sent back");
-            let (receipt, stop) = stopped(looped);
-            assert_eq!(stop, expected, "{second}");
             assert_eq!(calls.load(Ordering::SeqCst), 2, "{second}");
             let records = evidence(&handle, run.job);
             assert_eq!(
@@ -7555,11 +7596,34 @@ mod requests_and_tool_loop {
                 );
             }
             let job = job_record(&handle, run.job);
-            if kind == ToolOutcomeKind::Uncertain {
-                assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
-                assert_eq!(receipt.result, None);
-            } else {
-                assert!(job.failed_at.is_some(), "{second}");
+            match expected {
+                None => {
+                    assert_eq!(looped.sent.len(), 2, "{second}: the failure is answered");
+                    assert_eq!(
+                        tool_results(&looped.sent[1]),
+                        [
+                            ("a".to_owned(), r#"{"sum":3}"#.to_owned()),
+                            (
+                                "b".to_owned(),
+                                json!({"failed": "not_applied", "reason": "the tool failed"})
+                                    .to_string()
+                            ),
+                        ],
+                        "{second}: both results are answered in order"
+                    );
+                    assert!(job.completed_at.is_some() && job.failed_at.is_none());
+                }
+                Some(expected) => {
+                    assert_eq!(looped.sent.len(), 1, "{second}: nothing was sent back");
+                    let (receipt, stop) = stopped(looped);
+                    assert_eq!(stop, expected, "{second}");
+                    if kind == ToolOutcomeKind::Uncertain {
+                        assert!(job.unknown_at.is_some() && job.stop_confirmed_at.is_some());
+                        assert_eq!(receipt.result, None);
+                    } else {
+                        assert!(job.failed_at.is_some(), "{second}");
+                    }
+                }
             }
             assert!(blocking(&handle, llm).iter().all(|held| *held != run.job));
         }
@@ -8421,7 +8485,7 @@ mod requests_and_tool_loop {
         }
 
         #[test]
-        fn a_failed_workspace_read_sends_no_result_and_fails_the_job() {
+        fn a_failed_workspace_read_answers_its_call_and_the_loop_continues() {
             let (_outside_guard, outside) =
                 workspace_with("workspace-read-outside", &[("secret.txt", "outside")]);
             let (_workspace_guard, root) =
@@ -8455,25 +8519,25 @@ mod requests_and_tool_loop {
                     Some(tools),
                     vec![
                         calling(&[read_call(0, "call_read", &arguments)], (1, 1)),
-                        answering("never sent", (1, 1)),
+                        answering("I could not read that file.", (1, 1)),
                     ],
                     CancellationToken::default(),
                     |_| {},
                 );
-                assert_eq!(looped.sent.len(), 1, "{path}: no request carries a result");
-                let (receipt, stop) = stopped(looped);
+                assert_eq!(looped.sent.len(), 2, "{path}: the failure is answered");
                 assert_eq!(
-                    stop,
-                    ToolLoopStop::HandlerFailed {
-                        index: 0,
-                        message: message.to_owned()
-                    },
-                    "{path}"
+                    tool_results(&looped.sent[1]),
+                    [(
+                        "call_read".to_owned(),
+                        json!({"failed": "not_applied", "reason": message}).to_string()
+                    )],
+                    "{path}: the model gets the reason"
                 );
                 assert!(
                     !message.contains(path),
                     "the refusal does not repeat the path"
                 );
+                let receipt = looped.settled.expect("the loop settles");
                 assert!(receipt.result.is_some());
                 let records = evidence(&handle, run.job);
                 let [record] = records.as_slice() else {
@@ -8487,7 +8551,10 @@ mod requests_and_tool_loop {
                     "{path}: no completed result is recorded"
                 );
                 let job = job_record(&handle, run.job);
-                assert!(job.failed_at.is_some(), "{path}");
+                assert!(
+                    job.completed_at.is_some() && job.failed_at.is_none(),
+                    "{path}"
+                );
                 assert!(blocking(&handle, llm).is_empty(), "{path}");
             }
             worker.shutdown().expect("shutdown");
@@ -8926,35 +8993,39 @@ mod requests_and_tool_loop {
                         )],
                         (10, 5),
                     ),
-                    answering("never sent", (1, 1)),
+                    answering("The file already exists; I will read it.", (1, 1)),
                 ],
                 CancellationToken::default(),
                 |_| {},
             );
-            assert_eq!(looped.sent.len(), 1, "no result is sent");
-            let (_, stop) = stopped(looped);
+            assert_eq!(looped.sent.len(), 2, "the failure is answered");
             let message = "something already exists at the path".to_owned();
             assert_eq!(
-                stop,
-                ToolLoopStop::HandlerFailed {
-                    index: 0,
-                    message: message.clone()
-                }
+                tool_results(&looped.sent[1]),
+                [(
+                    "call_create".to_owned(),
+                    json!({"failed": "not_applied", "reason": message}).to_string()
+                )],
+                "the model gets the reason"
             );
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert_eq!(
                 outcome_of(&record),
-                Some(ToolOutcome::NotApplied { message })
+                Some(ToolOutcome::NotApplied {
+                    message: message.clone()
+                })
             );
             assert!(!record.is_applied() && !record.is_unresolved());
             assert_eq!(on_disk(&root, "summary.txt").as_deref(), Some(summary));
-            assert!(job_record(&handle, run.job).failed_at.is_some());
+            let receipt = looped.settled.expect("the loop settles");
+            assert!(receipt.result.is_some());
+            assert!(job_record(&handle, run.job).completed_at.is_some());
 
             worker.shutdown().expect("shutdown");
         }
 
         #[test]
-        fn a_failed_precondition_is_not_applied_and_fails_the_job() {
+        fn a_failed_precondition_is_not_applied_and_the_loop_continues() {
             let (_workspace_guard, root) = notes_workspace("workspace-write-mismatch-files");
             let (_root, directory) = data_directory("workspace-write-mismatch");
             let worker = DatabaseWorker::start(&directory).expect("start database");
@@ -8971,29 +9042,32 @@ mod requests_and_tool_loop {
                         &[write_call(0, "call_write", &update(stale, DONE))],
                         (10, 5),
                     ),
-                    answering("never sent", (1, 1)),
+                    answering("The file changed; I will re-read it.", (1, 1)),
                 ],
                 CancellationToken::default(),
                 |_| {},
             );
-            assert_eq!(looped.sent.len(), 1);
-            let (receipt, stop) = stopped(looped);
+            assert_eq!(looped.sent.len(), 2, "the failure is answered");
             let message = "the file's current content differs from expected_content".to_owned();
             assert_eq!(
-                stop,
-                ToolLoopStop::HandlerFailed {
-                    index: 0,
-                    message: message.clone()
-                }
+                tool_results(&looped.sent[1]),
+                [(
+                    "call_write".to_owned(),
+                    json!({"failed": "not_applied", "reason": message}).to_string()
+                )],
+                "the model gets the reason"
             );
-            assert!(receipt.result.is_some());
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert_eq!(
                 outcome_of(&record),
-                Some(ToolOutcome::NotApplied { message })
+                Some(ToolOutcome::NotApplied {
+                    message: message.clone()
+                })
             );
             assert_eq!(on_disk(&root, "notes.txt").as_deref(), Some(NOTES));
-            assert!(job_record(&handle, run.job).failed_at.is_some());
+            let receipt = looped.settled.expect("the loop settles");
+            assert!(receipt.result.is_some());
+            assert!(job_record(&handle, run.job).completed_at.is_some());
             assert!(blocking(&handle, llm).is_empty());
 
             worker.shutdown().expect("shutdown");
@@ -9827,27 +9901,32 @@ mod requests_and_tool_loop {
                 Some(tools),
                 vec![
                     calling(&[test_call(0, "call_test")], (10, 5)),
-                    answering("never sent", (1, 1)),
+                    answering("The program is not installed.", (1, 1)),
                 ],
                 CancellationToken::default(),
                 |_| {},
             );
-            let (_, stop) = stopped(looped);
+            assert_eq!(looped.sent.len(), 2, "the failure is answered");
             let message = "the command's program was not found on OCG's PATH".to_owned();
             assert_eq!(
-                stop,
-                ToolLoopStop::HandlerFailed {
-                    index: 0,
-                    message: message.clone()
-                }
+                tool_results(&looped.sent[1]),
+                [(
+                    "call_test".to_owned(),
+                    json!({"failed": "not_applied", "reason": message}).to_string()
+                )],
+                "the model gets the reason"
             );
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert_eq!(
                 outcome_of(&record),
-                Some(ToolOutcome::NotApplied { message })
+                Some(ToolOutcome::NotApplied {
+                    message: message.clone()
+                })
             );
             assert!(!record.is_applied() && !record.is_unresolved());
-            assert!(job_record(&handle, run.job).failed_at.is_some());
+            let receipt = looped.settled.expect("the loop settles");
+            assert!(receipt.result.is_some());
+            assert!(job_record(&handle, run.job).completed_at.is_some());
 
             assert_eq!(project.runs(), 0);
             assert!(!project.root.join("ran").exists());
@@ -10467,7 +10546,7 @@ mod requests_and_tool_loop {
         }
 
         #[test]
-        fn a_refused_discovery_call_sends_nothing_and_fails_the_job() {
+        fn a_refused_discovery_call_answers_its_call_and_the_loop_continues() {
             let (_files, root, _) = project("discovery-refused");
             let (_outside_guard, outside) =
                 crate::test_support::temporary_directory(SUITE, "discovery-refused-outside");
@@ -10484,33 +10563,43 @@ mod requests_and_tool_loop {
             let run = local_run(&handle, llm);
             let tools = workspace_command::code_tools(authorize(&root, &directory), &[])
                 .expect("enable the coding tools");
-            let looped = run_agent(&handle, run, tools, "Search vendor.", |_| {
-                calling(
-                    &[call(
-                        0,
-                        "call_search",
-                        SEARCH_TOOL_NAME,
-                        r#"{"path":"vendor","text":"CONNECT_TIMEOUT_MS"}"#,
-                    )],
-                    (10, 5),
-                )
-            });
-            assert_eq!(looped.sent.len(), 1, "a refused call sends no result");
-            let (_, stop) = stopped(looped);
             let message = "the path traverses a symbolic link".to_owned();
-            assert_eq!(
-                stop,
-                ToolLoopStop::HandlerFailed {
-                    index: 0,
-                    message: message.clone()
+            let reason = message.clone();
+            let looped = run_agent(&handle, run, tools, "Search vendor.", move |conversation| {
+                if conversation
+                    .messages
+                    .iter()
+                    .any(|message| message.tool_calls.is_some())
+                {
+                    assert_eq!(
+                        last_result(conversation),
+                        json!({"failed": "not_applied", "reason": reason.as_str()}),
+                        "the model gets the reason"
+                    );
+                    answering("I cannot search there.", (10, 5))
+                } else {
+                    calling(
+                        &[call(
+                            0,
+                            "call_search",
+                            SEARCH_TOOL_NAME,
+                            r#"{"path":"vendor","text":"CONNECT_TIMEOUT_MS"}"#,
+                        )],
+                        (10, 5),
+                    )
                 }
-            );
+            });
+            assert_eq!(looped.sent.len(), 2, "the failure is answered");
+            let receipt = looped.settled.expect("the loop settles");
+            assert!(receipt.result.is_some());
             let [record] = evidence(&handle, run.job).try_into().expect("one call");
             assert_eq!(
                 outcome_of(&record),
-                Some(ToolOutcome::NotApplied { message })
+                Some(ToolOutcome::NotApplied {
+                    message: message.clone()
+                })
             );
-            assert!(job_record(&handle, run.job).failed_at.is_some());
+            assert!(job_record(&handle, run.job).completed_at.is_some());
             worker.shutdown().expect("shutdown");
         }
     }

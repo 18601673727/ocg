@@ -165,9 +165,6 @@ pub enum ToolLoopStop {
     /// The database refused to record the admission of the call at this
     /// index, so its handler was not invoked.
     AdmissionRefused { index: u32, violation: Violation },
-    /// The handler of the call at this index reported a failure, with
-    /// evidence that its effect did not happen.
-    HandlerFailed { index: u32, message: String },
     /// The handler of the call at this index reported a failure without
     /// evidence that its effect did not happen.
     HandlerUncertain { index: u32, message: String },
@@ -224,9 +221,6 @@ impl std::fmt::Display for ToolLoopStop {
                     formatter,
                     "the admission of tool call {index} was refused: {violation}"
                 )
-            }
-            Self::HandlerFailed { index, message } => {
-                write!(formatter, "tool call {index} failed: {message}")
             }
             Self::HandlerUncertain { index, message } => {
                 write!(
@@ -3590,7 +3584,9 @@ fn needs_decision(tools: &ToolExecution, name: &str) -> bool {
 /// a grant withdrawn while the admission was recorded refuses it. A handler
 /// runs under the time limit and the execution's cancellation, and what is
 /// known of its outcome is recorded before its result can be sent on. Its
-/// result, serialized, is the answer, and it is never truncated.
+/// result, serialized, is the answer, and it is never truncated. A handler
+/// failure known not to have applied is answered with its reason, so the
+/// model may correct the call; any other failure stops the loop.
 #[allow(clippy::too_many_arguments)]
 async fn answer_calls(
     tools: &ToolExecution,
@@ -3944,15 +3940,29 @@ async fn answer_calls(
                 ToolLoopStop::TimedOut { index },
             ),
             Either::Right(Ok(Err(failure))) => match failure.certainty {
-                FailureCertainty::NotApplied => (
-                    ToolOutcome::NotApplied {
-                        message: failure.message.clone(),
-                    },
-                    ToolLoopStop::HandlerFailed {
-                        index,
-                        message: failure.message,
-                    },
-                ),
+                // A failure that changed nothing is the model's to correct:
+                // its reason is the call's answer, and the loop goes on.
+                FailureCertainty::NotApplied => {
+                    let message = failure.message;
+                    let outcome = ToolOutcome::NotApplied {
+                        message: message.clone(),
+                    };
+                    // The reason is sent on only once it is recorded.
+                    if let Err(error) = site.database.record_tool_outcome(reference, outcome).await
+                    {
+                        return Err(Stopped {
+                            stop: ToolLoopStop::EvidenceNotRecorded {
+                                index,
+                                outcome: Some(ToolOutcomeKind::NotApplied),
+                            },
+                            evidence: Some(error),
+                        });
+                    }
+                    answers.push(
+                        serde_json::json!({"failed": "not_applied", "reason": message}).to_string(),
+                    );
+                    continue;
+                }
                 FailureCertainty::Uncertain => (
                     ToolOutcome::Uncertain {
                         cause: UncertainCause::HandlerReported,
