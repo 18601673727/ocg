@@ -395,7 +395,7 @@ pub(super) async fn respond(
         Route::Job(job) => {
             let details = database.job_details(job).await?.ok_or(JOB_NOT_FOUND)?;
             Ok(Reply::ok(
-                json!({"api_version": API_VERSION, "job": job_json(&details.job)?, "result": details.result.as_ref().map(output_json), "usage": details.usage}),
+                json!({"api_version": API_VERSION, "job": job_json(&details.job)?, "result": details.result.as_ref().map(output_json), "usage": details.usage, "unknown_reason": details.unknown_reason}),
             ))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,

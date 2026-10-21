@@ -3,8 +3,13 @@ use super::*;
 /// Sends one validated conversation, with the tools it offers, to the
 /// frozen Provider and model with the frozen parameters, and reads the
 /// streamed response. The conversation is the whole message list sent.
-/// Tool calls in the response come back typed in the result once they are
-/// complete and allowed; anything else about them is an incomplete stream.
+/// Calls come back in wire order; a complete call this request did not
+/// admit (a name not offered or not chosen, arguments not one JSON object
+/// or refused by the schema) is in `tool_calls` as sent and in `refused`
+/// with its reason, inside `Ok`. A caller with no tool loop applies
+/// [`ProviderExecutionResult::admitted`], as `run_provider_job_inner` does
+/// inside its retry loop when no tools are offered. A cut-off or malformed
+/// stream and response-wide refusals are still `Err`.
 /// No tool is ever run here.
 pub async fn execute_conversation(
     frozen: &FrozenExecutionConfig,

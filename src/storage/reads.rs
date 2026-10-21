@@ -181,6 +181,21 @@ pub(crate) struct JobDetails {
     pub job: JobRecord,
     pub result: Option<JobOutputRecord>,
     pub usage: Option<JobUsage>,
+    pub unknown_reason: Option<String>,
+}
+
+/// Cuts `message` to its first 2048 bytes at a character boundary, ending
+/// with "…" when cut, so the Job route stays bounded.
+fn cut_unknown_reason(message: &str) -> String {
+    const LIMIT: usize = 2048;
+    if message.len() <= LIMIT {
+        return message.to_owned();
+    }
+    let mut boundary = LIMIT;
+    while !message.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}…", &message[..boundary])
 }
 
 pub(crate) fn read_job_details(
@@ -212,13 +227,20 @@ pub(crate) fn read_job_details(
         }
         result
     };
-    let usage = if conversation {
-        None
+    let (usage, unknown_reason) = if conversation {
+        (None, None)
     } else {
         let target = observations::frozen_llm_target(&rx, id)?;
         let mut usage = JobUsage::default();
         let mut events = Vec::new();
         let mut scanned = 0;
+        // The Job's latest request, named by the first event decoded in
+        // reverse; only its first Availability counts, so a retried attempt
+        // never reports an earlier attempt's failure.
+        let want_unknown = job.unknown_at.is_some();
+        let mut latest_request: Option<RequestNumber> = None;
+        let mut unknown_reason: Option<String> = None;
+        let mut unknown_done = !want_unknown;
         for entry in rx
             .open_table(REQUEST_EVENTS)?
             .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
@@ -234,12 +256,24 @@ pub(crate) fn read_job_details(
             let request = RequestNumber::new(request)
                 .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
             scanned += 1;
-            events.push(super::rows::decode_request_event(
-                id,
-                request,
-                seq,
-                bytes.value(),
-            )?);
+            let event = super::rows::decode_request_event(id, request, seq, bytes.value())?;
+            if !unknown_done {
+                if latest_request.is_none() {
+                    latest_request = Some(event.request);
+                }
+                if event.request != latest_request.expect("latest request named") {
+                    unknown_done = true;
+                } else if let crate::persistence::RequestPayload::Availability { failure, .. } =
+                    &event.payload
+                {
+                    if let Some(failure) = failure {
+                        unknown_reason = Some(cut_unknown_reason(&failure.message));
+                    }
+                    unknown_done = true;
+                }
+            }
+            let seq = event.seq;
+            events.push(event);
             if seq == 1 {
                 events.reverse();
                 if let Some(sample) = observations::usage_sample_of(id, request, &target, &events) {
@@ -266,9 +300,14 @@ pub(crate) fn read_job_details(
                 events.clear();
             }
         }
-        (scanned != 0).then_some(usage)
+        ((scanned != 0).then_some(usage), unknown_reason)
     };
-    Ok(Some(JobDetails { job, result, usage }))
+    Ok(Some(JobDetails {
+        job,
+        result,
+        usage,
+        unknown_reason,
+    }))
 }
 
 pub(crate) fn read_jobs(

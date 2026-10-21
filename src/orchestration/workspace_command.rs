@@ -1366,7 +1366,7 @@ mod tests {
             ToolLoopLimits {
                 max_provider_requests: 64,
                 max_tool_calls: 256,
-                max_tool_result_bytes: 16 * 1024,
+                max_tool_result_bytes: 72 * 1024,
                 max_tool_results_bytes: 1024 * 1024,
                 handler_timeout: COMMAND_TIMEOUT + STOP_GRACE,
             }

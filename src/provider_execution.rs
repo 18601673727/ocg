@@ -1964,6 +1964,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_unoffered_name_is_unauthorized_even_when_its_arguments_are_not_an_object() {
+        let config = ProviderExecutionConfig::default();
+        let mut sink = RecordingSink::default();
+        let result = wait(read_response(
+            payload(vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(tool_delta(r#"[{"index":0,"id":"a","function":{"name":"get_weather","arguments":"[1]"}},{"index":1,"id":"b","function":{"name":"g","arguments":"[1]"}}]"#)),
+                Step::Chunk(TOOL_CALLS),
+            ], config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+            &offering(&["get_weather"]),
+        )).expect("a complete response with two refused calls");
+        assert_eq!(
+            result.tool_calls,
+            [call(0, "a", "get_weather", "[1]"), call(1, "b", "g", "[1]")]
+        );
+        assert_eq!(
+            result.refused,
+            [
+                InvalidToolCall::at(
+                    crate::openai_compatible::ToolCallRefusal::InvalidArguments,
+                    0,
+                    "tool call 0 arguments are not one JSON object"
+                ),
+                InvalidToolCall::at(
+                    crate::openai_compatible::ToolCallRefusal::Unauthorized,
+                    1,
+                    "tool call 1 names `g`, which this request did not allow"
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn a_single_tool_call_is_reconstructed_with_its_wire_identity() {
         let mut sink = RecordingSink::default();
         let result = read(

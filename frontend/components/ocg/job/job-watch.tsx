@@ -115,6 +115,7 @@ function JobWatchBody({
   const [input, setInput] = useState<{ objective: string | null; attachments: string[] } | { error: string } | null>(null);
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
+  const [unknownReason, setUnknownReason] = useState<string | null>(null);
 
   useEffect(() => {
     if (!job && !settlement) return;
@@ -172,6 +173,16 @@ function JobWatchBody({
         });
     };
 
+    let settledAtFirstRead = false;
+    const refreshUnknownReason = () => {
+      client.readJob(jobId).then(
+        (record) => {
+          if (alive) setUnknownReason(record.unknown_reason ?? null);
+        },
+        () => {},
+      );
+    };
+
     const listener = (event: JobStreamEvent) => {
       if (!alive) return;
       // Anything the server sent proves the connection is back.
@@ -186,6 +197,7 @@ function JobWatchBody({
           });
           stopPolling();
           requestReload();
+          if (event.job.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReason();
         }
       } else if (event.type === "output") {
         if (event.output.seq <= processed) return;
@@ -201,6 +213,7 @@ function JobWatchBody({
         setStream("settled");
         stopPolling();
         requestReload();
+        if (event.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReason();
       } else if (event.type === "stream_error") {
         setFailure({ code: event.error.code, scope: "stream" });
         setStream("stream_error");
@@ -213,8 +226,10 @@ function JobWatchBody({
         const record = await client.readJob(jobId);
         if (!alive) return;
         setJob(record);
+        setUnknownReason(record.unknown_reason ?? null);
         // The record is the Job's own truth, whether or not the stream ever connects.
         if (record.settlement.state !== "unsettled") {
+          settledAtFirstRead = true;
           setSettlement({
             state: record.settlement.state,
             settled_at_us: record.settlement.settled_at_us,
@@ -365,6 +380,12 @@ function JobWatchBody({
         <div className="flex justify-between gap-2">
           <dt>{t("job.fact.stopConfirmed")}</dt>
           <dd>{formatMicros(settlement.stop_confirmed_at_us)}</dd>
+        </div>
+      ) : null}
+      {settlement?.state === "unknown" ? (
+        <div className="flex justify-between gap-2">
+          <dt>{t("job.fact.unknownReason")}</dt>
+          <dd>{unknownReason ?? "—"}</dd>
         </div>
       ) : null}
     </dl>

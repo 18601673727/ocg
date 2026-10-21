@@ -186,9 +186,9 @@ a one-shot conversation. A follow-up names `conversation` and cannot set
 After `202`, or if the reply is lost, repeat the same submission with the same
 key or send `GET /api/v1/admissions` with the same `Idempotency-Key` header. Poll
 `GET /api/v1/jobs/{job}` until `job.settlement.state` is `completed`, `failed`,
-`cancelled` or `unknown`, then read the envelope's `result` and `usage`.
+`cancelled` or `unknown`, then read the envelope's `result`, `usage` and `unknown_reason`.
 `result` is the newest result output or null; `usage` is null for a conversation
-id or a Job without request events. Usage sums requests and complete requests,
+id or a Job without request events. `unknown_reason` is the last failure's message when the settlement is `unknown`, else null. Usage sums requests and complete requests,
 input/output, cache-read/cache-write and reasoning tokens; `truncated` reports
 the scan limit. Failed results have a machine-readable `code`:
 `provider_rejected`, `not_delivered`, `build_failed`, `context_window_exceeded`,

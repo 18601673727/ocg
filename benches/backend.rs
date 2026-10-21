@@ -1792,7 +1792,7 @@ fn provider_record(options: &Options) -> Result<()> {
                         };
                         for round in 0..3 {
                             let response = provider_execution::execute_conversation(&frozen, &conversation,
-                                &EnvironmentCredentialResolver, &ProviderExecutionConfig::default(), Some(&mut sink)).await?;
+                                &EnvironmentCredentialResolver, &ProviderExecutionConfig::default(), Some(&mut sink)).await?.admitted()?;
                             if let Some(error) = sink.gap.take() { return Err(error.into()); }
                             if response.requests_tools() != (round < 2) { return Err("mock response has wrong round".into()); }
                             let assistant = ChatMessage::assistant(Some(response.text.clone()),
@@ -2169,7 +2169,7 @@ fn observability(options: &Options) -> Result<()> {
                                 &ProviderExecutionConfig::default(),
                                 Some(&mut sink),
                             )
-                            .await?;
+                            .await?.admitted()?;
                             if let Some(error) = sink.gap.take() {
                                 return Err(error.into());
                             }

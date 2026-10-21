@@ -325,13 +325,13 @@ impl ChatConversation {
     ///
     /// # Errors
     ///
-    /// Returns answerable refusals for calls with unauthorized names or
-    /// invalid arguments, skipping calls already refused by the assembler.
-    /// An invalid offer, schema or response-wide constraint stays an error.
+    /// Returns every answerable refusal of the response, one per call,
+    /// ordered by index. An invalid offer, schema or response-wide
+    /// constraint stays an error.
     pub fn admit_tool_calls(
         &self,
         calls: &[CompletedToolCall],
-        already_refused: &[InvalidToolCall],
+        assembled: Vec<InvalidToolCall>,
     ) -> Result<Vec<InvalidToolCall>, InvalidToolCall> {
         if self.parallel_tool_calls == Some(false) && calls.len() > 1 {
             return Err(InvalidToolCall::new(
@@ -342,18 +342,20 @@ impl ChatConversation {
                 ),
             ));
         }
+        // The assembler's per-call refusals, by wire index. A name this
+        // request did not allow replaces one; an offered and chosen call
+        // keeps its own.
+        let mut assembled: std::collections::BTreeMap<u32, InvalidToolCall> = assembled
+            .into_iter()
+            .filter_map(|refusal| refusal.index.map(|index| (index, refusal)))
+            .collect();
         // Each offered function's schema is compiled once, when a call first
         // names it.
         let mut validators: Vec<Option<Validator>> = self.tools.iter().map(|_| None).collect();
         let mut refused = Vec::new();
         for call in calls {
             let index = call.index;
-            if already_refused
-                .iter()
-                .any(|refusal| refusal.index == Some(index))
-            {
-                continue;
-            }
+            let assembled = assembled.remove(&index);
             let unauthorized = || {
                 InvalidToolCall::at(
                     ToolCallRefusal::Unauthorized,
@@ -388,6 +390,10 @@ impl ChatConversation {
             };
             if !chosen {
                 refused.push(unauthorized());
+                continue;
+            }
+            if let Some(refusal) = assembled {
+                refused.push(refusal);
                 continue;
             }
             let validator = match &mut validators[position] {

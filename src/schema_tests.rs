@@ -2740,6 +2740,66 @@ fn a_refused_tool_call_keeps_its_response_facts_and_stays_unconfirmed() {
 }
 
 #[test]
+fn an_unknown_settlement_reports_its_last_failure_on_the_job_read() {
+    let no_id = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n";
+    let (_root1, directory1) = data_directory("unknown-reason-read");
+    let worker = DatabaseWorker::start(&directory1).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    drive_with(
+        &handle,
+        run,
+        vec![
+            Step::Chunk(no_id),
+            Step::Chunk(STOP_CHUNK),
+            Step::Chunk(FINAL_INPUT_ONLY),
+        ],
+        ProviderExecutionConfig::default(),
+        offering_f(),
+    )
+    .expect("settle the run");
+    let details = wait(handle.job_details(run.job))
+        .expect("read job details")
+        .expect("job exists");
+    assert!(details.job.unknown_at.is_some());
+    let availability =
+        wait(handle.job_availability(run.job, None, 100)).expect("read AvailabilityStats");
+    let last = availability.last().expect("a last availability record");
+    let message = last
+        .observation
+        .failure
+        .as_ref()
+        .expect("the last record has a failure")
+        .message
+        .clone();
+    assert_eq!(details.unknown_reason, Some(message));
+    worker.shutdown().expect("shutdown");
+    assert_relationships_consistent(&directory1);
+
+    let (_root2, directory2) = data_directory("unknown-reason-completed");
+    let worker = DatabaseWorker::start(&directory2).expect("start database");
+    let handle = worker.handle();
+    let (_provider, llm) = llm_setup(&handle, "model-a");
+    let run = token_run(&handle, llm);
+    drive_with(
+        &handle,
+        run,
+        vec![Step::Chunk(HI_CHUNK), Step::Chunk(STOP_CHUNK)],
+        ProviderExecutionConfig::default(),
+        ChatConversation::default(),
+    )
+    .expect("settle the run");
+    let details = wait(handle.job_details(run.job))
+        .expect("read job details")
+        .expect("job exists");
+    assert!(details.job.completed_at.is_some());
+    assert_eq!(details.unknown_reason, None);
+    worker.shutdown().expect("shutdown");
+    assert_relationships_consistent(&directory2);
+}
+
+#[test]
 fn a_transport_failure_after_a_finish_keeps_the_finish_apart_from_the_failure() {
     let run = run_reopened(
         "finish-then-reset",
@@ -8554,7 +8614,7 @@ mod requests_and_tool_loop {
                 ("call_read", workspace_read::TOOL_NAME)
             );
             let admission = record.admission().expect("admitted");
-            assert_eq!(admission.handler_version, "workspace_read_file-2");
+            assert_eq!(admission.handler_version, "workspace_read_file-3");
             assert_eq!(admission.effect, ToolEffect::ReadOnly);
             assert_eq!(admission.arguments.as_str(), r#"{"path":"README.md"}"#);
             assert_eq!(admission.authorization, AuthorizationBasis::RegistryGrant);
@@ -8611,6 +8671,70 @@ mod requests_and_tool_loop {
         }
 
         #[test]
+        fn a_whole_file_at_the_limit_reaches_the_model() {
+            let chunk = "a \"b\" \\\n";
+            let text = chunk.repeat(workspace_read::MAX_FILE_BYTES / chunk.len());
+            assert_eq!(text.len(), workspace_read::MAX_FILE_BYTES);
+            let (_workspace_guard, root) =
+                workspace_with("workspace-read-at-limit-files", &[("limit.txt", &text)]);
+            let (_root, directory) = data_directory("workspace-read-at-limit");
+            let worker = DatabaseWorker::start(&directory).expect("start database");
+            let handle = worker.handle();
+            let (_provider, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let registry = ToolRegistry::default();
+            let workspace = Workspace::authorize(&root, &directory).expect("authorize");
+            workspace_read::register(&registry, workspace).expect("register");
+            registry
+                .authorize(workspace_read::TOOL_NAME)
+                .expect("authorize");
+            let tools = ToolExecution {
+                approve: Vec::new(),
+                decider: false,
+                offer: registry.offer(&[workspace_read::TOOL_NAME]).expect("offer"),
+                limits: crate::orchestration::workspace_command::coding_limits(
+                    std::time::Duration::from_secs(10),
+                ),
+            };
+            let looped = run_loop(
+                &handle,
+                run,
+                Some(tools),
+                vec![
+                    calling(
+                        &[read_call(0, "call_read", r#"{"path":"limit.txt"}"#)],
+                        (11, 4),
+                    ),
+                    answering("The file is at the limit.", (40, 9)),
+                ],
+                CancellationToken::default(),
+                |_| {},
+            );
+            let receipt = looped.settled.expect("the loop settles");
+            assert_eq!(receipt.job, run.job);
+            let [first, second] = looped.sent.as_slice() else {
+                panic!("two Provider requests");
+            };
+            let _ = first;
+            let result = serde_json::to_string(&json!({"path": "limit.txt", "content": text}))
+                .expect("JSON");
+            assert_eq!(
+                tool_results(second),
+                [("call_read".to_owned(), result.clone())],
+                "the next request carries the exact, complete file"
+            );
+            let records = evidence(&handle, run.job);
+            let [record] = records.as_slice() else {
+                panic!("one call: {records:?}");
+            };
+            assert_eq!(outcome_of(record), Some(completed(&result)));
+            let job = job_record(&handle, run.job);
+            assert!(job.completed_at.is_some());
+            worker.shutdown().expect("shutdown");
+            assert_relationships_consistent(&directory);
+        }
+
+        #[test]
         fn a_failed_workspace_read_answers_its_call_and_the_loop_continues() {
             let (_outside_guard, outside) =
                 workspace_with("workspace-read-outside", &[("secret.txt", "outside")]);
@@ -8634,7 +8758,10 @@ mod requests_and_tool_loop {
                     "the path is not a plain relative path inside the Workspace",
                 ),
                 ("linked.txt", "the path traverses a symbolic link"),
-                ("big.txt", "the file is larger than 8192 bytes"),
+                (
+                    "big.txt",
+                    "the file is 32769 bytes, more than the 32768 a whole read returns; read it in ranges with start_line and line_count, up to 2000 lines and about 32768 bytes per call",
+                ),
             ] {
                 let run = local_run(&handle, llm);
                 let tools = read_tools(&root, &directory);
@@ -9042,7 +9169,7 @@ mod requests_and_tool_loop {
                 ("call_write", workspace_write::TOOL_NAME)
             );
             let admission = write_record.admission().expect("admitted");
-            assert_eq!(admission.handler_version, "workspace_write_file-2");
+            assert_eq!(admission.handler_version, "workspace_write_file-3");
             assert_eq!(admission.effect, ToolEffect::NonIdempotent);
             assert_eq!(
                 serde_json::from_str::<Value>(admission.arguments.as_str()).expect("JSON"),
@@ -10338,7 +10465,7 @@ mod requests_and_tool_loop {
             write("src/lib.rs", "pub mod net;\n");
             write("src/net/mod.rs", "pub mod client;\npub mod server;\n");
             write("src/net/server.rs", "pub fn serve() {}\n");
-            let client = (1..=600)
+            let client = (1..=1000)
                 .map(|line| match line {
                     295 => "/// How long the client waits for a connection, in milliseconds.\n"
                         .to_owned(),
@@ -10636,7 +10763,7 @@ mod requests_and_tool_loop {
                     "path": "src/net/client.rs",
                     "start_line": ANSWER_LINE - 2,
                     "end_line": ANSWER_LINE,
-                    "total_lines": 600,
+                    "total_lines": 1000,
                     "next_start_line": ANSWER_LINE + 1,
                     "line_truncated": false,
                     "content": expected,
@@ -10674,7 +10801,7 @@ mod requests_and_tool_loop {
                     range,
                     3,
                     workspace_read::TOOL_NAME,
-                    "workspace_read_file-2",
+                    "workspace_read_file-3",
                     fourth,
                 ),
             ] {

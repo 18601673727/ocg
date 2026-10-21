@@ -65,7 +65,7 @@ pub const TOOL_NAME: &str = "workspace_read_file";
 
 /// The largest file the tool reads whole. A larger one is refused, never
 /// truncated; it may be read in ranges. Also the most a ranged read returns.
-pub const MAX_FILE_BYTES: usize = 8 * 1024;
+pub const MAX_FILE_BYTES: usize = 32 * 1024;
 
 /// The largest file a ranged read reads from.
 pub const MAX_RANGED_FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -74,7 +74,7 @@ pub const MAX_RANGED_FILE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RANGE_LINES: u64 = 2_000;
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_read_file-2";
+const HANDLER_VERSION: &str = "workspace_read_file-3";
 
 /// The longest relative path, in bytes, and the most components, a call may
 /// name.
@@ -250,7 +250,21 @@ impl Workspace {
     /// The whole text of the file at `path`, relative to the root.
     fn read(&self, path: &str) -> Result<String, Refusal> {
         let (directory, name) = self.parent(path)?;
-        let file = open_at(&directory, name, Step::File)?;
+        let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
+            |refusal| match refusal {
+                Refusal::TooLarge => Refusal::TooLargeForRange,
+                other => other,
+            },
+        )?;
+        let metadata = readable(&file, MAX_RANGED_FILE_BYTES).map_err(|refusal| match refusal {
+            Refusal::TooLarge => Refusal::TooLargeForRange,
+            other => other,
+        })?;
+        if metadata.len() > MAX_FILE_BYTES as u64 {
+            return Err(Refusal::TooLargeToReadWhole {
+                bytes: metadata.len(),
+            });
+        }
         read_whole(&file)
     }
 
@@ -402,6 +416,10 @@ pub enum Refusal {
     HardLinked,
     #[error("the file is larger than {MAX_FILE_BYTES} bytes")]
     TooLarge,
+    #[error(
+        "the file is {bytes} bytes, more than the {MAX_FILE_BYTES} a whole read returns; read it in ranges with start_line and line_count, up to {MAX_RANGE_LINES} lines and about {MAX_FILE_BYTES} bytes per call"
+    )]
+    TooLargeToReadWhole { bytes: u64 },
     #[error("the file is larger than {MAX_RANGED_FILE_BYTES} bytes, the most a ranged read reads")]
     TooLargeForRange,
     #[error(
@@ -834,7 +852,7 @@ pub(crate) fn register(
     registry.register(
         TOOL_NAME,
         Some(
-            "Read one UTF-8 text file from the authorized Workspace. With only `path`, return its complete contents; a file over 8 KiB fails the call, so read larger files in ranges. With `start_line` or `line_count`, return whole lines from `start_line` (from 1) of a file of up to 16 MiB, at most `line_count` (up to 2000) and about 8 KiB of them, exactly as the file holds them, with `end_line` (null when the file ends before `start_line`), `total_lines`, and `next_start_line` to continue from (null at the end of the file); `line_truncated` says the one line returned is cut because it alone is longer than the limit.",
+            "Read one UTF-8 text file from the authorized Workspace. With only `path`, return its complete contents; a file over 32 KiB fails the call, so read larger files in ranges. With `start_line` or `line_count`, return whole lines from `start_line` (from 1) of a file of up to 16 MiB, at most `line_count` (up to 2000) and about 32 KiB of them, exactly as the file holds them, with `end_line` (null when the file ends before `start_line`), `total_lines`, and `next_start_line` to continue from (null at the end of the file); `line_truncated` says the one line returned is cut because it alone is longer than the limit.",
         ),
         parameters(),
         Arc::new(ReadFile { workspace }),
@@ -1054,8 +1072,21 @@ mod tests {
         write(&root, "big.txt", "a".repeat(MAX_FILE_BYTES + 1).as_bytes());
         write(&root, "latin1.txt", b"caf\xe9\n");
         write(&root, "binary.bin", b"\x00\x01\x02");
+        let sparse = std::fs::File::create(root.join("sparse.bin")).expect("create");
+        sparse
+            .set_len(MAX_RANGED_FILE_BYTES as u64 + 1)
+            .expect("a sparse file");
         let workspace = Workspace::authorize(&root, &directory).expect("authorize");
-        assert_eq!(read(&workspace, "big.txt"), Err(Refusal::TooLarge));
+        assert_eq!(
+            read(&workspace, "big.txt"),
+            Err(Refusal::TooLargeToReadWhole {
+                bytes: (MAX_FILE_BYTES + 1) as u64
+            })
+        );
+        assert_eq!(
+            read(&workspace, "sparse.bin"),
+            Err(Refusal::TooLargeForRange)
+        );
         assert_eq!(read(&workspace, "latin1.txt"), Err(Refusal::NotText));
         assert_eq!(read(&workspace, "binary.bin"), Err(Refusal::NotText));
 
@@ -1375,14 +1406,16 @@ mod tests {
     fn a_file_larger_than_the_whole_file_limit_is_read_exactly_in_ranges() {
         let (_guard, root, _data, directory) = workspace("ranges");
         let text = (1..=3_000)
-            .map(|line| format!("line {line}: {}\n", "x".repeat(line % 17)))
+            .map(|line| format!("line {line}: {}\n", "x".repeat(40 + line % 17)))
             .collect::<String>();
         assert!(text.len() > 4 * MAX_FILE_BYTES);
         write(&root, "src/big.rs", text.as_bytes());
         let workspace = Workspace::authorize(&root, &directory).expect("authorize");
         assert_eq!(
             read(&workspace, "src/big.rs"),
-            Err(Refusal::TooLarge),
+            Err(Refusal::TooLargeToReadWhole {
+                bytes: text.len() as u64
+            }),
             "a call without a range reads whole files only, as it always did"
         );
 

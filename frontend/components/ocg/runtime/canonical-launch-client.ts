@@ -6,7 +6,7 @@ import { createHttpCanonicalControlClient, ControlTransportError, type ControlSu
 import { jobTranscript } from "../chat/job-transcript-model";
 import { pageTurns } from "./history-page";
 
-type Turn = { entries?: ControlConversationTurn["entries"]; sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string; toolError?: string };
+type Turn = { entries?: ControlConversationTurn["entries"]; sessionId: string; job: ControlJob; input: ControlConversationTurn["input"]; outputs: ControlOutput[]; tools: ControlToolCall[]; error?: string; toolError?: string; unknownReason?: string | null };
 type Pending = { key: string; signature: string; submission: ControlSubmission; admittedJob?: string };
 type StreamEntry = { subscription: JobStreamSubscription | null; timer: ReturnType<typeof setTimeout> | null; stopped: boolean };
 
@@ -262,6 +262,15 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const tools = await this.control.readAllJobTools(turn.job.id, this.lifetime.signal);
     if (!isCurrent()) return null;
     const state: Turn = { sessionId, ...turn, tools };
+    if (turn.job.settlement.state === "unknown") {
+      try {
+        const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
+        if (!isCurrent()) return null;
+        state.unknownReason = record.unknown_reason ?? null;
+      } catch {
+        state.unknownReason = null;
+      }
+    }
     const images = await this.readImages(state);
     if (!isCurrent()) return null;
     return { state, images };
@@ -286,7 +295,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       id: message.id, jobId: turn.job.id, commandId: turn.job.id, role: message.role, content: message.content,
       status: message.status,
       createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
-      ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, reasoning: message.reasoning, failureReason: turn.error ?? turn.toolError ?? message.detail ?? (message.status === "unknown" ? (turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") : undefined) }),
+      ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, reasoning: message.reasoning, failureReason: turn.error ?? turn.toolError ?? message.detail ?? (message.status === "unknown" ? ((turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") + (turn.unknownReason ? ` ${turn.unknownReason}` : "")) : undefined) }),
     }))];
     });
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
@@ -376,6 +385,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         } catch (error) {
           turn.toolError = `Tool evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
         }
+        if (turn.job.settlement.state === "unknown") {
+          try {
+            const record = await this.control.readJob(jobId, this.lifetime.signal);
+            turn.unknownReason = record.unknown_reason ?? null;
+          } catch {
+            turn.unknownReason = null;
+          }
+        }
         if (this.disposed || this.turns.get(jobId) !== turn) return;
         this.publish(turn.sessionId);
         await this.refreshConversations();
@@ -440,7 +457,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const [record, frozen, outputs, tools] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), this.control.readAllJobTools(job)]);
     const page = record.conversation ? await this.control.readConversationTurns(record.conversation, undefined, 20, this.lifetime.signal) : null;
     const stored = page?.turns.find(turn => turn.job.id === job);
-    const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools };
+    const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools, unknownReason: record.unknown_reason ?? null };
     while (outputs.has_more) {
       const page = await this.control.readOutputs(job, { afterSeq: turn.outputs.at(-1)?.seq, limit: 100 });
       turn.outputs.push(...page.outputs);

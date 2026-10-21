@@ -136,6 +136,10 @@ pub(crate) fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegis
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     ToolLoopLimits {
         handler_timeout: timeout.saturating_add(super::blocking::STOP_GRACE),
+        // Twice the read cap and 8 KiB more, so a 32 KiB file whose every
+        // byte escapes to two (quotes, backslashes, line ends) still fits
+        // with its keys and a path of up to 1 KiB, even escaped.
+        max_tool_result_bytes: 72 * 1024,
         ..ToolLoopLimits::default()
     }
 }

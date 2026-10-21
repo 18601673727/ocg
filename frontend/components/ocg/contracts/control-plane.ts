@@ -182,7 +182,9 @@ export function decodeHealth(input: unknown) {
 export function decodeJob(input: unknown) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
-  return jobRecord(envelope.job);
+  const unknown = envelope.unknown_reason;
+  const unknown_reason = unknown === undefined || unknown === null ? null : string(unknown, "unknown_reason");
+  return { ...jobRecord(envelope.job), unknown_reason };
 }
 
 export function decodeJobs(input: unknown) {

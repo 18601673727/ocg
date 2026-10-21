@@ -1,8 +1,9 @@
 use super::*;
 
 /// Reads one response stream, then admits its tool calls only as far as
-/// `conversation` allowed them, or carries answerable per-call refusals.
-/// Text, reasoning and every completed call are kept as sent. The configured
+/// `conversation` allowed them. Text, reasoning and every completed call
+/// are kept as sent; a complete call this request did not admit is in
+/// `tool_calls` as sent and in `refused` with its reason. The configured
 /// timeout applies only while waiting for the next provider chunk; parsing
 /// and persistence are outside that interval.
 pub(crate) async fn read_response(
@@ -25,8 +26,9 @@ pub(crate) async fn read_response(
         &mut capture,
     )
     .await?;
+    let assembled = std::mem::take(&mut result.refused);
     let refused = conversation
-        .admit_tool_calls(&result.tool_calls, &result.refused)
+        .admit_tool_calls(&result.tool_calls, assembled)
         .map_err(|error| {
             incomplete_tool_calls(
                 error,
@@ -37,8 +39,7 @@ pub(crate) async fn read_response(
                 },
             )
         })?;
-    result.refused.extend(refused);
-    result.refused.sort_by_key(|refusal| refusal.index);
+    result.refused = refused;
     Ok(result)
 }
 

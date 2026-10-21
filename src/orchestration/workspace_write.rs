@@ -64,16 +64,18 @@ use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 use crate::orchestration::workspace_read::{
-    self, MAX_FILE_BYTES, Refusal as PathRefusal, Step, Workspace, open_at, open_within,
-    read_bytes, read_whole,
+    self, Refusal as PathRefusal, Step, Workspace, open_at, open_within, read_bytes, read_whole,
 };
 use crate::persistence::{ContentDigest, ToolEffect};
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_write_file";
 
+/// The largest content, expected_content, old or new a call may carry.
+const MAX_CONTENT_BYTES: usize = 8 * 1024;
+
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_write_file-2";
+const HANDLER_VERSION: &str = "workspace_write_file-3";
 
 /// The largest file a delete may read and delete.
 const MAX_DELETE_BYTES: usize = 64 * 1024;
@@ -94,7 +96,7 @@ const STAGING_ATTEMPTS: usize = 8;
 enum Refusal {
     #[error("the arguments are invalid for the requested operation")]
     InvalidArguments,
-    #[error("content, expected_content, old or new is larger than {MAX_FILE_BYTES} bytes")]
+    #[error("content, expected_content, old or new is larger than {MAX_CONTENT_BYTES} bytes")]
     TooLarge,
     #[error("content, expected_content, old or new contains a NUL character")]
     NotText,
@@ -200,7 +202,7 @@ fn parse(arguments: &Value) -> Result<(&str, Operation<'_>), Refusal> {
             let Some(content) = text("content")? else {
                 return Err(Refusal::InvalidArguments);
             };
-            if content.len() > MAX_FILE_BYTES {
+            if content.len() > MAX_CONTENT_BYTES {
                 return Err(Refusal::TooLarge);
             }
             if content.contains('\0') {
@@ -217,7 +219,7 @@ fn parse(arguments: &Value) -> Result<(&str, Operation<'_>), Refusal> {
                 return Err(Refusal::InvalidArguments);
             };
             for t in [content, expected] {
-                if t.len() > MAX_FILE_BYTES {
+                if t.len() > MAX_CONTENT_BYTES {
                     return Err(Refusal::TooLarge);
                 }
                 if t.contains('\0') {
@@ -237,7 +239,7 @@ fn parse(arguments: &Value) -> Result<(&str, Operation<'_>), Refusal> {
                 return Err(Refusal::InvalidArguments);
             }
             for t in [old, new] {
-                if t.len() > MAX_FILE_BYTES {
+                if t.len() > MAX_CONTENT_BYTES {
                     return Err(Refusal::TooLarge);
                 }
                 if t.contains('\0') {
@@ -949,7 +951,7 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o077, 0, "a new file is private to its owner");
 
-        let at_limit = "a".repeat(MAX_FILE_BYTES);
+        let at_limit = "a".repeat(MAX_CONTENT_BYTES);
         assert!(call(&workspace, create_call("docs/limit.txt", &at_limit)).is_ok());
         assert_eq!(content(&root, "docs/limit.txt"), at_limit);
         assert!(call(&workspace, create_call("empty.txt", "")).is_ok());
@@ -1124,7 +1126,11 @@ mod tests {
         write(&root, "dir/inner.txt", "x");
         std::fs::hard_link(root.join("notes.txt"), root.join("hard.txt")).expect("hard link");
         symlink(root.join("dir/inner.txt"), root.join("soft.txt")).expect("link");
-        write(&root, "big.txt", &"a".repeat(MAX_FILE_BYTES + 1));
+        write(
+            &root,
+            "big.txt",
+            &"a".repeat(workspace_read::MAX_FILE_BYTES + 1),
+        );
         let workspace = Workspace::authorize(&root, &directory).expect("authorize");
         for (path, refusal) in [
             ("absent.txt", PathRefusal::NotFound),
@@ -1322,7 +1328,7 @@ mod tests {
         ] {
             assert!(validator.is_valid(&valid), "{valid}");
         }
-        let oversized = "a".repeat(MAX_FILE_BYTES + 1);
+        let oversized = "a".repeat(MAX_CONTENT_BYTES + 1);
         for arguments in [
             create_call("new.txt", &oversized),
             update_call("notes.txt", &oversized, "x"),
@@ -1421,7 +1427,7 @@ mod tests {
             workspace: authorize(),
         };
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_write_file-2");
+        assert_eq!(handler.version(), "workspace_write_file-3");
         assert!(crate::persistence::is_handler_version(handler.version()));
         let registry = ToolRegistry::default();
         register(&registry, authorize()).expect("register");
