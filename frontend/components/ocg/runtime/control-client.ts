@@ -393,7 +393,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     jobIdentity(job);
     const query: string[] = [];
     if (settings.after !== undefined && settings.after !== null) {
-      query.push(`after=${encodeURIComponent(settings.after)}`);
+      if (!/^[1-9][0-9]*:[0-9]+$/.test(settings.after)) throw new ContractError("after", "a tool cursor <request>:<index>");
+      query.push(`after=${settings.after}`);
     }
     if (settings.limit !== undefined) {
       if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
