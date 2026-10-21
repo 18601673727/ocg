@@ -118,7 +118,7 @@ test("refused tools use the same localized label as the transcript", () => {
   const part = converted.content[0];
   assert.equal(part.type, "tool-call");
   if (part.type === "tool-call") {
-    assert.equal(part.result, zh["transcript.outcome.refused"]);
+    assert.equal(part.result, `${zh["transcript.outcome.refused"]}: unauthorized`);
     assert.equal(part.isError, true);
   }
 });
