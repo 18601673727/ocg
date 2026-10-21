@@ -252,12 +252,12 @@ impl Workspace {
         let (directory, name) = self.parent(path)?;
         let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
             |refusal| match refusal {
-                Refusal::TooLarge => Refusal::TooLargeForRange,
+                Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
                 other => other,
             },
         )?;
         let metadata = readable(&file, MAX_RANGED_FILE_BYTES).map_err(|refusal| match refusal {
-            Refusal::TooLarge => Refusal::TooLargeForRange,
+            Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
             other => other,
         })?;
         if metadata.len() > MAX_FILE_BYTES as u64 {
@@ -282,7 +282,7 @@ impl Workspace {
         let (directory, name) = self.parent(path)?;
         let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
             |refusal| match refusal {
-                Refusal::TooLarge => Refusal::TooLargeForRange,
+                Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
                 other => other,
             },
         )?;
@@ -414,8 +414,8 @@ pub enum Refusal {
     NotRegularFile,
     #[error("the file has more than one link")]
     HardLinked,
-    #[error("the file is larger than {MAX_FILE_BYTES} bytes")]
-    TooLarge,
+    #[error("the file is larger than {limit} bytes")]
+    TooLarge { limit: u64 },
     #[error(
         "the file is {bytes} bytes, more than the {MAX_FILE_BYTES} a whole read returns; read it in ranges with start_line and line_count, up to {MAX_RANGE_LINES} lines and about {MAX_FILE_BYTES} bytes per call"
     )]
@@ -530,7 +530,9 @@ pub(super) fn open_within(
         (FileType::Directory, Step::Directory) => {}
         (FileType::RegularFile, Step::File) => {
             if !u64::try_from(stat.st_size).is_ok_and(|size| size <= limit as u64) {
-                return Err(Refusal::TooLarge);
+                return Err(Refusal::TooLarge {
+                    limit: limit as u64,
+                });
             }
         }
         (_, Step::Directory) => return Err(Refusal::NotDirectory),
@@ -569,7 +571,9 @@ pub(super) fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> 
         .read_to_end(&mut content)
         .map_err(|_| Refusal::Unreadable)?;
     if content.len() > limit {
-        return Err(Refusal::TooLarge);
+        return Err(Refusal::TooLarge {
+            limit: limit as u64,
+        });
     }
     unchanged(file, &before, content.len() as u64)?;
     Ok(content)
@@ -586,7 +590,9 @@ fn readable(file: &File, limit: usize) -> Result<std::fs::Metadata, Refusal> {
         return Err(Refusal::HardLinked);
     }
     if metadata.len() > limit as u64 {
-        return Err(Refusal::TooLarge);
+        return Err(Refusal::TooLarge {
+            limit: limit as u64,
+        });
     }
     Ok(metadata)
 }
@@ -666,7 +672,7 @@ fn escaped_len(byte: u8) -> usize {
 /// kept must be UTF-8 text without NUL.
 fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange, Refusal> {
     let before = readable(file, MAX_RANGED_FILE_BYTES).map_err(|refusal| match refusal {
-        Refusal::TooLarge => Refusal::TooLargeForRange,
+        Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
         other => other,
     })?;
     let end = start_line.saturating_add(line_count);
@@ -1371,7 +1377,9 @@ mod tests {
         );
         assert_eq!(
             workspace.read_binary("images/shot.png", image.len() - 1),
-            Err(Refusal::TooLarge)
+            Err(Refusal::TooLarge {
+                limit: (image.len() - 1) as u64
+            })
         );
         let absolute = outside.join("secret.png");
         for (path, refusal) in [

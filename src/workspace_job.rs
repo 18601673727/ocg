@@ -391,7 +391,7 @@ fn load_image(workspace: &Workspace, path: &str) -> Result<ImageInput, Error> {
         .read_binary(path, MAX_IMAGE_BYTES)
         .map_err(|refusal| {
             Error::Image(match refusal {
-                Refusal::TooLarge => ImageError::TooLarge.to_string(),
+                Refusal::TooLarge { .. } => ImageError::TooLarge.to_string(),
                 other => other.to_string(),
             })
         })?;

@@ -898,7 +898,7 @@ impl Build<'_> {
             .and_then(|file| read_bytes(&file, self.limits.file_bytes));
         let content = match content {
             Ok(content) => content,
-            Err(Refusal::TooLarge | Refusal::TooLargeForRange) => {
+            Err(Refusal::TooLarge { .. } | Refusal::TooLargeForRange) => {
                 self.coverage.skipped.too_large += 1;
                 return Ok(());
             }

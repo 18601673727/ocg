@@ -1138,7 +1138,12 @@ mod tests {
             ("notes.txt", PathRefusal::HardLinked),
             ("soft.txt", PathRefusal::SymbolicLink),
             ("dir", PathRefusal::NotRegularFile),
-            ("big.txt", PathRefusal::TooLarge),
+            (
+                "big.txt",
+                PathRefusal::TooLarge {
+                    limit: workspace_read::MAX_FILE_BYTES as u64,
+                },
+            ),
         ] {
             assert_eq!(
                 call(&workspace, update_call(path, "x", "y")),
