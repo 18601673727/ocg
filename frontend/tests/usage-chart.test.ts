@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { decodeUsageBuckets } from "../components/ocg/contracts/control-plane";
-import { summarize } from "../components/ocg/dashboard/usage-chart";
+import { summarize } from "../components/ocg/dashboard/usage-chart-data";
 
 test("usage buckets zero-fill days and rank models separately from Other", () => {
   const day = 86_400_000_000;

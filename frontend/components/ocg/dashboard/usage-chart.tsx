@@ -4,7 +4,7 @@ import { useEffect, useId, useState } from "react";
 import type { decodeUsageBuckets } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
-import { summarize, type RankedUsage } from "./usage-chart.ts";
+import { summarize, type RankedUsage } from "./usage-chart-data";
 
 const DAY_US = 86_400_000_000;
 const select = "rounded-md border border-input bg-background px-3 py-2 text-sm";
@@ -96,7 +96,10 @@ function UsagePlot({ data }: { data: ChartData }) {
   const tooltip = (bar: ChartData["bars"][number]) => [
     dateLabel(bar.bucketUs),
     `${t("observations.tokens")}: ${number.format(bar.total)}`,
-    ...[...bar.totals].filter(([, value]) => value > 0).map(([model, value]) => `${model ?? t("observations.unknownModel")}: ${number.format(value)}`),
+    ...data.ranking.flatMap(entry => entry.keys.flatMap(model => {
+      const value = bar.totals.get(model) ?? 0;
+      return value > 0 ? [`${model ?? t("observations.unknownModel")}: ${number.format(value)}`] : [];
+    })),
   ].join("\n");
   const maximum = Math.max(...data.bars.map((bar) => bar.total));
   const left = 60, top = 16, plotWidth = 660, plotHeight = 230;

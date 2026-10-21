@@ -6,7 +6,7 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useControlPage } from "../runtime/use-control-page";
 import type { decodeAvailability, decodeHealth, decodeUsage } from "../contracts";
 import { useI18n } from "../i18n";
-import { UsageChart } from "./usage-chart.tsx";
+import { UsageChart } from "./usage-chart";
 
 type Usage = ReturnType<typeof decodeUsage>["observations"][number];
 type Availability = ReturnType<typeof decodeAvailability>["observations"][number];
