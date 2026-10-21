@@ -1,9 +1,10 @@
 use super::*;
 
 /// Reads one response stream, then admits its tool calls only as far as
-/// `conversation` allowed them. The configured timeout applies only while
-/// waiting for the next provider chunk; parsing and persistence are outside
-/// that interval.
+/// `conversation` allowed them, or carries answerable per-call refusals.
+/// Text, reasoning and every completed call are kept as sent. The configured
+/// timeout applies only while waiting for the next provider chunk; parsing
+/// and persistence are outside that interval.
 pub(crate) async fn read_response(
     payload: Payload,
     status_code: u16,
@@ -14,7 +15,7 @@ pub(crate) async fn read_response(
     conversation: &ChatConversation,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut capture = UsageCapture::default();
-    let result = parse_stream(
+    let mut result = parse_stream(
         payload,
         status_code,
         started,
@@ -24,16 +25,20 @@ pub(crate) async fn read_response(
         &mut capture,
     )
     .await?;
-    if let Err(error) = conversation.admit_tool_calls(&result.tool_calls) {
-        return Err(incomplete_tool_calls(
-            error,
-            ResponseFacts {
-                status_code: result.status_code,
-                finish_reason: result.finish_reason,
-                raw_finish_reason: result.raw_finish_reason,
-            },
-        ));
-    }
+    let refused = conversation
+        .admit_tool_calls(&result.tool_calls, &result.refused)
+        .map_err(|error| {
+            incomplete_tool_calls(
+                error,
+                ResponseFacts {
+                    status_code: result.status_code,
+                    finish_reason: result.finish_reason,
+                    raw_finish_reason: result.raw_finish_reason.clone(),
+                },
+            )
+        })?;
+    result.refused.extend(refused);
+    result.refused.sort_by_key(|refusal| refusal.index);
     Ok(result)
 }
 
@@ -421,22 +426,24 @@ async fn parse_stream_body(
             response.incomplete("provider stream ended without a finish event", status_code)
         );
     }
-    let tool_calls = response
-        .tool_calls
-        .finish(response.finish_reason)
-        .map_err(|error| {
-            let facts = ResponseFacts {
-                status_code,
-                finish_reason: response.finish_reason,
-                raw_finish_reason: response.raw_finish_reason.clone(),
-            };
-            incomplete_tool_calls(error, facts)
-        })?;
+    let (tool_calls, refused) =
+        response
+            .tool_calls
+            .finish(response.finish_reason)
+            .map_err(|error| {
+                let facts = ResponseFacts {
+                    status_code,
+                    finish_reason: response.finish_reason,
+                    raw_finish_reason: response.raw_finish_reason.clone(),
+                };
+                incomplete_tool_calls(error, facts)
+            })?;
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
         text: response.text,
         reasoning: response.reasoning,
         tool_calls,
+        refused,
         usage: response.usage,
         finish_reason: response.finish_reason,
         raw_finish_reason: response.raw_finish_reason,

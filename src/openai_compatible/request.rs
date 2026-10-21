@@ -325,8 +325,14 @@ impl ChatConversation {
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidToolCall`] for the first call that is not admitted.
-    pub fn admit_tool_calls(&self, calls: &[CompletedToolCall]) -> Result<(), InvalidToolCall> {
+    /// Returns answerable refusals for calls with unauthorized names or
+    /// invalid arguments, skipping calls already refused by the assembler.
+    /// An invalid offer, schema or response-wide constraint stays an error.
+    pub fn admit_tool_calls(
+        &self,
+        calls: &[CompletedToolCall],
+        already_refused: &[InvalidToolCall],
+    ) -> Result<Vec<InvalidToolCall>, InvalidToolCall> {
         if self.parallel_tool_calls == Some(false) && calls.len() > 1 {
             return Err(InvalidToolCall::new(
                 ToolCallRefusal::Unauthorized,
@@ -339,8 +345,15 @@ impl ChatConversation {
         // Each offered function's schema is compiled once, when a call first
         // names it.
         let mut validators: Vec<Option<Validator>> = self.tools.iter().map(|_| None).collect();
+        let mut refused = Vec::new();
         for call in calls {
             let index = call.index;
+            if already_refused
+                .iter()
+                .any(|refusal| refusal.index == Some(index))
+            {
+                continue;
+            }
             let unauthorized = || {
                 InvalidToolCall::at(
                     ToolCallRefusal::Unauthorized,
@@ -352,13 +365,14 @@ impl ChatConversation {
                 )
             };
             let chosen = match &self.tool_choice {
-                Some(ToolChoiceWire::Mode(mode)) => matches!(mode.as_str(), "auto" | "required"),
+                Some(ToolChoiceWire::Mode(mode)) => match mode.as_str() {
+                    "auto" | "required" => true,
+                    "none" => false,
+                    _ => return Err(unauthorized()),
+                },
                 Some(ToolChoiceWire::Named(named)) => named.function.name == call.name,
                 None => true,
             };
-            if !chosen {
-                return Err(unauthorized());
-            }
             let mut offered = self
                 .tools
                 .iter()
@@ -366,8 +380,16 @@ impl ChatConversation {
                 .filter(|(_, tool)| tool.function.name == call.name);
             let (position, tool) = match (offered.next(), offered.next()) {
                 (Some(offered), None) if offered.1.tool_type == "function" => offered,
+                (None, None) => {
+                    refused.push(unauthorized());
+                    continue;
+                }
                 _ => return Err(unauthorized()),
             };
+            if !chosen {
+                refused.push(unauthorized());
+                continue;
+            }
             let validator = match &mut validators[position] {
                 Some(validator) => validator,
                 slot => slot.insert(admission::parameter_validator(
@@ -376,9 +398,13 @@ impl ChatConversation {
                     tool.function.parameters.as_ref(),
                 )?),
             };
-            admission::admit_arguments(index, &call.name, &call.arguments, validator)?;
+            if let Err(refusal) =
+                admission::admit_arguments(index, &call.name, &call.arguments, validator)
+            {
+                refused.push(refusal);
+            }
         }
-        Ok(())
+        Ok(refused)
     }
 }
 

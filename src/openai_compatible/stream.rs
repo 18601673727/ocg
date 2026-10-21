@@ -450,9 +450,9 @@ impl ToolCallAssembler {
 
     /// The completed tool calls of a stream that ended with `finish`, ordered
     /// by their wire index. A call is complete only with an id, a valid
-    /// function name and arguments that are one JSON object; the arguments
-    /// are returned exactly as sent. Tool calls are complete only beside a
-    /// `tool_calls` or `stop` finish (a forced function choice finishes with
+    /// function name; arguments that are not one JSON object are returned
+    /// beside a refusal. The arguments are returned exactly as sent. Tool
+    /// calls are complete only beside a `tool_calls` or `stop` finish (a forced function choice finishes with
     /// `stop`), and a `tool_calls` finish without any call is incomplete.
     ///
     /// # Errors
@@ -462,7 +462,7 @@ impl ToolCallAssembler {
     pub fn finish(
         mut self,
         finish: Option<ChatFinishReason>,
-    ) -> Result<Vec<CompletedToolCall>, InvalidToolCall> {
+    ) -> Result<(Vec<CompletedToolCall>, Vec<InvalidToolCall>), InvalidToolCall> {
         if self.calls.is_empty() {
             if finish == Some(ChatFinishReason::ToolCalls) {
                 return Err(InvalidToolCall::new(
@@ -470,7 +470,7 @@ impl ToolCallAssembler {
                     "the response finished with `tool_calls` but sent no tool call",
                 ));
             }
-            return Ok(self.calls);
+            return Ok((self.calls, Vec::new()));
         }
         if !matches!(
             finish,
@@ -484,6 +484,7 @@ impl ToolCallAssembler {
                 ),
             ));
         }
+        let mut refused = Vec::new();
         for call in &mut self.calls {
             let index = call.index;
             if call.id.trim().is_empty() {
@@ -509,14 +510,14 @@ impl ToolCallAssembler {
                 call.arguments.push_str("{}");
             }
             if !is_json_object(&call.arguments) {
-                return Err(InvalidToolCall::at(
+                refused.push(InvalidToolCall::at(
                     ToolCallRefusal::InvalidArguments,
                     index,
                     format!("tool call {index} arguments are not one JSON object"),
                 ));
             }
         }
-        Ok(self.calls)
+        Ok((self.calls, refused))
     }
 }
 

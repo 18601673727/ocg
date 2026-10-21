@@ -130,10 +130,10 @@ impl Default for ProviderExecutionConfig {
 }
 
 /// One finished Provider exchange. It may be assistant text, tool calls, or
-/// both. Tool calls are requests the Provider made, complete and admitted by
-/// the request that produced them, see [`ChatConversation::admit_tool_calls`];
-/// none of them has been run, and a result that carries them is not a
-/// finished answer. Admission is not permission to execute a call.
+/// both. Tool calls are complete requests the Provider made; `refused` names
+/// those the request did not admit. None has been run, and a result carrying
+/// calls is not a finished answer. Admission is not permission to execute.
+/// Paths without a tool loop must require [`Self::admitted`].
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionResult {
     pub text: String,
@@ -142,6 +142,8 @@ pub struct ProviderExecutionResult {
     pub reasoning: String,
     /// Ordered by their wire index, with ids, names and arguments as sent.
     pub tool_calls: Vec<CompletedToolCall>,
+    /// Answerable refusals ordered by index, each also present in `tool_calls`.
+    pub refused: Vec<InvalidToolCall>,
     pub usage: NormalizedUsage,
     pub finish_reason: Option<ChatFinishReason>,
     pub raw_finish_reason: Option<String>,
@@ -215,6 +217,21 @@ pub enum ProviderExecutionError {
 }
 
 impl ProviderExecutionResult {
+    /// Requires every call to be admitted when no tool loop can answer refusals.
+    pub fn admitted(self) -> Result<Self, ProviderExecutionError> {
+        if let Some(refusal) = self.refused.iter().min_by_key(|refusal| refusal.index) {
+            return Err(exchange::incomplete_tool_calls(
+                refusal.clone(),
+                ResponseFacts {
+                    status_code: self.status_code,
+                    finish_reason: self.finish_reason,
+                    raw_finish_reason: self.raw_finish_reason,
+                },
+            ));
+        }
+        Ok(self)
+    }
+
     /// Whether the Provider asked for tools to be run before it can answer.
     #[must_use]
     pub fn requests_tools(&self) -> bool {

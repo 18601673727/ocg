@@ -152,10 +152,11 @@ function assistantParts(
     let args: unknown = {};
     try { args = JSON.parse(call.arguments ?? "{}"); } catch { args = { raw: call.arguments }; }
     const checkedArgs = typeof args === "object" && args !== null && !Array.isArray(args) ? Object.fromEntries(Object.entries(args)) : { value: args };
+    const refused = !call.outcome_kind && call.decision !== "admitted" && call.decision !== "awaiting_approval" && call.decision !== "awaiting_answer";
     parts.push({ type: "tool-call", toolCallId: call.tool_call_id, toolName: call.name,
       args: checkedArgs, argsText: call.arguments ?? "{}",
-      ...(call.outcome_kind ? { result: call.result ?? call.outcome_kind } : {}),
-      isError: call.outcome_kind === "not_applied" || call.outcome_kind === "not_invoked" || call.outcome_kind === "uncertain",
+      ...(refused ? { result: `refused: ${call.decision}` } : call.outcome_kind ? { result: call.result ?? call.outcome_kind } : {}),
+      isError: refused || call.outcome_kind === "not_applied" || call.outcome_kind === "not_invoked" || call.outcome_kind === "uncertain",
     });
   }
   for (const image of message.images ?? []) parts.push(assistantImagePart(image, baseUrl));

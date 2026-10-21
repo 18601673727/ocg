@@ -1906,6 +1906,11 @@ fn drive_with(
             &conversation,
         )
         .await;
+        let execution = if conversation.tools.is_empty() {
+            execution.and_then(crate::provider_execution::ProviderExecutionResult::admitted)
+        } else {
+            execution
+        };
         finish_provider_job(handle, run.executor, run.input, run.job, sink, execution).await
     })
 }
@@ -5789,20 +5794,23 @@ mod requests_and_tool_loop {
         let handle = worker.handle();
         let (_provider, llm) = llm_setup(&handle, "model-a");
         let ambiguous = r#"{"index":0,"id":"c","function":{"name":"add","arguments":"{\"a\":1,\"b\":2}"}},{"index":0,"function":{"name":"subtract"}}"#;
-        for (case, calls_sent) in [
+        for (case, calls_sent, refusal) in [
             (
                 "an unregistered tool",
                 vec![call(0, "c", "subtract", r#"{"a":1,"b":2}"#)],
+                Some(ToolCallRefusal::Unauthorized),
             ),
             (
                 "arguments the schema refuses",
                 vec![call(0, "c", "add", r#"{"a":"1","b":2}"#)],
+                Some(ToolCallRefusal::InvalidArguments),
             ),
             (
                 "an unexpected argument",
                 vec![call(0, "c", "add", r#"{"a":1,"b":2,"c":3}"#)],
+                Some(ToolCallRefusal::InvalidArguments),
             ),
-            ("an ambiguous name", vec![ambiguous.to_owned()]),
+            ("an ambiguous name", vec![ambiguous.to_owned()], None),
         ] {
             let run = local_run(&handle, llm);
             let (registry, calls) = registered(vec![("add", Behavior::Add)]);
@@ -5810,14 +5818,32 @@ mod requests_and_tool_loop {
                 &handle,
                 run,
                 Some(execution(&registry, &["add"], ToolLoopLimits::default())),
-                vec![calling(&calls_sent, (1, 1))],
+                vec![calling(&calls_sent, (1, 1)), answering("done", (1, 1))],
                 CancellationToken::default(),
                 |_| {},
             );
             let receipt = looped.settled.expect("the refused response settles");
-            assert_eq!(receipt.result, None, "{case}");
             assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}: nothing ran");
             let job = job_record(&handle, run.job);
+            if let Some(kind) = refusal {
+                assert!(receipt.result.is_some(), "{case}");
+                assert!(
+                    job.completed_at.is_some() && job.unknown_at.is_none(),
+                    "{case}"
+                );
+                assert_eq!(looped.sent.len(), 2, "{case}");
+                let results = tool_results(&looped.sent[1]);
+                assert_eq!(results.len(), 1, "{case}");
+                assert_eq!(results[0].0, "c");
+                let answer: Value = serde_json::from_str(&results[0].1).expect("refusal JSON");
+                assert_eq!(answer["refused"], kind.as_str(), "{case}");
+                assert!(!answer["reason"].as_str().expect("reason").is_empty());
+                let [record] = evidence(&handle, run.job).try_into().expect("one refusal");
+                assert_eq!(record.decision.fact, ToolDecision::Refused(kind));
+                assert!(record.admission().is_none() && record.outcome.is_none());
+                continue;
+            }
+            assert_eq!(receipt.result, None, "{case}");
             assert!(
                 job.unknown_at.is_some()
                     && job.stop_confirmed_at.is_some()
@@ -5952,6 +5978,106 @@ mod requests_and_tool_loop {
             looped.settled.expect("a loop within its limits completes");
             assert!(job_record(&handle, run.job).completed_at.is_some());
         }
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_refused_call_is_answered_beside_valid_calls_and_the_loop_continues() {
+        let (_root, directory) = data_directory("tool-loop-refused-call");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+        let mut response = calling(
+            &[
+                add(0, "a", 1, 2),
+                call(1, "b", "subtract", r#"{"a":1,"b":2}"#),
+            ],
+            (1, 1),
+        );
+        response.insert(0, chunk("data: {\"choices\":[{\"delta\":{\"content\":\"checking\",\"reasoning_content\":\"calculate\"}}]}\n\n".into()));
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], ToolLoopLimits::default())),
+            vec![response, answering("done", (2, 2))],
+            CancellationToken::default(),
+            |_| {},
+        );
+        let receipt = looped.settled.expect("the loop settles");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(looped.sent.len(), 2);
+        assert_eq!(
+            tool_results(&looped.sent[1]),
+            [
+                ("a".to_owned(), json!({"sum": 3}).to_string()),
+                ("b".to_owned(), json!({"refused": "unauthorized", "reason": "tool call 1 names `subtract`, which this request did not allow"}).to_string()),
+            ]
+        );
+        let [a, b] = evidence(&handle, run.job).try_into().expect("two calls");
+        assert!(matches!(a.decision.fact, ToolDecision::Admitted(_)));
+        assert!(a.outcome.is_some());
+        assert_eq!(
+            b.decision.fact,
+            ToolDecision::Refused(ToolCallRefusal::Unauthorized)
+        );
+        assert!(b.admission().is_none() && b.outcome.is_none());
+        let outputs = wait(handle.job_outputs(run.job, None, 100)).expect("outputs");
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.kind == OutputKind::Reasoning
+                    && output.summary.as_deref() == Some("calculate"))
+        );
+        assert_eq!(
+            outputs
+                .iter()
+                .filter(|output| output.summary.as_deref() == Some("checking"))
+                .count(),
+            1
+        );
+        assert!(receipt.result.is_some());
+        let job = job_record(&handle, run.job);
+        assert!(job.completed_at.is_some() && job.failed_at.is_none() && job.unknown_at.is_none());
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn refused_calls_are_bounded_by_the_request_limit() {
+        let (_root, directory) = data_directory("tool-loop-refused-request-limit");
+        let worker = DatabaseWorker::start(&directory).expect("start database");
+        let handle = worker.handle();
+        let (_provider, llm) = llm_setup(&handle, "model-a");
+        let run = local_run(&handle, llm);
+        let (registry, calls) = registered(vec![("add", Behavior::Add)]);
+        let limits = ToolLoopLimits {
+            max_provider_requests: 2,
+            ..ToolLoopLimits::default()
+        };
+        let looped = run_loop(
+            &handle,
+            run,
+            Some(execution(&registry, &["add"], limits)),
+            vec![
+                calling(&[call(0, "a", "subtract", "{}")], (1, 1)),
+                calling(&[call(0, "b", "subtract", "{}")], (1, 1)),
+            ],
+            CancellationToken::default(),
+            |_| {},
+        );
+        assert_eq!(looped.sent.len(), 2);
+        let (_, stop) = stopped(looped);
+        assert_eq!(stop, ToolLoopStop::RequestLimit);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let [record] = evidence(&handle, run.job).try_into().expect("one refusal");
+        assert_eq!(
+            record.decision.fact,
+            ToolDecision::Refused(ToolCallRefusal::Unauthorized)
+        );
+        assert!(record.admission().is_none() && record.outcome.is_none());
+        let job = job_record(&handle, run.job);
+        assert!(job.failed_at.is_some() && job.unknown_at.is_none() && job.completed_at.is_none());
         worker.shutdown().expect("shutdown");
     }
 
@@ -8628,7 +8754,10 @@ mod requests_and_tool_loop {
                     &handle,
                     run,
                     tools,
-                    vec![calling(&[read_call(0, "call_read", arguments)], (1, 1))],
+                    vec![
+                        calling(&[read_call(0, "call_read", arguments)], (1, 1)),
+                        answering("done", (1, 1)),
+                    ],
                     CancellationToken::default(),
                     move |_| {
                         if revoked {
@@ -8636,6 +8765,25 @@ mod requests_and_tool_loop {
                         }
                     },
                 );
+                if offered && refused == Refused::Stream {
+                    assert_eq!(looped.sent.len(), 2, "{case}: the refusal is answered");
+                    let results = tool_results(&looped.sent[1]);
+                    assert_eq!(results.len(), 1);
+                    assert_eq!(results[0].0, "call_read");
+                    let answer: Value = serde_json::from_str(&results[0].1).expect("refusal JSON");
+                    assert_eq!(answer["refused"], "invalid arguments");
+                    assert!(!answer["reason"].as_str().expect("reason").is_empty());
+                    let [record] = evidence(&handle, run.job).try_into().expect("one refusal");
+                    assert_eq!(
+                        record.decision.fact,
+                        ToolDecision::Refused(ToolCallRefusal::InvalidArguments)
+                    );
+                    assert!(record.admission().is_none() && record.outcome.is_none());
+                    assert!(looped.settled.expect("settled").result.is_some());
+                    assert!(job_record(&handle, run.job).completed_at.is_some());
+                    assert!(blocking(&handle, llm).is_empty(), "{case}");
+                    continue;
+                }
                 assert_eq!(looped.sent.len(), 1, "{case}: no result is ever sent");
                 let records = evidence(&handle, run.job);
                 assert!(
@@ -9867,19 +10015,29 @@ mod requests_and_tool_loop {
                         )],
                         (10, 5),
                     ),
-                    answering("never sent", (1, 1)),
+                    answering("done", (1, 1)),
                 ],
                 CancellationToken::default(),
                 |_| {},
             );
-            // The response is refused whole, before any call is admitted.
             let receipt = looped.settled.expect("settled");
-            assert_eq!(receipt.result, None);
-            assert!(job_record(&handle, run.job).unknown_at.is_some());
-            assert!(
-                evidence(&handle, run.job).is_empty(),
-                "nothing was admitted"
+            assert!(receipt.result.is_some());
+            assert!(job_record(&handle, run.job).completed_at.is_some());
+            assert_eq!(looped.sent.len(), 2);
+            let results = tool_results(&looped.sent[1]);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, "call_shell");
+            let answer: Value = serde_json::from_str(&results[0].1).expect("refusal JSON");
+            assert_eq!(answer["refused"], "invalid arguments");
+            assert!(!answer["reason"].as_str().expect("reason").is_empty());
+            let [record] = evidence(&handle, run.job).try_into().expect("one refusal");
+            assert_eq!(
+                record.decision.fact,
+                ToolDecision::Refused(ToolCallRefusal::InvalidArguments)
             );
+            assert!(record.admission().is_none() && record.outcome.is_none());
+            assert_eq!(project.runs(), 0);
+            assert!(!project.root.join("ran").exists());
 
             // A program that is not found is refused before anything starts.
             let run = local_run(&handle, llm);

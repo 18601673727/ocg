@@ -3307,6 +3307,7 @@ async fn run_provider_job_inner(
             &site,
             &conversation,
             &calls,
+            &[],
             &links,
             &mut budget,
             cancellation,
@@ -3369,6 +3370,11 @@ async fn run_provider_job_inner(
                 });
             }
         };
+        let execution = if tools.is_none() {
+            execution.and_then(ProviderExecutionResult::admitted)
+        } else {
+            execution
+        };
         let result = match execution {
             Ok(result) if result.requests_tools() => result,
             execution => {
@@ -3393,10 +3399,13 @@ async fn run_provider_job_inner(
             .filter(|_| tools.is_some_and(|tools| round < tools.limits.max_provider_requests));
         let awaits = tools.is_some_and(|tools| {
             tools.decider
-                && result
-                    .tool_calls
-                    .iter()
-                    .any(|call| needs_decision(tools, &call.name))
+                && result.tool_calls.iter().any(|call| {
+                    !result
+                        .refused
+                        .iter()
+                        .any(|refusal| refusal.index == Some(call.index))
+                        && needs_decision(tools, &call.name)
+                })
         });
         let answered = match tools {
             Some(tools) if next.is_some() || awaits => {
@@ -3411,6 +3420,7 @@ async fn run_provider_job_inner(
                     &site,
                     &conversation,
                     &result.tool_calls,
+                    &result.refused,
                     &[],
                     &mut budget,
                     cancellation,
@@ -3615,13 +3625,16 @@ fn needs_decision(tools: &ToolExecution, name: &str) -> bool {
 /// known of its outcome is recorded before its result can be sent on. Its
 /// result, serialized, is the answer, and it is never truncated. A handler
 /// failure known not to have applied is answered with its reason, so the
-/// model may correct the call; any other failure stops the loop.
+/// model may correct the call. Answerable provider refusals are recorded and
+/// answered before continuing, count as calls, and are never resolved or
+/// admitted. Failure to record a refusal stops before answering it.
 #[allow(clippy::too_many_arguments)]
 async fn answer_calls(
     tools: &ToolExecution,
     site: &CallSite<'_>,
     conversation: &ChatConversation,
     calls: &[CompletedToolCall],
+    refused: &[InvalidToolCall],
     approvals: &[ToolCallRef],
     budget: &mut ToolBudget,
     cancellation: &CancellationToken,
@@ -3651,6 +3664,12 @@ async fn answer_calls(
             ))
             .into());
         }
+        if refused
+            .iter()
+            .any(|refusal| refusal.index == Some(call.index))
+        {
+            continue;
+        }
         if let Err(refusal) = tools.offer.resolve(call) {
             return Err(refuse(site, call, refusal).await);
         }
@@ -3675,6 +3694,18 @@ async fn answer_calls(
     for call in calls {
         if cancellation.is_cancelled() {
             return Err(ToolLoopStop::Cancelled.into());
+        }
+        if let Some(refusal) = refused
+            .iter()
+            .find(|refusal| refusal.index == Some(call.index))
+        {
+            record_refusal(site, call, refusal).await?;
+            answers.push(
+                serde_json::json!({"refused": refusal.kind.as_str(), "reason": refusal.message})
+                    .to_string(),
+            );
+            budget.calls += 1;
+            continue;
         }
         let approval = approvals.get(call.index as usize).copied();
         let resolved = if approval.is_some() && budget.calls >= limits.max_tool_calls {
@@ -4107,8 +4138,18 @@ async fn refuse(
     call: &CompletedToolCall,
     refusal: InvalidToolCall,
 ) -> Stopped {
-    let recorded = site
-        .database
+    match record_refusal(site, call, &refusal).await {
+        Ok(()) => ToolLoopStop::Refused(refusal).into(),
+        Err(stopped) => stopped,
+    }
+}
+
+async fn record_refusal(
+    site: &CallSite<'_>,
+    call: &CompletedToolCall,
+    refusal: &InvalidToolCall,
+) -> Result<(), Stopped> {
+    site.database
         .record_tool_decision(NewToolEvidence {
             approval: None,
             call: site.call(call),
@@ -4117,11 +4158,11 @@ async fn refuse(
             decision: ToolDecision::Refused(refusal.kind),
             spawns: false,
         })
-        .await;
-    Stopped {
-        stop: ToolLoopStop::Refused(refusal),
-        evidence: recorded.err(),
-    }
+        .await
+        .map_err(|error| Stopped {
+            stop: ToolLoopStop::Refused(refusal.clone()),
+            evidence: Some(error),
+        })
 }
 
 /// Records that an admitted call's handler was never invoked because the
@@ -5933,6 +5974,7 @@ mod provider_record_tests {
             handle.record_sent_request(retry).await.expect("Sent retry");
             sink.recorder.remember_sent(state);
             let result = ProviderExecutionResult {
+                refused: Vec::new(),
                 text: "answer".into(),
                 reasoning: "private thinking".into(),
                 tool_calls: vec![],

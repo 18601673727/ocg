@@ -190,7 +190,9 @@ pub async fn execute_chat_with_sink(
     sink: &mut dyn ProviderOutputSink,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let conversation = objective_conversation(frozen, objective);
-    execute_conversation(frozen, &conversation, resolver, config, Some(sink)).await
+    execute_conversation(frozen, &conversation, resolver, config, Some(sink))
+        .await?
+        .admitted()
 }
 
 /// The Authorization header of a request. It is marked sensitive, so no

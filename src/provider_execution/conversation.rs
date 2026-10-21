@@ -33,7 +33,9 @@ pub async fn execute_chat(
     config: &ProviderExecutionConfig,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let conversation = objective_conversation(frozen, objective);
-    execute_conversation(frozen, &conversation, resolver, config, None).await
+    execute_conversation(frozen, &conversation, resolver, config, None)
+        .await?
+        .admitted()
 }
 
 /// The conversation a Job's objective is sent as: the frozen Agent

@@ -138,12 +138,14 @@ function argumentSummary(raw: string | null): string {
   return "";
 }
 
-function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined, isLive: boolean): string {
+function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined, decision: ControlToolCall["decision"], isLive: boolean): string {
+  if (!kind && decision !== "admitted" && decision !== "awaiting_approval" && decision !== "awaiting_answer") return "refused";
   if (!kind) return isLive ? "running" : "uncertain";
   return kind;
 }
 
-function outcomeText(t: TranslateFn, kind: ControlToolOutcomeKind | null | undefined, isLive: boolean): string {
+function outcomeText(t: TranslateFn, kind: ControlToolOutcomeKind | null | undefined, decision: ControlToolCall["decision"], isLive: boolean): string {
+  if (outcomeLabel(kind, decision, isLive) === "refused") return t("transcript.outcome.refused");
   if (!kind) return isLive ? t("transcript.outcome.running") : t("transcript.outcome.uncertain");
   switch (kind) {
     case "completed":
@@ -175,7 +177,7 @@ function TurnToolCalls({
       <div className="flex flex-col gap-2 p-3 pt-0">
         {tools.map((tool) => {
           const summary = argumentSummary(tool.arguments);
-          const outcome = outcomeLabel(tool.outcome_kind, isLive);
+          const outcome = outcomeLabel(tool.outcome_kind, tool.decision, isLive);
           const isCompleted = outcome === "completed";
           const isRunning = outcome === "running";
           const isUncertain = outcome === "uncertain";
@@ -208,7 +210,7 @@ function TurnToolCalls({
                       "border border-border bg-muted text-muted-foreground",
                   )}
                 >
-                  {outcomeText(t, tool.outcome_kind, isLive)}
+                  {outcomeText(t, tool.outcome_kind, tool.decision, isLive)}
                 </span>
               </summary>
               <div className="mt-2 space-y-2 border-t border-border pt-2 font-mono text-xs">

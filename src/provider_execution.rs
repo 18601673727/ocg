@@ -1543,7 +1543,8 @@ pub(crate) mod tests {
                 Some(&mut sink),
                 &conversation,
             )
-            .await;
+            .await
+            .and_then(ProviderExecutionResult::admitted);
             (result, sink)
         })
     }
@@ -1884,6 +1885,7 @@ pub(crate) mod tests {
             sink,
             conversation,
         ))
+        .and_then(ProviderExecutionResult::admitted)
     }
 
     fn call(index: u32, id: &str, name: &str, arguments: &str) -> CompletedToolCall {
@@ -1922,6 +1924,43 @@ pub(crate) mod tests {
             result_value(&result),
             json!({"text": "hi", "finish_reason": "stop"})
         );
+    }
+
+    #[test]
+    fn a_refused_call_keeps_its_response_and_is_returned_with_its_reason() {
+        let config = ProviderExecutionConfig::default();
+        let mut sink = RecordingSink::default();
+        let result = wait(read_response(
+            payload(vec![
+                Step::Chunk(CONTENT),
+                Step::Chunk(tool_delta(r#"[{"index":0,"id":"a","function":{"name":"get_weather","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"get_weather","arguments":"[1]"}}]"#)),
+                Step::Chunk(TOOL_CALLS),
+            ], config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            Some(&mut sink),
+            &offering(&["get_weather"]),
+        )).expect("a complete response with a refused call");
+        assert_eq!(
+            result.tool_calls,
+            [
+                call(0, "a", "get_weather", "{}"),
+                call(1, "b", "get_weather", "[1]")
+            ]
+        );
+        assert_eq!(
+            result.refused,
+            [InvalidToolCall::at(
+                crate::openai_compatible::ToolCallRefusal::InvalidArguments,
+                1,
+                "tool call 1 arguments are not one JSON object"
+            )]
+        );
+        assert_eq!(result.text, "hi");
+        assert_eq!(sink.deltas, ["hi"]);
+        assert!(incomplete_message(result.admitted()).contains("(invalid arguments)"));
     }
 
     #[test]
