@@ -1909,6 +1909,19 @@ fn retry_stop_confirmation(result: &Result<(), DatabaseError>) -> bool {
     }
 }
 
+/// Codes on Failed results: provider_rejected (provider refusal), not_delivered
+/// (delivery ruled out), build_failed (request construction), context_window_exceeded
+/// (input budget), not_sent (pre-send refusal), tool_loop_stopped (known local stop),
+/// completion_refused (local completion rejected), internal (other runtime failure).
+const PROVIDER_REJECTED: &str = "provider_rejected";
+const NOT_DELIVERED: &str = "not_delivered";
+const BUILD_FAILED: &str = "build_failed";
+const CONTEXT_WINDOW_EXCEEDED: &str = "context_window_exceeded";
+const NOT_SENT: &str = "not_sent";
+const TOOL_LOOP_STOPPED: &str = "tool_loop_stopped";
+const COMPLETION_REFUSED: &str = "completion_refused";
+const INTERNAL_FAILURE: &str = "internal";
+
 pub(crate) fn claim_error_finalization(
     error: &ExecutionRuntimeError,
     tool_may_have_run: bool,
@@ -1924,7 +1937,7 @@ pub(crate) fn claim_error_finalization(
         } if !matches!(violation, Violation::JobAlreadyFinalized(_)) => {
             JobFinalization::Failed(FinalResult {
                 summary: Some(violation.to_string()),
-                code: None,
+                code: Some(COMPLETION_REFUSED.to_owned()),
                 goal_reached: Some(false),
                 value: None,
             })
@@ -1936,7 +1949,7 @@ pub(crate) fn claim_error_finalization(
         }
         _ => JobFinalization::Failed(FinalResult {
             summary: Some(error.to_string()),
-            code: None,
+            code: Some(INTERNAL_FAILURE.to_owned()),
             goal_reached: Some(false),
             value: None,
         }),
@@ -2195,6 +2208,8 @@ async fn admit_provider_job(
         offered,
     ))
 }
+
+pub(crate) const IMAGES_OMITTED_NOTICE: &str = "Images of earlier turns were omitted; a request carries at most 8 images and 16 MiB of images.";
 
 pub(crate) const OMITTED_NOTICE: &str =
     "Earlier turns of this conversation were omitted to fit the model's context window.";
@@ -2660,7 +2675,7 @@ async fn run_started_provider_job(
     let refused = async |summary: String| -> Result<ExecutionReceipt, ExecutionRuntimeError> {
         let failed = FinalResult {
             summary: Some(summary),
-            code: None,
+            code: Some(NOT_SENT.to_owned()),
             goal_reached: Some(false),
             value: None,
         };
@@ -2779,16 +2794,21 @@ async fn run_started_provider_job(
     let mut current_objective = input_record.objective.clone();
     let mut current_attachments = input_record.attachments.clone();
     let mut context_omitted = false;
+    let mut images_omitted = false;
+    let mut response_format = None;
     let mut tree_status = String::new();
     if job_record.conversation.is_some() {
         let budget = context_limits.read_budget();
         let mut context = database.read_turn_context(job, budget).await?;
         context_omitted = context.omitted;
+        response_format = context.response_format;
+        let mut bytes_left = crate::openai_compatible::image::MAX_REQUEST_IMAGE_BYTES as u64;
         tree_status = context.tree_status;
         if let Some(current) = context.turns.pop() {
             debug_assert_eq!(current.turn, job);
             current_objective = Some(format!("{}{}", context.attention, current.text));
             current_attachments = current.attachments;
+            bytes_left = bytes_left.saturating_sub(current.attachment_bytes.iter().sum::<u64>());
         }
         let mut images_left = if configuration
             .frozen
@@ -2804,14 +2824,17 @@ async fn run_started_provider_job(
         };
         let mut prior = Vec::new();
         for turn in context.turns.into_iter().rev() {
-            let mut attachments: Vec<_> = turn
-                .attachments
-                .into_iter()
-                .rev()
-                .take(images_left)
-                .collect();
+            let mut attachments = Vec::new();
+            for (attachment, bytes) in turn.attachments.iter().zip(&turn.attachment_bytes).rev() {
+                if images_left > 0 && *bytes <= bytes_left {
+                    attachments.push(*attachment);
+                    images_left -= 1;
+                    bytes_left -= bytes;
+                } else {
+                    images_omitted = true;
+                }
+            }
             attachments.reverse();
-            images_left = images_left.saturating_sub(attachments.len());
             prior.push((turn.text, attachments, turn.answer));
         }
         for (text, attachments, answer) in prior.into_iter().rev() {
@@ -2846,7 +2869,7 @@ async fn run_started_provider_job(
         None => {
             let failed = FinalResult {
                 summary: Some("the request exceeds the model's context window".to_owned()),
-                code: Some("context_window_exceeded".to_owned()),
+                code: Some(CONTEXT_WINDOW_EXCEEDED.to_owned()),
                 goal_reached: Some(false),
                 value: None,
             };
@@ -2862,6 +2885,12 @@ async fn run_started_provider_job(
         }
     };
 
+    conversation.response_format = response_format.map(Into::into);
+    if images_omitted {
+        conversation
+            .messages
+            .insert(0, ChatMessage::system(IMAGES_OMITTED_NOTICE));
+    }
     if context_omitted {
         conversation
             .messages
@@ -4151,7 +4180,7 @@ async fn stop_tool_loop(
     } else {
         JobFinalization::Failed(FinalResult {
             summary: Some(stop.to_string()),
-            code: None,
+            code: Some(TOOL_LOOP_STOPPED.to_owned()),
             goal_reached: Some(false),
             value: last.map(provider_execution::result_value),
         })
@@ -4256,7 +4285,7 @@ async fn complete_provider_job(
                 summary: Some(format!(
                     "the Provider answered, but the Job cannot complete: {violation}"
                 )),
-                code: None,
+                code: Some(COMPLETION_REFUSED.to_owned()),
                 goal_reached: Some(false),
                 value: Some(provider_execution::result_value(result)),
             });
@@ -4504,23 +4533,32 @@ pub(crate) async fn settle_provider_error(
     request: RequestNumber,
     error: ProviderExecutionError,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-    let unknown = matches!(
-        error,
+    let failure = match &error {
+        ProviderExecutionError::Rejected { failure } => Some((
+            PROVIDER_REJECTED,
+            Some(serde_json::json!({
+                "status_code": failure.status_code,
+                "provider_code": failure.provider_code,
+                "request_id": failure.request_id,
+                "retryable": failure.retryable,
+            })),
+        )),
+        ProviderExecutionError::NotDelivered { .. } => Some((NOT_DELIVERED, None)),
+        ProviderExecutionError::Build { .. } => Some((BUILD_FAILED, None)),
         ProviderExecutionError::Unknown { .. }
-            | ProviderExecutionError::Incomplete { .. }
-            | ProviderExecutionError::Interrupted { .. }
-            | ProviderExecutionError::Stopped { .. }
-            | ProviderExecutionError::OutputPersistence { .. }
-    );
-    let settlement = if unknown {
-        JobFinalization::Unknown
-    } else {
-        JobFinalization::Failed(FinalResult {
+        | ProviderExecutionError::Incomplete { .. }
+        | ProviderExecutionError::Interrupted { .. }
+        | ProviderExecutionError::Stopped { .. }
+        | ProviderExecutionError::OutputPersistence { .. } => None,
+    };
+    let settlement = match failure {
+        None => JobFinalization::Unknown,
+        Some((code, value)) => JobFinalization::Failed(FinalResult {
             summary: Some(error.to_string()),
-            code: None,
+            code: Some(code.to_owned()),
             goal_reached: Some(false),
-            value: None,
-        })
+            value,
+        }),
     };
     let result = match database.finalize_job(job, settlement.clone()).await {
         Ok(result) => result,

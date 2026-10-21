@@ -143,7 +143,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 23, with no migration;
+cancelled if reopened without a claim. The stored format is 24, with no migration;
 recreate data directories made by earlier versions.
 
 ## Sign a browser in
@@ -165,6 +165,47 @@ hours, only one session exists at a time, and it ends with the OCG process.
 - `GET /api/v1/tool-stats` — report aggregated tool execution statistics per tool name: `name`, `admitted`, `refused_arguments`, `completed`, `failed`, `open`, `duration_us_mean` and `duration_us_max`.
 - `GET /api/v1/usage/summary` — report total token usage and request count, optionally filtered by `from_us`, `until_us` or `agent` (a `profile:N` id). There is no model filter. Each row names its `agent` as `profile:N` or `null`, and its `provider` as `llm_provider:N`.
 - `POST /api/v1/provider-models` — test a Provider connection and list its models. Uses the same authentication as `/api/v1/profiles` (browser session with CSRF, or bearer token). Send `{endpoint, credential?}` or `{endpoint, credential_ref?}` to use a saved credential. Returns `{models: [{id, context_window}]}` sorted by id, with `null` for unknown context windows. Refusals are `provider_unreachable`, `provider_rejected` (with `status_code` and the Provider's message), or `models_not_listed`; the latter allows manual model entry. HTTPS only, no redirects, 30 s timeout and a 1 MiB response limit. Credentials are never saved or returned.
+
+## External Job API
+
+Use `Authorization: Bearer <token>` for every request. Upload each image with
+`POST /api/v1/attachments` using `{mime, data_base64, display_name?}`, then submit
+`POST /api/v1/jobs` with an `Idempotency-Key` of 16–128 characters. The JSON body
+names `executor` and `objective`, image `attachments` by id, and
+`agent_profile`/`llm_profile`. For a new conversation, omitting `llm_profile`
+uses the named Agent's `default_model`.
+
+Optional `response_format` accepts `{"type":"json_object"}` or
+`{"type":"json_schema","json_schema":{"name":"answer","schema":{},"strict":true}}`;
+`strict` is optional and the name is 1–64 letters, digits, underscores or hyphens.
+The format applies to its own turn only; model text is returned verbatim in
+`result.value.text`. Optional `keep_open` defaults to true; set it to false for
+a one-shot conversation. A follow-up names `conversation` and cannot set
+`keep_open`. A closed one-shot cannot be retried: submit again with a new key.
+
+After `202`, or if the reply is lost, repeat the same submission with the same
+key or query `GET /api/v1/admissions` with that `Idempotency-Key`. Poll
+`GET /api/v1/jobs/{job}` until `job.settlement.state` is `completed`, `failed`,
+`cancelled` or `unknown`, then read the envelope's `result` and `usage`.
+`result` is the newest result output or null; `usage` is null for a conversation
+id or a Job without request events. Usage sums requests and complete requests,
+input/output, cache-read/cache-write and reasoning tokens; `truncated` reports
+the scan limit. Failed results have a machine-readable `code`:
+`provider_rejected`, `not_delivered`, `build_failed`, `context_window_exceeded`,
+`not_sent`, `tool_loop_stopped`, `completion_refused` or `internal`.
+Provider rejections expose `status_code`, `provider_code`, `request_id` and
+`retryable` in `result.value`, without the provider response body.
+
+OCG binds only `127.0.0.1` and accepts Host only as `127.0.0.1:PORT` or
+`localhost:PORT`. A reverse proxy must terminate TLS, set Host to
+`127.0.0.1:$OCG_CONTROL_PORT`, remove `Origin` and `Sec-Fetch-Site`, allow request
+bodies of at least 6 MiB for image uploads, avoid buffering `/events`, and limit
+who may connect. The bearer token travels only over TLS outside loopback.
+
+Images are PNG, JPEG, GIF or WEBP checked by signature: at most 4 MiB each,
+8 images and 16 MiB per provider request. The newest earlier images that fit are
+sent; a system notice discloses omitted images, and every image remains in stored
+history. Submit bodies are at most 64 KiB and objectives at most 32 KiB.
 
 ## Commands
 

@@ -176,6 +176,9 @@ pub struct ChatConversation {
     pub tool_choice: Option<ToolChoiceWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
+    /// The requested response shape for this turn; model text is kept verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormatWire>,
 }
 
 impl ChatConversation {
@@ -1008,7 +1011,7 @@ pub struct NamedFunctionWire {
 }
 
 /// OpenAI `response_format`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResponseFormatWire {
     Text {},
@@ -1016,21 +1019,41 @@ pub enum ResponseFormatWire {
     JsonSchema { json_schema: JsonSchemaWire },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct JsonSchemaWire {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict: Option<bool>,
 }
 
+impl From<crate::persistence::ResponseFormat> for ResponseFormatWire {
+    fn from(format: crate::persistence::ResponseFormat) -> Self {
+        match format {
+            crate::persistence::ResponseFormat::JsonObject => Self::JsonObject {},
+            crate::persistence::ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => Self::JsonSchema {
+                json_schema: JsonSchemaWire {
+                    name: Some(name),
+                    schema: Some(schema),
+                    strict,
+                    description: None,
+                },
+            },
+        }
+    }
+}
+
 impl ResponseFormatWire {
-    fn validate(&self) -> Result<(), TransportError> {
+    pub(crate) fn validate(&self) -> Result<(), TransportError> {
         match self {
             ResponseFormatWire::Text {} | ResponseFormatWire::JsonObject {} => Ok(()),
             ResponseFormatWire::JsonSchema { json_schema } => {

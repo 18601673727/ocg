@@ -159,6 +159,14 @@ pub(super) fn entry_json(seq: u32, entry: &crate::persistence::TurnEntry) -> Val
             json!({ "kind": "retry_of", "turn": turn.to_string(), "by": actor_json(by) })
         }
         Entry::Iteration { n } => json!({ "kind": "iteration", "n": n }),
+        Entry::ResponseFormat { format } => match format {
+            crate::persistence::ResponseFormat::JsonObject => {
+                json!({"kind": "response_format", "type": "json_object"})
+            }
+            crate::persistence::ResponseFormat::JsonSchema { name, .. } => {
+                json!({"kind": "response_format", "type": "json_schema", "name": name})
+            }
+        },
     };
     value["seq"] = json!(seq);
     value["at_us"] = json!(entry.at.as_unix_micros());

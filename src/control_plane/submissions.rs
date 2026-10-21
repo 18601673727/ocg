@@ -44,10 +44,12 @@ use super::{
 };
 use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
+use crate::openai_compatible::ResponseFormatWire;
 use crate::openai_compatible::image::MAX_REQUEST_IMAGES;
 use crate::orchestration::execution_runtime::{
     AttachmentImageError, ExecutionRuntimeError, attachment_images,
 };
+use crate::persistence::ResponseFormat;
 use crate::persistence::{
     AttachmentId, AttachmentOrigin, ConfigBody, ConfigRecord, ExecutionConfiguration, ExecutorId,
     JobId, ModelCapability, NewSubmission, ProfileId, ProjectId, RequestFingerprint, SubmissionKey,
@@ -177,12 +179,12 @@ const TOOLS_NOT_SUPPORTED: Refusal = Refusal::new(
 const TOO_MANY_IMAGES: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "too_many_images",
-    "a conversation may carry at most 8 images; nothing was submitted",
+    "a turn may carry at most 8 images; nothing was submitted",
 );
 const IMAGES_TOO_LARGE: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "images_too_large",
-    "the conversation's images exceed 16 MiB together, or one exceeds 4 MiB; nothing was submitted",
+    "the turn's images exceed 16 MiB together, or one exceeds 4 MiB; nothing was submitted",
 );
 const ATTACHMENT_NOT_AN_IMAGE: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -219,6 +221,8 @@ pub(super) struct JobRequest {
     project: Option<ProjectId>,
     /// Image Attachments sent with the objective, in order.
     attachments: Vec<AttachmentId>,
+    response_format: Option<ResponseFormat>,
+    keep_open: bool,
 }
 
 #[derive(Deserialize)]
@@ -238,6 +242,10 @@ struct WireRequest {
     project: Option<String>,
     #[serde(default)]
     attachments: Vec<String>,
+    #[serde(default)]
+    response_format: Option<ResponseFormatWire>,
+    #[serde(default)]
+    keep_open: Option<bool>,
 }
 
 /// Text that may be stored: no control character but tab, carriage return
@@ -259,6 +267,14 @@ impl JobRequest {
     /// fields, none repeated, each within its bounds.
     pub(super) fn parse(body: &[u8]) -> Result<Self, Refusal> {
         let wire: WireRequest = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
+        let shape: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
+        if shape
+            .pointer("/response_format/json_schema/description")
+            .is_some()
+            || (wire.conversation.is_some() && shape.get("keep_open").is_some())
+        {
+            return Err(INVALID_BODY);
+        }
         let llm_profile = wire
             .llm_profile
             .as_deref()
@@ -278,6 +294,32 @@ impl JobRequest {
             .map(|prev| identity(prev, "job:").ok_or(INVALID_BODY))
             .transpose()?
             .map(JobId::new);
+        let response_format = wire
+            .response_format
+            .map(|format| {
+                format.validate().map_err(|_| INVALID_BODY)?;
+                match format {
+                    ResponseFormatWire::JsonObject {} => Ok(ResponseFormat::JsonObject),
+                    ResponseFormatWire::JsonSchema { json_schema } => {
+                        let name = json_schema.name.ok_or(INVALID_BODY)?;
+                        if name.is_empty()
+                            || name.len() > 64
+                            || !name
+                                .bytes()
+                                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                        {
+                            return Err(INVALID_BODY);
+                        }
+                        Ok(ResponseFormat::JsonSchema {
+                            name,
+                            schema: json_schema.schema.ok_or(INVALID_BODY)?,
+                            strict: json_schema.strict,
+                        })
+                    }
+                    ResponseFormatWire::Text {} => Err(INVALID_BODY),
+                }
+            })
+            .transpose()?;
         let project = wire
             .project
             .as_deref()
@@ -313,6 +355,8 @@ impl JobRequest {
             conversation,
             project,
             attachments,
+            response_format,
+            keep_open: wire.keep_open.unwrap_or(true),
         })
     }
 
@@ -355,6 +399,13 @@ impl JobRequest {
         if let Some(project) = self.project {
             context.update(&[5]);
             context.update(&project.get().to_le_bytes());
+        }
+        if let Some(format) = &self.response_format {
+            context.update(&[6]);
+            context.update(&crate::storage::encode_response_format(format));
+        }
+        if !self.keep_open {
+            context.update(&[7]);
         }
         RequestFingerprint::from_digest(sha256(context))
     }
@@ -884,23 +935,30 @@ async fn admit(
     let admitted = match request.conversation {
         Some(conversation) => shared
             .database
-            .append(conversation, first, Some(configuration), submission)
+            .append_with_format(
+                conversation,
+                first,
+                Some(configuration),
+                submission,
+                request.response_format,
+            )
             .await
             .map(|appended| appended.turn),
         None => shared
             .database
-            .open_conversation(
+            .open_conversation_with_format(
                 None,
                 crate::persistence::ConversationSpec {
                     name: request.name.clone(),
                     agent: request.agent_profile.map(Into::into),
                     project,
                     origin: crate::persistence::Origin::User,
-                    keep_open: true,
+                    keep_open: request.keep_open,
                 },
                 first,
                 configuration,
                 submission,
+                request.response_format,
             )
             .await
             .map(|(_, appended)| appended.turn),
@@ -1131,7 +1189,15 @@ async fn normalize(database: &DatabaseHandle, request: &mut JobRequest) -> Resul
                 .llm_profile;
         }
     } else if request.llm_profile.get() == 0 {
-        return Err(INVALID_BODY);
+        let agent = request.agent_profile.ok_or(INVALID_BODY)?;
+        let agent = match database.config(agent.into()).await? {
+            Some(ConfigRecord {
+                body: ConfigBody::Agent(agent),
+                ..
+            }) => agent,
+            _ => return Err(AGENT_PROFILE_NOT_FOUND),
+        };
+        request.llm_profile = agent.default_model.ok_or(INVALID_BODY)?.into();
     }
     Ok(())
 }
@@ -1411,6 +1477,127 @@ pub(super) mod tests {
                 String::from_utf8_lossy(&refused[..refused.len().min(120)])
             );
         }
+    }
+
+    #[test]
+    fn response_formats_are_strict_canonical_and_sent_only_when_named() {
+        use crate::openai_compatible::{ChatConversation, ChatMessage};
+        use crate::persistence::LlmParameters;
+        use crate::provider_execution::request_body;
+        let base = json!({"llm_profile":"profile:3", "executor":"executor:2", "objective":"o"});
+        let parse = |format: Value| {
+            let mut body = base.clone();
+            body["response_format"] = format;
+            JobRequest::parse(&serde_json::to_vec(&body).expect("JSON"))
+        };
+        let plain = JobRequest::parse(&serde_json::to_vec(&base).expect("JSON")).expect("plain");
+        let object = parse(json!({"type":"json_object"})).expect("object");
+        let schema = json!({"type":"json_schema", "json_schema":{
+            "name":"answer_1", "schema":{"type":"object", "properties":{"z":{"type":"number"},"a":{"type":"string"}}}, "strict":true
+        }});
+        let formatted = parse(schema.clone()).expect("schema");
+        assert_ne!(plain.fingerprint(), object.fingerprint());
+        assert_ne!(plain.fingerprint(), formatted.fingerprint());
+        let respelled = parse(serde_json::from_str(r#"{"json_schema":{"strict":true,"schema":{"properties":{"a":{"type":"string"},"z":{"type":"number"}},"type":"object"},"name":"answer_1"},"type":"json_schema"}"#).expect("JSON")).expect("same schema");
+        assert_eq!(formatted.fingerprint(), respelled.fingerprint());
+        for invalid in [
+            json!({"type":"text"}),
+            json!({"type":"json_schema", "json_schema":{"name":"a"}}),
+            json!({"type":"json_schema", "json_schema":{"schema":{}}}),
+            json!({"type":"json_schema", "json_schema":{"name":"bad name", "schema":{}}}),
+            json!({"type":"json_schema", "json_schema":{"name":"a", "schema":{}, "description":null}}),
+            json!({"type":"json_object", "unknown":true}),
+        ] {
+            assert_eq!(parse(invalid).err(), Some(INVALID_BODY));
+        }
+        let mut conversation = ChatConversation {
+            messages: vec![ChatMessage::user("o")],
+            ..Default::default()
+        };
+        assert!(
+            request_body("model", &LlmParameters::default(), &conversation)
+                .expect("body")
+                .get("response_format")
+                .is_none()
+        );
+        conversation.response_format = formatted.response_format.map(Into::into);
+        assert_eq!(
+            request_body("model", &LlmParameters::default(), &conversation).expect("body")["response_format"],
+            schema
+        );
+    }
+
+    #[test]
+    fn new_conversations_use_the_agents_default_model() {
+        use crate::database::DatabaseWorker;
+        use crate::persistence::{AgentConfig, LlmTransport, NewConfig, NewExecutor};
+        use crate::test_support::{data_directory, execution_configuration, wait};
+        let (_root, directory) = data_directory("submissions", "default-model");
+        let worker = DatabaseWorker::start(&directory).expect("start");
+        let handle = worker.handle();
+        let configuration = execution_configuration(&handle);
+        let executor = wait(handle.create_executor(NewExecutor {
+            name: "local".into(),
+            concurrency_limit: std::num::NonZeroU32::MIN,
+            llm_transports: [LlmTransport::OpenAiChatCompletions].into(),
+        }))
+        .expect("executor");
+        let agent = wait(handle.create_config(NewConfig {
+            name: "agent".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                models: vec![configuration.llm_profile.into()],
+                default_model: Some(configuration.llm_profile.into()),
+                ..Default::default()
+            }),
+        }))
+        .expect("agent");
+        let body = json!({"agent_profile":ProfileId::from(agent).to_string(), "executor":executor.to_string(), "objective":"o"});
+        let request =
+            JobRequest::parse(&serde_json::to_vec(&body).expect("JSON")).expect("request");
+        let fingerprint = request.fingerprint();
+        let job = store_fixture(
+            &handle,
+            request,
+            NewSubmission {
+                key: digest_key(b"default-model-0001"),
+                fingerprint,
+            },
+        );
+        assert_eq!(
+            wait(handle.job_configuration(job))
+                .expect("read")
+                .expect("configured")
+                .llm_profile,
+            configuration.llm_profile
+        );
+        assert_eq!(
+            wait(handle.submission(digest_key(b"default-model-0001")))
+                .expect("read")
+                .expect("submission")
+                .fingerprint,
+            fingerprint
+        );
+        wait(handle.update_config(
+            agent,
+            NewConfig {
+                name: "agent".into(),
+                body: ConfigBody::Agent(AgentConfig {
+                    models: vec![configuration.llm_profile.into()],
+                    ..Default::default()
+                }),
+            },
+        ))
+        .expect("clear default");
+        let mut request =
+            JobRequest::parse(&serde_json::to_vec(&body).expect("JSON")).expect("request");
+        assert_eq!(wait(normalize(&handle, &mut request)), Err(INVALID_BODY));
+        assert_eq!(INVALID_BODY.status, StatusCode::BAD_REQUEST);
+        request.agent_profile = Some(configuration.llm_profile);
+        assert_eq!(
+            wait(normalize(&handle, &mut request)),
+            Err(AGENT_PROFILE_NOT_FOUND)
+        );
+        worker.shutdown().expect("shutdown");
     }
 
     #[test]

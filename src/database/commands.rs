@@ -129,6 +129,7 @@ pub(super) enum Command {
         first: Entry,
         configuration: ExecutionConfiguration,
         submission: Option<NewSubmission>,
+        format: Option<crate::persistence::ResponseFormat>,
         reply: Reply<(JobId, Appended)>,
     },
     Append {
@@ -136,6 +137,7 @@ pub(super) enum Command {
         entry: Entry,
         freeze: Option<ExecutionConfiguration>,
         submission: Option<NewSubmission>,
+        format: Option<crate::persistence::ResponseFormat>,
         reply: Reply<Appended>,
     },
     StopTurn {
@@ -426,19 +428,29 @@ impl Command {
                 first,
                 configuration,
                 submission,
+                format,
                 reply,
             } => run(database, operation, commit, Kind::Open, reply, |batch| {
-                batch.open_conversation(parent, spec, first, configuration, submission, Vec::new())
+                batch.open_conversation_with_format(
+                    parent,
+                    spec,
+                    first,
+                    configuration,
+                    submission,
+                    Vec::new(),
+                    format,
+                )
             }),
             Self::Append {
                 conversation,
                 entry,
                 freeze,
                 submission,
+                format,
                 reply,
             } => run(database, operation, commit, Kind::Append, reply, |batch| {
                 batch.require_user_conversation(conversation)?;
-                batch.append(conversation, entry, freeze, submission, false)
+                batch.append_with_format(conversation, entry, freeze, submission, false, format)
             }),
             Self::StopTurn {
                 conversation,
@@ -679,9 +691,16 @@ impl Command {
             | Self::CreateSubmittedJob { job, .. } => {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
-            Self::Open { first, .. } | Self::Append { entry: first, .. } => {
-                byte_count(format!("{first:?}").len())
-            }
+            Self::Open { first, format, .. }
+            | Self::Append {
+                entry: first,
+                format,
+                ..
+            } => byte_count(format!("{first:?}").len()).saturating_add(
+                format.as_ref().map_or(0, |format| {
+                    byte_count(storage::encode_response_format(format).len())
+                }),
+            ),
             Self::StopTurn { .. }
             | Self::Close { .. }
             | Self::Hold { .. }

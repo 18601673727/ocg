@@ -103,7 +103,8 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
             Entry::AgentMessage { .. }
             | Entry::Notice { .. }
             | Entry::Decision { .. }
-            | Entry::Iteration { .. } => {}
+            | Entry::Iteration { .. }
+            | Entry::ResponseFormat { .. } => {}
         }
     }
     let mut executions = BTreeMap::new();

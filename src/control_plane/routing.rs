@@ -376,9 +376,9 @@ pub(super) async fn respond(
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,
         Route::Job(job) => {
-            let record = database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
+            let details = database.job_details(job).await?.ok_or(JOB_NOT_FOUND)?;
             Ok(Reply::ok(
-                json!({"api_version": API_VERSION, "job": job_json(&record)?}),
+                json!({"api_version": API_VERSION, "job": job_json(&details.job)?, "result": details.result.as_ref().map(output_json), "usage": details.usage}),
             ))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,

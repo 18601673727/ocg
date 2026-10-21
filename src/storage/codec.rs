@@ -530,6 +530,21 @@ impl Enc {
             NoticeEvent::RecurrenceHalted => self.u8(10),
         }
     }
+    pub(super) fn response_format(&mut self, format: &ResponseFormat) {
+        match format {
+            ResponseFormat::JsonObject => self.u8(0),
+            ResponseFormat::JsonSchema {
+                name,
+                schema,
+                strict,
+            } => {
+                self.u8(1);
+                self.str(name);
+                self.str(&schema.to_string());
+                self.opt(strict, |e, v| e.bool(*v));
+            }
+        }
+    }
     pub(super) fn entry(&mut self, entry: &Entry) {
         match entry {
             Entry::UserMessage { text, attachments } => {
@@ -572,10 +587,31 @@ impl Enc {
                 self.u8(5);
                 self.u64(*n);
             }
+            Entry::ResponseFormat { format } => {
+                self.u8(6);
+                self.response_format(format);
+            }
         }
     }
 }
+pub(crate) fn encode_response_format(format: &ResponseFormat) -> Vec<u8> {
+    let mut e = Enc(Vec::new());
+    e.response_format(format);
+    e.0
+}
 impl Dec<'_> {
+    fn response_format(&mut self) -> DecodeResult<ResponseFormat> {
+        Ok(match self.u8()? {
+            0 => ResponseFormat::JsonObject,
+            1 => ResponseFormat::JsonSchema {
+                name: self.str()?,
+                schema: serde_json::from_str(&self.str()?)
+                    .map_err(|_| StorageError::corrupted("invalid response schema"))?,
+                strict: self.opt(Self::bool)?,
+            },
+            _ => return Err(StorageError::corrupted("invalid response format")),
+        })
+    }
     pub(super) fn call_ref(&mut self) -> DecodeResult<crate::persistence::ToolCallRef> {
         Ok(crate::persistence::ToolCallRef {
             job: JobId::new(self.u64()?),
@@ -708,6 +744,9 @@ impl Dec<'_> {
                 by: self.actor()?,
             },
             5 => Entry::Iteration { n: self.u64()? },
+            6 => Entry::ResponseFormat {
+                format: self.response_format()?,
+            },
             _ => return Err(StorageError::corrupted("invalid entry")),
         })
     }

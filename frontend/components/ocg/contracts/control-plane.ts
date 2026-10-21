@@ -514,7 +514,7 @@ export function decodeConversationTurns(input: unknown, conversationId: string) 
     const entries = listOf(turn.entries, `${path}.entries`, (input, path) => {
       const entry = record(input, path);
       const kind = string(entry.kind, `${path}.kind`);
-      if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
+      if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
       return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path, "attachment:")), at_us: integer(entry.at_us, `${path}.at_us`) };
     });
     const userEntries = entries.filter(entry => entry.kind === "user_message" || entry.kind === "agent_message");

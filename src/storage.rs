@@ -34,8 +34,8 @@ use crate::openai_compatible::{
 use crate::persistence::{
     Actor, Appended, ApprovalDecision, ApprovalRecord, ConversationAction, ConversationSpec, Entry,
     EntryKind, JobKind, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind,
-    PlanSource, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase, StopProof, TurnEntry,
-    TurnExecution,
+    PlanSource, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase, ResponseFormat,
+    StopProof, TurnEntry, TurnExecution,
 };
 use crate::persistence::{
     AgentBehavior, AgentConfig, ApproveClass, AttachmentId, AttachmentOrigin, AttachmentRecord,
@@ -76,6 +76,7 @@ pub(crate) use batch::{
     Batch, BatchError, BatchFailure, BatchOutcome, Commit, CompactFailure, Probe, allocated_bytes,
     compact, persist_staged, run_batch_declinable, run_batch_with,
 };
+pub(crate) use codec::encode_response_format;
 use codec::{
     Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_CONVERSATION, TAG_JOB,
     TAG_JOB_STATE, TAG_OUTPUT, TAG_PROJECT, TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
@@ -99,18 +100,18 @@ pub(crate) use reads::{
     read_conversation_children, read_has_decider,
 };
 pub(crate) use reads::{
-    TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,
-    read_turn_execution,
+    JobDetails, UnresolvedExecution, content_available, probe_committed, queue_counts,
+    read_attachment, read_attachment_inputs, read_attachments, read_children,
+    read_compatible_executors, read_config, read_configs, read_conversations, read_execution_pool,
+    read_execution_pools, read_executor, read_executors, read_job, read_job_compatible_executors,
+    read_job_configuration, read_job_details, read_job_input, read_job_input_for_job, read_jobs,
+    read_latest_output, read_occupancy, read_outputs, read_pending_jobs, read_pool_binding,
+    read_project, read_projects, read_retries, read_submission, read_tool_evidence,
+    read_tool_stats, read_unresolved_executions, read_usage_summary, unneeded_content,
 };
 pub(crate) use reads::{
-    UnresolvedExecution, content_available, probe_committed, queue_counts, read_attachment,
-    read_attachment_inputs, read_attachments, read_children, read_compatible_executors,
-    read_config, read_configs, read_conversations, read_execution_pool, read_execution_pools,
-    read_executor, read_executors, read_job, read_job_compatible_executors, read_job_configuration,
-    read_job_input, read_job_input_for_job, read_jobs, read_latest_output, read_occupancy,
-    read_outputs, read_pending_jobs, read_pool_binding, read_project, read_projects, read_retries,
-    read_submission, read_tool_evidence, read_tool_stats, read_unresolved_executions,
-    read_usage_summary, unneeded_content,
+    TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,
+    read_turn_execution,
 };
 pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow, usage_agent};
 use rows::{

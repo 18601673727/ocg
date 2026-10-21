@@ -15290,6 +15290,52 @@ mod requests_and_tool_loop {
         }
 
         #[test]
+        fn job_api_returns_the_answer_and_request_usage() {
+            use crate::control_plane::{ControlPlane, ControlPlaneConfig};
+            use std::io::{Read, Write};
+            use std::net::TcpStream;
+            let (_root, directory) = data_directory("image-job-api");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            let answer = "A transparent pixel.";
+            settle_with_image(&handle, run, Ok(answering(answer, (85, 7))))
+                .0
+                .expect("settled");
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Stored,
+            )
+            .expect("runtime");
+            let token = "Image-Job-Api-Token_0123456789.abcdefghijk~";
+            let control = ControlPlane::start(
+                ControlPlaneConfig::new(0, token).expect("config"),
+                handle,
+                runtime.scheduler(),
+                directory,
+            )
+            .expect("listener");
+            let address = control.address();
+            let mut socket = TcpStream::connect(address).expect("connect");
+            socket.set_read_timeout(Some(BOUND)).expect("timeout");
+            write!(socket, "GET /api/v1/jobs/{} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n", run.job).expect("request");
+            let mut response = String::new();
+            socket.read_to_string(&mut response).expect("response");
+            assert!(response.starts_with("HTTP/1.1 200"));
+            let body: Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").expect("body").1)
+                    .expect("JSON");
+            assert_eq!(body["result"]["value"]["text"], answer);
+            assert!(body["result"]["code"].is_null());
+            assert_eq!(body["usage"]["requests"], 1);
+            assert_eq!(body["usage"]["input_tokens"], 85);
+            wait(control.stop()).expect("stop");
+            wait(runtime.shutdown()).expect("shutdown runtime");
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
         fn an_answer_about_an_image_completes_the_job() {
             let (_root, directory) = data_directory("image-answer");
             let worker = DatabaseWorker::start(&directory).expect("start database");
@@ -15479,6 +15525,35 @@ mod requests_and_tool_loop {
                     path.display()
                 );
             }
+        }
+
+        #[test]
+        fn provider_rejection_results_have_a_code_and_status() {
+            let (_root, directory) = data_directory("image-rejection-code");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let (_, llm) = llm_setup(&handle, "model-a");
+            let run = local_run(&handle, llm);
+            settle_with_image(
+                &handle,
+                run,
+                Err(ProviderFailure {
+                    message: "unsupported image".into(),
+                    status_code: Some(400),
+                    response_body: Some("private provider body".into()),
+                    ..Default::default()
+                }),
+            )
+            .0
+            .expect("settled");
+            let output = wait(handle.latest_output(run.job))
+                .expect("read")
+                .expect("result");
+            assert_eq!(output.code.as_deref(), Some("provider_rejected"));
+            let value = output.value.expect("value");
+            assert_eq!(value["status_code"], 400);
+            assert!(value.get("response_body").is_none());
+            worker.shutdown().expect("shutdown");
         }
 
         #[test]
@@ -15760,7 +15835,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 23);
+            assert_eq!(crate::storage::FORMAT_VERSION, 24);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");
@@ -16863,6 +16938,169 @@ mod requests_and_tool_loop {
                 "the replacement gets nothing"
             );
             assert_eq!(wait(handle.attachments(None, 10)).expect("list").len(), 1);
+            worker.shutdown().expect("shutdown");
+        }
+
+        #[test]
+        fn earlier_images_keep_the_newest_eight_and_disclose_omission() {
+            use crate::orchestration::execution_runtime::{
+                IMAGES_OMITTED_NOTICE,
+                provider_seam::{self, Response},
+            };
+            use crate::persistence::{
+                ConversationSpec, Entry, FinalResult, JobFinalization, Origin,
+            };
+            let (_root, directory) = data_directory("prior-image-limit");
+            let worker = DatabaseWorker::start(&directory).expect("start");
+            let handle = worker.handle();
+            let endpoint = "https://ingestion-images.invalid/v1";
+            let provider = wait(handle.create_config(NewConfig {
+                name: "images".into(),
+                body: ConfigBody::Connection(ConnectionConfig {
+                    protocol: OPENAI,
+                    endpoint: Some(endpoint.into()),
+                    credential_ref: None,
+                }),
+            }))
+            .expect("provider")
+            .into();
+            let mut config =
+                llm_config("model-a", &[ModelCapability::Chat, ModelCapability::Vision]);
+            config.context_window = Some(65_536);
+            let llm = llm_profile(&handle, provider, config);
+            let executor = executor(&handle, "vision", &[OPENAI]).expect("executor");
+            let images: Vec<_> = (0..9)
+                .map(|n| {
+                    let mut content = png();
+                    content.push(n);
+                    attach(&handle, content, "image/png", &format!("{n}.png"))
+                })
+                .collect();
+            let (conversation, first) = wait(handle.open_conversation(
+                None,
+                ConversationSpec {
+                    name: None,
+                    agent: None,
+                    project: None,
+                    origin: Origin::User,
+                    keep_open: true,
+                },
+                Entry::UserMessage {
+                    text: "first".into(),
+                    attachments: images[..5].to_vec(),
+                },
+                llm_only(llm).expect("configuration"),
+                None,
+            ))
+            .expect("open");
+            let finish = |turn| {
+                wait(handle.claim_fixture(turn, executor)).expect("claim");
+                wait(handle.finalize_job(
+                    turn,
+                    JobFinalization::Completed(FinalResult {
+                        summary: Some("seen".into()),
+                        code: None,
+                        goal_reached: Some(true),
+                        value: None,
+                    }),
+                ))
+                .expect("finish");
+            };
+            finish(first.turn);
+            let second = wait(handle.append(
+                conversation,
+                Entry::UserMessage {
+                    text: "second".into(),
+                    attachments: images[5..].to_vec(),
+                },
+                None,
+                None,
+            ))
+            .expect("append");
+            finish(second.turn);
+            let current = wait(handle.append(
+                conversation,
+                Entry::UserMessage {
+                    text: "now compare".into(),
+                    attachments: Vec::new(),
+                },
+                None,
+                None,
+            ))
+            .expect("append")
+            .turn;
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let captured = seen.clone();
+            provider_seam::install(endpoint, move |conversation| {
+                conversation.validate().expect("bounded request");
+                *captured.lock().expect("lock") = Some(conversation.clone());
+                Response {
+                    gate: None,
+                    steps: answering("answer", (85, 7)),
+                }
+            });
+            let runtime = ExecutionRuntime::start(
+                handle.clone(),
+                crate::orchestration::execution_runtime::ClaimScope::Stored,
+            )
+            .expect("runtime");
+            let deadline = Instant::now() + BOUND;
+            while job_record(&handle, current).completed_at.is_none() {
+                assert!(Instant::now() < deadline, "settlement timeout");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let sent = seen.lock().expect("lock").clone().expect("sent");
+            let body = request_body("model-a", &LlmParameters::default(), &sent).expect("body");
+            let urls: Vec<_> = body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .filter_map(|p| p["image_url"]["url"].as_str())
+                .collect();
+            let expected: Vec<_> = (1..9)
+                .map(|n| {
+                    let mut content = png();
+                    content.push(n);
+                    data_url("image/png", &content)
+                })
+                .collect();
+            assert_eq!(urls, expected);
+            assert!(
+                body["messages"]
+                    .as_array()
+                    .expect("messages")
+                    .iter()
+                    .any(|m| m["role"] == "system" && m["content"] == IMAGES_OMITTED_NOTICE)
+            );
+            let recorded = wait(handle.provider_request(current, RequestNumber::FIRST))
+                .expect("read")
+                .expect("recorded request");
+            let recorded_ids: Vec<_> = recorded
+                .messages
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+                .filter_map(|part| part["image_url"]["url"]["attachment"].as_str())
+                .collect();
+            assert_eq!(
+                recorded_ids,
+                images[1..]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            );
+            let stored_images: Vec<_> = wait(handle.turn_entries(first.turn))
+                .expect("entries")
+                .into_iter()
+                .flat_map(|(_, entry)| match entry.entry {
+                    Entry::UserMessage { attachments, .. } => attachments,
+                    _ => Vec::new(),
+                })
+                .collect();
+            assert_eq!(stored_images, images[..5]);
+            wait(runtime.shutdown()).expect("shutdown runtime");
             worker.shutdown().expect("shutdown");
         }
 

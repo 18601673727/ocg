@@ -88,6 +88,27 @@ impl Batch {
         submission: Option<NewSubmission>,
         dependencies: Vec<(JobId, DependencyCondition)>,
     ) -> Result<(JobId, Appended), BatchError> {
+        self.open_conversation_with_format(
+            parent,
+            spec,
+            first,
+            configuration,
+            submission,
+            dependencies,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_conversation_with_format(
+        &mut self,
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        submission: Option<NewSubmission>,
+        dependencies: Vec<(JobId, DependencyCondition)>,
+        format: Option<ResponseFormat>,
+    ) -> Result<(JobId, Appended), BatchError> {
         if let Some(parent) = parent {
             let parent_row = self.require_job(parent)?;
             if !parent_row.kind.is_conversation() {
@@ -163,6 +184,7 @@ impl Batch {
             false,
             spec.name,
             dependencies,
+            format,
         )?;
         Ok((conversation, appended))
     }
@@ -264,7 +286,8 @@ impl Batch {
                 Entry::AgentMessage { .. }
                 | Entry::Notice { .. }
                 | Entry::Decision { .. }
-                | Entry::Iteration { .. } => {}
+                | Entry::Iteration { .. }
+                | Entry::ResponseFormat { .. } => {}
             }
             Ok((seq, first_user))
         })?;
@@ -299,6 +322,17 @@ impl Batch {
         submission: Option<NewSubmission>,
         event: bool,
     ) -> Result<Appended, BatchError> {
+        self.append_with_format(conversation, entry, freeze, submission, event, None)
+    }
+    pub(crate) fn append_with_format(
+        &mut self,
+        conversation: JobId,
+        entry: Entry,
+        freeze: Option<ExecutionConfiguration>,
+        submission: Option<NewSubmission>,
+        event: bool,
+        format: Option<ResponseFormat>,
+    ) -> Result<Appended, BatchError> {
         self.append_named(
             conversation,
             entry,
@@ -307,6 +341,7 @@ impl Batch {
             event,
             None,
             Vec::new(),
+            format,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -319,6 +354,7 @@ impl Batch {
         event: bool,
         name: Option<String>,
         dependencies: Vec<(JobId, DependencyCondition)>,
+        format: Option<ResponseFormat>,
     ) -> Result<Appended, BatchError> {
         if let Some(submission) = &submission
             && let Some(existing) = self.submission(submission.key)?
@@ -465,6 +501,9 @@ impl Batch {
         let user_message = matches!(entry, Entry::UserMessage { .. });
         let attention = event && matches!(entry, Entry::Notice { .. });
         let seq = self.insert_turn_input(turn, entry)?;
+        if let Some(format) = format {
+            self.insert_turn_input(turn, Entry::ResponseFormat { format })?;
+        }
         if user_message {
             let mut row = self.conversation(conversation)?;
             if row.loop_count != 0 {
@@ -826,7 +865,15 @@ impl Batch {
     }
     pub(crate) fn auto_close_check(&mut self, conversation: JobId) -> Result<bool, BatchError> {
         let row = self.require_job(conversation)?;
-        if row.parent_id.is_none()
+        let user_one_shot = matches!(
+            row.kind,
+            JobKind::Conversation {
+                origin: Origin::User,
+                keep_open: false,
+                ..
+            }
+        );
+        if (row.parent_id.is_none() && !user_one_shot)
             || !matches!(
                 row.kind,
                 JobKind::Conversation {
@@ -844,14 +891,19 @@ impl Batch {
         if !self
             .require_job_state(tip)?
             .outcome
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+            .is_some_and(|outcome| match outcome.kind {
+                OutcomeKind::Completed => true,
+                OutcomeKind::Failed | OutcomeKind::Cancelled => user_one_shot,
+                OutcomeKind::Unknown => false,
+            })
             || !self.live_children(conversation)?.is_empty()
-            || self.step(|tx| {
-                Ok(tx
-                    .open_table(USER_ENTRY_AT)?
-                    .get(conversation.get())?
-                    .is_some())
-            })?
+            || (!user_one_shot
+                && self.step(|tx| {
+                    Ok(tx
+                        .open_table(USER_ENTRY_AT)?
+                        .get(conversation.get())?
+                        .is_some())
+                })?)
         {
             return Ok(false);
         }
@@ -1829,6 +1881,49 @@ mod tests {
         );
         fixture.worker.shutdown().expect("shutdown");
     }
+    #[test]
+    fn user_one_shots_close_automatically_after_failure() {
+        let fixture = Fixture::new("user-one-shot");
+        for keep_open in [false, true] {
+            let (conversation, turn) = wait(fixture.database.open_conversation(
+                None,
+                ConversationSpec {
+                    name: None,
+                    agent: None,
+                    project: None,
+                    origin: Origin::User,
+                    keep_open,
+                },
+                message("objective"),
+                fixture.configuration,
+                None,
+            ))
+            .expect("open");
+            fixture.finish(turn.turn, OutcomeKind::Failed);
+            let record = wait(fixture.database.job(conversation))
+                .expect("read")
+                .expect("conversation");
+            assert_eq!(record.children_closed_at.is_some(), !keep_open);
+            assert_eq!(record.settled(), !keep_open);
+            if !keep_open {
+                let entries = wait(fixture.database.with_database(move |database| {
+                    let rx = reads::read(database)?;
+                    let bytes = rx
+                        .open_table(CONVERSATIONS)?
+                        .get(conversation.get())?
+                        .expect("conversation")
+                        .value()
+                        .to_vec();
+                    Ok(ConversationRow::decode(&bytes)?.closing)
+                }))
+                .expect("read")
+                .expect("closing");
+                assert_eq!(entries.by, Actor::Auto);
+            }
+        }
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
     #[test]
     fn auto_close_writes_only_closed_self_and_idle_close_settles_in_its_transaction() {
         let fixture = Fixture::new("close");

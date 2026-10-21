@@ -171,6 +171,17 @@ pub enum EntryKind {
     Decision,
     RetryOf,
     Iteration,
+    ResponseFormat,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResponseFormat {
+    JsonObject,
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        strict: Option<bool>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +209,11 @@ pub enum Entry {
     Iteration {
         n: u64,
     },
+    /// The requested response shape for this turn only. Retries without an
+    /// override use their chain root's format; follow-ups do not inherit it.
+    ResponseFormat {
+        format: ResponseFormat,
+    },
 }
 impl Entry {
     pub fn kind(&self) -> EntryKind {
@@ -208,6 +224,7 @@ impl Entry {
             Self::Decision { .. } => EntryKind::Decision,
             Self::RetryOf { .. } => EntryKind::RetryOf,
             Self::Iteration { .. } => EntryKind::Iteration,
+            Self::ResponseFormat { .. } => EntryKind::ResponseFormat,
         }
     }
 }

@@ -164,6 +164,109 @@ pub(crate) fn read_job(database: &Database, id: JobId) -> Result<Option<JobRecor
         .transpose()
 }
 
+#[derive(serde::Serialize, Default)]
+pub(crate) struct JobUsage {
+    requests: u64,
+    complete_requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+    truncated: bool,
+}
+
+pub(crate) struct JobDetails {
+    pub job: JobRecord,
+    pub result: Option<JobOutputRecord>,
+    pub usage: Option<JobUsage>,
+}
+
+pub(crate) fn read_job_details(
+    database: &Database,
+    id: JobId,
+) -> Result<Option<JobDetails>, StorageError> {
+    let rx = read(database)?;
+    let Some(row) = read_job_row(&rx, id)? else {
+        return Ok(None);
+    };
+    let conversation = row.kind.is_conversation();
+    let job = job_record(&rx, row)?;
+    let result = if conversation {
+        conversation_result(&rx, id)?
+    } else {
+        let mut result = None;
+        for entry in rx
+            .open_table(JOB_OUTPUTS)?
+            .range((id.get(), 0)..=(id.get(), u32::MAX))?
+            .rev()
+            .take(MAX_OBSERVATION_SCAN)
+        {
+            let (key, bytes) = entry?;
+            let output = decode_output(key.value(), bytes.value())?;
+            if output.kind == OutputKind::Result {
+                result = Some(output);
+                break;
+            }
+        }
+        result
+    };
+    let usage = if conversation {
+        None
+    } else {
+        let target = observations::frozen_llm_target(&rx, id)?;
+        let mut usage = JobUsage::default();
+        let mut events = Vec::new();
+        let mut scanned = 0;
+        for entry in rx
+            .open_table(REQUEST_EVENTS)?
+            .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
+            .rev()
+            .take(MAX_OBSERVATION_SCAN)
+        {
+            let (key, bytes) = entry?;
+            let (_, request, seq) = key.value();
+            let request = RequestNumber::new(request)
+                .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
+            scanned += 1;
+            events.push(super::rows::decode_request_event(
+                id,
+                request,
+                seq,
+                bytes.value(),
+            )?);
+            if seq == 1 {
+                events.reverse();
+                if let Some(sample) = observations::usage_sample_of(id, request, &target, &events) {
+                    usage.requests = usage.requests.saturating_add(1);
+                    usage.complete_requests = usage.complete_requests.saturating_add(u64::from(
+                        sample.usage == crate::token_usage::TokenUsageState::Complete,
+                    ));
+                    usage.input_tokens = usage
+                        .input_tokens
+                        .saturating_add(u64::from(sample.input.value().unwrap_or(0)));
+                    usage.output_tokens = usage
+                        .output_tokens
+                        .saturating_add(u64::from(sample.output.value().unwrap_or(0)));
+                    usage.cache_read_tokens = usage
+                        .cache_read_tokens
+                        .saturating_add(u64::from(sample.cache_read.value().unwrap_or(0)));
+                    usage.cache_write_tokens = usage
+                        .cache_write_tokens
+                        .saturating_add(u64::from(sample.cache_write.value().unwrap_or(0)));
+                    usage.reasoning_tokens = usage
+                        .reasoning_tokens
+                        .saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
+                }
+                events.clear();
+            }
+        }
+        usage.truncated = scanned == MAX_OBSERVATION_SCAN;
+        (scanned != 0).then_some(usage)
+    };
+    Ok(Some(JobDetails { job, result, usage }))
+}
+
 pub(crate) fn read_jobs(
     database: &Database,
     before: Option<JobId>,
@@ -1382,6 +1485,7 @@ pub struct ContextTurn {
     pub turn: JobId,
     pub text: String,
     pub attachments: Vec<AttachmentId>,
+    pub attachment_bytes: Vec<u64>,
     pub answer: Option<String>,
 }
 #[derive(Clone, Debug)]
@@ -1390,6 +1494,7 @@ pub struct TurnContext {
     pub omitted: bool,
     pub attention: String,
     pub tree_status: String,
+    pub response_format: Option<ResponseFormat>,
 }
 
 fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageError> {
@@ -1437,7 +1542,10 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
             chain.reverse();
             for current in &chain {
                 for (_, original) in turn_entries(rx, *current)? {
-                    if !matches!(original.entry, Entry::RetryOf { .. }) {
+                    if !matches!(
+                        original.entry,
+                        Entry::RetryOf { .. } | Entry::ResponseFormat { .. }
+                    ) {
                         text.push('\n');
                         text.push_str(&entry_text(rx, &original.entry)?);
                     }
@@ -1498,6 +1606,7 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
             }
         }
         Entry::Iteration { n } => format!("Iteration {n}"),
+        Entry::ResponseFormat { .. } => String::new(),
     })
 }
 pub(crate) fn read_turn_context(
@@ -1512,8 +1621,59 @@ pub(crate) fn read_turn_context(
         omitted: false,
         attention: String::new(),
         tree_status: String::new(),
+        response_format: None,
     };
     let own_entries = turn_entries(&rx, turn)?;
+    context.response_format = own_entries
+        .iter()
+        .rev()
+        .find_map(|(_, entry)| match &entry.entry {
+            Entry::ResponseFormat { format } => Some(format.clone()),
+            _ => None,
+        });
+    if context.response_format.is_none() {
+        let mut next = own_entries.iter().find_map(|(_, entry)| match entry.entry {
+            Entry::RetryOf { turn, .. } => Some(turn),
+            _ => None,
+        });
+        let mut visited = BTreeSet::from([turn]);
+        let mut remaining = MAX_OBSERVATION_SCAN;
+        let mut root_entries = Vec::new();
+        while let Some(current) = next {
+            if !visited.insert(current) {
+                break;
+            }
+            root_entries = rx
+                .open_table(TURN_INPUTS)?
+                .range((current.get(), 0)..=(current.get(), u32::MAX))?
+                .rev()
+                .take(remaining)
+                .map(|entry| {
+                    let (key, bytes) = entry?;
+                    Ok((key.value().1, TurnEntry::decode(bytes.value())?))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            if root_entries.last().is_none_or(|(seq, _)| *seq != 1) {
+                return Err(StorageError::corrupted(
+                    "retry format read limit reached or input missing",
+                ));
+            }
+            remaining -= root_entries.len();
+            next = root_entries
+                .iter()
+                .rev()
+                .find_map(|(_, entry)| match entry.entry {
+                    Entry::RetryOf { turn, .. } => Some(turn),
+                    _ => None,
+                });
+        }
+        context.response_format = root_entries
+            .iter()
+            .find_map(|(_, entry)| match &entry.entry {
+                Entry::ResponseFormat { format } => Some(format.clone()),
+                _ => None,
+            });
+    }
     let iteration_only = own_entries
         .iter()
         .any(|(_, entry)| matches!(entry.entry, Entry::Iteration { .. }))
@@ -1549,6 +1709,9 @@ pub(crate) fn read_turn_context(
             iteration_context
                 .is_none_or(|(first, previous)| Some(id) != previous || id == first || id == turn)
         }) {
+            if matches!(entry.entry, Entry::ResponseFormat { .. }) {
+                continue;
+            }
             if !text.is_empty() {
                 text.push('\n');
             }
@@ -1594,10 +1757,24 @@ pub(crate) fn read_turn_context(
             Some(_) => None,
             None => row.kind.previous(),
         };
+        let attachment_table = rx.open_table(ATTACHMENTS)?;
+        let attachment_bytes = attachments
+            .iter()
+            .map(|id| {
+                attachment_table
+                    .get(id.get())?
+                    .map(|bytes| {
+                        decode_attachment(bytes.value()).map(|attachment| attachment.byte_length)
+                    })
+                    .transpose()?
+                    .ok_or_else(|| StorageError::corrupted("turn attachment missing"))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
         context.turns.push(ContextTurn {
             turn: id,
             text,
             attachments,
+            attachment_bytes,
             answer,
         });
     }

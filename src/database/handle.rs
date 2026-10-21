@@ -576,6 +576,14 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) async fn job_details(
+        &self,
+        job: JobId,
+    ) -> Result<Option<storage::JobDetails>, DatabaseError> {
+        self.read(move |database| storage::read_job_details(database, job))
+            .await
+    }
+
     pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
         self.read(move |database| storage::read_job(database, job))
             .await
@@ -1074,12 +1082,25 @@ impl DatabaseHandle {
         configuration: ExecutionConfiguration,
         submission: Option<NewSubmission>,
     ) -> Result<(JobId, Appended), DatabaseError> {
+        self.open_conversation_with_format(parent, spec, first, configuration, submission, None)
+            .await
+    }
+    pub(crate) async fn open_conversation_with_format(
+        &self,
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        submission: Option<NewSubmission>,
+        format: Option<crate::persistence::ResponseFormat>,
+    ) -> Result<(JobId, Appended), DatabaseError> {
         self.submit(|reply| Command::Open {
             parent,
             spec,
             first,
             configuration,
             submission,
+            format,
             reply,
         })
         .await
@@ -1091,11 +1112,23 @@ impl DatabaseHandle {
         freeze: Option<ExecutionConfiguration>,
         submission: Option<NewSubmission>,
     ) -> Result<Appended, DatabaseError> {
+        self.append_with_format(conversation, entry, freeze, submission, None)
+            .await
+    }
+    pub(crate) async fn append_with_format(
+        &self,
+        conversation: JobId,
+        entry: Entry,
+        freeze: Option<ExecutionConfiguration>,
+        submission: Option<NewSubmission>,
+        format: Option<crate::persistence::ResponseFormat>,
+    ) -> Result<Appended, DatabaseError> {
         self.submit(|reply| Command::Append {
             conversation,
             entry,
             freeze,
             submission,
+            format,
             reply,
         })
         .await
