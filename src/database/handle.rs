@@ -1086,8 +1086,23 @@ impl DatabaseHandle {
         call: ToolCallRef,
         tool: crate::orchestration::job_tools::JobToolCall,
     ) -> Result<serde_json::Value, DatabaseError> {
-        self.submit(|reply| Command::ApplyJobTool { call, tool, reply })
-            .await
+        self.apply_job_tool_within(call, tool, usize::MAX).await
+    }
+    /// Applies a job tool; a result longer than `max_result_bytes` is
+    /// recorded as withheld, in the transaction of its effect.
+    pub async fn apply_job_tool_within(
+        &self,
+        call: ToolCallRef,
+        tool: crate::orchestration::job_tools::JobToolCall,
+        max_result_bytes: usize,
+    ) -> Result<serde_json::Value, DatabaseError> {
+        self.submit(|reply| Command::ApplyJobTool {
+            call,
+            tool,
+            max_result_bytes,
+            reply,
+        })
+        .await
     }
     pub async fn boundary_b(&self, clock: i64) -> Result<(), DatabaseError> {
         self.submit(|reply| Command::BoundaryB { clock, reply })
@@ -1236,6 +1251,11 @@ impl DatabaseHandle {
         handle.stop_cause = Some(cause);
         handle.ignore_stop_cause = false;
         handle
+    }
+
+    /// Whether both handles reach the same database.
+    pub(crate) fn same_database(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     pub(crate) fn without_stop_cause(&self) -> Self {

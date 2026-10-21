@@ -117,6 +117,7 @@ pub(super) enum Command {
     ApplyJobTool {
         call: ToolCallRef,
         tool: crate::orchestration::job_tools::JobToolCall,
+        max_result_bytes: usize,
         reply: Reply<serde_json::Value>,
     },
     BoundaryB {
@@ -406,13 +407,18 @@ impl Command {
                 reply,
                 |batch| batch.decide(approval, decision),
             ),
-            Self::ApplyJobTool { call, tool, reply } => run(
+            Self::ApplyJobTool {
+                call,
+                tool,
+                max_result_bytes,
+                reply,
+            } => run(
                 database,
                 operation,
                 commit,
                 Kind::ApplyJobTool,
                 reply,
-                |batch| batch.apply_job_tool(call, tool),
+                |batch| batch.apply_job_tool(call, tool, max_result_bytes),
             ),
             Self::BoundaryB { clock, reply } => run(
                 database,

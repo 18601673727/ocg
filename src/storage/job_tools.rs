@@ -81,6 +81,7 @@ impl Batch {
         &mut self,
         call: ToolCallRef,
         tool: JobToolCall,
+        max_result_bytes: usize,
     ) -> Result<Value, BatchError> {
         self.require_executing_here(call.job)?;
         let Some(evidence) = self.tool_evidence(call)? else {
@@ -287,12 +288,17 @@ impl Batch {
                 json!({"conversation":conversation.to_string(), "status":status, "record_seq":effect.record_seq, "running":effect.running.iter().map(ToString::to_string).collect::<Vec<_>>()})
             }
         };
-        self.tool_outcome(
-            call,
+        let text = result.to_string();
+        let outcome = if text.len() > max_result_bytes {
+            ToolOutcome::CompletedWithheld {
+                reason: crate::persistence::WithheldReason::TooLarge,
+            }
+        } else {
             ToolOutcome::Completed {
-                result: ToolPayload::new(result.to_string()),
-            },
-        )?;
+                result: ToolPayload::new(text),
+            }
+        };
+        self.tool_outcome(call, outcome)?;
         Ok(result)
     }
 }

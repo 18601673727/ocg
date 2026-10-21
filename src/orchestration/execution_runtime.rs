@@ -1584,7 +1584,7 @@ async fn dispatch_runtime(
             }
             SchedulerMessage::Reconcile => {
                 reconcile_at = Instant::now() + Duration::from_secs(30);
-                retry_unsettled().await;
+                retry_unsettled(&database).await;
                 match ntex::rt::spawn_blocking(blocking::retry_unproven_groups).await {
                     Ok(recovered) => unconfirmed_stopped.extend(recovered),
                     Err(error) => {
@@ -1789,7 +1789,7 @@ async fn dispatch_runtime(
     for (job, task) in running {
         finish_grant(&database, job, task).await;
     }
-    retry_unsettled().await;
+    retry_unsettled(&database).await;
     lock(&state).current.clear();
     lock(&state).stops.clear();
     Ok(())
@@ -2015,10 +2015,18 @@ fn retain_unsettled(database: DatabaseHandle, job: JobId, outcome: JobFinalizati
     }
 }
 
-/// Retries every retained finalization once. A rejected completion is
-/// downgraded to a failure, so a refused result cannot be retried forever.
-async fn retry_unsettled() {
-    let retained = std::mem::take(&mut *UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner));
+/// Retries every finalization retained for `owner`'s database once. A
+/// rejected completion is downgraded to a failure, so a refused result
+/// cannot be retried forever.
+async fn retry_unsettled(owner: &DatabaseHandle) {
+    let retained = {
+        let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mine, others) = std::mem::take(&mut *unsettled)
+            .into_iter()
+            .partition(|(database, _, _)| database.same_database(owner));
+        *unsettled = others;
+        mine
+    };
     for (database, job, outcome) in retained {
         match database.finalize_job(job, outcome.clone()).await {
             Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
@@ -2570,6 +2578,16 @@ fn assemble_final_conversation(
     }
 }
 
+/// What the context read already dropped or says, which the fitted request
+/// must carry and count.
+#[derive(Clone, Copy, Default)]
+struct ContextNotices<'a> {
+    images_omitted: bool,
+    context_omitted: bool,
+    tree_status: Option<&'a str>,
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_conversation(
     frozen: &FrozenExecutionConfig,
@@ -2582,6 +2600,46 @@ pub(crate) fn fit_conversation(
     tools: Vec<ToolWire>,
     context_limits: ContextLimits,
 ) -> Option<ChatConversation> {
+    fit_with_notices(
+        frozen,
+        prior_turns,
+        current_objective,
+        current_images,
+        project,
+        grant,
+        agents_md,
+        tools,
+        context_limits,
+        ContextNotices::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_with_notices(
+    frozen: &FrozenExecutionConfig,
+    prior_turns: Vec<(Option<String>, Vec<ImageInput>, Option<String>)>,
+    current_objective: Option<&str>,
+    current_images: &[ImageInput],
+    project: Option<&ProjectRecord>,
+    grant: Option<&str>,
+    agents_md: Option<&str>,
+    tools: Vec<ToolWire>,
+    context_limits: ContextLimits,
+    notices: ContextNotices<'_>,
+) -> Option<ChatConversation> {
+    // The system messages of the request, led by the tree status and the
+    // images notice; the omitted notice is part of the system prompt.
+    let with_prefix = |omitted: bool| {
+        let mut system = Vec::new();
+        if let Some(status) = notices.tree_status.filter(|status| !status.is_empty()) {
+            system.push(ChatMessage::system(status));
+        }
+        if notices.images_omitted {
+            system.push(ChatMessage::system(IMAGES_OMITTED_NOTICE));
+        }
+        system.extend(system_messages(frozen, project, grant, agents_md, omitted));
+        system
+    };
     // 1. Build messages once without per-attempt cloning.
     let prior_messages: Vec<PriorTurnMessages> = prior_turns
         .into_iter()
@@ -2609,15 +2667,15 @@ pub(crate) fn fit_conversation(
 
     let Some(window) = context_limits.context_window else {
         return Some(assemble_final_conversation(
-            system_messages(frozen, project, grant, agents_md, false),
+            with_prefix(notices.context_omitted),
             prior_messages,
             current_user_message,
             tools,
         ));
     };
 
-    let system_without_notice = system_messages(frozen, project, grant, agents_md, false);
-    let system_with_notice = system_messages(frozen, project, grant, agents_md, true);
+    let system_without_notice = with_prefix(notices.context_omitted);
+    let system_with_notice = with_prefix(true);
 
     // 2. Estimate token weights once for prior turns and the rest (system, notice, current turn, tools, max_tokens).
     let tools_bytes: usize = tools.iter().map(tool_bytes).sum();
@@ -2909,7 +2967,7 @@ async fn run_started_provider_job(
     let context_limits = ContextLimits::for_profile(&configuration.frozen.llm.config);
     let tools_wire = offered.unwrap_or_default();
 
-    let mut conversation = match fit_conversation(
+    let mut conversation = match fit_with_notices(
         &configuration.frozen,
         prior_turns,
         current_objective.as_deref(),
@@ -2919,6 +2977,11 @@ async fn run_started_provider_job(
         agents_md.as_deref(),
         tools_wire,
         context_limits,
+        ContextNotices {
+            images_omitted,
+            context_omitted,
+            tree_status: Some(tree_status.as_str()),
+        },
     ) {
         Some(conversation) => conversation,
         None => {
@@ -2941,21 +3004,6 @@ async fn run_started_provider_job(
     };
 
     conversation.response_format = response_format.map(Into::into);
-    if images_omitted {
-        conversation
-            .messages
-            .insert(0, ChatMessage::system(IMAGES_OMITTED_NOTICE));
-    }
-    if context_omitted {
-        conversation
-            .messages
-            .insert(0, ChatMessage::system(OMITTED_NOTICE));
-    }
-    if !tree_status.is_empty() {
-        conversation
-            .messages
-            .insert(0, ChatMessage::system(std::mem::take(&mut tree_status)));
-    }
     let mut attachments = prior_attachments
         .into_iter()
         .skip(conversation.dropped_turns as usize)
@@ -3385,6 +3433,12 @@ async fn run_provider_job_inner(
         sink.request = RequestNumber::FIRST
             .next()
             .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
+        if let Some(window) = context_limits.context_window
+            && estimate_request_tokens(&conversation, context_limits.max_tokens) > window as u64
+        {
+            let stopped = Stopped::from(ToolLoopStop::ContextWindow);
+            return stop_tool_loop(run, sink, None, stopped).await;
+        }
     }
     let mut round = 1u32;
     loop {
@@ -3906,7 +3960,18 @@ async fn answer_calls(
                 serde_json::json!({"name":call.name,"arguments":dispatch.arguments}),
             );
             let applied = match parsed {
-                Ok(tool) => site.database.apply_job_tool(reference, tool).await,
+                Ok(tool) => {
+                    let remaining = limits
+                        .max_tool_results_bytes
+                        .saturating_sub(budget.result_bytes);
+                    site.database
+                        .apply_job_tool_within(
+                            reference,
+                            tool,
+                            remaining.min(limits.max_tool_result_bytes),
+                        )
+                        .await
+                }
                 Err(_) => Ok(
                     serde_json::json!({"refused":"invalid_arguments","reason":"job tool arguments do not match its schema"}),
                 ),
@@ -3941,15 +4006,10 @@ async fn answer_calls(
                     });
                 }
             };
-            if result.get("refused").is_some() {
+            if let Some(reason) = result.get("refused").map(|_| result.to_string()) {
                 if let Err(error) = site
                     .database
-                    .record_tool_outcome(
-                        reference,
-                        ToolOutcome::Completed {
-                            result: ToolPayload::new(result.to_string()),
-                        },
-                    )
+                    .record_tool_outcome(reference, ToolOutcome::NotApplied { message: reason })
                     .await
                 {
                     return Err(Stopped {
