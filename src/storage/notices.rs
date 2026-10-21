@@ -202,16 +202,6 @@ impl Batch {
         let iteration = recurrence
             .as_ref()
             .is_some_and(|row| row.current_turn == turn && row.phase == RecurrencePhase::Active);
-        if iteration && let Some(mut recurrence) = recurrence {
-            recurrence.phase = RecurrencePhase::WaitingDue {
-                due: self
-                    .now()
-                    .as_unix_micros()
-                    .saturating_add(i64::from(recurrence.interval_s) * 1_000_000),
-            };
-            recurrence.previous_turn = Some(turn);
-            self.put_recurrence(conversation, &recurrence, None)?;
-        }
         self.count_loop_turn(conversation, turn)?;
         let quarantined = outcome.kind == OutcomeKind::Unknown && state.stop_confirmed_at.is_none();
         if quarantined {
@@ -241,10 +231,23 @@ impl Batch {
         {
             return Ok(());
         }
-        let event = if matches!(
+        let stopped = matches!(
             outcome.cause,
             Some(crate::persistence::OutcomeCause::Stopped { .. })
-        ) {
+        );
+        if iteration
+            && !stopped
+            && let Some(mut recurrence) = recurrence
+        {
+            recurrence.phase = RecurrencePhase::WaitingDue {
+                due: crate::storage::promotion_clock()
+                    .max(self.now().as_unix_micros())
+                    .saturating_add(i64::from(recurrence.interval_s) * 1_000_000),
+            };
+            recurrence.previous_turn = Some(turn);
+            self.put_recurrence(conversation, &recurrence, None)?;
+        }
+        let event = if stopped {
             NoticeEvent::StoppedAbove
         } else if outcome.kind == OutcomeKind::Completed && iteration {
             NoticeEvent::IterationCompleted

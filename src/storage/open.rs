@@ -1,4 +1,5 @@
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
@@ -9,20 +10,32 @@ use crate::persistence::{JobId, OutcomeCause, OutcomeKind, OutcomeRecord, Timest
 static PROMOTION_CLOCK_BASE: OnceLock<(i64, Instant)> = OnceLock::new();
 
 /// Fixes the promotion clock: the wall time at open, plus the monotonic time
-/// elapsed since. A wall-clock step afterwards moves nothing.
+/// elapsed since.
 pub(crate) fn init_promotion_clock(wall_time_at_open: i64) {
     let _ = PROMOTION_CLOCK_BASE.set((wall_time_at_open, Instant::now()));
 }
 
+static PROMOTION_HIGH_WATER: AtomicI64 = AtomicI64::new(i64::MIN);
+
+/// The later of the monotonic and the wall reading, never going back. Wall
+/// time catches up after a suspend, which the monotonic reading does not
+/// count, and deadlines are made from wall time; a backward wall step moves
+/// nothing.
 pub(crate) fn promotion_clock() -> i64 {
-    if let Some((wall_base, instant_base)) = PROMOTION_CLOCK_BASE.get() {
-        *wall_base + i64::try_from(instant_base.elapsed().as_micros()).unwrap_or(i64::MAX)
-    } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
-            .unwrap_or(0)
-    }
+    let wall = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    let reading =
+        match PROMOTION_CLOCK_BASE.get() {
+            Some((wall_base, instant_base)) => wall.max(wall_base.saturating_add(
+                i64::try_from(instant_base.elapsed().as_micros()).unwrap_or(i64::MAX),
+            )),
+            None => wall,
+        };
+    PROMOTION_HIGH_WATER
+        .fetch_max(reading, Ordering::SeqCst)
+        .max(reading)
 }
 
 static IDENTIFIERS: OnceLock<(Option<String>, Option<String>)> = OnceLock::new();
