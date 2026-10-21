@@ -260,7 +260,7 @@ async fn saved_connection_credential(
     reference: &str,
 ) -> Result<bool, Refusal> {
     Ok(database
-        .configs(Some(ConfigKind::Connection), None, PROFILE_SCAN_LIMIT)
+        .all_configs(Some(ConfigKind::Connection))
         .await?
         .iter()
         .any(|record| {
@@ -317,12 +317,19 @@ pub(super) fn map_mutation_error(error: DatabaseError) -> Refusal {
 /// Ensures at least one Pool offers OpenAI Chat Completions, so newly created
 /// LLM Profiles can be selected and executed immediately.
 async fn ensure_compatible_executor(database: &DatabaseHandle) -> Result<(), Refusal> {
-    let executors = database.executors(None, PROFILE_SCAN_LIMIT).await?;
-    let has_compatible = executors.iter().any(|executor| {
-        executor
-            .llm_transports
-            .contains(&LlmTransport::OpenAiChatCompletions)
-    });
+    let mut before = None;
+    let has_compatible = loop {
+        let page = database.executors(before, PROFILE_SCAN_LIMIT).await?;
+        let found = page.iter().any(|executor| {
+            executor
+                .llm_transports
+                .contains(&LlmTransport::OpenAiChatCompletions)
+        });
+        if found || page.len() < PROFILE_SCAN_LIMIT {
+            break found;
+        }
+        before = page.last().map(|executor| executor.id);
+    };
     if !has_compatible {
         let concurrency_limit = NonZeroU32::new(4).ok_or(INTERNAL)?;
         database
@@ -350,9 +357,7 @@ async fn resolve_or_create_connection(
         endpoint,
         credential_ref,
     };
-    let existing = database
-        .configs(Some(ConfigKind::Connection), None, PROFILE_SCAN_LIMIT)
-        .await?;
+    let existing = database.all_configs(Some(ConfigKind::Connection)).await?;
     if let Some(found) = existing.into_iter().find(
         |connection| matches!(&connection.body, ConfigBody::Connection(body) if *body == wanted),
     ) {
@@ -378,7 +383,7 @@ async fn build_profiles_snapshot(
     database: &DatabaseHandle,
     saved_profile: Option<ProfileId>,
 ) -> Result<Value, Refusal> {
-    let records = database.configs(None, None, PROFILE_SCAN_LIMIT).await?;
+    let records = database.all_configs(None).await?;
     let mut llm_profiles = Vec::new();
     let mut agent_profiles = Vec::new();
 
@@ -409,9 +414,13 @@ async fn build_profiles_snapshot(
         let id = ProfileId::from(record.id);
         match record.body {
             ConfigBody::Model(model) => {
-                let connection = connections
-                    .get(&model.connection_id)
-                    .ok_or(INCONSISTENT_RECORD)?;
+                let connection = match connections.get(&model.connection_id) {
+                    Some(connection) => connection.clone(),
+                    None => match database.config(model.connection_id).await?.map(|r| r.body) {
+                        Some(ConfigBody::Connection(connection)) => connection,
+                        _ => return Err(INCONSISTENT_RECORD),
+                    },
+                };
                 let executors = database
                     .compatible_executors(id)
                     .await?
@@ -678,9 +687,8 @@ pub(super) async fn save_profile(
                     Some(reference) => reference,
                     None => {
                         let base = default_credential_ref(name.trim());
-                        let existing_connections = database
-                            .configs(Some(ConfigKind::Connection), None, PROFILE_SCAN_LIMIT)
-                            .await?;
+                        let existing_connections =
+                            database.all_configs(Some(ConfigKind::Connection)).await?;
                         let is_in_use = |r: &str| {
                             existing_connections.iter().any(|record| {
                                 if let ConfigBody::Connection(conn) = &record.body {

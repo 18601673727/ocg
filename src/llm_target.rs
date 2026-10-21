@@ -102,7 +102,7 @@ pub async fn targets(
         endpoint: Some(target.endpoint.clone()),
         credential_ref: Some(target.credential_ref.clone()),
     };
-    let configs = database.configs(None, None, 1_000).await?;
+    let configs = database.all_configs(None).await?;
     let connection_id = match configs.iter().find(
         |config| matches!(&config.body, ConfigBody::Connection(found) if *found == connection),
     ) {
@@ -155,7 +155,7 @@ pub async fn agent_profile(
         ..AgentConfig::default()
     };
     let existing = database
-        .configs(Some(ConfigKind::Agent), None, 1_000)
+        .all_configs(Some(ConfigKind::Agent))
         .await?
         .into_iter()
         .find(|config| {

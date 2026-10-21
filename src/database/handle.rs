@@ -1032,6 +1032,26 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Every config of `kind` (every kind when `None`), newest first,
+    /// archived ones included, read page by page.
+    pub async fn all_configs(
+        &self,
+        kind: Option<ConfigKind>,
+    ) -> Result<Vec<ConfigRecord>, DatabaseError> {
+        const PAGE: usize = 1_000;
+        let mut all = Vec::new();
+        let mut before = None;
+        loop {
+            let page = self.configs(kind, before, PAGE).await?;
+            let full = page.len() == PAGE;
+            before = page.last().map(|record| record.id);
+            all.extend(page);
+            if !full {
+                return Ok(all);
+            }
+        }
+    }
+
     /// Creates a Connection, Model, Agent or Pool config. Its references must
     /// name configs of the kinds its body requires.
     pub async fn create_config(&self, config: NewConfig) -> Result<ConfigId, DatabaseError> {

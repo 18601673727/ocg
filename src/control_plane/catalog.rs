@@ -402,7 +402,20 @@ pub(super) async fn conversation_turns(
     let mut turns = Vec::new();
     for record in records.iter().take(limit) {
         let entries = database.turn_entries(record.id).await?;
-        let outputs = database.job_outputs(record.id, None, 1000).await?;
+        let mut outputs = database.job_outputs(record.id, None, 1000).await?;
+        let mut outputs_truncated = false;
+        if outputs.len() == 1000
+            && outputs
+                .last()
+                .is_some_and(|last| last.kind != crate::persistence::OutputKind::Result)
+        {
+            outputs_truncated = true;
+            if let Some(latest) = database.latest_output(record.id).await?
+                && latest.kind == crate::persistence::OutputKind::Result
+            {
+                outputs.push(latest);
+            }
+        }
         let configuration = database.job_configuration(record.id).await?.map(|submitted| json!({"agent_profile": submitted.agent_profile.map(|profile| profile.to_string()), "llm_profile": submitted.llm_profile.to_string(), "model": submitted.frozen.llm.config.model, "context_window": submitted.frozen.llm.config.context_window}));
         let mut uncertain = Vec::new();
         if record.unknown_at.is_some() {
@@ -419,7 +432,7 @@ pub(super) async fn conversation_turns(
                 }
             }
         }
-        turns.push(json!({"job":super::job_json(record)?, "entries":entries.iter().map(|(seq, entry)| entry_json(*seq, entry)).collect::<Vec<_>>(), "configuration": configuration, "outputs":outputs.iter().map(super::output_json).collect::<Vec<_>>(), "uncertain_calls":uncertain}));
+        turns.push(json!({"job":super::job_json(record)?, "entries":entries.iter().map(|(seq, entry)| entry_json(*seq, entry)).collect::<Vec<_>>(), "configuration": configuration, "outputs":outputs.iter().map(super::output_json).collect::<Vec<_>>(), "uncertain_calls":uncertain, "outputs_truncated":outputs_truncated}));
     }
     Ok(Reply::ok(
         json!({"api_version":API_VERSION,"conversation":conversation.to_string(),"turns":turns,"has_more":has_more,"next_before":if has_more { records.get(limit.saturating_sub(1)).map(|record| record.id.to_string()) } else {None}}),

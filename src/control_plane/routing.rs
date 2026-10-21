@@ -414,7 +414,10 @@ pub(super) async fn respond(
             conversation,
             before,
             limit,
-        } => catalog::conversation_turns(database, conversation, before, limit).await,
+        } => {
+            let reply = catalog::conversation_turns(database, conversation, before, limit).await?;
+            dashboard::bounded(shared, reply.body)
+        }
         Route::ConversationNotices {
             conversation,
             after,

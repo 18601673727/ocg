@@ -1,7 +1,7 @@
 //! Reads of the raw request events a Job recorded, and the queries over the
 //! `request_scope` index: events by Connection and model.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 
 use super::rows::decode_request_event;
@@ -504,14 +504,23 @@ pub(crate) fn read_observed_models(
     // One entry per (Provider, model) the range holds, with what it holds.
     let mut choices: BTreeMap<ObservedModel, (bool, bool)> = BTreeMap::new();
     let mut groups: HashMap<(u64, [u8; 32]), ObservedModel> = HashMap::new();
+    // Groups at or before the caller's cursor, which the page never holds.
+    let mut passed: HashSet<(u64, [u8; 32])> = HashSet::new();
     walk_scope(&rx, &range, None, usize::MAX, |key| {
-        if groups.len() >= scan_limit && !groups.contains_key(&(key.0, key.1)) {
+        let group = (key.0, key.1);
+        if passed.contains(&group) {
             return Ok(true);
+        }
+        match groups.get(&group) {
+            Some(observed) if choices.get(observed) == Some(&(true, true)) => return Ok(true),
+            Some(_) => {}
+            None if groups.len() >= scan_limit => return Ok(false),
+            None => {}
         }
         let Some(event) = event_at(&rx, key)? else {
             return Ok(true);
         };
-        let observed = match groups.get(&(key.0, key.1)) {
+        let observed = match groups.get(&group) {
             Some(observed) => observed.clone(),
             None => {
                 let Some(target) = frozen_llm_target(&rx, JobId::new(key.3))? else {
@@ -521,7 +530,11 @@ pub(crate) fn read_observed_models(
                     provider: target.frozen.provider.id,
                     model: target.frozen.config.model,
                 };
-                groups.insert((key.0, key.1), observed.clone());
+                if after.is_some_and(|after| observed <= *after) {
+                    passed.insert(group);
+                    return Ok(true);
+                }
+                groups.insert(group, observed.clone());
                 observed
             }
         };
