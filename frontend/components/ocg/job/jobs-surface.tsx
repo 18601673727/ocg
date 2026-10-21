@@ -32,6 +32,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
   }, [client, active]);
   const page = useControlPage(load, active);
   const select = useCallback((next: string) => {
+    setTreeSelection(null);
     onJob(next);
   }, [onJob]);
 

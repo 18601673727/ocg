@@ -86,12 +86,13 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
   const [loaded, setLoaded] = useState<{ root: string; revision: number } | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set<string>());
   // One page per node at a time: a second click while it is in flight is ignored.
-  const loadingNodes = useRef(new Set<string>());
+  const loadingNodes = useRef(new Map<string, AbortController>());
 
   const loading = loaded?.root !== root || loaded?.revision !== revision;
 
   useEffect(() => {
     const controller = new AbortController();
+    const pending = loadingNodes.current;
     client.readJobTree(root, { depth: 2, signal: controller.signal }).then(
       (answer) => {
         if (controller.signal.aborted) return;
@@ -107,18 +108,24 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
         setLoaded({ root, revision });
       },
     );
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      for (const child of pending.values()) child.abort();
+      pending.clear();
+    };
   }, [client, root, revision]);
 
   /** Reads the children of a node the answer did not list, or the page after them. */
   const loadChildren = useCallback(async (node: ControlTreeNode, after?: string) => {
     if (loadingNodes.current.has(node.id)) return;
-    loadingNodes.current.add(node.id);
+    const controller = new AbortController();
+    loadingNodes.current.set(node.id, controller);
     try {
       const answer = await client.readJobTree(
         node.id,
-        after === undefined ? { depth: 2 } : { after, depth: 2 },
+        { after, depth: 2, signal: controller.signal },
       );
+      if (controller.signal.aborted) return;
       const fetched = answer.root.children ?? [];
       setTree((current) => {
         if (!current) return current;
@@ -130,8 +137,10 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
         }));
       });
       setExpanded((current) => new Set([...current, node.id]));
+    } catch (cause: unknown) {
+      if (!controller.signal.aborted) throw cause;
     } finally {
-      loadingNodes.current.delete(node.id);
+      if (loadingNodes.current.get(node.id) === controller) loadingNodes.current.delete(node.id);
     }
   }, [client]);
 
@@ -169,6 +178,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
           {hasChildren ? (
             <button
               type="button"
+              disabled={loading}
               onClick={() => toggle(node)}
               aria-label={isExpanded ? t("jobs.tree.collapse") : t("jobs.tree.expand")}
               className="rounded p-0.5 text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
@@ -261,6 +271,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
               type="button"
               variant="outline"
               size="xs"
+              disabled={loading}
               onClick={() => {
                 void loadChildren(node, nextAfter).catch((cause: unknown) => {
                   setFailure(cause instanceof Error ? cause.message : String(cause));

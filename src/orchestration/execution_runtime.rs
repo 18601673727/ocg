@@ -3336,6 +3336,11 @@ async fn run_provider_job_inner(
         let mut retries = 0;
         let execution = loop {
             let execution = exchange(&conversation, &mut sink).await;
+            let execution = if tools.is_none() {
+                execution.and_then(ProviderExecutionResult::admitted)
+            } else {
+                execution
+            };
             let Err(error) = &execution else {
                 break execution;
             };
@@ -3369,11 +3374,6 @@ async fn run_provider_job_inner(
                     message: "provider execution was cancelled before sending".to_owned(),
                 });
             }
-        };
-        let execution = if tools.is_none() {
-            execution.and_then(ProviderExecutionResult::admitted)
-        } else {
-            execution
         };
         let result = match execution {
             Ok(result) if result.requests_tools() => result,
