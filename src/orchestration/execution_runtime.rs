@@ -3518,6 +3518,9 @@ fn retry_delay(
             failure.retry_after_ms.unwrap_or(1_000 << retries)
         }
         ProviderExecutionError::NotDelivered { .. } => 1_000 << retries,
+        // An incomplete stream produced no usable answer or call, so the
+        // request can be sent again without having applied anything.
+        ProviderExecutionError::Incomplete { .. } => 1_000 << retries,
         _ => return None,
     };
     (milliseconds <= 30_000).then(|| std::time::Duration::from_millis(milliseconds))
@@ -4791,6 +4794,18 @@ mod failure_tests {
             finish_reason: None,
             raw_finish_reason: None,
         };
+        let incomplete = ProviderExecutionError::Incomplete {
+            message: "incomplete".into(),
+            facts: facts.clone(),
+        };
+        for (retry, seconds) in [(0, 1), (1, 2), (2, 4)] {
+            assert_eq!(
+                retry_delay(&incomplete, retry, false),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        assert!(retry_delay(&incomplete, 3, false).is_none());
+        assert!(retry_delay(&incomplete, 0, true).is_none());
         for error in [
             ProviderExecutionError::Rejected {
                 failure: ProviderFailure::default(),
@@ -4799,10 +4814,6 @@ mod failure_tests {
                 message: "unknown".into(),
                 facts: None,
                 finished: false,
-            },
-            ProviderExecutionError::Incomplete {
-                message: "incomplete".into(),
-                facts: facts.clone(),
             },
             ProviderExecutionError::Interrupted {
                 message: "interrupted".into(),

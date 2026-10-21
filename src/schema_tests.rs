@@ -1866,6 +1866,33 @@ where
     ntex::rt::System::new("token-test", ntex::rt::DefaultRuntime).block_on(future)
 }
 
+/// Runs a test future on its own System thread, so timers advance while the
+/// test thread waits.
+fn on_ntex_timers<Make, Work, Output>(make: Make) -> Output
+where
+    Make: FnOnce() -> Work + Send + 'static,
+    Work: std::future::Future<Output = Output> + 'static,
+    Output: Send + 'static,
+{
+    let (done, finished) = flume::bounded(1);
+    std::thread::spawn(move || {
+        let runner = ntex::rt::System::new("token-test", ntex::rt::DefaultRuntime);
+        runner
+            .run(move || {
+                ntex::rt::spawn(async move {
+                    let output = make().await;
+                    if done.send(output).is_err() {
+                        panic!("test stopped waiting for its System task");
+                    }
+                    ntex::rt::System::current().stop();
+                });
+                Ok(())
+            })
+            .expect("token-test System");
+    });
+    wait(finished.recv_async()).expect("test System task completed")
+}
+
 /// The execution path after a response head: announce the delivered request,
 /// read the scripted body with the real parser into the real sink, and settle.
 fn drive(
@@ -5360,61 +5387,89 @@ mod requests_and_tool_loop {
         tools: Option<ToolExecution>,
         responses: Vec<Vec<Step>>,
         cancellation: CancellationToken,
-        mut after: impl FnMut(usize) + 'static,
+        after: impl FnMut(usize) + Send + 'static,
+    ) -> Looped {
+        on_ntex(run_loop_body(
+            handle.clone(),
+            run,
+            tools,
+            responses,
+            cancellation,
+            after,
+        ))
+    }
+
+    /// The same loop on a System thread, so a retry timer can advance.
+    fn run_loop_timers(
+        handle: &DatabaseHandle,
+        run: TokenRun,
+        tools: Option<ToolExecution>,
+        responses: Vec<Vec<Step>>,
+        cancellation: CancellationToken,
+        after: impl FnMut(usize) + Send + 'static,
     ) -> Looped {
         let handle = handle.clone();
-        on_ntex(async move {
-            let config = ProviderExecutionConfig {
-                cancellation: cancellation.clone(),
-                ..ProviderExecutionConfig::default()
-            };
-            let conversation = ChatConversation {
-                messages: vec![ChatMessage::user("add the numbers")],
-                tools: tools
-                    .as_ref()
-                    .map(|tools| tools.offer.wires().expect("offer"))
-                    .unwrap_or_default(),
-                ..ChatConversation::default()
-            };
-            let mut responses = responses.into_iter();
-            let mut sent = Vec::new();
-            let settled = run_provider_job(
-                ProviderRun {
-                    scheduler: None,
-                    database: handle,
-                    executor: run.executor,
-                    input: run.input,
-                    job: run.job,
-                },
-                conversation,
-                tools.as_ref(),
-                &cancellation,
-                async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
-                    sent.push(conversation.clone());
-                    conversation
-                        .validate()
-                        .map_err(|error| ProviderExecutionError::Build {
-                            message: error.to_string(),
-                        })?;
-                    let steps = responses.next().expect("a response for every request");
-                    announce(Some(&mut *sink), ProviderFact::Delivered).await;
-                    let response = read_response(
-                        payload(steps, config.cancellation.clone()),
-                        200,
-                        Instant::now(),
-                        None,
-                        &config,
-                        Some(&mut *sink),
-                        conversation,
-                    )
-                    .await;
-                    after(sent.len());
-                    response
-                },
-            )
-            .await;
-            Looped { settled, sent }
-        })
+        on_ntex_timers(move || run_loop_body(handle, run, tools, responses, cancellation, after))
+    }
+
+    async fn run_loop_body(
+        handle: DatabaseHandle,
+        run: TokenRun,
+        tools: Option<ToolExecution>,
+        responses: Vec<Vec<Step>>,
+        cancellation: CancellationToken,
+        mut after: impl FnMut(usize) + Send + 'static,
+    ) -> Looped {
+        let config = ProviderExecutionConfig {
+            cancellation: cancellation.clone(),
+            ..ProviderExecutionConfig::default()
+        };
+        let conversation = ChatConversation {
+            messages: vec![ChatMessage::user("add the numbers")],
+            tools: tools
+                .as_ref()
+                .map(|tools| tools.offer.wires().expect("offer"))
+                .unwrap_or_default(),
+            ..ChatConversation::default()
+        };
+        let mut responses = responses.into_iter();
+        let mut sent = Vec::new();
+        let settled = run_provider_job(
+            ProviderRun {
+                scheduler: None,
+                database: handle,
+                executor: run.executor,
+                input: run.input,
+                job: run.job,
+            },
+            conversation,
+            tools.as_ref(),
+            &cancellation,
+            async |conversation: &ChatConversation, sink: &mut DatabaseOutputSink| {
+                sent.push(conversation.clone());
+                conversation
+                    .validate()
+                    .map_err(|error| ProviderExecutionError::Build {
+                        message: error.to_string(),
+                    })?;
+                let steps = responses.next().expect("a response for every request");
+                announce(Some(&mut *sink), ProviderFact::Delivered).await;
+                let response = read_response(
+                    payload(steps, config.cancellation.clone()),
+                    200,
+                    Instant::now(),
+                    None,
+                    &config,
+                    Some(&mut *sink),
+                    conversation,
+                )
+                .await;
+                after(sent.len());
+                response
+            },
+        )
+        .await;
+        Looped { settled, sent }
     }
 
     fn job_record(handle: &DatabaseHandle, job: JobId) -> JobRecord {
@@ -5654,7 +5709,7 @@ mod requests_and_tool_loop {
         let worker = DatabaseWorker::start(&directory).expect("start database");
         let handle = worker.handle();
         let (_provider, llm) = llm_setup(&handle, "model-a");
-        type Change = Box<dyn FnMut(&ToolRegistry)>;
+        type Change = Box<dyn FnMut(&ToolRegistry) + Send>;
         let cases: Vec<(&str, Change, ToolCallRefusal)> = vec![
             (
                 "a grant withdrawn before dispatch",
@@ -5814,11 +5869,15 @@ mod requests_and_tool_loop {
         ] {
             let run = local_run(&handle, llm);
             let (registry, calls) = registered(vec![("add", Behavior::Add)]);
-            let looped = run_loop(
+            let looped = run_loop_timers(
                 &handle,
                 run,
                 Some(execution(&registry, &["add"], ToolLoopLimits::default())),
-                vec![calling(&calls_sent, (1, 1)), answering("done", (1, 1))],
+                if refusal.is_some() {
+                    vec![calling(&calls_sent, (1, 1)), answering("done", (1, 1))]
+                } else {
+                    (0..4).map(|_| calling(&calls_sent, (1, 1))).collect()
+                },
                 CancellationToken::default(),
                 |_| {},
             );
@@ -5848,9 +5907,13 @@ mod requests_and_tool_loop {
                 job.unknown_at.is_some()
                     && job.stop_confirmed_at.is_some()
                     && job.completed_at.is_none(),
-                "{case}: an inadmissible response stays an unknown outcome, as before"
+                "{case}: an inadmissible response stays an unknown outcome"
             );
-            assert_eq!(looped.sent.len(), 1, "{case}: nothing was sent back");
+            assert_eq!(
+                looped.sent.len(),
+                4,
+                "{case}: the incomplete response is retried three times"
+            );
         }
         worker.shutdown().expect("shutdown");
     }
@@ -8708,6 +8771,7 @@ mod requests_and_tool_loop {
                     true,
                     false,
                     Refused::Stream,
+                    2,
                 ),
                 (
                     "no path",
@@ -8715,6 +8779,7 @@ mod requests_and_tool_loop {
                     true,
                     false,
                     Refused::Stream,
+                    2,
                 ),
                 (
                     "a tool OCG did not offer",
@@ -8722,6 +8787,7 @@ mod requests_and_tool_loop {
                     false,
                     false,
                     Refused::Stream,
+                    4,
                 ),
                 (
                     "a grant withdrawn after the offer",
@@ -8729,9 +8795,10 @@ mod requests_and_tool_loop {
                     true,
                     true,
                     Refused::Dispatch(ToolCallRefusal::Unauthorized),
+                    1,
                 ),
             ];
-            for (case, arguments, offered, revoked, refused) in cases {
+            for (case, arguments, offered, revoked, refused, sends) in cases {
                 let run = local_run(&handle, llm);
                 let registry = ToolRegistry::default();
                 workspace_read::register(
@@ -8750,14 +8817,21 @@ mod requests_and_tool_loop {
                     )
                 });
                 let revoker = registry.clone();
-                let looped = run_loop(
-                    &handle,
-                    run,
-                    tools,
+                let steps = if offered && refused == Refused::Stream {
                     vec![
                         calling(&[read_call(0, "call_read", arguments)], (1, 1)),
                         answering("done", (1, 1)),
-                    ],
+                    ]
+                } else {
+                    (0..sends)
+                        .map(|_| calling(&[read_call(0, "call_read", arguments)], (1, 1)))
+                        .collect()
+                };
+                let looped = run_loop_timers(
+                    &handle,
+                    run,
+                    tools,
+                    steps,
                     CancellationToken::default(),
                     move |_| {
                         if revoked {
@@ -8784,7 +8858,7 @@ mod requests_and_tool_loop {
                     assert!(blocking(&handle, llm).is_empty(), "{case}");
                     continue;
                 }
-                assert_eq!(looped.sent.len(), 1, "{case}: no result is ever sent");
+                assert_eq!(looped.sent.len(), sends, "{case}: no result is ever sent");
                 let records = evidence(&handle, run.job);
                 assert!(
                     records.iter().all(|record| record.admission().is_none()),
@@ -10001,7 +10075,7 @@ mod requests_and_tool_loop {
 
             // Arguments the schema refuses are never a command.
             let run = local_run(&handle, llm);
-            let looped = run_loop(
+            let looped = run_loop_timers(
                 &handle,
                 run,
                 Some(project.tools(&directory, crate::test_support::WAIT)),
