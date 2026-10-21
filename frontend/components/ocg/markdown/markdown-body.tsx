@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { Check, Copy } from "lucide-react";
 
@@ -13,6 +13,7 @@ import {
   type Token,
 } from "./markdown-pipeline";
 import { cn } from "@/lib/utils";
+import { useI18n } from "../i18n";
 
 export interface MarkdownBodyProps {
   content: string;
@@ -232,6 +233,7 @@ function CodeBlock({
   inMuted: boolean;
   copyLabel: string;
 }) {
+  const { t } = useI18n();
   const highlight = highlightCode(code, language);
   const caption = highlight?.language || language || "text";
   const muted = inMuted ? "text-muted-foreground" : "";
@@ -241,8 +243,8 @@ function CodeBlock({
       <MermaidDiagram
         code={code}
         inMuted={inMuted}
-        errorLabel="Diagram error"
-        diagramLabel="Mermaid diagram"
+        errorLabel={t("chat.mermaidError")}
+        diagramLabel={t("chat.mermaidDiagram")}
       />
     );
   }
@@ -662,9 +664,11 @@ function tableEnd(tokens: Token[], start: number): number {
  * library from the code rather than passed through from the document.
  */
 export function MarkdownBody({ content, className, inMuted = false }: MarkdownBodyProps) {
+  const { t } = useI18n();
+  const tokens = useMemo(() => markdownParser().parse(content, {}), [content]);
   const ctx: WalkContext = {
     inMuted,
-    copyLabel: "Copy code",
+    copyLabel: t("chat.copyCode"),
     nextKey: { current: 0 },
   };
 
@@ -675,7 +679,7 @@ export function MarkdownBody({ content, className, inMuted = false }: MarkdownBo
         className,
       )}
     >
-      {walk(ctx, markdownParser().parse(content, {}))}
+      {walk(ctx, tokens)}
     </div>
   );
 }

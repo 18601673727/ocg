@@ -36,16 +36,22 @@ function stateLabel(t: TranslateFn, state: ControlTreeState): string {
   return runtimeStateLabel(t, state);
 }
 
-/** The children a node already holds, then only the incoming ones no id names. */
-function mergeChildren(existing: ControlTreeNode[], incoming: ControlTreeNode[]): ControlTreeNode[] {
-  const seen = new Set<string>();
-  const merged: ControlTreeNode[] = [];
-  for (const child of [...existing, ...incoming]) {
-    if (seen.has(child.id)) continue;
-    seen.add(child.id);
-    merged.push(child);
+/** Refresh incoming facts while retaining descendants and pages already loaded. */
+export function mergeChildren(existing: ControlTreeNode[], incoming: ControlTreeNode[]): ControlTreeNode[] {
+  const merged = new Map(existing.map((child) => [child.id, child]));
+  for (const child of incoming) {
+    const previous = merged.get(child.id);
+    const children = previous?.children
+      ? mergeChildren(previous.children, child.children ?? [])
+      : child.children;
+    const page = child.children === null && previous?.children ? previous : child;
+    merged.set(child.id, {
+      ...child, children,
+      has_more_children: page.has_more_children,
+      next_after: page.next_after === null ? null : children?.at(-1)?.id ?? page.next_after,
+    });
   }
-  return merged;
+  return [...merged.values()];
 }
 
 /** One node with its children replaced, wherever it sits in the tree. */
@@ -130,7 +136,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
       setTree((current) => {
         if (!current) return current;
         return replaceNode(current, node.id, (existing) => ({
-          ...existing,
+          ...answer.root,
           children: mergeChildren(after === undefined ? [] : (existing.children ?? []), fetched),
           has_more_children: answer.root.has_more_children,
           next_after: answer.root.next_after,
@@ -160,7 +166,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
     });
   }, [loadChildren]);
 
-  const render = (node: ControlTreeNode, level: number, isRoot = false): ReactNode => {
+  const render = (node: ControlTreeNode, isRoot = false): ReactNode => {
     const isExpanded = expanded.has(node.id);
     const hasChildren = (node.children?.length ?? 0) > 0 || node.has_more_children;
     const agent = node.agent_name ?? node.agent ?? t("jobs.tree.noAgent");
@@ -169,9 +175,6 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
     return (
       <li
         key={node.id}
-        role="treeitem"
-        aria-expanded={hasChildren ? isExpanded : undefined}
-        aria-selected={node.id === selected}
         className={cn("py-0.5", node.id === selected && "text-foreground")}
       >
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm">
@@ -180,6 +183,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
               type="button"
               disabled={loading}
               onClick={() => toggle(node)}
+              aria-expanded={isExpanded}
               aria-label={isExpanded ? t("jobs.tree.collapse") : t("jobs.tree.expand")}
               className="rounded p-0.5 text-muted-foreground hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
             >
@@ -191,6 +195,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
           <button
             type="button"
             onClick={() => onSelect(node.id)}
+            aria-current={node.id === selected ? "true" : undefined}
             className="flex min-w-0 flex-1 flex-wrap items-center gap-2 rounded px-1 text-left hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
           >
             <code className="font-geist-mono text-xs">{node.id}</code>
@@ -205,7 +210,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
             </span>
           ) : null}
           {node.recurrence ? (
-            <span title={t("jobs.tree.recurring")} className="flex items-center gap-1 text-xs text-muted-foreground">
+            <span title={t("jobs.tree.recurring")} aria-label={t("jobs.tree.recurring")} className="flex items-center gap-1 text-xs text-muted-foreground">
               <Repeat2 className="size-4" />
               {t(`chat.child.${node.recurrence.phase}`)}
             </span>
@@ -261,8 +266,8 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
           </div>
         ) : null}
         {isExpanded && node.children ? (
-          <ul role="group" className="ml-3 border-l border-border pl-3">
-            {node.children.map((child) => render(child, level + 1))}
+          <ul className="ml-3 border-l border-border pl-3">
+            {node.children.map((child) => render(child))}
           </ul>
         ) : null}
         {isExpanded && nextAfter ? (
@@ -315,8 +320,8 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
       {failure ? <p role="alert" className="text-sm text-destructive">{failure}</p> : null}
       {loading && !tree ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {tree ? (
-        <ul role="tree" aria-label={t("jobs.tree.title")} className="flex flex-col">
-          {render(tree, 0, true)}
+        <ul aria-label={t("jobs.tree.title")} className="flex flex-col">
+          {render(tree, true)}
         </ul>
       ) : null}
     </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useSyncExternalStore } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { MockOcgRuntimeClient } from "./mock-client";
 import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
@@ -59,7 +59,20 @@ export function OcgRuntimeProvider({ scenario, children, controlClient }: { scen
     if (controlUrl) return CanonicalOcgRuntimeClient.connect(scenario, controlUrl, fetch);
     return new MockOcgRuntimeClient(scenario);
   }, [scenario, controlUrl, controlClient]);
-  useEffect(() => () => client.dispose?.(), [client]);
+  const leases = useRef(new Map<OcgRuntimeClient, symbol>());
+  useEffect(() => {
+    const token = Symbol();
+    const retained = leases.current;
+    retained.set(client, token);
+    return () => {
+      // StrictMode reattaches the same client before this microtask runs.
+      queueMicrotask(() => {
+        if (retained.get(client) !== token) return;
+        retained.delete(client);
+        client.dispose?.();
+      });
+    };
+  }, [client]);
   const authority = client.authority;
   const subscribe = useCallback(
     (onStoreChange: () => void) => client.subscribe(() => onStoreChange()),

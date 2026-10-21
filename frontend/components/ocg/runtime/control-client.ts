@@ -1,5 +1,6 @@
 import {
   ContractError,
+  TREE_MAX_DEPTH,
   decodeAdmission,
   decodeAgentProfiles,
   decodeAttachment,
@@ -233,9 +234,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   const programmatic = options.bearerToken !== undefined;
   const base = controlOrigin(options.baseUrl, !programmatic);
   const fetchImpl = options.fetch.bind(globalThis);
-  // Delivery acknowledgements only; output history and Job state live on server.
-  const cursors = new Map<string, number>();
-  const active = new Map<string, AbortController>();
+  // Live subscriptions only; each owns its delivery acknowledgement.
+  const active = new Set<AbortController>();
   const profileListeners = new Set<() => void>();
   const conversationListeners = new Set<() => void>();
   let closed = false;
@@ -260,13 +260,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     jobId: string,
     signal: AbortSignal,
     listener: (event: JobStreamEvent) => void | Promise<void>,
+    cursor: { sequence: number | undefined },
   ): Promise<Exclude<JobStreamEnd, "aborted"> | null> {
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
       ...await credentials(),
     };
-    const cursor = cursors.get(jobId);
-    if (cursor !== undefined) headers["Last-Event-ID"] = String(cursor);
+    if (cursor.sequence !== undefined) headers["Last-Event-ID"] = String(cursor.sequence);
     let response: Response;
     try {
       // The route requires the canonical literal job:<n>; it does not decode %3A.
@@ -314,12 +314,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           const event = decodeJobEvent(frame.event, input, jobId, frame.id);
           if (event.type === "output") {
             const acknowledged = event.output.seq;
-            const previous = cursors.get(jobId) ?? 0;
+            const previous = cursor.sequence ?? 0;
             if (acknowledged <= previous) continue;
             if (acknowledged !== previous + 1) throw new ContractError("output.seq", "the next stored sequence without a gap");
             await listener(event);
             // A rejected listener never acknowledges an unprocessed output.
-            cursors.set(jobId, acknowledged);
+            cursor.sequence = acknowledged;
           } else {
             await listener(event);
           }
@@ -474,8 +474,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeLogs((await send("GET", `/api/v1/logs?${query.join("&")}`, { signal: settings.signal })).input);
     },
 
-    lastOutputSequence(jobId: string): number | undefined { return cursors.get(jobId); },
-
     /** What the host establishes about itself and its database, now. */
     async readHealth(signal?: AbortSignal) {
       return decodeHealth((await send("GET", "/api/v1/health", { signal })).input);
@@ -519,8 +517,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         throw new ContractError("limit", "an integer from 1 to 100");
       }
       const depth = settings.depth ?? 2;
-      if (!Number.isSafeInteger(depth) || depth < 1 || depth > 4) {
-        throw new ContractError("depth", "an integer from 1 to 4");
+      if (!Number.isSafeInteger(depth) || depth < 1 || depth > TREE_MAX_DEPTH) {
+        throw new ContractError("depth", `an integer from 1 to ${TREE_MAX_DEPTH}`);
       }
       const query = [`limit=${limit}`, `depth=${depth}`];
       if (settings.after) query.push(`after=${jobIdentity(settings.after)}`);
@@ -552,7 +550,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     async retryConversation(conversation: string, turn: string, signal?: AbortSignal) {
       jobIdentity(conversation);
       jobIdentity(turn);
-      const answer = await send("POST", `/api/v1/conversations/${conversation}/retry`, { body: { turn }, signal });
+      const answer = await send("POST", `/api/v1/conversations/${conversation}/retry`, { body: { turn }, sign: true, signal });
       const result = decodeRetry(answer.input);
       if (result.conversation !== conversation) throw new ContractError("conversation", `matching ${conversation}`);
       return result;
@@ -825,26 +823,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     ): JobStreamSubscription {
       if (closed) throw new ControlTransportError("client_closed", 0, false);
       if (!/^job:(0|[1-9][0-9]*)$/.test(jobId)) throw new ContractError("job", "a canonical Job identity");
-      if (active.has(jobId)) throw new ControlTransportError("job_stream_already_open", 0, false);
-      if (settings.afterSeq !== undefined) {
-        const supplied = sequence(settings.afterSeq);
-        const previous = cursors.get(jobId);
-        if (previous !== undefined && supplied !== previous) throw new ContractError("after_seq", "the acknowledged Job cursor");
-        cursors.set(jobId, supplied);
-      }
+      // Each consumer acknowledges its own output; another view cannot skip it.
+      const cursor = { sequence: settings.afterSeq === undefined ? undefined : sequence(settings.afterSeq) };
       const controller = new AbortController();
       const signal = controller.signal;
       const stop = () => controller.abort();
       settings.signal?.addEventListener("abort", stop, { once: true });
       if (settings.signal?.aborted) stop();
-      active.set(jobId, controller);
+      active.add(controller);
       const completed = (async (): Promise<JobStreamEnd> => {
         let delay = 250;
         try {
           while (!signal.aborted) {
             let failure = new ControlTransportError("premature_end", 0, true);
             try {
-              const end = await connection(jobId, signal, listener);
+              const end = await connection(jobId, signal, listener, cursor);
               if (end) return end;
             } catch (error) {
               if (signal.aborted) return "aborted";
@@ -860,7 +853,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         } finally {
           controller.abort();
           settings.signal?.removeEventListener("abort", stop);
-          active.delete(jobId);
+          active.delete(controller);
         }
       })();
       return { closed: completed, close: stop };

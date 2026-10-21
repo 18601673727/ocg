@@ -518,7 +518,7 @@ export function decodeConversationTurns(input: unknown, conversationId: string) 
       return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path, "attachment:")), at_us: integer(entry.at_us, `${path}.at_us`) };
     });
     const userEntries = entries.filter(entry => entry.kind === "user_message" || entry.kind === "agent_message");
-    const frozenInput = jobInputRecord({ id: `job_input:${job.id.slice(4)}`, objective: userEntries.map(entry => entry.text ?? "").join("\n"), submitted_at_us: job.created_at_us, attachments: userEntries.flatMap(entry => entry.attachments), configuration: turn.configuration }, `${path}.input`, job.id);
+    const frozenInput = jobInputRecord({ id: job.input, objective: userEntries.map(entry => entry.text ?? "").join("\n"), submitted_at_us: job.created_at_us, attachments: userEntries.flatMap(entry => entry.attachments), configuration: turn.configuration }, `${path}.input`, job.id);
     const outputs = listOf(turn.outputs, `${path}.outputs`, output => outputRecord(output));
     return { job, entries, input: frozenInput, outputs };
   });
@@ -860,7 +860,9 @@ export function decodeChildren(input: unknown, conversationId: string) {
     return {
       id: identity(child.id, `${path}.id`, "job:"), title: string(child.title, `${path}.title`),
       agent: child.agent === null ? null : identity(child.agent, `${path}.agent`, "profile:"), state,
-      on_hold: by === null ? null : { by: { kind: by } }, keep_open: boolean(child.keep_open, `${path}.keep_open`),
+      on_hold: by === null ? null : { by: by === "agent"
+        ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`, "job:") }
+        : { kind: by } }, keep_open: boolean(child.keep_open, `${path}.keep_open`),
       recurrence: recurrence === null ? null : { interval_s: interval!, phase: phase!, due_us: recurrence.due_us === null ? null : integer(recurrence.due_us, `${path}.recurrence.due_us`) },
     };
   });
@@ -891,7 +893,7 @@ export type ControlTreeNode = {
   agent: string | null;
   agent_name: string | null;
   model: { llm_profile: string; model: string } | null;
-  on_hold: { by: { kind: "user" | "agent" | "loop" | "auto" } } | null;
+  on_hold: { by: { kind: "agent"; conversation: string } | { kind: "user" | "loop" | "auto" } } | null;
   origin: "user" | "agent" | "system" | null;
   keep_open: boolean | null;
   active_turn: string | null;
@@ -925,12 +927,11 @@ const TREE_STATES = [
   "queued",
 ] as const;
 
-// The tree is read one level at a time; a deeper answer than the server
-// bounds is refused rather than walked.
-const TREE_MAX_DEPTH = 6;
+// Depth counts edges below the root, matching the server's tree query.
+export const TREE_MAX_DEPTH = 4;
 
 function treeNode(input: unknown, path: string, depth: number): ControlTreeNode {
-  if (depth > TREE_MAX_DEPTH) throw new ContractError(path, "a tree of at most 6 levels");
+  if (depth > TREE_MAX_DEPTH) throw new ContractError(path, `a tree of at most ${TREE_MAX_DEPTH} edges below the root`);
   const node = record(input, path);
   const model = node.model === null ? null : (() => {
     const frozen = record(node.model, `${path}.model`);
@@ -966,7 +967,9 @@ function treeNode(input: unknown, path: string, depth: number): ControlTreeNode 
     agent: node.agent === null ? null : identity(node.agent, `${path}.agent`, "profile:"),
     agent_name: node.agent_name === null ? null : string(node.agent_name, `${path}.agent_name`),
     model,
-    on_hold: by === null ? null : { by: { kind: by } },
+    on_hold: by === null ? null : { by: by === "agent"
+      ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`, "job:") }
+      : { kind: by } },
     origin,
     keep_open: node.keep_open === null ? null : boolean(node.keep_open, `${path}.keep_open`),
     active_turn: node.active_turn === null ? null : identity(node.active_turn, `${path}.active_turn`, "job:"),
@@ -997,7 +1000,7 @@ export function decodeJobTree(input: unknown, job: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
   if (envelope.job !== job) throw new ContractError("job", "the requested Job");
-  const root = treeNode(envelope.root, "root", 1);
+  const root = treeNode(envelope.root, "root", 0);
   if (root.id !== job) throw new ContractError("root.id", "the requested Job");
   return {
     job,

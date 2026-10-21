@@ -14,6 +14,7 @@ import { useOcgRuntime } from "./runtime-context";
 import { createOcgExternalStoreAdapter, type OcgConversationState } from "./assistant-ui-adapter";
 import { useOcgControlUrl } from "../profile/control-url";
 import type { ChatImage } from "../contracts";
+import { useI18n } from "../i18n";
 
 type OcgReloadConfig = {
   parentId: string | null;
@@ -39,6 +40,7 @@ interface OcgAssistantProviderProps {
  */
 export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({ children, sessionId, projectId }) => {
   const runtime = useOcgRuntime();
+  const { t } = useI18n();
   // Managed images are served by the control server; resolve their paths
   // against this base so the browser can fetch them from any page origin.
   const controlBaseUrl = useOcgControlUrl();
@@ -112,9 +114,10 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({ children, 
       onReload,
       onCancel,
       controlBaseUrl,
-      onLoadEarlier
+      onLoadEarlier,
+      t
     );
-  }, [getState, onNew, onReload, onCancel, controlBaseUrl, onLoadEarlier]);
+  }, [getState, onNew, onReload, onCancel, controlBaseUrl, onLoadEarlier, t]);
 
   // Create the assistant-ui runtime from the external store
   const assistantRuntime = useExternalStoreRuntime(adapter);

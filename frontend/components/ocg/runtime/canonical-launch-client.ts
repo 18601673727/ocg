@@ -78,7 +78,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           (item.tip_created_at_us < local.job.created_at_us ||
             (item.tip_created_at_us === local.job.created_at_us && Number(item.tip_job.slice(4)) < Number(known.slice(4))))) continue;
         this.tips.set(id, item.tip_job);
-        const session: ChatSession = { id, sessionId: item.tip_job, title: item.title, agentProfile: item.agent ?? undefined, workType: "research", updatedAt: new Date(item.tip_created_at_us / 1000).toISOString() };
+        const session: ChatSession = { id, conversationId: item.root_job, sessionId: item.tip_job, title: item.title, agentProfile: item.agent ?? undefined, workType: "research", updatedAt: new Date(item.tip_created_at_us / 1000).toISOString() };
         this.emit({ type: current ? "conversation.session-updated" : "conversation.session-created", session });
       }
       if (!page.has_more) break;
@@ -184,7 +184,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!this.roots.has(root)) { this.unlisted.add(id); this.roots.set(root, id); }
     job = conversation.turns.at(-1)?.job.id ?? job;
     if (!this.getSnapshot().sessions.some(session => session.id === id)) {
-      this.emit({ type: "conversation.session-created", session: { id, sessionId: job, title: conversation.turns[0]?.input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
+      this.emit({ type: "conversation.session-created", session: { id, conversationId: root, sessionId: job, title: conversation.turns[0]?.input.objective?.slice(0, 80) || "Conversation", workType: "research", updatedAt: new Date().toISOString() } });
     }
     // Read each turn's attachments and tool evidence as well as its stored text.
     const isCurrent = () => !this.disposed && (hiddenBefore || !this.hiddenRoots.has(root));
@@ -215,7 +215,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.tips.set(id, job);
     const session = this.getSnapshot().sessions.find(session => session.id === id);
     if (!session) return id;
-    this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: conversation.turns.at(-1)?.input.configuration?.agent_profile ?? undefined } });
+    this.emit({ type: "conversation.session-updated", session: { ...session, conversationId: root, sessionId: job, agentProfile: conversation.turns.at(-1)?.input.configuration?.agent_profile ?? undefined } });
     this.publish(id);
     for (const turn of conversation.turns) if (turn.job.settlement.state === "unsettled") this.watch(turn.job.id);
     return id;
@@ -340,7 +340,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       }
     };
 
-    const afterSeq = this.control.lastOutputSequence(jobId) ?? turn.outputs.at(-1)?.seq ?? 0;
+    const afterSeq = turn.outputs.at(-1)?.seq ?? 0;
     const subscription = this.control.subscribeJobEvents(jobId, event => {
       if (this.disposed || entry.stopped) return;
       if (event.type === "job") turn.job = event.job;
@@ -427,7 +427,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       for (const image of input.images ?? []) this.images.set(image.id, image);
       const admitted = await this.control.readJob(job);
       if (admitted.conversation) this.roots.set(admitted.conversation, sessionId);
-      this.emit({ type: "conversation.session-updated", session: { ...session, sessionId: job, agentProfile: selection.agentProfile, title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
+      this.emit({ type: "conversation.session-updated", session: { ...session, conversationId: admitted.conversation ?? undefined, sessionId: job, agentProfile: selection.agentProfile, title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
       await this.trackTurn(sessionId, job);
     } catch (error) {
       if (!pending.admittedJob && error instanceof ControlTransportError && ((error.status >= 400 && error.status < 500) || error.status === 503)) this.pending.delete(sessionId);

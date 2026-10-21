@@ -208,36 +208,6 @@ function JobWatchBody({
       }
     };
 
-    const open = async (): Promise<JobStreamSubscription> => {
-      for (let attempt = 0; ; attempt++) {
-        try {
-          return client.subscribeJobEvents(
-            jobId,
-            listener,
-            client.lastOutputSequence(jobId) === undefined
-              ? {
-                  afterSeq: processed,
-                  onReconnect: () => {
-                    if (alive) setStream("reconnecting");
-                  },
-                }
-              : {
-                  onReconnect: () => {
-                    if (alive) setStream("reconnecting");
-                  },
-                },
-          );
-        } catch (error) {
-          // A subscription of an earlier view is closing; wait for it.
-          if (attempt >= 4 || !(error instanceof ControlTransportError) ||
-            error.code !== "job_stream_already_open") {
-            throw error;
-          }
-          await new Promise((resolve) => setTimeout(resolve, 200));
-        }
-      }
-    };
-
     (async () => {
       try {
         const record = await client.readJob(jobId);
@@ -285,7 +255,12 @@ function JobWatchBody({
         return;
       }
       try {
-        subscription = await open();
+        subscription = client.subscribeJobEvents(jobId, listener, {
+          afterSeq: processed,
+          onReconnect: () => {
+            if (alive) setStream("reconnecting");
+          },
+        });
         if (!alive) {
           subscription.close();
           return;

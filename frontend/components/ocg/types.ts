@@ -8,6 +8,7 @@ export type ChatSession = {
   projectId?: string;
   sessionId?: string;
   agentProfile?: string;
+  conversationId?: string;
 };
 
 /**

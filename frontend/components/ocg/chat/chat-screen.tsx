@@ -3,6 +3,7 @@
 import {
   createContext,
   useContext,
+  useEffect,
   useCallback,
   useMemo,
   useState,
@@ -192,8 +193,11 @@ export const ChatScreen: FC<ChatScreenProps> = ({
   const runtime = useOcgRuntime();
   const [draft, setDraft] = useState("");
   const [selection, setSelection] = useState<ChatModelSelection | undefined>(() =>
-    readModelPreference(session.projectId, session.sessionId ?? session.id),
+    readModelPreference(session.projectId, session.conversationId ?? session.id),
   );
+  useEffect(() => {
+    if (session.conversationId && selection) writeModelPreference(session.projectId, session.conversationId, selection);
+  }, [session.conversationId, session.projectId, selection]);
   const messages = runtime.snapshot.messagesBySession[session.id] ?? [];
   const liveExecution = isExecutionActive(execution) ? execution : null;
   const messageStreaming = messages.some((message) =>
@@ -209,8 +213,8 @@ export const ChatScreen: FC<ChatScreenProps> = ({
 
   const onPreference = useCallback(
     (next: ChatModelSelection) =>
-      writeModelPreference(session.projectId, session.sessionId ?? session.id, next),
-    [session.id, session.projectId, session.sessionId],
+      writeModelPreference(session.projectId, session.conversationId ?? session.id, next),
+    [session.id, session.projectId, session.conversationId],
   );
   const composerValue = useMemo<ChatComposerContextValue>(
     () => ({

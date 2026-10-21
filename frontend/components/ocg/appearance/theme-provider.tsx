@@ -55,10 +55,6 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     const onSystemThemeChange = (event: MediaQueryListEvent) => {
       const next = event.matches ? "dark" : "light";
       setSystemTheme(next);
-      setPreferences((current) => {
-        applyRootAppearance(current, next);
-        return current;
-      });
     };
     media.addEventListener?.("change", onSystemThemeChange);
     return () => {

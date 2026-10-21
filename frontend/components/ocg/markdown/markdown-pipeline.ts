@@ -169,6 +169,7 @@ export type { Token } from "markdown-it";
  */
 export function sanitizeUrl(rawUrl: string): string | null {
   const url = rawUrl.trim();
+  if (/[\u0000-\u001f\u007f\\]/.test(url)) return null;
   if (!url) return null;
   // Protocol-relative references name another origin; they are not in-site.
   if (url.startsWith("//")) return null;

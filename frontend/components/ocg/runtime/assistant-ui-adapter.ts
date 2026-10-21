@@ -19,6 +19,8 @@ import type {
 import type { ChatMessage, MessageRole } from "../types";
 import type { JobExecution } from "../execution/domain";
 import { retryInput } from "../chat/retry";
+import type { TranslateFn } from "../i18n";
+import { en } from "../i18n/dictionaries";
 
 type OcgMetadata = Record<string, unknown>;
 
@@ -137,6 +139,7 @@ function toolPart(message: ChatMessage): ToolCallMessagePart {
 function assistantParts(
   message: ChatMessage,
   baseUrl: string | null | undefined,
+  t: TranslateFn,
 ): readonly ThreadAssistantMessagePart[] {
   const parts: ThreadAssistantMessagePart[] = [];
   // Reasoning precedes the answer so the thought is read before the result.
@@ -155,7 +158,7 @@ function assistantParts(
     const refused = !call.outcome_kind && call.decision !== "admitted" && call.decision !== "awaiting_approval" && call.decision !== "awaiting_answer";
     parts.push({ type: "tool-call", toolCallId: call.tool_call_id, toolName: call.name,
       args: checkedArgs, argsText: call.arguments ?? "{}",
-      ...(refused ? { result: `refused: ${call.decision}` } : call.outcome_kind ? { result: call.result ?? call.outcome_kind } : {}),
+      ...(refused ? { result: t("transcript.outcome.refused") } : call.outcome_kind ? { result: call.result ?? call.outcome_kind } : {}),
       isError: refused || call.outcome_kind === "not_applied" || call.outcome_kind === "not_invoked" || call.outcome_kind === "uncertain",
     });
   }
@@ -187,6 +190,7 @@ export function convertOcgMessage(
   _idx: number,
   messages: readonly ChatMessage[] = [message],
   baseUrl: string | null = null,
+  t: TranslateFn = (key) => en[key],
 ): ThreadMessageLike {
   const role: MessageRole = message.role === "user" ? "user" : message.role === "assistant" ? "assistant" : "assistant";
   const common = {
@@ -207,7 +211,7 @@ export function convertOcgMessage(
   return {
     ...common,
     role: "assistant",
-    content: assistantParts(message, baseUrl),
+    content: assistantParts(message, baseUrl, t),
     status: statusFor(message.status),
   };
 }
@@ -229,6 +233,7 @@ export function createOcgExternalStoreAdapter(
   onCancel?: () => Promise<void>,
   controlBaseUrl?: string | null,
   onLoadEarlier?: () => Promise<void>,
+  t?: TranslateFn,
 ): import("@assistant-ui/react").ExternalStoreAdapter<ChatMessage> {
   const state = getState();
   return {
@@ -239,7 +244,7 @@ export function createOcgExternalStoreAdapter(
     isLoading: false,
     convertMessage: (message, idx) => {
       const current = getState();
-      return convertOcgMessage(message, idx, current.messages, controlBaseUrl ?? null);
+      return convertOcgMessage(message, idx, current.messages, controlBaseUrl ?? null, t);
     },
     onNew,
     onEdit,
