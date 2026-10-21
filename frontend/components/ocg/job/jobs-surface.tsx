@@ -20,9 +20,11 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
 }) {
   const { t } = useI18n();
   const [inspect, setInspect] = useState("");
-  // The tree keeps its own root: picking a Job below it watches that Job
-  // without moving the tree's root.
-  const [treeRoot, setTreeRoot] = useState(job);
+  // Picking a Job below the tree watches that Job without moving the tree's
+  // root; every other change of `job` (list, form, URL) moves the root too.
+  const [treeSelection, setTreeSelection] = useState<{ job: string; root: string } | null>(null);
+  if (treeSelection !== null && treeSelection.job !== job) setTreeSelection(null);
+  const treeRoot = treeSelection?.job === job ? treeSelection.root : job;
   const load = useCallback(async (before: string | undefined, signal: AbortSignal) => {
     if (!active) return { items: [], next: null };
     const page = await client.readJobs({ before, limit: 50, signal });
@@ -30,7 +32,6 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
   }, [client, active]);
   const page = useControlPage(load, active);
   const select = useCallback((next: string) => {
-    setTreeRoot(next);
     onJob(next);
   }, [onJob]);
 
@@ -111,7 +112,10 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
             client={client}
             root={treeRoot}
             selected={job}
-            onSelect={(next) => onJob(next)}
+            onSelect={(next) => {
+              if (next !== job && treeRoot !== null) setTreeSelection({ job: next, root: treeRoot });
+              onJob(next);
+            }}
             onReroot={(next) => select(next)}
             onOpenChat={onOpenChat}
           />

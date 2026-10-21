@@ -53,6 +53,7 @@
 //!   objective as text, which the Job record names only by identity, its
 //!   Attachments by identity, and the Profiles and model it was frozen with.
 //!   Nothing of a Provider's endpoint or credential. See [`catalog`].
+//! - `GET /api/v1/jobs/{job}/tree`: the ancestors above the Job and the work below it.
 //! - `GET /api/v1/agent-profiles?before=profile:N&limit=M`: Agent Profiles,
 //!   newest first, each with the LLM Profiles it may run with and the
 //!   Executors that can run each now. A page reads `limit` Profiles of either

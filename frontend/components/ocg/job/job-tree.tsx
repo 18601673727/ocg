@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, CirclePause, Repeat2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -34,6 +34,18 @@ function stateLabel(t: TranslateFn, state: ControlTreeState): string {
   if (state === "open") return t("jobs.tree.state.open");
   if (state === "closing") return t("jobs.tree.state.closing");
   return runtimeStateLabel(t, state);
+}
+
+/** The children a node already holds, then only the incoming ones no id names. */
+function mergeChildren(existing: ControlTreeNode[], incoming: ControlTreeNode[]): ControlTreeNode[] {
+  const seen = new Set<string>();
+  const merged: ControlTreeNode[] = [];
+  for (const child of [...existing, ...incoming]) {
+    if (seen.has(child.id)) continue;
+    seen.add(child.id);
+    merged.push(child);
+  }
+  return merged;
 }
 
 /** One node with its children replaced, wherever it sits in the tree. */
@@ -73,6 +85,8 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
   const [failure, setFailure] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<{ root: string; revision: number } | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set<string>());
+  // One page per node at a time: a second click while it is in flight is ignored.
+  const loadingNodes = useRef(new Set<string>());
 
   const loading = loaded?.root !== root || loaded?.revision !== revision;
 
@@ -83,7 +97,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
         if (controller.signal.aborted) return;
         setTree(answer.root);
         setAncestors(answer.ancestors);
-        setExpanded(new Set<string>());
+        setExpanded(new Set<string>([answer.root.id]));
         setFailure(null);
         setLoaded({ root, revision });
       },
@@ -98,25 +112,31 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
 
   /** Reads the children of a node the answer did not list, or the page after them. */
   const loadChildren = useCallback(async (node: ControlTreeNode, after?: string) => {
-    const answer = await client.readJobTree(
-      node.id,
-      after === undefined ? { depth: 2 } : { after, depth: 2 },
-    );
-    const fetched = answer.root.children ?? [];
-    setTree((current) => {
-      if (!current) return current;
-      return replaceNode(current, node.id, (existing) => ({
-        ...existing,
-        children: after === undefined ? fetched : [...(existing.children ?? []), ...fetched],
-        has_more_children: answer.root.has_more_children,
-        next_after: answer.root.next_after,
-      }));
-    });
-    setExpanded((current) => new Set([...current, node.id]));
+    if (loadingNodes.current.has(node.id)) return;
+    loadingNodes.current.add(node.id);
+    try {
+      const answer = await client.readJobTree(
+        node.id,
+        after === undefined ? { depth: 2 } : { after, depth: 2 },
+      );
+      const fetched = answer.root.children ?? [];
+      setTree((current) => {
+        if (!current) return current;
+        return replaceNode(current, node.id, (existing) => ({
+          ...existing,
+          children: mergeChildren(after === undefined ? [] : (existing.children ?? []), fetched),
+          has_more_children: answer.root.has_more_children,
+          next_after: answer.root.next_after,
+        }));
+      });
+      setExpanded((current) => new Set([...current, node.id]));
+    } finally {
+      loadingNodes.current.delete(node.id);
+    }
   }, [client]);
 
   const toggle = useCallback((node: ControlTreeNode) => {
-    if (node.children !== null) {
+    if ((node.children?.length ?? 0) > 0) {
       setExpanded((current) => {
         const next = new Set(current);
         if (next.has(node.id)) next.delete(node.id);
@@ -131,9 +151,9 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
     });
   }, [loadChildren]);
 
-  const render = (node: ControlTreeNode, level: number): ReactNode => {
+  const render = (node: ControlTreeNode, level: number, isRoot = false): ReactNode => {
     const isExpanded = expanded.has(node.id);
-    const hasChildren = node.children !== null || node.has_more_children;
+    const hasChildren = (node.children?.length ?? 0) > 0 || node.has_more_children;
     const agent = node.agent_name ?? node.agent ?? t("jobs.tree.noAgent");
     const activeTurn = node.active_turn;
     const nextAfter = node.next_after;
@@ -177,7 +197,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
           {node.recurrence ? (
             <span title={t("jobs.tree.recurring")} className="flex items-center gap-1 text-xs text-muted-foreground">
               <Repeat2 className="size-4" />
-              {node.recurrence.phase}
+              {t(`chat.child.${node.recurrence.phase}`)}
             </span>
           ) : null}
           {node.origin ? (
@@ -251,6 +271,9 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
             </Button>
           </div>
         ) : null}
+        {isRoot && !hasChildren ? (
+          <p className="pl-7 text-sm text-muted-foreground">{t("jobs.tree.empty")}</p>
+        ) : null}
       </li>
     );
   };
@@ -280,12 +303,9 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
       </div>
       {failure ? <p role="alert" className="text-sm text-destructive">{failure}</p> : null}
       {loading && !tree ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
-      {tree && tree.children && tree.children.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{t("jobs.tree.empty")}</p>
-      ) : null}
-      {tree && tree.children && tree.children.length > 0 ? (
+      {tree ? (
         <ul role="tree" aria-label={t("jobs.tree.title")} className="flex flex-col">
-          {tree.children.map((child) => render(child, 1))}
+          {render(tree, 0, true)}
         </ul>
       ) : null}
     </div>

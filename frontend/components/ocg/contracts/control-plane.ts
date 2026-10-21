@@ -997,10 +997,12 @@ export function decodeJobTree(input: unknown, job: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
   if (envelope.job !== job) throw new ContractError("job", "the requested Job");
+  const root = treeNode(envelope.root, "root", 1);
+  if (root.id !== job) throw new ContractError("root.id", "the requested Job");
   return {
     job,
     ancestors: listOf(envelope.ancestors, "ancestors", (entry, path) => identity(entry, path, "job:")),
-    root: treeNode(envelope.root, "root", 1),
+    root,
   };
 }
 
