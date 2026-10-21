@@ -50,23 +50,25 @@
 //! evidence. No message this tool reports repeats a path or any content.
 
 use std::fs::File;
+use std::future::Future;
 use std::io::Write as _;
-use std::sync::Arc;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{AtFlags, FileType, Gid, Mode, OFlags, RenameFlags, Stat};
 use rustix::io::Errno;
 use serde_json::{Value, json};
 
-use crate::orchestration::blocking::{self, Kind};
+use crate::orchestration::blocking::{self, Kind, StopSignal};
 use crate::orchestration::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 use crate::orchestration::workspace_read::{
     self, Refusal as PathRefusal, Step, Workspace, open_at, open_within, read_bytes, read_whole,
 };
-use crate::persistence::{ContentDigest, ToolEffect};
+use crate::persistence::{ContentDigest, JobId, ToolCallRef, ToolEffect};
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_write_file";
@@ -124,6 +126,8 @@ enum Refusal {
     FileTooLargeForDelete,
     #[error("the file could not be deleted")]
     NotDeleted,
+    #[error("the call was stopped before it changed anything")]
+    Stopped,
 }
 
 /// Why what a call did to the Workspace is not known, or not all known.
@@ -277,9 +281,59 @@ fn parent<'a>(workspace: &Workspace, path: &'a str) -> Result<(File, &'a str), R
     })
 }
 
+/// Targets with a mutation in progress, by directory identity and name.
+static TARGETS: std::sync::Mutex<std::collections::BTreeSet<(u64, u64, String)>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+static TARGETS_FREED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Exclusive hold on one target while it is checked and changed, so two
+/// calls cannot both publish over the version each of them checked.
+struct TargetLock(Option<(u64, u64, String)>);
+
+impl TargetLock {
+    /// Waits for the target of `name` in `directory`, giving up when `stop`
+    /// is requested.
+    fn acquire(directory: &File, name: &str, stop: &StopSignal) -> Result<Self, Failure> {
+        let stat = rustix::fs::fstat(directory).map_err(|_| PathRefusal::Unreadable)?;
+        let key = (stat.st_dev as u64, stat.st_ino as u64, name.to_owned());
+        let mut held = TARGETS.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if stop.requested() {
+                return Err(Refusal::Stopped.into());
+            }
+            if !held.contains(&key) {
+                held.insert(key.clone());
+                return Ok(Self(Some(key)));
+            }
+            held = TARGETS_FREED
+                .wait_timeout(held, Duration::from_millis(10))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+impl Drop for TargetLock {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            TARGETS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&key);
+            TARGETS_FREED.notify_all();
+        }
+    }
+}
+
 /// Creates the file at `path` with `content`, when nothing exists there.
-fn create(workspace: &Workspace, path: &str, content: &str) -> Result<(), Failure> {
+fn create(
+    workspace: &Workspace,
+    path: &str,
+    content: &str,
+    stop: &StopSignal,
+) -> Result<(), Failure> {
     let (directory, name) = parent(workspace, path)?;
+    let _target = TargetLock::acquire(&directory, name, stop)?;
     // The exclusive rename is what refuses an existing target; this only
     // names what was found.
     match rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -291,13 +345,20 @@ fn create(workspace: &Workspace, path: &str, content: &str) -> Result<(), Failur
         Err(errno) => return Err(PathRefusal::from_errno(errno).into()),
     }
     let staged = Staged::new(&directory, content, None)?;
-    staged.publish(name, Publication::Exclusive)
+    staged.publish(name, Publication::Exclusive, stop)
 }
 
 /// Replaces the content of the file at `path` with `content`, when its whole
 /// current content is `expected`.
-fn update(workspace: &Workspace, path: &str, expected: &str, content: &str) -> Result<(), Failure> {
+fn update(
+    workspace: &Workspace,
+    path: &str,
+    expected: &str,
+    content: &str,
+    stop: &StopSignal,
+) -> Result<(), Failure> {
     let (directory, name) = parent(workspace, path)?;
+    let _target = TargetLock::acquire(&directory, name, stop)?;
     let file = open_at(&directory, name, Step::File)?;
     let before = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
     let current = read_whole(&file)?;
@@ -315,6 +376,7 @@ fn update(workspace: &Workspace, path: &str, expected: &str, content: &str) -> R
             file: &file,
             read: &read,
         },
+        stop,
     )
 }
 
@@ -324,8 +386,10 @@ fn replace(
     path: &str,
     old: &str,
     new: &str,
+    stop: &StopSignal,
 ) -> Result<(usize, String, String), Failure> {
     let (directory, name) = parent(workspace, path)?;
+    let _target = TargetLock::acquire(&directory, name, stop)?;
     let file = open_within(&directory, name, Step::File, MAX_REPLACE_FILE_BYTES)?;
     let before = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
     let current_bytes = read_bytes(&file, MAX_REPLACE_FILE_BYTES)?;
@@ -371,13 +435,20 @@ fn replace(
             file: &file,
             read: &read,
         },
+        stop,
     )?;
     Ok((offset, before_sha256, after_sha256))
 }
 
 /// Deletes the regular file at `path`, when its whole current content is `expected`.
-fn delete(workspace: &Workspace, path: &str, expected: &str) -> Result<(), Failure> {
+fn delete(
+    workspace: &Workspace,
+    path: &str,
+    expected: &str,
+    stop: &StopSignal,
+) -> Result<(), Failure> {
     let (directory, name) = parent(workspace, path)?;
+    let _target = TargetLock::acquire(&directory, name, stop)?;
     let initial_stat =
         rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| match e {
             Errno::NOENT => PathRefusal::NotFound.into(),
@@ -419,6 +490,9 @@ fn delete(workspace: &Workspace, path: &str, expected: &str) -> Result<(), Failu
         .map_err(|_| Refusal::Changed)?;
     if version(&read) != version(&after) {
         return Err(Refusal::Changed.into());
+    }
+    if stop.requested() {
+        return Err(Refusal::Stopped.into());
     }
     rustix::fs::unlinkat(&directory, name, AtFlags::empty()).map_err(|_| Refusal::NotDeleted)?;
     directory
@@ -503,7 +577,15 @@ impl<'a> Staged<'a> {
     }
 
     /// Gives the target's name the staged content, then syncs the directory.
-    fn publish(mut self, name: &str, publication: Publication<'_>) -> Result<(), Failure> {
+    fn publish(
+        mut self,
+        name: &str,
+        publication: Publication<'_>,
+        stop: &StopSignal,
+    ) -> Result<(), Failure> {
+        if stop.requested() {
+            return Err(self.abandon(Refusal::Stopped));
+        }
         let exclusive = matches!(publication, Publication::Exclusive);
         let renamed = match publication {
             Publication::Exclusive => rustix::fs::renameat_with(
@@ -688,8 +770,36 @@ impl ToolHandler for WriteFile {
         ToolEffect::NonIdempotent
     }
 
-    /// Writes on a dedicated blocking worker while holding a file permit.
+    /// Its blocking workers are tracked, so a stop waits for them.
+    fn spawns(&self) -> bool {
+        true
+    }
+
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
+        self.write(None, arguments)
+    }
+
+    fn call_for(&self, call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
+        self.write(Some(call.job), arguments)
+    }
+
+    /// Stops the writes of `job` and waits until their workers have ended.
+    fn stop(&self, job: JobId) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
+        Box::pin(async move {
+            if blocking::stop_job(job).await {
+                Ok(())
+            } else {
+                Err(ToolFailure::uncertain(
+                    "a write was still running when it was stopped",
+                ))
+            }
+        })
+    }
+}
+
+impl WriteFile {
+    /// Writes on a dedicated blocking worker while holding a file permit.
+    fn write(&self, job: Option<JobId>, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let (path, operation) = parse(&arguments)
                 .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
@@ -703,11 +813,11 @@ impl ToolHandler for WriteFile {
                     let content = content.to_owned();
                     let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
                     let bytes_written = content.len();
-                    blocking::run(Kind::File, move || {
+                    blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
                         #[cfg(test)]
                         write_seam::install_boxed(seam);
                         let _mutation = workspace_read::WorkspaceMutation::begin();
-                        create(&workspace, &path_for_worker, &content)
+                        create(&workspace, &path_for_worker, &content, stop)
                     })
                     .await
                     .map_err(ToolFailure::uncertain)?
@@ -724,11 +834,11 @@ impl ToolHandler for WriteFile {
                     let expected = expected.to_owned();
                     let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
                     let bytes_written = content.len();
-                    blocking::run(Kind::File, move || {
+                    blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
                         #[cfg(test)]
                         write_seam::install_boxed(seam);
                         let _mutation = workspace_read::WorkspaceMutation::begin();
-                        update(&workspace, &path_for_worker, &expected, &content)
+                        update(&workspace, &path_for_worker, &expected, &content, stop)
                     })
                     .await
                     .map_err(ToolFailure::uncertain)?
@@ -744,11 +854,11 @@ impl ToolHandler for WriteFile {
                     let old = old.to_owned();
                     let new = new.to_owned();
                     let (offset, before_sha256, after_sha256) =
-                        blocking::run(Kind::File, move || {
+                        blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
                             #[cfg(test)]
                             write_seam::install_boxed(seam);
                             let _mutation = workspace_read::WorkspaceMutation::begin();
-                            replace(&workspace, &path_for_worker, &old, &new)
+                            replace(&workspace, &path_for_worker, &old, &new, stop)
                         })
                         .await
                         .map_err(ToolFailure::uncertain)?
@@ -763,11 +873,11 @@ impl ToolHandler for WriteFile {
                 }
                 Operation::Delete { expected } => {
                     let expected = expected.to_owned();
-                    blocking::run(Kind::File, move || {
+                    blocking::run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
                         #[cfg(test)]
                         write_seam::install_boxed(seam);
                         let _mutation = workspace_read::WorkspaceMutation::begin();
-                        delete(&workspace, &path_for_worker, &expected)
+                        delete(&workspace, &path_for_worker, &expected, stop)
                     })
                     .await
                     .map_err(ToolFailure::uncertain)?

@@ -509,6 +509,78 @@ where
         .map_err(|_| "the blocking task ended without a result")
 }
 
+/// A worker of a Job still alive: its stop signal and a channel that
+/// disconnects when its thread ends.
+type TrackedWorker = (JobId, StopSignal, flume::Receiver<()>);
+
+static TRACKED: Mutex<Vec<TrackedWorker>> = Mutex::new(Vec::new());
+
+/// Like [`run`], for work that mutates: the worker waits for its permit only
+/// until `stop` is requested, `work` is given `stop` to check before it
+/// changes anything, and [`stop_job`] can wait for the thread to end.
+pub(crate) async fn run_tracked<T, F>(
+    job: Option<JobId>,
+    kind: Kind,
+    stop: StopSignal,
+    work: F,
+) -> Result<T, &'static str>
+where
+    T: Send + 'static,
+    F: FnOnce(&StopSignal) -> T + Send + 'static,
+{
+    let (send, receive) = flume::bounded(1);
+    let (alive, ended) = flume::bounded::<()>(1);
+    {
+        let mut tracked = TRACKED.lock().unwrap_or_else(PoisonError::into_inner);
+        tracked.retain(|(_, _, ended)| !ended.is_disconnected());
+        if let Some(job) = job {
+            tracked.push((job, stop.clone(), ended));
+        }
+    }
+    thread::Builder::new()
+        .name("ocg-blocking-work".to_owned())
+        .spawn(move || {
+            let _alive = alive;
+            let Ok(_permit) = Permit::acquire_until_stopped(kind, Some(&stop), None) else {
+                return;
+            };
+            if send.send(work(&stop)).is_err() {
+                log::debug!("blocking work result was dropped");
+            }
+        })
+        .map_err(|_| "the blocking task could not be started")?;
+    receive
+        .recv_async()
+        .await
+        .map_err(|_| "the blocking task ended without a result")
+}
+
+/// Requests a stop of the tracked workers of `job` and waits until their
+/// threads have ended, for at most [`STOP_GRACE`].
+pub(crate) async fn stop_job(job: JobId) -> bool {
+    let workers = {
+        let mut tracked = TRACKED.lock().unwrap_or_else(PoisonError::into_inner);
+        tracked.retain(|(_, _, ended)| !ended.is_disconnected());
+        tracked
+            .iter()
+            .filter(|(owner, _, _)| *owner == job)
+            .map(|(_, stop, ended)| (stop.clone(), ended.clone()))
+            .collect::<Vec<_>>()
+    };
+    for (stop, _) in &workers {
+        stop.request();
+    }
+    let deadline = Instant::now() + STOP_GRACE;
+    for (_, ended) in workers {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match ntex::util::select(ended.recv_async(), ntex::time::sleep(wait)).await {
+            ntex::util::Either::Left(_) => {}
+            ntex::util::Either::Right(()) => return false,
+        }
+    }
+    true
+}
+
 fn signal(group: Pid, signal: Signal) {
     if let Err(error) = rustix::process::kill_process_group(group, signal)
         && error != rustix::io::Errno::SRCH
