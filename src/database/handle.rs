@@ -1764,6 +1764,14 @@ impl DatabaseHandle {
         if ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err() {
             return Err("credential secret is not a valid HTTP Bearer token".to_string());
         }
+        {
+            let admission = self
+                .shared
+                .admission
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            admitted(&admission).map_err(|error| error.to_string())?;
+        }
         let mut guard = self
             .shared
             .credentials
@@ -1773,9 +1781,20 @@ impl DatabaseHandle {
         updated.insert(reference.to_string(), secret.to_string());
         let serialized = serde_json::to_vec(&updated)
             .map_err(|error| format!("failed to serialize credentials: {error}"))?;
-        let temp_path = self.shared.credentials_path.with_extension("json.tmp");
+        let temp_path = self.shared.credentials_path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            rustix::fs::OFlags::NOFOLLOW.bits() as i32,
+        );
         crate::data_directory::private_file(&mut options);
         let mut file = options
             .open(&temp_path)
@@ -1784,8 +1803,13 @@ impl DatabaseHandle {
             .and_then(|()| file.sync_all())
             .map_err(|error| format!("failed to write credential staging file: {error}"))?;
         drop(file);
-        std::fs::rename(&temp_path, &self.shared.credentials_path)
-            .map_err(|error| format!("failed to commit credential store: {error}"))?;
+        if let Err(error) = std::fs::rename(&temp_path, &self.shared.credentials_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("failed to commit credential store: {error}"));
+        }
+        std::fs::File::open(&self.shared.database_directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync the credential directory: {error}"))?;
         let _ = crate::data_directory::restrict_file(&self.shared.credentials_path);
         *guard = updated;
         Ok(())

@@ -218,7 +218,13 @@ impl DatabaseWorker {
                     }
                 };
                 let credentials_path = directory.join("credentials.json");
-                let credentials = load_credentials_file(&credentials_path);
+                let credentials = match load_credentials_file(&credentials_path) {
+                    Ok(credentials) => credentials,
+                    Err(error) => {
+                        ready_sender.send(Err(DatabaseError::Open(error))).ok();
+                        return Ok(());
+                    }
+                };
                 let shared = Arc::new(Shared {
                     data_directory: data_directory.clone(),
                     scheduler_wake,
@@ -417,15 +423,19 @@ pub(super) fn open_error(error: OpenError, directory: &std::path::Path) -> Datab
     }
 }
 
-fn load_credentials_file(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
-    if !path.exists() {
-        return std::collections::BTreeMap::new();
-    }
+fn load_credentials_file(
+    path: &std::path::Path,
+) -> Result<std::collections::BTreeMap<String, String>, StorageError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(std::collections::BTreeMap::new());
+        }
+        Err(error) => return Err(redb::Error::Io(error).into()),
+    };
     let _ = crate::data_directory::restrict_file(path);
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| serde_json::from_str(&contents).ok())
-        .unwrap_or_default()
+    serde_json::from_str(&contents)
+        .map_err(|_| StorageError::corrupted("credentials.json is invalid"))
 }
 
 pub(super) fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseError> {

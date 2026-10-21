@@ -1588,7 +1588,15 @@ impl ToolHandler for WorkspaceCode {
                     if text_budget == 0 { return Err(refused("result limit too small for counts")); }
                     text_budget = text_budget.saturating_sub(bytes - max_result_bytes);
                 };
-                *previous.lock().unwrap_or_else(PoisonError::into_inner) = scan.files;
+                // Only files this call indexed count as seen; one that was
+                // skipped stays changed for the next call.
+                *previous.lock().unwrap_or_else(PoisonError::into_inner) = scan
+                    .files
+                    .into_iter()
+                    .filter(|(path, stamp)| {
+                        index.files.get(path).is_some_and(|file| file.stamp == *stamp)
+                    })
+                    .collect();
                 Ok(result)
             }).await.map_err(ToolFailure::uncertain)?
         })
