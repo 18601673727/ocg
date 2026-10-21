@@ -108,7 +108,7 @@ pub(crate) use reads::{
     read_job_input_for_job, read_job_tree, read_jobs, read_latest_output, read_occupancy,
     read_outputs, read_pending_jobs, read_pool_binding, read_project, read_projects, read_retries,
     read_submission, read_tool_evidence, read_tool_stats, read_unresolved_executions,
-    read_usage_summary, unneeded_content,
+    read_usage_buckets, read_usage_summary, unneeded_content,
 };
 pub(crate) use reads::{
     TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,

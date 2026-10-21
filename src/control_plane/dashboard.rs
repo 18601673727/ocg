@@ -213,10 +213,18 @@ pub(super) async fn tool_stats(shared: &Shared) -> Result<Reply, Refusal> {
     )
 }
 
+const MAX_USAGE_BUCKETS: i64 = 400;
+
 pub(super) fn usage_summary_query(
     query: &str,
-) -> Result<crate::persistence::UsageSummaryFilter, Refusal> {
-    use crate::persistence::USAGE_SUMMARY_HOUR_MICROS as HOUR;
+) -> Result<
+    (
+        crate::persistence::UsageSummaryFilter,
+        Option<crate::persistence::UsageBucketing>,
+    ),
+    Refusal,
+> {
+    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketWidth, UsageBucketing};
     let mut values = pairs(query)?;
     let from_us = values
         .remove("from_us")
@@ -249,6 +257,59 @@ pub(super) fn usage_summary_query(
             return Err(INVALID_REQUEST);
         }
     }
+    let bucket = values
+        .remove("bucket")
+        .map(|value| match value {
+            "day" => Ok(UsageBucketWidth::Day),
+            "week" => Ok(UsageBucketWidth::Week),
+            _ => Err(INVALID_REQUEST),
+        })
+        .transpose()?;
+    let offset = values
+        .remove("tz_offset_minutes")
+        .map(|value| {
+            let offset = if let Some(value) = value.strip_prefix('-') {
+                decimal::<i32>(value)
+                    .filter(|offset| *offset != 0)
+                    .map(|offset| -offset)
+            } else {
+                decimal::<i32>(value)
+            };
+            offset
+                .filter(|offset| (-840..=840).contains(offset) && offset % 60 == 0)
+                .ok_or(INVALID_REQUEST)
+        })
+        .transpose()?;
+    let bucketing = match bucket {
+        Some(width) => {
+            let bucketing = UsageBucketing {
+                width,
+                offset_minutes: offset.unwrap_or(0),
+            };
+            let from = from_us
+                .and_then(|us| bucketing.start_of(us))
+                .ok_or(INVALID_REQUEST)?;
+            let until = until_us
+                .and_then(|us| us.checked_sub(1))
+                .and_then(|us| bucketing.end_of(us))
+                .ok_or(INVALID_REQUEST)?;
+            let width = bucketing
+                .end_of(from)
+                .and_then(|end| end.checked_sub(from))
+                .ok_or(INVALID_REQUEST)?;
+            let count = until.checked_sub(from).ok_or(INVALID_REQUEST)? / width;
+            if count > MAX_USAGE_BUCKETS {
+                return Err(INVALID_REQUEST);
+            }
+            Some(bucketing)
+        }
+        None => {
+            if offset.is_some() {
+                return Err(INVALID_REQUEST);
+            }
+            None
+        }
+    };
     let agent = values
         .remove("agent")
         .map(|value| super::profiles::profile_id(value).map(|id| id.get()))
@@ -256,45 +317,81 @@ pub(super) fn usage_summary_query(
     if !values.is_empty() {
         return Err(INVALID_REQUEST);
     }
-    Ok(crate::persistence::UsageSummaryFilter {
-        from_us,
-        until_us,
-        agent,
+    Ok((
+        crate::persistence::UsageSummaryFilter {
+            from_us,
+            until_us,
+            agent,
+        },
+        bucketing,
+    ))
+}
+
+fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> Value {
+    json!({
+        // 0 is "no Agent"; it is never a Profile id.
+        "agent": (row.agent != 0).then(|| format!("profile:{}", row.agent)),
+        "provider": format!("llm_provider:{}", row.provider),
+        "model": row.model,
+        "requests": row.requests,
+        "complete_requests": row.complete_requests,
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "cache_read_tokens": row.cache_read_tokens,
+        "cache_write_tokens": row.cache_write_tokens,
+        "reasoning_tokens": row.reasoning_tokens,
     })
 }
 
 pub(super) async fn usage_summary(
     shared: &Shared,
     filter: crate::persistence::UsageSummaryFilter,
+    bucketing: Option<crate::persistence::UsageBucketing>,
 ) -> Result<Reply, Refusal> {
-    let summary = shared.database.usage_summary(filter).await?;
-    let rows = summary
-        .rows
-        .iter()
-        .map(|row| {
+    let val = match bucketing {
+        None => {
+            let summary = shared.database.usage_summary(filter).await?;
+            let rows = summary
+                .rows
+                .iter()
+                .map(usage_summary_row)
+                .collect::<Vec<_>>();
             json!({
-                // 0 is "no Agent"; it is never a Profile id.
-                "agent": (row.agent != 0).then(|| format!("profile:{}", row.agent)),
-                "provider": format!("llm_provider:{}", row.provider),
-                "model": row.model,
-                "requests": row.requests,
-                "complete_requests": row.complete_requests,
-                "input_tokens": row.input_tokens,
-                "output_tokens": row.output_tokens,
-                "cache_read_tokens": row.cache_read_tokens,
-                "cache_write_tokens": row.cache_write_tokens,
-                "reasoning_tokens": row.reasoning_tokens,
+                "api_version": API_VERSION,
+                "from_us": summary.from_us,
+                "until_us": summary.until_us,
+                "complete": summary.complete,
+                "resume_from_us": summary.resume_from_us,
+                "rows": rows,
             })
-        })
-        .collect::<Vec<_>>();
-    let val = json!({
-        "api_version": API_VERSION,
-        "from_us": summary.from_us,
-        "until_us": summary.until_us,
-        "complete": summary.complete,
-        "resume_from_us": summary.resume_from_us,
-        "rows": rows,
-    });
+        }
+        Some(bucketing) => {
+            let summary = shared.database.usage_buckets(filter, bucketing).await?;
+            let rows = summary
+                .rows
+                .iter()
+                .map(|bucket| {
+                    let mut row = usage_summary_row(&bucket.row);
+                    row["bucket_us"] = json!(bucket.bucket_us);
+                    row
+                })
+                .collect::<Vec<_>>();
+            let bucket = match bucketing.width {
+                crate::persistence::UsageBucketWidth::Day => "day",
+                crate::persistence::UsageBucketWidth::Week => "week",
+            };
+            json!({
+                "api_version": API_VERSION,
+                "from_us": summary.from_us,
+                "until_us": summary.until_us,
+                "complete": summary.complete,
+                "resume_from_us": summary.resume_from_us,
+                "bucket": bucket,
+                "tz_offset_minutes": bucketing.offset_minutes,
+                "rows": rows,
+            })
+        }
+    };
     bounded(shared, val)
 }
 
@@ -450,13 +547,14 @@ mod tests {
 
     #[test]
     fn usage_summary_query_parsing() {
-        let filter = usage_summary_query("").expect("empty query");
+        let filter = usage_summary_query("").expect("empty query").0;
         assert_eq!(filter.from_us, None);
         assert_eq!(filter.until_us, None);
         assert_eq!(filter.agent, None);
 
         let filter = usage_summary_query("from_us=100&until_us=200&agent=profile:42")
-            .expect("profile query");
+            .expect("profile query")
+            .0;
         assert_eq!(filter.from_us, Some(100));
         assert_eq!(filter.until_us, Some(200));
         assert_eq!(filter.agent, Some(42));
@@ -472,5 +570,27 @@ mod tests {
         );
         assert!(usage_summary_query("model=gpt-4o").is_err());
         assert!(usage_summary_query("unknown=1").is_err());
+        let day = usage_summary_query("bucket=day&from_us=0&until_us=86400000000").unwrap();
+        assert_eq!(
+            day.1.unwrap().width,
+            crate::persistence::UsageBucketWidth::Day
+        );
+        assert!(usage_summary_query("bucket=week&from_us=0&until_us=604800000000").is_ok());
+        assert!(usage_summary_query("bucket=day&from_us=0&until_us=34560000000000").is_ok());
+        let west =
+            usage_summary_query("bucket=day&from_us=0&until_us=86400000000&tz_offset_minutes=-300")
+                .unwrap();
+        assert_eq!(west.1.unwrap().offset_minutes, -300);
+        for query in [
+            "bucket=day",
+            "bucket=hour&from_us=0&until_us=86400000000",
+            "bucket=month&from_us=0&until_us=86400000000",
+            "bucket=day&from_us=0&until_us=86400000000&tz_offset_minutes=30",
+            "bucket=day&from_us=0&until_us=86400000000&tz_offset_minutes=-0",
+            "tz_offset_minutes=60",
+            "bucket=day&from_us=0&until_us=34646400000000",
+        ] {
+            assert!(usage_summary_query(query).is_err(), "{query}");
+        }
     }
 }

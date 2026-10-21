@@ -6,6 +6,7 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useControlPage } from "../runtime/use-control-page";
 import type { decodeAvailability, decodeHealth, decodeUsage } from "../contracts";
 import { useI18n } from "../i18n";
+import { UsageChart } from "./usage-chart.tsx";
 
 type Usage = ReturnType<typeof decodeUsage>["observations"][number];
 type Availability = ReturnType<typeof decodeAvailability>["observations"][number];
@@ -72,6 +73,7 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
           <Button variant="outline" disabled={page.loading} onClick={() => setWindowEnd(Date.now() * 1000)}>{t("common.refresh")}</Button>
         </div>
       </div>
+      {kind === "usage" ? <UsageChart client={client} reloadKey={windowEnd} /> : null}
       {kind === "health" ? (
         <>
           <section aria-label={t("observations.runtimeHealth")} className="grid gap-3 sm:grid-cols-4">

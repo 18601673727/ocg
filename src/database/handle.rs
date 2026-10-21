@@ -153,6 +153,15 @@ impl DatabaseHandle {
             .await
     }
 
+    pub async fn usage_buckets(
+        &self,
+        filter: crate::persistence::UsageSummaryFilter,
+        bucketing: crate::persistence::UsageBucketing,
+    ) -> Result<crate::persistence::UsageBucketResponse, DatabaseError> {
+        self.read(move |database| storage::read_usage_buckets(database, &filter, &bucketing))
+            .await
+    }
+
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
         self.shared
             .scheduler_subscription

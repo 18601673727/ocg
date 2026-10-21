@@ -968,3 +968,56 @@ pub struct UsageSummaryFilter {
     pub until_us: Option<i64>,
     pub agent: Option<u64>,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UsageBucketWidth {
+    #[default]
+    Day,
+    Week,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBucketing {
+    pub width: UsageBucketWidth,
+    pub offset_minutes: i32,
+}
+
+impl UsageBucketing {
+    pub fn start_of(self, us: i64) -> Option<i64> {
+        const DAY: i64 = 86_400_000_000;
+        let offset = i64::from(self.offset_minutes).checked_mul(60_000_000)?;
+        let (width, anchor) = match self.width {
+            UsageBucketWidth::Day => (DAY, 0),
+            UsageBucketWidth::Week => (7 * DAY, 4 * DAY),
+        };
+        us.checked_add(offset)?
+            .checked_sub(anchor)?
+            .div_euclid(width)
+            .checked_mul(width)?
+            .checked_add(anchor)?
+            .checked_sub(offset)
+    }
+
+    pub fn end_of(self, us: i64) -> Option<i64> {
+        let width = match self.width {
+            UsageBucketWidth::Day => 86_400_000_000,
+            UsageBucketWidth::Week => 7 * 86_400_000_000,
+        };
+        self.start_of(us)?.checked_add(width)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBucketRow {
+    pub bucket_us: i64,
+    pub row: UsageSummaryRow,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBucketResponse {
+    pub from_us: i64,
+    pub until_us: i64,
+    pub complete: bool,
+    pub resume_from_us: Option<i64>,
+    pub rows: Vec<UsageBucketRow>,
+}

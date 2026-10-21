@@ -1658,6 +1658,7 @@ pub(crate) fn read_tool_stats(
 }
 
 pub const MAX_USAGE_SCAN: usize = 100_000;
+const MAX_USAGE_BUCKET_ROWS: usize = 1_000;
 
 fn resolve_model_name(
     rx: &ReadTransaction,
@@ -1678,19 +1679,15 @@ fn resolve_model_name(
     Ok(None)
 }
 
-type UsageGroupKey = (u64, u64, [u8; 32]);
+type UsageGroupKey = (i64, u64, u64, [u8; 32]);
 type UsageCounters = (u64, u64, u64, u64, u64, u64, u64);
 
 pub(crate) fn read_usage_summary(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,
 ) -> Result<crate::persistence::UsageSummaryResponse, StorageError> {
-    use crate::persistence::{
-        USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse, UsageSummaryRow,
-    };
+    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse};
 
-    let rx = read(database)?;
-    let table = rx.open_table(USAGE_TOTALS)?;
     // `from_us` is inclusive and rounds down to its bucket; `until_us` is
     // exclusive and rounds up, so the buckets scanned are exactly those an
     // instant in `[from_us, until_us)` falls in. The last bucket is
@@ -1740,85 +1737,13 @@ pub(crate) fn read_usage_summary(
         });
     }
 
-    let start = (from_hour, 0, 0, [0u8; 32]);
-    let end = (until_hour, u64::MAX, u64::MAX, [0xffu8; 32]);
-
-    let mut current_hour: Option<i64> = None;
-    let mut resume_from_us = None;
-    let mut earliest_hour: Option<i64> = None;
-    let mut latest_hour: Option<i64> = None;
-
-    let mut grouped: std::collections::BTreeMap<UsageGroupKey, UsageCounters> =
-        std::collections::BTreeMap::new();
-
-    for (scanned_rows, entry) in table.range(start..=end)?.enumerate() {
-        let (key, value) = entry?;
-        let (hour, agent, provider, model_hash) = key.value();
-
-        if let Some(cur) = current_hour {
-            if hour != cur {
-                if scanned_rows >= MAX_USAGE_SCAN {
-                    resume_from_us = Some(hour.checked_mul(HOUR).ok_or_else(|| {
-                        StorageError::corrupted("usage summary resume point overflows")
-                    })?);
-                    break;
-                }
-                current_hour = Some(hour);
-            }
-        } else {
-            current_hour = Some(hour);
-        }
-
-        if earliest_hour.is_none() {
-            earliest_hour = Some(hour);
-        }
-        latest_hour = Some(hour);
-
-        if let Some(target_agent) = filter.agent
-            && agent != target_agent
-        {
-            continue;
-        }
-
-        let (reqs, comp, inp, out, cr, cw, reas) = value.value();
-        let slot = grouped
-            .entry((agent, provider, model_hash))
-            .or_insert((0, 0, 0, 0, 0, 0, 0));
-        slot.0 = slot.0.saturating_add(reqs);
-        slot.1 = slot.1.saturating_add(comp);
-        slot.2 = slot.2.saturating_add(inp);
-        slot.3 = slot.3.saturating_add(out);
-        slot.4 = slot.4.saturating_add(cr);
-        slot.5 = slot.5.saturating_add(cw);
-        slot.6 = slot.6.saturating_add(reas);
-    }
-
-    let mut model_cache: std::collections::HashMap<(u64, [u8; 32]), Option<String>> =
-        std::collections::HashMap::new();
-    let mut rows = Vec::with_capacity(grouped.len());
-
-    for ((agent, provider, model_hash), (reqs, comp, inp, out, cr, cw, reas)) in grouped {
-        let model = match model_cache.entry((provider, model_hash)) {
-            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let resolved = resolve_model_name(&rx, provider, model_hash)?;
-                e.insert(resolved.clone());
-                resolved
-            }
-        };
-        rows.push(UsageSummaryRow {
-            agent,
-            provider,
-            model,
-            requests: reqs,
-            complete_requests: comp,
-            input_tokens: inp,
-            output_tokens: out,
-            cache_read_tokens: cr,
-            cache_write_tokens: cw,
-            reasoning_tokens: reas,
-        });
-    }
+    let UsageScan {
+        rows,
+        earliest_hour,
+        latest_hour,
+        resume_from_us,
+    } = scan_usage_totals(database, filter, from_hour, until_hour, None)?;
+    let rows = rows.into_iter().map(|bucket| bucket.row).collect();
 
     let effective_from_us = requested_from_us
         .or_else(|| earliest_hour.map(|hour| hour.saturating_mul(HOUR)))
@@ -1842,6 +1767,172 @@ pub(crate) fn read_usage_summary(
         complete: resume_from_us.is_none(),
         resume_from_us,
         rows,
+    })
+}
+
+pub(crate) fn read_usage_buckets(
+    database: &Database,
+    filter: &crate::persistence::UsageSummaryFilter,
+    bucketing: &crate::persistence::UsageBucketing,
+) -> Result<crate::persistence::UsageBucketResponse, StorageError> {
+    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketResponse};
+
+    if bucketing.offset_minutes % 60 != 0 || !(-840..=840).contains(&bucketing.offset_minutes) {
+        return Err(StorageError::corrupted("invalid usage bucket offset"));
+    }
+    let from_us = filter
+        .from_us
+        .and_then(|us| bucketing.start_of(us))
+        .ok_or_else(|| StorageError::corrupted("usage buckets require a representable from_us"))?;
+    let until_us = filter
+        .until_us
+        .and_then(|us| us.checked_sub(1))
+        .and_then(|us| bucketing.end_of(us))
+        .ok_or_else(|| StorageError::corrupted("usage buckets require a representable until_us"))?;
+    let scan = scan_usage_totals(
+        database,
+        filter,
+        from_us.div_euclid(HOUR),
+        until_us.div_euclid(HOUR) - 1,
+        Some(bucketing),
+    )?;
+    Ok(UsageBucketResponse {
+        from_us,
+        until_us: scan.resume_from_us.unwrap_or(until_us),
+        complete: scan.resume_from_us.is_none(),
+        resume_from_us: scan.resume_from_us,
+        rows: scan.rows,
+    })
+}
+
+#[derive(Default)]
+struct UsageScan {
+    rows: Vec<crate::persistence::UsageBucketRow>,
+    earliest_hour: Option<i64>,
+    latest_hour: Option<i64>,
+    resume_from_us: Option<i64>,
+}
+
+fn scan_usage_totals(
+    database: &Database,
+    filter: &crate::persistence::UsageSummaryFilter,
+    from_hour: i64,
+    until_hour: i64,
+    bucketing: Option<&crate::persistence::UsageBucketing>,
+) -> Result<UsageScan, StorageError> {
+    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketRow, UsageSummaryRow};
+
+    let rx = read(database)?;
+    let table = rx.open_table(USAGE_TOTALS)?;
+    if from_hour > until_hour {
+        return Ok(UsageScan::default());
+    }
+    let start = (from_hour, 0, 0, [0u8; 32]);
+    let end = (until_hour, u64::MAX, u64::MAX, [0xffu8; 32]);
+
+    let mut current_bucket: Option<i64> = None;
+    let mut resume_from_us = None;
+    let mut earliest_hour: Option<i64> = None;
+    let mut latest_hour: Option<i64> = None;
+
+    let mut grouped: std::collections::BTreeMap<UsageGroupKey, UsageCounters> =
+        std::collections::BTreeMap::new();
+
+    for (scanned_rows, entry) in table.range(start..=end)?.enumerate() {
+        let (key, value) = entry?;
+        let (hour, agent, provider, model_hash) = key.value();
+
+        let bucket_us = match bucketing {
+            Some(bucketing) => hour
+                .checked_mul(HOUR)
+                .and_then(|us| bucketing.start_of(us))
+                .ok_or_else(|| StorageError::corrupted("usage bucket overflows"))?,
+            None => hour,
+        };
+        if let Some(cur) = current_bucket {
+            if bucket_us != cur {
+                if scanned_rows >= MAX_USAGE_SCAN
+                    || (bucketing.is_some() && grouped.len() >= MAX_USAGE_BUCKET_ROWS)
+                {
+                    resume_from_us = Some(match bucketing {
+                        Some(_) => bucket_us,
+                        None => hour.checked_mul(HOUR).ok_or_else(|| {
+                            StorageError::corrupted("usage summary resume point overflows")
+                        })?,
+                    });
+                    break;
+                }
+                current_bucket = Some(bucket_us);
+            }
+        } else {
+            current_bucket = Some(bucket_us);
+        }
+
+        if earliest_hour.is_none() {
+            earliest_hour = Some(hour);
+        }
+        latest_hour = Some(hour);
+
+        if let Some(target_agent) = filter.agent
+            && agent != target_agent
+        {
+            continue;
+        }
+
+        let (reqs, comp, inp, out, cr, cw, reas) = value.value();
+        let slot = grouped
+            .entry((
+                if bucketing.is_some() { bucket_us } else { 0 },
+                agent,
+                provider,
+                model_hash,
+            ))
+            .or_insert((0, 0, 0, 0, 0, 0, 0));
+        slot.0 = slot.0.saturating_add(reqs);
+        slot.1 = slot.1.saturating_add(comp);
+        slot.2 = slot.2.saturating_add(inp);
+        slot.3 = slot.3.saturating_add(out);
+        slot.4 = slot.4.saturating_add(cr);
+        slot.5 = slot.5.saturating_add(cw);
+        slot.6 = slot.6.saturating_add(reas);
+    }
+
+    let mut model_cache: std::collections::HashMap<(u64, [u8; 32]), Option<String>> =
+        std::collections::HashMap::new();
+    let mut rows = Vec::with_capacity(grouped.len());
+
+    for ((bucket_us, agent, provider, model_hash), (reqs, comp, inp, out, cr, cw, reas)) in grouped
+    {
+        let model = match model_cache.entry((provider, model_hash)) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let resolved = resolve_model_name(&rx, provider, model_hash)?;
+                e.insert(resolved.clone());
+                resolved
+            }
+        };
+        rows.push(UsageBucketRow {
+            bucket_us,
+            row: UsageSummaryRow {
+                agent,
+                provider,
+                model,
+                requests: reqs,
+                complete_requests: comp,
+                input_tokens: inp,
+                output_tokens: out,
+                cache_read_tokens: cr,
+                cache_write_tokens: cw,
+                reasoning_tokens: reas,
+            },
+        });
+    }
+
+    Ok(UsageScan {
+        rows,
+        earliest_hour,
+        latest_hour,
+        resume_from_us,
     })
 }
 

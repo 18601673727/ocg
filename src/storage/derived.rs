@@ -1089,6 +1089,102 @@ mod tests {
     }
 
     #[test]
+    fn usage_summary_buckets_by_day_and_week() {
+        use crate::database::DatabaseWorker;
+        use crate::openai_compatible::NormalizedUsage;
+        use crate::persistence::*;
+        use crate::test_support::wait;
+        use std::collections::BTreeSet;
+
+        const H: i64 = USAGE_SUMMARY_HOUR_MICROS;
+        const D: i64 = 24 * H;
+        let (_data, directory) = data_directory("derived", "usage-buckets");
+        let worker = DatabaseWorker::start(&directory).expect("worker");
+        let database = worker.handle();
+        let (pool, llm) = provision(&database);
+        let job = wait(database.create_job(NewJob {
+            process_grant: None,
+            name: None,
+            eligible_at: None,
+            parent: database.genesis(),
+            project: None,
+            input: JobInputDraft::default(),
+            configuration: Some(ExecutionConfiguration {
+                agent_profile: None,
+                llm_profile: llm,
+            }),
+            previous: None,
+        }))
+        .unwrap();
+        wait(database.claim_execution(ClaimRequest {
+            job,
+            allowed_pools: BTreeSet::from([pool]),
+        }))
+        .unwrap()
+        .unwrap();
+        let second = RequestNumber::FIRST.next().unwrap();
+        let third = second.next().unwrap();
+        for (request, at, input) in [
+            (RequestNumber::FIRST, 4 * D + 3 * H, 10),
+            (second, 4 * D + 15 * H, 20),
+            (third, 5 * D + 5 * H, 30),
+        ] {
+            wait(database.record_metrics(NewMetrics {
+                job,
+                request,
+                observed_at: Timestamp::from_unix_micros(at),
+                measurements: Measurements {
+                    usage: NormalizedUsage {
+                        input_tokens: Some(input),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                token: Some(crate::token_usage::TokenAnnotation::eligible(
+                    crate::token_usage::UsageFinality::Final,
+                )),
+            }))
+            .unwrap();
+        }
+        for (width, offset_minutes, expected) in [
+            (UsageBucketWidth::Day, 0, vec![(4 * D, 30), (5 * D, 30)]),
+            (
+                UsageBucketWidth::Day,
+                600,
+                vec![(4 * D - 10 * H, 10), (5 * D - 10 * H, 50)],
+            ),
+            (UsageBucketWidth::Week, 0, vec![(4 * D, 60)]),
+        ] {
+            let bucketing = UsageBucketing {
+                width,
+                offset_minutes,
+            };
+            let summary = wait(database.usage_buckets(
+                UsageSummaryFilter {
+                    from_us: Some(0),
+                    until_us: Some(7 * D),
+                    agent: None,
+                },
+                bucketing,
+            ))
+            .unwrap();
+            assert!(summary.complete);
+            assert_eq!(summary.resume_from_us, None);
+            assert_eq!(summary.from_us, bucketing.start_of(0).unwrap());
+            assert_eq!(summary.until_us, bucketing.end_of(7 * D - 1).unwrap());
+            assert_eq!(
+                summary
+                    .rows
+                    .iter()
+                    .map(|bucket| (bucket.bucket_us, bucket.row.input_tokens))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn usage_totals_cumulative_then_final_and_agent_hour_filtering() {
         use crate::database::DatabaseWorker;
         use crate::openai_compatible::NormalizedUsage;

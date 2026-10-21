@@ -12,7 +12,10 @@ pub(super) enum Route {
         limit: usize,
     },
     Usage(dashboard::ObservationQuery),
-    UsageSummary(crate::persistence::UsageSummaryFilter),
+    UsageSummary(
+        crate::persistence::UsageSummaryFilter,
+        Option<crate::persistence::UsageBucketing>,
+    ),
     ToolStats,
     Availability(dashboard::ObservationQuery),
     Logs(dashboard::LogQuery),
@@ -102,7 +105,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Jobs { .. }
             | Route::Conversations { .. }
             | Route::Usage(_)
-            | Route::UsageSummary(_)
+            | Route::UsageSummary(..)
             | Route::ToolStats
             | Route::Availability(_)
             | Route::Logs(_)
@@ -220,7 +223,8 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["conversations"] => catalog::conversations_query(query)
             .map(|(before, limit)| Route::Conversations { before, limit }),
         ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
-        ["usage", "summary"] => dashboard::usage_summary_query(query).map(Route::UsageSummary),
+        ["usage", "summary"] => dashboard::usage_summary_query(query)
+            .map(|(filter, bucketing)| Route::UsageSummary(filter, bucketing)),
         ["tool-stats"] => no_query(query).map(|()| Route::ToolStats),
         ["availability"] => dashboard::ObservationQuery::parse(query).map(Route::Availability),
         ["logs"] => dashboard::LogQuery::parse(query).map(Route::Logs),
@@ -388,7 +392,9 @@ pub(super) async fn respond(
             catalog::conversations(database, before, limit).await
         }
         Route::Usage(query) => dashboard::usage(shared, query).await,
-        Route::UsageSummary(filter) => dashboard::usage_summary(shared, filter).await,
+        Route::UsageSummary(filter, bucketing) => {
+            dashboard::usage_summary(shared, filter, bucketing).await
+        }
         Route::ToolStats => dashboard::tool_stats(shared).await,
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,

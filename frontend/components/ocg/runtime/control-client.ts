@@ -15,6 +15,7 @@ import {
   decodeHealth,
   decodeJobs,
   decodeUsage,
+  decodeUsageBuckets,
   decodeAvailability,
   decodeLogs,
   decodeJob,
@@ -459,6 +460,20 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     async readUsage(settings: ObservationSettings = {}) {
       return decodeUsage((await send("GET", `/api/v1/usage${observationQuery(settings)}`, { signal: settings.signal })).input);
+    },
+
+    async readUsageBuckets({ fromUs, untilUs, bucket, tzOffsetMinutes, signal }: {
+      fromUs: number;
+      untilUs: number;
+      bucket: "day" | "week";
+      tzOffsetMinutes: number;
+      signal?: AbortSignal;
+    }) {
+      if (!Number.isSafeInteger(tzOffsetMinutes)) {
+        throw new ContractError("tz_offset_minutes", "a signed safe integer");
+      }
+      const query = `from_us=${sequence(fromUs)}&until_us=${sequence(untilUs)}&bucket=${bucket}&tz_offset_minutes=${tzOffsetMinutes}`;
+      return decodeUsageBuckets((await send("GET", `/api/v1/usage/summary?${query}`, { signal })).input);
     },
 
     async readAvailability(settings: ObservationSettings = {}) {

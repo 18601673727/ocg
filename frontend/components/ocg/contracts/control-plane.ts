@@ -278,6 +278,53 @@ export function decodeUsage(input: unknown) {
   };
 }
 
+export function decodeUsageBuckets(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== 1) throw new ContractError("api_version", "1");
+  const bucket = envelope.bucket;
+  if (bucket !== "day" && bucket !== "week") throw new ContractError("bucket", "day or week");
+  const signedInteger = (value: unknown, path: string): number => {
+    if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+      throw new ContractError(path, "a signed safe integer");
+    }
+    return value;
+  };
+  const offset = signedInteger(envelope.tz_offset_minutes, "tz_offset_minutes");
+  if (offset < -840 || offset > 840 || offset % 60 !== 0) {
+    throw new ContractError("tz_offset_minutes", "whole hours from -840 to 840 minutes");
+  }
+  const complete = boolean(envelope.complete, "complete");
+  const resume = envelope.resume_from_us === null ? null : signedInteger(envelope.resume_from_us, "resume_from_us");
+  if (complete !== (resume === null)) {
+    throw new ContractError("resume_from_us", "null exactly when complete");
+  }
+  return {
+    api_version: 1,
+    from_us: signedInteger(envelope.from_us, "from_us"),
+    until_us: signedInteger(envelope.until_us, "until_us"),
+    complete,
+    resume_from_us: resume,
+    bucket,
+    tz_offset_minutes: offset,
+    rows: listOf(envelope.rows, "rows", (input, path) => {
+      const row = record(input, path);
+      return {
+        bucket_us: signedInteger(row.bucket_us, `${path}.bucket_us`),
+        agent: row.agent === null ? null : identity(row.agent, `${path}.agent`, "profile:"),
+        provider: identity(row.provider, `${path}.provider`, "llm_provider:"),
+        model: row.model === null ? null : string(row.model, `${path}.model`),
+        requests: integer(row.requests, `${path}.requests`),
+        complete_requests: integer(row.complete_requests, `${path}.complete_requests`),
+        input_tokens: integer(row.input_tokens, `${path}.input_tokens`),
+        output_tokens: integer(row.output_tokens, `${path}.output_tokens`),
+        cache_read_tokens: integer(row.cache_read_tokens, `${path}.cache_read_tokens`),
+        cache_write_tokens: integer(row.cache_write_tokens, `${path}.cache_write_tokens`),
+        reasoning_tokens: integer(row.reasoning_tokens, `${path}.reasoning_tokens`),
+      };
+    }),
+  };
+}
+
 export function decodeAvailability(input: unknown) {
   const { envelope, next_after } = observationPage(input);
   return {
