@@ -30,6 +30,7 @@ type OcgTopbarProps = {
    * while the Chat surface is up; every other view gets it in this row.
    */
   projectSelector?: React.ReactNode;
+  inspectorToggle?: React.ReactNode;
 };
 
 export function OcgTopbar({
@@ -41,6 +42,7 @@ export function OcgTopbar({
   titleVisible = true,
   syncStatus,
   projectSelector,
+  inspectorToggle,
 }: OcgTopbarProps) {
   const { t } = useI18n();
 
@@ -75,7 +77,7 @@ export function OcgTopbar({
   );
   const title = session && activeView === "chat" ? session.title : getViewTitle(activeView);
   return (
-    <header className={cn("flex h-14 shrink-0 items-center gap-1.5 px-2 sm:px-5", activeView === "chat" && "pointer-events-none absolute inset-x-0 top-0 z-20 bg-transparent [&_button]:pointer-events-auto")}>
+    <header className={cn("flex h-14 shrink-0 items-center gap-1.5 px-2 sm:px-5", activeView === "chat" && "pointer-events-none absolute inset-x-0 top-0 z-20 h-[4.25rem] gap-3 bg-transparent px-3 sm:px-3 [&_button]:pointer-events-auto")}>
       {/* Mobile sidebar toggle */}
       <Tooltip>
         <TooltipTrigger
@@ -104,7 +106,7 @@ export function OcgTopbar({
         </h1>
       )}
       {projectSelector && <div className="flex min-w-0 shrink-0 items-center">{projectSelector}</div>}
-      {activeView === "chat" && <div className="mr-14 flex min-w-0 flex-1"><ConversationErrorHeader key={session?.id ?? "new"} /></div>}
+      {activeView === "chat" && <div className="flex min-w-0 flex-1 justify-center"><ConversationErrorHeader key={session?.id ?? "new"} /></div>}
 
       {syncStatus && sync && isDegradedSyncStatus(syncStatus) && (
         <div
@@ -119,6 +121,8 @@ export function OcgTopbar({
           <span className="font-medium">{syncLabel}</span>
         </div>
       )}
+
+      {inspectorToggle}
 
     </header>
   );

@@ -354,6 +354,16 @@ export function decodeUsageBuckets(input: unknown) {
         reasoning_tokens: integer(row.reasoning_tokens, `${path}.reasoning_tokens`),
       } satisfies Wire.WireUsageBucket;
     }),
+    retry_rows: listOf(envelope.retry_rows, "retry_rows", (input, path) => {
+      const row = record(input, path);
+      return {
+        agent: row.agent === null ? null : identity(row.agent, `${path}.agent`, "profile:"),
+        provider: identity(row.provider, `${path}.provider`, "llm_provider:"),
+        model: row.model === null ? null : string(row.model, `${path}.model`),
+        retries: integer(row.retries, `${path}.retries`),
+        bucket_us: signedInteger(row.bucket_us, `${path}.bucket_us`),
+      } satisfies Wire.WireUsageRetryRow;
+    }),
   } satisfies Wire.WireEnvelope<Wire.WireUsageBuckets>;
 }
 

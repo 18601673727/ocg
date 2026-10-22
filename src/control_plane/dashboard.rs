@@ -375,6 +375,16 @@ fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> WireUsageRow 
     }
 }
 
+fn usage_retry_row(row: &crate::persistence::UsageRetryRow) -> WireUsageRetryRow {
+    WireUsageRetryRow {
+        agent: (row.agent != 0).then(|| format!("profile:{}", row.agent)),
+        provider: format!("llm_provider:{}", row.provider),
+        model: row.model.clone(),
+        retries: row.retries,
+        bucket_us: row.bucket_us,
+    }
+}
+
 pub(super) async fn usage_summary(
     shared: &Shared,
     filter: crate::persistence::UsageSummaryFilter,
@@ -394,6 +404,11 @@ pub(super) async fn usage_summary(
                 complete: summary.complete,
                 resume_from_us: summary.resume_from_us,
                 rows,
+                retry_rows: summary
+                    .retry_rows
+                    .iter()
+                    .map(usage_retry_row)
+                    .collect::<Vec<_>>(),
             })
         }
         Some(bucketing) => {
@@ -416,6 +431,11 @@ pub(super) async fn usage_summary(
                 complete: summary.complete,
                 resume_from_us: summary.resume_from_us,
                 rows,
+                retry_rows: summary
+                    .retry_rows
+                    .iter()
+                    .map(usage_retry_row)
+                    .collect::<Vec<_>>(),
                 bucket: bucket.to_owned(),
                 tz_offset_minutes: bucketing.offset_minutes,
             })

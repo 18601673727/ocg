@@ -118,9 +118,11 @@ export type WireUsageRow = { agent: string | null, provider: string, model: stri
 
 export type WireUsageBucket = { bucket_us: number, agent: string | null, provider: string, model: string | null, requests: number, complete_requests: number, input_tokens: number, output_tokens: number, cache_read_tokens: number, cache_write_tokens: number, reasoning_tokens: number, };
 
-export type WireUsageSummary = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageRow>, };
+export type WireUsageRetryRow = { agent: string | null, provider: string, model: string | null, retries: number, bucket_us: number, };
 
-export type WireUsageBuckets = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageBucket>, bucket: string, tz_offset_minutes: number, };
+export type WireUsageSummary = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageRow>, retry_rows: Array<WireUsageRetryRow>, };
+
+export type WireUsageBuckets = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageBucket>, retry_rows: Array<WireUsageRetryRow>, bucket: string, tz_offset_minutes: number, };
 
 export type WireToolStatsRow = { name: string, admitted: number, refused_arguments: number, completed: number, failed: number, open: number, duration_us_mean: number | null, duration_us_max: number, };
 

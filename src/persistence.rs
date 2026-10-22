@@ -63,8 +63,8 @@ pub use records::{
     ProjectCommand, ProjectRecord, ProviderSnapshot, RequestEventRecord, RequestFingerprint,
     RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord, SubmittedConfiguration,
     ToolCallRecord, ToolStatRecord, USAGE_SUMMARY_HOUR_MICROS, UsageBucketResponse, UsageBucketRow,
-    UsageBucketWidth, UsageBucketing, UsageSummaryFilter, UsageSummaryResponse, UsageSummaryRow,
-    validate_project_commands,
+    UsageBucketWidth, UsageBucketing, UsageRetryRow, UsageSummaryFilter, UsageSummaryResponse,
+    UsageSummaryRow, validate_project_commands,
 };
 pub use scheduling::*;
 pub use tool_evidence::{
