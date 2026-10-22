@@ -129,6 +129,18 @@ contracts! {
         pub next_after_seq: Option<i64>,
         pub has_more: bool,
     }
+    struct WireProviderResponse {
+        pub request: u32,
+        pub text: String,
+        pub requests_tools: bool,
+        pub created_at_us: i64,
+    }
+    struct WireProviderResponses {
+        pub job: String,
+        pub responses: Vec<WireProviderResponse>,
+        pub next_after: Option<u32>,
+        pub has_more: bool,
+    }
     #[serde(rename_all = "snake_case")]
     enum WireToolOutcomeKind {
         Completed,

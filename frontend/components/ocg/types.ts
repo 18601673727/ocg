@@ -53,6 +53,7 @@ export type ChatMessage = {
   /** Extended thinking content from models that support reasoning. */
   reasoning?: string;
   reasoningDurationMs?: number;
+  intermediate?: boolean;
   failureReason?: string;
   failureCode?: "project-missing" | "configuration-required" | "stream-closed";
   createdAt: string;

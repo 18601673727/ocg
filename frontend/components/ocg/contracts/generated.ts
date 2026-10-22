@@ -28,6 +28,10 @@ export type WireJobs = { jobs: Array<WireJob>, next_before: string | null, has_m
 
 export type WireOutputs = { job: string, after_seq: number | null, outputs: Array<WireOutput>, next_after_seq: number | null, has_more: boolean, };
 
+export type WireProviderResponse = { request: number, text: string, requests_tools: boolean, created_at_us: number, };
+
+export type WireProviderResponses = { job: string, responses: Array<WireProviderResponse>, next_after: number | null, has_more: boolean, };
+
 export type WireToolOutcomeKind = "completed" | "completed_withheld" | "not_applied" | "not_invoked" | "uncertain";
 
 export type WireToolCall = { tool_call_id: string, request: number, index: number, name: string, decision: string, outcome_kind: WireToolOutcomeKind | null, arguments: string | null, arguments_cut: boolean, result: string | null, result_cut: boolean, };

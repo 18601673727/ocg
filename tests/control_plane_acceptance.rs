@@ -330,6 +330,30 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
         None,
     );
     assert_eq!(bad_tools.status, 400);
+    let responses = request(
+        address,
+        &format!("GET /api/v1/jobs/{failing}/responses"),
+        None,
+        None,
+    );
+    assert_eq!(responses.status, 200);
+    assert_eq!(responses.body["responses"], json!([]));
+    assert_eq!(responses.body["has_more"], false);
+    assert_eq!(responses.body["next_after"], Value::Null);
+    assert_eq!(
+        request(
+            address,
+            &format!("GET /api/v1/jobs/{failing}/responses?after=0"),
+            None,
+            None
+        )
+        .status,
+        400
+    );
+    assert_eq!(
+        request(address, "GET /api/v1/jobs/job:999999/responses", None, None).status,
+        404
+    );
     // The same key and request name the same Job; another request is refused.
     let replay = submit(address, failing_key, &failing_body);
     assert_eq!((replay.status, admitted(&replay)), (200, failing.clone()));

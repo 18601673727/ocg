@@ -21,6 +21,7 @@ import {
   ContractError,
   type ControlJob,
   type ControlOutput,
+  type ControlProviderResponse,
   type ControlToolCall,
 } from "@/components/ocg/contracts";
 import { useI18n, type I18nKey, type TranslateFn } from "@/components/ocg/i18n";
@@ -128,6 +129,7 @@ function JobWatchBody({
   const [earlierFailure, setEarlierFailure] = useState<{ code: string; scope: "read" } | null>(null);
   const earlierLoad = useRef<AbortController | null>(null);
   const [tools, setTools] = useState<ControlToolCall[]>([]);
+  const [responses, setResponses] = useState<ControlProviderResponse[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
   const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
@@ -159,6 +161,8 @@ function JobWatchBody({
     // The application consumes each stored output once: everything the
     // page reads and everything the stream replays passes this cursor.
     let processed = 0;
+    let historyComplete = false;
+    let replies: ControlProviderResponse[] = [];
 
     // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
     const fail = (error: unknown, scope: "read" | "stream") => {
@@ -187,11 +191,16 @@ function JobWatchBody({
         return;
       }
       reloading = true;
-      client
-        .readAllJobTools(jobId)
-        .then(
-          (loaded) => {
-            if (alive) setTools(loaded);
+      const completeWindow = historyComplete && processed <= windowRef.current;
+      Promise.all([
+        client.readAllJobTools(jobId),
+        completeWindow ? client.readAllProviderResponses(jobId, undefined, replies.at(-1)?.request) : Promise.resolve([]),
+      ]).then(
+          ([loaded, incoming]) => {
+            if (!alive) return;
+            setTools(loaded);
+            replies = completeWindow ? [...replies, ...incoming] : [];
+            setResponses(replies);
           },
           () => {},
         )
@@ -311,6 +320,8 @@ function JobWatchBody({
         if (alive) fail(error, "read");
         return;
       }
+      historyComplete = true;
+      requestReload();
       try {
         subscription = client.subscribeJobEvents(jobId, listener, {
           afterSeq: processed,
@@ -409,6 +420,10 @@ function JobWatchBody({
       windowRef.current = nextWindow;
       const incoming = walked;
       setOutputs((existing) => mergeOutputWindow(existing, incoming, nextWindow));
+      if (walked.length >= storedTotal) {
+        const replies = await client.readAllProviderResponses(jobId, controller.signal);
+        if (!controller.signal.aborted) setResponses(replies);
+      }
     } catch (error) {
       if (!controller.signal.aborted) {
         setEarlierFailure({
@@ -428,8 +443,8 @@ function JobWatchBody({
   const attachments = input !== null && "attachments" in input ? input.attachments : undefined;
   const streaming = stream === "live" || stream === "reconnecting";
   const turns = useMemo(
-    () => jobTranscript(jobId, objective, outputs, settlement, streaming, attachments, tools),
-    [jobId, objective, outputs, settlement, streaming, attachments, tools],
+    () => jobTranscript(jobId, objective, outputs, settlement, streaming, attachments, tools, job?.previous === null, responses),
+    [jobId, objective, outputs, settlement, streaming, attachments, tools, job?.previous, responses],
   );
   const evictedOutputs = hasEvictedOutputs(storedTotal, outputs.length);
 

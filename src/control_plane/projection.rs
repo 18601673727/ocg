@@ -179,6 +179,81 @@ pub(super) async fn outputs(
 
 pub(super) const MAX_EXPOSED_TOOL_STRING_BYTES: usize = 2 * 1024;
 
+pub(super) fn responses_query(query: &str) -> Result<(Option<RequestNumber>, usize), Refusal> {
+    let (mut after, mut limit) = (None, None);
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+            match key {
+                "after" if after.is_none() => {
+                    after = Some(
+                        routing::decimal::<u32>(value)
+                            .and_then(RequestNumber::new)
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                "limit" if limit.is_none() => {
+                    limit = Some(
+                        routing::decimal::<usize>(value)
+                            .filter(|limit| (1..=100).contains(limit))
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                _ => return Err(INVALID_REQUEST),
+            }
+        }
+    }
+    Ok((after, limit.unwrap_or(50)))
+}
+
+/// Pages received assistant text without replaying each request's full context.
+pub(super) async fn provider_responses(
+    shared: &Shared,
+    job: JobId,
+    after: Option<RequestNumber>,
+    limit: usize,
+) -> Result<Value, Refusal> {
+    if shared.database.job(job).await?.is_none() {
+        return Err(JOB_NOT_FOUND);
+    }
+    let records = shared
+        .database
+        .provider_responses(job, after, limit + 1)
+        .await?;
+    let envelope = |responses: Vec<WireProviderResponse>, next_after, has_more| {
+        envelope(WireProviderResponses {
+            job: job.to_string(),
+            responses,
+            next_after,
+            has_more,
+        })
+    };
+    let mut size = envelope(Vec::new(), Some(u32::MAX), true).to_string().len();
+    let mut page = Vec::new();
+    let mut more = records.len() > limit;
+    let mut next = None;
+    for record in records.into_iter().take(limit) {
+        let response = WireProviderResponse {
+            request: record.request.get(),
+            text: record.text,
+            requests_tools: record.requests_tools,
+            created_at_us: record.recorded_at.as_unix_micros(),
+        };
+        let cost = json!(response).to_string().len() + 1;
+        if size + cost > shared.response_bytes {
+            if page.is_empty() {
+                return Err(OUTPUT_TOO_LARGE);
+            }
+            more = true;
+            break;
+        }
+        size += cost;
+        next = Some(response.request);
+        page.push(response);
+    }
+    Ok(envelope(page, if more { next } else { None }, more))
+}
+
 pub(super) fn cut_tool_string(text: &str) -> (&str, bool) {
     if text.len() <= MAX_EXPOSED_TOOL_STRING_BYTES {
         (text, false)
@@ -417,6 +492,29 @@ mod tests {
         );
         assert_eq!(value["quarantined"], json!([]));
         worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn response_query_requires_an_advancing_request_and_bounded_page() {
+        assert_eq!(responses_query("").unwrap(), (None, 50));
+        assert_eq!(
+            responses_query("after=2&limit=1").unwrap(),
+            (RequestNumber::new(2), 1)
+        );
+        for query in [
+            "after=0",
+            "after=01",
+            "after=4294967296",
+            "after=1&after=2",
+            "limit=0",
+            "limit=101",
+            "limit=1&limit=2",
+            "limit=2&",
+            "&limit=2",
+            "unknown=1",
+        ] {
+            assert_eq!(responses_query(query), Err(INVALID_REQUEST), "{query}");
+        }
     }
 
     #[test]

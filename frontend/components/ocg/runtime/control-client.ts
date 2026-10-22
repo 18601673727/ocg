@@ -25,6 +25,7 @@ import {
   decodeJobTools,
   decodeJobTree,
   decodeOutputsPage,
+  decodeProviderResponses,
   decodePoolAnswer,
   decodePools,
   decodeProfiles,
@@ -39,6 +40,7 @@ import {
   type ControlJobToolsPage,
   type ControlProject,
   type ControlToolCall,
+  type ControlProviderResponse,
 } from "../contracts";
 import { SseParser } from "./sse";
 
@@ -701,6 +703,22 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       settings: { after?: string; limit?: number; signal?: AbortSignal } = {},
     ): Promise<ControlJobToolsPage> {
       return readJobToolsInternal(job, settings);
+    },
+
+    /** Received assistant replies after a request, paging until caught up. */
+    async readAllProviderResponses(job: string, signal?: AbortSignal, after?: number): Promise<ControlProviderResponse[]> {
+      jobIdentity(job);
+      const responses: ControlProviderResponse[] = [];
+      let cursor = after;
+      for (;;) {
+        const query = `?limit=100${cursor === undefined ? "" : `&after=${sequence(cursor)}`}`;
+        const page = decodeProviderResponses((await send("GET", `/api/v1/jobs/${job}/responses${query}`, { signal })).input, job);
+        if (page.responses.some(response => response.request <= (cursor ?? 0))) throw new ContractError("responses.request", "a request after the cursor");
+        responses.push(...page.responses);
+        if (!page.has_more) return responses;
+        if (page.next_after === null || page.next_after <= (cursor ?? 0)) throw new ContractError("next_after", "an advancing request cursor");
+        cursor = page.next_after;
+      }
     },
 
     /** All recorded tool calls for a Job, paging through until complete. */

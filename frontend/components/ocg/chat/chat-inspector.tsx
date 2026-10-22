@@ -12,7 +12,7 @@ export function ChatInspector({ session, messages, onClose, onOpenJob }: {
   onOpenJob: (job: string) => void;
 }) {
   const { t, locale } = useI18n();
-  const turns = messages.filter(message => message.role === "assistant");
+  const turns = [...new Map(messages.filter(message => message.role === "assistant").map(message => [message.jobId ?? message.id, message])).values()];
 
   return (
     <aside id="chat-inspector" aria-labelledby="chat-inspector-title" className="fixed inset-y-3 right-3 z-40 flex min-h-0 w-[min(24rem,calc(100%-1.5rem))] min-w-0 flex-col overflow-hidden rounded-3xl border-0 bg-muted text-foreground shadow-lg lg:relative lg:inset-auto lg:z-auto lg:m-3 lg:h-[calc(100%-1.5rem)] lg:w-80 lg:shrink-0 lg:shadow-none xl:w-96">
