@@ -8,6 +8,7 @@ import type { decodeAvailability, decodeHealth, decodeUsage } from "../contracts
 import { useI18n } from "../i18n";
 import { PageTitle } from "../layout/page-title";
 import { UsageChart } from "./usage-chart";
+import { ReliabilityChart } from "./reliability-chart";
 import { HealthChart } from "./health-chart";
 
 type Usage = ReturnType<typeof decodeUsage>["observations"][number];
@@ -76,6 +77,7 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
         </div>
       </div>
       {kind === "usage" ? <UsageChart client={client} reloadKey={windowEnd} /> : null}
+      {kind === "usage" ? <ReliabilityChart client={client} reloadKey={windowEnd} /> : null}
       {kind === "health" ? <HealthChart key={`${days}:${windowEnd}`} client={client} fromUs={windowEnd - days * 86400_000_000} untilUs={windowEnd} /> : null}
       {kind === "health" ? (
         <>

@@ -485,12 +485,20 @@ contracts! {
         pub row: WireUsageRow,
         pub bucket_us: i64,
     }
+    struct WireUsageRetryRow {
+        pub agent: Option<String>,
+        pub provider: String,
+        pub model: Option<String>,
+        pub retries: u64,
+        pub bucket_us: i64,
+    }
     struct WireUsageSummary {
         pub from_us: i64,
         pub until_us: i64,
         pub complete: bool,
         pub resume_from_us: Option<i64>,
         pub rows: Vec<WireUsageRow>,
+        pub retry_rows: Vec<WireUsageRetryRow>,
     }
     struct WireUsageBuckets {
         pub from_us: i64,
@@ -498,6 +506,7 @@ contracts! {
         pub complete: bool,
         pub resume_from_us: Option<i64>,
         pub rows: Vec<WireUsageBucket>,
+        pub retry_rows: Vec<WireUsageRetryRow>,
         pub bucket: String,
         pub tz_offset_minutes: i32,
     }

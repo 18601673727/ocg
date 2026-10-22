@@ -1053,7 +1053,7 @@ mod tests {
     use crate::database::{DatabaseHandle, DatabaseWorker};
     use crate::persistence::{
         ClaimRecord, ExecutionConfiguration, NewExecutor, NewSubmission, RequestFingerprint,
-        ToolCallRef,
+        ToolCallRef, UsageBucketWidth, UsageBucketing, UsageSummaryFilter,
     };
     use crate::test_support::{data_directory, execution_configuration, wait};
     use std::num::NonZeroU32;
@@ -2102,6 +2102,46 @@ mod tests {
         assert_eq!(
             wait(fixture.database.retries(first)).expect("retries"),
             [retry.turn]
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+    #[test]
+    fn retried_turns_appear_in_usage_bucket_retry_rows() {
+        let fixture = Fixture::new("retry-usage-buckets");
+        let (conversation, first) = fixture.open();
+        fixture.finish(first, OutcomeKind::Completed);
+        wait(fixture.database.retry(conversation, first, Actor::User)).expect("retry");
+        let now_us = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_micros(),
+        )
+        .expect("time fits");
+        let day = 86_400_000_000;
+        let filter = UsageSummaryFilter {
+            from_us: Some(now_us - 2 * day),
+            until_us: Some(now_us + 2 * day),
+            agent: None,
+        };
+        let bucketing = UsageBucketing {
+            width: UsageBucketWidth::Day,
+            offset_minutes: 0,
+        };
+        let buckets =
+            wait(fixture.database.usage_buckets(filter.clone(), bucketing)).expect("buckets");
+        assert_eq!(buckets.retry_rows.len(), 1, "one retried scope in range");
+        assert_eq!(buckets.retry_rows[0].retries, 1);
+        assert_ne!(buckets.retry_rows[0].provider, 0);
+        let summary = wait(fixture.database.usage_summary(filter)).expect("summary");
+        assert_eq!(
+            summary
+                .retry_rows
+                .iter()
+                .map(|row| row.retries)
+                .sum::<u64>(),
+            1,
+            "one retry in range"
         );
         fixture.worker.shutdown().expect("shutdown");
     }

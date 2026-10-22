@@ -951,6 +951,19 @@ pub struct UsageSummaryRow {
     pub reasoning_tokens: u64,
 }
 
+/// One aggregated row in a usage summary retry breakdown. The grouping
+/// matches [`UsageSummaryRow`]: `agent` is 0 for work submitted without an
+/// Agent, and `bucket_us` is the day or week bucket start in bucketed
+/// responses and the hour start otherwise.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageRetryRow {
+    pub bucket_us: i64,
+    pub agent: u64,
+    pub provider: u64,
+    pub model: Option<String>,
+    pub retries: u64,
+}
+
 /// The aggregated token usage summary response. `complete` says the scan
 /// finished; `resume_from_us` is set exactly when it did not.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -960,6 +973,7 @@ pub struct UsageSummaryResponse {
     pub complete: bool,
     pub resume_from_us: Option<i64>,
     pub rows: Vec<UsageSummaryRow>,
+    pub retry_rows: Vec<UsageRetryRow>,
 }
 
 /// Optional filters for querying usage summaries.
@@ -1021,4 +1035,5 @@ pub struct UsageBucketResponse {
     pub complete: bool,
     pub resume_from_us: Option<i64>,
     pub rows: Vec<UsageBucketRow>,
+    pub retry_rows: Vec<UsageRetryRow>,
 }
