@@ -1,10 +1,16 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { JobTranscript } from "@/components/ocg/chat/job-transcript";
 import { jobTranscript } from "@/components/ocg/chat/job-transcript-model";
+import {
+  JOB_WATCH_RESIDENT_OUTPUTS,
+  JOB_WATCH_WINDOW_STEP,
+  hasEvictedOutputs,
+  mergeOutputWindow,
+} from "./output-window";
 import {
   ControlTransportError,
   type HttpCanonicalControlClient,
@@ -71,6 +77,12 @@ const TONE: Record<string, string> = {
  * output stream, and its actual outcome. Nothing here is simulated; the
  * stream is the stored history continued live, and a reconnect replays
  * from the last output this view processed, never twice.
+ *
+ * State retains only the latest resident output window (see
+ * `./output-window`): every accepted output is appended once and the window
+ * is trimmed from the front, so neither the retained rows nor the work per
+ * event grows with the Job. The processed cursor is the highest stored
+ * sequence and is independent of the visible rows.
  */
 export function JobWatch(props: {
   client: HttpCanonicalControlClient;
@@ -107,6 +119,12 @@ function JobWatchBody({
   const { t } = useI18n();
   const [job, setJob] = useState<ControlJob | null>(null);
   const [outputs, setOutputs] = useState<ControlOutput[]>([]);
+  // Highest stored sequence processed so far: the reconnect/replay cursor,
+  // independent of how many rows the resident window retains.
+  const [storedTotal, setStoredTotal] = useState(0);
+  // Automatically retained rows; earlier outputs load only on explicit request.
+  const windowRef = useRef(JOB_WATCH_RESIDENT_OUTPUTS);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [tools, setTools] = useState<ControlToolCall[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
@@ -214,7 +232,9 @@ function JobWatchBody({
       } else if (event.type === "output") {
         if (event.output.seq <= processed) return;
         processed = event.output.seq;
-        setOutputs((existing) => [...existing, event.output]);
+        setStoredTotal(event.output.seq);
+        const incoming = event.output;
+        setOutputs((existing) => mergeOutputWindow(existing, [incoming], windowRef.current));
         requestReload();
       } else if (event.type === "settlement") {
         setSettlement({
@@ -264,17 +284,21 @@ function JobWatchBody({
       );
       requestReload();
       // The stored history first, in pages and in order; the stream then
-      // continues after the last output this view processed.
+      // continues after the last output this view processed. Only the latest
+      // resident window is retained in state; the cursor still advances past
+      // every stored sequence.
       try {
         for (;;) {
           const page = await client.readOutputs(jobId, { afterSeq: processed });
           if (!alive) return;
+          let high = processed;
           for (const output of page.outputs) {
-            if (output.seq > processed) {
-              processed = output.seq;
-              setOutputs((existing) => [...existing, output]);
-            }
+            if (output.seq > high) high = output.seq;
           }
+          processed = high;
+          setStoredTotal(high);
+          const incoming = page.outputs;
+          setOutputs((existing) => mergeOutputWindow(existing, incoming, windowRef.current));
           if (!page.has_more) break;
         }
       } catch (error) {
@@ -354,6 +378,40 @@ function JobWatchBody({
   const state = settlement?.state ?? (job ? "unsettled" : null);
   const badge = state ?? (failure ? "unavailable" : "loading");
 
+  // Earlier stored outputs are durable on the server, not in state. Loading
+  // them is an explicit walk from the first stored sequence, merged by `seq`
+  // with whatever the live stream appended meanwhile.
+  async function loadEarlierOutputs() {
+    const nextWindow = windowRef.current + JOB_WATCH_WINDOW_STEP;
+    windowRef.current = nextWindow;
+    setLoadingEarlier(true);
+    try {
+      const walked: ControlOutput[] = [];
+      let after = 0;
+      for (;;) {
+        const page = await client.readOutputs(jobId, { afterSeq: after });
+        walked.push(...page.outputs);
+        if (!page.has_more) break;
+        const next = page.next_after_seq ?? page.outputs.at(-1)?.seq ?? after;
+        if (next <= after) break;
+        after = next;
+      }
+      const incoming = walked;
+      setOutputs((existing) => mergeOutputWindow(existing, incoming, windowRef.current));
+    } finally {
+      setLoadingEarlier(false);
+    }
+  }
+
+  const objective = input !== null && "objective" in input ? input.objective : null;
+  const attachments = input !== null && "attachments" in input ? input.attachments : undefined;
+  const streaming = stream === "live" || stream === "reconnecting";
+  const turns = useMemo(
+    () => jobTranscript(jobId, objective, outputs, settlement, streaming, attachments, tools),
+    [jobId, objective, outputs, settlement, streaming, attachments, tools],
+  );
+  const evictedOutputs = hasEvictedOutputs(storedTotal, outputs.length);
+
   const recordFacts = (
     <dl className="grid gap-x-6 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
       <div className="flex justify-between gap-2">
@@ -405,8 +463,17 @@ function JobWatchBody({
   const storedOutputs = job ? (
       <details className="flex flex-col gap-2">
         <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-          {t("job.storedOutputs", { count: outputs.length })}
+          {evictedOutputs
+            ? t("job.storedOutputsWindowed", { shown: outputs.length, total: storedTotal })
+            : t("job.storedOutputs", { count: outputs.length })}
         </summary>
+        {evictedOutputs ? (
+          <div className="mt-2">
+            <Button variant="outline" size="sm" onClick={() => void loadEarlierOutputs()} disabled={loadingEarlier}>
+              {loadingEarlier ? t("common.loading") : t("job.loadEarlierOutputs")}
+            </Button>
+          </div>
+        ) : null}
         <ol className="mt-2 flex flex-col gap-2">
           {outputs.map((output) => (
             <li
@@ -442,15 +509,7 @@ function JobWatchBody({
   const answer = job ? (
     <>
       <JobTranscript
-        turns={jobTranscript(
-          jobId,
-          input !== null && "objective" in input ? input.objective : null,
-          outputs,
-          settlement,
-          stream === "live" || stream === "reconnecting",
-          input !== null && "attachments" in input ? input.attachments : undefined,
-          tools,
-        )}
+        turns={turns}
         userLabel={presentation === "chat" ? t("job.you") : t("job.objective")}
         attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
       />

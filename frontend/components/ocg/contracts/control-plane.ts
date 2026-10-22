@@ -197,15 +197,29 @@ export function decodeJobs(input: unknown) {
   };
 }
 
+/** A hold actor, as conversation, child, and tree boundaries carry it. */
+function holdActor(
+  input: unknown,
+  path: string,
+): { kind: "agent"; conversation: string } | { kind: "user" | "loop" | "auto" } {
+  const by = record(input, path);
+  const kind = oneOf(by.kind, `${path}.kind`, ["user", "agent", "loop", "auto"] as const);
+  if (kind === "agent") {
+    return { kind, conversation: identity(by.conversation, `${path}.conversation`, "job:") };
+  }
+  return { kind };
+}
+
 function conversationRecord(input: unknown) {
   const c = record(input, "conversation");
+  const hold = c.on_hold === null ? null : record(c.on_hold, "conversation.on_hold");
   return {
     root_job: identity(c.root_job, "conversation.root_job", "job:"),
     tip_job: identity(c.tip_job, "conversation.tip_job", "job:"),
     agent: c.agent === null ? null : identity(c.agent, "conversation.agent", "profile:"),
     title: string(c.title, "conversation.title"),
     state: c.state === "open" || c.state === "closing" || c.state === "settled" ? c.state : (() => { throw new ContractError("conversation.state", "open, closing or settled"); })(),
-    on_hold: c.on_hold === null ? null : { by: record(record(c.on_hold, "conversation.on_hold").by, "conversation.on_hold.by") },
+    on_hold: hold === null ? null : { by: holdActor(hold.by, "conversation.on_hold.by") },
     project: c.project === null ? null : identity(c.project, "conversation.project", "project:"),
     tip_settlement_state: string(c.tip_settlement_state, "conversation.tip_settlement_state"),
     tip_created_at_us: integer(c.tip_created_at_us, "conversation.tip_created_at_us"),

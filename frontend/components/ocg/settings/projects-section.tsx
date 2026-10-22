@@ -14,11 +14,7 @@ import type {
 } from "@/components/ocg/runtime/control-client";
 import { Section, describeError, refusalText } from "./settings-parts";
 import { useI18n, type I18nKey } from "../i18n";
-
-type CommandDraft = {
-  name: string;
-  argvText: string;
-};
+import { nextCommandDraftId, toCommandDrafts, toProjectCommands, type CommandDraft } from "./command-drafts";
 
 const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
   project_root_invalid: "settings.projects.refusal.rootInvalid",
@@ -84,34 +80,29 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
     setName(project.name);
     setRoot(project.root);
     setDescription(project.description ?? "");
-    setCommands(
-      project.commands.map((cmd) => ({
-        name: cmd.name,
-        argvText: cmd.argv.join("\n"),
-      }))
-    );
+    setCommands(toCommandDrafts(project.commands));
     setError(null);
     setNotice(null);
   }
 
   function addCommand() {
-    setCommands((prev) => [...prev, { name: "", argvText: "" }]);
+    setCommands((prev) => [...prev, { id: nextCommandDraftId(prev), name: "", argvText: "" }]);
   }
 
-  function updateCommandName(index: number, newName: string) {
+  function updateCommandName(id: string, newName: string) {
     setCommands((prev) =>
-      prev.map((cmd, i) => (i === index ? { ...cmd, name: newName } : cmd))
+      prev.map((cmd) => (cmd.id === id ? { ...cmd, name: newName } : cmd))
     );
   }
 
-  function updateCommandArgv(index: number, newArgvText: string) {
+  function updateCommandArgv(id: string, newArgvText: string) {
     setCommands((prev) =>
-      prev.map((cmd, i) => (i === index ? { ...cmd, argvText: newArgvText } : cmd))
+      prev.map((cmd) => (cmd.id === id ? { ...cmd, argvText: newArgvText } : cmd))
     );
   }
 
-  function removeCommand(index: number) {
-    setCommands((prev) => prev.filter((_, i) => i !== index));
+  function removeCommand(id: string) {
+    setCommands((prev) => prev.filter((cmd) => cmd.id !== id));
   }
 
   async function handleSave(e: FormEvent) {
@@ -122,13 +113,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
 
     const trimmedDesc = description.trim();
     const finalDescription = trimmedDesc.length > 0 ? trimmedDesc : null;
-    const finalCommands: ControlProjectCommand[] = commands.map((cmd) => ({
-      name: cmd.name.trim(),
-      argv: cmd.argvText
-        .split("\n")
-        .map((line) => line.replace(/\r$/, ""))
-        .filter((line) => line.trim().length > 0),
-    }));
+    const finalCommands: ControlProjectCommand[] = toProjectCommands(commands);
 
     try {
       if (editingProject) {
@@ -310,22 +295,22 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
             </Button>
           </div>
 
-          {commands.map((cmd, idx) => (
+          {commands.map((cmd) => (
             <div
-              key={idx}
+              key={cmd.id}
               className="flex flex-col gap-2 rounded-md border border-border p-2.5 sm:flex-row sm:items-start"
             >
               <div className="flex-1 space-y-2">
                 <Input
                   value={cmd.name}
-                  onChange={(e) => updateCommandName(idx, e.target.value)}
+                  onChange={(e) => updateCommandName(cmd.id, e.target.value)}
                   placeholder={t("settings.projects.commandName")}
                   spellCheck={false}
                   className="text-xs"
                 />
                 <Textarea
                   value={cmd.argvText}
-                  onChange={(e) => updateCommandArgv(idx, e.target.value)}
+                  onChange={(e) => updateCommandArgv(cmd.id, e.target.value)}
                   placeholder={t("settings.projects.commandArgv")}
                   rows={2}
                   className="font-mono text-xs"
@@ -337,7 +322,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
                 variant="ghost"
                 size="xs"
                 className="text-destructive hover:text-destructive self-end sm:self-start"
-                onClick={() => removeCommand(idx)}
+                onClick={() => removeCommand(cmd.id)}
               >
                 {t("settings.projects.removeCommand")}
               </Button>

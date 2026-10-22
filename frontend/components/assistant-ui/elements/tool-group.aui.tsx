@@ -12,6 +12,7 @@ import { ChevronDownIcon, LoaderIcon } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/components/ocg/i18n";
 import {
   CollapsibleRoot as Collapsible,
   CollapsibleContent,
@@ -101,7 +102,8 @@ function ToolGroupTrigger({
   count: number;
   active?: boolean;
 }) {
-  const label = `${count} tool ${count === 1 ? "call" : "calls"}`;
+  const { t } = useI18n();
+  const label = t(count === 1 ? "aui.toolCalls.one" : "aui.toolCalls.other", { count });
 
   return (
     <CollapsibleTrigger

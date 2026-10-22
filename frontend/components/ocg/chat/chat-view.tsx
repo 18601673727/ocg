@@ -21,6 +21,11 @@ import {
   type ComposerIntent,
   type ComposerSuggestion,
 } from "../composer/domain";
+import {
+  CHILDREN_POLL_BASE_MS,
+  childrenListSignature,
+  nextChildrenPollDelay,
+} from "./children-polling";
 
 /* ---------- composer ---------- */
 
@@ -334,11 +339,28 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const lock = useRef(false);
+  const delayRef = useRef(CHILDREN_POLL_BASE_MS);
+  const signatureRef = useRef<string | null>(null);
   useEffect(() => {
     if (!control || !conversation) return;
     const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout>;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+    let inFlight = false;
+    delayRef.current = CHILDREN_POLL_BASE_MS;
+    signatureRef.current = null;
+    const schedule = () => {
+      if (disposed || controller.signal.aborted) return;
+      // A hidden tab schedules nothing; visibility restoration refreshes.
+      if (typeof document !== "undefined" && document.hidden) return;
+      timer = setTimeout(() => void refresh(), delayRef.current);
+    };
     const refresh = async () => {
+      if (inFlight) {
+        schedule();
+        return;
+      }
+      inFlight = true;
       try {
         const items: ControlChildConversation[] = [];
         let before: string | undefined;
@@ -350,15 +372,45 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
           before = reply.next_before ?? undefined;
           if (!more) break;
         }
-        if (!controller.signal.aborted) { setChildren(items); setHasMore(more); setError(null); }
+        if (!controller.signal.aborted) {
+          setChildren(items); setHasMore(more); setError(null);
+          // Changed lists stay prompt; only consecutive identical refreshes
+          // back off, and discovery never stops while idle.
+          const signature = childrenListSignature(items, more);
+          delayRef.current = signatureRef.current === null || signatureRef.current !== signature
+            ? CHILDREN_POLL_BASE_MS
+            : nextChildrenPollDelay(delayRef.current);
+          signatureRef.current = signature;
+        }
       } catch (cause) {
         if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
       } finally {
-        if (!controller.signal.aborted) timer = setTimeout(() => void refresh(), 2000);
+        inFlight = false;
+        if (!controller.signal.aborted) schedule();
       }
     };
+    const onVisibility = () => {
+      if (typeof document === "undefined" || document.hidden) return;
+      if (disposed || controller.signal.aborted) return;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      delayRef.current = CHILDREN_POLL_BASE_MS;
+      void refresh();
+    };
     void refresh();
-    return () => { controller.abort(); clearTimeout(timer); };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibility);
+    }
+    return () => {
+      disposed = true;
+      controller.abort();
+      if (timer !== undefined) clearTimeout(timer);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibility);
+      }
+    };
   }, [control, conversation, pages, revision]);
 
   async function act(child: ControlChildConversation, action: "stop" | "close" | "hold" | "unhold") {

@@ -72,6 +72,7 @@ import {
   type PropsWithChildren,
 } from "react";
 import { BoundedMessage } from "@/components/ocg/chat/bounded-message";
+import { useI18n } from "@/components/ocg/i18n";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -156,13 +157,15 @@ const isHistoryLoadingView = (s: AssistantState) =>
   !s.thread.isDisabled &&
   !s.threads.isLoading;
 
-const ThreadHistorySkeleton: FC = () => (
-  <div
-    data-slot="aui_thread-history-skeleton"
-    role="status"
-    className="animate-in fade-in fill-mode-both flex flex-col gap-y-6 [animation-delay:150ms] [animation-duration:200ms]"
-  >
-    <span className="sr-only">Loading conversation</span>
+const ThreadHistorySkeleton: FC = () => {
+  const { t } = useI18n();
+  return (
+    <div
+      data-slot="aui_thread-history-skeleton"
+      role="status"
+      className="animate-in fade-in fill-mode-both flex flex-col gap-y-6 [animation-delay:150ms] [animation-duration:200ms]"
+    >
+    <span className="sr-only">{t("app.loadingConversation")}</span>
     <Skeleton className="ml-auto h-9 w-2/5 rounded-xl motion-reduce:animate-none" />
     <div className="flex flex-col gap-y-2">
       <Skeleton className="h-4 w-11/12 motion-reduce:animate-none" />
@@ -175,7 +178,8 @@ const ThreadHistorySkeleton: FC = () => (
       <Skeleton className="h-4 w-2/3 motion-reduce:animate-none" />
     </div>
   </div>
-);
+  );
+};
 
 export const Thread: FC<ThreadProps> = ({
   components = EMPTY_COMPONENTS,
@@ -289,6 +293,7 @@ const SpokenText: TextMessagePartComponent = ({ text }) => (
 );
 
 const SpokenMessage: FC = () => {
+  const { t } = useI18n();
   const role = useAuiState((s) => s.message.role);
   const position = useVoiceRunPosition();
   const isSpeaking = useAuiState(
@@ -316,7 +321,7 @@ const SpokenMessage: FC = () => {
           className="text-muted-foreground mb-1.5 flex items-center gap-1.5 text-xs"
         >
           <PhoneIcon className="size-3" aria-hidden />
-          <span>Voice conversation</span>
+          <span>{t("aui.voiceConversation")}</span>
         </div>
       )}
       <div
@@ -331,7 +336,7 @@ const SpokenMessage: FC = () => {
           )}
         </span>
         <span className="sr-only">
-          {role === "user" ? "You said" : "Assistant said"}
+          {role === "user" ? t("aui.youSaid") : t("aui.assistantSaid")}
         </span>
         <div className="min-w-0 flex-1 wrap-break-word">
           <MessagePrimitive.Parts components={{ Text: SpokenText }} />
@@ -340,7 +345,7 @@ const SpokenMessage: FC = () => {
               data-slot="aui_spoken-message-indicator"
               role="status"
               className="text-muted-foreground ms-1 animate-pulse font-sans"
-              aria-label="Assistant is speaking"
+              aria-label={t("aui.speaking")}
             >
               ●
             </span>
@@ -353,6 +358,7 @@ const SpokenMessage: FC = () => {
 };
 
 const SpokenActionBar: FC = () => {
+  const { t } = useI18n();
   return (
     <ActionBarPrimitive.Root
       hideWhenRunning
@@ -360,7 +366,7 @@ const SpokenActionBar: FC = () => {
       className="aui-spoken-action-bar text-muted-foreground flex shrink-0 gap-1"
     >
       <ActionBarPrimitive.Copy asChild>
-        <TooltipIconButton tooltip="Copy" className="size-6">
+        <TooltipIconButton tooltip={t("common.copy")} className="size-6">
           <AuiIf condition={(s) => s.message.isCopied}>
             <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
           </AuiIf>
@@ -391,6 +397,7 @@ const nextFocusable = (start: Element) => {
 };
 
 const ThreadLoadEarlier: FC = () => {
+  const { t } = useI18n();
   const visible = useAuiState(
     (s) => s.thread.hasEarlier || s.thread.isLoadingEarlier,
   );
@@ -419,7 +426,7 @@ const ThreadLoadEarlier: FC = () => {
       }}
     >
       <span role="status" className="sr-only">
-        {loading ? "Loading earlier messages" : ""}
+        {loading ? t("aui.loadingEarlier") : ""}
       </span>
       {visible && (
         <ThreadPrimitive.LoadEarlier asChild>
@@ -432,7 +439,7 @@ const ThreadLoadEarlier: FC = () => {
             <span
               className={cn(loading && "shimmer motion-reduce:animate-none")}
             >
-              {loading ? "Loading earlier messages" : "Load earlier messages"}
+              {loading ? t("aui.loadingEarlier") : t("aui.loadEarlier")}
             </span>
           </Button>
         </ThreadPrimitive.LoadEarlier>
@@ -442,10 +449,11 @@ const ThreadLoadEarlier: FC = () => {
 };
 
 const ThreadScrollToBottom: FC = () => {
+  const { t } = useI18n();
   return (
     <ThreadPrimitive.ScrollToBottom asChild>
       <TooltipIconButton
-        tooltip="Scroll to bottom"
+        tooltip={t("aui.scrollBottom")}
         variant="outline"
         className="aui-thread-scroll-to-bottom dark:border-border dark:bg-background dark:hover:bg-accent absolute -top-12 z-10 self-center rounded-full p-4 disabled:invisible"
       >
@@ -456,10 +464,11 @@ const ThreadScrollToBottom: FC = () => {
 };
 
 const ThreadWelcome: FC = () => {
+  const { t } = useI18n();
   return (
     <div className="aui-thread-welcome-root mb-6 flex flex-col px-2">
       <p className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-medium tracking-tight duration-200">
-        How can I help you today?
+        {t("aui.welcome")}
       </p>
     </div>
   );
@@ -500,6 +509,7 @@ const ThreadSuggestionItem: FC = () => {
 };
 
 const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
+  const { t } = useI18n();
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
       <ComposerPrimitive.AttachmentDropzone asChild>
@@ -509,12 +519,12 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
         >
           <ComposerAttachments />
           <ComposerPrimitive.Input
-            placeholder="Send a message..."
+            placeholder={t("aui.composerPlaceholder")}
             className="aui-composer-input caret-primary placeholder:text-muted-foreground/60 max-h-48 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base leading-6 outline-none"
             rows={1}
             autoFocus={autoFocus}
             enterKeyHint="send"
-            aria-label="Message input"
+            aria-label={t("aui.composerLabel")}
           />
           <ComposerAction />
         </div>
@@ -524,6 +534,7 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 };
 
 const ComposerAction: FC = () => {
+  const { t } = useI18n();
   // The stop control only cancels the send while no run it could stop is going.
   const isSending = useAuiState(
     (s) =>
@@ -539,13 +550,13 @@ const ComposerAction: FC = () => {
           <AuiIf condition={(s) => s.composer.dictation == null}>
             <ComposerPrimitive.Dictate asChild>
               <TooltipIconButton
-                tooltip="Voice input"
+                tooltip={t("aui.voiceInput")}
                 side="bottom"
                 type="button"
                 variant="ghost"
                 size="icon"
                 className="aui-composer-dictate text-muted-foreground hover:text-foreground size-7 rounded-full"
-                aria-label="Start voice input"
+                aria-label={t("aui.startDictation")}
               >
                 <MicIcon className="aui-composer-dictate-icon size-4" />
               </TooltipIconButton>
@@ -554,13 +565,13 @@ const ComposerAction: FC = () => {
           <AuiIf condition={(s) => s.composer.dictation != null}>
             <ComposerPrimitive.StopDictation asChild>
               <TooltipIconButton
-                tooltip="Stop dictation"
+                tooltip={t("aui.stopDictation")}
                 side="bottom"
                 type="button"
                 variant="ghost"
                 size="icon"
                 className="aui-composer-stop-dictation text-destructive size-7 rounded-full"
-                aria-label="Stop voice input"
+                aria-label={t("aui.stopVoiceInput")}
               >
                 <SquareIcon className="aui-composer-stop-dictation-icon size-3.5 animate-pulse fill-current" />
               </TooltipIconButton>
@@ -576,13 +587,13 @@ const ComposerAction: FC = () => {
         >
           <ComposerPrimitive.Send asChild>
             <TooltipIconButton
-              tooltip="Send message"
+              tooltip={t("aui.sendMessage")}
               side="bottom"
               type="button"
               variant="default"
               size="icon"
               className="aui-composer-send size-7 rounded-full"
-              aria-label="Send message"
+              aria-label={t("aui.sendMessage")}
             >
               <ArrowUpIcon className="aui-composer-send-icon size-4" />
             </TooltipIconButton>
@@ -601,7 +612,7 @@ const ComposerAction: FC = () => {
               variant="default"
               size="icon"
               className="aui-composer-cancel size-7 rounded-full"
-              aria-label={isSending ? "Cancel sending" : "Stop generating"}
+              aria-label={isSending ? t("aui.cancelSending") : t("aui.stopGenerating")}
             >
               <SquareIcon className="aui-composer-cancel-icon size-3.5 fill-current" />
             </Button>
@@ -630,6 +641,7 @@ const AssistantMessage: FC = () => {
     TaskGroup: TaskGroupComponent,
   } = useContext(ThreadComponentsContext);
   const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
+  const { t } = useI18n();
   const failureReason = useAuiState((s) => {
     const value = s.message.metadata.custom.failureReason;
     return typeof value === "string" ? value : null;
@@ -711,7 +723,7 @@ const AssistantMessage: FC = () => {
                 case "image":
                   return (
                     <div data-slot="aui_assistant-message-image" className="py-1">
-                      <Image {...part} />
+                      <Image {...part} alt={part.filename ?? t("aui.messageImage")} />
                     </div>
                   );
                 case "indicator":
@@ -719,7 +731,7 @@ const AssistantMessage: FC = () => {
                     <span
                       data-slot="aui_assistant-message-indicator"
                       className="animate-pulse font-sans"
-                      aria-label="Assistant is working"
+                      aria-hidden="true"
                     >
                       {"●"}
                     </span>
@@ -750,6 +762,7 @@ const AssistantMessage: FC = () => {
 };
 
 const AssistantActionBar: FC = () => {
+  const { t } = useI18n();
   return (
     <ActionBarPrimitive.Root
       hideWhenRunning
@@ -757,7 +770,7 @@ const AssistantActionBar: FC = () => {
       className="aui-assistant-action-bar-root text-muted-foreground animate-in fade-in col-start-3 row-start-2 -ms-1 flex gap-1 duration-200"
     >
       <ActionBarPrimitive.Copy asChild>
-        <TooltipIconButton tooltip="Copy">
+        <TooltipIconButton tooltip={t("common.copy")}>
           <AuiIf condition={(s) => s.message.isCopied}>
             <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out" />
           </AuiIf>
@@ -769,7 +782,7 @@ const AssistantActionBar: FC = () => {
       <AuiIf condition={(s) => s.thread.capabilities.feedback}>
         <ActionBarPrimitive.FeedbackPositive asChild>
           <TooltipIconButton
-            tooltip="Helpful"
+            tooltip={t("aui.helpful")}
             className="data-[submitted=true]:bg-accent data-[submitted=true]:text-accent-foreground"
           >
             <ThumbsUpIcon />
@@ -777,7 +790,7 @@ const AssistantActionBar: FC = () => {
         </ActionBarPrimitive.FeedbackPositive>
         <ActionBarPrimitive.FeedbackNegative asChild>
           <TooltipIconButton
-            tooltip="Not helpful"
+            tooltip={t("aui.notHelpful")}
             className="data-[submitted=true]:bg-accent data-[submitted=true]:text-accent-foreground"
           >
             <ThumbsDownIcon />
@@ -786,7 +799,7 @@ const AssistantActionBar: FC = () => {
       </AuiIf>
       <AuiIf condition={(s) => s.message.metadata.custom.canRetry === true}>
         <ActionBarPrimitive.Reload asChild>
-          <TooltipIconButton tooltip="Retry failed turn">
+          <TooltipIconButton tooltip={t("aui.retryTurn")}>
             <RefreshCwIcon />
           </TooltipIconButton>
         </ActionBarPrimitive.Reload>
@@ -794,7 +807,7 @@ const AssistantActionBar: FC = () => {
       <ActionBarMorePrimitive.Root>
         <ActionBarMorePrimitive.Trigger asChild>
           <TooltipIconButton
-            tooltip="More"
+            tooltip={t("aui.more")}
             className="data-[state=open]:bg-accent"
           >
             <MoreHorizontalIcon />
@@ -809,7 +822,7 @@ const AssistantActionBar: FC = () => {
           <ActionBarPrimitive.ExportMarkdown asChild>
             <ActionBarMorePrimitive.Item className="aui-action-bar-more-item hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none">
               <DownloadIcon className="size-4" />
-              Export as Markdown
+              {t("aui.exportMarkdown")}
             </ActionBarMorePrimitive.Item>
           </ActionBarPrimitive.ExportMarkdown>
         </ActionBarMorePrimitive.Content>
@@ -819,6 +832,7 @@ const AssistantActionBar: FC = () => {
 };
 
 const MessageFile: FileMessagePartComponent = (part) => {
+  const { t } = useI18n();
   const image = part.mimeType.toLowerCase().startsWith("image/")
     ? getFileHref(part.data, part.mimeType, part.sourceType)
     : null;
@@ -828,6 +842,7 @@ const MessageFile: FileMessagePartComponent = (part) => {
       type="image"
       image={image}
       status={part.status}
+      alt={part.filename ?? t("aui.messageImage")}
       {...(part.filename !== undefined && { filename: part.filename })}
     />
   );
@@ -839,11 +854,14 @@ const UserFilePart: FileMessagePartComponent = (part) => (
   </div>
 );
 
-const UserImagePart: ImageMessagePartComponent = (part) => (
-  <div data-slot="aui_user-message-image" className="py-1">
-    <Image {...part} />
-  </div>
-);
+const UserImagePart: ImageMessagePartComponent = (part) => {
+  const { t } = useI18n();
+  return (
+    <div data-slot="aui_user-message-image" className="py-1">
+      <Image {...part} alt={part.filename ?? t("aui.messageImage")} />
+    </div>
+  );
+};
 
 const UserMessage: FC = () => {
   return (
@@ -879,6 +897,7 @@ const UserMessage: FC = () => {
 };
 
 const UserActionBar: FC = () => {
+  const { t } = useI18n();
   return (
     <ActionBarPrimitive.Root
       hideWhenRunning
@@ -886,7 +905,7 @@ const UserActionBar: FC = () => {
       className="aui-user-action-bar-root flex flex-col items-end"
     >
       <ActionBarPrimitive.Edit asChild>
-        <TooltipIconButton tooltip="Edit" className="aui-user-action-edit">
+        <TooltipIconButton tooltip={t("common.edit")} className="aui-user-action-edit">
           <PencilIcon />
         </TooltipIconButton>
       </ActionBarPrimitive.Edit>
@@ -895,6 +914,7 @@ const UserActionBar: FC = () => {
 };
 
 const EditComposer: FC = () => {
+  const { t } = useI18n();
   return (
     <MessagePrimitive.Root
       data-slot="aui_edit-composer-wrapper"
@@ -908,12 +928,12 @@ const EditComposer: FC = () => {
         <div className="aui-edit-composer-footer mx-2.5 mb-2.5 flex items-center gap-1.5 self-end">
           <ComposerPrimitive.Cancel asChild>
             <Button variant="ghost" size="sm" className="h-8 px-3">
-              Cancel
+              {t("common.cancel")}
             </Button>
           </ComposerPrimitive.Cancel>
           <ComposerPrimitive.Send asChild>
             <Button size="sm" className="h-8 px-3">
-              Update
+              {t("aui.editUpdate")}
             </Button>
           </ComposerPrimitive.Send>
         </div>
@@ -926,6 +946,7 @@ const BranchPicker: FC<BranchPickerPrimitive.Root.Props> = ({
   className,
   ...rest
 }) => {
+  const { t } = useI18n();
   return (
     <BranchPickerPrimitive.Root
       hideWhenSingleBranch
@@ -936,7 +957,7 @@ const BranchPicker: FC<BranchPickerPrimitive.Root.Props> = ({
       {...rest}
     >
       <BranchPickerPrimitive.Previous asChild>
-        <TooltipIconButton tooltip="Previous">
+        <TooltipIconButton tooltip={t("aui.branchPrevious")}>
           <ChevronLeftIcon />
         </TooltipIconButton>
       </BranchPickerPrimitive.Previous>
@@ -944,7 +965,7 @@ const BranchPicker: FC<BranchPickerPrimitive.Root.Props> = ({
         <BranchPickerPrimitive.Number /> / <BranchPickerPrimitive.Count />
       </span>
       <BranchPickerPrimitive.Next asChild>
-        <TooltipIconButton tooltip="Next">
+        <TooltipIconButton tooltip={t("aui.branchNext")}>
           <ChevronRightIcon />
         </TooltipIconButton>
       </BranchPickerPrimitive.Next>

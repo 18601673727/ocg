@@ -6,6 +6,7 @@ import {
   useEffect,
   useCallback,
   useRef,
+  type ComponentProps,
   type PropsWithChildren,
 } from "react";
 import { createPortal } from "react-dom";
@@ -25,6 +26,7 @@ import type {
   ImageMessagePartComponent,
 } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/components/ocg/i18n";
 import { hostOf, safeHref } from "../utils/href";
 
 const extensionForMimeType = (mimeType?: string): string => {
@@ -214,10 +216,12 @@ function ImagePreview({
   fit = "contain",
   onLoad,
   onError,
-  alt = "Image content",
+  alt,
   src,
   ...props
 }: ImagePreviewProps) {
+  const { t } = useI18n();
+  const resolvedAlt = alt ?? t("aui.messageImage");
   const imgRef = useRef<HTMLImageElement>(null);
   const [loadedSrc, setLoadedSrc] = useState<string | undefined>(undefined);
   const [errorSrc, setErrorSrc] = useState<string | undefined>(undefined);
@@ -274,7 +278,7 @@ function ImagePreview({
         <img
           ref={imgRef}
           src={src}
-          alt={alt}
+          alt={resolvedAlt}
           className={cn(
             fixedRatio
               ? cn("block h-full w-full", {
@@ -394,7 +398,9 @@ type ImageZoomProps = PropsWithChildren<{
   alt?: string;
 }>;
 
-function ImageZoom({ src, alt = "Image preview", children }: ImageZoomProps) {
+function ImageZoom({ src, alt, children }: ImageZoomProps) {
+  const { t } = useI18n();
+  const resolvedAlt = alt ?? t("aui.imagePreview");
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
@@ -464,7 +470,7 @@ function ImageZoom({ src, alt = "Image preview", children }: ImageZoomProps) {
         role="button"
         tabIndex={0}
         className="aui-image-zoom-trigger cursor-zoom-in"
-        aria-label="Click to zoom image"
+        aria-label={t("aui.zoomImage")}
       >
         {children}
       </div>
@@ -477,12 +483,12 @@ function ImageZoom({ src, alt = "Image preview", children }: ImageZoomProps) {
             aria-modal="true"
             className="aui-image-zoom-overlay fade-in animate-in fixed inset-0 z-50 flex items-center justify-center bg-black/80 duration-200"
             onClick={handleClose}
-            aria-label="Zoomed image"
+            aria-label={t("aui.zoomedImage")}
           >
             <img
               data-slot="image-zoom-content"
               src={src}
-              alt={alt}
+              alt={resolvedAlt}
               className="aui-image-zoom-content fade-in zoom-in-95 animate-in max-h-[90%] max-w-[90%] cursor-zoom-out object-contain duration-200"
               onClick={(e) => {
                 e.stopPropagation();
@@ -492,7 +498,7 @@ function ImageZoom({ src, alt = "Image preview", children }: ImageZoomProps) {
             <button
               ref={closeRef}
               type="button"
-              aria-label="Close zoomed image"
+              aria-label={t("aui.closeZoomedImage")}
               onClick={(e) => {
                 e.stopPropagation();
                 handleClose();
@@ -509,6 +515,7 @@ function ImageZoom({ src, alt = "Image preview", children }: ImageZoomProps) {
 }
 
 function ImageGenerating({ className }: { className?: string }) {
+  const { t } = useI18n();
   return (
     <div
       data-slot="image-generating"
@@ -518,7 +525,7 @@ function ImageGenerating({ className }: { className?: string }) {
       )}
     >
       <Loader2Icon className="text-muted-foreground size-8 animate-spin" />
-      <span className="sr-only">Generating image…</span>
+      <span className="sr-only">{t("aui.generatingImage")}</span>
     </div>
   );
 }
@@ -560,6 +567,7 @@ function RegenerateButton({
 }: {
   onRegenerate: () => void | Promise<void>;
 }) {
+  const { t } = useI18n();
   const [isRegenerating, setIsRegenerating] = useState(false);
   return (
     <button
@@ -575,7 +583,7 @@ function RegenerateButton({
       }}
       disabled={isRegenerating}
       data-slot="image-regenerate"
-      aria-label="Regenerate image"
+      aria-label={t("aui.regenerateImage")}
       className="hover:bg-muted inline-flex size-7 items-center justify-center rounded disabled:opacity-50"
     >
       <RefreshCwIcon
@@ -586,6 +594,7 @@ function RegenerateButton({
 }
 
 function ImageActions({ part, onRegenerate, className }: ImageActionsProps) {
+  const { t } = useI18n();
   return (
     <div
       data-slot="image-actions"
@@ -595,7 +604,7 @@ function ImageActions({ part, onRegenerate, className }: ImageActionsProps) {
         type="button"
         onClick={() => downloadImagePart(part)}
         data-slot="image-download"
-        aria-label="Download image"
+        aria-label={t("aui.downloadImage")}
         className="hover:bg-muted inline-flex size-7 items-center justify-center rounded"
       >
         <DownloadIcon className="size-4" />
@@ -606,7 +615,7 @@ function ImageActions({ part, onRegenerate, className }: ImageActionsProps) {
           copyImagePart(part).catch(() => {});
         }}
         data-slot="image-copy"
-        aria-label="Copy image"
+        aria-label={t("aui.copyImage")}
         className="hover:bg-muted inline-flex size-7 items-center justify-center rounded"
       >
         <CopyIcon className="size-4" />
@@ -616,8 +625,10 @@ function ImageActions({ part, onRegenerate, className }: ImageActionsProps) {
   );
 }
 
-const ImageImpl: ImageMessagePartComponent = (props) => {
-  const { image, filename, status } = props;
+const ImageImpl = (props: ComponentProps<ImageMessagePartComponent> & { alt?: string }) => {
+  const { image, filename, status, alt } = props;
+  const { t } = useI18n();
+  const resolvedAlt = alt ?? filename ?? t("aui.messageImage");
 
   if (status?.type === "running") {
     return (
@@ -631,15 +642,15 @@ const ImageImpl: ImageMessagePartComponent = (props) => {
   if (status?.type === "incomplete" && status.reason === "content-filter") {
     return (
       <ImageRoot>
-        <ImageContentFilterError reason="The provider blocked this image." />
+        <ImageContentFilterError reason={t("aui.imageBlocked")} />
       </ImageRoot>
     );
   }
 
   return (
     <ImageRoot>
-      <ImageZoom src={image} alt={filename || "Image content"}>
-        <ImagePreview src={image} alt={filename || "Image content"} />
+      <ImageZoom src={image} alt={resolvedAlt}>
+        <ImagePreview src={image} alt={resolvedAlt} />
       </ImageZoom>
       <ImageFilename>{filename}</ImageFilename>
     </ImageRoot>

@@ -379,6 +379,296 @@ export class RuntimeEnvelopeFactory {
 /* Validation / normalization                                                 */
 /* -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- */
+/* Nested domain validators                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Closed unions the reconciler and its consumers already assume. A message,
+ * session, or acknowledgement outside these sets cannot be rendered or
+ * reduced without a fallback, so unknown input carrying one is reported
+ * instead of being typed as a complete envelope.
+ *
+ * The unions mirror `MessageRole`/`MessageStatus`/`WorkType` in
+ * `../types`, `JobLaunchOutcome` in `./runtime-types`, and the attention,
+ * bootstrap, and status domains; they are data here so a validator can check
+ * membership without an `as` cast.
+ */
+export const MESSAGE_ROLES = ["user", "assistant", "call", "tool"] as const;
+export const MESSAGE_STATUSES = ["pending", "streaming", "completed", "cancelled", "unknown", "failed"] as const;
+export const CHAT_WORK_TYPES = ["research", "coding", "design", "devops"] as const;
+export const JOB_LAUNCH_OUTCOMES = ["accepted", "rejected", "requires-attention", "failed"] as const;
+export const SNAPSHOT_AUTHORITIES = ["canonical", "mock"] as const;
+
+const ATTENTION_KINDS = [
+  "approval",
+  "budget",
+  "policy",
+  "permission",
+  "blocked",
+  "runtime-failure",
+  "resource-degraded",
+  "configuration",
+  "retry",
+  "escalation",
+] as const;
+
+const ATTENTION_SEVERITIES = ["info", "warning", "high", "critical"] as const;
+
+const ATTENTION_SOURCES = ["execution", "runtime", "provider", "resource", "policy", "configuration"] as const;
+
+const ATTENTION_DESTINATIONS = [
+  "job-execution",
+  "control-center",
+  "resource-ledger",
+  "logs",
+  "settings",
+  "chat",
+] as const;
+
+const BOOTSTRAP_ACCESS_STATES = [
+  "local",
+  "authenticated",
+  "unauthenticated",
+  "session-expired",
+  "denied",
+  "auth-required",
+] as const;
+
+const BOOTSTRAP_HANDOFF_STATES = ["unavailable", "idle", "pending", "complete", "failed"] as const;
+
+const RUNTIME_STATUS_DETAIL_CODES = ["provider-ready", "configuration-required"] as const;
+
+/** One managed image, as message images, chat messages, and queued inputs carry it. */
+export function validateChatImageValue(image: unknown): string | null {
+  if (
+    !isRecord(image) || !isNonEmptyString(image.id) || typeof image.name !== "string" ||
+    !isNonEmptyString(image.media_type) || !isNonEmptyString(image.url)
+  ) {
+    return "image must contain a valid image.";
+  }
+  return null;
+}
+
+/** One chat message, as history, message events, and snapshot maps carry it. */
+export function validateChatMessageValue(message: unknown): string | null {
+  if (!isRecord(message)) return "message must be an object.";
+  if (!isNonEmptyString(message.id)) return "message.id is required.";
+  if (!isOneOf(message.role, MESSAGE_ROLES)) {
+    return `Unknown message role "${String(message.role)}".`;
+  }
+  if (!isOneOf(message.status, MESSAGE_STATUSES)) {
+    return `Unknown message status "${String(message.status)}".`;
+  }
+  if (typeof message.content !== "string") return "message.content must be a string.";
+  if (typeof message.createdAt !== "string") return "message.createdAt must be a string.";
+  if (
+    message.images !== undefined &&
+    (!Array.isArray(message.images) || message.images.some((image) => validateChatImageValue(image) !== null))
+  ) {
+    return "message images must contain valid images.";
+  }
+  if (
+    message.toolCalls !== undefined &&
+    (!Array.isArray(message.toolCalls) ||
+      message.toolCalls.some((call) => !isRecord(call) || typeof call.name !== "string" || typeof call.decision !== "string"))
+  ) {
+    return "message tool calls must contain valid tool calls.";
+  }
+  return null;
+}
+
+/** One chat session, as session events and snapshot session lists carry it. */
+export function validateChatSessionValue(session: unknown): string | null {
+  if (!isRecord(session)) return "session must be an object.";
+  if (!isNonEmptyString(session.id)) return "session.id is required.";
+  if (typeof session.title !== "string") return "session.title must be a string.";
+  if (!isOneOf(session.workType, CHAT_WORK_TYPES)) {
+    return `Unknown session work type "${String(session.workType)}".`;
+  }
+  if (typeof session.updatedAt !== "string") return "session.updatedAt must be a string.";
+  for (const key of ["projectId", "sessionId", "agentProfile", "conversationId"] as const) {
+    if (session[key] !== undefined && typeof session[key] !== "string") {
+      return `session.${key} must be a string when present.`;
+    }
+  }
+  return null;
+}
+
+/** Connection status, as status-changed events and snapshot baselines carry it. */
+export function validateRuntimeStatusValue(status: unknown): string | null {
+  if (!isRecord(status)) return "status must be an object.";
+  if (!isOneOf(status.state, RUNTIME_CONNECTION_STATES)) {
+    return `Unknown runtime connection state "${String(status.state)}".`;
+  }
+  if (status.detailCode !== undefined && !isOneOf(status.detailCode, RUNTIME_STATUS_DETAIL_CODES)) {
+    return `Unknown runtime status detail "${String(status.detailCode)}".`;
+  }
+  if (status.detail !== undefined && typeof status.detail !== "string") {
+    return "status.detail must be a string when present.";
+  }
+  return null;
+}
+
+/** Bootstrap state: the shell reads access, inventory lists, and readiness off it. */
+export function validateBootstrapValue(bootstrap: unknown): string | null {
+  if (!isRecord(bootstrap)) return "bootstrap must be an object.";
+  const access = bootstrap.access;
+  if (
+    !isRecord(access) || !isOneOf(access.state, BOOTSTRAP_ACCESS_STATES) ||
+    typeof access.remote !== "boolean" || !isOneOf(access.handoffState, BOOTSTRAP_HANDOFF_STATES)
+  ) {
+    return "bootstrap access must name a known access and handoff state.";
+  }
+  if (bootstrap.onboarding !== null && bootstrap.onboarding !== undefined && !isRecord(bootstrap.onboarding)) {
+    return "bootstrap onboarding must be an object or null.";
+  }
+  for (const key of ["resources", "connections", "models", "capabilities", "profiles"] as const) {
+    const list = bootstrap[key];
+    if (!Array.isArray(list) || list.some((entry) => !isRecord(entry))) {
+      return `bootstrap ${key} must be an array of records.`;
+    }
+  }
+  if (
+    bootstrap.providers !== undefined &&
+    (!Array.isArray(bootstrap.providers) || bootstrap.providers.some((entry) => !isRecord(entry)))
+  ) {
+    return "bootstrap providers must be an array of records when present.";
+  }
+  if (typeof bootstrap.ready !== "boolean") return "bootstrap ready must be a boolean.";
+  return null;
+}
+
+/** Observability projection: the reconciler bounds its timeline and activities. */
+export function validateObservabilityValue(observability: unknown): string | null {
+  if (!isRecord(observability)) return "observability must be an object.";
+  if (!isRecord(observability.job)) return "observability.job must be an object.";
+  if (!Array.isArray(observability.workers) || observability.workers.some((worker) => !isRecord(worker))) {
+    return "observability.workers must be an array of records.";
+  }
+  if (!Array.isArray(observability.timeline)) return "observability.timeline must be an array.";
+  if (!Array.isArray(observability.activities)) return "observability.activities must be an array.";
+  return null;
+}
+
+/**
+ * Canonical Job execution projection. Execution, call, and executor states
+ * stay open: unknown states render verbatim downstream, so only identity,
+ * ordering, and collection shape are checked here.
+ */
+export function validateJobExecutionValue(execution: unknown): string | null {
+  if (!isRecord(execution)) return "execution must be an object.";
+  if (!isNonEmptyString(execution.jobId)) return "execution.jobId is required.";
+  if (!isProjectId(execution.projectId)) return "execution.projectId is required.";
+  if (!isNonEmptyString(execution.apiVersion)) return "execution apiVersion is required.";
+  if (!isNonNegativeInteger(execution.generation) || !isNonNegativeInteger(execution.cursor)) {
+    return "execution generation and cursor must be non-negative integers.";
+  }
+  if (!Array.isArray(execution.attempts) || !Array.isArray(execution.calls) || !Array.isArray(execution.executors)) {
+    return "execution entities must be arrays.";
+  }
+  return null;
+}
+
+/** Ledger entry, as ledger events and snapshot ledgers carry it. */
+export function validateLedgerEntryValue(entry: unknown): string | null {
+  if (!isRecord(entry) || !isNonEmptyString(entry.id)) return "ledger entry.id is required.";
+  if (!isNonEmptyString(entry.jobId)) return "ledger entry.jobId is required.";
+  if (!isNonEmptyString(entry.timestamp)) return "ledger entry.timestamp is required.";
+  if (!isNonNegativeInteger(entry.attempt) || entry.attempt < 1) {
+    return "ledger entry.attempt must be a positive integer.";
+  }
+  if (
+    entry.costMicros !== null &&
+    (typeof entry.costMicros !== "number" || !Number.isSafeInteger(entry.costMicros) || entry.costMicros < 0)
+  ) {
+    return "ledger entry.costMicros must be a non-negative safe integer or null.";
+  }
+  return null;
+}
+
+/** Attention item, as attention events and snapshot lists carry it. */
+export function validateAttentionItemValue(item: unknown): string | null {
+  if (!isRecord(item)) return "attention item must be an object.";
+  if (!isNonEmptyString(item.id)) return "attention item.id is required.";
+  if (!isOneOf(item.kind, ATTENTION_KINDS)) return `Unknown attention kind "${String(item.kind)}".`;
+  if (!isOneOf(item.status, ATTENTION_LIFECYCLES)) return "attention item.status is invalid.";
+  if (!isOneOf(item.severity, ATTENTION_SEVERITIES)) {
+    return `Unknown attention severity "${String(item.severity)}".`;
+  }
+  if (typeof item.title !== "string" || typeof item.summary !== "string") {
+    return "attention item title and summary must be strings.";
+  }
+  if (!isNonEmptyString(item.createdAt) || !isNonEmptyString(item.updatedAt)) {
+    return "attention item timestamps are required.";
+  }
+  if (!isOneOf(item.source, ATTENTION_SOURCES)) return `Unknown attention source "${String(item.source)}".`;
+  if (!isOneOf(item.destination, ATTENTION_DESTINATIONS)) {
+    return `Unknown attention destination "${String(item.destination)}".`;
+  }
+  if (item.projectId !== undefined && !isProjectId(item.projectId)) {
+    return "attention item.projectId must be a known Project ID.";
+  }
+  for (const key of ["approval", "blocked", "resolution"] as const) {
+    if (item[key] !== undefined && item[key] !== null && !isRecord(item[key])) {
+      return `attention item.${key} must be an object or null when present.`;
+    }
+  }
+  return null;
+}
+
+/** Log entry, as log events and snapshot logs carry it. */
+export function validateLogEntryValue(entry: unknown): string | null {
+  if (!isRecord(entry) || !isNonEmptyString(entry.id)) return "log entry.id is required.";
+  if (!isIsoDate(entry.timestamp)) return "log entry.timestamp must be a valid timestamp.";
+  if (!isNonEmptyString(entry.source)) return "log entry.source is required.";
+  if (!isOneOf(entry.level, LOG_LEVELS)) return "log entry.level is invalid.";
+  if (typeof entry.message !== "string") return "log entry.message must be a string.";
+  return null;
+}
+
+/** Command acknowledgement, as launch-updated events carry it. */
+export function validateLaunchResultValue(result: unknown): string | null {
+  if (!isRecord(result)) return "result must be an object.";
+  if (!isOneOf(result.outcome, JOB_LAUNCH_OUTCOMES)) {
+    return `Unknown launch outcome "${String(result.outcome)}".`;
+  }
+  if (!isNonEmptyString(result.commandId)) return "result.commandId is required.";
+  if (!isNonEmptyString(result.draftId)) return "result.draftId is required.";
+  if (!isProjectId(result.projectId)) return "result.projectId is required.";
+  if (!isNonEmptyString(result.sessionId)) return "result.sessionId is required.";
+  if (typeof result.message !== "string") return "result.message must be a string.";
+  if (typeof result.duplicate !== "boolean") return "result.duplicate must be a boolean.";
+  return null;
+}
+
+/** One queued chat message, as queue events and snapshot queues carry it. */
+export function validateQueuedMessageValue(item: unknown): string | null {
+  if (!isRecord(item) || !isNonEmptyString(item.id)) return "queued message.id is required.";
+  if (!isRecord(item.input) || typeof item.input.content !== "string") {
+    return "queued message input must carry content text.";
+  }
+  if (
+    item.input.images !== undefined &&
+    (!Array.isArray(item.input.images) || item.input.images.some((image) => validateChatImageValue(image) !== null))
+  ) {
+    return "queued message images must contain valid images.";
+  }
+  return null;
+}
+
+/** Tool activity, as activity events carry it. */
+export function validateToolActivityValue(activity: unknown): string | null {
+  if (!isRecord(activity) || !isNonEmptyString(activity.id)) return "activity.id is required.";
+  if (
+    typeof activity.name !== "string" || typeof activity.status !== "string" ||
+    typeof activity.summary !== "string" || typeof activity.detail !== "string"
+  ) {
+    return "activity must name its tool and carry summary text.";
+  }
+  return null;
+}
+
 function diagnostic(
   code: RuntimeDiagnosticCode,
   message: string,
@@ -393,59 +683,43 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
     case "conversation.session-deleted":
       return null;
     case "conversation.queue-updated": {
-      if (typeof payload.paused !== "boolean" || !Array.isArray(payload.queue) || payload.queue.some(item =>
-        !isRecord(item) || !isNonEmptyString(item.id) || !isRecord(item.input) || typeof item.input.content !== "string"
-      )) return "queue must contain valid queued chat messages.";
+      if (typeof payload.paused !== "boolean" || !Array.isArray(payload.queue)) {
+        return "queue must contain valid queued chat messages.";
+      }
+      for (const item of payload.queue) {
+        const error = validateQueuedMessageValue(item);
+        if (error) return error;
+      }
       return null;
     }
     case "job.execution-updated": {
-      const execution = payload.execution;
-      if (!isRecord(execution) || !isNonEmptyString(execution.jobId)) return "execution.jobId is required.";
-      if (!isProjectId(execution.projectId)) return "execution.projectId is required.";
-      if (!isNonNegativeInteger(execution.generation) || !isNonNegativeInteger(execution.cursor)) return "execution generation and cursor must be non-negative integers.";
-      if (!Array.isArray(execution.attempts) || !Array.isArray(execution.calls) || !Array.isArray(execution.executors)) return "execution entities must be arrays.";
+      const executionError = validateJobExecutionValue(payload.execution);
+      if (executionError) return executionError;
       if (payload.accounting !== null && !isRecord(payload.accounting)) return "accounting must be an object or null.";
       return null;
     }
     case "runtime.status-changed": {
-      const status = payload.status;
-      if (!isRecord(status) || typeof status.state !== "string") return "status.state is required.";
-      if (!isOneOf(status.state, RUNTIME_CONNECTION_STATES)) {
-        return `Unknown runtime connection state "${String(status.state)}".`;
-      }
-      if (status.detail !== undefined && typeof status.detail !== "string") return "status.detail must be a string when present.";
-      return null;
+      return validateRuntimeStatusValue(payload.status);
     }
     case "conversation.session-created":
     case "conversation.session-updated": {
-      const session = payload.session;
-      if (!isRecord(session) || !isNonEmptyString(session.id)) return "session.id is required.";
-      if (typeof session.title !== "string") return "session.title must be a string.";
-      if (!isNonEmptyString(session.workType)) return "session.workType is required.";
-      return null;
+      return validateChatSessionValue(payload.session);
     }
     case "conversation.message-started":
     case "conversation.message-completed": {
-      const message = payload.message;
-      if (!isRecord(message) || !isNonEmptyString(message.id)) return "message.id is required.";
-      if (!isNonEmptyString(message.role)) return "message.role is required.";
-      if (!isNonEmptyString(message.status)) return "message.status is required.";
-      if (typeof message.content !== "string") return "message.content must be a string.";
-      return null;
+      return validateChatMessageValue(payload.message);
     }
     case "conversation.history-loaded": {
-      if (!Array.isArray(payload.messages) || payload.messages.some((message) =>
-        !isRecord(message) || !isNonEmptyString(message.id) ||
-        !isNonEmptyString(message.role) || !isNonEmptyString(message.status) ||
-        typeof message.content !== "string"
-      )) return "messages must contain valid chat messages.";
+      if (!Array.isArray(payload.messages)) return "messages must be an array.";
+      for (const message of payload.messages) {
+        const error = validateChatMessageValue(message);
+        if (error) return error;
+      }
       return null;
     }
     case "conversation.message-image": {
       if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
-      const image = payload.image;
-      if (!isRecord(image) || !isNonEmptyString(image.id) || typeof image.name !== "string" || !isNonEmptyString(image.media_type) || !isNonEmptyString(image.url)) return "image must contain a valid image.";
-      return null;
+      return validateChatImageValue(payload.image);
     }
     case "conversation.message-delta": {
       if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
@@ -469,53 +743,26 @@ function validatePayload(type: RuntimeEventType, payload: unknown): string | nul
     }
     case "activity.updated": {
       if (!isNonEmptyString(payload.messageId)) return "messageId is required.";
-      if (!isRecord(payload.activity) || !isNonEmptyString(payload.activity.id)) return "activity.id is required.";
-      return null;
+      return validateToolActivityValue(payload.activity);
     }
     case "observability.updated": {
-      const observability = payload.observability;
-      if (!isRecord(observability)) return "observability must be an object.";
-      if (!Array.isArray(observability.workers)) return "observability.workers must be an array.";
-      if (!isRecord(observability.job)) return "observability.job must be an object.";
-      return null;
+      return validateObservabilityValue(payload.observability);
     }
     case "job.launch-updated": {
-      const result = payload.result;
-      if (!isRecord(result) || !isNonEmptyString(result.outcome)) return "result.outcome is required.";
-      if (!isNonEmptyString(result.commandId)) return "result.commandId is required.";
-      return null;
+      return validateLaunchResultValue(payload.result);
     }
     case "attention.updated": {
-      const item = payload.item;
-      if (!isRecord(item) || !isNonEmptyString(item.id)) return "attention item.id is required.";
-      if (!isNonEmptyString(item.status)) return "attention item.status is required.";
-      if (!isOneOf(item.status, ATTENTION_LIFECYCLES)) return "attention item.status is invalid.";
-      if (!isNonEmptyString(item.updatedAt)) return "attention item.updatedAt is required.";
-      if (item.projectId !== undefined && !isProjectId(item.projectId)) return "attention item.projectId must be a known Project ID.";
-      return null;
+      return validateAttentionItemValue(payload.item);
     }
     case "ledger.entry-added":
     case "ledger.entry-updated": {
-      const entry = payload.entry;
-      if (!isRecord(entry) || !isNonEmptyString(entry.id)) return "ledger entry.id is required.";
-      if (!isNonEmptyString(entry.jobId)) return "ledger entry.jobId is required.";
-      if (!isNonEmptyString(entry.timestamp)) return "ledger entry.timestamp is required.";
-      if (!isNonNegativeInteger(entry.attempt) || entry.attempt < 1) return "ledger entry.attempt must be a positive integer.";
-      if (entry.costMicros !== null && (typeof entry.costMicros !== "number" || !Number.isSafeInteger(entry.costMicros) || entry.costMicros < 0)) return "ledger entry.costMicros must be a non-negative safe integer or null.";
-      return null;
+      return validateLedgerEntryValue(payload.entry);
     }
     case "log.appended": {
-      const entry = payload.entry;
-      if (!isRecord(entry) || !isNonEmptyString(entry.id)) return "log entry.id is required.";
-      if (!isIsoDate(entry.timestamp)) return "log entry.timestamp must be a valid timestamp.";
-      if (!isNonEmptyString(entry.source)) return "log entry.source is required.";
-      if (!isOneOf(entry.level, LOG_LEVELS)) return "log entry.level is invalid.";
-      if (typeof entry.message !== "string") return "log entry.message must be a string.";
-      return null;
+      return validateLogEntryValue(payload.entry);
     }
     case "bootstrap.updated": {
-      if (!isRecord(payload.bootstrap)) return "bootstrap must be an object.";
-      return null;
+      return validateBootstrapValue(payload.bootstrap);
     }
     case "warning":
     case "error": {
