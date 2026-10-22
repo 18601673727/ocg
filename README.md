@@ -117,24 +117,24 @@ continue); `POST /api/v1/conversations/{job}` sends `{"title": "..."}` or
 A conversation is a long-lived parent that owns its Agent, Project and child
 turns. `POST /api/v1/jobs` opens a conversation with its first user message;
 its admission reply names `conversation`, `job`, `seq`, `joined` and the frozen
-`model`. Send another message with `"conversation": "job:N"`. Messages can be
+`model`. Send another message with `"conversation": "<job-uuid>"`. Messages can be
 sent while an answer runs: the first creates a waiting turn, and more messages
 join that turn until it is claimed. A joined message uses that turn's frozen
 model. The Agent stays fixed; an omitted Model uses the tip's Model.
 
 `GET /api/v1/conversations` lists visible root conversations by newest tip,
 with `state` (`open`, `closing`, `settled`), `on_hold` and `project`.
-`GET /api/v1/conversations/job:N/turns?limit=20&before=job:M` pages turns newest
+`GET /api/v1/conversations/<job-uuid>/turns?limit=20&before=<cursor-uuid>` pages turns newest
 first (maximum 100), including each input entry, outputs and uncertain calls.
-`GET /api/v1/conversations/job:N/notices?after_seq=0&limit=20` reads notice rows.
+`GET /api/v1/conversations/<job-uuid>/notices?after_seq=0&limit=20` reads notice rows.
 
-Send `{}` to `POST /api/v1/conversations/job:N/stop` to stop the current answer.
+Send `{}` to `POST /api/v1/conversations/<job-uuid>/stop` to stop the current answer.
 Queued messages remain in the chain for the next turn to read; Stop leaves the
 conversation open. Send `{}` to `/close` to close its whole subtree: it accepts
 no new turns and settles once every running execution is confirmed stopped.
 An idle conversation settles in the Close transaction. `/hold` prevents new
 claims in the subtree; `/unhold` places eligible waiting turns again. Hold does
-not stop an answer already running. `/retry` accepts `{"turn":"job:M"}` and
+not stop an answer already running. `/retry` accepts `{"turn":"<turn-uuid>"}` and
 appends a retry reference; started calls with uncertain outcomes are disclosed
 and never automatically replayed. System conversations are managed in Settings.
 
@@ -180,7 +180,7 @@ hours, only one session exists at a time, and it ends with the OCG process.
 
 - `GET /api/v1/health` — report host status, database readiness, vitals (database commits/timings, claims/timings, queue counts, process memory) and quarantined executions.
 - `GET /api/v1/tool-stats` — report aggregated tool execution statistics per tool name: `name`, `admitted`, `refused_arguments`, `completed`, `failed`, `open`, `duration_us_mean` and `duration_us_max`.
-- `GET /api/v1/usage/summary` — report total token usage and request count, optionally filtered by `from_us`, `until_us` or `agent` (a `profile:N` id). There is no model filter. Each row names its `agent` as `profile:N` or `null`, and its `provider` as `llm_provider:N`. Optional `bucket=day|week` (weeks start Monday) requires both bounds, rounds them out to whole buckets and allows at most 400 buckets. `tz_offset_minutes` is local minus UTC, defaults to 0 and accepts whole hours from -840 to 840; the client rounds half-hour zones to whole hours and ignores DST. Bucketed rows add `bucket_us`, the bucket start in UTC microseconds. Paging stops only at bucket boundaries; continue with `from_us=resume_from_us` and the original `until_us`.
+- `GET /api/v1/usage/summary` — report total token usage and request count, optionally filtered by `from_us`, `until_us` or `agent` (a `<profile-uuid>` id). There is no model filter. Each row names its `agent` as `<profile-uuid>` or `null`, and its `provider` as `<provider-uuid>`. Optional `bucket=day|week` (weeks start Monday) requires both bounds, rounds them out to whole buckets and allows at most 400 buckets. `tz_offset_minutes` is local minus UTC, defaults to 0 and accepts whole hours from -840 to 840; the client rounds half-hour zones to whole hours and ignores DST. Bucketed rows add `bucket_us`, the bucket start in UTC microseconds. Paging stops only at bucket boundaries; continue with `from_us=resume_from_us` and the original `until_us`.
 - `POST /api/v1/provider-models` — test a Provider connection and list its models. Uses the same authentication as `/api/v1/profiles` (browser session with CSRF, or bearer token). Send `{endpoint, credential?}` or `{endpoint, credential_ref?}` to use a saved credential. Returns `{models: [{id, context_window}]}` sorted by id, with `null` for unknown context windows. Refusals are `provider_unreachable`, `provider_rejected` (with `status_code` and the Provider's message), or `models_not_listed`; the latter allows manual model entry. HTTPS only, no redirects, 30 s timeout and a 1 MiB response limit. Credentials are never saved or returned.
 
 ## External Job API
@@ -281,7 +281,7 @@ policy logs at `info` level, rotates at 10 MiB and keeps logs for 7 days.
 ## Agent dispatch and recurring conversations
 
 An Agent may name allowed Agent Profiles in `dispatch_to` (sorted, unique
-`profile:N` ids, including itself). Each target needs a `default_model` selected
+`<profile-uuid>` ids, including itself). Each target needs a `default_model` selected
 from its `llm_targets`. Both fields are accepted and returned by `/api/v1/profiles`.
 Stored turns offer `job_dispatch`, `job_message`, `job_stop`, `job_close`,
 `job_hold`, `job_unhold` and `job_retry` when their frozen Agent has dispatch
@@ -299,17 +299,17 @@ stay open, continue after failed iterations, and use the objective plus the
 previous iteration's result as context. Close, a removed model assignment, or a
 refused iteration halts a recurrence. Hold pauses future turns until Unhold.
 
-Eight consecutive attention-woken turns that successfully act on children put
-the parent on a loop hold; children keep running. A user message or Unhold resets
-the count, and a user message lifts a loop hold. Reporting without child actions
-does not consume this bound.
+Consecutive notice-driven follow-up turns put the parent on a loop hold at its
+effective automatic-turn limit (8 by default); children keep running. All such
+turns count, including reporting without child actions. A user message or Unhold
+resets the count, and a user message lifts a loop hold.
 
-`GET /api/v1/conversations/{job:N}/children?before=job:N&limit=20` pages child
+`GET /api/v1/conversations/{job}/children?before=<job-uuid>&limit=20` pages child
 conversations, including settled children, with title, Agent, state, hold,
 keep-open and recurrence details. The chat's child strip opens a child in the
 same chat view and provides Stop, Close and Hold/Unhold.
 
-`GET /api/v1/jobs/{job:N}/tree?after=job:M&limit=50&depth=2` reads the tree of
+`GET /api/v1/jobs/{job}/tree?after=<cursor-uuid>&limit=50&depth=2` reads the tree of
 the work below a Job: its ancestors, and its children in creation order, each
 with the state, Agent, model and dependencies the rows that own them hold. The
 root's own children are one page of at most 100; every node deeper than that
@@ -328,12 +328,12 @@ the turn completes with the pending requests in its result. Child conversations
 with a deciding user and a Model that supports Tools also offer
 `ask_user {"question":"..."}`. Questions complete the turn in the same way.
 
-`GET /api/v1/conversations/{job:N}/cards` reads undecided approvals, questions,
+`GET /api/v1/conversations/{job}/cards` reads undecided approvals, questions,
 loop holds and quarantines throughout the live subtree. Each card names its
 conversation and parent; the chat nests cards under their parent conversation.
 System conversations show only quarantine cards.
 
-`POST /api/v1/approvals/{job:N}/{request}/{index}` takes
+`POST /api/v1/approvals/{job}/{request}/{index}` takes
 `{"decision":"approve"}`, `{"decision":"reject"}`, or, for a question,
 `{"answer":"..."}`. A decision commits once and appends one Decision entry.
 The next claimed turn executes approved calls once under a host-made request 1,
@@ -341,7 +341,7 @@ rechecking the current registry and grant; its first provider request is 2.
 Closing voids undecided calls. Approved calls that never ran appear in the final
 conversation result, and an unresolved approved execution blocks Retry.
 
-`POST /api/v1/jobs/{job:N}/release-slot` takes `{}` and first tries the host's
+`POST /api/v1/jobs/{job}/release-slot` takes `{}` and first tries the host's
 process-group proof. A live group refuses with `slot_live`. When no group is
 tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
 confirmation. Successful replies are `released` or `already_released`. This route

@@ -678,7 +678,7 @@ fn a_sigkilled_supervisor_quarantines_the_capacity_its_surviving_child_uses() {
             panic!("the supervisor did not report its child in time; it said {seen:?}");
         };
         seen.push(line.clone());
-        if let Some(rest) = line.trim().strip_prefix("OCG_SUPERVISOR_READY") {
+        if let Some((_, rest)) = line.split_once("OCG_SUPERVISOR_READY") {
             supervisor_job = rest
                 .split_whitespace()
                 .find_map(|field| field.strip_prefix("job="))

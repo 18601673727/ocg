@@ -75,7 +75,7 @@ pub const CODE_COMMAND: &str = "workspace-code";
 /// objective.
 pub const VISION_COMMAND: &str = "workspace-vision";
 pub use crate::llm_target::{CREDENTIAL_REF_VARIABLE, ENDPOINT_VARIABLE, MODEL_VARIABLE};
-/// The Project the Job works in, written `project:<n>`: its root is the
+/// The Project the Job works in, identified by its UUID: its root is the
 /// Workspace the Job may read from.
 pub const PROJECT_VARIABLE: &str = "OCG_PROJECT";
 
@@ -155,7 +155,7 @@ impl Mode {
 pub enum Error {
     #[error("{0} must be set")]
     NotConfigured(&'static str),
-    #[error("{PROJECT_VARIABLE} must name a Project as project:<n>")]
+    #[error("{PROJECT_VARIABLE} must name a Project by its UUID")]
     InvalidProject,
     #[error("{0} does not exist")]
     ProjectMissing(ProjectId),

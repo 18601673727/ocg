@@ -360,7 +360,7 @@ impl Host {
             project: String::new(),
         };
         host.post(&format!("profiles/{}",host.model), json!({"kind":"llm","name":"scripted","model":"k-scenario","endpoint":format!("http://{}/v1",host._provider.address),"declared_capabilities":["chat","tools"]}));
-        let pool = host.executor.replace("executor:", "execution_pool:");
+        let pool = &host.executor;
         host.post(&format!("pools/{pool}"), json!({"concurrency_limit":16}));
         host.project = host.post(
             "projects",
@@ -728,8 +728,10 @@ fn scenario_03_grandchild_approval_executes_exactly_once() {
     assert_eq!(host.children(&child)[0]["id"], grandchild);
     let approval = card["approval"].as_array().unwrap();
     let path = format!(
-        "approvals/job:{}/{}/{}",
-        approval[0], approval[1], approval[2]
+        "approvals/{}/{}/{}",
+        approval[0].as_str().unwrap(),
+        approval[1],
+        approval[2]
     );
     let address = host.address();
     let mut attempts = Vec::new();
@@ -1086,8 +1088,10 @@ fn scenario_06_stop_keeps_queued_input_and_close_voids_the_tree() {
     assert!(!host.workspace.join("never.txt").exists());
     let approval = card["approval"].as_array().unwrap();
     let path = format!(
-        "approvals/job:{}/{}/{}",
-        approval[0], approval[1], approval[2]
+        "approvals/{}/{}/{}",
+        approval[0].as_str().unwrap(),
+        approval[1],
+        approval[2]
     );
     let (status, reply) = request(
         host.address(),
@@ -1097,22 +1101,25 @@ fn scenario_06_stop_keeps_queued_input_and_close_voids_the_tree() {
     );
     assert_eq!(status, 422);
     assert_eq!(reply["error"]["code"], "approval_decided");
-    let approval_turn = approval[0].as_u64().unwrap();
+    let approval_turn = id(approval[0].as_str().unwrap());
     let request = approval[1].as_u64().unwrap() as u32;
     let index = approval[2].as_u64().unwrap() as u32;
     host.inspect(|db| { let db=db.clone(); db_wait(async move {
         let stopped=db.job(id(&running)).await.unwrap().unwrap(); assert_eq!(stopped.outcome.as_ref().unwrap().kind,OutcomeKind::Unknown); assert!(matches!(stopped.outcome.unwrap().cause,Some(OutcomeCause::Stopped { .. })));
         assert!(db.turn_entries(id(&queued)).await.unwrap().iter().any(|(_,entry)|matches!(&entry.entry,Entry::UserMessage { text,.. } if text=="queued while running")));
         assert!(db.job(id(&tree)).await.unwrap().unwrap().subtree_settled);
-        assert!(matches!(db.tool_evidence(ocg::persistence::JobId::new(u128::from(approval_turn)),None,100).await.unwrap()[0].decision.fact,ToolDecision::AwaitingApproval(_)));
+        assert!(matches!(db.tool_evidence(approval_turn,None,100).await.unwrap()[0].decision.fact,ToolDecision::AwaitingApproval(_)));
     }); });
     let directory = DataDirectory::bootstrap(host.data.clone().into_os_string()).unwrap();
     let database = redb::Database::open(directory.database_path().join("ocg.redb")).unwrap();
     let tx = database.begin_read().unwrap();
     let table = tx
-        .open_table(TableDefinition::<(u64, u32, u32), &[u8]>::new("approval"))
+        .open_table(TableDefinition::<(u128, u32, u32), &[u8]>::new("approval"))
         .unwrap();
-    let row = table.get((approval_turn, request, index)).unwrap().unwrap();
+    let row = table
+        .get((approval_turn.get(), request, index))
+        .unwrap()
+        .unwrap();
     assert_eq!(row.value()[2], 4, "Voided decision tag");
 }
 

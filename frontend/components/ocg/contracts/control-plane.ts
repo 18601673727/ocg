@@ -76,7 +76,7 @@ export function decodeControlError(input: unknown) {
   return { code: string(value.code, "error.code"), message: string(value.message, "error.message") } satisfies Wire.WireError;
 }
 
-function identity(value: unknown, path: string, _prefix: string): string {
+function identity(value: unknown, path: string): string {
   const text = string(value, path);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(text)) {
     throw new ContractError(path, "a canonical UUIDv7 identity");
@@ -93,10 +93,10 @@ function jobRecord(input: unknown) {
     throw new ContractError("job.execution_mode", "a Control Plane execution mode");
   }
   return {
-    id: identity(job.id, "job.id", "job:"),
-    ...(job.parent === undefined || job.parent === null ? {} : { parent: identity(job.parent, "job.parent", "job:") }),
+    id: identity(job.id, "job.id"),
+    ...(job.parent === undefined || job.parent === null ? {} : { parent: identity(job.parent, "job.parent") }),
     kind: job.kind === "conversation" ? "conversation" as const : job.kind === "turn" ? "turn" as const : (() => { throw new ContractError("job.kind", "conversation or turn"); })(),
-    conversation: job.conversation === null ? null : identity(job.conversation, "job.conversation", "job:"),
+    conversation: job.conversation === null ? null : identity(job.conversation, "job.conversation"),
     name: job.name === null ? null : string(job.name, "job.name"),
     title: job.title === undefined || job.title === null ? null : string(job.title, "job.title"),
     is_chat: typeof job.is_chat === "boolean" ? job.is_chat : false,
@@ -104,10 +104,10 @@ function jobRecord(input: unknown) {
     input: string(job.input, "job.input"),
     previous: job.previous === undefined || job.previous === null
       ? null
-      : identity(job.previous, "job.previous", "job:"),
+      : identity(job.previous, "job.previous"),
     assigned_executor: job.assigned_executor === null
       ? null
-      : identity(job.assigned_executor, "job.assigned_executor", "executor:"),
+      : identity(job.assigned_executor, "job.assigned_executor"),
     created_at_us: integer(job.created_at_us, "job.created_at_us"),
     updated_at_us: integer(job.updated_at_us, "job.updated_at_us"),
     started_at_us: timestamp(job.started_at_us, "job.started_at_us"),
@@ -174,7 +174,7 @@ export type ControlOutput = ReturnType<typeof outputRecord>;
 export function decodeProviderResponses(input: unknown, jobId: string) {
   const envelope = record(input, "response");
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
-  const job = identity(envelope.job, "job", "job:");
+  const job = identity(envelope.job, "job");
   if (job !== jobId) throw new ContractError("job", "the requested Job");
   if (!Array.isArray(envelope.responses)) throw new ContractError("responses", "an array");
   let previous = 0;
@@ -232,8 +232,8 @@ export function decodeHealth(input: unknown) {
   const quarantined = listOf(envelope.quarantined, "quarantined", (entry, path) => {
     const item = record(entry, path);
     return {
-      job: identity(item.job, `${path}.job`, "job:"),
-      pool: item.pool === null ? null : identity(item.pool, `${path}.pool`, "execution_pool:"),
+      job: identity(item.job, `${path}.job`),
+      pool: item.pool === null ? null : identity(item.pool, `${path}.pool`),
       since: integer(item.since, `${path}.since`),
     } satisfies Wire.WireQuarantined;
   });
@@ -262,7 +262,7 @@ export function decodeJobs(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   return {
     jobs: listOf(envelope.jobs, "jobs", (job) => jobRecord(job)),
-    next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:"),
+    next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before"),
     has_more: boolean(envelope.has_more, "has_more"),
   } satisfies Wire.WireJobs;
 }
@@ -275,7 +275,7 @@ function holdActor(
   const by = record(input, path);
   const kind = oneOf(by.kind, `${path}.kind`, ["user", "agent", "loop", "auto"] as const);
   if (kind === "agent") {
-    return { kind, conversation: identity(by.conversation, `${path}.conversation`, "job:") };
+    return { kind, conversation: identity(by.conversation, `${path}.conversation`) };
   }
   return { kind };
 }
@@ -284,13 +284,13 @@ function conversationRecord(input: unknown) {
   const c = record(input, "conversation");
   const hold = c.on_hold === null ? null : record(c.on_hold, "conversation.on_hold");
   return {
-    root_job: identity(c.root_job, "conversation.root_job", "job:"),
-    tip_job: identity(c.tip_job, "conversation.tip_job", "job:"),
-    agent: c.agent === null ? null : identity(c.agent, "conversation.agent", "profile:"),
+    root_job: identity(c.root_job, "conversation.root_job"),
+    tip_job: identity(c.tip_job, "conversation.tip_job"),
+    agent: c.agent === null ? null : identity(c.agent, "conversation.agent"),
     title: string(c.title, "conversation.title"),
     state: c.state === "open" || c.state === "closing" || c.state === "settled" ? c.state : (() => { throw new ContractError("conversation.state", "open, closing or settled"); })(),
     on_hold: hold === null ? null : { by: holdActor(hold.by, "conversation.on_hold.by") },
-    project: c.project === null ? null : identity(c.project, "conversation.project", "project:"),
+    project: c.project === null ? null : identity(c.project, "conversation.project"),
     tip_settlement_state: string(c.tip_settlement_state, "conversation.tip_settlement_state"),
     tip_created_at_us: integer(c.tip_created_at_us, "conversation.tip_created_at_us"),
   } satisfies Wire.WireConversation;
@@ -303,7 +303,7 @@ export function decodeConversations(input: unknown) {
     conversations: listOf(envelope.conversations, "conversations", (conversation) => conversationRecord(conversation)),
     next_before: envelope.next_before === null || envelope.next_before === undefined
       ? null
-      : identity(envelope.next_before, "next_before", "job:"),
+      : identity(envelope.next_before, "next_before"),
     has_more: boolean(envelope.has_more, "has_more"),
   } satisfies Wire.WireConversations;
 }
@@ -324,7 +324,7 @@ function observation(input: unknown, path: string) {
     value,
     common: {
       id: string(value.id, `${path}.id`),
-      job: identity(value.job, `${path}.job`, "job:"),
+      job: identity(value.job, `${path}.job`),
       request: integer(value.request, `${path}.request`),
       observed_at_us: integer(value.observed_at_us, `${path}.observed_at_us`),
       model: optionalString(value.model, `${path}.model`),
@@ -347,7 +347,7 @@ export function decodeUsage(input: unknown) {
       }
       return {
         ...common,
-        llm_profile: value.llm_profile === null ? null : identity(value.llm_profile, `${path}.llm_profile`, "profile:"),
+        llm_profile: value.llm_profile === null ? null : identity(value.llm_profile, `${path}.llm_profile`),
         input_tokens: timestamp(value.input_tokens, `${path}.input_tokens`),
         output_tokens: timestamp(value.output_tokens, `${path}.output_tokens`),
         cache_read_tokens: timestamp(value.cache_read_tokens, `${path}.cache_read_tokens`),
@@ -388,8 +388,8 @@ export function decodeUsageBuckets(input: unknown) {
       const row = record(input, path);
       return {
         bucket_us: signedInteger(row.bucket_us, `${path}.bucket_us`),
-        agent: row.agent === null ? null : identity(row.agent, `${path}.agent`, "profile:"),
-        provider: identity(row.provider, `${path}.provider`, "llm_provider:"),
+        agent: row.agent === null ? null : identity(row.agent, `${path}.agent`),
+        provider: identity(row.provider, `${path}.provider`),
         model: row.model === null ? null : string(row.model, `${path}.model`),
         requests: integer(row.requests, `${path}.requests`),
         complete_requests: integer(row.complete_requests, `${path}.complete_requests`),
@@ -414,8 +414,8 @@ export function decodeUsageRetries(input: unknown) {
     retry_rows: listOf(envelope.retry_rows, "retry_rows", (input, path) => {
       const row = record(input, path);
       return {
-        agent: row.agent === null ? null : identity(row.agent, `${path}.agent`, "profile:"),
-        provider: identity(row.provider, `${path}.provider`, "llm_provider:"),
+        agent: row.agent === null ? null : identity(row.agent, `${path}.agent`),
+        provider: identity(row.provider, `${path}.provider`),
         model: row.model === null ? null : string(row.model, `${path}.model`),
         retries: integer(row.retries, `${path}.retries`),
         bucket_us: signedInteger(row.bucket_us, `${path}.bucket_us`),
@@ -556,14 +556,14 @@ export function decodeAdmission(input: unknown) {
   if (status !== "admitted" && status !== "pending" && status !== "uncertain" && status !== "not_found") {
     throw new ContractError("admission.status", "a Control Plane admission status");
   }
-  const job = admission.job === null ? null : identity(admission.job, "admission.job", "job:");
+  const job = admission.job === null ? null : identity(admission.job, "admission.job");
   if ((status === "admitted") !== (job !== null)) {
     throw new ContractError("admission.job", "a Job exactly when the key was admitted");
   }
   if (status === "admitted") {
     const admitted = {
-      status, job: identity(admission.job, "admission.job", "job:"),
-      conversation: identity(admission.conversation, "admission.conversation", "job:"),
+      status, job: identity(admission.job, "admission.job"),
+      conversation: identity(admission.conversation, "admission.conversation"),
       seq: integer(admission.seq, "admission.seq"), joined: boolean(admission.joined, "admission.joined"),
       model: string(admission.model, "admission.model"), kept: admission.kept === true,
     } satisfies Extract<Wire.WireAdmission, { status: "admitted" }>;
@@ -606,19 +606,19 @@ function jobInputRecord(input: unknown, path: string, jobId: string) {
     configuration = {
       agent_profile: frozen.agent_profile === null
         ? null
-        : identity(frozen.agent_profile, `${path}.configuration.agent_profile`, "profile:"),
-      llm_profile: identity(frozen.llm_profile, `${path}.configuration.llm_profile`, "profile:"),
+        : identity(frozen.agent_profile, `${path}.configuration.agent_profile`),
+      llm_profile: identity(frozen.llm_profile, `${path}.configuration.llm_profile`),
       model: string(frozen.model, `${path}.configuration.model`),
       context_window: optionalInteger(frozen.context_window, `${path}.configuration.context_window`),
     };
   }
   return {
     job: jobId,
-    id: identity(value.id, `${path}.id`, "job_input:"),
+    id: identity(value.id, `${path}.id`),
     objective: value.objective === null ? null : string(value.objective, `${path}.objective`),
     submitted_at_us: timestamp(value.submitted_at_us, `${path}.submitted_at_us`),
     attachments: attachments.map((attachment, index) =>
-      identity(attachment, `${path}.attachments[${index}]`, "attachment:")),
+      identity(attachment, `${path}.attachments[${index}]`)),
     configuration,
   } satisfies Wire.WireInput & { job: string };
 }
@@ -650,14 +650,14 @@ export function decodeConversationTurns(input: unknown, conversationId: string) 
       const entry = record(input, path);
       const kind = oneOf(entry.kind, `${path}.kind`, ["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format"] as const);
       if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
-      return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path, "attachment:")), at_us: integer(entry.at_us, `${path}.at_us`) } satisfies ProjectedEntry;
+      return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path)), at_us: integer(entry.at_us, `${path}.at_us`) } satisfies ProjectedEntry;
     });
     const userEntries = entries.filter(entry => entry.kind === "user_message" || entry.kind === "agent_message");
     const frozenInput = jobInputRecord({ id: job.input, objective: userEntries.map(entry => entry.text ?? "").join("\n"), submitted_at_us: job.created_at_us, attachments: userEntries.flatMap(entry => entry.attachments), configuration: turn.configuration }, `${path}.input`, job.id);
     const outputs = listOf(turn.outputs, `${path}.outputs`, output => outputRecord(output));
     return { job, entries, input: frozenInput, outputs } satisfies ProjectedTurn;
   });
-  return { conversation: conversationId, turns, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:") } satisfies Omit<Wire.WireTurns, "turns"> & { turns: ProjectedTurn[] };
+  return { conversation: conversationId, turns, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before") } satisfies Omit<Wire.WireTurns, "turns"> & { turns: ProjectedTurn[] };
 }
 export type ControlConversation = ReturnType<typeof decodeConversationTurns>;
 export type ControlConversationTurn = ControlConversation["turns"][number];
@@ -687,7 +687,7 @@ export function decodeAgentProfiles(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   const nextBefore = envelope.next_before === null
     ? null
-    : identity(envelope.next_before, "next_before", "profile:");
+    : identity(envelope.next_before, "next_before");
   const hasMore = boolean(envelope.has_more, "has_more");
   if (hasMore !== (nextBefore !== null)) {
     throw new ContractError("next_before", "a cursor exactly when more Profiles remain");
@@ -696,13 +696,13 @@ export function decodeAgentProfiles(input: unknown) {
     agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
       const agent = record(entry, path);
       return {
-        id: identity(agent.id, `${path}.id`, "profile:"),
+        id: identity(agent.id, `${path}.id`),
         name: string(agent.name, `${path}.name`),
         tool_grant: toolGrant(agent.tool_grant, `${path}.tool_grant`),
         llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`, (target, targetPath) => {
           const llm = record(target, targetPath);
           return {
-            id: identity(llm.id, `${targetPath}.id`, "profile:"),
+            id: identity(llm.id, `${targetPath}.id`),
             name: string(llm.name, `${targetPath}.name`),
             model: string(llm.model, `${targetPath}.model`),
             context_window: optionalInteger(llm.context_window, `${targetPath}.context_window`),
@@ -714,7 +714,7 @@ export function decodeAgentProfiles(input: unknown) {
                 return known;
               }),
             executors: listOf(llm.executors, `${targetPath}.executors`,
-              (executor, executorPath) => identity(executor, executorPath, "executor:")),
+              (executor, executorPath) => identity(executor, executorPath)),
           } satisfies Omit<Wire.WireLlmTarget, "parameters">;
         }),
       } satisfies ProjectedAgent;
@@ -727,7 +727,7 @@ export function decodeAgentProfiles(input: unknown) {
 function projectRecord(input: unknown, path: string) {
   const project = record(input, path);
   return {
-    id: identity(project.id, `${path}.id`, "project:"),
+    id: identity(project.id, `${path}.id`),
     name: string(project.name, `${path}.name`),
     description: optionalString(project.description, `${path}.description`),
     root: string(project.root, `${path}.root`),
@@ -749,7 +749,7 @@ export function decodeProjects(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   const nextBefore = envelope.next_before === null
     ? null
-    : identity(envelope.next_before, "next_before", "project:");
+    : identity(envelope.next_before, "next_before");
   const hasMore = boolean(envelope.has_more, "has_more");
   if (hasMore !== (nextBefore !== null)) {
     throw new ContractError("next_before", "a cursor exactly when more Projects remain");
@@ -774,7 +774,7 @@ function poolRecord(input: unknown, path: string) {
     throw new ContractError(`${path}.concurrency_limit`, "an integer >= 1");
   }
   return {
-    id: identity(pool.id, `${path}.id`, "execution_pool:"),
+    id: identity(pool.id, `${path}.id`),
     name: string(pool.name, `${path}.name`),
     concurrency_limit: concurrencyLimit,
     enabled: boolean(pool.enabled, `${path}.enabled`),
@@ -800,8 +800,8 @@ export function decodeRetry(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   return {
     api_version: CONTROL_API_VERSION,
-    conversation: identity(envelope.conversation, "conversation", "job:"),
-    turn: identity(envelope.turn, "turn", "job:"),
+    conversation: identity(envelope.conversation, "conversation"),
+    turn: identity(envelope.turn, "turn"),
     seq: integer(envelope.seq, "seq"),
     joined: boolean(envelope.joined, "joined"),
   } satisfies Wire.WireEnvelope<Wire.WireAppend>;
@@ -851,7 +851,7 @@ export function decodeProfiles(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   const profileId = envelope.profile_id === undefined || envelope.profile_id === null
     ? null
-    : identity(envelope.profile_id, "profile_id", "profile:");
+    : identity(envelope.profile_id, "profile_id");
   return {
     profile_id: profileId,
     llm_profiles: listOf(envelope.llm_profiles, "llm_profiles", (entry, path) => {
@@ -862,7 +862,7 @@ export function decodeProfiles(input: unknown) {
       }
       const params = record(llm.parameters, `${path}.parameters`);
       return {
-        id: identity(llm.id, `${path}.id`, "profile:"),
+        id: identity(llm.id, `${path}.id`),
         name: string(llm.name, `${path}.name`),
         model: string(llm.model, `${path}.model`),
         context_window: optionalInteger(llm.context_window, `${path}.context_window`),
@@ -887,10 +887,10 @@ export function decodeProfiles(input: unknown) {
           frequency_penalty: optionalFiniteNumber(params.frequency_penalty, `${path}.parameters.frequency_penalty`),
         },
         executors: listOf(llm.executors, `${path}.executors`,
-          (executor, executorPath) => identity(executor, executorPath, "executor:")),
+          (executor, executorPath) => identity(executor, executorPath)),
         editable: boolean(llm.editable, `${path}.editable`),
         blocking_jobs: listOf(llm.blocking_jobs, `${path}.blocking_jobs`,
-          (job, jobPath) => identity(job, jobPath, "job:")),
+          (job, jobPath) => identity(job, jobPath)),
         more_blocking_jobs: boolean(llm.more_blocking_jobs, `${path}.more_blocking_jobs`),
         created_at_us: integer(llm.created_at_us, `${path}.created_at_us`),
         updated_at_us: integer(llm.updated_at_us, `${path}.updated_at_us`),
@@ -903,20 +903,20 @@ export function decodeProfiles(input: unknown) {
         throw new ContractError(`${path}.behavior`, "chat or general");
       }
       return {
-        id: identity(agent.id, `${path}.id`, "profile:"),
+        id: identity(agent.id, `${path}.id`),
         name: string(agent.name, `${path}.name`),
         tool_grant: toolGrant(agent.tool_grant, `${path}.tool_grant`),
         instructions: optionalString(agent.instructions, `${path}.instructions`),
         behavior: rawBehavior as ControlAgentBehavior,
         llm_targets: listOf(agent.llm_targets, `${path}.llm_targets`,
-          (target, targetPath) => identity(target, targetPath, "profile:")),
+          (target, targetPath) => identity(target, targetPath)),
         dispatch_to: agent.dispatch_to === undefined ? undefined : listOf(agent.dispatch_to, `${path}.dispatch_to`,
-          (target, targetPath) => identity(target, targetPath, "profile:")),
+          (target, targetPath) => identity(target, targetPath)),
         default_model: agent.default_model === undefined ? undefined : agent.default_model === null ? null
-          : identity(agent.default_model, `${path}.default_model`, "profile:"),
+          : identity(agent.default_model, `${path}.default_model`),
         editable: boolean(agent.editable, `${path}.editable`),
         blocking_jobs: listOf(agent.blocking_jobs, `${path}.blocking_jobs`,
-          (job, jobPath) => identity(job, jobPath, "job:")),
+          (job, jobPath) => identity(job, jobPath)),
         more_blocking_jobs: boolean(agent.more_blocking_jobs, `${path}.more_blocking_jobs`),
         created_at_us: integer(agent.created_at_us, `${path}.created_at_us`),
         updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`),
@@ -934,7 +934,7 @@ export function decodeProfiles(input: unknown) {
         credential_ref: optionalString(provider.credential_ref, `${path}.credential_ref`),
         has_credential: boolean(provider.has_credential, `${path}.has_credential`),
         profile_ids: listOf(provider.profile_ids, `${path}.profile_ids`,
-          (id, idPath) => identity(id, idPath, "profile:")),
+          (id, idPath) => identity(id, idPath)),
         models: listOf(provider.models, `${path}.models`,
           (model, modelPath) => string(model, modelPath)),
       } satisfies Wire.WireProvider;
@@ -956,7 +956,7 @@ export function decodeAttachment(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   const attachment = record(envelope.attachment, "attachment");
   return {
-    id: identity(attachment.id, "attachment.id", "attachment:"),
+    id: identity(attachment.id, "attachment.id"),
     mime: string(attachment.mime, "attachment.mime"),
     byte_length: integer(attachment.byte_length, "attachment.byte_length"),
     sha256: string(attachment.sha256, "attachment.sha256"),
@@ -994,15 +994,15 @@ export function decodeChildren(input: unknown, conversationId: string) {
     const interval = recurrence === null ? null : integer(recurrence.interval_s, `${path}.recurrence.interval_s`);
     if (interval !== null && (interval < 60 || interval > 2592000)) throw new ContractError(`${path}.recurrence.interval_s`, "60 to 2592000");
     return {
-      id: identity(child.id, `${path}.id`, "job:"), title: string(child.title, `${path}.title`),
-      agent: child.agent === null ? null : identity(child.agent, `${path}.agent`, "profile:"), state,
+      id: identity(child.id, `${path}.id`), title: string(child.title, `${path}.title`),
+      agent: child.agent === null ? null : identity(child.agent, `${path}.agent`), state,
       on_hold: by === null ? null : { by: by === "agent"
-        ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`, "job:") }
+        ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`) }
         : { kind: by } }, keep_open: boolean(child.keep_open, `${path}.keep_open`),
       recurrence: recurrence === null ? null : { interval_s: interval!, phase: phase!, due_us: recurrence.due_us === null ? null : integer(recurrence.due_us, `${path}.recurrence.due_us`) },
     } satisfies Wire.WireChild;
   });
-  return { conversation: conversationId, children, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before", "job:") } satisfies Wire.WireChildren;
+  return { conversation: conversationId, children, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before") } satisfies Wire.WireChildren;
 }
 export type ControlChildConversation = ReturnType<typeof decodeChildren>["children"][number];
 
@@ -1049,7 +1049,7 @@ function treeNode(input: unknown, path: string, depth: number): ControlTreeNode 
   const model = node.model === null ? null : (() => {
     const frozen = record(node.model, `${path}.model`);
     return {
-      llm_profile: identity(frozen.llm_profile, `${path}.model.llm_profile`, "profile:"),
+      llm_profile: identity(frozen.llm_profile, `${path}.model.llm_profile`),
       model: string(frozen.model, `${path}.model.model`),
     };
   })();
@@ -1071,28 +1071,28 @@ function treeNode(input: unknown, path: string, depth: number): ControlTreeNode 
     };
   })();
   return {
-    id: identity(node.id, `${path}.id`, "job:"),
+    id: identity(node.id, `${path}.id`),
     kind: oneOf(node.kind, `${path}.kind`, ["conversation", "turn"] as const),
-    parent: node.parent === null ? null : identity(node.parent, `${path}.parent`, "job:"),
+    parent: node.parent === null ? null : identity(node.parent, `${path}.parent`),
     title: string(node.title, `${path}.title`),
     state: oneOf(node.state, `${path}.state`, TREE_STATES),
     created_at_us: integer(node.created_at_us, `${path}.created_at_us`),
-    agent: node.agent === null ? null : identity(node.agent, `${path}.agent`, "profile:"),
+    agent: node.agent === null ? null : identity(node.agent, `${path}.agent`),
     agent_name: node.agent_name === null ? null : string(node.agent_name, `${path}.agent_name`),
     model,
     on_hold: by === null ? null : { by: by === "agent"
-      ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`, "job:") }
+      ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`) }
       : { kind: by } },
     origin,
     keep_open: node.keep_open === null ? null : boolean(node.keep_open, `${path}.keep_open`),
-    active_turn: node.active_turn === null ? null : identity(node.active_turn, `${path}.active_turn`, "job:"),
+    active_turn: node.active_turn === null ? null : identity(node.active_turn, `${path}.active_turn`),
     recurrence,
-    conversation: node.conversation === null ? null : identity(node.conversation, `${path}.conversation`, "job:"),
-    previous: node.previous === null ? null : identity(node.previous, `${path}.previous`, "job:"),
+    conversation: node.conversation === null ? null : identity(node.conversation, `${path}.conversation`),
+    previous: node.previous === null ? null : identity(node.previous, `${path}.previous`),
     depends_on: listOf(node.depends_on, `${path}.depends_on`, (entry, entryPath) => {
       const dependency = record(entry, entryPath);
       return {
-        job: identity(dependency.job, `${entryPath}.job`, "job:"),
+        job: identity(dependency.job, `${entryPath}.job`),
         condition: oneOf(dependency.condition, `${entryPath}.condition`, ["settled", "success"] as const),
         state: oneOf(dependency.state, `${entryPath}.state`, ["waiting", "satisfied", "impossible"] as const),
       };
@@ -1101,7 +1101,7 @@ function treeNode(input: unknown, path: string, depth: number): ControlTreeNode 
       ? null
       : listOf(node.children, `${path}.children`, (entry, entryPath) => treeNode(entry, entryPath, depth + 1)),
     has_more_children: boolean(node.has_more_children, `${path}.has_more_children`),
-    next_after: node.next_after === null ? null : identity(node.next_after, `${path}.next_after`, "job:"),
+    next_after: node.next_after === null ? null : identity(node.next_after, `${path}.next_after`),
   };
 }
 
@@ -1117,7 +1117,7 @@ export function decodeJobTree(input: unknown, job: string) {
   if (root.id !== job) throw new ContractError("root.id", "the requested Job");
   return {
     job,
-    ancestors: listOf(envelope.ancestors, "ancestors", (entry, path) => identity(entry, path, "job:")),
+    ancestors: listOf(envelope.ancestors, "ancestors", (entry, path) => identity(entry, path)),
     root,
   } satisfies Wire.WireTree;
 }
@@ -1126,7 +1126,7 @@ export type ControlApproval = Wire.WireApprovalDecision["approval"];
 
 function approvalRef(input: unknown, path: string): ControlApproval {
   if (!Array.isArray(input) || input.length !== 3) throw new ContractError(path, "an approval triple");
-  const turn = identity(input[0], `${path}.turn`, "job:");
+  const turn = identity(input[0], `${path}.turn`);
   const request = integer(input[1], `${path}.request`);
   const index = integer(input[2], `${path}.index`);
   if (request === 0 || request > 0xffffffff || index > 0xffffffff) throw new ContractError(path, "a stored call reference");
@@ -1141,12 +1141,12 @@ export function decodeCards(input: unknown, conversationId: string) {
   if (envelope.conversation !== conversationId) throw new ContractError("conversation", `matching ${conversationId}`);
   const cards = listOf(envelope.cards, "cards", (input, path): ControlConversationCard => {
     const card = record(input, path);
-    const common = { conversation: identity(card.conversation, `${path}.conversation`, "job:"), parent: card.parent === null ? null : identity(card.parent, `${path}.parent`, "job:") };
+    const common = { conversation: identity(card.conversation, `${path}.conversation`), parent: card.parent === null ? null : identity(card.parent, `${path}.parent`) };
     switch (card.kind) {
       case "approval": return { ...common, kind: card.kind, approval: approvalRef(card.approval, `${path}.approval`), tool: string(card.tool, `${path}.tool`), arguments: string(card.arguments, `${path}.arguments`) } satisfies Wire.WireCard;
       case "question": return { ...common, kind: card.kind, approval: approvalRef(card.approval, `${path}.approval`), tool: string(card.tool, `${path}.tool`), question: string(card.question, `${path}.question`) } satisfies Wire.WireCard;
       case "loop_hold": return { ...common, kind: card.kind } satisfies Wire.WireCard;
-      case "quarantine": return { ...common, kind: card.kind, turn: identity(card.turn, `${path}.turn`, "job:") } satisfies Wire.WireCard;
+      case "quarantine": return { ...common, kind: card.kind, turn: identity(card.turn, `${path}.turn`) } satisfies Wire.WireCard;
       default: throw new ContractError(`${path}.kind`, "an approval, question, loop_hold or quarantine card");
     }
   });
@@ -1160,7 +1160,7 @@ export function decodeApprovalDecision(input: unknown, expected: ControlApproval
   if (approval.some((part, index) => part !== expected[index])) throw new ContractError("approval", "the requested approval");
   const decision = value.decision;
   if (decision !== "approved" && decision !== "rejected" && decision !== "answered") throw new ContractError("decision", "an approval decision");
-  return { approval, decision, turn: identity(value.turn, "turn", "job:"), seq: integer(value.seq, "seq"), joined: boolean(value.joined, "joined") } satisfies Wire.WireApprovalDecision;
+  return { approval, decision, turn: identity(value.turn, "turn"), seq: integer(value.seq, "seq"), joined: boolean(value.joined, "joined") } satisfies Wire.WireApprovalDecision;
 }
 
 export function decodeReleaseSlot(input: unknown) {

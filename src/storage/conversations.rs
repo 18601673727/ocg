@@ -3719,6 +3719,10 @@ mod tests {
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0]["parent"], child.to_string());
         assert_eq!(cards[0]["conversation"], grandchild.to_string());
+        assert_eq!(
+            cards[0]["approval"],
+            serde_json::json!([turn.to_string(), approval.request.get(), approval.index])
+        );
         wait(
             fixture
                 .database

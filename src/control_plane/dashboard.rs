@@ -478,6 +478,10 @@ impl UsageRetriesQuery {
     }
 }
 
+fn retry_cursor((original, retry): (u128, u128)) -> String {
+    format!("{}.{}", JobId::new(original), JobId::new(retry))
+}
+
 pub(super) async fn usage_retries(
     shared: &Shared,
     query: UsageRetriesQuery,
@@ -490,9 +494,7 @@ pub(super) async fn usage_retries(
         shared,
         envelope(WireUsageRetries {
             retry_rows: page.rows.iter().map(usage_retry_row).collect(),
-            next_after: page
-                .next
-                .map(|(original, retry)| format!("{original}.{retry}")),
+            next_after: page.next.map(retry_cursor),
         }),
     )
 }
@@ -669,8 +671,13 @@ mod tests {
         let base = "from_us=0&until_us=86400000000&bucket=day";
         let original = "00000002-0000-7001-8000-000000000002";
         let retry = "00000003-0000-7001-8000-000000000003";
-        let query = UsageRetriesQuery::parse(&format!("{base}&after={original}.{retry}&limit=1"))
-            .expect("query");
+        let cursor = retry_cursor((
+            crate::persistence::parse_entity_id(original).unwrap(),
+            crate::persistence::parse_entity_id(retry).unwrap(),
+        ));
+        assert_eq!(cursor, format!("{original}.{retry}"));
+        let query =
+            UsageRetriesQuery::parse(&format!("{base}&after={cursor}&limit=1")).expect("query");
         assert_eq!(
             query.after,
             Some((

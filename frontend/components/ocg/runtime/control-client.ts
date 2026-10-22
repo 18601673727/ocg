@@ -182,7 +182,7 @@ function jobIdentity(value: string): string {
   return value;
 }
 
-function identity(value: string, path: string, _prefix: string): string {
+function identity(value: string, path: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
     throw new ContractError(path, "a canonical UUIDv7 identity");
   }
@@ -262,7 +262,7 @@ function observationQuery(settings: ObservationSettings): string {
     if (!/^[A-Za-z0-9_-]{1,400}$/.test(settings.after)) throw new ContractError("after", "an observation cursor");
     query.push(`after=${settings.after}`);
   }
-  if (settings.llmProfile) query.push(`llm_profile=${identity(settings.llmProfile, "llm_profile", "profile:")}`);
+  if (settings.llmProfile) query.push(`llm_profile=${identity(settings.llmProfile, "llm_profile")}`);
   return query.length ? `?${query.join("&")}` : "";
 }
 
@@ -448,7 +448,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
   async function readProjectPage(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {
     const query: string[] = [];
-    if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before", "project:")}`);
+    if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before")}`);
     if (settings.limit !== undefined) {
       if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
         throw new ContractError("limit", "an integer from 1 to 100");
@@ -628,7 +628,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
     ) {
       const query: string[] = [];
-      if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before", "profile:")}`);
+      if (settings.before !== undefined) query.push(`before=${identity(settings.before, "before")}`);
       if (settings.limit !== undefined) {
         if (!Number.isSafeInteger(settings.limit) || settings.limit < 1 || settings.limit > 100) {
           throw new ContractError("limit", "an integer from 1 to 100");
@@ -667,7 +667,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     /** Updates an existing Project. */
     async updateProject(projectId: string, body: ControlProjectUpdate, signal?: AbortSignal) {
-      identity(projectId, "project", "project:");
+      identity(projectId, "project");
       const answer = await send("POST", `/api/v1/projects/${projectId}`, {
         body,
         sign: true,
@@ -684,7 +684,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     /** Updates a Pool's concurrency limit or enabled state. */
     async updatePool(poolId: string, body: ControlPoolUpdate, signal?: AbortSignal) {
-      identity(poolId, "pool", "execution_pool:");
+      identity(poolId, "pool");
       if (body.concurrency_limit !== undefined) {
         if (!Number.isSafeInteger(body.concurrency_limit) || body.concurrency_limit < 1 || body.concurrency_limit > 4294967295) {
           throw new ContractError("concurrency_limit", "an integer from 1 to 4294967295");
@@ -717,7 +717,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     /** Updates an existing LLM Profile or Agent Profile. */
     async updateProfile(profileId: string, profile: ControlProfileWriteRequest, signal?: AbortSignal) {
-      identity(profileId, "profile", "profile:");
+      identity(profileId, "profile");
       const answer = await send("POST", `/api/v1/profiles/${profileId}`, {
         body: profile,
         sign: true,
@@ -825,14 +825,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
      * submitted under a second key; the same key is looked up or replayed.
      */
     async submitJob(submission: ControlSubmission, key: string, signal?: AbortSignal) {
-      if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile", "profile:");
-      if (submission.llm_profile !== undefined) identity(submission.llm_profile, "llm_profile", "profile:");
-      identity(submission.executor, "executor", "executor:");
+      if (submission.agent_profile !== undefined) identity(submission.agent_profile, "agent_profile");
+      if (submission.llm_profile !== undefined) identity(submission.llm_profile, "llm_profile");
+      identity(submission.executor, "executor");
       if (submission.conversation !== undefined) jobIdentity(submission.conversation);
-      if (submission.project !== undefined) identity(submission.project, "project", "project:");
+      if (submission.project !== undefined) identity(submission.project, "project");
       if (submission.attachments !== undefined) {
         for (const [index, att] of submission.attachments.entries()) {
-          identity(att, `attachments[${index}]`, "attachment:");
+          identity(att, `attachments[${index}]`);
         }
       }
       submissionKey(key);
@@ -870,14 +870,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     /** Reads metadata of an image Attachment. */
     async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
-      identity(attachmentId, "attachment", "attachment:");
+      identity(attachmentId, "attachment");
       const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, { signal });
       return decodeAttachment(answer.input);
     },
 
     /** URL to fetch the raw image content of an Attachment. */
     attachmentContentUrl(attachmentId: string): string {
-      identity(attachmentId, "attachment", "attachment:");
+      identity(attachmentId, "attachment");
       return `${base}/api/v1/attachments/${attachmentId}/content`;
     },
 

@@ -2544,7 +2544,7 @@ pub(crate) fn read_cards(
                     .ok_or_else(|| StorageError::corrupted("awaiting admission missing"))?
                     .arguments
                     .as_str();
-                let mut card = json!({"kind": if matches!(call.decision.fact, crate::persistence::ToolDecision::AwaitingAnswer(_)) { "question" } else { "approval" }, "conversation": conversation.to_string(), "parent":parent, "approval":[turn.to_string(),request,index], "tool":call.name});
+                let mut card = json!({"kind": if matches!(call.decision.fact, crate::persistence::ToolDecision::AwaitingAnswer(_)) { "question" } else { "approval" }, "conversation": conversation.to_string(), "parent":parent, "approval":[JobId::new(turn).to_string(),request,index], "tool":call.name});
                 if matches!(
                     call.decision.fact,
                     crate::persistence::ToolDecision::AwaitingAnswer(_)

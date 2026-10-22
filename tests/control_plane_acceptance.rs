@@ -244,6 +244,18 @@ fn job(address: SocketAddr, job: &str) -> Value {
     answer.body["job"].clone()
 }
 
+fn job_ids(address: SocketAddr) -> Vec<String> {
+    let answer = request(address, "GET /api/v1/job-history?limit=100", None, None);
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert_eq!(answer.body["has_more"], false, "the fixture fits one page");
+    answer.body["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .map(|job| job["id"].as_str().expect("Job UUID").to_owned())
+        .collect()
+}
+
 fn admitted(answer: &Answer) -> String {
     assert_eq!(
         answer.body["admission"]["status"], "admitted",
@@ -434,6 +446,7 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
         Some("{}"),
     );
     assert_eq!(again.body["status"], "already_settled");
+    let before_restart = job_ids(address);
     daemon.stop();
 
     // After a restart, the keys still name their Jobs, and replays run
@@ -457,20 +470,7 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
         Some("{}"),
     );
     assert_eq!(stop.body["status"], "already_settled");
-    // Jobs are numbered in order: none after it repeats either submission.
-    let last = running[4..].parse::<u64>().expect("a number");
-    for later in last + 1..last + 32 {
-        let answer = request(
-            address,
-            &format!("GET /api/v1/jobs/job:{later}"),
-            None,
-            None,
-        );
-        if answer.status == 200 {
-            let name = &answer.body["job"]["name"];
-            assert!(name != "acceptance running" && name != "acceptance failing");
-        }
-    }
+    assert_eq!(job_ids(address), before_restart, "replays create no Jobs");
     daemon.stop();
     drop(silent);
     std::fs::remove_dir_all(&root).ok();

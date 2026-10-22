@@ -12602,12 +12602,12 @@ mod requests_and_tool_loop {
                 Value::Null
             );
 
-            // The root of the Job tree is not a Job and has no input.
+            // The internal root sentinel is not a public UUIDv7 identity.
             let genesis = get(
                 address,
                 &format!("/api/v1/jobs/{}/input", running.handle.genesis()),
             );
-            assert_eq!(genesis.status, 404, "{}", genesis.body);
+            assert_eq!(genesis.status, 400, "{}", genesis.body);
             assert_eq!(
                 get(
                     address,
@@ -12846,7 +12846,10 @@ mod requests_and_tool_loop {
                 &format!("/api/v1/conversations/{genesis}"),
                 r#"{"hidden":true}"#,
             );
-            assert_eq!((hidden.status, hidden.error().as_str()), (404, "not_found"));
+            assert_eq!(
+                (hidden.status, hidden.error().as_str()),
+                (400, "invalid_request")
+            );
             running.stop();
         }
 
@@ -13725,12 +13728,12 @@ mod requests_and_tool_loop {
                 crate::persistence::parse_entity_id("00000001-0000-7001-8000-000000000001")
                     .expect("a canonical UUIDv7"),
             );
-            for job in [unknown, handle.genesis()] {
+            for (job, status, code) in [
+                (unknown, 404, "conversation_not_found"),
+                (handle.genesis(), 400, "invalid_request"),
+            ] {
                 let missing = stop(address, job);
-                assert_eq!(
-                    (missing.status, missing.error().as_str()),
-                    (404, "conversation_not_found")
-                );
+                assert_eq!((missing.status, missing.error().as_str()), (status, code));
             }
             until(|| running.control.held() == (0, 0));
             running.stop();

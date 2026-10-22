@@ -16,7 +16,7 @@ If anything below conflicts with the rule above, the rule above wins. If the cod
 
 - **Upstream blacklist.** No code from the GitHub accounts or orgs `unifiedjs`, `micromark`, `shikijs`, `wooorm` or `ChristianMurphy`: not direct, transitive, dev, build, bundled, vendored, copied or forked. Banned: `remark-*`, `rehype-*`, `react-markdown`, Shiki. Only exception: full Mermaid and the paths it strictly requires. Before adding or upgrading any Rust or npm dependency, check the whole dependency graph for these origins; if unsure, stop and report.
 - **No new dependency** unless the instruction allows it. Never run a bare `cargo update` or an unpinned `pnpm update`.
-- **No language servers** (LSP, rust-analyzer, vtsls, ...). Code intelligence is OCG's own tree-sitter.
+- **Code intelligence integrated** Do not integrate extra language servers into OCG; OCG’s code intelligence uses its own tree-sitter. Development agents may use LSP tools to navigate, analyze, and edit this repository.
 - **Stored format:** any change to a stored key, row or encoding bumps `FORMAT_VERSION` in `src/storage/schema.rs` (and its assertion in `src/schema_tests.rs` and the README line). No migrations, no compatibility shims: an old data directory is refused.
 - **Each fact is stored once,** in the row it belongs to. Derived tables are rebuildable from source rows; never store a second copy of a fact to save a read.
 - **All history is kept.** Never silently drop a chat turn, notice, output or record.

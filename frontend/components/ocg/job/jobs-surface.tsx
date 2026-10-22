@@ -101,7 +101,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
           if (isJobIdentity(inspect.trim())) select(inspect.trim());
         }}>
           <label className="flex flex-1 flex-col gap-1.5 text-sm">{t("jobs.identity")}
-            <Input value={inspect} onChange={(event) => setInspect(event.target.value)} placeholder="job:<n>" spellCheck={false} />
+            <Input value={inspect} onChange={(event) => setInspect(event.target.value)} placeholder="UUID" spellCheck={false} />
           </label>
           <Button type="submit" variant="outline" disabled={!isJobIdentity(inspect.trim())}>{t("jobs.watch")}</Button>
         </form>

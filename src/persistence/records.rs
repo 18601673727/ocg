@@ -937,7 +937,7 @@ pub struct ToolStatRecord {
 pub const USAGE_SUMMARY_HOUR_MICROS: i64 = 3_600_000_000;
 
 /// One aggregated row in a token usage summary breakdown. `agent` is 0 for
-/// work submitted without an Agent; the route reports it as `profile:N` or
+/// work submitted without an Agent; the route reports it as `<profile-uuid>` or
 /// `null`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummaryRow {

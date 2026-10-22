@@ -27,7 +27,10 @@ impl Timestamp {
 /// Parses only canonical lowercase, hyphenated UUIDv7 identities.
 pub fn parse_entity_id(text: &str) -> Option<u128> {
     let id = uuid::Uuid::parse_str(text).ok()?;
-    (id.hyphenated().to_string() == text && id.get_version_num() == 7).then_some(id.as_u128())
+    (id.hyphenated().to_string() == text
+        && id.get_version_num() == 7
+        && id.get_variant() == uuid::Variant::RFC4122)
+        .then_some(id.as_u128())
 }
 
 macro_rules! record_id_type {

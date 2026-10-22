@@ -48,13 +48,13 @@
 //!   claim timing, queue lengths, and process memory. Nothing about
 //!   Providers or credentials.
 //! - `GET /api/v1/jobs/{job}`: the Job's persisted lifecycle, with `job`
-//!   written as OCG writes it, `job:<n>`.
+//!   written as OCG writes it, `<job-uuid>`.
 //! - `GET /api/v1/jobs/{job}/input`: the Job's frozen input as stored: its
 //!   objective as text, which the Job record names only by identity, its
 //!   Attachments by identity, and the Profiles and model it was frozen with.
 //!   Nothing of a Provider's endpoint or credential. See [`catalog`].
 //! - `GET /api/v1/jobs/{job}/tree`: the ancestors above the Job and the work below it.
-//! - `GET /api/v1/agent-profiles?before=profile:N&limit=M`: Agent Profiles,
+//! - `GET /api/v1/agent-profiles?before=<profile-uuid>&limit=M`: Agent Profiles,
 //!   newest first, each with the LLM Profiles it may run with and the
 //!   Executors that can run each now. A page reads `limit` Profiles of either
 //!   kind, so it may list fewer; `next_before` continues it. See [`catalog`].
@@ -74,13 +74,13 @@
 //!   how the Job settled. A browser's `EventSource` cannot send the token;
 //!   a client reads it with an authenticated `fetch`. See [`events`].
 //! - `POST /api/v1/jobs`: submits one Provider Job, under the request's one
-//!   `Idempotency-Key`, of `{"llm_profile": "profile:<n>", "executor":
-//!   "executor:<n>", "objective": "...", "name": "...", "agent_profile":
-//!   "profile:<n>"}`, `name` and `agent_profile` optional: an existing LLM
+//!   `Idempotency-Key`, of `{"llm_profile": "<profile-uuid>", "executor":
+//!   "<executor-uuid>", "objective": "...", "name": "...", "agent_profile":
+//!   "<profile-uuid>"}`, `name` and `agent_profile` optional: an existing LLM
 //!   Profile and an Executor that can run it, and an Agent Profile that
 //!   targets that LLM Profile, all checked here and again when the Job is
 //!   created. Workspace tools follow the frozen Agent grant and the optional
-//!   `"project": "project:<n>"`, which an Agent with a grant requires and a
+//!   `"project": "<project-uuid>"`, which an Agent with a grant requires and a
 //!   follow-up takes from its previous turn; nothing of a Provider,
 //!   credential or command is accepted. The answer
 //!   is `{"admission": {"status", "job"}}`: `201` when this request created
@@ -379,7 +379,11 @@ mod tests {
         for text in [
             "7",
             "job:",
+            "00000000-0000-0000-0000-000000000000",
             "00000007-0000-4001-8000-000000000007",
+            "00000007-0000-7001-0000-000000000007",
+            "00000007-0000-7001-c000-000000000007",
+            "00000007-0000-7001-e000-000000000007",
             "job:+7",
             "job:-7",
             "Job:7",
