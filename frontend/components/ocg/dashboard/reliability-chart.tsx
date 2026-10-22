@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useId, useState } from "react";
-import type { decodeUsage, decodeUsageBuckets } from "../contracts";
+import type { decodeAvailability, decodeUsage, decodeUsageBuckets, decodeUsageRetries } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { summarizeReliability, type ReliabilitySummary } from "./reliability-chart-data";
@@ -14,8 +14,8 @@ type ChartData = ReliabilitySummary & { fromUs: number; untilUs: number; offset:
 
 const errorsColor = "#ef4444";
 const retriesColor = "#f59e0b";
-const cacheHitsColor = "#22c55e";
-const cacheMissColor = "#3b82f6";
+const cacheReadsColor = "#22c55e";
+const cacheWritesColor = "#3b82f6";
 const ttfbColor = "#8b5cf6";
 const durationColor = "#14b8a6";
 
@@ -64,17 +64,39 @@ function ReliabilityChartData({ client, days, bucket }: { client: HttpCanonicalC
         let lastUntil = from;
         let bucketsPartial = false;
         const rows: ReturnType<typeof decodeUsageBuckets>["rows"] = [];
-        const retryRows: ReturnType<typeof decodeUsageBuckets>["retry_rows"] = [];
+        const retryRows: ReturnType<typeof decodeUsageRetries>["retry_rows"] = [];
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
           const page = await client.readUsageBuckets({ fromUs: from, untilUs: until, bucket, tzOffsetMinutes: offset, signal });
           if (signal.aborted) return;
           if (pageNumber === 0) firstFrom = page.from_us;
           lastUntil = page.until_us;
           rows.push(...page.rows);
-          retryRows.push(...page.retry_rows);
           bucketsPartial = !page.complete;
           if (page.complete || page.resume_from_us === null) break;
           from = page.resume_from_us;
+        }
+        let retriesPartial = false;
+        let retryAfter: string | undefined;
+        for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
+          const page = await client.readUsageRetries({ fromUs: firstFrom, untilUs: lastUntil, bucket, tzOffsetMinutes: offset, after: retryAfter, signal });
+          if (signal.aborted) return;
+          retryRows.push(...page.retry_rows);
+          retriesPartial = page.next_after !== null;
+          if (!page.next_after) break;
+          if (page.next_after === retryAfter) throw new Error("Retry cursor did not advance.");
+          retryAfter = page.next_after;
+        }
+        const availability: ReturnType<typeof decodeAvailability>["observations"] = [];
+        let availabilityPartial = false;
+        let availabilityAfter: string | undefined;
+        for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
+          const page = await client.readAvailability({ fromUs: firstFrom, untilUs: lastUntil, after: availabilityAfter, limit: 100, signal });
+          if (signal.aborted) return;
+          availability.push(...page.observations);
+          availabilityPartial = page.next_after !== null;
+          if (!page.next_after) break;
+          if (page.next_after === availabilityAfter) throw new Error("Availability cursor did not advance.");
+          availabilityAfter = page.next_after;
         }
         const observations: ReturnType<typeof decodeUsage>["observations"] = [];
         let observationsPartial = false;
@@ -91,11 +113,11 @@ function ReliabilityChartData({ client, days, bucket }: { client: HttpCanonicalC
         if (!signal.aborted) {
           setResult({
             data: {
-              ...summarizeReliability(rows, retryRows, observations, firstFrom, lastUntil, bucket === "day" ? DAY_US : 7 * DAY_US),
+              ...summarizeReliability(rows, retryRows, observations, firstFrom, lastUntil, bucket === "day" ? DAY_US : 7 * DAY_US, availability),
               fromUs: firstFrom,
               untilUs: lastUntil,
               offset,
-              partial: bucketsPartial || observationsPartial,
+              partial: bucketsPartial || observationsPartial || retriesPartial || availabilityPartial,
             },
             error: null,
           });
@@ -131,8 +153,8 @@ function ReliabilityPlot({ data }: { data: ChartData }) {
       ? `${number.format(data.totalErrors)}`
       : `${number.format(data.totalErrors)} (${percent.format(errorShare)})`],
     [t("observations.reliabilityRetries"), number.format(data.totalRetries)],
-    [t("observations.reliabilityCacheHits"), number.format(data.totalCacheHits)],
-    [t("observations.reliabilityCacheMiss"), number.format(data.totalCacheMiss)],
+    [t("observations.reliabilityCacheReads"), number.format(data.totalCacheReads)],
+    [t("observations.reliabilityCacheWrites"), number.format(data.totalCacheWrites)],
     [t("observations.reliabilityAvgTtfb"), data.ttfbAvgMs === null ? "—" : `${ms.format(data.ttfbAvgMs)} ms`],
     [t("observations.reliabilityAvgDuration"), data.durationAvgMs === null ? "—" : `${ms.format(data.durationAvgMs)} ms`],
   ];
@@ -175,20 +197,20 @@ function ReliabilityPlot({ data }: { data: ChartData }) {
         ariaLabel={t("observations.reliabilityCacheAria", {
           from: dateLabel(data.fromUs),
           until: dateLabel(data.untilUs - 1),
-          hits: number.format(data.totalCacheHits),
-          miss: number.format(data.totalCacheMiss),
+          reads: number.format(data.totalCacheReads),
+          writes: number.format(data.totalCacheWrites),
         })}
         series={[
-          { key: "hits", label: t("observations.reliabilityCacheHits"), color: cacheHitsColor, share: data.totalCacheHits + data.totalCacheMiss ? data.totalCacheHits / (data.totalCacheHits + data.totalCacheMiss) : 0 },
-          { key: "miss", label: t("observations.reliabilityCacheMiss"), color: cacheMissColor, share: data.totalCacheHits + data.totalCacheMiss ? data.totalCacheMiss / (data.totalCacheHits + data.totalCacheMiss) : 0 },
+          { key: "hits", label: t("observations.reliabilityCacheReads"), color: cacheReadsColor, share: data.totalCacheReads + data.totalCacheWrites ? data.totalCacheReads / (data.totalCacheReads + data.totalCacheWrites) : 0 },
+          { key: "miss", label: t("observations.reliabilityCacheWrites"), color: cacheWritesColor, share: data.totalCacheReads + data.totalCacheWrites ? data.totalCacheWrites / (data.totalCacheReads + data.totalCacheWrites) : 0 },
         ]}
         bars={data.buckets.map((bar) => ({
           key: String(bar.bucketUs),
           label: dateLabel(bar.bucketUs),
-          values: [bar.cacheHits, bar.cacheMiss],
+          values: [bar.cacheReads, bar.cacheWrites],
           tooltip: [dateLabel(bar.bucketUs),
-            `${t("observations.reliabilityCacheHits")}: ${number.format(bar.cacheHits)}`,
-            `${t("observations.reliabilityCacheMiss")}: ${number.format(bar.cacheMiss)}`,
+            `${t("observations.reliabilityCacheReads")}: ${number.format(bar.cacheReads)}`,
+            `${t("observations.reliabilityCacheWrites")}: ${number.format(bar.cacheWrites)}`,
           ].join("\n"),
         }))} />
     </div>

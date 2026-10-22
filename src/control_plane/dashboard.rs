@@ -404,11 +404,6 @@ pub(super) async fn usage_summary(
                 complete: summary.complete,
                 resume_from_us: summary.resume_from_us,
                 rows,
-                retry_rows: summary
-                    .retry_rows
-                    .iter()
-                    .map(usage_retry_row)
-                    .collect::<Vec<_>>(),
             })
         }
         Some(bucketing) => {
@@ -431,17 +426,75 @@ pub(super) async fn usage_summary(
                 complete: summary.complete,
                 resume_from_us: summary.resume_from_us,
                 rows,
-                retry_rows: summary
-                    .retry_rows
-                    .iter()
-                    .map(usage_retry_row)
-                    .collect::<Vec<_>>(),
                 bucket: bucket.to_owned(),
                 tz_offset_minutes: bucketing.offset_minutes,
             })
         }
     };
     bounded(shared, val)
+}
+
+pub(super) struct UsageRetriesQuery {
+    filter: crate::persistence::UsageSummaryFilter,
+    bucketing: crate::persistence::UsageBucketing,
+    after: Option<(u64, u64)>,
+    limit: usize,
+}
+
+impl UsageRetriesQuery {
+    pub(super) fn parse(query: &str) -> Result<Self, Refusal> {
+        let mut values = pairs(query)?;
+        let after = values
+            .remove("after")
+            .map(|cursor| {
+                let (original, retry) = cursor.split_once('.').ok_or(INVALID_REQUEST)?;
+                let positive = |value| {
+                    decimal::<u64>(value)
+                        .filter(|id| *id > 0)
+                        .ok_or(INVALID_REQUEST)
+                };
+                Ok::<_, Refusal>((positive(original)?, positive(retry)?))
+            })
+            .transpose()?;
+        let limit = page_limit(values.remove("limit"))?;
+        let rest = values
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let (mut filter, bucketing) = usage_summary_query(&rest)?;
+        let bucketing = bucketing.ok_or(INVALID_REQUEST)?;
+        filter.from_us = filter.from_us.and_then(|us| bucketing.start_of(us));
+        filter.until_us = filter
+            .until_us
+            .and_then(|us| us.checked_sub(1))
+            .and_then(|us| bucketing.end_of(us));
+        Ok(Self {
+            filter,
+            bucketing,
+            after,
+            limit,
+        })
+    }
+}
+
+pub(super) async fn usage_retries(
+    shared: &Shared,
+    query: UsageRetriesQuery,
+) -> Result<Reply, Refusal> {
+    let page = shared
+        .database
+        .usage_retries(query.filter, query.bucketing, query.after, query.limit)
+        .await?;
+    bounded(
+        shared,
+        envelope(WireUsageRetries {
+            retry_rows: page.rows.iter().map(usage_retry_row).collect(),
+            next_after: page
+                .next
+                .map(|(original, retry)| format!("{original}.{retry}")),
+        }),
+    )
 }
 
 pub(super) async fn availability(
@@ -610,6 +663,29 @@ fn log_tail(directory: &std::path::Path, query: LogQuery) -> Result<Value, Refus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_pages_require_buckets_and_bounded_advancing_key_cursors() {
+        let base = "from_us=0&until_us=86400000000&bucket=day";
+        let query = UsageRetriesQuery::parse(&format!("{base}&after=2.3&limit=1")).expect("query");
+        assert_eq!(query.after, Some((2, 3)));
+        assert_eq!(query.limit, 1);
+        for suffix in [
+            "after=0.1",
+            "after=1.0",
+            "after=01.2",
+            "after=1.2.3",
+            "after=1.2&after=2.3",
+            "limit=0",
+            "limit=101",
+        ] {
+            assert!(
+                UsageRetriesQuery::parse(&format!("{base}&{suffix}")).is_err(),
+                "{suffix}"
+            );
+        }
+        assert!(UsageRetriesQuery::parse("from_us=0&until_us=86400000000").is_err());
+    }
 
     #[test]
     fn usage_summary_query_parsing() {

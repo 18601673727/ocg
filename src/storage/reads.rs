@@ -1752,13 +1752,11 @@ pub(crate) fn read_usage_summary(
             complete: true,
             resume_from_us: None,
             rows: Vec::new(),
-            retry_rows: Vec::new(),
         });
     }
 
     let UsageScan {
         rows,
-        retry_rows,
         earliest_hour,
         latest_hour,
         resume_from_us,
@@ -1787,7 +1785,6 @@ pub(crate) fn read_usage_summary(
         complete: resume_from_us.is_none(),
         resume_from_us,
         rows,
-        retry_rows,
     })
 }
 
@@ -1823,14 +1820,12 @@ pub(crate) fn read_usage_buckets(
         complete: scan.resume_from_us.is_none(),
         resume_from_us: scan.resume_from_us,
         rows: scan.rows,
-        retry_rows: scan.retry_rows,
     })
 }
 
 #[derive(Default)]
 struct UsageScan {
     rows: Vec<crate::persistence::UsageBucketRow>,
-    retry_rows: Vec<crate::persistence::UsageRetryRow>,
     earliest_hour: Option<i64>,
     latest_hour: Option<i64>,
     resume_from_us: Option<i64>,
@@ -1843,9 +1838,7 @@ fn scan_usage_totals(
     until_hour: i64,
     bucketing: Option<&crate::persistence::UsageBucketing>,
 ) -> Result<UsageScan, StorageError> {
-    use crate::persistence::{
-        USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketRow, UsageRetryRow, UsageSummaryRow,
-    };
+    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketRow, UsageSummaryRow};
 
     let rx = read(database)?;
     let table = rx.open_table(USAGE_TOTALS)?;
@@ -1922,63 +1915,6 @@ fn scan_usage_totals(
         slot.6 = slot.6.saturating_add(reas);
     }
 
-    // Turn retries by the retried turn's scope and the retry's creation
-    // hour. Retries are rare next to requests, so this scans the whole
-    // RETRIES table and filters to the scanned hours instead of storing a
-    // second copy of the fact. Hours at or past `resume_from_us` were not
-    // scanned above, so their retries wait for the next page, exactly like
-    // the usage rows.
-    let mut retry_counts: std::collections::BTreeMap<UsageGroupKey, u64> =
-        std::collections::BTreeMap::new();
-    {
-        let jobs = rx.open_table(JOBS)?;
-        for entry in rx.open_table(RETRIES)?.iter()? {
-            let (key, _) = entry?;
-            let (original, retry_turn) = key.value();
-            let Some(retry_row) = read_job_row(&rx, JobId::new(retry_turn))? else {
-                return Err(StorageError::corrupted(format!(
-                    "retry {retry_turn} has no job row"
-                )));
-            };
-            let hour = retry_row.created_at.as_unix_micros().div_euclid(HOUR);
-            if hour < from_hour || hour > until_hour {
-                continue;
-            }
-            if resume_from_us.is_some_and(|resume| hour.saturating_mul(HOUR) >= resume) {
-                continue;
-            }
-            let Some(original_row) = read_job_row(&rx, JobId::new(original))? else {
-                return Err(StorageError::corrupted(format!(
-                    "retry names turn {original} with no job row"
-                )));
-            };
-            if original_row.kind.is_conversation() {
-                return Err(StorageError::corrupted(format!(
-                    "retry names conversation {original}"
-                )));
-            }
-            let parent = match original_row.parent_id {
-                Some(parent) => read_job_row(&rx, parent)?,
-                None => None,
-            };
-            let agent = usage_agent(&original_row, parent.as_ref());
-            if let Some(target) = filter.agent
-                && agent != target
-            {
-                continue;
-            }
-            let execution = turn_execution(&jobs, &original_row)?.0;
-            let provider = execution.llm.provider.id.get();
-            let model_hash =
-                *crate::persistence::ContentDigest::of(execution.llm.config.model.as_bytes())
-                    .as_bytes();
-            let slot = retry_counts
-                .entry((hour, agent, provider, model_hash))
-                .or_insert(0);
-            *slot = slot.saturating_add(1);
-        }
-    }
-
     let mut model_cache: std::collections::HashMap<(u64, [u8; 32]), Option<String>> =
         std::collections::HashMap::new();
     let mut rows = Vec::with_capacity(grouped.len());
@@ -2010,37 +1946,8 @@ fn scan_usage_totals(
         });
     }
 
-    let mut retry_rows = Vec::with_capacity(retry_counts.len());
-    for ((hour, agent, provider, model_hash), retries) in retry_counts {
-        let bucket_us = match bucketing {
-            Some(bucketing) => hour
-                .checked_mul(HOUR)
-                .and_then(|us| bucketing.start_of(us))
-                .ok_or_else(|| StorageError::corrupted("usage retry bucket overflows"))?,
-            None => hour
-                .checked_mul(HOUR)
-                .ok_or_else(|| StorageError::corrupted("usage retry hour overflows"))?,
-        };
-        let model = match model_cache.entry((provider, model_hash)) {
-            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                let resolved = resolve_model_name(&rx, provider, model_hash)?;
-                e.insert(resolved.clone());
-                resolved
-            }
-        };
-        retry_rows.push(UsageRetryRow {
-            bucket_us,
-            agent,
-            provider,
-            model,
-            retries,
-        });
-    }
-
     Ok(UsageScan {
         rows,
-        retry_rows,
         earliest_hour,
         latest_hour,
         resume_from_us,
@@ -2650,4 +2557,77 @@ pub(crate) fn read_cards(
         }
     }
     Ok(cards)
+}
+
+pub(crate) struct UsageRetriesPage {
+    pub rows: Vec<crate::persistence::UsageRetryRow>,
+    pub next: Option<(u64, u64)>,
+}
+
+/// Scans at most `limit` retry keys, including those outside the time filter.
+/// The cursor advances over scanned keys even when the page has no matches.
+pub(crate) fn read_usage_retries(
+    database: &Database,
+    filter: &crate::persistence::UsageSummaryFilter,
+    bucketing: crate::persistence::UsageBucketing,
+    after: Option<(u64, u64)>,
+    limit: usize,
+) -> Result<UsageRetriesPage, StorageError> {
+    let rx = read(database)?;
+    let retries = rx.open_table(RETRIES)?;
+    let jobs = rx.open_table(JOBS)?;
+    let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+    let mut entries = retries.range((start, std::ops::Bound::Unbounded))?;
+    let mut grouped: BTreeMap<UsageGroupKey, (String, u64)> = BTreeMap::new();
+    let mut last = None;
+    for _ in 0..limit.clamp(1, 100) {
+        let Some(entry) = entries.next() else { break };
+        let key = entry?.0.value();
+        last = Some(key);
+        let retry = read_job_row(&rx, JobId::new(key.1))?
+            .ok_or_else(|| StorageError::corrupted("retry has no job row"))?;
+        let at = retry.created_at.as_unix_micros();
+        if filter.from_us.is_some_and(|from| at < from)
+            || filter.until_us.is_some_and(|until| at >= until)
+        {
+            continue;
+        }
+        let original = read_job_row(&rx, JobId::new(key.0))?
+            .ok_or_else(|| StorageError::corrupted("retry names a missing turn"))?;
+        let parent = original
+            .parent_id
+            .map(|id| read_job_row(&rx, id))
+            .transpose()?
+            .flatten();
+        let agent = usage_agent(&original, parent.as_ref());
+        if filter.agent.is_some_and(|target| agent != target) {
+            continue;
+        }
+        let execution = turn_execution(&jobs, &original)?.0;
+        let bucket = bucketing
+            .start_of(at)
+            .ok_or_else(|| StorageError::corrupted("retry bucket overflows"))?;
+        let model = execution.llm.config.model;
+        let hash = *ContentDigest::of(model.as_bytes()).as_bytes();
+        let slot = grouped
+            .entry((bucket, agent, execution.llm.provider.id.get(), hash))
+            .or_insert((model, 0));
+        slot.1 += 1;
+    }
+    let more = entries.next().transpose()?.is_some();
+    Ok(UsageRetriesPage {
+        rows: grouped
+            .into_iter()
+            .map(|((bucket_us, agent, provider, _), (model, retries))| {
+                crate::persistence::UsageRetryRow {
+                    bucket_us,
+                    agent,
+                    provider,
+                    model: Some(model),
+                    retries,
+                }
+            })
+            .collect(),
+        next: if more { last } else { None },
+    })
 }

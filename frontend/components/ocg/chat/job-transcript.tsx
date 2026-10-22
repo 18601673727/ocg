@@ -28,6 +28,12 @@ function TurnRow({
   const { t } = useI18n();
   const isUser = turn.role === "user";
   const note = isUser ? undefined : STATUS_NOTE[turn.status];
+  const reasoning = !isUser && turn.reasoning ? <details className="rounded-md border border-border bg-muted/20 text-xs"><summary className="cursor-pointer px-3 py-2">{t("chat.thinking")}</summary><p className="whitespace-pre-wrap break-words px-3 pb-3">{turn.reasoning}</p></details> : null;
+  const toolCalls = !isUser && turn.tools?.length ? <TurnToolCalls tools={turn.tools} isLive={turn.status === "streaming" || turn.status === "pending"} /> : null;
+  if (!isUser && !turn.content && !turn.detail && !turn.attachments?.length) {
+    if (reasoning || toolCalls) return <>{reasoning}{toolCalls}</>;
+    if (turn.intermediate && turn.status === "completed") return null;
+  }
   return (
     <div className="flex gap-2.5">
       <span
@@ -94,6 +100,7 @@ function TurnRow({
               })}
             </div>
           ) : null}
+          {reasoning}
           {/* The Provider's text is shown as text: it is never interpreted as markup. */}
           <p className="whitespace-pre-wrap break-words">{turn.content}</p>
           {turn.detail ? (
@@ -103,12 +110,7 @@ function TurnRow({
           ) : null}
           {note ? <span className="mt-1 block text-xs text-muted-foreground">{t(note)}</span> : null}
         </div>
-        {!isUser && turn.tools && turn.tools.length > 0 ? (
-          <TurnToolCalls
-            tools={turn.tools}
-            isLive={turn.status === "streaming" || turn.status === "pending"}
-          />
-        ) : null}
+        {toolCalls}
       </div>
     </div>
   );
@@ -136,12 +138,15 @@ function argumentSummary(raw: string | null): string {
 }
 
 function outcomeLabel(kind: ControlToolOutcomeKind | null | undefined, decision: ControlToolCall["decision"], isLive: boolean): string {
+  if (!kind && (decision === "awaiting_approval" || decision === "awaiting_answer")) return decision;
   if (!kind && decision !== "admitted" && decision !== "awaiting_approval" && decision !== "awaiting_answer") return "refused";
   if (!kind) return isLive ? "running" : "uncertain";
   return kind;
 }
 
 function outcomeText(t: TranslateFn, kind: ControlToolOutcomeKind | null | undefined, decision: ControlToolCall["decision"], isLive: boolean): string {
+  if (!kind && decision === "awaiting_approval") return t("transcript.outcome.awaitingApproval");
+  if (!kind && decision === "awaiting_answer") return t("transcript.outcome.awaitingAnswer");
   if (outcomeLabel(kind, decision, isLive) === "refused") return t("transcript.outcome.refused");
   if (!kind) return isLive ? t("transcript.outcome.running") : t("transcript.outcome.uncertain");
   switch (kind) {
@@ -177,7 +182,7 @@ function TurnToolCalls({
           const outcome = outcomeLabel(tool.outcome_kind, tool.decision, isLive);
           const isCompleted = outcome === "completed";
           const isRunning = outcome === "running";
-          const isUncertain = outcome === "uncertain";
+          const isUncertain = outcome === "uncertain" || outcome === "awaiting_approval" || outcome === "awaiting_answer";
           return (
             <details
               key={`${tool.request}:${tool.index}`}

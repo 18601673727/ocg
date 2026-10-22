@@ -132,6 +132,8 @@ contracts! {
     struct WireProviderResponse {
         pub request: u32,
         pub text: String,
+        pub text_offset: u32,
+        pub text_complete: bool,
         pub requests_tools: bool,
         pub created_at_us: i64,
     }
@@ -139,6 +141,7 @@ contracts! {
         pub job: String,
         pub responses: Vec<WireProviderResponse>,
         pub next_after: Option<u32>,
+        pub next_text_offset: Option<u32>,
         pub has_more: bool,
     }
     #[serde(rename_all = "snake_case")]
@@ -504,13 +507,16 @@ contracts! {
         pub retries: u64,
         pub bucket_us: i64,
     }
+    struct WireUsageRetries {
+        pub retry_rows: Vec<WireUsageRetryRow>,
+        pub next_after: Option<String>,
+    }
     struct WireUsageSummary {
         pub from_us: i64,
         pub until_us: i64,
         pub complete: bool,
         pub resume_from_us: Option<i64>,
         pub rows: Vec<WireUsageRow>,
-        pub retry_rows: Vec<WireUsageRetryRow>,
     }
     struct WireUsageBuckets {
         pub from_us: i64,
@@ -518,7 +524,6 @@ contracts! {
         pub complete: bool,
         pub resume_from_us: Option<i64>,
         pub rows: Vec<WireUsageBucket>,
-        pub retry_rows: Vec<WireUsageRetryRow>,
         pub bucket: String,
         pub tz_offset_minutes: i32,
     }

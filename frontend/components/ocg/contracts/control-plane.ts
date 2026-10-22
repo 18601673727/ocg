@@ -38,6 +38,11 @@ function integer(value: unknown, path: string): number {
   return value;
 }
 
+function signedInteger(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) throw new ContractError(path, "a signed safe integer");
+  return value;
+}
+
 function timestamp(value: unknown, path: string): number | null {
   return value === null ? null : integer(value, path);
 }
@@ -173,25 +178,33 @@ export function decodeProviderResponses(input: unknown, jobId: string) {
   if (job !== jobId) throw new ContractError("job", "the requested Job");
   if (!Array.isArray(envelope.responses)) throw new ContractError("responses", "an array");
   let previous = 0;
+  const count = envelope.responses.length;
   const responses = envelope.responses.map((input, index) => {
     const value = record(input, `responses[${index}]`);
     const request = integer(value.request, `responses[${index}].request`);
     if (request <= previous || request > 0xffffffff) throw new ContractError("responses.request", "strictly increasing positive request numbers");
     previous = request;
-    return {
-      request,
-      text: string(value.text, `responses[${index}].text`),
+    const text_offset = integer(value.text_offset, "responses.text_offset");
+    const text_complete = boolean(value.text_complete, "responses.text_complete");
+    const text = string(value.text, "responses.text");
+    if (text_offset > 0xffffffff || (index > 0 && text_offset !== 0)
+      || (!text_complete && (index !== count - 1 || text.length === 0))) throw new ContractError("responses", "contiguous nonempty reply chunks");
+    return { request, text, text_offset, text_complete,
       requests_tools: boolean(value.requests_tools, `responses[${index}].requests_tools`),
       created_at_us: integer(value.created_at_us, `responses[${index}].created_at_us`),
     } satisfies Wire.WireProviderResponse;
   });
   const has_more = boolean(envelope.has_more, "has_more");
   const next_after = envelope.next_after === null ? null : integer(envelope.next_after, "next_after");
-  if (has_more ? !responses.length || next_after !== previous : next_after !== null) throw new ContractError("next_after", "the last request only when another page exists");
-  return { job, responses, next_after, has_more } satisfies Wire.WireProviderResponses;
+  const next_text_offset = envelope.next_text_offset === null ? null : integer(envelope.next_text_offset, "next_text_offset");
+  const last = responses.at(-1);
+  const expectedOffset = last && !last.text_complete ? last.text_offset + new TextEncoder().encode(last.text).length : 0;
+  if (has_more ? !last || expectedOffset > 0xffffffff || next_after !== last.request || next_text_offset !== expectedOffset
+    : next_after !== null || next_text_offset !== null || last?.text_complete === false) throw new ContractError("next_after", "an exact advancing reply chunk cursor");
+  return { job, responses, next_after, next_text_offset, has_more } satisfies Wire.WireProviderResponses;
 }
 
-export type ControlProviderResponse = ReturnType<typeof decodeProviderResponses>["responses"][number];
+export type ControlProviderResponse = Omit<Wire.WireProviderResponse, "text_offset" | "text_complete">;
 
 /** What the host establishes about itself and its database, now. */
 export function decodeHealth(input: unknown) {
@@ -342,12 +355,6 @@ export function decodeUsageBuckets(input: unknown) {
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   const bucket = envelope.bucket;
   if (bucket !== "day" && bucket !== "week") throw new ContractError("bucket", "day or week");
-  const signedInteger = (value: unknown, path: string): number => {
-    if (typeof value !== "number" || !Number.isSafeInteger(value)) {
-      throw new ContractError(path, "a signed safe integer");
-    }
-    return value;
-  };
   const offset = signedInteger(envelope.tz_offset_minutes, "tz_offset_minutes");
   if (offset < -840 || offset > 840 || offset % 60 !== 0) {
     throw new ContractError("tz_offset_minutes", "whole hours from -840 to 840 minutes");
@@ -381,6 +388,17 @@ export function decodeUsageBuckets(input: unknown) {
         reasoning_tokens: integer(row.reasoning_tokens, `${path}.reasoning_tokens`),
       } satisfies Wire.WireUsageBucket;
     }),
+
+  } satisfies Wire.WireEnvelope<Wire.WireUsageBuckets>;
+}
+
+export function decodeUsageRetries(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
+  const next = envelope.next_after;
+  if (next !== null && (typeof next !== "string" || !/^[1-9]\d*\.[1-9]\d*$/.test(next))) throw new ContractError("next_after", "a retry cursor or null");
+  return {
+    next_after: next,
     retry_rows: listOf(envelope.retry_rows, "retry_rows", (input, path) => {
       const row = record(input, path);
       return {
@@ -391,7 +409,7 @@ export function decodeUsageBuckets(input: unknown) {
         bucket_us: signedInteger(row.bucket_us, `${path}.bucket_us`),
       } satisfies Wire.WireUsageRetryRow;
     }),
-  } satisfies Wire.WireEnvelope<Wire.WireUsageBuckets>;
+  } satisfies Wire.WireUsageRetries;
 }
 
 export function decodeAvailability(input: unknown) {

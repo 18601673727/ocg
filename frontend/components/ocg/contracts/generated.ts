@@ -28,9 +28,9 @@ export type WireJobs = { jobs: Array<WireJob>, next_before: string | null, has_m
 
 export type WireOutputs = { job: string, after_seq: number | null, outputs: Array<WireOutput>, next_after_seq: number | null, has_more: boolean, };
 
-export type WireProviderResponse = { request: number, text: string, requests_tools: boolean, created_at_us: number, };
+export type WireProviderResponse = { request: number, text: string, text_offset: number, text_complete: boolean, requests_tools: boolean, created_at_us: number, };
 
-export type WireProviderResponses = { job: string, responses: Array<WireProviderResponse>, next_after: number | null, has_more: boolean, };
+export type WireProviderResponses = { job: string, responses: Array<WireProviderResponse>, next_after: number | null, next_text_offset: number | null, has_more: boolean, };
 
 export type WireToolOutcomeKind = "completed" | "completed_withheld" | "not_applied" | "not_invoked" | "uncertain";
 
@@ -124,9 +124,11 @@ export type WireUsageBucket = { bucket_us: number, agent: string | null, provide
 
 export type WireUsageRetryRow = { agent: string | null, provider: string, model: string | null, retries: number, bucket_us: number, };
 
-export type WireUsageSummary = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageRow>, retry_rows: Array<WireUsageRetryRow>, };
+export type WireUsageRetries = { retry_rows: Array<WireUsageRetryRow>, next_after: string | null, };
 
-export type WireUsageBuckets = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageBucket>, retry_rows: Array<WireUsageRetryRow>, bucket: string, tz_offset_minutes: number, };
+export type WireUsageSummary = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageRow>, };
+
+export type WireUsageBuckets = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageBucket>, bucket: string, tz_offset_minutes: number, };
 
 export type WireToolStatsRow = { name: string, admitted: number, refused_arguments: number, completed: number, failed: number, open: number, duration_us_mean: number | null, duration_us_max: number, };
 

@@ -117,13 +117,10 @@ function providerMessages(
   responses: readonly ControlProviderResponse[] | undefined,
   visible: (text: string) => string,
 ): TranscriptTurn[] {
-  if (!responses?.length) return [answer];
+  if (!responses?.length) return fallbackMessages(answer, progress, visible);
   const recorded = responses.map(response => response.text).join("");
   if (!progress.startsWith(recorded) && !recorded.startsWith(progress)) {
-    const content = visible(progress);
-    return answer.status === "completed" && content && !content.endsWith(answer.content)
-      ? [{ ...answer, id: `${answer.id}:progress`, content, status: "completed", detail: null, intermediate: true }, { ...answer, reasoning: undefined, tools: undefined }]
-      : [{ ...answer, content: content || answer.content }];
+    return fallbackMessages(answer, progress, visible);
   }
   const remainder = progress.startsWith(recorded) ? progress.slice(recorded.length) : "";
   const tools = answer.tools ?? [];
@@ -137,14 +134,23 @@ function providerMessages(
     detail: null,
     intermediate: true,
   });
-  const requests = [...new Set([...responses.map(response => response.request), ...tools.map(tool => tool.request)])].sort((a, b) => a - b);
+  const byRequest = new Map(responses.map(response => [response.request, response]));
+  const toolsByRequest = new Map<number, ControlToolCall[]>();
+  for (const call of tools) {
+    const group = toolsByRequest.get(call.request) ?? [];
+    group.push(call);
+    toolsByRequest.set(call.request, group);
+  }
+  const requests = [...new Set([...byRequest.keys(), ...toolsByRequest.keys()])].sort((a, b) => a - b);
   let final = false;
   for (const request of requests) {
-    const response = responses.find(response => response.request === request);
-    const calls = tools.filter(tool => tool.request === request);
+    const response = byRequest.get(request);
+    const calls = toolsByRequest.get(request) ?? [];
     const isFinal = response === responses.at(-1) && !response?.requests_tools && answer.status === "completed" && !remainder;
     final ||= isFinal;
-    const running = (answer.status === "streaming" || answer.status === "pending") && calls.some(call => !call.outcome_kind && call.decision === "admitted");
+    const active = answer.status === "streaming" || answer.status === "pending";
+    const waiting = active && calls.some(call => !call.outcome_kind && (call.decision === "awaiting_approval" || call.decision === "awaiting_answer"));
+    const running = active && calls.some(call => !call.outcome_kind && call.decision === "admitted");
     messages.push({
       ...answer,
       id: isFinal ? answer.id : `${answer.id}:request:${request}`,
@@ -153,7 +159,7 @@ function providerMessages(
       reasoningDurationMs: undefined,
       createdAtUs: response?.created_at_us ?? answer.createdAtUs,
       tools: calls,
-      status: running ? "streaming" : "completed",
+      status: waiting ? "pending" : running ? "streaming" : "completed",
       detail: null,
       intermediate: !isFinal,
     });
@@ -162,9 +168,25 @@ function providerMessages(
     let content = visible(remainder);
     if (answer.status === "completed") {
       const last = visible(responses.at(-1)?.text ?? "");
-      content = answer.content.startsWith(last) ? answer.content.slice(last.length).trimStart() : answer.content;
+      const suffix = answer.content.slice(last.length);
+      const awaiting = responses.at(-1)?.requests_tools && !remainder && last
+        && answer.content.startsWith(last) && /^\nAwaiting (?:approval|answer):/.test(suffix);
+      content = awaiting ? suffix.trimStart() : answer.content;
     }
     messages.push({ ...answer, content, reasoning: undefined, reasoningDurationMs: undefined, tools: undefined });
   }
   return messages;
+}
+
+
+function fallbackMessages(answer: TranscriptTurn, progress: string, visible: (text: string) => string): TranscriptTurn[] {
+  if (answer.status !== "completed") return [answer];
+  const text = visible(progress);
+  const earlier = answer.content && text.endsWith(answer.content)
+    ? text.slice(0, -answer.content.length) : text;
+  if (!earlier || text === answer.content) return [answer];
+  return [
+    { ...answer, id: `${answer.id}:progress`, content: earlier, status: "completed", detail: null, intermediate: true },
+    { ...answer, reasoning: undefined, tools: undefined },
+  ];
 }

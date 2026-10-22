@@ -953,8 +953,7 @@ pub struct UsageSummaryRow {
 
 /// One aggregated row in a usage summary retry breakdown. The grouping
 /// matches [`UsageSummaryRow`]: `agent` is 0 for work submitted without an
-/// Agent, and `bucket_us` is the day or week bucket start in bucketed
-/// responses and the hour start otherwise.
+/// Agent, and `bucket_us` is the requested day or week bucket start.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageRetryRow {
     pub bucket_us: i64,
@@ -973,7 +972,6 @@ pub struct UsageSummaryResponse {
     pub complete: bool,
     pub resume_from_us: Option<i64>,
     pub rows: Vec<UsageSummaryRow>,
-    pub retry_rows: Vec<UsageRetryRow>,
 }
 
 /// Optional filters for querying usage summaries.
@@ -1035,5 +1033,4 @@ pub struct UsageBucketResponse {
     pub complete: bool,
     pub resume_from_us: Option<i64>,
     pub rows: Vec<UsageBucketRow>,
-    pub retry_rows: Vec<UsageRetryRow>,
 }

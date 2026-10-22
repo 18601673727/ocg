@@ -162,6 +162,19 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) async fn usage_retries(
+        &self,
+        filter: crate::persistence::UsageSummaryFilter,
+        bucketing: crate::persistence::UsageBucketing,
+        after: Option<(u64, u64)>,
+        limit: usize,
+    ) -> Result<storage::UsageRetriesPage, DatabaseError> {
+        self.read(move |database| {
+            storage::read_usage_retries(database, &filter, bucketing, after, limit)
+        })
+        .await
+    }
+
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
         self.shared
             .scheduler_subscription
@@ -1598,9 +1611,12 @@ impl DatabaseHandle {
         job: JobId,
         after: Option<RequestNumber>,
         limit: usize,
-    ) -> Result<Vec<storage::ProviderResponse>, DatabaseError> {
-        self.read(move |database| storage::read_provider_responses(database, job, after, limit))
-            .await
+        max_text_bytes: usize,
+    ) -> Result<storage::ProviderResponsesPage, DatabaseError> {
+        self.read(move |database| {
+            storage::read_provider_responses(database, job, after, limit, max_text_bytes)
+        })
+        .await
     }
 
     pub async fn provider_request(

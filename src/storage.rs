@@ -83,8 +83,10 @@ use codec::{
 };
 #[cfg(test)]
 pub(crate) use derived::relationship_inconsistencies;
+#[cfg(test)]
+pub(crate) use observations::ProviderResponse;
 pub(crate) use observations::{
-    ProviderResponse, read_availability_stats, read_job_availability, read_job_metrics,
+    ProviderResponsesPage, read_availability_stats, read_job_availability, read_job_metrics,
     read_metrics, read_observed_models, read_provider_request, read_provider_responses,
 };
 use open::allocate;
@@ -100,15 +102,16 @@ pub(crate) use reads::{
 #[allow(unused_imports)]
 pub(crate) use reads::{ConversationEntry, JobUsage};
 pub(crate) use reads::{
-    JobDetails, JobTree, TreeFacts, TreeNode, UnresolvedExecution, content_available,
-    probe_committed, queue_counts, read_attachment, read_attachment_inputs, read_attachments,
-    read_children, read_compatible_executors, read_config, read_configs, read_conversations,
-    read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,
-    read_job_compatible_executors, read_job_configuration, read_job_details, read_job_input,
-    read_job_input_for_job, read_job_tree, read_jobs, read_latest_output, read_occupancy,
-    read_outputs, read_pending_jobs, read_pool_binding, read_project, read_projects, read_retries,
-    read_submission, read_tool_evidence, read_tool_stats, read_unresolved_executions,
-    read_usage_buckets, read_usage_summary, unneeded_content,
+    JobDetails, JobTree, TreeFacts, TreeNode, UnresolvedExecution, UsageRetriesPage,
+    content_available, probe_committed, queue_counts, read_attachment, read_attachment_inputs,
+    read_attachments, read_children, read_compatible_executors, read_config, read_configs,
+    read_conversations, read_execution_pool, read_execution_pools, read_executor, read_executors,
+    read_job, read_job_compatible_executors, read_job_configuration, read_job_details,
+    read_job_input, read_job_input_for_job, read_job_tree, read_jobs, read_latest_output,
+    read_occupancy, read_outputs, read_pending_jobs, read_pool_binding, read_project,
+    read_projects, read_retries, read_submission, read_tool_evidence, read_tool_stats,
+    read_unresolved_executions, read_usage_buckets, read_usage_retries, read_usage_summary,
+    unneeded_content,
 };
 pub(crate) use reads::{
     TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,

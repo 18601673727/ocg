@@ -6232,9 +6232,10 @@ mod provider_record_tests {
                 .await
                 .expect("check rows");
             let replies = handle
-                .provider_responses(job, None, 1)
+                .provider_responses(job, None, 1, 1024 * 1024)
                 .await
-                .expect("responses");
+                .expect("responses")
+                .responses;
             assert_eq!(replies.len(), 1);
             assert_eq!(replies[0].request.get(), 2, "Sent alone is not a reply");
             assert_eq!(replies[0].text, "answer");
@@ -6251,18 +6252,20 @@ mod provider_record_tests {
                 })).expect("tool reply"),
             }).await.expect("record tool reply");
             let tail = handle
-                .provider_responses(job, Some(replies[0].request), 1)
+                .provider_responses(job, Some(replies[0].request), 1, 1024 * 1024)
                 .await
-                .expect("next page");
+                .expect("next page")
+                .responses;
             assert_eq!(tail.len(), 1);
             assert_eq!(tail[0].request, sink.request);
             assert!(tail[0].text.is_empty());
             assert!(tail[0].requests_tools);
             assert!(
                 handle
-                    .provider_responses(job, Some(sink.request), 1)
+                    .provider_responses(job, Some(sink.request), 1, 1024 * 1024)
                     .await
                     .expect("end")
+                    .responses
                     .is_empty()
             );
             worker.shutdown().expect("close");
@@ -6277,9 +6280,10 @@ mod provider_record_tests {
             );
             let restored = worker
                 .handle()
-                .provider_responses(job, None, 10)
+                .provider_responses(job, None, 10, 1024 * 1024)
                 .await
-                .expect("restored replies");
+                .expect("restored replies")
+                .responses;
             assert_eq!(restored.len(), 2);
             assert_eq!(restored[0].text, replies[0].text);
             assert_eq!(restored[1].request, tail[0].request);

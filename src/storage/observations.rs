@@ -579,12 +579,18 @@ pub(crate) struct ProviderResponse {
     pub recorded_at: Timestamp,
 }
 
+pub(crate) struct ProviderResponsesPage {
+    pub responses: Vec<ProviderResponse>,
+    pub has_more: bool,
+}
+
 pub(crate) fn read_provider_responses(
     database: &Database,
     job: JobId,
     after: Option<RequestNumber>,
     limit: usize,
-) -> Result<Vec<ProviderResponse>, StorageError> {
+    max_text_bytes: usize,
+) -> Result<ProviderResponsesPage, StorageError> {
     let rx = read(database)?;
     let events = rx.open_table(REQUEST_EVENTS)?;
     let messages = rx.open_table(MESSAGES)?;
@@ -593,10 +599,9 @@ pub(crate) fn read_provider_responses(
         Bound::Included((job.get(), u32::MAX, u32::MAX)),
     );
     let mut responses = Vec::new();
+    let mut text_bytes = 0;
+    let mut has_more = false;
     for entry in events.range(bounds)? {
-        if responses.len() == limit {
-            break;
-        }
         let (key, bytes) = entry?;
         let (_, number, seq) = key.value();
         let request = RequestNumber::new(number)
@@ -605,6 +610,10 @@ pub(crate) fn read_provider_responses(
         let RequestPayload::Received { digest } = event.payload else {
             continue;
         };
+        if responses.len() == limit || text_bytes >= max_text_bytes {
+            has_more = true;
+            break;
+        }
         let body = messages
             .get(digest.as_bytes().as_slice())?
             .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
@@ -615,6 +624,7 @@ pub(crate) fn read_provider_responses(
             Some(serde_json::Value::String(text)) => text.clone(),
             Some(_) => return Err(StorageError::corrupted("response content is not text")),
         };
+        text_bytes += text.len();
         responses.push(ProviderResponse {
             request,
             text,
@@ -625,7 +635,10 @@ pub(crate) fn read_provider_responses(
             recorded_at: event.recorded_at,
         });
     }
-    Ok(responses)
+    Ok(ProviderResponsesPage {
+        responses,
+        has_more,
+    })
 }
 
 pub(crate) fn read_provider_request(

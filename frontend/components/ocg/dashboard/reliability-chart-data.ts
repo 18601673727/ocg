@@ -1,20 +1,20 @@
-import type { decodeUsage, decodeUsageBuckets } from "../contracts";
+import type { decodeAvailability, decodeUsage, decodeUsageBuckets, decodeUsageRetries } from "../contracts";
 
 type BucketRow = ReturnType<typeof decodeUsageBuckets>["rows"][number];
-type RetryRow = ReturnType<typeof decodeUsageBuckets>["retry_rows"][number];
+type RetryRow = ReturnType<typeof decodeUsageRetries>["retry_rows"][number];
 type UsageObservation = ReturnType<typeof decodeUsage>["observations"][number];
 
 export type ReliabilityBucket = {
   bucketUs: number;
   requests: number;
-  /** Requests that did not complete: requests minus complete requests, floored at zero. */
+  /** Requests with a recorded HTTP error status (400 through 599). */
   errors: number;
   /** Turn retries attributed to this bucket. */
   retries: number;
   /** Tokens served from cache. */
-  cacheHits: number;
+  cacheReads: number;
   /** Tokens written to cache. */
-  cacheMiss: number;
+  cacheWrites: number;
   ttfbCount: number;
   ttfbAvgMs: number | null;
   durationCount: number;
@@ -26,8 +26,8 @@ export type ReliabilitySummary = {
   totalRequests: number;
   totalErrors: number;
   totalRetries: number;
-  totalCacheHits: number;
-  totalCacheMiss: number;
+  totalCacheReads: number;
+  totalCacheWrites: number;
   ttfbCount: number;
   ttfbAvgMs: number | null;
   durationCount: number;
@@ -40,7 +40,7 @@ function average(sum: number, count: number): number | null {
 
 /**
  * Zero-fills one bucket per `widthUs` over `[fromUs, untilUs)`, then folds
- * usage-bucket counts (failed requests, retries, cache hits and misses) and
+ * recorded HTTP errors, turn retries, cache reads and writes, and
  * usage-observation latencies (average time to first byte and total
  * duration) into each bucket.
  */
@@ -51,6 +51,7 @@ export function summarizeReliability(
   fromUs: number,
   untilUs: number,
   widthUs: number,
+  availability: readonly ReturnType<typeof decodeAvailability>["observations"][number][],
 ): ReliabilitySummary {
   const buckets: ReliabilityBucket[] = [];
   if (widthUs > 0) {
@@ -60,8 +61,8 @@ export function summarizeReliability(
         requests: 0,
         errors: 0,
         retries: 0,
-        cacheHits: 0,
-        cacheMiss: 0,
+        cacheReads: 0,
+        cacheWrites: 0,
         ttfbCount: 0,
         ttfbAvgMs: null,
         durationCount: 0,
@@ -82,10 +83,23 @@ export function summarizeReliability(
   for (const row of bucketRows) {
     if (!inRange(row.bucket_us)) continue;
     const bucket = buckets[at(row.bucket_us)];
-    bucket.requests += row.requests;
-    bucket.errors += Math.max(0, row.requests - row.complete_requests);
-    bucket.cacheHits += row.cache_read_tokens;
-    bucket.cacheMiss += row.cache_write_tokens;
+    bucket.cacheReads += row.cache_read_tokens;
+    bucket.cacheWrites += row.cache_write_tokens;
+  }
+  const requests = new Map<string, { at: number; error: boolean }>();
+  for (const row of availability) {
+    if (!inRange(row.observed_at_us)) continue;
+    const key = `${row.job}:${row.request}`;
+    const previous = requests.get(key);
+    requests.set(key, {
+      at: Math.min(previous?.at ?? row.observed_at_us, row.observed_at_us),
+      error: (previous?.error ?? false) || (row.status_code !== null && row.status_code >= 400 && row.status_code <= 599),
+    });
+  }
+  for (const request of requests.values()) {
+    const bucket = buckets[at(request.at)];
+    bucket.requests += 1;
+    if (request.error) bucket.errors += 1;
   }
   for (const row of retryRows) {
     if (!inRange(row.bucket_us)) continue;
@@ -115,8 +129,8 @@ export function summarizeReliability(
   let totalRequests = 0;
   let totalErrors = 0;
   let totalRetries = 0;
-  let totalCacheHits = 0;
-  let totalCacheMiss = 0;
+  let totalCacheReads = 0;
+  let totalCacheWrites = 0;
   for (const [index, bucket] of buckets.entries()) {
     const ttfb = ttfbSums.get(index);
     if (ttfb) {
@@ -131,16 +145,16 @@ export function summarizeReliability(
     totalRequests += bucket.requests;
     totalErrors += bucket.errors;
     totalRetries += bucket.retries;
-    totalCacheHits += bucket.cacheHits;
-    totalCacheMiss += bucket.cacheMiss;
+    totalCacheReads += bucket.cacheReads;
+    totalCacheWrites += bucket.cacheWrites;
   }
   return {
     buckets,
     totalRequests,
     totalErrors,
     totalRetries,
-    totalCacheHits,
-    totalCacheMiss,
+    totalCacheReads,
+    totalCacheWrites,
     ttfbCount,
     ttfbAvgMs: average(ttfbSum, ttfbCount),
     durationCount,

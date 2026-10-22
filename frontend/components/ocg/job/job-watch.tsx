@@ -13,6 +13,7 @@ import {
 } from "./output-window";
 import {
   ControlTransportError,
+  readTranscriptEvidence,
   type HttpCanonicalControlClient,
   type JobStreamEvent,
   type JobStreamSubscription,
@@ -129,6 +130,7 @@ function JobWatchBody({
   const [earlierFailure, setEarlierFailure] = useState<{ code: string; scope: "read" } | null>(null);
   const earlierLoad = useRef<AbortController | null>(null);
   const [tools, setTools] = useState<ControlToolCall[]>([]);
+  const [evidenceFailure, setEvidenceFailure] = useState<string>();
   const [responses, setResponses] = useState<ControlProviderResponse[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
@@ -163,6 +165,9 @@ function JobWatchBody({
     let processed = 0;
     let historyComplete = false;
     let replies: ControlProviderResponse[] = [];
+    let completed = false;
+    let reconciled = false;
+    const evidenceController = new AbortController();
 
     // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
     const fail = (error: unknown, scope: "read" | "stream") => {
@@ -192,18 +197,21 @@ function JobWatchBody({
       }
       reloading = true;
       const completeWindow = historyComplete && processed <= windowRef.current;
-      Promise.all([
-        client.readAllJobTools(jobId),
-        completeWindow ? client.readAllProviderResponses(jobId, undefined, replies.at(-1)?.request) : Promise.resolve([]),
-      ]).then(
-          ([loaded, incoming]) => {
-            if (!alive) return;
-            setTools(loaded);
-            replies = completeWindow ? [...replies, ...incoming] : [];
-            setResponses(replies);
-          },
-          () => {},
-        )
+      const catchUp = completeWindow && completed && !reconciled;
+      if (catchUp) reconciled = true;
+      readTranscriptEvidence(client, jobId, { signal: evidenceController.signal, previous: completeWindow ? replies : [], settled: catchUp, readReplies: completeWindow }).then(
+        evidence => {
+          if (!alive) return;
+          if (evidence.tools) setTools(evidence.tools);
+          if (completeWindow && processed <= windowRef.current) replies = evidence.responses ?? replies;
+          else replies = [];
+          setResponses(replies);
+          setEvidenceFailure(evidence.error);
+        },
+        error => {
+          if (alive && !evidenceController.signal.aborted) setEvidenceFailure(`Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`);
+        },
+      )
         .finally(() => {
           reloading = false;
           if (reloadQueued && alive) {
@@ -234,6 +242,7 @@ function JobWatchBody({
       setStream((current) => (current === "reconnecting" ? "live" : current));
       if (event.type === "job") {
         setJob(event.job);
+        completed = event.job.settlement.state === "completed";
         if (event.job.settlement.state !== "unsettled") {
           setSettlement({
             state: event.job.settlement.state,
@@ -252,6 +261,7 @@ function JobWatchBody({
         setOutputs((existing) => mergeOutputWindow(existing, [incoming], windowRef.current));
         requestReload();
       } else if (event.type === "settlement") {
+        completed = event.settlement.state === "completed";
         setSettlement({
           state: event.settlement.state,
           settled_at_us: event.settlement.settled_at_us,
@@ -273,6 +283,7 @@ function JobWatchBody({
         const record = await client.readJob(jobId);
         if (!alive) return;
         setJob(record);
+        completed = record.settlement.state === "completed";
         setUnknownReason(record.unknown_reason ?? null);
         // The record is the Job's own truth, whether or not the stream ever connects.
         if (record.settlement.state !== "unsettled") {
@@ -361,6 +372,7 @@ function JobWatchBody({
       alive = false;
       stopPolling();
       subscription?.close();
+      evidenceController.abort();
     };
   }, [client, jobId]);
 
@@ -421,8 +433,11 @@ function JobWatchBody({
       const incoming = walked;
       setOutputs((existing) => mergeOutputWindow(existing, incoming, nextWindow));
       if (walked.length >= storedTotal) {
-        const replies = await client.readAllProviderResponses(jobId, controller.signal);
-        if (!controller.signal.aborted) setResponses(replies);
+        const evidence = await readTranscriptEvidence(client, jobId, { signal: controller.signal });
+        if (!controller.signal.aborted) {
+          setResponses(evidence.responses ?? []);
+          setEvidenceFailure(evidence.error);
+        }
       }
     } catch (error) {
       if (!controller.signal.aborted) {
@@ -545,6 +560,7 @@ function JobWatchBody({
   ) : null;
   const answer = job ? (
     <>
+      {evidenceFailure && <p role="alert" className="text-xs text-destructive">{evidenceFailure}</p>}
       <JobTranscript
         turns={turns}
         userLabel={presentation === "chat" ? t("job.you") : t("job.objective")}

@@ -2,7 +2,7 @@ import type { ChatImage, ChatImageUploadRequest, ChatModelSelection, ControlConv
 import type { ChatMessage, ChatSession, OcgRuntimeEvent, SendMessageInput } from "../types";
 import { RuntimeClientBase } from "./mock-client";
 import type { CreateSessionInput, ScenarioId } from "./runtime-types";
-import { createHttpCanonicalControlClient, ControlTransportError, type ControlSubmission, type HttpCanonicalControlClient, type JobStreamSubscription } from "./control-client";
+import { createHttpCanonicalControlClient, readTranscriptEvidence, ControlTransportError, type ControlSubmission, type HttpCanonicalControlClient, type JobStreamSubscription } from "./control-client";
 import { jobTranscript } from "../chat/job-transcript-model";
 import { pageTurns } from "./history-page";
 
@@ -259,12 +259,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   private async readHistoryTurn(sessionId: string, turn: ControlConversationTurn, isCurrent: () => boolean) {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
-    const [tools, responses] = await Promise.all([
-      this.control.readAllJobTools(turn.job.id, this.lifetime.signal),
-      this.control.readAllProviderResponses(turn.job.id, this.lifetime.signal),
-    ]);
+    const evidence = await readTranscriptEvidence(this.control, turn.job.id, { signal: this.lifetime.signal });
     if (!isCurrent()) return null;
-    const state: Turn = { sessionId, ...turn, tools, responses };
+    const outputs = evidence.responses === null
+      ? await this.control.readAllJobOutputs(turn.job.id, this.lifetime.signal) : turn.outputs;
+    if (!isCurrent()) return null;
+    const state: Turn = { sessionId, ...turn, outputs, tools: evidence.tools ?? [], responses: evidence.responses ?? [], toolError: evidence.error };
     if (turn.job.settlement.state === "unknown") {
       try {
         const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
@@ -330,18 +330,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       inFlight = true;
       const version = outputVersion;
       try {
-        const [fetched, responses] = await Promise.all([
-          this.control.readAllJobTools(jobId, this.lifetime.signal),
-          this.control.readAllProviderResponses(jobId, this.lifetime.signal, turn.responses.at(-1)?.request),
-        ]);
+        const evidence = await readTranscriptEvidence(this.control, jobId, { signal: this.lifetime.signal, previous: turn.responses });
+        const fetched = evidence.tools ?? turn.tools;
+        const responses = evidence.responses ?? turn.responses;
         if (entry.stopped || this.disposed) return;
         const currentJson = JSON.stringify(fetched);
-        const changed = currentJson !== lastToolsJson || responses.length > 0;
+        const changed = currentJson !== lastToolsJson || responses.length !== turn.responses.length || evidence.error !== turn.toolError;
         lastToolsJson = currentJson;
         turn.tools = fetched;
-        turn.responses.push(...responses);
+        turn.responses = responses;
         const recovered = turn.toolError !== undefined;
-        turn.toolError = undefined;
+        turn.toolError = evidence.error;
         delay = changed || version !== outputVersion ? 1500 : Math.min(delay * 2, 12000);
         if (changed || recovered) this.publish(turn.sessionId);
       } catch (error) {
@@ -388,13 +387,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (end === "settled") {
         turn.error = undefined;
         try {
-          const [tools, responses] = await Promise.all([
-            this.control.readAllJobTools(jobId, this.lifetime.signal),
-            this.control.readAllProviderResponses(jobId, this.lifetime.signal, turn.responses.at(-1)?.request),
-          ]);
-          turn.tools = tools;
-          turn.responses.push(...responses);
-          turn.toolError = undefined;
+          const evidence = await readTranscriptEvidence(this.control, jobId, {
+            signal: this.lifetime.signal, previous: turn.responses, settled: turn.job.settlement.state === "completed",
+          });
+          turn.tools = evidence.tools ?? turn.tools;
+          turn.responses = evidence.responses ?? turn.responses;
+          turn.toolError = evidence.error;
         } catch (error) {
           turn.toolError = `Transcript evidence unavailable: ${error instanceof Error ? error.message : String(error)}`;
         }
@@ -467,10 +465,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async trackTurn(sessionId: string, job: string) {
-    const [record, frozen, outputs, tools, responses] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), this.control.readAllJobTools(job), this.control.readAllProviderResponses(job)]);
+    const [record, frozen, outputs, evidence] = await Promise.all([this.control.readJob(job), this.control.readJobInput(job), this.control.readOutputs(job, { limit: 100 }), readTranscriptEvidence(this.control, job, { signal: this.lifetime.signal })]);
     const page = record.conversation ? await this.control.readConversationTurns(record.conversation, undefined, 20, this.lifetime.signal) : null;
     const stored = page?.turns.find(turn => turn.job.id === job);
-    const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools, responses, unknownReason: record.unknown_reason ?? null };
+    const turn: Turn = { entries: stored?.entries, sessionId, job: record, input: stored?.input ?? frozen, outputs: outputs.outputs, tools: evidence.tools ?? [], responses: evidence.responses ?? [], toolError: evidence.error, unknownReason: record.unknown_reason ?? null };
     while (outputs.has_more) {
       const page = await this.control.readOutputs(job, { afterSeq: turn.outputs.at(-1)?.seq, limit: 100 });
       turn.outputs.push(...page.outputs);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { decodeUsage, decodeUsageBuckets } from "../components/ocg/contracts/control-plane";
+import type { decodeAvailability, decodeUsage, decodeUsageBuckets, decodeUsageRetries } from "../components/ocg/contracts/control-plane";
 import { summarizeReliability } from "../components/ocg/dashboard/reliability-chart-data";
 
 type Buckets = ReturnType<typeof decodeUsageBuckets>;
@@ -22,7 +22,7 @@ test("reliability buckets zero-fill days and sum errors, retries, cache and late
       cache_read_tokens: 0, cache_write_tokens: 8, reasoning_tokens: 2,
     },
   ];
-  const retryRows: Buckets["retry_rows"] = [
+  const retryRows: ReturnType<typeof decodeUsageRetries>["retry_rows"] = [
     { bucket_us: 0, agent: "profile:1", provider: "llm_provider:1", model: "model-a", retries: 2 },
     { bucket_us: day, agent: null, provider: "llm_provider:2", model: null, retries: 1 },
   ];
@@ -40,27 +40,44 @@ test("reliability buckets zero-fill days and sum errors, retries, cache and late
       finality: "cumulative", eligibility: null,
     },
   ];
-  const summary = summarizeReliability(rows, retryRows, observations, 0, 3 * day, day);
+  const availability: ReturnType<typeof decodeAvailability>["observations"] = [
+    { id: "availability:1", job: "job:1", request: 1, observed_at_us: 1_000, provider: "p", model: "model-a", status_code: 200, finish_reason: "stop", classification: "available" },
+    { id: "availability:2", job: "job:2", request: 1, observed_at_us: 2_000, provider: "p", model: "model-a", status_code: 503, finish_reason: null, classification: "unavailable" },
+    { id: "availability:3", job: "job:2", request: 1, observed_at_us: 3_000, provider: "p", model: "model-a", status_code: 503, finish_reason: null, classification: "unavailable" },
+    { id: "availability:4", job: "job:2", request: 2, observed_at_us: 2 * day + 1_000, provider: "p", model: "model-a", status_code: 200, finish_reason: "tool_calls", classification: "unconfirmed" },
+  ];
+  const summary = summarizeReliability(rows, retryRows, observations, 0, 3 * day, day, availability);
   assert.equal(summary.buckets.length, 3);
   const [first, empty, last] = summary.buckets;
-  assert.deepEqual([first.requests, first.errors, first.retries], [10, 3, 2]);
-  assert.deepEqual([first.cacheHits, first.cacheMiss], [30, 5]);
+  assert.deepEqual([first.requests, first.errors, first.retries], [2, 1, 2]);
+  assert.deepEqual([first.cacheReads, first.cacheWrites], [30, 5]);
   assert.deepEqual([first.ttfbCount, first.ttfbAvgMs], [1, 100]);
   assert.deepEqual([first.durationCount, first.durationAvgMs], [1, 500]);
   assert.deepEqual(
-    [empty.requests, empty.errors, empty.retries, empty.cacheHits, empty.cacheMiss],
+    [empty.requests, empty.errors, empty.retries, empty.cacheReads, empty.cacheWrites],
     [0, 0, 1, 0, 0],
   );
   assert.equal(empty.ttfbAvgMs, null);
-  assert.deepEqual([last.requests, last.errors, last.retries], [4, 0, 0]);
-  assert.deepEqual([last.cacheHits, last.cacheMiss], [0, 8]);
+  assert.deepEqual([last.requests, last.errors, last.retries], [1, 0, 0]);
+  assert.deepEqual([last.cacheReads, last.cacheWrites], [0, 8]);
   assert.deepEqual([last.ttfbCount, last.ttfbAvgMs], [1, 300]);
   assert.equal(last.durationAvgMs, null);
   assert.deepEqual(
     [summary.totalRequests, summary.totalErrors, summary.totalRetries],
-    [14, 3, 3],
+    [3, 1, 3],
   );
-  assert.deepEqual([summary.totalCacheHits, summary.totalCacheMiss], [30, 13]);
+  assert.deepEqual([summary.totalCacheReads, summary.totalCacheWrites], [30, 13]);
   assert.deepEqual([summary.ttfbCount, summary.ttfbAvgMs], [2, 200]);
   assert.deepEqual([summary.durationCount, summary.durationAvgMs], [1, 500]);
+});
+
+
+test("missing token reports are not HTTP errors and cache writes are not inferred misses", () => {
+  const rows: Buckets["rows"] = [{ bucket_us: 0, agent: null, provider: "llm_provider:1", model: "m", requests: 1, complete_requests: 0, input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 50, reasoning_tokens: 0 }];
+  const availability: ReturnType<typeof decodeAvailability>["observations"] = [{ id: "availability:1", job: "job:1", request: 1, observed_at_us: 1, provider: "p", model: "m", status_code: 200, finish_reason: "stop", classification: "available" }];
+  const result = summarizeReliability(rows, [], [], 0, 100, 100, availability);
+  assert.equal(result.totalRequests, 1);
+  assert.equal(result.totalErrors, 0);
+  assert.equal(result.totalCacheWrites, 50);
+  assert.equal(result.totalCacheReads, 0);
 });

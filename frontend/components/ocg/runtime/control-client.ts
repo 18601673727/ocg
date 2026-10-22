@@ -16,6 +16,7 @@ import {
   decodeJobs,
   decodeUsage,
   decodeUsageBuckets,
+  decodeUsageRetries,
   decodeAvailability,
   decodeLogs,
   decodeJob,
@@ -208,6 +209,39 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
 }
 
 export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
+
+/** Auxiliary evidence must not hide the authoritative stored outputs. */
+export async function readTranscriptEvidence(
+  client: Pick<HttpCanonicalControlClient, "readAllJobTools" | "readAllProviderResponses">,
+  job: string,
+  { signal = new AbortController().signal, previous = [], settled = false, readReplies = true }: {
+    signal?: AbortSignal; previous?: readonly ControlProviderResponse[]; settled?: boolean; readReplies?: boolean;
+  } = {},
+) {
+  const [tools, replies] = await Promise.allSettled([
+    client.readAllJobTools(job, signal),
+    readReplies ? client.readAllProviderResponses(job, signal, previous.at(-1)?.request) : Promise.resolve([]),
+  ]);
+  signal.throwIfAborted();
+  const responses = replies.status === "fulfilled" ? [...previous, ...replies.value] : null;
+  let replyError = replies.status === "rejected" ? replies.reason : null;
+  // Settlement precedes the final Received write. Reconcile that short gap
+  // independently of the now-closed output stream, with bounded retries.
+  for (const delay of [100, 300, 1000, 3000]) {
+    if (!settled || responses === null || replyError || (responses.length && !responses.at(-1)?.requests_tools)) break;
+    await pause(delay, signal);
+    signal.throwIfAborted();
+    try {
+      responses.push(...await client.readAllProviderResponses(job, signal, responses.at(-1)?.request));
+    } catch (error) { replyError = error; }
+  }
+  const failures = [tools.status === "rejected" ? tools.reason : null, replyError].filter(error => error !== null);
+  return {
+    tools: tools.status === "fulfilled" ? tools.value : null,
+    responses,
+    error: failures.length ? `Transcript evidence unavailable; showing stored output. ${failures.map(error => error instanceof Error ? error.message : String(error)).join("; ")}` : undefined,
+  };
+}
 
 export type ObservationSettings = {
   fromUs?: number;
@@ -478,6 +512,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeUsageBuckets((await send("GET", `/api/v1/usage/summary?${query}`, { signal })).input);
     },
 
+    async readUsageRetries({ fromUs, untilUs, bucket, tzOffsetMinutes, after, signal }: {
+      fromUs: number; untilUs: number; bucket: "day" | "week"; tzOffsetMinutes: number; after?: string; signal?: AbortSignal;
+    }) {
+      if (!Number.isSafeInteger(tzOffsetMinutes)) throw new ContractError("tz_offset_minutes", "a signed safe integer");
+      const query = `from_us=${sequence(fromUs)}&until_us=${sequence(untilUs)}&bucket=${bucket}&tz_offset_minutes=${tzOffsetMinutes}&limit=100${after ? `&after=${encodeURIComponent(after)}` : ""}`;
+      return decodeUsageRetries((await send("GET", `/api/v1/usage/retries?${query}`, { signal })).input);
+    },
+
     async readAvailability(settings: ObservationSettings = {}) {
       return decodeAvailability((await send("GET", `/api/v1/availability${observationQuery(settings)}`, { signal: settings.signal })).input);
     },
@@ -705,20 +747,50 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return readJobToolsInternal(job, settings);
     },
 
-    /** Received assistant replies after a request, paging until caught up. */
+    async readAllJobOutputs(job: string, signal?: AbortSignal) {
+      const outputs: ReturnType<typeof decodeOutputsPage>["outputs"] = [];
+      let after = 0;
+      for (;;) {
+        const page = decodeOutputsPage((await send("GET", `/api/v1/jobs/${jobIdentity(job)}/outputs?limit=100&after_seq=${after}`, { signal })).input, job);
+        if (page.outputs.some(output => output.seq <= after)) throw new ContractError("outputs.seq", "a sequence after the cursor");
+        outputs.push(...page.outputs);
+        if (!page.has_more) return outputs;
+        const next = page.outputs.at(-1)?.seq;
+        if (next === undefined || next <= after) throw new ContractError("next_after_seq", "an advancing output cursor");
+        after = next;
+      }
+    },
+
+    /** Reassembles reply chunks; an incomplete 50-page walk is refused. */
     async readAllProviderResponses(job: string, signal?: AbortSignal, after?: number): Promise<ControlProviderResponse[]> {
       jobIdentity(job);
       const responses: ControlProviderResponse[] = [];
       let cursor = after;
-      for (;;) {
-        const query = `?limit=100${cursor === undefined ? "" : `&after=${sequence(cursor)}`}`;
+      let offset = 0;
+      let partial: ControlProviderResponse | null = null;
+      let partialBytes = 0;
+      for (let pageCount = 0; pageCount < 50; pageCount++) {
+        const query = `?limit=100${cursor === undefined ? "" : `&after=${sequence(cursor)}`}${offset ? `&text_offset=${offset}` : ""}`;
         const page = decodeProviderResponses((await send("GET", `/api/v1/jobs/${job}/responses${query}`, { signal })).input, job);
-        if (page.responses.some(response => response.request <= (cursor ?? 0))) throw new ContractError("responses.request", "a request after the cursor");
-        responses.push(...page.responses);
+        for (const chunk of page.responses) {
+          if (chunk.text_offset === 0) {
+            if (partial || chunk.request <= (cursor ?? 0)) throw new ContractError("responses.request", "a request after the cursor");
+            partial = { request: chunk.request, text: "", requests_tools: chunk.requests_tools, created_at_us: chunk.created_at_us };
+            partialBytes = 0;
+          }
+          if (!partial || chunk.request !== partial.request || chunk.text_offset !== partialBytes
+            || chunk.requests_tools !== partial.requests_tools || chunk.created_at_us !== partial.created_at_us) throw new ContractError("responses.text_offset", "contiguous chunks of the same reply");
+          partial.text += chunk.text;
+          partialBytes += new TextEncoder().encode(chunk.text).length;
+          if (chunk.text_complete) { responses.push(partial); partial = null; }
+        }
         if (!page.has_more) return responses;
-        if (page.next_after === null || page.next_after <= (cursor ?? 0)) throw new ContractError("next_after", "an advancing request cursor");
+        if (page.next_after === null || page.next_text_offset === null || page.next_after < (cursor ?? 0)
+          || (page.next_after === cursor && page.next_text_offset <= offset)) throw new ContractError("next_after", "an advancing reply cursor");
         cursor = page.next_after;
+        offset = page.next_text_offset;
       }
+      throw new ContractError("responses", "complete provider replies within 50 pages");
     },
 
     /** All recorded tool calls for a Job, paging through until complete. */

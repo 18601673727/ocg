@@ -354,6 +354,25 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
         request(address, "GET /api/v1/jobs/job:999999/responses", None, None).status,
         404
     );
+    let retries = request(
+        address,
+        "GET /api/v1/usage/retries?from_us=0&until_us=86400000000&bucket=day&limit=1",
+        None,
+        None,
+    );
+    assert_eq!(retries.status, 200);
+    assert_eq!(retries.body["retry_rows"], json!([]));
+    assert_eq!(retries.body["next_after"], Value::Null);
+    assert_eq!(
+        request(
+            address,
+            "GET /api/v1/usage/retries?from_us=0&until_us=86400000000&bucket=day&after=0.1",
+            None,
+            None
+        )
+        .status,
+        400
+    );
     // The same key and request name the same Job; another request is refused.
     let replay = submit(address, failing_key, &failing_body);
     assert_eq!((replay.status, admitted(&replay)), (200, failing.clone()));

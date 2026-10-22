@@ -2110,7 +2110,8 @@ mod tests {
         let fixture = Fixture::new("retry-usage-buckets");
         let (conversation, first) = fixture.open();
         fixture.finish(first, OutcomeKind::Completed);
-        wait(fixture.database.retry(conversation, first, Actor::User)).expect("retry");
+        let first_retry =
+            wait(fixture.database.retry(conversation, first, Actor::User)).expect("retry");
         let now_us = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2128,20 +2129,68 @@ mod tests {
             width: UsageBucketWidth::Day,
             offset_minutes: 0,
         };
-        let buckets =
-            wait(fixture.database.usage_buckets(filter.clone(), bucketing)).expect("buckets");
-        assert_eq!(buckets.retry_rows.len(), 1, "one retried scope in range");
-        assert_eq!(buckets.retry_rows[0].retries, 1);
-        assert_ne!(buckets.retry_rows[0].provider, 0);
-        let summary = wait(fixture.database.usage_summary(filter)).expect("summary");
-        assert_eq!(
-            summary
-                .retry_rows
-                .iter()
-                .map(|row| row.retries)
-                .sum::<u64>(),
-            1,
-            "one retry in range"
+        let retry = wait(fixture.database.retry(conversation, first, Actor::User));
+        assert!(retry.is_err(), "an unfinished retry prevents another retry");
+        let page = wait(
+            fixture
+                .database
+                .usage_retries(filter.clone(), bucketing, None, 1),
+        )
+        .expect("page");
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].retries, 1);
+        assert!(
+            page.rows[0].model.is_some(),
+            "pending retries resolve their frozen model without usage"
+        );
+        let retry_turn = first_retry.turn;
+        fixture.finish(retry_turn, OutcomeKind::Completed);
+        wait(
+            fixture
+                .database
+                .retry(conversation, retry_turn, Actor::User),
+        )
+        .expect("second retry");
+        let page = wait(
+            fixture
+                .database
+                .usage_retries(filter.clone(), bucketing, None, 1),
+        )
+        .expect("first page");
+        let cursor = page.next.expect("bounded scan");
+        assert_eq!(page.rows.iter().map(|row| row.retries).sum::<u64>(), 1);
+        let tail = wait(
+            fixture
+                .database
+                .usage_retries(filter.clone(), bucketing, Some(cursor), 1),
+        )
+        .expect("tail");
+        assert_eq!(tail.rows.iter().map(|row| row.retries).sum::<u64>(), 1);
+        assert!(tail.next.is_none());
+        let outside = UsageSummaryFilter {
+            from_us: Some(now_us + day),
+            until_us: Some(now_us + 2 * day),
+            agent: None,
+        };
+        let empty = wait(
+            fixture
+                .database
+                .usage_retries(outside.clone(), bucketing, None, 1),
+        )
+        .expect("filtered page");
+        assert!(empty.rows.is_empty());
+        let next = empty
+            .next
+            .expect("cursor advances even without matching rows");
+        assert!(
+            wait(
+                fixture
+                    .database
+                    .usage_retries(outside, bucketing, Some(next), 1)
+            )
+            .expect("filtered tail")
+            .next
+            .is_none()
         );
         fixture.worker.shutdown().expect("shutdown");
     }

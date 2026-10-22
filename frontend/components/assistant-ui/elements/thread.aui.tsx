@@ -664,6 +664,8 @@ const AssistantMessage: FC = () => {
   // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
   const ACTION_BAR_HEIGHT = `min-h-7.5 ${ACTION_BAR_PT}`;
 
+  if (intermediate && messageParts.length === 0 && !failureReason) return null;
+
   return (
     <MessagePrimitive.Root
       data-slot="aui_assistant-message-root"

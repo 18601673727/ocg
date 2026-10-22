@@ -179,8 +179,8 @@ pub(super) async fn outputs(
 
 pub(super) const MAX_EXPOSED_TOOL_STRING_BYTES: usize = 2 * 1024;
 
-pub(super) fn responses_query(query: &str) -> Result<(Option<RequestNumber>, usize), Refusal> {
-    let (mut after, mut limit) = (None, None);
+pub(super) fn responses_query(query: &str) -> Result<(Option<RequestNumber>, usize, u32), Refusal> {
+    let (mut after, mut limit, mut offset) = (None, None, None);
     if !query.is_empty() {
         for pair in query.split('&') {
             let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
@@ -190,68 +190,144 @@ pub(super) fn responses_query(query: &str) -> Result<(Option<RequestNumber>, usi
                         routing::decimal::<u32>(value)
                             .and_then(RequestNumber::new)
                             .ok_or(INVALID_REQUEST)?,
-                    );
+                    )
                 }
                 "limit" if limit.is_none() => {
                     limit = Some(
                         routing::decimal::<usize>(value)
                             .filter(|limit| (1..=100).contains(limit))
                             .ok_or(INVALID_REQUEST)?,
-                    );
+                    )
+                }
+                "text_offset" if offset.is_none() => {
+                    offset = Some(
+                        routing::decimal::<u32>(value)
+                            .filter(|offset| *offset > 0)
+                            .ok_or(INVALID_REQUEST)?,
+                    )
                 }
                 _ => return Err(INVALID_REQUEST),
             }
         }
     }
-    Ok((after, limit.unwrap_or(50)))
+    if offset.is_some() && after.is_none() {
+        return Err(INVALID_REQUEST);
+    }
+    Ok((after, limit.unwrap_or(50), offset.unwrap_or(0)))
 }
 
-/// Pages received assistant text without replaying each request's full context.
+/// Pages received assistant text, splitting large replies only at UTF-8 boundaries.
 pub(super) async fn provider_responses(
     shared: &Shared,
     job: JobId,
     after: Option<RequestNumber>,
     limit: usize,
+    text_offset: u32,
 ) -> Result<Value, Refusal> {
     if shared.database.job(job).await?.is_none() {
         return Err(JOB_NOT_FOUND);
     }
+    let read_after = if text_offset > 0 {
+        after.and_then(|request| RequestNumber::new(request.get() - 1))
+    } else {
+        after
+    };
     let records = shared
         .database
-        .provider_responses(job, after, limit + 1)
+        .provider_responses(job, read_after, limit, shared.response_bytes)
         .await?;
-    let envelope = |responses: Vec<WireProviderResponse>, next_after, has_more| {
-        envelope(WireProviderResponses {
-            job: job.to_string(),
-            responses,
-            next_after,
-            has_more,
-        })
-    };
-    let mut size = envelope(Vec::new(), Some(u32::MAX), true).to_string().len();
+    provider_response_page(job, after, text_offset, records, shared.response_bytes)
+}
+
+fn provider_response_page(
+    job: JobId,
+    after: Option<RequestNumber>,
+    text_offset: u32,
+    records: crate::storage::ProviderResponsesPage,
+    response_bytes: usize,
+) -> Result<Value, Refusal> {
+    if text_offset > 0 && records.responses.first().map(|response| response.request) != after {
+        return Err(INVALID_REQUEST);
+    }
+    let envelope =
+        |responses: Vec<WireProviderResponse>, next_after, next_text_offset, has_more| {
+            envelope(WireProviderResponses {
+                job: job.to_string(),
+                responses,
+                next_after,
+                next_text_offset,
+                has_more,
+            })
+        };
+    let mut size = envelope(Vec::new(), Some(u32::MAX), Some(u32::MAX), true)
+        .to_string()
+        .len();
     let mut page = Vec::new();
-    let mut more = records.len() > limit;
+    let mut more = records.has_more;
     let mut next = None;
-    for record in records.into_iter().take(limit) {
-        let response = WireProviderResponse {
+    let mut next_offset = 0;
+    for record in records.responses {
+        let offset = if page.is_empty() {
+            text_offset as usize
+        } else {
+            0
+        };
+        if offset > record.text.len() || !record.text.is_char_boundary(offset) {
+            return Err(INVALID_REQUEST);
+        }
+        let mut response = WireProviderResponse {
             request: record.request.get(),
-            text: record.text,
+            text: String::new(),
+            text_offset: offset as u32,
+            text_complete: false,
             requests_tools: record.requests_tools,
             created_at_us: record.recorded_at.as_unix_micros(),
         };
-        let cost = json!(response).to_string().len() + 1;
-        if size + cost > shared.response_bytes {
+        let base = json!(response).to_string().len() + 1;
+        let available = response_bytes.saturating_sub(size + base);
+        let mut bytes = 0;
+        let mut end = offset;
+        for character in record.text[offset..].chars() {
+            let cost = match character {
+                '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+                c if c <= '\u{1f}' => 6,
+                c => c.len_utf8(),
+            };
+            if bytes + cost > available {
+                break;
+            }
+            bytes += cost;
+            end += character.len_utf8();
+        }
+        if size + base > response_bytes || (end == offset && offset < record.text.len()) {
             if page.is_empty() {
                 return Err(OUTPUT_TOO_LARGE);
             }
             more = true;
             break;
         }
-        size += cost;
+        response.text = record.text[offset..end].to_owned();
+        response.text_complete = end == record.text.len();
+        size += base + bytes;
         next = Some(response.request);
+        next_offset = if response.text_complete {
+            0
+        } else {
+            end as u32
+        };
+        let partial = !response.text_complete;
         page.push(response);
+        if partial {
+            more = true;
+            break;
+        }
     }
-    Ok(envelope(page, if more { next } else { None }, more))
+    Ok(envelope(
+        page,
+        if more { next } else { None },
+        if more { Some(next_offset) } else { None },
+        more,
+    ))
 }
 
 pub(super) fn cut_tool_string(text: &str) -> (&str, bool) {
@@ -495,13 +571,77 @@ mod tests {
     }
 
     #[test]
+    fn reply_chunks_fit_the_wire_limit_and_reassemble_escaped_utf8_exactly() {
+        let job = JobId::new(7);
+        let text = String::from_utf8(vec![0xc3, 0xa9, 0xe4, 0xb8, 0xad, 34, 92, 10, 1])
+            .expect("UTF-8")
+            .repeat(150_000);
+        assert!(text.len() > 1024 * 1024);
+        let mut after = None;
+        let mut offset = 0;
+        let mut restored = String::new();
+        let mut seen_later = false;
+        for _ in 0..10 {
+            let mut responses = Vec::new();
+            if after.is_none() || offset > 0 {
+                responses.push(crate::storage::ProviderResponse {
+                    request: RequestNumber::FIRST,
+                    text: text.clone(),
+                    requests_tools: true,
+                    recorded_at: crate::persistence::Timestamp::from_unix_micros(1),
+                });
+            }
+            responses.push(crate::storage::ProviderResponse {
+                request: RequestNumber::new(2).expect("number"),
+                text: "final answer".to_owned(),
+                requests_tools: false,
+                recorded_at: crate::persistence::Timestamp::from_unix_micros(2),
+            });
+            let page = provider_response_page(
+                job,
+                after,
+                offset,
+                crate::storage::ProviderResponsesPage {
+                    responses,
+                    has_more: false,
+                },
+                1024 * 1024,
+            )
+            .expect("page");
+            assert!(page.to_string().len() <= 1024 * 1024);
+            for reply in page["responses"].as_array().expect("replies") {
+                if reply["request"] == 1 {
+                    assert_eq!(
+                        reply["text_offset"].as_u64().expect("offset") as usize,
+                        restored.len()
+                    );
+                    restored.push_str(reply["text"].as_str().expect("text"));
+                } else {
+                    assert_eq!(reply["text"], "final answer");
+                    seen_later = true;
+                }
+            }
+            if page["has_more"] == false {
+                break;
+            }
+            after = RequestNumber::new(page["next_after"].as_u64().expect("cursor") as u32);
+            offset = page["next_text_offset"].as_u64().expect("offset") as u32;
+        }
+        assert_eq!(restored, text);
+        assert!(seen_later, "paging progresses past the oversized reply");
+    }
+
+    #[test]
     fn response_query_requires_an_advancing_request_and_bounded_page() {
-        assert_eq!(responses_query("").unwrap(), (None, 50));
+        assert_eq!(responses_query("").unwrap(), (None, 50, 0));
         assert_eq!(
             responses_query("after=2&limit=1").unwrap(),
-            (RequestNumber::new(2), 1)
+            (RequestNumber::new(2), 1, 0)
         );
         for query in [
+            "text_offset=1",
+            "after=1&text_offset=0",
+            "after=1&text_offset=1&text_offset=2",
             "after=0",
             "after=01",
             "after=4294967296",

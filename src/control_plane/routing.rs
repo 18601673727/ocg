@@ -17,6 +17,7 @@ pub(super) enum Route {
         crate::persistence::UsageSummaryFilter,
         Option<crate::persistence::UsageBucketing>,
     ),
+    UsageRetries(dashboard::UsageRetriesQuery),
     ToolStats,
     Availability(dashboard::ObservationQuery),
     Logs(dashboard::LogQuery),
@@ -42,6 +43,7 @@ pub(super) enum Route {
         job: JobId,
         after: Option<RequestNumber>,
         limit: usize,
+        text_offset: u32,
     },
     AgentProfiles {
         before: Option<ProfileId>,
@@ -112,6 +114,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Conversations { .. }
             | Route::Usage(_)
             | Route::UsageSummary(..)
+            | Route::UsageRetries(_)
             | Route::ToolStats
             | Route::Availability(_)
             | Route::Logs(_)
@@ -232,6 +235,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
         ["usage", "summary"] => dashboard::usage_summary_query(query)
             .map(|(filter, bucketing)| Route::UsageSummary(filter, bucketing)),
+        ["usage", "retries"] => dashboard::UsageRetriesQuery::parse(query).map(Route::UsageRetries),
         ["tool-stats"] => no_query(query).map(|()| Route::ToolStats),
         ["availability"] => dashboard::ObservationQuery::parse(query).map(Route::Availability),
         ["logs"] => dashboard::LogQuery::parse(query).map(Route::Logs),
@@ -263,8 +267,13 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         }
         ["jobs", job, "responses"] => {
             let job = job_id(job)?;
-            let (after, limit) = projection::responses_query(query)?;
-            Ok(Route::ProviderResponses { job, after, limit })
+            let (after, limit, text_offset) = projection::responses_query(query)?;
+            Ok(Route::ProviderResponses {
+                job,
+                after,
+                limit,
+                text_offset,
+            })
         }
         ["jobs", job, "input"] => {
             let job = job_id(job)?;
@@ -407,6 +416,7 @@ pub(super) async fn respond(
         Route::UsageSummary(filter, bucketing) => {
             dashboard::usage_summary(shared, filter, bucketing).await
         }
+        Route::UsageRetries(query) => dashboard::usage_retries(shared, query).await,
         Route::ToolStats => dashboard::tool_stats(shared).await,
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,
@@ -453,11 +463,14 @@ pub(super) async fn respond(
                 response: record.response,
             })))
         }
-        Route::ProviderResponses { job, after, limit } => {
-            projection::provider_responses(shared, job, after, limit)
-                .await
-                .map(Reply::ok)
-        }
+        Route::ProviderResponses {
+            job,
+            after,
+            limit,
+            text_offset,
+        } => projection::provider_responses(shared, job, after, limit, text_offset)
+            .await
+            .map(Reply::ok),
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await
         }
