@@ -22,6 +22,8 @@
 //! listener's own Host and Origin checks, a page from any other origin
 //! can neither use nor forge the session.
 
+use super::contracts::*;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
@@ -35,11 +37,11 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ntex::http::StatusCode;
 use ntex::http::header::{self, HeaderMap};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
-    API_VERSION, BODY_TOO_LARGE, INTERNAL, LENGTH_REQUIRED, Refusal, Reply, UNSUPPORTED_MEDIA_TYPE,
-    decimal, single,
+    BODY_TOO_LARGE, INTERNAL, LENGTH_REQUIRED, Refusal, Reply, UNSUPPORTED_MEDIA_TYPE, decimal,
+    single,
 };
 use crate::persistence::Timestamp;
 
@@ -223,7 +225,11 @@ impl State {
             .remove(&session.key);
         Reply::with_cookie(
             StatusCode::OK,
-            json!({"api_version": API_VERSION, "session": {"authenticated": false}}),
+            envelope(WireSessionResponse {
+                session: WireSession::SignedOut(WireSignedOut {
+                    authenticated: false,
+                }),
+            }),
             format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
         )
     }
@@ -231,13 +237,12 @@ impl State {
 
 /// What a signed-in request may read of its own session.
 pub(super) fn described(session: &Session) -> Value {
-    json!({
-        "api_version": API_VERSION,
-        "session": {
-            "authenticated": true,
-            "csrf_token": session.csrf,
-            "expires_at_us": session.expires_at_us,
-        },
+    envelope(WireSessionResponse {
+        session: WireSession::SignedIn(WireSignedIn {
+            authenticated: true,
+            csrf_token: session.csrf.clone(),
+            expires_at_us: session.expires_at_us,
+        }),
     })
 }
 

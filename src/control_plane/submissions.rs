@@ -32,15 +32,17 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use super::contracts::*;
 use aws_lc_rs::digest::{Context, SHA256};
 use ntex::http::StatusCode;
 use ntex::http::header::HeaderMap;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 use super::{
-    API_VERSION, DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN,
-    Shared, decimal,
+    DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared, decimal,
 };
 use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
@@ -741,14 +743,8 @@ pub(crate) mod resolution_seam {
     }
 }
 
-fn admission(status: &str, job: Option<JobId>) -> Value {
-    json!({
-        "api_version": API_VERSION,
-        "admission": {
-            "status": status,
-            "job": job.map(|job| job.to_string()),
-        },
-    })
+fn admission(admission: WireAdmission) -> Value {
+    envelope(WireAdmissionResponse { admission })
 }
 
 /// Submits `request` once under `key`, see the module documentation, and
@@ -806,7 +802,10 @@ pub(super) async fn submit(
             // The admission's task was dropped with the listener, so how it
             // ended is not known here.
             Ok(Ok(Outcome::Uncertain) | Err(_)) => Err(UNCERTAIN),
-            Err(()) => Ok(Reply::new(StatusCode::ACCEPTED, admission("pending", None))),
+            Err(()) => Ok(Reply::new(
+                StatusCode::ACCEPTED,
+                admission(WireAdmission::Pending { job: None }),
+            )),
         };
     }
     Err(UNCERTAIN)
@@ -823,21 +822,25 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
         // and its absence means the owner may still admit it.
         Some(Local::Resolving) => match shared.database.submission(key).await? {
             Some(record) => Some(record),
-            None => return Ok(Reply::ok(admission("pending", None))),
+            None => return Ok(Reply::ok(admission(WireAdmission::Pending { job: None }))),
         },
-        Some(Local::Admitting) => return Ok(Reply::ok(admission("pending", None))),
+        Some(Local::Admitting) => {
+            return Ok(Reply::ok(admission(WireAdmission::Pending { job: None })));
+        }
         Some(Local::Uncertain { generation, epoch }) => {
             match reconcile(shared, key, generation, epoch).await {
                 Reconciled::Recorded(record) => Some(record),
                 Reconciled::Absent => None,
-                Reconciled::Unresolved => return Ok(Reply::ok(admission("uncertain", None))),
+                Reconciled::Unresolved => {
+                    return Ok(Reply::ok(admission(WireAdmission::Uncertain { job: None })));
+                }
             }
         }
         None => shared.database.submission(key).await?,
     };
     Ok(Reply::ok(match found {
         Some(record) => admitted_value(shared, key, record.job).await?,
-        None => admission("not_found", None),
+        None => admission(WireAdmission::NotFound { job: None }),
     }))
 }
 
@@ -1226,9 +1229,12 @@ pub(super) async fn action(
             .retry(conversation, turn, Actor::User)
             .await
             .map_err(action_error)?;
-        return Ok(Reply::ok(
-            json!({ "api_version": API_VERSION, "conversation": conversation.to_string(), "turn": appended.turn.to_string(), "seq": appended.seq, "joined": appended.joined }),
-        ));
+        return Ok(Reply::ok(envelope(WireAppend {
+            conversation: conversation.to_string(),
+            turn: appended.turn.to_string(),
+            seq: appended.seq,
+            joined: appended.joined,
+        })));
     }
     if !object.is_empty() {
         return Err(INVALID_ROUTE_BODY);
@@ -1259,11 +1265,15 @@ pub(super) async fn action(
             .ok_or(INTERNAL)?
             .outcome
             .is_some();
-        return Ok(Reply::ok(json!({
-            "api_version": API_VERSION,
-            "conversation": conversation.to_string(),
-            "status": if settled { "already_settled" } else { "already_closing" },
-            "record_seq": result.record_seq,
+        return Ok(Reply::ok(envelope(WireStop {
+            conversation: conversation.to_string(),
+            status: if settled {
+                "already_settled"
+            } else {
+                "already_closing"
+            }
+            .to_owned(),
+            record_seq: result.record_seq,
         })));
     }
     let changed = action != "stop"
@@ -1287,7 +1297,16 @@ pub(super) async fn action(
         } else {
             StatusCode::OK
         },
-        json!({ "api_version": API_VERSION, "conversation": conversation.to_string(), "status": if changed { "requested" } else { "already_settled" }, "record_seq": result.record_seq }),
+        envelope(WireStop {
+            conversation: conversation.to_string(),
+            status: if changed {
+                "requested"
+            } else {
+                "already_settled"
+            }
+            .to_owned(),
+            record_seq: result.record_seq,
+        }),
     ))
 }
 fn action_error(error: DatabaseError) -> Refusal {
@@ -1308,9 +1327,16 @@ async fn admitted_value(shared: &Shared, key: SubmissionKey, job: JobId) -> Resu
         .job_configuration(job)
         .await?
         .ok_or(INTERNAL)?;
-    Ok(
-        json!({ "api_version": API_VERSION, "admission": { "status": "admitted", "job": job.to_string(), "conversation": turn.conversation.map(|conversation| conversation.to_string()), "seq": record.seq, "joined": record.seq > 1, "model": frozen.frozen.llm.config.model, "kept": turn.cancelled_at.is_some() } }),
-    )
+    Ok(envelope(WireAdmissionResponse {
+        admission: WireAdmission::Admitted {
+            job: job.to_string(),
+            conversation: turn.conversation.map(|id| id.to_string()),
+            seq: record.seq,
+            joined: record.seq > 1,
+            model: frozen.frozen.llm.config.model,
+            kept: turn.cancelled_at.is_some(),
+        },
+    }))
 }
 
 #[cfg(test)]
@@ -1939,9 +1965,13 @@ pub(super) async fn decide(
         .decide_approval(approval, decision)
         .await
         .map_err(action_error)?;
-    Ok(Reply::ok(
-        json!({"api_version":API_VERSION, "approval":[approval.job.get(),approval.request.get(),approval.index], "decision":name, "turn":appended.turn.to_string(), "seq":appended.seq, "joined":appended.joined}),
-    ))
+    Ok(Reply::ok(envelope(WireApprovalDecision {
+        approval: (approval.job.get(), approval.request.get(), approval.index),
+        decision: name.to_owned(),
+        turn: appended.turn.to_string(),
+        seq: appended.seq,
+        joined: appended.joined,
+    })))
 }
 
 pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply, Refusal> {
@@ -1953,10 +1983,18 @@ pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply,
     {
         return Err(conversation_refusal("conversation_not_found"));
     }
-    let cards = shared.database.conversation_cards(conversation).await?;
-    Ok(Reply::ok(
-        json!({"api_version":API_VERSION, "conversation":conversation.to_string(), "cards":cards}),
-    ))
+    let cards = shared
+        .database
+        .conversation_cards(conversation)
+        .await?
+        .into_iter()
+        .map(serde_json::from_value)
+        .collect::<Result<Vec<WireCard>, _>>()
+        .map_err(|_| INTERNAL)?;
+    Ok(Reply::ok(envelope(WireCards {
+        conversation: conversation.to_string(),
+        cards,
+    })))
 }
 
 pub(super) async fn release_slot(
@@ -1979,7 +2017,11 @@ pub(super) async fn release_slot(
     if record.unknown_at.is_none() {
         return Err(conversation_refusal("not_quarantined"));
     }
-    let released = || Reply::ok(json!({"api_version":API_VERSION,"status":"already_released"}));
+    let released = || {
+        Reply::ok(envelope(WireReleaseSlot {
+            status: "already_released".to_owned(),
+        }))
+    };
     if record.stop_confirmed_at.is_some() {
         return Ok(released());
     }
@@ -1992,16 +2034,22 @@ pub(super) async fn release_slot(
             let refusal = conversation_refusal("slot_live");
             return Ok(Reply::new(
                 refusal.status,
-                json!({"api_version":API_VERSION, "error":{"code":refusal.code,"message":format!("process group {group} is still live"),"group":group}}),
+                envelope(WireGroupErrorResponse {
+                    error: WireGroupError {
+                        code: refusal.code.to_owned(),
+                        message: format!("process group {group} is still live"),
+                        group,
+                    },
+                }),
             ));
         }
         JobProof::Untracked if object.get("confirm") == Some(&Value::Bool(true)) => StopProof::User,
         JobProof::Untracked => return Err(conversation_refusal("confirm_required")),
     };
     match database.confirm_job_stopped(job, by).await {
-        Ok(()) => Ok(Reply::ok(
-            json!({"api_version":API_VERSION,"status":"released"}),
-        )),
+        Ok(()) => Ok(Reply::ok(envelope(WireReleaseSlot {
+            status: "released".to_owned(),
+        }))),
         Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => Ok(released()),
         Err(error) => Err(action_error(error)),
     }

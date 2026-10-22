@@ -1,3 +1,4 @@
+use super::contracts::*;
 use super::*;
 
 /// A request's route, once admitted.
@@ -400,9 +401,12 @@ pub(super) async fn respond(
         Route::Logs(query) => dashboard::logs(shared, query).await,
         Route::Job(job) => {
             let details = database.job_details(job).await?.ok_or(JOB_NOT_FOUND)?;
-            Ok(Reply::ok(
-                json!({"api_version": API_VERSION, "job": job_json(&details.job)?, "result": details.result.as_ref().map(output_json), "usage": details.usage, "unknown_reason": details.unknown_reason}),
-            ))
+            Ok(Reply::ok(envelope(WireJobDetails {
+                job: projection::job_view(&details.job)?,
+                result: details.result.as_ref().map(projection::output_view),
+                usage: details.usage,
+                unknown_reason: details.unknown_reason,
+            })))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
         Route::ConversationChildren {
@@ -428,11 +432,15 @@ pub(super) async fn respond(
                 .provider_request(job, request)
                 .await?
                 .ok_or(NOT_FOUND)?;
-            Ok(Reply::ok(
-                json!({"api_version": API_VERSION, "job": job.to_string(),
-                "request": request.get(), "messages": record.messages, "tools": record.tools,
-                "parameters": record.parameters, "dropped_turns": record.dropped_turns, "response": record.response}),
-            ))
+            Ok(Reply::ok(envelope(WireProviderRequest {
+                job: job.to_string(),
+                request: request.get(),
+                messages: record.messages,
+                tools: record.tools,
+                parameters: record.parameters,
+                dropped_turns: record.dropped_turns,
+                response: record.response,
+            })))
         }
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await

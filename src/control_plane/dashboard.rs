@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
+use super::contracts::*;
 use super::*;
 use crate::persistence::{
     AvailabilityClassification, LlmProviderId, ObservationCursor, ObservationFilter, RequestNumber,
@@ -60,7 +61,7 @@ pub(super) async fn jobs(
     let page = records
         .iter()
         .take(limit)
-        .map(job_json)
+        .map(super::projection::job_view)
         .collect::<Result<Vec<_>, _>>()?;
     let more = records.len() > limit;
     let next = more
@@ -68,7 +69,11 @@ pub(super) async fn jobs(
         .flatten();
     bounded(
         shared,
-        json!({"api_version": API_VERSION, "jobs": page, "next_before": next, "has_more": more}),
+        envelope(WireJobs {
+            jobs: page,
+            next_before: next,
+            has_more: more,
+        }),
     )
 }
 
@@ -158,30 +163,61 @@ pub(super) async fn usage(shared: &Shared, query: ObservationQuery) -> Result<Re
         .database
         .metrics(query.filter, query.after, query.limit)
         .await?;
-    let rows = page.records.iter().map(|record| {
-        let measurements = &record.measurements;
-        let usage = &measurements.usage;
-        json!({
-            "id": record.id.to_string(), "job": record.job.to_string(), "request": record.request.get(),
-            "observed_at_us": record.observed_at.as_unix_micros(),
-            "model": record.target.as_ref().map(|target| &target.frozen.config.model),
-            "provider": record.target.as_ref().map(|target| &target.frozen.provider.name),
-            "llm_profile": record.target.as_ref().map(|target| target.llm_profile.to_string()),
-            "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
-            "cache_read_tokens": usage.cache_read_tokens, "cache_write_tokens": usage.cache_write_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-            "ttfb_ms": measurements.ttfb_ms, "finished_in_ms": measurements.request_finished_in_ms,
-            "eligibility": record.token.map(|token| match token.eligibility {
-                RequestEligibility::Eligible => "eligible", RequestEligibility::Excluded => "excluded",
-            }),
-            "finality": record.token.map(|token| match token.finality {
-                UsageFinality::Final => "final", UsageFinality::Cumulative => "cumulative",
-            }),
+    let rows = page
+        .records
+        .iter()
+        .map(|record| {
+            let measurements = &record.measurements;
+            let usage = &measurements.usage;
+            WireUsageObservation {
+                observation: WireObservation {
+                    id: record.id.to_string(),
+                    job: record.job.to_string(),
+                    request: record.request.get(),
+                    observed_at_us: record.observed_at.as_unix_micros(),
+                    model: record
+                        .target
+                        .as_ref()
+                        .map(|target| target.frozen.config.model.clone()),
+                    provider: record
+                        .target
+                        .as_ref()
+                        .map(|target| target.frozen.provider.name.clone()),
+                },
+                llm_profile: record
+                    .target
+                    .as_ref()
+                    .map(|target| target.llm_profile.to_string()),
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
+                cache_write_tokens: usage.cache_write_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                ttfb_ms: measurements.ttfb_ms,
+                finished_in_ms: measurements.request_finished_in_ms,
+                eligibility: record.token.map(|token| {
+                    match token.eligibility {
+                        RequestEligibility::Eligible => "eligible",
+                        RequestEligibility::Excluded => "excluded",
+                    }
+                    .to_owned()
+                }),
+                finality: record.token.map(|token| {
+                    match token.finality {
+                        UsageFinality::Final => "final",
+                        UsageFinality::Cumulative => "cumulative",
+                    }
+                    .to_owned()
+                }),
+            }
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     bounded(
         shared,
-        json!({"api_version": API_VERSION, "observations": rows, "next_after": next_cursor(page.next)?}),
+        envelope(WireUsage {
+            observations: rows,
+            next_after: next_cursor(page.next)?,
+        }),
     )
 }
 
@@ -192,25 +228,22 @@ pub(super) async fn tool_stats(shared: &Shared) -> Result<Reply, Refusal> {
         .map(|stat| {
             let finished = stat.completed.saturating_add(stat.failed);
             let duration_us_mean = stat.duration_us_total.checked_div(finished);
-            json!({
-                "name": stat.name,
-                "admitted": stat.admitted,
-                "refused_arguments": stat.refused_arguments,
-                "completed": stat.completed,
-                "failed": stat.failed,
-                "open": stat.admitted.saturating_sub(stat.completed).saturating_sub(stat.failed),
-                "duration_us_mean": duration_us_mean,
-                "duration_us_max": stat.duration_us_max,
-            })
+            WireToolStatsRow {
+                name: stat.name,
+                admitted: stat.admitted,
+                refused_arguments: stat.refused_arguments,
+                completed: stat.completed,
+                failed: stat.failed,
+                open: stat
+                    .admitted
+                    .saturating_sub(stat.completed)
+                    .saturating_sub(stat.failed),
+                duration_us_mean,
+                duration_us_max: stat.duration_us_max,
+            }
         })
         .collect::<Vec<_>>();
-    bounded(
-        shared,
-        json!({
-            "api_version": API_VERSION,
-            "tools": tools,
-        }),
-    )
+    bounded(shared, envelope(WireToolStats { tools }))
 }
 
 const MAX_USAGE_BUCKETS: i64 = 400;
@@ -327,20 +360,19 @@ pub(super) fn usage_summary_query(
     ))
 }
 
-fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> Value {
-    json!({
-        // 0 is "no Agent"; it is never a Profile id.
-        "agent": (row.agent != 0).then(|| format!("profile:{}", row.agent)),
-        "provider": format!("llm_provider:{}", row.provider),
-        "model": row.model,
-        "requests": row.requests,
-        "complete_requests": row.complete_requests,
-        "input_tokens": row.input_tokens,
-        "output_tokens": row.output_tokens,
-        "cache_read_tokens": row.cache_read_tokens,
-        "cache_write_tokens": row.cache_write_tokens,
-        "reasoning_tokens": row.reasoning_tokens,
-    })
+fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> WireUsageRow {
+    WireUsageRow {
+        agent: (row.agent != 0).then(|| format!("profile:{}", row.agent)),
+        provider: format!("llm_provider:{}", row.provider),
+        model: row.model.clone(),
+        requests: row.requests,
+        complete_requests: row.complete_requests,
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_write_tokens: row.cache_write_tokens,
+        reasoning_tokens: row.reasoning_tokens,
+    }
 }
 
 pub(super) async fn usage_summary(
@@ -356,13 +388,12 @@ pub(super) async fn usage_summary(
                 .iter()
                 .map(usage_summary_row)
                 .collect::<Vec<_>>();
-            json!({
-                "api_version": API_VERSION,
-                "from_us": summary.from_us,
-                "until_us": summary.until_us,
-                "complete": summary.complete,
-                "resume_from_us": summary.resume_from_us,
-                "rows": rows,
+            envelope(WireUsageSummary {
+                from_us: summary.from_us,
+                until_us: summary.until_us,
+                complete: summary.complete,
+                resume_from_us: summary.resume_from_us,
+                rows,
             })
         }
         Some(bucketing) => {
@@ -370,25 +401,23 @@ pub(super) async fn usage_summary(
             let rows = summary
                 .rows
                 .iter()
-                .map(|bucket| {
-                    let mut row = usage_summary_row(&bucket.row);
-                    row["bucket_us"] = json!(bucket.bucket_us);
-                    row
+                .map(|bucket| WireUsageBucket {
+                    row: usage_summary_row(&bucket.row),
+                    bucket_us: bucket.bucket_us,
                 })
                 .collect::<Vec<_>>();
             let bucket = match bucketing.width {
                 crate::persistence::UsageBucketWidth::Day => "day",
                 crate::persistence::UsageBucketWidth::Week => "week",
             };
-            json!({
-                "api_version": API_VERSION,
-                "from_us": summary.from_us,
-                "until_us": summary.until_us,
-                "complete": summary.complete,
-                "resume_from_us": summary.resume_from_us,
-                "bucket": bucket,
-                "tz_offset_minutes": bucketing.offset_minutes,
-                "rows": rows,
+            envelope(WireUsageBuckets {
+                from_us: summary.from_us,
+                until_us: summary.until_us,
+                complete: summary.complete,
+                resume_from_us: summary.resume_from_us,
+                rows,
+                bucket: bucket.to_owned(),
+                tz_offset_minutes: bucketing.offset_minutes,
             })
         }
     };
@@ -403,26 +432,40 @@ pub(super) async fn availability(
         .database
         .availability_stats(query.filter, query.after, query.limit)
         .await?;
-    let rows = page.records.iter().map(|record| {
-        let observation = &record.observation;
-        let classification = match observation.classification() {
-            AvailabilityClassification::Available => "available",
-            AvailabilityClassification::Unavailable(_) => "unavailable",
-            AvailabilityClassification::Rejected(_) => "rejected",
-            AvailabilityClassification::Unconfirmed => "unconfirmed",
-        };
-        json!({
-            "id": record.id.to_string(), "job": record.job.to_string(), "request": record.request.get(),
-            "observed_at_us": record.observed_at.as_unix_micros(),
-            "model": record.target.frozen.config.model, "provider": record.target.frozen.provider.name,
-            "status_code": observation.status_code,
-            "finish_reason": observation.finish_reason.map(|finish| finish.as_openai_str()),
-            "classification": classification,
+    let rows = page
+        .records
+        .iter()
+        .map(|record| {
+            let observation = &record.observation;
+            let classification = match observation.classification() {
+                AvailabilityClassification::Available => "available",
+                AvailabilityClassification::Unavailable(_) => "unavailable",
+                AvailabilityClassification::Rejected(_) => "rejected",
+                AvailabilityClassification::Unconfirmed => "unconfirmed",
+            };
+            WireAvailabilityObservation {
+                observation: WireObservation {
+                    id: record.id.to_string(),
+                    job: record.job.to_string(),
+                    request: record.request.get(),
+                    observed_at_us: record.observed_at.as_unix_micros(),
+                    model: Some(record.target.frozen.config.model.clone()),
+                    provider: Some(record.target.frozen.provider.name.clone()),
+                },
+                status_code: observation.status_code,
+                finish_reason: observation
+                    .finish_reason
+                    .map(|reason| reason.as_openai_str().to_owned()),
+                classification: classification.to_owned(),
+            }
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     bounded(
         shared,
-        json!({"api_version": API_VERSION, "observations": rows, "next_after": next_cursor(page.next)?}),
+        envelope(WireAvailability {
+            observations: rows,
+            next_after: next_cursor(page.next)?,
+        }),
     )
 }
 
@@ -535,10 +578,13 @@ fn log_tail(directory: &std::path::Path, query: LogQuery) -> Result<Value, Refus
         lines.reverse();
         truncated = start > 0 || complete.lines().count() > query.limit;
     }
-    Ok(
-        json!({"api_version": API_VERSION, "files": files.into_iter().rev().collect::<Vec<_>>(),
-        "file": selected, "lines": lines, "truncated": truncated, "files_truncated": matched > 100}),
-    )
+    Ok(envelope(WireLogs {
+        files: files.into_iter().rev().collect(),
+        file: selected,
+        lines,
+        truncated,
+        files_truncated: matched > 100,
+    }))
 }
 
 #[cfg(test)]

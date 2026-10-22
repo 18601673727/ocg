@@ -13,13 +13,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 
+use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    API_VERSION, DATABASE_BUSY, DATABASE_UNAVAILABLE, INCONSISTENT_RECORD, INTERNAL,
-    INVALID_REQUEST, Refusal, Reply, SHUTTING_DOWN, decimal, micros,
+    DATABASE_BUSY, DATABASE_UNAVAILABLE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST, Refusal,
+    Reply, SHUTTING_DOWN, decimal,
 };
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
@@ -454,98 +455,90 @@ async fn build_profiles_snapshot(
                 group.profile_ids.push(id_str.clone());
                 group.models.insert(model.model.clone());
 
-                llm_profiles.push(json!({
-                    "id": id_str,
-                    "name": record.name,
-                    "model": model.model,
-                    "context_window": model.context_window,
-                    "protocol": protocol,
-                    "endpoint": connection.endpoint,
-                    "credential_ref": connection.credential_ref,
-                    "has_credential": has_credential,
-                    "declared_capabilities": capabilities,
-                    "parameters": {
-                        "temperature": model.parameters.temperature,
-                        "top_p": model.parameters.top_p,
-                        "max_tokens": model.parameters.max_tokens,
-                        "reasoning_effort": model.parameters.reasoning_effort,
-                        "max_completion_tokens": model.parameters.max_completion_tokens,
-                        "presence_penalty": model.parameters.presence_penalty,
-                        "frequency_penalty": model.parameters.frequency_penalty,
-                    },
-                    "executors": executors,
-                    // Edits are always allowed and change no Job that froze the
-                    // old values, so nothing locks a Profile.
-                    "editable": true,
-                    "blocking_jobs": Vec::<String>::new(),
-                    "more_blocking_jobs": false,
-                    "created_at_us": micros(Some(record.created_at)),
-                    "updated_at_us": micros(Some(record.updated_at)),
-                }));
+                llm_profiles.push(WireLlmProfile {
+                    id: id_str,
+                    name: record.name,
+                    model: model.model,
+                    context_window: model.context_window,
+                    protocol: protocol.to_owned(),
+                    endpoint: connection.endpoint,
+                    credential_ref: connection.credential_ref,
+                    has_credential,
+                    declared_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+                    parameters: WireLlmParameters::from_parameters(&model.parameters),
+                    executors,
+                    editable: true,
+                    blocking_jobs: Vec::new(),
+                    more_blocking_jobs: false,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
+                });
             }
             ConfigBody::Agent(agent) => {
-                agent_profiles.push(json!({
-                    "id": id.to_string(),
-                    "name": record.name,
-                    "instructions": agent.instructions,
-                    "tool_grant": agent.tool_grant,
-                    "approve": agent.approve.iter().map(|class| class.as_str()).collect::<Vec<_>>(),
-                    "dispatch_to": agent.dispatch_to.iter().map(|id| ProfileId::from(*id).to_string()).collect::<Vec<_>>(),
-                    "default_model": agent.default_model.map(|id| ProfileId::from(id).to_string()),
-                    "behavior": match agent.behavior {
+                agent_profiles.push(WireManagedAgent {
+                    id: id.to_string(),
+                    name: record.name,
+                    instructions: agent.instructions,
+                    tool_grant: agent.tool_grant,
+                    approve: agent
+                        .approve
+                        .iter()
+                        .map(|class| class.as_str().to_owned())
+                        .collect(),
+                    dispatch_to: agent
+                        .dispatch_to
+                        .iter()
+                        .map(|id| ProfileId::from(*id).to_string())
+                        .collect(),
+                    default_model: agent
+                        .default_model
+                        .map(|id| ProfileId::from(id).to_string()),
+                    behavior: match agent.behavior {
                         AgentBehavior::Chat => "chat",
                         AgentBehavior::General => "general",
-                    },
-                    "llm_targets": agent
+                    }
+                    .to_owned(),
+                    llm_targets: agent
                         .models
                         .iter()
-                        .map(|model| ProfileId::from(*model).to_string())
-                        .collect::<Vec<_>>(),
-                    "editable": true,
-                    "blocking_jobs": Vec::<String>::new(),
-                    "more_blocking_jobs": false,
-                    "created_at_us": micros(Some(record.created_at)),
-                    "updated_at_us": micros(Some(record.updated_at)),
-                }));
+                        .map(|id| ProfileId::from(*id).to_string())
+                        .collect(),
+                    editable: true,
+                    blocking_jobs: Vec::new(),
+                    more_blocking_jobs: false,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
+                });
             }
             ConfigBody::Connection(_) | ConfigBody::Pool(_) => {}
         }
     }
     // Newest first, as Profiles have always been listed.
-    llm_profiles.sort_by_key(|profile| std::cmp::Reverse(profile_number(profile)));
-    agent_profiles.sort_by_key(|profile| std::cmp::Reverse(profile_number(profile)));
+    llm_profiles.sort_by_key(|profile| {
+        std::cmp::Reverse(profile_id(&profile.id).map_or(0, ProfileId::get))
+    });
+    agent_profiles.sort_by_key(|profile| {
+        std::cmp::Reverse(profile_id(&profile.id).map_or(0, ProfileId::get))
+    });
 
     let providers = provider_groups
         .into_iter()
-        .map(|(key, group)| {
-            json!({
-                "protocol": key.protocol,
-                "endpoint": key.endpoint,
-                "credential_ref": key.credential_ref,
-                "has_credential": group.has_credential,
-                "profile_ids": group.profile_ids,
-                "models": group.models.into_iter().collect::<Vec<_>>(),
-            })
+        .map(|(key, group)| WireProvider {
+            protocol: key.protocol.to_owned(),
+            endpoint: key.endpoint,
+            credential_ref: key.credential_ref,
+            has_credential: group.has_credential,
+            profile_ids: group.profile_ids,
+            models: group.models.into_iter().collect(),
         })
         .collect::<Vec<_>>();
 
-    let mut body = json!({
-        "api_version": API_VERSION,
-        "llm_profiles": llm_profiles,
-        "agent_profiles": agent_profiles,
-        "providers": providers,
-    });
-    if let Some(saved) = saved_profile {
-        body["profile_id"] = json!(saved.to_string());
-    }
-    Ok(body)
-}
-
-fn profile_number(profile: &Value) -> u64 {
-    profile["id"]
-        .as_str()
-        .and_then(|id| profile_id(id).ok())
-        .map_or(0, ProfileId::get)
+    Ok(envelope(WireProfiles {
+        llm_profiles,
+        agent_profiles,
+        providers,
+        profile_id: saved_profile.map(|id| id.to_string()),
+    }))
 }
 
 pub(super) async fn save_profile(
@@ -1147,7 +1140,17 @@ pub(super) async fn provider_models(
     )
     .await
     {
-        Ok(models) => return Ok(Reply::ok(json!({"models": models}))),
+        Ok(models) => {
+            return Ok(Reply::ok(json!(WireProviderModels {
+                models: models
+                    .into_iter()
+                    .map(|model| WireProviderModel {
+                        id: model.id,
+                        context_window: model.context_window
+                    })
+                    .collect()
+            })));
+        }
         Err(ModelListError::Unreachable) => (
             "provider_unreachable",
             "could not connect to the provider".to_owned(),
@@ -1167,13 +1170,15 @@ pub(super) async fn provider_models(
             Some(status_code),
         ),
     };
-    let mut error = json!({"code": code, "message": message});
-    if let Some(status) = status_code {
-        error["status_code"] = json!(status);
-    }
     Ok(Reply::new(
         StatusCode::BAD_GATEWAY,
-        json!({"api_version": API_VERSION, "error": error}),
+        envelope(WireProviderErrorResponse {
+            error: WireProviderError {
+                code: code.to_owned(),
+                message,
+                status_code,
+            },
+        }),
     ))
 }
 

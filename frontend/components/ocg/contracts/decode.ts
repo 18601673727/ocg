@@ -1,32 +1,6 @@
-/**
- * Minimal structural decoders for the Rust-generated control contract.
- *
- * `generated.ts` gives the PWA the *shape* of every control payload, but a
- * TypeScript type is erased at runtime: `JSON.parse` hands back `unknown`, and
- * every consumer would otherwise need an unchecked cast. The clients this
- * replaced used eight `as` casts, so a renamed or retyped Rust field reached
- * the UI as `undefined` with no error anywhere.
- *
- * A decoder closes that gap without pulling in a schema library. Each decoder
- * either yields a value of its declared contract type or reports the path that
- * stopped matching, so a malformed payload becomes a visible contract violation
- * instead of a `TypeError` three components later.
- *
- * Every decoder builds its result value *explicitly* from checked parts rather
- * than casting a record. That is what makes the Rust definition, the generated
- * type, and the runtime check one contract: when Rust adds or renames a
- * **required** field, the object literal here no longer satisfies the contract
- * type and the build fails. A cast-based helper would silently accept the new
- * field as `undefined`.
- *
- * A newly **optional** field is the deliberate exception. It does not stop the
- * build, and the decoder leaves it out of the value it returns, so the PWA
- * ignores a field it does not understand instead of failing on a newer
- * backend's addition. Reading such a field is a product decision, and adding
- * the check to the decoder is how you make it.
- */
+/** Runtime decoding primitives shared by Control Plane and frontend view models. */
 
-import type { JsonValue } from "./generated";
+import type { JsonValue } from "./view-models";
 
 /** Reports where a payload stopped matching the contract. */
 export class ContractError extends Error {

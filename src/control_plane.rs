@@ -140,6 +140,7 @@ mod attachments;
 mod browser;
 mod catalog;
 mod config;
+pub mod contracts;
 mod dashboard;
 mod events;
 mod listener;
@@ -165,7 +166,7 @@ use config::{
     DEFAULT_OUTPUT_PAGE, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES, Token,
 };
 pub use listener::{ControlPlane, StartError, StopError};
-use projection::{health, job_json, micros, output_json, outputs, settlement_json};
+use projection::{health, outputs};
 use routing::{Route, authorize, decimal, respond, route};
 #[cfg(test)]
 use routing::{job_id, output_query};

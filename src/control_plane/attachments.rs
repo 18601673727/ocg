@@ -14,15 +14,17 @@
 //! An Attachment is referenced from a Job's input by identity; its bytes are
 //! never copied into a Job.
 
+use super::contracts::*;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ntex::http::StatusCode;
 use ntex::http::header::{self, HeaderValue};
 use ntex::web::HttpResponse;
 use serde::Deserialize;
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::json;
 
-use super::{API_VERSION, INTERNAL, INVALID_REQUEST, Refusal, Reply, decimal, micros};
+use super::{INTERNAL, INVALID_REQUEST, Refusal, Reply, decimal};
 use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::openai_compatible::image::MAX_IMAGE_BYTES;
@@ -113,16 +115,16 @@ fn attachment_refusal(error: AttachmentError) -> Refusal {
     }
 }
 
-fn attachment_json(record: &AttachmentRecord) -> Value {
-    json!({
-        "id": record.id.to_string(),
-        "mime": record.mime,
-        "byte_length": record.byte_length,
-        "sha256": record.sha256.to_string(),
-        "display_name": record.display_name,
-        "created_at_us": micros(Some(record.created_at)),
-        "available": record.is_available(),
-    })
+fn attachment_json(record: &AttachmentRecord) -> WireAttachment {
+    WireAttachment {
+        id: record.id.to_string(),
+        mime: record.mime.clone(),
+        byte_length: record.byte_length,
+        sha256: record.sha256.to_string(),
+        display_name: record.display_name.clone(),
+        created_at_us: record.created_at.as_unix_micros(),
+        available: record.is_available(),
+    }
 }
 
 /// Stores one checked image as a user-provided Attachment.
@@ -148,7 +150,9 @@ pub(super) async fn upload(database: &DatabaseHandle, body: &[u8]) -> Result<Rep
     log::info!("control plane stored {id} ({} bytes)", record.byte_length);
     Ok(Reply::new(
         StatusCode::CREATED,
-        json!({"api_version": API_VERSION, "attachment": attachment_json(&record)}),
+        envelope(WireAttachmentAnswer {
+            attachment: attachment_json(&record),
+        }),
     ))
 }
 
@@ -171,9 +175,9 @@ pub(super) async fn metadata(
     id: AttachmentId,
 ) -> Result<Reply, Refusal> {
     let record = image_record(database, id).await?;
-    Ok(Reply::ok(
-        json!({"api_version": API_VERSION, "attachment": attachment_json(&record)}),
-    ))
+    Ok(Reply::ok(envelope(WireAttachmentAnswer {
+        attachment: attachment_json(&record),
+    })))
 }
 
 /// The verified bytes of a user-provided image, as that image.

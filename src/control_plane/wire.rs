@@ -1,3 +1,4 @@
+use super::contracts::*;
 use super::*;
 
 /// A refused or failed request: its status and a fixed code and message.
@@ -23,9 +24,11 @@ impl Refusal {
     fn response(&self) -> HttpResponse {
         let mut response = json_response(
             self.status,
-            &json!({
-                "api_version": API_VERSION,
-                "error": {"code": self.code, "message": self.message},
+            &envelope(WireErrorResponse {
+                error: WireError {
+                    code: self.code.to_owned(),
+                    message: self.message.to_owned(),
+                },
             }),
         );
         if self.status == StatusCode::UNAUTHORIZED {

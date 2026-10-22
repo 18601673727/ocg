@@ -12,7 +12,7 @@
 //!
 //! Events, each one complete JSON object on one `data` line:
 //!
-//! - `job`, without an `id`: the Job's record as [`super::job_json`]
+//! - `job`, without an `id`: the Job's record as [`super::projection::job_view`]
 //!   describes it, when the stream opens and again whenever its lifecycle
 //!   changes without concluding. It is an observation, not an output.
 //! - `output`, with the output's stored `seq` as its `id`: `{"api_version",
@@ -57,16 +57,17 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use super::contracts::*;
+use super::projection::{job_view, output_view, settlement_view};
 use ntex::http::StatusCode;
 use ntex::http::header::{self, HeaderMap};
 use ntex::io::IoRef;
 use ntex::util::{Bytes, Stream};
 use ntex::web::HttpResponse;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::{
-    API_VERSION, INVALID_REQUEST, JOB_NOT_FOUND, OUTPUT_TOO_LARGE, Refusal, SHUTTING_DOWN, Shared,
-    decimal, job_json, output_json, settlement_json,
+    INVALID_REQUEST, JOB_NOT_FOUND, OUTPUT_TOO_LARGE, Refusal, SHUTTING_DOWN, Shared, decimal,
 };
 use crate::database::DatabaseError;
 use crate::persistence::{JobId, JobOutputRecord, JobRecord, Timestamp};
@@ -172,7 +173,7 @@ pub(super) async fn open(
     let slot = Slot::take(shared)?;
     let database = &shared.database;
     let record = database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
-    job_json(&record)?;
+    job_view(&record)?;
     let page = database.job_outputs(job, after_seq, PAGE).await?;
     #[cfg(test)]
     shared.fetched.fetch_add(page.len(), Ordering::SeqCst);
@@ -435,10 +436,10 @@ impl Feed {
     }
 
     fn announce(mut self) -> Option<(Bytes, Self)> {
-        match job_json(&self.record) {
+        match job_view(&self.record) {
             Ok(described) => {
                 self.announced = Some(lifecycle(&self.record));
-                let data = json!({"api_version": API_VERSION, "job": described});
+                let data = envelope(WireJobEvent { job: described });
                 self.send(event("job", &data))
             }
             Err(refusal) => self.fail(refusal),
@@ -446,14 +447,16 @@ impl Feed {
     }
 
     fn settle(mut self) -> Option<(Bytes, Self)> {
-        match settlement_json(&self.record) {
+        match settlement_view(&self.record) {
             Ok(settlement) => {
                 self.ended = true;
-                let data = json!({
-                    "api_version": API_VERSION,
-                    "job": self.job.to_string(),
-                    "settlement": settlement,
-                    "stop_confirmed_at_us": super::micros(self.record.stop_confirmed_at),
+                let data = envelope(WireSettlementEvent {
+                    job: self.job.to_string(),
+                    settlement,
+                    stop_confirmed_at_us: self
+                        .record
+                        .stop_confirmed_at
+                        .map(|at| at.as_unix_micros()),
                 });
                 self.send(event("settlement", &data))
             }
@@ -463,9 +466,11 @@ impl Feed {
 
     fn fail(mut self, refusal: Refusal) -> Option<(Bytes, Self)> {
         self.ended = true;
-        let data = json!({
-            "api_version": API_VERSION,
-            "error": {"code": refusal.code, "message": refusal.message},
+        let data = envelope(WireErrorResponse {
+            error: WireError {
+                code: refusal.code.to_owned(),
+                message: refusal.message.to_owned(),
+            },
         });
         self.send(event("stream_error", &data))
     }
@@ -480,10 +485,9 @@ fn event(name: &str, data: &Value) -> Bytes {
 /// than a response may be. Such an output is larger than a page of the
 /// outputs route could carry too.
 fn output_event(shared: &Shared, job: JobId, output: &JobOutputRecord) -> Result<Bytes, Refusal> {
-    let data = json!({
-        "api_version": API_VERSION,
-        "job": job.to_string(),
-        "output": output_json(output),
+    let data = envelope(WireOutputEvent {
+        job: job.to_string(),
+        output: output_view(output),
     });
     let event = format!("id: {}\nevent: output\ndata: {data}\n\n", output.seq);
     if event.len() > shared.response_bytes {

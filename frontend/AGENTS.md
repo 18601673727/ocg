@@ -50,9 +50,13 @@ https://github.com/vercel-labs/agent-skills/blob/main/skills/react-best-practice
 
 `components/ocg/contracts/` is the only sanctioned way to talk to the loopback
 control server. `generated.ts` is projected from the Rust definitions in
-`src/contracts.rs` by `cargo run --bin ocg-rs-ts` (run `make contracts` from the
-repository root) and is committed. It is generated, not hand-edited, and
-`tests/contracts.rs` fails when it drifts from Rust.
+`src/control_plane/contracts.rs` using `ts-rs`. Run `make contracts` from the
+repository root (or `cargo run --locked --bin ocg-rs-ts`) and commit the result. It is generated, not hand-edited, and
+`make contracts-check` and `tests/contracts.rs` fail when it drifts from Rust.
+`pnpm test` and `pnpm build` run the same drift check. JSON integers generate
+as TypeScript `number`; runtime decoders still enforce safe integer bounds.
+The older UI adapter types live in `view-models.ts`; they are frontend models,
+not a second backend wire contract.
 
 Import contract types and their decoders from `components/ocg/contracts`, never
 from `./generated` directly, so the type and the check that enforces it stay
@@ -62,9 +66,10 @@ renamed Rust field to reach the UI as `undefined`. A payload that does not match
 its contract raises a `ContractError` naming the path; let it, and report it
 rather than rendering a partly-typed view.
 
-Adding a **required** field on the Rust side breaks `tsc` in the decoder, which
-is the point. Adding an **optional** one does not: the decoder omits it, so the
-PWA ignores a field it does not understand rather than breaking against a newer
-backend. If the PWA should read such a field, add the check to its decoder
-rather than reading it off the wire type.
+Handlers construct the Rust response types before serialization. The decoders
+check their returned projections against generated types with `satisfies`;
+fields deliberately excluded from a UI projection are listed with `Omit`. A new
+required field on a consumed projection therefore requires a decoder update,
+while optional fields may remain unread. Regenerate and commit the declarations
+with every wire change. This changes no persisted storage format.
 

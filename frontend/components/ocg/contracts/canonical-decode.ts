@@ -1,11 +1,4 @@
-/**
- * Runtime decoders for the canonical control contract.
- *
- * The shapes below are the generated projection of `src/contracts.rs`. These
- * replace the unchecked `as` casts the canonical client used: a payload whose
- * shape has drifted from the Rust definition now raises a contract violation
- * naming the offending path instead of reaching a component as `undefined`.
- */
+/** Runtime validation of the frontend view models used by UI adapters. */
 
 import type {
   CanonicalJobRelations,
@@ -18,7 +11,7 @@ import type {
   EntityRef,
   JsonValue,
   RecursiveLimits,
-} from "./generated";
+} from "./view-models";
 import {
   array,
   bad,
@@ -51,7 +44,7 @@ import {
  * `CanonicalJobSnapshot::job` is an unconstrained `serde_json::Value` in
  * `src/orchestration/canonical_control.rs`, assembled by `canonical_snapshot`
  * from the authoritative records in `src/orchestration/domain.rs`. Those
- * records carry no `ts_rs` projection of their own — the field set here mirrors
+ * records carry no wire projection of their own — the field set here mirrors
  * the Rust structs exactly, and each decoder is the check that keeps the mirror
  * honest: a renamed or retyped field stops the payload here with a path,
  * instead of reaching a surface as `undefined`.
@@ -123,7 +116,7 @@ export type CanonicalJob = CanonicalJobRelations & CanonicalJobOperations & {
  * One Watchdog action, as `domain_watchdog_actions` recorded it.
  *
  * `WatchdogActionRecord` is serialized straight into the snapshot's `watchdog`
- * array and carries no `ts_rs` projection, so this mirrors its serde shape.
+ * array and carries no wire projection, so this mirrors its serde shape.
  * `classification`, `action` and `outcome` are bare strings in the substrate and
  * stay strings here: the UI renders the ones it recognizes and shows any other
  * word verbatim rather than coercing it. Absent optional ids are `null`.

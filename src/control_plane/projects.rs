@@ -10,13 +10,12 @@
 //! Provider with every request, so they must hold no secret. A Project is
 //! never deleted.
 
+use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
-use serde_json::{Value, json};
 
 use super::{
-    API_VERSION, INTERNAL, INVALID_REQUEST, Refusal, Reply, Shared, catalog, decimal, micros,
-    profiles, submissions,
+    INTERNAL, INVALID_REQUEST, Refusal, Reply, Shared, catalog, decimal, profiles, submissions,
 };
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
@@ -101,20 +100,23 @@ pub(super) fn projects_query(query: &str) -> Result<(Option<ProjectId>, usize), 
     catalog::page_query(query, project_id)
 }
 
-fn project_json(record: &ProjectRecord) -> Value {
-    json!({
-        "id": record.id.to_string(),
-        "name": record.name,
-        "description": record.description,
-        "root": record.root,
-        "commands": record
+fn project_json(record: &ProjectRecord) -> WireProject {
+    WireProject {
+        id: record.id.to_string(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        root: record.root.clone(),
+        commands: record
             .commands
             .iter()
-            .map(|command| json!({"name": command.name, "argv": command.argv}))
-            .collect::<Vec<_>>(),
-        "created_at_us": micros(Some(record.created_at)),
-        "updated_at_us": micros(Some(record.updated_at)),
-    })
+            .map(|command| WireProjectCommand {
+                name: command.name.clone(),
+                argv: command.argv.clone(),
+            })
+            .collect(),
+        created_at_us: record.created_at.as_unix_micros(),
+        updated_at_us: record.updated_at.as_unix_micros(),
+    }
 }
 
 pub(super) async fn list(
@@ -125,11 +127,10 @@ pub(super) async fn list(
     let mut records = database.projects(before, limit + 1).await?;
     let has_more = records.len() > limit;
     records.truncate(limit);
-    Ok(Reply::ok(json!({
-        "api_version": API_VERSION,
-        "projects": records.iter().map(project_json).collect::<Vec<_>>(),
-        "has_more": has_more,
-        "next_before": has_more
+    Ok(Reply::ok(envelope(WireProjects {
+        projects: records.iter().map(project_json).collect(),
+        has_more,
+        next_before: has_more
             .then(|| records.last().map(|record| record.id.to_string()))
             .flatten(),
     })))
@@ -222,7 +223,9 @@ pub(super) async fn create(shared: &Shared, body: &[u8]) -> Result<Reply, Refusa
     let record = shared.database.project(id).await?.ok_or(INTERNAL)?;
     Ok(Reply::new(
         StatusCode::CREATED,
-        json!({"api_version": API_VERSION, "project": project_json(&record)}),
+        envelope(WireProjectAnswer {
+            project: project_json(&record),
+        }),
     ))
 }
 
@@ -246,7 +249,7 @@ pub(super) async fn update(
         .await
         .map_err(refusal)?;
     let record = database.project(id).await?.ok_or(PROJECT_NOT_FOUND)?;
-    Ok(Reply::ok(
-        json!({"api_version": API_VERSION, "project": project_json(&record)}),
-    ))
+    Ok(Reply::ok(envelope(WireProjectAnswer {
+        project: project_json(&record),
+    })))
 }

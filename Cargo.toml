@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.98"
 license = "MIT"
 publish = false
+default-run = "ocg"
+
+[[bin]]
+name = "ocg-rs-ts"
+path = "src/bin/ocg-rs-ts.rs"
 
 [[bin]]
 name = "ocg"
@@ -23,6 +28,7 @@ name = "backend"
 harness = false
 
 [dependencies]
+ts-rs = { version = "=12.0.1", default-features = false, features = ["serde-compat", "serde-json-impl"] }
 redb = { version = "=4.3.0", default-features = false, features = ["std"] }
 petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
 flume = "0.11"

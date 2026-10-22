@@ -9,11 +9,12 @@
 //! copies or interprets anything, and neither says anything of a Provider's
 //! endpoint or credential.
 
-use serde_json::{Value, json};
+use super::contracts::*;
+use serde_json::Value;
 
 use super::{
-    API_VERSION, INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, NOT_FOUND, Refusal, Reply,
-    Shared, dashboard, decimal, micros, profiles, routing, submissions,
+    INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, NOT_FOUND, Refusal, Reply, Shared,
+    dashboard, decimal, profiles, routing, submissions,
 };
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
@@ -143,77 +144,81 @@ pub(super) async fn job_input(database: &DatabaseHandle, job: JobId) -> Result<R
         .job_input_for_job(job)
         .await?
         .ok_or(INCONSISTENT_RECORD)?;
-    let configuration = database.job_configuration(job).await?.map(|submitted| {
-        json!({
-            "agent_profile": submitted.agent_profile.map(|profile| profile.to_string()),
-            "llm_profile": submitted.llm_profile.to_string(),
-            "model": submitted.frozen.llm.config.model,
-            "context_window": submitted.frozen.llm.config.context_window,
-        })
-    });
-    Ok(Reply::ok(json!({
-        "api_version": API_VERSION,
-        "job": job.to_string(),
-        "input": {
-            "id": input.id.to_string(),
-            "objective": input.objective,
-            "submitted_at_us": micros(input.submitted_at),
-            "attachments": input
-                .attachments
-                .iter()
-                .map(|attachment| attachment.to_string())
-                .collect::<Vec<_>>(),
-            "configuration": configuration,
+    let configuration = database
+        .job_configuration(job)
+        .await?
+        .map(|submitted| WireConfiguration {
+            agent_profile: submitted.agent_profile.map(|id| id.to_string()),
+            llm_profile: submitted.llm_profile.to_string(),
+            model: submitted.frozen.llm.config.model,
+            context_window: submitted.frozen.llm.config.context_window,
+        });
+    Ok(Reply::ok(envelope(WireJobInput {
+        job: job.to_string(),
+        input: WireInput {
+            id: input.id.to_string(),
+            objective: input.objective,
+            submitted_at_us: input.submitted_at.map(|at| at.as_unix_micros()),
+            attachments: input.attachments.iter().map(ToString::to_string).collect(),
+            configuration,
         },
     })))
 }
 
-pub(super) fn actor_json(actor: &crate::persistence::Actor) -> Value {
+pub(super) fn actor_view(actor: &crate::persistence::Actor) -> WireActor {
     use crate::persistence::Actor;
     match actor {
-        Actor::Auto => json!({"kind":"auto"}),
-        Actor::User => json!({"kind":"user"}),
-        Actor::Loop => json!({"kind":"loop"}),
-        Actor::Agent { conversation } => {
-            json!({"kind":"agent", "conversation":conversation.to_string()})
-        }
+        Actor::Auto => WireActor::Auto,
+        Actor::User => WireActor::User,
+        Actor::Loop => WireActor::Loop,
+        Actor::Agent { conversation } => WireActor::Agent {
+            conversation: conversation.to_string(),
+        },
     }
 }
-pub(super) fn entry_json(seq: u32, entry: &crate::persistence::TurnEntry) -> Value {
+
+pub(super) fn entry_json(seq: u32, entry: &crate::persistence::TurnEntry) -> WireTurnEntry {
     use crate::persistence::Entry;
-    let mut value = match &entry.entry {
-        Entry::UserMessage { text, attachments } => {
-            json!({ "kind": "user_message", "text": text, "attachments": attachments.iter().map(ToString::to_string).collect::<Vec<_>>() })
-        }
-        Entry::AgentMessage { text, call } => {
-            json!({ "kind": "agent_message", "text": text, "call": format!("{}:{}/{}", call.job, call.request.get(), call.index) })
-        }
+    let value = match &entry.entry {
+        Entry::UserMessage { text, attachments } => WireEntry::UserMessage {
+            text: text.clone(),
+            attachments: attachments.iter().map(ToString::to_string).collect(),
+        },
+        Entry::AgentMessage { text, call } => WireEntry::AgentMessage {
+            text: text.clone(),
+            call: format!("{}:{}/{}", call.job, call.request.get(), call.index),
+        },
         Entry::Notice {
             child,
             event,
             reference,
-        } => {
-            json!({ "kind": "notice", "child": child.to_string(), "event": format!("{event:?}"), "reference": reference.to_string() })
-        }
-        Entry::Decision { approval } => {
-            json!({ "kind": "decision", "approval": [approval.0.get(), approval.1 as u64, approval.2 as u64] })
-        }
-        Entry::RetryOf { turn, by } => {
-            json!({ "kind": "retry_of", "turn": turn.to_string(), "by": actor_json(by) })
-        }
-        Entry::Iteration { n } => json!({ "kind": "iteration", "n": n }),
-        Entry::ResponseFormat { format } => match format {
-            crate::persistence::ResponseFormat::JsonObject => {
-                json!({"kind": "response_format", "type": "json_object"})
-            }
-            crate::persistence::ResponseFormat::JsonSchema { name, .. } => {
-                json!({"kind": "response_format", "type": "json_schema", "name": name})
-            }
+        } => WireEntry::Notice {
+            child: child.to_string(),
+            event: format!("{event:?}"),
+            reference: reference.to_string(),
+        },
+        Entry::Decision { approval } => WireEntry::Decision {
+            approval: (approval.0.get(), approval.1, approval.2),
+        },
+        Entry::RetryOf { turn, by } => WireEntry::RetryOf {
+            turn: turn.to_string(),
+            by: actor_view(by),
+        },
+        Entry::Iteration { n } => WireEntry::Iteration { n: *n },
+        Entry::ResponseFormat { format } => WireEntry::ResponseFormat {
+            format: match format {
+                crate::persistence::ResponseFormat::JsonObject => WireResponseFormat::JsonObject,
+                crate::persistence::ResponseFormat::JsonSchema { name, .. } => {
+                    WireResponseFormat::JsonSchema { name: name.clone() }
+                }
+            },
         },
     };
-    value["seq"] = json!(seq);
-    value["at_us"] = json!(entry.at.as_unix_micros());
-    value
+    WireTurnEntry {
+        seq,
+        at_us: entry.at.as_unix_micros(),
+        entry: value,
+    }
 }
 pub(super) async fn conversation_children(
     database: &DatabaseHandle,
@@ -232,41 +237,78 @@ pub(super) async fn conversation_children(
     let mut children = Vec::new();
     for record in records.iter().take(limit) {
         let c = &record.conversation;
-        let recurrence = record.recurrence.as_ref().map(|row| {
-            use crate::persistence::RecurrencePhase;
-            let (phase, due) = match row.phase {
-                RecurrencePhase::Active => ("active", None),
-                RecurrencePhase::WaitingDue { due } => ("waiting_due", Some(due)),
-                RecurrencePhase::Halted { .. } => ("halted", None),
-            };
-            json!({"interval_s":row.interval_s, "phase":phase, "due_us":due})
+        children.push(WireChild {
+            id: c.root_job.to_string(),
+            title: c.title.clone(),
+            agent: c.agent.map(|id| ProfileId::from(id).to_string()),
+            state: c.state.to_owned(),
+            on_hold: c.on_hold.as_ref().map(|by| WireHold { by: actor_view(by) }),
+            keep_open: record.keep_open,
+            recurrence: record.recurrence.as_ref().map(recurrence_json),
         });
-        children.push(json!({"id":c.root_job.to_string(), "title":c.title, "agent":c.agent.map(|id| ProfileId::from(id).to_string()), "state":c.state, "on_hold":c.on_hold.as_ref().map(|by| json!({"by":actor_json(by)})), "keep_open":record.keep_open, "recurrence":recurrence}));
     }
-    Ok(Reply::ok(
-        json!({"api_version":API_VERSION,"conversation":conversation.to_string(),"children":children,"has_more":has_more,"next_before":if has_more { records.get(limit.saturating_sub(1)).map(|record| record.conversation.root_job.to_string()) } else { None }}),
-    ))
+    Ok(Reply::ok(envelope(WireChildren {
+        conversation: conversation.to_string(),
+        children,
+        has_more,
+        next_before: if has_more {
+            records
+                .get(limit.saturating_sub(1))
+                .map(|record| record.conversation.root_job.to_string())
+        } else {
+            None
+        },
+    })))
 }
 /// The recurrence of a conversation, as the children route reports it.
-fn recurrence_json(row: &Recurrence) -> Value {
+fn recurrence_json(row: &Recurrence) -> WireRecurrence {
     use crate::persistence::RecurrencePhase;
     let (phase, due) = match row.phase {
         RecurrencePhase::Active => ("active", None),
         RecurrencePhase::WaitingDue { due } => ("waiting_due", Some(due)),
         RecurrencePhase::Halted { .. } => ("halted", None),
     };
-    json!({"interval_s":row.interval_s, "phase":phase, "due_us":due})
+    WireRecurrence {
+        interval_s: row.interval_s,
+        phase: phase.to_owned(),
+        due_us: due,
+    }
 }
 
 /// One node of the tree, as the route reports it. The children of a node
 /// are the nodes the tree holds below it.
-fn tree_node_json(node: &TreeNode, tree: &JobTree) -> Value {
-    let agent = node
-        .agent
-        .as_ref()
-        .map(|(id, _)| ProfileId::from(*id).to_string());
-    let agent_name = node.agent.as_ref().and_then(|(_, name)| name.clone());
-    let mut value = match &node.facts {
+fn tree_node_json(node: &TreeNode, tree: &JobTree) -> WireTreeNode {
+    let mut value = WireTreeNode {
+        id: node.id.to_string(),
+        kind: WireJobKind::Turn,
+        parent: node.parent_id.map(|id| id.to_string()),
+        title: String::new(),
+        state: String::new(),
+        created_at_us: node.created_at.as_unix_micros(),
+        agent: node
+            .agent
+            .as_ref()
+            .map(|(id, _)| ProfileId::from(*id).to_string()),
+        agent_name: node.agent.as_ref().and_then(|(_, name)| name.clone()),
+        model: None,
+        on_hold: None,
+        origin: None,
+        keep_open: None,
+        active_turn: None,
+        recurrence: None,
+        conversation: None,
+        previous: None,
+        depends_on: Vec::new(),
+        children: node.children.as_ref().map(|children| {
+            children
+                .iter()
+                .map(|index| tree_node_json(&tree.nodes[*index], tree))
+                .collect()
+        }),
+        has_more_children: node.has_more_children,
+        next_after: node.next_after.map(|id| id.to_string()),
+    };
+    match &node.facts {
         TreeFacts::Conversation {
             title,
             state,
@@ -276,28 +318,18 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> Value {
             active_turn,
             recurrence,
         } => {
-            let model = active_turn.as_ref().map(|(_, llm, model)| {
-                json!({"llm_profile": ProfileId::from(*llm).to_string(), "model": model})
+            value.kind = WireJobKind::Conversation;
+            value.title = title.clone();
+            value.state = (*state).to_owned();
+            value.on_hold = on_hold.as_ref().map(|by| WireHold { by: actor_view(by) });
+            value.origin = Some((*origin).to_owned());
+            value.keep_open = Some(*keep_open);
+            value.active_turn = active_turn.as_ref().map(|(id, _, _)| id.to_string());
+            value.recurrence = recurrence.as_ref().map(recurrence_json);
+            value.model = active_turn.as_ref().map(|(_, llm, model)| WireModel {
+                llm_profile: ProfileId::from(*llm).to_string(),
+                model: model.clone(),
             });
-            json!({
-                "id": node.id.to_string(),
-                "kind": "conversation",
-                "parent": node.parent_id.map(|parent| parent.to_string()),
-                "title": title,
-                "state": state,
-                "created_at_us": node.created_at.as_unix_micros(),
-                "agent": agent,
-                "agent_name": agent_name,
-                "model": model,
-                "on_hold": on_hold.as_ref().map(|by| json!({"by": actor_json(by)})),
-                "origin": origin,
-                "keep_open": keep_open,
-                "active_turn": active_turn.as_ref().map(|(turn, _, _)| turn.to_string()),
-                "recurrence": recurrence.as_ref().map(recurrence_json),
-                "conversation": Value::Null,
-                "previous": Value::Null,
-                "depends_on": Vec::<Value>::new(),
-            })
         }
         TreeFacts::Turn {
             title,
@@ -306,48 +338,34 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> Value {
             previous,
             model,
             depends_on,
-        } => json!({
-            "id": node.id.to_string(),
-            "kind": "turn",
-            "parent": node.parent_id.map(|parent| parent.to_string()),
-            "title": title,
-            "state": state,
-            "created_at_us": node.created_at.as_unix_micros(),
-            "agent": agent,
-            "agent_name": agent_name,
-            "model": json!({"llm_profile": ProfileId::from(model.0).to_string(), "model": model.1}),
-            "on_hold": Value::Null,
-            "origin": Value::Null,
-            "keep_open": Value::Null,
-            "active_turn": Value::Null,
-            "recurrence": Value::Null,
-            "conversation": conversation.map(|conversation| conversation.to_string()),
-            "previous": previous.map(|previous| previous.to_string()),
-            "depends_on": depends_on.iter().map(|(job, condition, state)| json!({
-                "job": job.to_string(),
-                "condition": match condition {
-                    DependencyCondition::Success => "success",
-                    DependencyCondition::Settled => "settled",
-                },
-                "state": match state {
-                    DependencyState::Waiting => "waiting",
-                    DependencyState::Satisfied => "satisfied",
-                    DependencyState::Impossible => "impossible",
-                },
-            })).collect::<Vec<_>>(),
-        }),
-    };
-    value["children"] = match &node.children {
-        Some(children) => Value::Array(
-            children
+        } => {
+            value.title = title.clone();
+            value.state = (*state).to_owned();
+            value.model = Some(WireModel {
+                llm_profile: ProfileId::from(model.0).to_string(),
+                model: model.1.clone(),
+            });
+            value.conversation = conversation.map(|id| id.to_string());
+            value.previous = previous.map(|id| id.to_string());
+            value.depends_on = depends_on
                 .iter()
-                .map(|index| tree_node_json(&tree.nodes[*index], tree))
-                .collect(),
-        ),
-        None => Value::Null,
-    };
-    value["has_more_children"] = json!(node.has_more_children);
-    value["next_after"] = node.next_after.map(|id| id.to_string()).into();
+                .map(|(job, condition, state)| WireDependency {
+                    job: job.to_string(),
+                    condition: match condition {
+                        DependencyCondition::Success => "success",
+                        DependencyCondition::Settled => "settled",
+                    }
+                    .to_owned(),
+                    state: match state {
+                        DependencyState::Waiting => "waiting",
+                        DependencyState::Satisfied => "satisfied",
+                        DependencyState::Impossible => "impossible",
+                    }
+                    .to_owned(),
+                })
+                .collect();
+        }
+    }
     value
 }
 
@@ -368,11 +386,10 @@ pub(super) async fn job_tree(
     let root = tree_node_json(&tree.nodes[0], &tree);
     dashboard::bounded(
         shared,
-        json!({
-            "api_version": API_VERSION,
-            "job": job.to_string(),
-            "ancestors": tree.ancestors.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-            "root": root,
+        envelope(WireTree {
+            job: job.to_string(),
+            ancestors: tree.ancestors.iter().map(ToString::to_string).collect(),
+            root,
         }),
     )
 }
@@ -416,7 +433,15 @@ pub(super) async fn conversation_turns(
                 outputs.push(latest);
             }
         }
-        let configuration = database.job_configuration(record.id).await?.map(|submitted| json!({"agent_profile": submitted.agent_profile.map(|profile| profile.to_string()), "llm_profile": submitted.llm_profile.to_string(), "model": submitted.frozen.llm.config.model, "context_window": submitted.frozen.llm.config.context_window}));
+        let configuration = database
+            .job_configuration(record.id)
+            .await?
+            .map(|submitted| WireConfiguration {
+                agent_profile: submitted.agent_profile.map(|id| id.to_string()),
+                llm_profile: submitted.llm_profile.to_string(),
+                model: submitted.frozen.llm.config.model,
+                context_window: submitted.frozen.llm.config.context_window,
+            });
         let mut uncertain = Vec::new();
         if record.unknown_at.is_some() {
             for call in database.tool_evidence(record.id, None, 1000).await? {
@@ -428,15 +453,39 @@ pub(super) async fn conversation_turns(
                         )
                     })
                 {
-                    uncertain.push(json!({"request":call.call.request.get(),"index":call.call.index,"tool":call.name,"argv":admission.arguments.as_str()}));
+                    uncertain.push(WireUncertainCall {
+                        request: call.call.request.get(),
+                        index: call.call.index,
+                        tool: call.name.clone(),
+                        argv: admission.arguments.as_str().to_owned(),
+                    });
                 }
             }
         }
-        turns.push(json!({"job":super::job_json(record)?, "entries":entries.iter().map(|(seq, entry)| entry_json(*seq, entry)).collect::<Vec<_>>(), "configuration": configuration, "outputs":outputs.iter().map(super::output_json).collect::<Vec<_>>(), "uncertain_calls":uncertain, "outputs_truncated":outputs_truncated}));
+        turns.push(WireTurn {
+            job: super::projection::job_view(record)?,
+            entries: entries
+                .iter()
+                .map(|(seq, entry)| entry_json(*seq, entry))
+                .collect(),
+            configuration,
+            outputs: outputs.iter().map(super::projection::output_view).collect(),
+            uncertain_calls: uncertain,
+            outputs_truncated,
+        });
     }
-    Ok(Reply::ok(
-        json!({"api_version":API_VERSION,"conversation":conversation.to_string(),"turns":turns,"has_more":has_more,"next_before":if has_more { records.get(limit.saturating_sub(1)).map(|record| record.id.to_string()) } else {None}}),
-    ))
+    Ok(Reply::ok(envelope(WireTurns {
+        conversation: conversation.to_string(),
+        turns,
+        has_more,
+        next_before: if has_more {
+            records
+                .get(limit.saturating_sub(1))
+                .map(|record| record.id.to_string())
+        } else {
+            None
+        },
+    })))
 }
 pub(super) async fn conversation_notices(
     database: &DatabaseHandle,
@@ -456,14 +505,44 @@ pub(super) async fn conversation_notices(
         ));
     }
     let records = database.notices(conversation, after, limit + 1).await?;
-    let notices = records.iter().take(limit).map(|(seq, notice)| {
-        use crate::persistence::{NoticeClass, NoticeBody};
-        let body = match &notice.body { NoticeBody::Event {child,event,reference} => json!({"child":child.to_string(),"event":format!("{event:?}"),"reference":reference.to_string()}), NoticeBody::Record {event,by,at} => json!({"event":format!("{event:?}").to_lowercase(),"by":actor_json(by),"at_us":at.as_unix_micros()}) };
-        json!({"seq":seq,"class":match notice.class {NoticeClass::Attention=>"attention",NoticeClass::Progress=>"progress",NoticeClass::Record=>"record"},"body":body})
-    }).collect::<Vec<_>>();
-    Ok(Reply::ok(
-        json!({"api_version":API_VERSION,"conversation":conversation.to_string(),"notices":notices,"has_more":records.len()>limit}),
-    ))
+    let notices = records
+        .iter()
+        .take(limit)
+        .map(|(seq, notice)| {
+            use crate::persistence::{NoticeBody, NoticeClass};
+            let body = match &notice.body {
+                NoticeBody::Event {
+                    child,
+                    event,
+                    reference,
+                } => WireNoticeBody::Event {
+                    child: child.to_string(),
+                    event: format!("{event:?}"),
+                    reference: reference.to_string(),
+                },
+                NoticeBody::Record { event, by, at } => WireNoticeBody::Record {
+                    event: format!("{event:?}").to_lowercase(),
+                    by: actor_view(by),
+                    at_us: at.as_unix_micros(),
+                },
+            };
+            WireNotice {
+                seq: *seq,
+                class: match notice.class {
+                    NoticeClass::Attention => "attention",
+                    NoticeClass::Progress => "progress",
+                    NoticeClass::Record => "record",
+                }
+                .to_owned(),
+                body,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Reply::ok(envelope(WireNotices {
+        conversation: conversation.to_string(),
+        notices,
+        has_more: records.len() > limit,
+    })))
 }
 
 fn capability(capability: ModelCapability) -> &'static str {
@@ -511,47 +590,35 @@ pub(super) async fn agent_profiles(
                 return Err(INCONSISTENT_RECORD);
             };
             let executors = database.compatible_executors((*target).into()).await?;
-            llm_targets.push(json!({
-                "id": ProfileId::from(llm.id).to_string(),
-                "name": llm.name,
-                "model": model.model,
-                "context_window": model.context_window,
-                "parameters": {
-                    "temperature": model.parameters.temperature,
-                    "top_p": model.parameters.top_p,
-                    "max_tokens": model.parameters.max_tokens,
-                    "reasoning_effort": model.parameters.reasoning_effort,
-                    "max_completion_tokens": model.parameters.max_completion_tokens,
-                    "presence_penalty": model.parameters.presence_penalty,
-                    "frequency_penalty": model.parameters.frequency_penalty,
-                },
-                "declared_capabilities": model
+            llm_targets.push(WireLlmTarget {
+                id: ProfileId::from(llm.id).to_string(),
+                name: llm.name,
+                model: model.model,
+                context_window: model.context_window,
+                parameters: WireLlmParameters::from_parameters(&model.parameters),
+                declared_capabilities: model
                     .declared_capabilities
                     .iter()
-                    .map(|declared| capability(*declared))
-                    .collect::<Vec<_>>(),
-                "executors": executors
-                    .iter()
-                    .map(|executor| executor.to_string())
-                    .collect::<Vec<_>>(),
-            }));
+                    .map(|declared| capability(*declared).to_owned())
+                    .collect(),
+                executors: executors.iter().map(ToString::to_string).collect(),
+            });
         }
-        agent_profiles.push(json!({
-            "id": ProfileId::from(record.id).to_string(),
-            "name": record.name,
-            "tool_grant": agent.tool_grant,
-            "llm_targets": llm_targets,
-        }));
+        agent_profiles.push(WireAgentProfile {
+            id: ProfileId::from(record.id).to_string(),
+            name: record.name,
+            tool_grant: agent.tool_grant,
+            llm_targets,
+        });
     }
     Ok(Reply::ok(page(agent_profiles, next_before)))
 }
 
-fn page(agent_profiles: Vec<Value>, next_before: Option<String>) -> Value {
-    json!({
-        "api_version": API_VERSION,
-        "agent_profiles": agent_profiles,
-        "has_more": next_before.is_some(),
-        "next_before": next_before,
+fn page(agent_profiles: Vec<WireAgentProfile>, next_before: Option<String>) -> Value {
+    envelope(WireAgentProfiles {
+        agent_profiles,
+        has_more: next_before.is_some(),
+        next_before,
     })
 }
 
@@ -565,25 +632,22 @@ pub(super) async fn conversations(
     let items = page
         .conversations
         .into_iter()
-        .map(|c| {
-            json!({
-                "root_job": c.root_job.to_string(),
-                "tip_job": c.tip_job.to_string(),
-                "agent": c.agent.map(|agent| ProfileId::from(agent).to_string()),
-                "title": c.title,
-                "project": c.project.map(|project| project.to_string()),
-                "state": c.state,
-                "on_hold": c.on_hold.as_ref().map(|by| json!({"by": actor_json(by)})),
-                "tip_settlement_state": c.tip_settlement_state,
-                "tip_created_at_us": c.tip_created_at.as_unix_micros(),
-            })
+        .map(|c| WireConversation {
+            root_job: c.root_job.to_string(),
+            tip_job: c.tip_job.to_string(),
+            agent: c.agent.map(|id| ProfileId::from(id).to_string()),
+            title: c.title,
+            project: c.project.map(|id| id.to_string()),
+            state: c.state.to_owned(),
+            on_hold: c.on_hold.as_ref().map(|by| WireHold { by: actor_view(by) }),
+            tip_settlement_state: c.tip_settlement_state.to_owned(),
+            tip_created_at_us: c.tip_created_at.as_unix_micros(),
         })
         .collect::<Vec<_>>();
-    Ok(Reply::ok(json!({
-        "api_version": API_VERSION,
-        "conversations": items,
-        "has_more": page.has_more,
-        "next_before": page.next_before.map(|j| j.to_string()),
+    Ok(Reply::ok(envelope(WireConversations {
+        conversations: items,
+        has_more: page.has_more,
+        next_before: page.next_before.map(|j| j.to_string()),
     })))
 }
 
@@ -619,9 +683,9 @@ pub(super) async fn edit_conversation(
             DatabaseError::Rejected(Violation::NotFound(RecordRef::Job(_))) => NOT_FOUND,
             other => profiles::map_mutation_error(other),
         })?;
-    Ok(Reply::ok(
-        json!({"api_version": API_VERSION, "conversation": root.to_string()}),
-    ))
+    Ok(Reply::ok(envelope(WireConversationEdited {
+        conversation: root.to_string(),
+    })))
 }
 
 #[cfg(test)]

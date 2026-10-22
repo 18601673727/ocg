@@ -165,7 +165,8 @@ pub(crate) fn read_job(database: &Database, id: JobId) -> Result<Option<JobRecor
         .transpose()
 }
 
-#[derive(serde::Serialize, Default)]
+#[derive(serde::Serialize, ts_rs::TS, Default)]
+#[ts(rename = "WireJobUsage")]
 pub(crate) struct JobUsage {
     requests: u64,
     complete_requests: u64,

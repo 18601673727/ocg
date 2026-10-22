@@ -1,3 +1,4 @@
+use super::contracts::*;
 use super::*;
 
 /// What the host can establish: it runs, as the listener answers only
@@ -15,12 +16,10 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
     let quarantined = match database.unresolved_executions().await {
         Ok(unresolved) => unresolved
             .into_iter()
-            .map(|(job, execution)| {
-                json!({
-                    "job": job.to_string(),
-                    "pool": execution.pool.map(|pool| pool.to_string()),
-                    "since": execution.unresolved_at.as_unix_micros(),
-                })
+            .map(|(job, execution)| WireQuarantined {
+                job: job.to_string(),
+                pool: execution.pool.map(|pool| pool.to_string()),
+                since: execution.unresolved_at.as_unix_micros(),
             })
             .collect::<Vec<_>>(),
         Err(error) => {
@@ -28,105 +27,108 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             Vec::new()
         }
     };
-    json!({
-        "api_version": API_VERSION,
-        "host": "running",
-        "database": {
-            "status": status,
-            "accepting_commands": status == "open",
-            "readable": readable,
-            "database_bytes": vitals.database_bytes,
-            "available_bytes": vitals.available_bytes,
-            "durable_commits": vitals.durable_commits,
-            "commit_us_mean": vitals.commit_us_mean,
-            "commit_us_max": vitals.commit_us_max,
+    envelope(WireHealth {
+        host: "running".to_owned(),
+        database: WireDatabaseHealth {
+            status: status.to_owned(),
+            accepting_commands: status == "open",
+            readable,
+            database_bytes: vitals.database_bytes,
+            available_bytes: vitals.available_bytes,
+            durable_commits: vitals.durable_commits,
+            commit_us_mean: vitals.commit_us_mean,
+            commit_us_max: vitals.commit_us_max,
         },
-        "claims": {
-            "count": vitals.claims_count,
-            "mean_us": vitals.claim_us_mean,
-            "max_us": vitals.claim_us_max,
+        claims: WireClaims {
+            count: vitals.claims_count,
+            mean_us: vitals.claim_us_mean,
+            max_us: vitals.claim_us_max,
         },
-        "queue": {
-            "pending": vitals.queue_pending,
-            "ready": vitals.queue_ready,
-            "delayed": vitals.queue_delayed,
-            "commands_waiting": vitals.commands_waiting,
+        queue: WireQueue {
+            pending: vitals.queue_pending,
+            ready: vitals.queue_ready,
+            delayed: vitals.queue_delayed,
+            commands_waiting: vitals.commands_waiting,
         },
-        "process": {
-            "rss_bytes": vitals.rss_bytes,
-            "peak_rss_bytes": vitals.peak_rss_bytes,
+        process: WireProcess {
+            rss_bytes: vitals.rss_bytes,
+            peak_rss_bytes: vitals.peak_rss_bytes,
         },
-        "quarantined": quarantined,
+        quarantined,
     })
-}
-
-pub(super) fn micros(timestamp: Option<crate::persistence::Timestamp>) -> Value {
-    timestamp.map_or(Value::Null, |timestamp| json!(timestamp.as_unix_micros()))
 }
 
 /// The Job's settlement: the one outcome its record holds, or none yet; a
 /// record holding more than one is not described at all.
-pub(super) fn settlement_json(record: &JobRecord) -> Result<Value, Refusal> {
+pub(super) fn settlement_view(record: &JobRecord) -> Result<WireSettlement, Refusal> {
     let outcomes = [
-        ("completed", record.completed_at),
-        ("failed", record.failed_at),
-        ("cancelled", record.cancelled_at),
-        ("unknown", record.unknown_at),
+        (WireSettlementState::Completed, record.completed_at),
+        (WireSettlementState::Failed, record.failed_at),
+        (WireSettlementState::Cancelled, record.cancelled_at),
+        (WireSettlementState::Unknown, record.unknown_at),
     ]
     .into_iter()
     .filter_map(|(state, at)| at.map(|at| (state, at)))
     .collect::<Vec<_>>();
-    match outcomes.as_slice() {
-        [] => Ok(json!({"state": "unsettled", "settled_at_us": null})),
-        [(state, at)] => Ok(json!({"state": state, "settled_at_us": at.as_unix_micros()})),
-        _ => Err(INCONSISTENT_RECORD),
-    }
-}
-
-/// The Job's lifecycle as recorded, with its [`settlement_json`].
-pub(super) fn job_json(record: &JobRecord) -> Result<Value, Refusal> {
-    let settlement = settlement_json(record)?;
-    let is_chat = record.conversation.is_some();
-    Ok(json!({
-        "id": record.id.to_string(),
-        "name": record.name,
-        "title": record.objective.as_deref(),
-        "is_chat": is_chat,
-        "execution_mode": "once",
-        "input": record.input.to_string(),
-        "previous": record.previous.map(|previous| previous.to_string()),
-        "kind": if record.kind.is_conversation() { "conversation" } else { "turn" },
-        "conversation": record.conversation.map(|conversation| conversation.to_string()),
-        "assigned_executor": record.assigned_executor.map(|executor| executor.to_string()),
-        "created_at_us": record.created_at.as_unix_micros(),
-        "updated_at_us": record.updated_at.as_unix_micros(),
-        "started_at_us": micros(record.started_at),
-        "paused_at_us": null,
-        "sterilized_at_us": micros(record.children_closed_at),
-        "settlement": settlement,
-        // Recorded only for an Unknown Job whose local execution was
-        // confirmed stopped; it says nothing about the Provider.
-        "stop_confirmed_at_us": micros(record.stop_confirmed_at),
-    }))
-}
-
-pub(super) fn output_json(record: &JobOutputRecord) -> Value {
-    let kind = match record.kind {
-        OutputKind::Progress => "progress",
-        OutputKind::Evaluation => "evaluation",
-        OutputKind::Result => "result",
-        OutputKind::Reasoning => "reasoning",
+    let mut outcomes = outcomes.into_iter();
+    let value = match outcomes.next() {
+        None => WireSettlement {
+            state: WireSettlementState::Unsettled,
+            settled_at_us: None,
+        },
+        Some((state, at)) => WireSettlement {
+            state,
+            settled_at_us: Some(at.as_unix_micros()),
+        },
     };
-    json!({
-        "id": record.id.to_string(),
-        "seq": record.seq,
-        "kind": kind,
-        "summary": record.summary,
-        "code": record.code,
-        "goal_reached": record.goal_reached,
-        "value": record.value,
-        "created_at_us": record.created_at.as_unix_micros(),
+    if outcomes.next().is_some() {
+        return Err(INCONSISTENT_RECORD);
+    }
+    Ok(value)
+}
+
+pub(super) fn job_view(record: &JobRecord) -> Result<WireJob, Refusal> {
+    Ok(WireJob {
+        id: record.id.to_string(),
+        name: record.name.clone(),
+        title: record.objective.clone(),
+        is_chat: record.conversation.is_some(),
+        execution_mode: "once".to_owned(),
+        input: record.input.to_string(),
+        previous: record.previous.map(|id| id.to_string()),
+        kind: if record.kind.is_conversation() {
+            WireJobKind::Conversation
+        } else {
+            WireJobKind::Turn
+        },
+        conversation: record.conversation.map(|id| id.to_string()),
+        assigned_executor: record.assigned_executor.map(|id| id.to_string()),
+        created_at_us: record.created_at.as_unix_micros(),
+        updated_at_us: record.updated_at.as_unix_micros(),
+        started_at_us: record.started_at.map(|at| at.as_unix_micros()),
+        paused_at_us: None,
+        sterilized_at_us: record.children_closed_at.map(|at| at.as_unix_micros()),
+        settlement: settlement_view(record)?,
+        stop_confirmed_at_us: record.stop_confirmed_at.map(|at| at.as_unix_micros()),
     })
+}
+
+pub(super) fn output_view(record: &JobOutputRecord) -> WireOutput {
+    WireOutput {
+        id: record.id.to_string(),
+        seq: record.seq,
+        kind: match record.kind {
+            OutputKind::Progress => WireOutputKind::Progress,
+            OutputKind::Evaluation => WireOutputKind::Evaluation,
+            OutputKind::Result => WireOutputKind::Result,
+            OutputKind::Reasoning => WireOutputKind::Reasoning,
+        },
+        summary: record.summary.clone(),
+        code: record.code.clone(),
+        goal_reached: record.goal_reached,
+        value: record.value.clone().unwrap_or(Value::Null),
+        created_at_us: record.created_at.as_unix_micros(),
+    }
 }
 
 /// A page of the Job's outputs, exactly as stored and in `seq` order: as
@@ -145,14 +147,13 @@ pub(super) async fn outputs(
         return Err(JOB_NOT_FOUND);
     }
     let records = database.job_outputs(job, after_seq, limit + 1).await?;
-    let envelope = |outputs: Vec<Value>, next: Option<i64>, more: bool| {
-        json!({
-            "api_version": API_VERSION,
-            "job": job.to_string(),
-            "after_seq": after_seq,
-            "outputs": outputs,
-            "next_after_seq": next,
-            "has_more": more,
+    let envelope = |outputs: Vec<WireOutput>, next: Option<i64>, more: bool| {
+        envelope(WireOutputs {
+            job: job.to_string(),
+            after_seq,
+            outputs,
+            next_after_seq: next,
+            has_more: more,
         })
     };
     let mut size = envelope(Vec::new(), Some(i64::MIN), true).to_string().len();
@@ -160,8 +161,8 @@ pub(super) async fn outputs(
     let mut next = after_seq;
     let mut more = records.len() > limit;
     for record in records.iter().take(limit) {
-        let output = output_json(record);
-        let cost = output.to_string().len() + 1;
+        let output = output_view(record);
+        let cost = json!(output).to_string().len() + 1;
         if size + cost > shared.response_bytes {
             if page.is_empty() {
                 return Err(OUTPUT_TOO_LARGE);
@@ -224,7 +225,7 @@ pub(super) fn tools_query(query: &str) -> Result<(Option<(RequestNumber, u32)>, 
     Ok((after, limit.unwrap_or(50)))
 }
 
-pub(super) fn tool_json(record: &ToolEvidenceRecord) -> Value {
+fn tool_view(record: &ToolEvidenceRecord) -> WireToolCall {
     let decision = match &record.decision.fact {
         ToolDecision::Admitted(_) => "admitted",
         ToolDecision::AwaitingApproval(_) => "awaiting_approval",
@@ -266,25 +267,30 @@ pub(super) fn tool_json(record: &ToolEvidenceRecord) -> Value {
         None => (None, false),
     };
     let outcome_kind = record.outcome.as_ref().map(|o| match o.fact.kind() {
-        ToolOutcomeKind::Completed => "completed",
-        ToolOutcomeKind::CompletedWithheld => "completed_withheld",
-        ToolOutcomeKind::NotApplied => "not_applied",
-        ToolOutcomeKind::NotInvoked => "not_invoked",
-        ToolOutcomeKind::Uncertain => "uncertain",
+        ToolOutcomeKind::Completed => WireToolOutcomeKind::Completed,
+        ToolOutcomeKind::CompletedWithheld => WireToolOutcomeKind::CompletedWithheld,
+        ToolOutcomeKind::NotApplied => WireToolOutcomeKind::NotApplied,
+        ToolOutcomeKind::NotInvoked => WireToolOutcomeKind::NotInvoked,
+        ToolOutcomeKind::Uncertain => WireToolOutcomeKind::Uncertain,
     });
 
-    json!({
-        "tool_call_id": record.tool_call_id,
-        "request": record.call.request.get(),
-        "index": record.call.index,
-        "name": record.name,
-        "decision": decision,
-        "outcome_kind": outcome_kind,
-        "arguments": arguments,
-        "arguments_cut": arguments_cut,
-        "result": result,
-        "result_cut": result_cut,
-    })
+    WireToolCall {
+        tool_call_id: record.tool_call_id.clone(),
+        request: record.call.request.get(),
+        index: record.call.index,
+        name: record.name.clone(),
+        decision: decision.to_owned(),
+        outcome_kind,
+        arguments: arguments.map(str::to_owned),
+        arguments_cut,
+        result: result.map(str::to_owned),
+        result_cut,
+    }
+}
+
+#[cfg(test)]
+fn tool_json(record: &ToolEvidenceRecord) -> Value {
+    json!(tool_view(record))
 }
 
 pub(super) async fn tools(
@@ -299,14 +305,13 @@ pub(super) async fn tools(
     }
     let records = database.tool_evidence(job, after, limit + 1).await?;
     let after_cursor = after.map(|(req, idx)| format!("{}:{}", req.get(), idx));
-    let envelope = |page: Vec<Value>, next: Option<(RequestNumber, u32)>, more: bool| {
-        json!({
-            "api_version": API_VERSION,
-            "job": job.to_string(),
-            "after": after_cursor,
-            "tools": page,
-            "next_after": next.map(|(req, idx)| format!("{}:{}", req.get(), idx)),
-            "has_more": more,
+    let envelope = |page: Vec<WireToolCall>, next: Option<(RequestNumber, u32)>, more: bool| {
+        envelope(WireTools {
+            job: job.to_string(),
+            after: after_cursor.clone(),
+            tools: page,
+            next_after: next.map(|(req, idx)| format!("{}:{}", req.get(), idx)),
+            has_more: more,
         })
     };
     let mut size = envelope(Vec::new(), None, true).to_string().len();
@@ -314,8 +319,8 @@ pub(super) async fn tools(
     let mut next = None;
     let mut more = records.len() > limit;
     for record in records.iter().take(limit) {
-        let tool = tool_json(record);
-        let cost = tool.to_string().len() + 1;
+        let tool = tool_view(record);
+        let cost = json!(tool).to_string().len() + 1;
         if size + cost > shared.response_bytes {
             if page.is_empty() {
                 return Err(OUTPUT_TOO_LARGE);

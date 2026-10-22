@@ -4,10 +4,12 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "pnpm contracts:check && next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "node scripts/test.mjs"
+    "test": "pnpm contracts:check && node scripts/test.mjs",
+    "contracts": "cargo run --locked --quiet --bin ocg-rs-ts",
+    "contracts:check": "cargo run --locked --quiet --bin ocg-rs-ts -- --check"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.15.28",

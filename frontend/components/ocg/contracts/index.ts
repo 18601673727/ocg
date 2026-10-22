@@ -1,14 +1,4 @@
-/**
- * The generated wire contract and its runtime decoders.
- *
- * Rust owns the control protocol: `src/contracts.rs` declares every struct
- * that crosses the loopback boundary and `cargo run --bin ocg-rs-ts` projects
- * it into `./generated`. Nothing in the PWA hand-maintains a mirror of a Rust
- * struct, and `tests/contracts.rs` fails if the projection drifts.
- *
- * Frontend code should import from here rather than from `./generated`
- * directly, so the types and the decoders that check them stay together.
- */
+/** Import frontend view models and checked Control Plane projections here. */
 
 export type {
   AuthenticationMode,
@@ -65,9 +55,9 @@ export type {
   Provider,
   ProviderProtocol,
   RecursiveLimits,
-} from "./generated";
+} from "./view-models";
 
-export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./generated";
+export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./view-models";
 
 export { ContractError, decode } from "./decode";
 export type { DecodeResult, Decoder } from "./decode";
@@ -87,11 +77,12 @@ export type {
   CanonicalJobState,
 } from "./canonical-decode";
 
-export type { UsageQuantity, UsageTokenTotals, UsageCurrencyCost, UsageCost, ContextCostTotals, UsageTotals, UsageBreakdown, UsageConversationRow, ProjectUsageResponse, ConversationUsageResponse, JobUsageResponse, UsageCompleteness, UsageWindow, UsageCostSource } from "./generated";
+export type { UsageQuantity, UsageTokenTotals, UsageCurrencyCost, UsageCost, ContextCostTotals, UsageTotals, UsageBreakdown, UsageConversationRow, ProjectUsageResponse, ConversationUsageResponse, JobUsageResponse, UsageCompleteness, UsageWindow, UsageCostSource } from "./view-models";
 
 export * from "./control-plane";
+export { CONTROL_API_VERSION } from "./generated";
 
-export type ChatModelSelection = import("./generated").ChatModelSelection & {
+export type ChatModelSelection = import("./view-models").ChatModelSelection & {
   agentProfile?: string;
   llmProfile?: string;
   executor?: string;

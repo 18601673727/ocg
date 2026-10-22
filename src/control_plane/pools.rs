@@ -9,11 +9,11 @@
 
 use std::num::NonZeroU32;
 
+use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
-use serde_json::{Value, json};
 
-use super::{API_VERSION, INVALID_REQUEST, Refusal, Reply, decimal, profiles};
+use super::{INVALID_REQUEST, Refusal, Reply, decimal, profiles};
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{ExecutionPool, ExecutionPoolId, Violation};
 use crate::storage::MAX_PAGE;
@@ -38,13 +38,13 @@ pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
         .ok_or(INVALID_REQUEST)
 }
 
-fn pool_json(pool: &ExecutionPool) -> Value {
-    json!({
-        "id": pool.id.to_string(),
-        "name": pool.name,
-        "concurrency_limit": pool.config.concurrency_limit,
-        "enabled": pool.enabled,
-    })
+fn pool_json(pool: &ExecutionPool) -> WirePool {
+    WirePool {
+        id: pool.id.to_string(),
+        name: pool.name.clone(),
+        concurrency_limit: pool.config.concurrency_limit.get(),
+        enabled: pool.enabled,
+    }
 }
 
 pub(super) async fn list(database: &DatabaseHandle) -> Result<Reply, Refusal> {
@@ -59,9 +59,7 @@ pub(super) async fn list(database: &DatabaseHandle) -> Result<Reply, Refusal> {
             break;
         }
     }
-    Ok(Reply::ok(
-        json!({"api_version": API_VERSION, "pools": pools}),
-    ))
+    Ok(Reply::ok(envelope(WirePools { pools })))
 }
 
 fn refusal(error: DatabaseError) -> Refusal {
@@ -101,7 +99,7 @@ pub(super) async fn update(
         _ => return Err(INVALID_REQUEST),
     }
     let pool = database.execution_pool(id).await?.ok_or(POOL_NOT_FOUND)?;
-    Ok(Reply::ok(
-        json!({"api_version": API_VERSION, "pool": pool_json(&pool)}),
-    ))
+    Ok(Reply::ok(envelope(WirePoolAnswer {
+        pool: pool_json(&pool),
+    })))
 }

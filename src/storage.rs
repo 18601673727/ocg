@@ -90,8 +90,6 @@ pub(crate) use observations::{
 use open::allocate;
 pub(crate) use open::{OpenError, OpenedFile, database_file, open};
 pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pending_snapshot};
-#[allow(unused_imports)]
-pub(crate) use reads::ConversationEntry;
 use reads::read;
 #[cfg(test)]
 pub(crate) use reads::record_attachment_cleanup;
@@ -99,6 +97,8 @@ pub(crate) use reads::{
     ChildConversationEntry, ConversationsPage, read_approved_calls, read_cards,
     read_conversation_children, read_has_decider,
 };
+#[allow(unused_imports)]
+pub(crate) use reads::{ConversationEntry, JobUsage};
 pub(crate) use reads::{
     JobDetails, JobTree, TreeFacts, TreeNode, UnresolvedExecution, content_available,
     probe_committed, queue_counts, read_attachment, read_attachment_inputs, read_attachments,
