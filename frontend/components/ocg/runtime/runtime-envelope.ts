@@ -461,6 +461,7 @@ export function validateChatMessageValue(message: unknown): string | null {
     return `Unknown message status "${String(message.status)}".`;
   }
   if (typeof message.content !== "string") return "message.content must be a string.";
+  if (message.intermediate !== undefined && typeof message.intermediate !== "boolean") return "message.intermediate must be a boolean.";
   if (typeof message.createdAt !== "string") return "message.createdAt must be a string.";
   if (
     message.images !== undefined &&

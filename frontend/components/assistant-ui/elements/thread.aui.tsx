@@ -647,6 +647,7 @@ const AssistantMessage: FC = () => {
   const latestReasoningIndex = useLatestReasoningIndex();
   const messageParts = useAuiState((s) => s.message.parts);
   const unsettled = useAuiState((s) => s.message.status?.type === "running");
+  const intermediate = useAuiState((s) => s.message.metadata.custom.intermediate === true);
   const storedReasoningDuration = useAuiState((s) => {
     const value = s.message.metadata.custom.reasoningDurationMs;
     return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value / 1000 : undefined;
@@ -667,11 +668,12 @@ const AssistantMessage: FC = () => {
     <MessagePrimitive.Root
       data-slot="aui_assistant-message-root"
       data-role="assistant"
+      data-intermediate={intermediate || undefined}
       className="fade-in slide-in-from-bottom-1 animate-in relative -mb-7.5 pb-7.5 duration-150 [contain-intrinsic-size:auto_200px] [content-visibility:auto]"
     >
       <div
         data-slot="aui_assistant-message-content"
-        className="text-foreground px-2 leading-relaxed wrap-break-word"
+        className={cn("px-2 leading-relaxed wrap-break-word", intermediate ? "text-sm text-muted-foreground" : "text-foreground")}
       >
           <MessagePrimitive.GroupedParts groupBy={groupBy}>
             {({ part, children }) => {
@@ -761,13 +763,13 @@ const AssistantMessage: FC = () => {
           )}
       </div>
 
-      <div
+      {!intermediate && <div
         data-slot="aui_assistant-message-footer"
         className={cn("ms-2 flex items-center", ACTION_BAR_HEIGHT)}
       >
         <BranchPicker />
         <AssistantActionBar />
-      </div>
+      </div>}
     </MessagePrimitive.Root>
   );
 };

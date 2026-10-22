@@ -1593,6 +1593,16 @@ impl DatabaseHandle {
         .await
     }
 
+    pub(crate) async fn provider_responses(
+        &self,
+        job: JobId,
+        after: Option<RequestNumber>,
+        limit: usize,
+    ) -> Result<Vec<storage::ProviderResponse>, DatabaseError> {
+        self.read(move |database| storage::read_provider_responses(database, job, after, limit))
+            .await
+    }
+
     pub async fn provider_request(
         &self,
         job: JobId,

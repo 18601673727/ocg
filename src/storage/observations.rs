@@ -572,6 +572,62 @@ pub(crate) fn read_observed_models(
     })
 }
 
+pub(crate) struct ProviderResponse {
+    pub request: RequestNumber,
+    pub text: String,
+    pub requests_tools: bool,
+    pub recorded_at: Timestamp,
+}
+
+pub(crate) fn read_provider_responses(
+    database: &Database,
+    job: JobId,
+    after: Option<RequestNumber>,
+    limit: usize,
+) -> Result<Vec<ProviderResponse>, StorageError> {
+    let rx = read(database)?;
+    let events = rx.open_table(REQUEST_EVENTS)?;
+    let messages = rx.open_table(MESSAGES)?;
+    let bounds = (
+        Bound::Excluded((job.get(), after.map_or(0, RequestNumber::get), u32::MAX)),
+        Bound::Included((job.get(), u32::MAX, u32::MAX)),
+    );
+    let mut responses = Vec::new();
+    for entry in events.range(bounds)? {
+        if responses.len() == limit {
+            break;
+        }
+        let (key, bytes) = entry?;
+        let (_, number, seq) = key.value();
+        let request = RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("zero request number"))?;
+        let event = decode_request_event(job, request, seq, bytes.value())?;
+        let RequestPayload::Received { digest } = event.payload else {
+            continue;
+        };
+        let body = messages
+            .get(digest.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
+        let message: serde_json::Value = serde_json::from_slice(body.value())
+            .map_err(|error| StorageError::corrupted(format!("invalid response JSON: {error}")))?;
+        let text = match message.get("content") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(_) => return Err(StorageError::corrupted("response content is not text")),
+        };
+        responses.push(ProviderResponse {
+            request,
+            text,
+            requests_tools: message
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| !calls.is_empty()),
+            recorded_at: event.recorded_at,
+        });
+    }
+    Ok(responses)
+}
+
 pub(crate) fn read_provider_request(
     database: &Database,
     job: JobId,

@@ -38,6 +38,11 @@ pub(super) enum Route {
         limit: usize,
     },
     ProviderRequest(JobId, RequestNumber),
+    ProviderResponses {
+        job: JobId,
+        after: Option<RequestNumber>,
+        limit: usize,
+    },
     AgentProfiles {
         before: Option<ProfileId>,
         limit: usize,
@@ -116,6 +121,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ConversationTurns { .. }
             | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
+            | Route::ProviderResponses { .. }
             | Route::Tools { .. }
             | Route::JobTree { .. }
             | Route::AgentProfiles { .. }
@@ -254,6 +260,11 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 .and_then(RequestNumber::new)
                 .ok_or(INVALID_REQUEST)?;
             no_query(query).map(|()| Route::ProviderRequest(job, request))
+        }
+        ["jobs", job, "responses"] => {
+            let job = job_id(job)?;
+            let (after, limit) = projection::responses_query(query)?;
+            Ok(Route::ProviderResponses { job, after, limit })
         }
         ["jobs", job, "input"] => {
             let job = job_id(job)?;
@@ -441,6 +452,11 @@ pub(super) async fn respond(
                 dropped_turns: record.dropped_turns,
                 response: record.response,
             })))
+        }
+        Route::ProviderResponses { job, after, limit } => {
+            projection::provider_responses(shared, job, after, limit)
+                .await
+                .map(Reply::ok)
         }
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await

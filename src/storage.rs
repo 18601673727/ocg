@@ -84,8 +84,8 @@ use codec::{
 #[cfg(test)]
 pub(crate) use derived::relationship_inconsistencies;
 pub(crate) use observations::{
-    read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
-    read_observed_models, read_provider_request,
+    ProviderResponse, read_availability_stats, read_job_availability, read_job_metrics,
+    read_metrics, read_observed_models, read_provider_request, read_provider_responses,
 };
 use open::allocate;
 pub(crate) use open::{OpenError, OpenedFile, database_file, open};

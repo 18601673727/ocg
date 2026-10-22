@@ -166,6 +166,33 @@ export type ControlJobEvent = ReturnType<typeof decodeJobEvent>;
 export type ControlJob = ReturnType<typeof jobRecord>;
 export type ControlOutput = ReturnType<typeof outputRecord>;
 
+export function decodeProviderResponses(input: unknown, jobId: string) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
+  const job = identity(envelope.job, "job", "job:");
+  if (job !== jobId) throw new ContractError("job", "the requested Job");
+  if (!Array.isArray(envelope.responses)) throw new ContractError("responses", "an array");
+  let previous = 0;
+  const responses = envelope.responses.map((input, index) => {
+    const value = record(input, `responses[${index}]`);
+    const request = integer(value.request, `responses[${index}].request`);
+    if (request <= previous || request > 0xffffffff) throw new ContractError("responses.request", "strictly increasing positive request numbers");
+    previous = request;
+    return {
+      request,
+      text: string(value.text, `responses[${index}].text`),
+      requests_tools: boolean(value.requests_tools, `responses[${index}].requests_tools`),
+      created_at_us: integer(value.created_at_us, `responses[${index}].created_at_us`),
+    } satisfies Wire.WireProviderResponse;
+  });
+  const has_more = boolean(envelope.has_more, "has_more");
+  const next_after = envelope.next_after === null ? null : integer(envelope.next_after, "next_after");
+  if (has_more ? !responses.length || next_after !== previous : next_after !== null) throw new ContractError("next_after", "the last request only when another page exists");
+  return { job, responses, next_after, has_more } satisfies Wire.WireProviderResponses;
+}
+
+export type ControlProviderResponse = ReturnType<typeof decodeProviderResponses>["responses"][number];
+
 /** What the host establishes about itself and its database, now. */
 export function decodeHealth(input: unknown) {
   const envelope = record(input, "response");

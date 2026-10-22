@@ -6214,6 +6214,40 @@ mod provider_record_tests {
                 })
                 .await
                 .expect("check rows");
+            let replies = handle
+                .provider_responses(job, None, 1)
+                .await
+                .expect("responses");
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].request.get(), 2, "Sent alone is not a reply");
+            assert_eq!(replies[0].text, "answer");
+            assert!(!replies[0].requests_tools);
+            handle.record_provider_answer(crate::persistence::NewProviderAnswer {
+                stat: NewAvailabilityStat {
+                    job, request: sink.request, observed_at: Timestamp::now(),
+                    observation: provider_execution::success_observation(&result),
+                },
+                measurements: provider_execution::metrics(&result),
+                response: crate::persistence::MessageBody::new(&json!({
+                    "role":"assistant", "content":null,
+                    "tool_calls":[{"id":"call-3", "type":"function", "function":{"name":"read", "arguments":"{}"}}]
+                })).expect("tool reply"),
+            }).await.expect("record tool reply");
+            let tail = handle
+                .provider_responses(job, Some(replies[0].request), 1)
+                .await
+                .expect("next page");
+            assert_eq!(tail.len(), 1);
+            assert_eq!(tail[0].request, sink.request);
+            assert!(tail[0].text.is_empty());
+            assert!(tail[0].requests_tools);
+            assert!(
+                handle
+                    .provider_responses(job, Some(sink.request), 1)
+                    .await
+                    .expect("end")
+                    .is_empty()
+            );
             worker.shutdown().expect("close");
             let worker = DatabaseWorker::start(&directory).expect("reopen");
             assert_eq!(
@@ -6224,6 +6258,15 @@ mod provider_record_tests {
                     .expect("read"),
                 Some(first)
             );
+            let restored = worker
+                .handle()
+                .provider_responses(job, None, 10)
+                .await
+                .expect("restored replies");
+            assert_eq!(restored.len(), 2);
+            assert_eq!(restored[0].text, replies[0].text);
+            assert_eq!(restored[1].request, tail[0].request);
+            assert_eq!(restored[1].recorded_at, tail[0].recorded_at);
             worker.shutdown().expect("close");
         });
     }
