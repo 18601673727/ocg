@@ -3707,6 +3707,33 @@ mod tests {
     }
 
     #[test]
+    fn delegated_conversations_keep_the_user_decider_beyond_default_depth() {
+        let fixture = Fixture::new("deep-decider");
+        let (root, _) = fixture.open();
+        wait(fixture.database.set_conversation(
+            root,
+            crate::persistence::ConversationEdit::Limits(ConversationLimits {
+                max_depth: 4,
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        let mut descendant = root;
+        for _ in 0..4 {
+            descendant = fixture.child(descendant, true).0;
+        }
+        assert_eq!(
+            wait(fixture.database.conversation_limits(descendant))
+                .unwrap()
+                .unwrap()
+                .1,
+            4
+        );
+        assert!(wait(fixture.database.has_decider(Some(descendant))).unwrap());
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn grandchild_card_carries_its_parent_and_disappears_after_decision() {
         use crate::persistence::ApprovalDecision;
         let fixture = Fixture::new("approval-grandchild");

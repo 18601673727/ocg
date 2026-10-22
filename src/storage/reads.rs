@@ -2437,7 +2437,7 @@ pub(super) fn has_decider(
     conversation: Option<JobId>,
 ) -> Result<bool, StorageError> {
     let mut current = conversation;
-    for _ in 0..=3 {
+    for _ in 0..=crate::persistence::MAX_CONVERSATION_DEPTH {
         let Some(id) = current else {
             return Ok(false);
         };
