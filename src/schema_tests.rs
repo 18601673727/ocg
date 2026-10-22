@@ -5964,7 +5964,9 @@ mod requests_and_tool_loop {
                     calling(&[add(0, "a", 1, 2)], (1, 1)),
                     calling(&[add(0, "b", 1, 2)], (1, 1)),
                 ],
-                ToolLoopStop::RequestLimit,
+                ToolLoopStop::RequestLimit {
+                    max_provider_requests: 2,
+                },
                 1,
             ),
             (
@@ -6128,7 +6130,12 @@ mod requests_and_tool_loop {
         );
         assert_eq!(looped.sent.len(), 2);
         let (_, stop) = stopped(looped);
-        assert_eq!(stop, ToolLoopStop::RequestLimit);
+        assert_eq!(
+            stop,
+            ToolLoopStop::RequestLimit {
+                max_provider_requests: 2
+            }
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let [record] = evidence(&handle, run.job).try_into().expect("one refusal");
         assert_eq!(
@@ -6625,7 +6632,12 @@ mod requests_and_tool_loop {
             "a response asking for tools sends no second request"
         );
         let (_, stop) = stopped(looped);
-        assert_eq!(stop, ToolLoopStop::RequestLimit);
+        assert_eq!(
+            stop,
+            ToolLoopStop::RequestLimit {
+                max_provider_requests: 1
+            }
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -17869,7 +17881,7 @@ mod requests_and_tool_loop {
         fn item_3_unified_tool_loop_limits_and_running_totals() {
             // Verify unified defaults
             let limits = ToolLoopLimits::default();
-            assert_eq!(limits.max_provider_requests, 64);
+            assert_eq!(limits.max_provider_requests, 256);
             assert_eq!(limits.max_tool_calls, 256);
             assert_eq!(limits.max_tool_result_bytes, 16 * 1024);
             assert_eq!(limits.max_tool_results_bytes, 1024 * 1024);

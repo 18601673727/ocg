@@ -135,7 +135,7 @@ impl ToolLoopLimits {
 impl Default for ToolLoopLimits {
     fn default() -> Self {
         Self {
-            max_provider_requests: 64,
+            max_provider_requests: 256,
             max_tool_calls: 256,
             max_tool_result_bytes: 16 * 1024,
             max_tool_results_bytes: 1024 * 1024,
@@ -151,9 +151,9 @@ pub enum ToolLoopStop {
     /// The limits cannot bound the execution, see
     /// [`ToolLoopLimits::validate`], so no Provider request was sent.
     InvalidLimits(ToolLimitsError),
-    /// The Provider requested tools in the last request the limits allow.
-    /// None of them ran.
-    RequestLimit,
+    /// The Provider requested tools after the last request the limits
+    /// allow. None of them ran.
+    RequestLimit { max_provider_requests: u32 },
     /// The calls of a response would exceed the call limit. None of them ran.
     CallLimit,
     /// A call was refused at dispatch: OCG did not offer it, it is no longer
@@ -209,9 +209,12 @@ impl std::fmt::Display for ToolLoopStop {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidLimits(error) => write!(formatter, "invalid tool loop limits: {error}"),
-            Self::RequestLimit => {
-                formatter.write_str("the Provider requested tools after the last allowed request")
-            }
+            Self::RequestLimit {
+                max_provider_requests,
+            } => write!(
+                formatter,
+                "the Provider requested tools after the tool loop's limit of {max_provider_requests} Provider requests; none of that round's calls ran"
+            ),
             Self::CallLimit => {
                 formatter.write_str("the requested tool calls exceed the call limit")
             }
@@ -3585,7 +3588,10 @@ async fn run_provider_job_inner(
                 )
                 .await
             }
-            Some(_) => Err(ToolLoopStop::RequestLimit.into()),
+            Some(tools) => Err(ToolLoopStop::RequestLimit {
+                max_provider_requests: tools.limits.max_provider_requests,
+            }
+            .into()),
             None => Err(ToolLoopStop::Refused(InvalidToolCall::new(
                 ToolCallRefusal::Unauthorized,
                 "the Provider requested tools that OCG did not offer",
@@ -3634,8 +3640,19 @@ async fn run_provider_job_inner(
             .await;
         }
         let Some(next) = next else {
-            return stop_tool_loop(run, sink, Some(&result), ToolLoopStop::RequestLimit.into())
-                .await;
+            let max_provider_requests = tools
+                .map(|tools| tools.limits.max_provider_requests)
+                .unwrap_or(0);
+            return stop_tool_loop(
+                run,
+                sink,
+                Some(&result),
+                ToolLoopStop::RequestLimit {
+                    max_provider_requests,
+                }
+                .into(),
+            )
+            .await;
         };
         conversation.messages.push(assistant);
         if let Some(digest) = sink.response_digest.take() {
