@@ -5,12 +5,13 @@
 //! A call names a command, never a command line. The built-in `cargo_check`
 //! runs `cargo check --all-targets` and `cargo_test` runs
 //! `cargo test --all-targets`; the Project adds commands of its own by name,
-//! each with the argument vector its owner stored. No other program,
-//! argument, flag, directory or variable can be chosen. The argument vector
-//! is never the call's, and the process is started directly, never through
-//! a shell. A bare program name is found on the PATH OCG itself was started
-//! with, among absolute entries only, so never in a path a call names or the
-//! Workspace provides by a relative entry; an absolute program path is used
+//! each with the base argument vector its owner stored. A call may append
+//! literal strings through its optional `arguments` array. It cannot replace
+//! the program, base arguments, directory or environment. The process is
+//! started directly, never through a shell. A bare program name is found on
+//! the PATH OCG itself was started with, among absolute entries only, so never
+//! in a path a call names or the Workspace provides by a relative entry; an
+//! absolute program path is used
 //! when it is an executable regular file. A program that is not found is
 //! refused before anything starts.
 //!
@@ -98,7 +99,10 @@ use crate::persistence::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef, 
 pub const TOOL_NAME: &str = "workspace_run_command";
 
 /// Identifies this handler's behavior in every call it records.
-const HANDLER_VERSION: &str = "workspace_run_command-6";
+const HANDLER_VERSION: &str = "workspace_run_command-7";
+
+const MAX_EXTRA_ARGUMENTS: usize = 64;
+const MAX_EXTRA_ARGUMENT_BYTES: usize = 4096;
 
 /// Longest a command may run before it is stopped.
 pub use super::job_tools::COMMAND_TIMEOUT;
@@ -117,14 +121,15 @@ pub const OUTPUT_BYTES: usize = 12 * 1024;
 pub const RESULT_BYTES: usize = 15 * 1024;
 
 /// The variables taken from OCG's own environment, when set: what locates
-/// the toolchain and its temporary files. PATH is taken too, reduced to its
-/// absolute entries.
+/// the toolchain, its temporary files and the SSH agent. PATH is taken too,
+/// reduced to its absolute entries.
 pub const PASSED_VARIABLES: &[&str] = &[
     "HOME",
     "TMPDIR",
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
+    "SSH_AUTH_SOCK",
 ];
 
 /// Variables every command gets.
@@ -167,7 +172,9 @@ impl Preset {
 /// Provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 enum Refusal {
-    #[error("the arguments do not name exactly one supported command")]
+    #[error(
+        "the arguments must name a supported command and an optional array of literal arguments"
+    )]
     InvalidArguments,
     #[error(transparent)]
     Path(#[from] PathRefusal),
@@ -246,12 +253,26 @@ impl Selected {
     }
 }
 
-/// The command a call names. The schema already allows nothing else; the
-/// arguments are checked again here, so nothing else can ever run.
+/// The command a call names, after checking its optional extra arguments.
 fn parse(arguments: &Value, commands: &[ProjectCommand]) -> Result<Selected, Refusal> {
     let object = arguments.as_object().ok_or(Refusal::InvalidArguments)?;
-    if object.len() != 1 {
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "command" | "arguments"))
+    {
         return Err(Refusal::InvalidArguments);
+    }
+    if let Some(extra) = object.get("arguments") {
+        let extra = extra.as_array().ok_or(Refusal::InvalidArguments)?;
+        if extra.len() > MAX_EXTRA_ARGUMENTS
+            || extra.iter().any(|argument| {
+                argument.as_str().is_none_or(|argument| {
+                    argument.len() > MAX_EXTRA_ARGUMENT_BYTES || argument.contains('\0')
+                })
+            })
+        {
+            return Err(Refusal::InvalidArguments);
+        }
     }
     let name = object
         .get("command")
@@ -828,7 +849,16 @@ impl RunCommand {
     fn invoke(&self, call: CommandCall, arguments: Value, start: ToolStart) -> ToolFuture<'_> {
         Box::pin(async move {
             let selected = parse(&arguments, &self.commands).map_err(Failure::from)?;
-            let invocation = self.prepare(&selected).map_err(Failure::from)?;
+            let mut invocation = self.prepare(&selected).map_err(Failure::from)?;
+            invocation.arguments.extend(
+                arguments
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            );
             let argv = std::iter::once(invocation.program.to_string_lossy().into_owned())
                 .chain(invocation.arguments.iter().cloned())
                 .collect::<Vec<_>>();
@@ -906,8 +936,8 @@ impl RunCommand {
     }
 }
 
-/// The parameters a call must match exactly: one command name, the built-in
-/// presets first, then the Project's.
+/// One command name and optional extra arguments. The names list the built-in
+/// presets first, then the Project's commands.
 fn parameters(commands: &[ProjectCommand]) -> Value {
     let names = Preset::ALL
         .map(Preset::name)
@@ -928,6 +958,12 @@ fn parameters(commands: &[ProjectCommand]) -> Value {
                 "type": "string",
                 "enum": names,
                 "description": description
+            },
+            "arguments": {
+                "type": "array",
+                "items": { "type": "string", "maxLength": MAX_EXTRA_ARGUMENT_BYTES },
+                "maxItems": MAX_EXTRA_ARGUMENTS,
+                "description": "Extra argv entries appended after the command's configured arguments. Each item is one literal argument, including any spaces; shell syntax is not interpreted."
             }
         },
         "required": ["command"],
@@ -948,7 +984,7 @@ pub(crate) fn register(
     registry.register(
         TOOL_NAME,
         Some(
-            "Run one of the Project's commands in the authorized Workspace root and return its argv, exit code, stdout, stderr, wall_ms, cpu_user_ms, cpu_system_ms and peak_rss_bytes. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. No other command, argument, directory or environment can be chosen.",
+            "Run one of the Project's commands in the authorized Workspace root, optionally appending literal entries from `arguments`, and return its argv, exit code, stdout, stderr, wall_ms, cpu_user_ms, cpu_system_ms and peak_rss_bytes. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. The command's executable, configured arguments, directory and environment cannot be replaced.",
         ),
         parameters(commands),
         Arc::new(RunCommand {
@@ -1308,6 +1344,71 @@ mod tests {
     }
 
     #[test]
+    fn commands_append_literal_arguments_and_record_the_resolved_argv() {
+        let setup = setup("extra-arguments", "printf '%s\\n' \"$@\"");
+        let program = setup.bin.join("cargo").display().to_string();
+        let commands = vec![ProjectCommand {
+            name: "print".into(),
+            argv: vec![program.clone(), "fixed argument".into()],
+        }];
+        let extra = [
+            "  spaces  ",
+            "",
+            "$(touch injected); & |",
+            "中文\nsecond line",
+        ];
+        let validator =
+            crate::openai_compatible::admission::compile_parameters(&parameters(&commands))
+                .expect("an enforceable schema");
+        for (command, base) in [
+            ("print", vec!["fixed argument"]),
+            ("cargo_test", vec!["test", "--all-targets"]),
+        ] {
+            let arguments = json!({"command": command, "arguments": extra});
+            assert!(validator.is_valid(&arguments));
+            let handler = RunCommand {
+                commands: commands.clone(),
+                ..setup.handler(WAIT)
+            };
+            let result = run(handler, arguments).expect("command completed");
+            let expected = base.into_iter().chain(extra).collect::<Vec<_>>();
+            assert_eq!(result["exit_code"], 0);
+            assert_eq!(result["stdout"], format!("{}\n", expected.join("\n")));
+            assert_eq!(
+                result["argv"],
+                json!(
+                    std::iter::once(program.as_str())
+                        .chain(expected)
+                        .collect::<Vec<_>>()
+                )
+            );
+        }
+        assert!(!setup.root.join("injected").exists());
+    }
+
+    #[test]
+    fn invalid_extra_arguments_start_nothing() {
+        let setup = setup("invalid-extra-arguments", "touch ran");
+        for extra in [
+            Value::Null,
+            json!("--short"),
+            json!([1]),
+            json!(["nul\0argument"]),
+            json!(["x".repeat(MAX_EXTRA_ARGUMENT_BYTES + 1)]),
+            json!(vec!["x"; MAX_EXTRA_ARGUMENTS + 1]),
+        ] {
+            assert_eq!(
+                run(
+                    setup.handler(WAIT),
+                    json!({"command": "cargo_test", "arguments": extra}),
+                ),
+                refused(Refusal::InvalidArguments)
+            );
+        }
+        assert!(!setup.ran(), "nothing was started");
+    }
+
+    #[test]
     fn a_command_invalidates_indexes_and_refresh_observes_indirect_writes() {
         use crate::orchestration::workspace_fts::{FtsLimits, WorkspaceFts};
         let setup = setup(
@@ -1411,7 +1512,7 @@ mod tests {
 
         let handler = setup.handler(COMMAND_TIMEOUT);
         assert_eq!(handler.effect(), ToolEffect::NonIdempotent);
-        assert_eq!(handler.version(), "workspace_run_command-6");
+        assert_eq!(handler.version(), "workspace_run_command-7");
         assert!(
             crate::persistence::ToolAdmission {
                 handler_version: handler.version().to_owned(),
@@ -1886,6 +1987,7 @@ mod tests {
             ("PATH", format!("{bin}:.:relative/bin:/usr/bin:/bin")),
             ("HOME", "/home/operator".to_owned()),
             ("TMPDIR", "/tmp/operator".to_owned()),
+            ("SSH_AUTH_SOCK", "/tmp/operator-agent.socket".to_owned()),
             ("COMMAND_CODE_API_KEY", "sk-secret-command-code".to_owned()),
             (
                 "OCG_PROVIDER_CREDENTIAL_REF",
@@ -1919,6 +2021,7 @@ mod tests {
                 ("PATH", path.as_str()),
                 ("HOME", "/home/operator"),
                 ("TMPDIR", "/tmp/operator"),
+                ("SSH_AUTH_SOCK", "/tmp/operator-agent.socket"),
                 ("CARGO_TERM_COLOR", "never"),
             ])
         );

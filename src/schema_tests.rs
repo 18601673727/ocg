@@ -9869,7 +9869,7 @@ mod requests_and_tool_loop {
                     (id, workspace_command::TOOL_NAME)
                 );
                 let admission = record.admission().expect("admitted");
-                assert_eq!(admission.handler_version, "workspace_run_command-6");
+                assert_eq!(admission.handler_version, "workspace_run_command-7");
                 assert_eq!(admission.effect, ToolEffect::NonIdempotent);
                 assert_eq!(admission.arguments.as_str(), r#"{"command":"cargo_test"}"#);
                 assert_eq!(
