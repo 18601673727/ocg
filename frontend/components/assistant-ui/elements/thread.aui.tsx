@@ -15,6 +15,8 @@ import {
   ReasoningRoot,
   ReasoningText,
   ReasoningTrigger,
+  useLatestReasoningIndex,
+  estimateReasoningTokens,
 } from "@/components/assistant-ui/elements/reasoning.aui";
 import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
 import {
@@ -71,7 +73,6 @@ import {
   type FC,
   type PropsWithChildren,
 } from "react";
-import { BoundedMessage } from "@/components/ocg/chat/bounded-message";
 import { useI18n } from "@/components/ocg/i18n";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
@@ -79,7 +80,7 @@ export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 const reasoningDuration = (timing: ThreadGroupPart["timing"]) =>
   timing?.completedAt === undefined
     ? undefined
-    : Math.round((timing.completedAt - timing.startedAt) / 1000);
+    : Math.max(0, (timing.completedAt - timing.startedAt) / 1000);
 
 /**
  * Optional component overrides for the thread. `AssistantMessage` and
@@ -215,13 +216,14 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
       }}
     >
       <ThreadPrimitive.Viewport
-        turnAnchor="top"
+        turnAnchor="bottom"
+        autoScroll
         data-slot="aui_thread-viewport"
         className="ocg-subtle-scrollbar relative flex flex-1 flex-col overflow-x-auto overflow-y-auto scroll-smooth"
       >
         <div
           className={cn(
-            "mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4",
+            "mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-16",
             isEmpty && "justify-center",
           )}
         >
@@ -245,7 +247,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
 
           <ThreadPrimitive.ViewportFooter
             className={cn(
-              "aui-thread-viewport-footer bg-background flex flex-col gap-4 overflow-visible pb-4 md:pb-6",
+              "aui-thread-viewport-footer pointer-events-none flex flex-col gap-4 overflow-visible bg-transparent pb-4 [&>*]:pointer-events-auto md:pb-6",
               !isEmpty &&
                 "sticky bottom-0 mt-auto rounded-t-(--composer-radius)",
             )}
@@ -641,15 +643,18 @@ const AssistantMessage: FC = () => {
     TaskGroup: TaskGroupComponent,
   } = useContext(ThreadComponentsContext);
   const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
+  const latestReasoningIndex = useLatestReasoningIndex();
+  const messageParts = useAuiState((s) => s.message.parts);
+  const unsettled = useAuiState((s) => s.message.status?.type === "running");
+  const storedReasoningDuration = useAuiState((s) => {
+    const value = s.message.metadata.custom.reasoningDurationMs;
+    return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value / 1000 : undefined;
+  });
   const { t } = useI18n();
   const failureReason = useAuiState((s) => {
     const value = s.message.metadata.custom.failureReason;
     return typeof value === "string" ? value : null;
   });
-  // Long assistant messages stay bounded and expandable on this surface too;
-  // the same presentation rule the legacy ChatView rows use.
-  const streaming = useAuiState((s) => s.message.status?.type === "running");
-
   const ACTION_BAR_PT = "pt-1.5";
   // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
   const ACTION_BAR_HEIGHT = `min-h-7.5 ${ACTION_BAR_PT}`;
@@ -664,7 +669,6 @@ const AssistantMessage: FC = () => {
         data-slot="aui_assistant-message-content"
         className="text-foreground px-2 leading-relaxed wrap-break-word"
       >
-        <BoundedMessage streaming={streaming}>
           <MessagePrimitive.GroupedParts groupBy={groupBy}>
             {({ part, children }) => {
               switch (part.type) {
@@ -684,7 +688,7 @@ const AssistantMessage: FC = () => {
                         count={part.indices.length}
                         active={part.status.type === "running"}
                       />
-                      <ToolGroupContent>{children}</ToolGroupContent>
+                      <ToolGroupContent streaming={part.status.type === "running"}>{children}</ToolGroupContent>
                     </ToolGroupRoot>
                   );
                 case "group-reasoning": {
@@ -695,12 +699,16 @@ const AssistantMessage: FC = () => {
                   }
                   const running = part.status.type === "running";
                   return (
-                    <ReasoningRoot streaming={running}>
+                    <ReasoningRoot streaming={running} latest={part.indices.includes(latestReasoningIndex)}>
                       <ReasoningTrigger
-                        active={running}
-                        duration={reasoningDuration(part.timing)}
+                        active={unsettled}
+                        duration={storedReasoningDuration ?? reasoningDuration(part.timing)}
+                        tokens={estimateReasoningTokens(part.indices.map(index => {
+                          const item = messageParts[index];
+                          return item?.type === "reasoning" ? item.text : "";
+                        }).join(""))}
                       />
-                      <ReasoningContent aria-busy={running}>
+                      <ReasoningContent streaming={running} aria-busy={running}>
                         <ReasoningText>{children}</ReasoningText>
                       </ReasoningContent>
                     </ReasoningRoot>
@@ -747,7 +755,6 @@ const AssistantMessage: FC = () => {
               {failureReason}
             </p>
           )}
-        </BoundedMessage>
       </div>
 
       <div
@@ -874,14 +881,9 @@ const UserMessage: FC = () => {
 
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
         <div className="aui-user-message-content peer bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word empty:hidden">
-          {/* A long user message stays bounded and expandable, exactly like an
-              assistant message. Attachments and the action bar live outside this
-              bubble, so they are unaffected by the bounded viewport. */}
-          <BoundedMessage streaming={false}>
-            <MessagePrimitive.Parts
-              components={{ File: UserFilePart, Image: UserImagePart }}
-            />
-          </BoundedMessage>
+          <MessagePrimitive.Parts
+            components={{ File: UserFilePart, Image: UserImagePart }}
+          />
         </div>
         <div className="aui-user-action-bar-wrapper absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 peer-empty:hidden rtl:translate-x-full">
           <UserActionBar />

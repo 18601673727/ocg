@@ -78,7 +78,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           (item.tip_created_at_us < local.job.created_at_us ||
             (item.tip_created_at_us === local.job.created_at_us && Number(item.tip_job.slice(4)) < Number(known.slice(4))))) continue;
         this.tips.set(id, item.tip_job);
-        const session: ChatSession = { id, conversationId: item.root_job, sessionId: item.tip_job, title: item.title, agentProfile: item.agent ?? undefined, workType: "research", updatedAt: new Date(item.tip_created_at_us / 1000).toISOString() };
+        const session: ChatSession = { id, conversationId: item.root_job, sessionId: item.tip_job, title: item.title, agentProfile: item.agent ?? undefined, projectId: item.project ?? undefined, workType: "research", updatedAt: new Date(item.tip_created_at_us / 1000).toISOString() };
         this.emit({ type: current ? "conversation.session-updated" : "conversation.session-created", session });
       }
       if (!page.has_more) break;
@@ -295,7 +295,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       id: message.id, jobId: turn.job.id, commandId: turn.job.id, role: message.role, content: message.content,
       status: message.status,
       createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
-      ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, reasoning: message.reasoning, failureReason: turn.error ?? turn.toolError ?? message.detail ?? (message.status === "unknown" ? ((turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") + (turn.unknownReason ? ` ${turn.unknownReason}` : "")) : undefined) }),
+      ...(message.role === "user" ? { images: turn.input.attachments.flatMap(id => this.images.get(id) ?? []) } : { toolCalls: turn.tools, reasoning: message.reasoning, reasoningDurationMs: message.reasoningDurationMs, failureReason: turn.error ?? turn.toolError ?? message.detail ?? (message.status === "unknown" ? ((turn.job.stop_confirmed_at_us === null ? "Outcome unknown; stop is not yet confirmed." : "Execution stopped; final outcome unknown.") + (turn.unknownReason ? ` ${turn.unknownReason}` : "")) : undefined) }),
     }))];
     });
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
@@ -444,7 +444,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       for (const image of input.images ?? []) this.images.set(image.id, image);
       const admitted = await this.control.readJob(job);
       if (admitted.conversation) this.roots.set(admitted.conversation, sessionId);
-      this.emit({ type: "conversation.session-updated", session: { ...session, conversationId: admitted.conversation ?? undefined, sessionId: job, agentProfile: selection.agentProfile, title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
+      this.emit({ type: "conversation.session-updated", session: { ...session, conversationId: admitted.conversation ?? undefined, sessionId: job, agentProfile: selection.agentProfile, projectId: conversation ? session.projectId : selection.project, title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation", updatedAt: new Date().toISOString() } });
       await this.trackTurn(sessionId, job);
     } catch (error) {
       if (!pending.admittedJob && error instanceof ControlTransportError && ((error.status >= 400 && error.status < 500) || error.status === 503)) this.pending.delete(sessionId);

@@ -3,6 +3,7 @@ import type { ControlOutput, ControlToolCall } from "@/components/ocg/contracts"
 /** How a Job settled, as the Control Plane reports it. */
 export type TranscriptSettlement = {
   state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown";
+  settled_at_us?: number | null;
 };
 
 export type TranscriptTurn = {
@@ -11,6 +12,7 @@ export type TranscriptTurn = {
   content: string;
   /** The model's stored reasoning, shown apart from the answer. */
   reasoning?: string;
+  reasoningDurationMs?: number;
   attachments?: readonly string[];
   status: "completed" | "streaming" | "pending" | "failed" | "cancelled" | "unknown";
   /** The Result output's own text where the Job did not complete. */
@@ -49,12 +51,26 @@ export function jobTranscript(
     .join("");
   const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
   const state = settlement?.state ?? "unsettled";
+  let reasoningStartedAt: number | null = null;
+  let reasoningDurationUs = 0;
+  for (const output of outputs) {
+    if (output.kind === "reasoning" && output.summary) {
+      reasoningStartedAt ??= output.created_at_us;
+    } else if (output.kind !== "reasoning" && reasoningStartedAt !== null) {
+      reasoningDurationUs += Math.max(0, output.created_at_us - reasoningStartedAt);
+      reasoningStartedAt = null;
+    }
+  }
+  if (reasoningStartedAt !== null) {
+    const endedAt = (state !== "unsettled" ? settlement?.settled_at_us : null) ?? outputs.at(-1)?.created_at_us ?? reasoningStartedAt;
+    reasoningDurationUs += Math.max(0, endedAt - reasoningStartedAt);
+  }
   const base = {
     id: `${jobId}:answer`,
     role: "assistant" as const,
     createdAtUs: outputs.at(-1)?.created_at_us ?? null,
     tools,
-    ...(reasoning ? { reasoning } : {}),
+    ...(reasoning ? { reasoning, reasoningDurationMs: reasoningDurationUs / 1000 } : {}),
   };
   const hasUserTurn = objective !== null || (attachments && attachments.length > 0);
   const user: TranscriptTurn[] = !hasUserTurn

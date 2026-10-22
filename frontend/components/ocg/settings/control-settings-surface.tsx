@@ -23,6 +23,7 @@ import { ProjectsSection } from "./projects-section";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
 import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
+import { PageTitle } from "../layout/page-title";
 
 type Health = {
   host: string;
@@ -388,7 +389,7 @@ export function SettingsSurface({
     <PageSurface className="mx-auto w-full max-w-4xl">
       <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <h1 className="text-2xl font-semibold tracking-tight">{t("settings.title")}</h1>
+          <PageTitle className="text-2xl font-semibold tracking-tight">{t("settings.title")}</PageTitle>
           <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
             {t("settings.manage")}
           </p>
@@ -914,20 +915,6 @@ export function SettingsSurface({
                 : t("common.unknown")}
             </span>
           </SettingRow>
-        </Section>
-        <Section
-          id="settings-unavailable"
-          title={t("settings.unavailable.title")}
-          description={t("settings.unavailable.description")}
-        >
-          <ul className="flex list-disc flex-col gap-1.5 py-3 pl-5 text-[13px] leading-5 text-muted-foreground">
-            <li>{t("settings.unavailable.workspace")}</li>
-            <li>
-              {t("settings.unavailable.releaseSlotBefore")}{" "}
-              <code>ocg release-slot &lt;job&gt;</code>
-              {t("settings.unavailable.releaseSlotAfter")}
-            </li>
-          </ul>
         </Section>
       </div>
     </PageSurface>

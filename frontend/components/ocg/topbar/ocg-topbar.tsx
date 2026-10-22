@@ -20,6 +20,7 @@ type OcgTopbarProps = {
   projectName?: string;
   onOpenMobileSidebar: () => void;
   activeView?: WorkspaceView;
+  titleVisible?: boolean;
   /** Canonical reconciler sync status. Only degraded states are surfaced. */
   syncStatus?: RuntimeSyncStatus | null;
   /**
@@ -36,6 +37,7 @@ export function OcgTopbar({
   projectName,
   onOpenMobileSidebar,
   activeView = "chat",
+  titleVisible = true,
   syncStatus,
   projectSelector,
 }: OcgTopbarProps) {
@@ -44,7 +46,7 @@ export function OcgTopbar({
   // Map view types to i18n title keys
   const getViewTitle = (view: WorkspaceView): string => {
     const viewTitleMap: Record<WorkspaceView, string> = {
-      jobs: "Jobs",
+      jobs: t("jobs.title"),
       chat: t("nav.chat"),
       home: t("nav.home"),
       usage: t("nav.usage"),
@@ -72,7 +74,7 @@ export function OcgTopbar({
   );
   const title = session && activeView === "chat" ? session.title : getViewTitle(activeView);
   return (
-    <header className={cn("flex h-14 shrink-0 items-center gap-1.5 px-2 sm:px-5", activeView === "chat" && "pointer-events-none [&_button]:pointer-events-auto")}>
+    <header className={cn("flex h-14 shrink-0 items-center gap-1.5 px-2 sm:px-5", activeView === "chat" && "pointer-events-none absolute inset-x-0 top-0 z-20 bg-transparent [&_button]:pointer-events-auto")}>
       {/* Mobile sidebar toggle */}
       <Tooltip>
         <TooltipTrigger
@@ -92,7 +94,11 @@ export function OcgTopbar({
       </Tooltip>
       {/* Conversation title, or the open workspace's name. */}
       {title && (
-        <h1 className={cn("min-w-0 max-w-full truncate px-2 text-sm font-medium", activeView === "chat" && "sr-only")}>
+        <h1 aria-hidden={!titleVisible} className={cn(
+          "min-w-0 max-w-full truncate px-2 text-sm font-medium transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none",
+          titleVisible ? "translate-y-0 opacity-100" : "pointer-events-none translate-y-1 opacity-0",
+          activeView === "chat" && "sr-only",
+        )}>
           {title}
         </h1>
       )}

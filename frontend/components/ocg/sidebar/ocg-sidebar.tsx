@@ -35,13 +35,14 @@ import { AccountMenu } from "./account-menu";
 import { ConversationSearch } from "./conversation-search";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
+import { OcgLogo } from "../primitives/ocg-logo";
 
 const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.health" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
   { target: "jobs", labelKey: "nav.jobExecution", icon: Workflow },
   { target: "usage", labelKey: "nav.usage", icon: BarChart3 },
-  { target: "logs", labelKey: "nav.logs", icon: ScrollText },
   { target: "health", labelKey: "nav.health", icon: Activity },
+  { target: "logs", labelKey: "nav.logs", icon: ScrollText },
 ];
 
 type OcgSidebarProps = {
@@ -257,14 +258,14 @@ export function OcgSidebar({
           keeps its icon, label, attention badge and active state.
         */
         <details
-          className="px-2 pb-2"
+          className="group/workbench px-2 pb-2"
           open={workbenchNav.some((item) => item.target === activeView) || undefined}
           data-workbench-menu=""
         >
           <summary className={cn("group flex min-h-11 cursor-pointer items-center gap-2 rounded-lg px-3 py-2 select-none", TYPOGRAPHY_SCALE.body_sm, "text-muted-foreground hover:bg-muted/60")}>
             <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
-            <ChevronDown className="size-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" aria-hidden="true" />
+            <ChevronDown className="size-3.5 shrink-0 -rotate-90 text-muted-foreground transition-transform duration-[180ms] group-open/workbench:rotate-0 motion-reduce:transition-none" aria-hidden="true" />
           </summary>
           <ul className="mt-1 flex flex-col gap-px pl-2">
             {workbenchNav.map(renderWorkspaceItem)}
@@ -278,7 +279,7 @@ export function OcgSidebar({
     return (
       <TooltipProvider delay={100}>
         <div className="flex h-full w-full flex-col items-center gap-1 px-2 py-3">
-          <span aria-label="OCG" className="mb-2 scale-y-75 text-[18px] leading-none font-black tracking-[-0.06em]">OCG</span>
+          <OcgLogo compact className="mb-2" />
           <RailButton label={t("sidebar.expand")} onClick={onToggle}>
             <ChevronsLeft className="size-4 rotate-180" />
           </RailButton>
@@ -367,9 +368,7 @@ export function OcgSidebar({
     <TooltipProvider delay={100}>
       <div className="flex h-full w-full flex-col">
         <div className="flex items-center gap-2 px-3 pt-3 pb-2">
-          <span aria-label="OCG" className="min-w-0 flex-1 origin-left scale-y-75 text-[28px] leading-none font-black tracking-[-0.06em]">
-            OCG
-          </span>
+          <OcgLogo className="min-w-0 flex-1" />
           <Tooltip>
             <TooltipTrigger
               render={

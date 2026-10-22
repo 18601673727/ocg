@@ -15,7 +15,13 @@ import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./messa
  * surface: the assistant-ui Thread messages render through it, so long
  * messages stay bounded and expandable on the active surface too.
  */
-export function BoundedMessage({ streaming, children }: { streaming: boolean; children: React.ReactNode }) {
+export function BoundedMessage({ streaming, children, expandable = true, className, label }: {
+  streaming: boolean;
+  children: React.ReactNode;
+  expandable?: boolean;
+  className?: string;
+  label?: string;
+}) {
   const { t } = useI18n();
   const viewport = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -40,19 +46,23 @@ export function BoundedMessage({ streaming, children }: { streaming: boolean; ch
     return () => observer.disconnect();
   }, [expanded, streaming]);
 
-  const toggle = boundedToggle(overflowing, expanded);
+  const toggle = expandable ? boundedToggle(overflowing, expanded) : null;
   return (
     <>
       <div
         ref={viewport}
         data-message-bounds={expanded ? "expanded" : "bounded"}
+        role={label ? "region" : undefined}
+        aria-label={label}
+        tabIndex={label ? 0 : undefined}
         onScroll={() => {
           const el = viewport.current;
           if (!el || expanded) return;
           following.current = followAfterScroll(following.current, lastTop.current, el);
           lastTop.current = el.scrollTop;
         }}
-        className={cn("min-w-0", !expanded && BOUNDED_MESSAGE_CLASS)}
+        className={cn("min-w-0", !expanded && BOUNDED_MESSAGE_CLASS,
+          label && "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30", className)}
       >
         <div ref={content}>{children}</div>
       </div>

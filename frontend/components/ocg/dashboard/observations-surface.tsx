@@ -6,7 +6,9 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useControlPage } from "../runtime/use-control-page";
 import type { decodeAvailability, decodeHealth, decodeUsage } from "../contracts";
 import { useI18n } from "../i18n";
+import { PageTitle } from "../layout/page-title";
 import { UsageChart } from "./usage-chart";
+import { HealthChart } from "./health-chart";
 
 type Usage = ReturnType<typeof decodeUsage>["observations"][number];
 type Availability = ReturnType<typeof decodeAvailability>["observations"][number];
@@ -64,7 +66,7 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 py-6 sm:px-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="font-heading text-xl">{kind === "usage" ? t("nav.usage") : t("observations.health")}</h2>
+        <PageTitle className="font-heading text-xl">{kind === "usage" ? t("nav.usage") : t("observations.health")}</PageTitle>
         <div className="flex items-center gap-2">
           <label className="sr-only" htmlFor="observation-period">{t("observations.timeRange")}</label>
           <select id="observation-period" className={select} value={days} onChange={(event) => { setDays(Number(event.target.value)); setWindowEnd(Date.now() * 1000); }}>
@@ -74,6 +76,7 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
         </div>
       </div>
       {kind === "usage" ? <UsageChart client={client} reloadKey={windowEnd} /> : null}
+      {kind === "health" ? <HealthChart key={`${days}:${windowEnd}`} client={client} fromUs={windowEnd - days * 86400_000_000} untilUs={windowEnd} /> : null}
       {kind === "health" ? (
         <>
           <section aria-label={t("observations.runtimeHealth")} className="grid gap-3 sm:grid-cols-4">

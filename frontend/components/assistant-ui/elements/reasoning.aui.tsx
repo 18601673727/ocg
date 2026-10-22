@@ -10,6 +10,7 @@ import {
 import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import {
   ANIMATION_DURATION,
+  estimateReasoningTokens,
   ReasoningRoot as ReasoningRootBase,
   ReasoningTrigger,
   ReasoningContent,
@@ -59,11 +60,31 @@ const ReasoningImpl: ReasoningMessagePartComponent = (props) => (
   <MarkdownText text={props.text} status={props.status} inMuted />
 );
 
+export const useLatestReasoningIndex = () => useAuiState((s) => {
+  for (let messageIndex = s.thread.messages.length - 1; messageIndex >= 0; messageIndex--) {
+    const message = s.thread.messages[messageIndex];
+    if (message.role !== "assistant") continue;
+    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex--) {
+      if (message.parts[partIndex].type === "reasoning") {
+        return message.id === s.message.id ? partIndex : -1;
+      }
+    }
+  }
+  return -1;
+});
+
 const ReasoningGroupImpl: ReasoningGroupComponent = ({
   children,
   startIndex,
   endIndex,
 }) => {
+  const latestReasoningIndex = useLatestReasoningIndex();
+  const unsettled = useAuiState((s) => s.message.status?.type === "running");
+  const duration = useAuiState((s) => {
+    const value = s.message.metadata.custom.reasoningDurationMs;
+    return typeof value === "number" ? value / 1000 : undefined;
+  });
+  const text = useAuiState((s) => s.message.parts.slice(startIndex, endIndex + 1).map(part => part.type === "reasoning" ? part.text : "").join(""));
   const isReasoningStreaming = useAuiState((s) => {
     if (s.message.status?.type !== "running") return false;
     for (let index = startIndex; index <= endIndex; index++) {
@@ -73,9 +94,9 @@ const ReasoningGroupImpl: ReasoningGroupComponent = ({
   });
 
   return (
-    <ReasoningRoot streaming={isReasoningStreaming}>
-      <ReasoningTrigger active={isReasoningStreaming} />
-      <ReasoningContent aria-busy={isReasoningStreaming}>
+    <ReasoningRoot streaming={isReasoningStreaming} latest={latestReasoningIndex >= startIndex && latestReasoningIndex <= endIndex}>
+      <ReasoningTrigger active={unsettled} duration={duration} tokens={estimateReasoningTokens(text)} />
+      <ReasoningContent streaming={isReasoningStreaming} aria-busy={isReasoningStreaming}>
         <ReasoningText>{children}</ReasoningText>
       </ReasoningContent>
     </ReasoningRoot>
@@ -108,6 +129,7 @@ const ReasoningGroup = memo(ReasoningGroupImpl);
 ReasoningGroup.displayName = "ReasoningGroup";
 
 export {
+  estimateReasoningTokens,
   Reasoning,
   ReasoningGroup,
   ReasoningRoot,

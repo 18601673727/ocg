@@ -18,6 +18,7 @@ import type { decodeHealth } from "../contracts";
 import type { ComposerIntent } from "../composer/domain";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
+import { PageTitleVisibilityContext } from "./page-title";
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -47,6 +48,7 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
   const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const [pageTitleInView, setPageTitleInView] = useState(true);
   const session = runtime.snapshot.sessions.find(session => session.id === sessionId);
   const closeInspector = useCallback(() => {
     setInspectorOpen(false);
@@ -136,20 +138,23 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
     {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label={t("app.closeNavigation")} className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view}
+        titleVisible={location.view === "chat" || !pageTitleInView}
         onOpenMobileSidebar={() => setMobile(true)} syncStatus={runtime.sync?.status} />
       {location.view === "chat" && !inspectorOpen && <Button id="chat-inspector-toggle" type="button" variant="ghost" size="icon" className="absolute top-3 right-3 z-20 size-11 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted" aria-label={t("topbar.expandInspector")} title={t("topbar.expandInspector")} aria-expanded={false} aria-controls="chat-inspector" onClick={() => setInspectorOpen(true)}><PanelRight className="size-4" /></Button>}
       {signOutError && <p role="alert" className="px-5 text-sm text-destructive">{signOutError}</p>}
-      <main className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
+      <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
+      <main key={location.view} className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
         {location.view === "chat" ? <>
           {runtime.snapshot.status.state === "failed" && <p role="alert" className="px-5 py-2 text-sm text-destructive">{runtime.snapshot.status.detail} <button className="underline" onClick={() => void runtime.client.refreshConversations?.().catch(cause => setError(String(cause)))}>{t("app.refreshConversations")}</button></p>}
           {error && <p role="alert" className="px-5 py-2 text-sm text-destructive">{error} <button className="underline" onClick={() => setAttempt(value => value + 1)}>{t("app.retryLoading")}</button></p>}
-          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">{t("app.loadingConversation")}</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} onOpenConversation={job => { setSessionId(""); go("chat", job); }} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="m-auto flex flex-col items-center gap-4 p-6"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
+          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">{t("app.loadingConversation")}</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} onOpenConversation={job => { setSessionId(""); go("chat", job); }} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
         </> : null}
         {location.view === "jobs" && <JobsSurface client={client} active job={location.job} onJob={job => go("jobs", job)} onOpenChat={job => { setSessionId(""); go("chat", job); }} />}
-        {(location.view === "usage" || location.view === "health") && <ObservationsSurface client={client} kind={location.view} health={health} onJob={job => go("jobs", job)} />}
+        {(location.view === "usage" || location.view === "health") && <ObservationsSurface key={location.view} client={client} kind={location.view} health={health} onJob={job => go("jobs", job)} />}
         {location.view === "logs" && <LogsSurface client={client} />}
         {location.view === "settings" && <SettingsSurface client={client} health={health} sessionExpiresAtUs={sessionExpiresAtUs} signingOut={signingOut} onSignOut={onSignOut} />}
       </main>
+      </PageTitleVisibilityContext.Provider>
     </div>
     {location.view === "chat" && inspectorOpen && <ChatInspector session={session} messages={session ? runtime.snapshot.messagesBySession[session.id] ?? [] : []} onClose={closeInspector} onOpenJob={job => go("jobs", job)} />}
   </div>;

@@ -4,7 +4,6 @@ import { cn } from "@/lib/utils";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { STATUS_TEXT } from "@/components/ocg/primitives";
 import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/contracts";
-import { BoundedMessage } from "./bounded-message";
 import type { TranscriptTurn } from "./job-transcript-model";
 import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 
@@ -95,10 +94,8 @@ function TurnRow({
               })}
             </div>
           ) : null}
-          <BoundedMessage streaming={turn.status === "streaming"}>
-            {/* The Provider's text is shown as text: it is never interpreted as markup. */}
-            <p className="whitespace-pre-wrap break-words">{turn.content}</p>
-          </BoundedMessage>
+          {/* The Provider's text is shown as text: it is never interpreted as markup. */}
+          <p className="whitespace-pre-wrap break-words">{turn.content}</p>
           {turn.detail ? (
             <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-xs">
               {turn.detail}

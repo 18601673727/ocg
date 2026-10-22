@@ -91,13 +91,13 @@ export function AccountMenu({
         }
       >
         {onLogout && (
-          <DropdownMenuItem onSelect={onLogout}>
+          <DropdownMenuItem className="gap-2" onSelect={onLogout}>
             <LogOut className="size-3.5 shrink-0" aria-hidden="true" />
             {t("sidebar.logout")}
           </DropdownMenuItem>
         )}
         {onSettingsClick && (
-          <DropdownMenuItem onSelect={onSettingsClick}>
+          <DropdownMenuItem className="gap-2" onSelect={onSettingsClick}>
             <SlidersHorizontal className="size-3.5 shrink-0" aria-hidden="true" />
             {t("sidebar.openSettings")}
           </DropdownMenuItem>

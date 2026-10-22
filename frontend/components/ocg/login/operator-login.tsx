@@ -10,6 +10,7 @@ import {
 } from "@/components/ocg/runtime/control-client";
 import { ContractError } from "@/components/ocg/contracts";
 import { useI18n } from "../i18n";
+import { OcgLogo } from "../primitives/ocg-logo";
 
 export type OperatorSession = {
   csrfToken: string;
@@ -57,7 +58,7 @@ export function OperatorLogin({
   return (
     <main className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-6 px-6 py-16">
       <header className="flex flex-col gap-2">
-        <h1 className="font-heading text-2xl tracking-tight">OCG</h1>
+        <h1><OcgLogo /></h1>
         <p className="text-sm text-muted-foreground">
           {t("login.pairing.description")}
         </p>

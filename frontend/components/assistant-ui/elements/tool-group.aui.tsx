@@ -13,6 +13,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
 import { useI18n } from "@/components/ocg/i18n";
+import { BoundedMessage } from "@/components/ocg/chat/bounded-message";
 import {
   CollapsibleRoot as Collapsible,
   CollapsibleContent,
@@ -152,8 +153,10 @@ function ToolGroupTrigger({
 function ToolGroupContent({
   className,
   children,
+  streaming = false,
   ...props
-}: React.ComponentProps<typeof CollapsibleContent>) {
+}: React.ComponentProps<typeof CollapsibleContent> & { streaming?: boolean }) {
+  const { t } = useI18n();
   return (
     <CollapsibleContent
       data-slot="tool-group-content"
@@ -169,6 +172,8 @@ function ToolGroupContent({
       )}
       {...props}
     >
+      <BoundedMessage streaming={streaming} expandable={false} label={t("aui.toolHistory")}
+        className="max-h-[min(24rem,50dvh)] overscroll-contain">
       <div
         className={cn(
           "mt-2 flex flex-col gap-2",
@@ -185,6 +190,7 @@ function ToolGroupContent({
       >
         {children}
       </div>
+      </BoundedMessage>
     </CollapsibleContent>
   );
 }

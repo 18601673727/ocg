@@ -5,6 +5,7 @@ import type { decodeUsageBuckets } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { summarize, type RankedUsage } from "./usage-chart-data";
+import { StackedBarChart } from "./stacked-bar-chart";
 
 const DAY_US = 86_400_000_000;
 const select = "rounded-md border border-input bg-background px-3 py-2 text-sm";
@@ -86,68 +87,20 @@ function UsageChartData({ client, days, bucket }: { client: HttpCanonicalControl
 
 function UsagePlot({ data }: { data: ChartData }) {
   const { t, locale } = useI18n();
-  const [activeBar, setActiveBar] = useState<number | null>(null);
-  const compact = new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 });
   const number = new Intl.NumberFormat(locale);
-  const percent = new Intl.NumberFormat(locale, { style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1 });
   const date = new Intl.DateTimeFormat(locale, { year: "numeric", month: "short", day: "numeric", timeZone: "UTC" });
   const dateLabel = (us: number) => date.format(new Date((us + data.offset * 60_000_000) / 1000));
-  const name = (entry: RankedUsage) => entry.other ? t("observations.other") : entry.unknown ? t("observations.unknownModel") : entry.model ?? "";
-  const tooltip = (bar: ChartData["bars"][number]) => [
-    dateLabel(bar.bucketUs),
-    `${t("observations.tokens")}: ${number.format(bar.total)}`,
-    ...data.ranking.flatMap(entry => entry.keys.flatMap(model => {
-      const value = bar.totals.get(model) ?? 0;
-      return value > 0 ? [`${model ?? t("observations.unknownModel")}: ${number.format(value)}`] : [];
-    })),
-  ].join("\n");
-  const maximum = Math.max(...data.bars.map((bar) => bar.total));
-  const left = 60, top = 16, plotWidth = 660, plotHeight = 230;
-  const step = plotWidth / data.bars.length;
-  const last = data.bars[data.bars.length - 1];
-  return (
-    <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1fr)_16rem]">
-      <div className="relative min-w-0">
-        <p className="mb-2 text-xs text-muted-foreground">{t("observations.tokens")}</p>
-        <svg viewBox="0 0 740 290" width="100%" role="img" aria-label={t("observations.usageAria", { from: dateLabel(data.fromUs), until: dateLabel(data.untilUs - 1), tokens: number.format(data.total) })}>
-          {[0, 1, 2, 3].map((tick) => {
-            const y = top + plotHeight - plotHeight * tick / 3;
-            return <g key={tick}>
-              <line x1={left} x2={left + plotWidth} y1={y} y2={y} stroke="var(--border)" />
-              <text x={left - 8} y={y + 4} textAnchor="end" fill="var(--muted-foreground)" className="text-[24px] sm:text-[11px]">{compact.format(maximum * tick / 3)}</text>
-            </g>;
-          })}
-          {data.bars.map((bar, index) => {
-            let stacked = 0;
-            const label = tooltip(bar);
-            return <g key={bar.bucketUs} tabIndex={0} aria-label={label}
-              onMouseEnter={() => setActiveBar(index)} onMouseLeave={() => setActiveBar(null)}
-              onFocus={() => setActiveBar(index)} onBlur={() => setActiveBar(null)}
-              onKeyDown={(event) => { if (event.key === "Escape") setActiveBar(null); }}
-              className="outline-none focus-visible:stroke-foreground">
-              <title>{label}</title>
-              <rect x={left + index * step} y={top} width={step} height={plotHeight} fill="transparent" />
-              {data.ranking.map((entry, rank) => {
-                const value = entry.keys.reduce((sum, key) => sum + (bar.totals.get(key) ?? 0), 0);
-                stacked += value;
-                return value > 0 ? <rect key={rank} x={left + index * step + step * 0.1} y={top + plotHeight - stacked / maximum * plotHeight}
-                  width={step * 0.8} height={value / maximum * plotHeight} fill={color(entry, rank)} /> : null;
-              })}
-            </g>;
-          })}
-          <text x={left} y={top + plotHeight + 26} fill="var(--muted-foreground)" className="text-[24px] sm:text-[11px]">{dateLabel(data.bars[0].bucketUs)}</text>
-          <text x={left + plotWidth} y={top + plotHeight + 26} textAnchor="end" fill="var(--muted-foreground)" className="text-[24px] sm:text-[11px]">{dateLabel(last.bucketUs)}</text>
-        </svg>
-        {activeBar !== null ? <div role="tooltip" className="pointer-events-none absolute left-16 top-8 z-10 max-h-64 max-w-[calc(100%-4rem)] overflow-y-auto whitespace-pre-line rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">{tooltip(data.bars[activeBar])}</div> : null}
-      </div>
-      <ol className="min-w-0 space-y-3 text-sm">
-        {data.ranking.map((entry, rank) => <li key={rank} className="flex items-center gap-2">
-          <span className="w-4 shrink-0 text-right text-xs text-muted-foreground">{rank + 1}</span>
-          <span className="h-3 w-3 shrink-0 rounded-sm" style={{ backgroundColor: color(entry, rank) }} />
-          <span className="min-w-0 flex-1 break-words">{name(entry)}</span>
-          <span className="shrink-0 tabular-nums text-muted-foreground">{percent.format(entry.share)}</span>
-        </li>)}
-      </ol>
-    </div>
-  );
+  return <StackedBarChart metricLabel={t("observations.tokens")}
+    ariaLabel={t("observations.usageAria", { from: dateLabel(data.fromUs), until: dateLabel(data.untilUs - 1), tokens: number.format(data.total) })}
+    series={data.ranking.map((entry, rank) => ({ key: String(rank), label: entry.other ? t("observations.other") : entry.unknown ? t("observations.unknownModel") : entry.model ?? "", color: color(entry, rank), share: entry.share }))}
+    bars={data.bars.map(bar => ({
+      key: String(bar.bucketUs), label: dateLabel(bar.bucketUs),
+      values: data.ranking.map(entry => entry.keys.reduce((sum, key) => sum + (bar.totals.get(key) ?? 0), 0)),
+      tooltip: [dateLabel(bar.bucketUs), `${t("observations.tokens")}: ${number.format(bar.total)}`,
+        ...data.ranking.flatMap(entry => entry.keys.flatMap(model => {
+          const value = bar.totals.get(model) ?? 0;
+          return value > 0 ? [`${model ?? t("observations.unknownModel")}: ${number.format(value)}`] : [];
+        })),
+      ].join("\n"),
+    }))} />;
 }

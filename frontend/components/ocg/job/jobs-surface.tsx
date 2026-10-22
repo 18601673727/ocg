@@ -10,6 +10,7 @@ import { JobWatch } from "./job-watch";
 import { JobTree } from "./job-tree";
 import { isJobIdentity } from "../layout/view-domain";
 import { useI18n } from "../i18n";
+import { PageTitle } from "../layout/page-title";
 
 export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
   client: HttpCanonicalControlClient;
@@ -40,7 +41,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 px-4 py-6 sm:px-6">
       <section className="rounded-lg border border-border bg-card p-5">
         <div className="mb-3 flex items-center justify-between gap-3">
-          <h2 className="font-heading text-lg">{t("jobs.title")}</h2>
+          <PageTitle className="font-heading text-lg">{t("jobs.title")}</PageTitle>
           <Button variant="outline" size="sm" disabled={page.loading} onClick={page.refresh}>{t("common.refresh")}</Button>
         </div>
         <p className="mb-4 text-sm text-muted-foreground">{t("jobs.description")}</p>

@@ -32,6 +32,7 @@ function metadataFor(message: ChatMessage, messages: readonly ChatMessage[]): Oc
     jobId: message.jobId,
     optimistic: message.optimistic,
     reasoning: message.reasoning,
+    reasoningDurationMs: message.reasoningDurationMs,
     failureReason: message.failureReason,
     failureCode: message.failureCode,
     call: message.call ?? message.tool,

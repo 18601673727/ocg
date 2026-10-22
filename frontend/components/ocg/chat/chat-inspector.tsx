@@ -15,10 +15,10 @@ export function ChatInspector({ session, messages, onClose, onOpenJob }: {
   const turns = messages.filter(message => message.role === "assistant");
 
   return (
-    <aside id="chat-inspector" aria-labelledby="chat-inspector-title" className="fixed inset-y-0 right-0 z-40 flex h-full min-h-0 w-[min(24rem,calc(100%-1rem))] min-w-0 flex-col overflow-hidden rounded-3xl border-0 bg-muted text-foreground shadow-lg lg:static lg:z-auto lg:w-80 lg:shrink-0 lg:shadow-none xl:w-96">
-      <header className="flex shrink-0 items-center gap-3 px-5 py-4">
+    <aside id="chat-inspector" aria-labelledby="chat-inspector-title" className="fixed inset-y-3 right-3 z-40 flex min-h-0 w-[min(24rem,calc(100%-1.5rem))] min-w-0 flex-col overflow-hidden rounded-3xl border-0 bg-muted text-foreground shadow-lg lg:relative lg:inset-auto lg:z-auto lg:m-3 lg:h-[calc(100%-1.5rem)] lg:w-80 lg:shrink-0 lg:shadow-none xl:w-96">
+      <header className="flex min-h-14 shrink-0 items-center gap-3 py-4 pr-14 pl-5">
         <h2 id="chat-inspector-title" className="min-w-0 flex-1 text-sm font-semibold">{t("usage.conversation")}</h2>
-        <Button id="chat-inspector-close" type="button" variant="ghost" size="icon" className="size-11 rounded-full" onClick={onClose} aria-label={t("topbar.collapseInspector")} title={t("topbar.collapseInspector")}><X className="size-4" /></Button>
+        <Button id="chat-inspector-close" type="button" variant="ghost" size="icon" className="absolute top-0 right-0 size-11 rounded-full" onClick={onClose} aria-label={t("topbar.collapseInspector")} title={t("topbar.collapseInspector")}><X className="size-4" /></Button>
       </header>
       <div className="ocg-subtle-scrollbar min-h-0 flex-1 space-y-6 overflow-x-hidden overflow-y-auto overscroll-contain px-5 pb-6 [overflow-wrap:anywhere]" data-chat-inspector-scroll="">
         {session ? <>

@@ -46,7 +46,8 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
   }, [control, attempt]);
   useEffect(() => control?.onProfilesChanged(() => setAttempt(value => value + 1)), [control]);
 
-  const fixedAgent = snapshot.sessions.find(session => session.id === sessionId)?.agentProfile;
+  const session = snapshot.sessions.find(session => session.id === sessionId);
+  const fixedAgent = session?.agentProfile;
   const agents = (catalog?.agents ?? []).filter(agent => agent.llm_targets.some(target => target.declared_capabilities.includes("chat") && target.executors.length));
   const agent = agents.find(agent => agent.id === (fixedAgent ?? selection?.agentProfile)) ?? (!fixedAgent ? agents[0] : undefined);
   const targets = agent?.llm_targets.filter(target => target.declared_capabilities.includes("chat") && target.executors.length) ?? [];
@@ -86,23 +87,15 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
   }
 
   return <div className="min-w-0 flex-1">
-    <ModelSelectorView title={model ?? t("chat.noModels")} subtitle={agent?.name ?? null}
-      status={busy ? t("chat.settingsLocked") : t("chat.settingsNextTurn")} active={busy} locked={busy} disabled={disabled} loading={!catalog && !error}
+    <ModelSelectorView
+      status={busy ? t("chat.settingsLocked") : t("chat.settingsNextTurn")} disabled={disabled} loading={!catalog && !error}
       error={error ?? (catalog && fixedAgent && !agent ? t("chat.agentUnavailable") : undefined)} refresh={{ disabled: busy, onRefresh: () => setAttempt(value => value + 1) }}
       providerLabel={t("chat.agent")} effortLabel={t("chat.executor")}
+      project={{ value: fixedAgent ? session?.projectId ?? "" : projectId ?? "", options: (fixedAgent ? catalog?.projects ?? [] : projects).map(project => ({ value: project.id, label: project.name })),
+        disabled: busy || !catalog || !agent?.tool_grant || Boolean(fixedAgent), placeholder: !agent?.tool_grant ? t("chat.noWorkspaceAccess") : !fixedAgent && !projects.length ? t("chat.projectNone") : t("chat.projectChoose"), onChange: chooseProject }}
       provider={{ value: agentId ?? "", options: agents.filter(option => !fixedAgent || option.id === fixedAgent).map(agent => ({ value: agent.id, label: agent.name })), onChange: value => choose(value) }}
-      model={{ value: llmId ?? "", options: targets.map(target => ({ value: target.id, label: `${target.model} (${target.id})` })), onChange: value => { if (agentId) choose(agentId, value); } }}
-      effort={{ value: executor ?? "", options: (llm?.executors ?? []).map(id => ({ value: id, label: id })), onChange: value => { if (agentId) choose(agentId, llmId, value); } }} effortUnsupported={false} />
-    {agent && <p className="mt-1 px-1 text-xs text-muted-foreground">{agent.tool_grant ? t("chat.workspaceAccess", { grant: agent.tool_grant }) : t("chat.noWorkspaceAccess")}</p>}
-    {agent?.tool_grant && !fixedAgent && catalog && (projects.length
-      ? <label className="mt-1 flex items-center gap-2 px-1 text-xs text-muted-foreground">{t("chat.project")}
-        <select className="h-7 min-w-0 rounded-md border border-input bg-background px-2 text-xs text-foreground" value={projectId ?? ""} disabled={busy}
-          onChange={event => chooseProject(event.target.value)}>
-          <option value="">{t("chat.projectChoose")}</option>
-          {projects.map(project => <option key={project.id} value={project.id}>{project.name} ({project.id})</option>)}
-        </select>
-      </label>
-      : <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.projectNone")}</p>)}
+      model={{ value: llmId ?? "", options: targets.map(target => ({ value: target.id, label: target.name.trim() || target.model })), onChange: value => { if (agentId) choose(agentId, value); } }}
+      effort={{ value: executor ?? "", options: (llm?.executors ?? []).map(id => ({ value: id, label: id })), onChange: value => { if (agentId) choose(agentId, llmId, value); } }} />
     {llm && !llm.declared_capabilities.includes("tools") && <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.toolsWarning")}</p>}
     {llm && !llm.declared_capabilities.includes("vision") && <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.visionWarning")}</p>}
   </div>;

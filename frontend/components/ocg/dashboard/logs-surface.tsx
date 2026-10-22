@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import type { decodeLogs } from "../contracts";
 import { useI18n } from "../i18n";
+import { PageTitle } from "../layout/page-title";
 
 export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {
   const { t } = useI18n();
@@ -39,7 +40,7 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
   }, [live, refresh]);
 
   return <div className="mx-auto flex w-full max-w-7xl flex-col gap-4 px-4 py-6 sm:px-6">
-    <div className="flex flex-wrap items-center justify-between gap-3"><h2 className="font-heading text-xl">{t("logs.title")}</h2>
+    <div className="flex flex-wrap items-center justify-between gap-3"><PageTitle className="font-heading text-xl">{t("logs.title")}</PageTitle>
       <div className="flex flex-wrap items-center gap-3">
         <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={live} onChange={(event) => setLive(event.target.checked)} />{t("logs.autoRefresh")}</label>
         <Button variant="outline" disabled={loading} onClick={refresh}>{t("common.refresh")}</Button>
