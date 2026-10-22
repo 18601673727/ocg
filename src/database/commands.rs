@@ -740,7 +740,9 @@ impl Command {
                 .saturating_add(text_bytes(description))
                 .saturating_add(command_bytes(commands)),
             Self::SetConversation { edit, .. } => match edit {
-                ConversationEdit::Title(title) => byte_count(title.len()),
+                ConversationEdit::Title(title) | ConversationEdit::SuggestedTitle(title) => {
+                    byte_count(title.len())
+                }
                 ConversationEdit::Hide => 16,
             },
             Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {

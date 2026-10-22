@@ -1831,7 +1831,7 @@ pub(super) mod tests {
         let seen_conversations = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen_conversations.clone();
         let mut replies = vec![
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 1: Remembered cobalt.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<ocg-title>Remembering cobalt</ocg-title>\\nReply 1: Remembered cobalt.\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 2: Your word is cobalt.\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 3: tlaboc.\"}}]}\n\n",
         ]
@@ -1883,6 +1883,32 @@ pub(super) mod tests {
         };
 
         let job1 = run_turn("turn-1-00000000000001", "My secret word is cobalt.", None);
+        let root = wait(handle.job(job1))
+            .expect("read")
+            .expect("turn")
+            .conversation
+            .expect("conversation");
+        assert_eq!(
+            wait(catalog::conversations(&handle, None, 20))
+                .expect("conversations")
+                .body["conversations"][0]["title"],
+            "Remembering cobalt"
+        );
+        let outputs = wait(handle.job_outputs(job1, None, 20)).expect("outputs");
+        assert!(outputs.iter().any(
+            |output| output.kind == crate::persistence::OutputKind::Result
+                && output.summary.as_deref() == Some("Reply 1: Remembered cobalt.")
+        ));
+        wait(handle.set_conversation(
+            root,
+            crate::persistence::ConversationEdit::Title("Manual title".to_owned()),
+        ))
+        .expect("rename");
+        wait(handle.set_conversation(
+            root,
+            crate::persistence::ConversationEdit::SuggestedTitle("Ignored suggestion".to_owned()),
+        ))
+        .expect("suggestion");
         let job2 = run_turn(
             "turn-2-00000000000002",
             "What is my secret word?",
@@ -1892,7 +1918,14 @@ pub(super) mod tests {
 
         let sent = seen_conversations.lock().expect("lock").clone();
         assert_eq!(sent.len(), 3);
-        assert_eq!(sent[0]["messages"].as_array().expect("msgs").len(), 2);
+        assert_eq!(sent[0]["messages"].as_array().expect("msgs").len(), 3);
+        assert_eq!(sent[0]["messages"][1]["role"], "system");
+        assert!(
+            sent[0]["messages"][1]["content"]
+                .as_str()
+                .expect("instruction")
+                .contains("<ocg-title>")
+        );
         assert_eq!(sent[1]["messages"].as_array().expect("msgs").len(), 4);
         assert_eq!(
             sent[1]["messages"][1]["content"],
@@ -1929,6 +1962,12 @@ pub(super) mod tests {
         assert_eq!(turns[1]["job"]["previous"], job1.to_string());
         assert_eq!(turns[2]["job"]["id"], job3.to_string());
         assert_eq!(turns[2]["job"]["previous"], job2.to_string());
+        assert_eq!(
+            wait(catalog::conversations(&handle, None, 20))
+                .expect("conversations")
+                .body["conversations"][0]["title"],
+            "Manual title"
+        );
 
         wait(runtime.shutdown()).expect("shutdown runtime");
         worker.shutdown().expect("shutdown worker");

@@ -39,6 +39,7 @@ export function jobTranscript(
   streaming: boolean,
   attachments?: readonly string[],
   tools?: readonly ControlToolCall[],
+  titleMetadata = false,
 ): TranscriptTurn[] {
   const answerOutputs = outputs.filter((output) => output.kind !== "reasoning");
   const progress = answerOutputs
@@ -51,6 +52,17 @@ export function jobTranscript(
     .join("");
   const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
   const state = settlement?.state ?? "unsettled";
+  const visibleAnswer = (text: string) => {
+    if (!titleMetadata) return text;
+    const start = text.trimStart();
+    const prefix = "<ocg-title>";
+    if (!start.startsWith(prefix)) return state === "unsettled" && prefix.startsWith(start) ? "" : text;
+    const end = start.indexOf("</ocg-title>", prefix.length);
+    if (end < 0) return state === "unsettled" && new TextEncoder().encode(start).length <= 1024 ? "" : text;
+    const title = start.slice(prefix.length, end).trim();
+    if (!title || [...title].length > 80 || new TextEncoder().encode(title).length > 256 || /[\p{Cc}<>]/u.test(title)) return text;
+    return start.slice(end + "</ocg-title>".length).trimStart();
+  };
   let reasoningStartedAt: number | null = null;
   let reasoningDurationUs = 0;
   for (const output of outputs) {
@@ -89,10 +101,10 @@ export function jobTranscript(
   if (state === "completed") {
     // The Result carries the Provider's complete text; it supersedes the
     // streamed pieces it was assembled from.
-    return [...user, { ...base, content: result?.summary ?? progress, status: "completed", detail: null }];
+    return [...user, { ...base, content: visibleAnswer(result?.summary ?? progress), status: "completed", detail: null }];
   }
   if (state === "unsettled") {
-    return [...user, { ...base, content: progress, status: streaming ? "streaming" : "pending", detail: null }];
+    return [...user, { ...base, content: visibleAnswer(progress), status: streaming ? "streaming" : "pending", detail: null }];
   }
-  return [...user, { ...base, content: progress, status: state, detail: result?.summary ?? null }];
+  return [...user, { ...base, content: visibleAnswer(progress), status: state, detail: result?.summary ?? null }];
 }

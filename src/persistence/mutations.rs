@@ -602,6 +602,8 @@ pub(crate) fn set_conversation(
     let mut row = batch.conversation(root)?;
     match edit {
         ConversationEdit::Title(title) => row.title = Some(title),
+        ConversationEdit::SuggestedTitle(_) if row.title.is_some() => return Ok(()),
+        ConversationEdit::SuggestedTitle(title) => row.title = Some(title),
         ConversationEdit::Hide if row.hidden_at.is_some() => return Ok(()),
         ConversationEdit::Hide => row.hidden_at = Some(batch.now()),
     }

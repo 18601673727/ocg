@@ -291,7 +291,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const turns = [...this.turns.values()].filter(turn => turn.sessionId === sessionId).sort((a, b) => a.job.created_at_us - b.job.created_at_us || Number(a.job.id.slice(4)) - Number(b.job.id.slice(4)));
     const messages: ChatMessage[] = turns.flatMap(turn => {
       const users: ChatMessage[] = (turn.entries ?? []).filter(entry => entry.kind === "user_message" || entry.kind === "agent_message").map(entry => ({ id: `${turn.job.id}:entry:${entry.seq}`, jobId: turn.job.id, commandId: turn.job.id, role: "user", content: entry.text ?? "", status: "completed", createdAt: new Date(entry.at_us / 1000).toISOString(), images: entry.attachments.flatMap(id => this.images.get(id) ?? []) }));
-      return [...users, ...jobTranscript(turn.job.id, turn.entries ? null : turn.input.objective, turn.outputs, turn.job.settlement, turn.job.settlement.state === "unsettled").map(message => ({
+      return [...users, ...jobTranscript(turn.job.id, turn.entries ? null : turn.input.objective, turn.outputs, turn.job.settlement, turn.job.settlement.state === "unsettled", undefined, undefined, turn.job.previous === null).map(message => ({
       id: message.id, jobId: turn.job.id, commandId: turn.job.id, role: message.role, content: message.content,
       status: message.status,
       createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),

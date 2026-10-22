@@ -3355,6 +3355,38 @@ async fn run_provider_job_inner(
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let mut sink = output_sink(run.database.clone(), run.job);
+    if conversation.response_format.is_none()
+        && let Some(turn) = run.database.job(run.job).await?
+        && turn.kind.is_stored()
+        && turn.previous.is_none()
+        && let Some(root) = turn.conversation
+        && let Some(parent) = run.database.job(root).await?
+        && parent.parent_id.is_none()
+        && parent.name.is_none()
+        && matches!(
+            parent.kind,
+            crate::persistence::JobKind::Conversation {
+                origin: crate::persistence::Origin::User,
+                ..
+            }
+        )
+    {
+        sink.title_conversation = Some(root);
+        let before_user = conversation
+            .messages
+            .iter()
+            .position(|message| message.role != ChatRole::System)
+            .unwrap_or(conversation.messages.len());
+        conversation.messages.insert(
+            before_user,
+            ChatMessage::system(super::conversation_title::INSTRUCTION),
+        );
+        conversation.image_attachments = conversation
+            .image_attachments
+            .into_iter()
+            .map(|(index, attachments)| (index + usize::from(index >= before_user), attachments))
+            .collect();
+    }
     sink.recorder.image_attachments = std::mem::take(&mut conversation.image_attachments);
     sink.dropped_turns = conversation.dropped_turns;
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
@@ -3453,6 +3485,19 @@ async fn run_provider_job_inner(
             } else {
                 execution
             };
+            if let Ok(result) = &execution
+                && let Some(root) = sink.title_conversation
+                && let Some((title, _)) = super::conversation_title::split(&result.text)
+                && let Err(error) = sink
+                    .database
+                    .set_conversation(
+                        root,
+                        crate::persistence::ConversationEdit::SuggestedTitle(title.to_owned()),
+                    )
+                    .await
+            {
+                sink.gap.get_or_insert(error);
+            }
             let Err(error) = &execution else {
                 break execution;
             };
@@ -4428,6 +4473,13 @@ async fn complete_provider_job(
     summary: String,
     answer: Option<&ChatMessage>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let summary = if sink.title_conversation.is_some()
+        && let Some((_, answer)) = super::conversation_title::split(&summary)
+    {
+        answer.to_owned()
+    } else {
+        summary
+    };
     let mut gap = sink.gap.take();
     let mut refused = None;
     let mut settlement = JobFinalization::Completed(FinalResult {
@@ -4578,6 +4630,7 @@ pub(crate) struct DatabaseOutputSink {
     recorder: provider_execution::RequestRecorder,
     dropped_turns: u32,
     response_digest: Option<crate::persistence::ContentDigest>,
+    title_conversation: Option<JobId>,
 }
 
 pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutputSink {
@@ -4589,6 +4642,7 @@ pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutpu
         recorder: provider_execution::RequestRecorder::default(),
         dropped_turns: 0,
         response_digest: None,
+        title_conversation: None,
     }
 }
 

@@ -424,8 +424,9 @@ mod tests {
         let sent = seen_conversations.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
         let messages = sent[0]["messages"].as_array().expect("messages");
-        assert_eq!(messages.len(), 1);
-        let content_parts = messages[0]["content"].as_array().expect("parts");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        let content_parts = messages[1]["content"].as_array().expect("parts");
         assert_eq!(content_parts.len(), 2);
         assert_eq!(content_parts[0]["type"], "text");
         assert_eq!(content_parts[0]["text"], "What is in this image?");

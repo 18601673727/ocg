@@ -382,6 +382,7 @@ pub struct JobOutputRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEdit {
     Title(String),
+    SuggestedTitle(String),
     /// Hides it from the conversation list, for good.
     Hide,
 }
