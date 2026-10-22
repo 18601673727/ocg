@@ -164,8 +164,8 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view}
         titleVisible={location.view === "chat" || !pageTitleInView}
-        onOpenMobileSidebar={() => setMobile(true)} syncStatus={runtime.sync?.status} />
-      {location.view === "chat" && !inspectorOpen && <Button id="chat-inspector-toggle" type="button" variant="ghost" size="icon" className="absolute top-3 right-3 z-20 size-11 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted" aria-label={t("topbar.expandInspector")} title={t("topbar.expandInspector")} aria-expanded={false} aria-controls="chat-inspector" onClick={() => setInspectorOpen(true)}><PanelRight className="size-4" /></Button>}
+        onOpenMobileSidebar={() => setMobile(true)} syncStatus={runtime.sync?.status}
+        inspectorToggle={location.view === "chat" && !inspectorOpen ? <Button id="chat-inspector-toggle" type="button" variant="ghost" size="icon" className="size-11 shrink-0 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted" aria-label={t("topbar.expandInspector")} title={t("topbar.expandInspector")} aria-expanded={false} aria-controls="chat-inspector" onClick={() => setInspectorOpen(true)}><PanelRight className="size-4" /></Button> : undefined} />
       {signOutError && <p role="alert" className="px-5 text-sm text-destructive">{signOutError}</p>}
       <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
       <main key={location.view} className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
