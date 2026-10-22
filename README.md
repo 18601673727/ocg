@@ -143,8 +143,25 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 24, with no migration;
+cancelled if reopened without a claim. The stored format is 25, with no migration;
 recreate data directories made by earlier versions.
+
+Conversation depth is derived from parent links. Limits default to depth 3
+(root depth 0), 8 automatic notice-driven follow-up turns, and 100 scheduled
+iterations per recurring conversation. Conversation Inspector controls and
+`GET /api/v1/conversations/{job}/limits` expose effective limits; the existing
+conversation edit endpoint accepts a `limits` object. Limits inherit from
+ancestors. Users can raise them up to depth 16, 255 automatic turns and 10,000
+iterations; agents can only tighten their own or descendant limits through
+`job_limits`. Zero disables new work of that kind. Already-running work and
+recorded history remain intact.
+
+Agents with a nonempty `dispatch_to` allowlist can inspect permitted Agent
+profiles through `job_agents` and their own direct workers through `job_workers`.
+Both tools page at most 20 rows. `job_assign` atomically reuses an idle, open,
+non-recurring child with an allowed profile; unrelated or user-managed
+conversations are refused. `job_dispatch` creates a new child. Results use the
+existing child-notice mechanism.
 
 ## Sign a browser in
 

@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -415,9 +416,9 @@ export function SettingsSurface({
               }
             >
               {loadError ? (
-                <p role="alert" className="py-2 text-sm text-destructive">
+                <DismissibleNotice message={loadError}  className="py-2 text-sm text-destructive">
                   {loadError}
-                </p>
+                </DismissibleNotice>
               ) : null}
               <div className="divide-y divide-border/70 py-2">
                 {llmProfiles.length === 0 ? (
@@ -594,9 +595,9 @@ export function SettingsSurface({
                 </div>
 
                 {llmError ? (
-                  <p role="alert" className="text-sm text-destructive">
+                  <DismissibleNotice message={llmError}  className="text-sm text-destructive">
                     {llmError}
-                  </p>
+                  </DismissibleNotice>
                 ) : null}
                 {llmNotice ? (
                   <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">
@@ -755,9 +756,9 @@ export function SettingsSurface({
                 </fieldset>
 
                 {agentError ? (
-                  <p role="alert" className="text-sm text-destructive">
+                  <DismissibleNotice message={agentError}  className="text-sm text-destructive">
                     {agentError}
-                  </p>
+                  </DismissibleNotice>
                 ) : null}
                 {agentNotice ? (
                   <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">

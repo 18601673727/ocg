@@ -2033,6 +2033,34 @@ pub(crate) fn read_conversation_turns(
     Ok(turns)
 }
 
+pub(crate) fn read_conversation_limits(
+    database: &Database,
+    conversation: JobId,
+) -> Result<Option<(ConversationLimits, u8)>, StorageError> {
+    let rx = read(database)?;
+    let mut current = conversation;
+    let mut limits = ConversationLimits::CEILING;
+    for depth in 0..=crate::persistence::MAX_CONVERSATION_DEPTH {
+        let Some(row) = read_job_row(&rx, current)? else {
+            return Ok(None);
+        };
+        if !row.kind.is_conversation() {
+            return Ok(None);
+        }
+        let own = read_conversation(&rx, current)?.limits;
+        if let Some(own) = own {
+            limits = limits.intersect(own);
+        }
+        match row.parent_id {
+            Some(parent) => current = parent,
+            None => return Ok(Some((limits.intersect(own.unwrap_or_default()), depth))),
+        }
+    }
+    Err(StorageError::corrupted(
+        "conversation ancestry exceeds the hard depth limit",
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct ContextTurn {
     pub turn: JobId,

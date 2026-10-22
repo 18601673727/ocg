@@ -5,6 +5,75 @@ use crate::persistence::{
 };
 
 impl Batch {
+    pub(crate) fn conversation_limits(
+        &mut self,
+        conversation: JobId,
+    ) -> Result<(ConversationLimits, u8), BatchError> {
+        let mut current = conversation;
+        let mut effective = ConversationLimits::CEILING;
+        for depth in 0..=crate::persistence::MAX_CONVERSATION_DEPTH {
+            let row = self.require_job(current)?;
+            if !row.kind.is_conversation() {
+                return self.reject(Violation::InvalidValue(
+                    "conversation_not_found",
+                    "expected a conversation",
+                ));
+            }
+            let own = self.conversation(current)?.limits;
+            if let Some(limits) = own {
+                effective = effective.intersect(limits);
+            }
+            match row.parent_id {
+                Some(parent) => current = parent,
+                None => return Ok((effective.intersect(own.unwrap_or_default()), depth)),
+            }
+        }
+        self.corrupted("conversation ancestry exceeds the hard depth limit".into())
+    }
+
+    pub(crate) fn set_conversation_limits(
+        &mut self,
+        conversation: JobId,
+        limits: ConversationLimits,
+        by: Actor,
+    ) -> Result<(), BatchError> {
+        let row = self.require_user_conversation(conversation)?;
+        let ceiling = match row.parent_id {
+            Some(parent) => self.conversation_limits(parent)?.0,
+            None => ConversationLimits::CEILING,
+        };
+        if !limits.within(ceiling) {
+            return self.reject(Violation::InvalidValue(
+                "limits",
+                "limits exceed an ancestor or system ceiling",
+            ));
+        }
+        if let Actor::Agent {
+            conversation: caller,
+        } = by
+        {
+            if caller != conversation {
+                self.job_tool_rights(caller, conversation)?;
+            }
+            if !limits.within(self.conversation_limits(conversation)?.0) {
+                return self.reject(Violation::InvalidValue(
+                    "limits",
+                    "an Agent may only tighten the effective limits",
+                ));
+            }
+        }
+        let mut metadata = self.conversation(conversation)?;
+        metadata.limits = Some(limits);
+        self.insert_conversation(conversation, &metadata)?;
+        self.loop_hold_if_needed(conversation)?;
+        if self
+            .recurrence(conversation)?
+            .is_some_and(|recurrence| recurrence.n >= u64::from(limits.max_iterations))
+        {
+            self.halt_recurrence(conversation, RecurrenceHalt::LimitReached)?;
+        }
+        Ok(())
+    }
     pub(crate) fn turn_execution(
         &mut self,
         turn: &JobRow,
@@ -114,13 +183,12 @@ impl Batch {
             if !parent_row.kind.is_conversation() {
                 return self.reject(Violation::InvalidValue("parent", "expected a conversation"));
             }
+            let (limits, parent_depth) = self.conversation_limits(parent)?;
             let mut root = parent;
-            let mut depth = 1;
             while let Some(ancestor) = self.require_job(root)?.parent_id {
                 root = ancestor;
-                depth += 1;
             }
-            if depth > 3
+            if parent_depth.saturating_add(1) > limits.max_depth
                 || self.live_children(parent)?.len() >= 16
                 || self.live_subtree(root)?.len() >= 64
             {
@@ -1304,6 +1372,7 @@ mod tests {
                 }),
             ] {
                 let row = ConversationRow {
+                    limits: Some(ConversationLimits::default()),
                     title: Some("title".into()),
                     hidden_at: Some(at),
                     on_hold: Some(2),
@@ -2660,6 +2729,228 @@ mod tests {
             }))
             .unwrap()
         }
+    }
+
+    #[test]
+    fn delegation_catalog_and_atomic_idle_worker_assignment() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("idle-worker-assignment");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        let catalog = fixture.apply(
+            turn,
+            0,
+            JobToolCall::JobAgents {
+                after: None,
+                limit: Some(1),
+            },
+        );
+        assert_eq!(
+            catalog["agents"][0]["agent"],
+            format!("profile:{}", agent.get())
+        );
+        assert_eq!(catalog["has_more"], false);
+        let empty = fixture.apply(
+            turn,
+            1,
+            JobToolCall::JobAgents {
+                after: Some(format!("profile:{}", agent.get())),
+                limit: None,
+            },
+        );
+        assert!(empty["agents"].as_array().unwrap().is_empty());
+        let (worker, first) = fixture.dispatch(turn, 2, agent, true, None, vec![]);
+        let busy = fixture.apply(
+            turn,
+            3,
+            JobToolCall::JobWorkers {
+                after: None,
+                limit: None,
+            },
+        );
+        assert_eq!(busy["workers"][0]["idle"], false);
+        fixture.finish(first, OutcomeKind::Completed);
+        let idle = fixture.apply(
+            turn,
+            4,
+            JobToolCall::JobWorkers {
+                after: None,
+                limit: None,
+            },
+        );
+        assert_eq!(idle["workers"][0]["idle"], true);
+        let assigned = fixture.apply(
+            turn,
+            5,
+            JobToolCall::JobAssign {
+                conversation: worker.to_string(),
+                objective: "follow-up work".into(),
+            },
+        );
+        let next = JobId::new(assigned["turn"].as_str().unwrap()[4..].parse().unwrap());
+        assert_ne!(next, first);
+        assert_eq!(
+            wait(fixture.database.job(next)).unwrap().unwrap().parent_id,
+            Some(worker)
+        );
+        let second = JobToolCall::JobAssign {
+            conversation: worker.to_string(),
+            objective: "competing work".into(),
+        };
+        let call = fixture.admit(turn, 6, &second);
+        assert!(matches!(
+            wait(fixture.database.apply_job_tool(call, second)),
+            Err(crate::database::DatabaseError::Rejected(
+                Violation::InvalidValue("worker_not_idle", _)
+            ))
+        ));
+        let unrelated = fixture.open().0;
+        let takeover = JobToolCall::JobAssign {
+            conversation: unrelated.to_string(),
+            objective: "takeover".into(),
+        };
+        let call = fixture.admit(turn, 7, &takeover);
+        assert!(matches!(
+            wait(fixture.database.apply_job_tool(call, takeover)),
+            Err(crate::database::DatabaseError::Rejected(
+                Violation::InvalidValue("rights", _)
+            ))
+        ));
+        assert_eq!(
+            wait(fixture.database.conversation_limits(parent))
+                .unwrap()
+                .unwrap()
+                .1,
+            0
+        );
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn conversation_limits_are_inherited_and_agent_updates_cannot_escalate() {
+        use crate::orchestration::job_tools::JobToolCall;
+        let fixture = Fixture::new("managed-depth");
+        let (parent, turn, _) = fixture.dispatch_parent();
+        let read = fixture.apply(
+            turn,
+            0,
+            JobToolCall::JobLimits {
+                conversation: None,
+                max_depth: None,
+                max_auto_turns: None,
+                max_iterations: None,
+            },
+        );
+        assert_eq!(read["max_depth"], 3);
+        assert_eq!(read["max_iterations"], 100);
+        fixture.apply(
+            turn,
+            1,
+            JobToolCall::JobLimits {
+                conversation: None,
+                max_depth: Some(1),
+                max_auto_turns: Some(2),
+                max_iterations: Some(3),
+            },
+        );
+        let escalation = JobToolCall::JobLimits {
+            conversation: None,
+            max_depth: Some(4),
+            max_auto_turns: None,
+            max_iterations: None,
+        };
+        let call = fixture.admit(turn, 2, &escalation);
+        assert!(matches!(
+            wait(fixture.database.apply_job_tool(call, escalation)),
+            Err(crate::database::DatabaseError::Rejected(
+                Violation::InvalidValue("limits", _)
+            ))
+        ));
+        wait(fixture.database.set_conversation(
+            parent,
+            crate::persistence::ConversationEdit::Limits(ConversationLimits {
+                max_depth: 4,
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        let mut ancestor = parent;
+        for depth in 1..=4 {
+            ancestor = fixture.child(ancestor, true).0;
+            let (limits, actual) = wait(fixture.database.conversation_limits(ancestor))
+                .unwrap()
+                .unwrap();
+            assert_eq!(actual, depth);
+            assert_eq!(limits.max_depth, 4);
+        }
+        let refused = wait(fixture.database.open_conversation(
+            Some(ancestor),
+            ConversationSpec {
+                name: None,
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            message("too deep"),
+            fixture.configuration,
+            None,
+        ));
+        assert!(matches!(
+            refused,
+            Err(crate::database::DatabaseError::Rejected(
+                Violation::InvalidValue("children", _)
+            ))
+        ));
+        wait(fixture.database.set_conversation(
+            parent,
+            crate::persistence::ConversationEdit::Limits(ConversationLimits {
+                max_depth: 2,
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            wait(fixture.database.conversation_limits(ancestor))
+                .unwrap()
+                .unwrap()
+                .1,
+            4
+        );
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn scheduled_iterations_stop_at_the_inherited_limit() {
+        let fixture = Fixture::new("finite-recurrence");
+        let (parent, turn, agent) = fixture.dispatch_parent();
+        wait(fixture.database.set_conversation(
+            parent,
+            crate::persistence::ConversationEdit::Limits(ConversationLimits {
+                max_iterations: 2,
+                ..Default::default()
+            }),
+        ))
+        .unwrap();
+        let (child, first) = fixture.dispatch(turn, 0, agent, true, Some(60), vec![]);
+        fixture.finish(first, OutcomeKind::Completed);
+        let RecurrencePhase::WaitingDue { due } = fixture.recurrence(child).phase else {
+            panic!("due")
+        };
+        wait(fixture.database.boundary_b(due + 1)).unwrap();
+        let second = fixture.recurrence(child).current_turn;
+        fixture.finish(second, OutcomeKind::Completed);
+        let RecurrencePhase::WaitingDue { due } = fixture.recurrence(child).phase else {
+            panic!("due")
+        };
+        wait(fixture.database.boundary_b(due + 1)).unwrap();
+        assert_eq!(fixture.recurrence(child).n, 2);
+        assert_eq!(
+            fixture.recurrence(child).phase,
+            RecurrencePhase::Halted {
+                reason: RecurrenceHalt::LimitReached
+            }
+        );
+        fixture.worker.shutdown().unwrap();
     }
 
     #[test]

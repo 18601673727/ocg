@@ -95,7 +95,7 @@ export function ConversationErrorHeader() {
     return () => document.removeEventListener("pointerdown", dismiss);
   }, [expanded]);
 
-  if (!latest || !history) return null;
+  if (!latest || !history || !active) return null;
   return <div ref={root} className="pointer-events-none relative w-full min-w-0 max-w-3xl" data-slot="conversation-errors"
     onKeyDown={event => {
       if (event.key === "Escape" && expanded) {
@@ -114,7 +114,6 @@ export function ConversationErrorHeader() {
     {active && <button type="button" className="flex h-full w-11 shrink-0 items-center justify-center rounded-xl hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring" aria-label={t("chat.errors.dismiss")} title={t("chat.errors.dismiss")} onClick={() => {
       if (conversation) store?.dismiss(conversation, latest.id);
       setExpanded(false);
-      trigger.current?.focus();
     }}><X className="size-4" aria-hidden="true" /></button>}
     </div>
     {expanded && <section id={panelId} aria-label={t("chat.errors.history")} className="pointer-events-auto absolute inset-x-0 top-full z-30 mt-2 overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-lg">

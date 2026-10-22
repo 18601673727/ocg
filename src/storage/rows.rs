@@ -570,6 +570,7 @@ pub(super) fn decode_project_root(bytes: &[u8]) -> DecodeResult<(ProjectId, Stri
 /// What the owner changed about a conversation root.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConversationRow {
+    pub(crate) limits: Option<ConversationLimits>,
     pub(crate) title: Option<String>,
     pub(crate) hidden_at: Option<Timestamp>,
     pub(crate) on_hold: Option<u32>,
@@ -596,6 +597,11 @@ impl ConversationRow {
             e.actor(&closing.by);
             e.bool(closing.running);
         });
+        e.opt(&self.limits, |e, limits| {
+            e.u8(limits.max_depth);
+            e.u8(limits.max_auto_turns);
+            e.u32(limits.max_iterations);
+        });
         e.0
     }
 
@@ -611,6 +617,13 @@ impl ConversationRow {
                     at: d.ts()?,
                     by: d.actor()?,
                     running: d.bool()?,
+                })
+            })?,
+            limits: d.opt(|d| {
+                Ok(ConversationLimits {
+                    max_depth: d.u8()?,
+                    max_auto_turns: d.u8()?,
+                    max_iterations: d.u32()?,
                 })
             })?,
         };

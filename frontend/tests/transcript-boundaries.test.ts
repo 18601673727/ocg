@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { toolActivitySummary, toolCategory } from "../components/ocg/chat/tool-activity-summary";
+import { conversationAncestors, conversationPath, parseConversationPath } from "../components/ocg/layout/conversation-path";
+import { decodeConversationLimits } from "../components/ocg/contracts/control-plane";
 import { jobTranscript } from "../components/ocg/chat/job-transcript-model";
 import { ContractError, decodeProviderResponses, type ControlOutput, type ControlProviderResponse, type ControlToolCall } from "../components/ocg/contracts";
 import { ControlTransportError, readTranscriptEvidence, createHttpCanonicalControlClient } from "../components/ocg/runtime/control-client";
@@ -20,8 +23,8 @@ const responses = [reply(1, first), reply(2, ""), reply(3, final, false)];
 
 test("reload preserves each assistant reply, tool-only rounds and the final answer exactly once", () => {
   const messages = jobTranscript("job:1", "Fix it", chunks, { state: "completed" }, false, undefined, [tool(1), tool(2)], false, responses);
-  assert.deepEqual(messages.map(m => m.content), ["Fix it", "", first, "", final]);
-  assert.deepEqual(messages.map(m => m.tools?.map(t => t.request) ?? []), [[], [], [1], [2], []]);
+  assert.deepEqual(messages.map(m => m.content), ["Fix it", "", first, final]);
+  assert.deepEqual(messages.map(m => m.tools?.map(t => t.request) ?? []), [[], [], [1, 2], []]);
   assert.equal(messages[1].reasoning, "Thinking separately.");
   assert.equal(messages.at(-1)?.intermediate, false);
   assert.equal(messages.at(-1)?.id, "job:1:answer");
@@ -32,7 +35,7 @@ test("streaming chunks form only the current tail while completed tool rounds ke
   const live = jobTranscript("job:1", null, [...chunks.slice(0, 3), output(4, "The change")], { state: "unsettled" }, true, undefined, [tool(1), tool(2, null)], false, responses.slice(0, 2));
   assert.equal(live.at(-1)?.content, "The change");
   assert.equal(live.at(-1)?.status, "streaming");
-  assert.equal(live.find(m => m.tools?.[0]?.request === 2)?.status, "streaming");
+  assert.equal(live.find(m => m.tools?.some(call => call.request === 2))?.status, "streaming");
   const settled = jobTranscript("job:1", null, chunks, { state: "completed" }, false, undefined, [tool(1), tool(2)], false, responses);
   assert.equal(live.find(m => m.content === first)?.id, settled.find(m => m.content === first)?.id);
   assert.equal(live.at(-1)?.id, settled.at(-1)?.id);
@@ -188,4 +191,58 @@ test("awaiting tool calls are pending while unsettled without changing a settled
     assert.equal(settled.at(-1)?.status, "completed");
     assert.equal(settled.flatMap(message => message.tools ?? []).length, 1);
   }
+});
+
+
+test("consecutive tool-only requests fold into one group without crossing narration", () => {
+  const replies = [reply(1, first), reply(2, ""), reply(3, "  "), reply(4, "Check results."), reply(5, ""), reply(6, final, false)];
+  const calls = [1,2,3,4,5].map(n => tool(n));
+  const progress = replies.map(row => row.text).join("");
+  const messages = jobTranscript("job:1", null, [output(1, progress), output(2, final, "result")], {state:"completed"}, false, undefined, calls, false, replies);
+  assert.deepEqual(messages.map(row => row.content), [first, "Check results.", final]);
+  assert.deepEqual(messages.map(row => row.tools?.map(call => call.request) ?? []), [[1,2,3],[4,5],[]]);
+  assert.equal(messages[0].id, "job:1:answer:request:1");
+  assert.equal(messages.flatMap(row => row.tools ?? []).length, 5);
+});
+
+
+test("activity categories follow workflow order and combine search strategies", () => {
+  const summary = toolActivitySummary(["workspace_run_command", "workspace_fts_search", "workspace_code", "workspace_read_file", "workspace_search", "unknown"].map(name => ({name})));
+  assert.deepEqual(summary.categories.map(row => [row.category,row.count]), [["read",1],["search",2],["code",1],["command",1],["other",1]]);
+  assert.equal(toolCategory("job_assign"),"agent");
+  assert.equal(summary.durationMs,null);
+});
+
+test("activity totals estimate UTF-8 payloads and mark missing durations and truncated text", () => {
+  const summary = toolActivitySummary([{name:"workspace_read_file",arguments:"中",result:"é",durationMs:25,truncated:true}, {name:"workspace_code",arguments:"{}",result:"abc"}]);
+  assert.equal(summary.tokens,Math.ceil(10/3));
+  assert.equal(summary.durationMs,25);
+  assert.equal(summary.durationPartial,true);
+  assert.equal(summary.truncated,true);
+  assert.equal(toolActivitySummary([{name:"x",durationMs:0}]).durationMs,0);
+});
+
+test("nested conversation routes round-trip and reject malformed or cyclic paths", () => {
+  const ids=["job:1","job:3","job:5"];
+  assert.deepEqual(parseConversationPath(conversationPath(ids)),ids);
+  for (const invalid of ["/jobs", "/jobs/job:1/jobs", "/jobs/job:1/jobs/job:1", "/jobs/job%3A1", "/jobs/job:1/other/job:2"]) assert.equal(parseConversationPath(invalid),null);
+  assert.throws(()=>conversationPath(["job:1","bad"]));
+});
+
+test("nested conversation ancestry follows stored parents, not the visible URL", async () => {
+  const records = new Map([
+    ["job:1",{id:"job:1",kind:"conversation" as const,conversation:null}],
+    ["job:3",{id:"job:3",kind:"conversation" as const,conversation:null,parent:"job:1"}],
+    ["job:4",{id:"job:4",kind:"turn" as const,conversation:"job:3"}],
+  ]);
+  const read=async (id:string)=>{const record=records.get(id);if(!record)throw new Error("missing");return record;};
+  assert.deepEqual(await conversationAncestors(read,"job:4"),["job:1","job:3"]);
+  records.set("job:1",{id:"job:1",kind:"conversation",conversation:null,parent:"job:3"});
+  await assert.rejects(conversationAncestors(read,"job:3"),/ancestry/);
+});
+
+test("conversation limit decoder checks bounds and derived remaining depth", () => {
+  const valid={api_version:1,conversation:"job:1",depth:2,remaining_depth:1,max_depth:3,max_auto_turns:8,max_iterations:100};
+  assert.equal(decodeConversationLimits(valid,"job:1").max_iterations,100);
+  for(const change of [{remaining_depth:2},{max_depth:17},{max_auto_turns:256},{max_iterations:-1}])assert.throws(()=>decodeConversationLimits({...valid,...change},"job:1"),ContractError);
 });

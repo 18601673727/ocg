@@ -7,6 +7,147 @@ use crate::persistence::{
 use serde_json::{Value, json};
 
 impl Batch {
+    fn job_tool_page(&mut self, limit: Option<u32>) -> Result<usize, BatchError> {
+        match limit.unwrap_or(10) {
+            limit @ 1..=20 => Ok(limit as usize),
+            _ => self.reject(Violation::InvalidValue("limit", "must be between 1 and 20")),
+        }
+    }
+
+    fn idle_worker(&mut self, caller: JobId, worker: JobId) -> Result<bool, BatchError> {
+        let row = self.require_user_conversation(worker)?;
+        if row.parent_id != Some(caller)
+            || !matches!(
+                row.kind,
+                JobKind::Conversation {
+                    origin: Origin::Agent { .. },
+                    keep_open: true,
+                    ..
+                }
+            )
+        {
+            return Ok(false);
+        }
+        let metadata = self.conversation(worker)?;
+        if metadata.closing.is_some()
+            || metadata.on_hold.is_some()
+            || self.require_job_state(worker)?.outcome.is_some()
+            || self.active_turn(worker)?.is_some()
+            || self.recurrence(worker)?.is_some()
+            || self.step(|tx| Ok(tx.open_table(USER_ENTRY_AT)?.get(worker.get())?.is_some()))?
+        {
+            return Ok(false);
+        }
+        match self.tip(worker)? {
+            Some(tip) => Ok(self.require_job_state(tip)?.outcome.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    fn allowed_job_agents(&mut self, turn: &JobRow) -> Result<Vec<ConfigId>, BatchError> {
+        let (frozen, _, _) = self.turn_execution(turn)?;
+        let mut agents = frozen
+            .agent
+            .map_or_else(Vec::new, |agent| agent.dispatch_to);
+        agents.sort();
+        agents.dedup();
+        Ok(agents)
+    }
+
+    fn job_agent_catalog(
+        &mut self,
+        turn: &JobRow,
+        after: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, BatchError> {
+        let limit = self.job_tool_page(limit)?;
+        let after = after
+            .map(|id| self.job_tool_id(&id, "profile:"))
+            .transpose()?
+            .unwrap_or(0);
+        let targets: Vec<_> = self
+            .allowed_job_agents(turn)?
+            .into_iter()
+            .filter(|id| id.get() > after)
+            .take(limit + 1)
+            .collect();
+        let has_more = targets.len() > limit;
+        let mut agents = Vec::new();
+        for target in targets.into_iter().take(limit) {
+            let record = self.require_config_kind(target, ConfigKind::Agent)?;
+            let ConfigBody::Agent(agent) = record.body else {
+                return self.corrupted("Agent kind mismatch".into());
+            };
+            let instructions = agent.instructions.as_deref().unwrap_or("");
+            let summary: String = instructions.chars().take(256).collect();
+            let model = match agent.default_model {
+                Some(model) => {
+                    let record = self.require_config_kind(model, ConfigKind::Model)?;
+                    let ConfigBody::Model(body) = record.body else {
+                        return self.corrupted("Model kind mismatch".into());
+                    };
+                    let capabilities: Vec<_> = body
+                        .declared_capabilities
+                        .into_iter()
+                        .map(|capability| match capability {
+                            crate::persistence::ModelCapability::Chat => "chat",
+                            crate::persistence::ModelCapability::Tools => "tools",
+                            crate::persistence::ModelCapability::Vision => "vision",
+                            crate::persistence::ModelCapability::Reasoning => "reasoning",
+                        })
+                        .collect();
+                    json!({"profile":format!("profile:{}", model.get()), "name":record.name, "model":body.model, "declared_capabilities":capabilities, "archived":record.archived_at.is_some()})
+                }
+                None => Value::Null,
+            };
+            agents.push(json!({"agent":format!("profile:{}",target.get()), "name":record.name, "archived":record.archived_at.is_some(), "instructions_summary":summary, "instructions_truncated":summary.len() < instructions.len(), "tool_grant":agent.tool_grant, "default_model":model}));
+        }
+        let next_after = if has_more {
+            agents.last().map(|agent| agent["agent"].clone())
+        } else {
+            None
+        };
+        Ok(json!({"agents":agents, "has_more":has_more, "next_after":next_after}))
+    }
+
+    fn job_worker_catalog(
+        &mut self,
+        caller: JobId,
+        after: Option<String>,
+        limit: Option<u32>,
+    ) -> Result<Value, BatchError> {
+        let limit = self.job_tool_page(limit)?;
+        let after = after
+            .map(|id| self.job_tool_id(&id, "job:"))
+            .transpose()?
+            .unwrap_or(0);
+        if after == u64::MAX {
+            return Ok(json!({"workers":[], "has_more":false, "next_after":null}));
+        }
+        let ids = self.step(|tx| {
+            tx.open_table(CHILD_CONVERSATIONS)?
+                .range((caller.get(), after.saturating_add(1))..=(caller.get(), u64::MAX))?
+                .take(limit + 1)
+                .map(|entry| Ok(JobId::new(entry?.0.value().1)))
+                .collect::<Result<Vec<_>, StorageError>>()
+        })?;
+        let has_more = ids.len() > limit;
+        let mut workers = Vec::new();
+        for worker in ids.into_iter().take(limit) {
+            let row = self.require_user_conversation(worker)?;
+            let JobKind::Conversation { agent, project, .. } = row.kind else {
+                return self.corrupted("child is not a conversation".into());
+            };
+            workers.push(json!({"conversation":worker.to_string(), "agent":agent.map(|id|format!("profile:{}",id.get())), "project":project.map(|id|id.to_string()), "title":self.conversation(worker)?.title, "idle":self.idle_worker(caller,worker)?}));
+        }
+        let next_after = if has_more {
+            workers.last().map(|worker| worker["conversation"].clone())
+        } else {
+            None
+        };
+        Ok(json!({"workers":workers, "has_more":has_more, "next_after":next_after}))
+    }
+
     fn job_tool_id(&mut self, text: &str, prefix: &'static str) -> Result<u64, BatchError> {
         match text
             .strip_prefix(prefix)
@@ -21,11 +162,15 @@ impl Batch {
             )),
         }
     }
-    fn job_tool_rights(&mut self, caller: JobId, target: JobId) -> Result<(), BatchError> {
+    pub(super) fn job_tool_rights(
+        &mut self,
+        caller: JobId,
+        target: JobId,
+    ) -> Result<(), BatchError> {
         let target_row = self.require_user_conversation(target)?;
         let mut parent = target_row.parent_id;
         let mut below = false;
-        for _ in 0..3 {
+        for _ in 0..=crate::persistence::MAX_CONVERSATION_DEPTH {
             match parent {
                 Some(id) if id == caller => {
                     below = true;
@@ -108,6 +253,85 @@ impl Batch {
             return self.corrupted("stored caller has no conversation".into());
         };
         let result = match tool {
+            JobToolCall::JobLimits {
+                conversation,
+                max_depth,
+                max_auto_turns,
+                max_iterations,
+            } => {
+                let target = match conversation {
+                    Some(id) => JobId::new(self.job_tool_id(&id, "job:")?),
+                    None => caller,
+                };
+                if target != caller {
+                    self.job_tool_rights(caller, target)?;
+                }
+                let (current, depth) = self.conversation_limits(target)?;
+                if max_depth.is_some() || max_auto_turns.is_some() || max_iterations.is_some() {
+                    self.set_conversation_limits(
+                        target,
+                        ConversationLimits {
+                            max_depth: max_depth.unwrap_or(current.max_depth),
+                            max_auto_turns: max_auto_turns.unwrap_or(current.max_auto_turns),
+                            max_iterations: max_iterations.unwrap_or(current.max_iterations),
+                        },
+                        Actor::Agent {
+                            conversation: caller,
+                        },
+                    )?;
+                }
+                let (limits, _) = self.conversation_limits(target)?;
+                json!({"conversation":target.to_string(), "depth":depth, "remaining_depth":limits.max_depth.saturating_sub(depth), "max_depth":limits.max_depth,"max_auto_turns":limits.max_auto_turns,"max_iterations":limits.max_iterations})
+            }
+            JobToolCall::JobAgents { after, limit } => {
+                self.job_agent_catalog(&caller_turn, after, limit)?
+            }
+            JobToolCall::JobWorkers { after, limit } => {
+                self.job_worker_catalog(caller, after, limit)?
+            }
+            JobToolCall::JobAssign {
+                conversation,
+                objective,
+            } => {
+                let worker = JobId::new(self.job_tool_id(&conversation, "job:")?);
+                self.job_tool_rights(caller, worker)?;
+                if !self.idle_worker(caller, worker)? {
+                    return self.reject(Violation::InvalidValue(
+                        "worker_not_idle",
+                        "the target is not an idle worker owned by this parent",
+                    ));
+                }
+                let row = self.require_user_conversation(worker)?;
+                let JobKind::Conversation {
+                    agent: Some(agent), ..
+                } = row.kind
+                else {
+                    return self.reject(Violation::InvalidValue(
+                        "dispatch_to",
+                        "worker must have an allowed Agent profile",
+                    ));
+                };
+                if !self.allowed_job_agents(&caller_turn)?.contains(&agent) {
+                    return self.reject(Violation::InvalidValue(
+                        "dispatch_to",
+                        "the caller's frozen Agent does not allow this worker's Agent profile",
+                    ));
+                }
+                if objective.trim().is_empty() {
+                    return self.reject(Violation::InvalidValue("objective", "must not be empty"));
+                }
+                let appended = self.append(
+                    worker,
+                    Entry::AgentMessage {
+                        text: objective,
+                        call,
+                    },
+                    None,
+                    None,
+                    false,
+                )?;
+                json!({"conversation":worker.to_string(), "turn":appended.turn.to_string()})
+            }
             JobToolCall::JobDispatch {
                 agent,
                 project,
@@ -149,6 +373,14 @@ impl Batch {
                     ));
                 }
                 let caller_row = self.require_job(caller)?;
+                if every_seconds.is_some()
+                    && self.conversation_limits(caller)?.0.max_iterations == 0
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "max_iterations",
+                        "scheduled recurrence is disabled by the conversation limits",
+                    ));
+                }
                 let project = match project {
                     Some(project) => Some(ProjectId::new(self.job_tool_id(&project, "project:")?)),
                     None => match caller_row.kind {

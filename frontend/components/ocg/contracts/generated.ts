@@ -18,7 +18,7 @@ export type WireSettlementState = "unsettled" | "completed" | "failed" | "cancel
 
 export type WireSettlement = { state: WireSettlementState, settled_at_us: number | null, };
 
-export type WireJob = { id: string, name: string | null, title: string | null, is_chat: boolean, execution_mode: string, input: string, previous: string | null, kind: WireJobKind, conversation: string | null, assigned_executor: string | null, created_at_us: number, updated_at_us: number, started_at_us: number | null, paused_at_us: number | null, sterilized_at_us: number | null, settlement: WireSettlement, stop_confirmed_at_us: number | null, };
+export type WireJob = { id: string, parent?: string, name: string | null, title: string | null, is_chat: boolean, execution_mode: string, input: string, previous: string | null, kind: WireJobKind, conversation: string | null, assigned_executor: string | null, created_at_us: number, updated_at_us: number, started_at_us: number | null, paused_at_us: number | null, sterilized_at_us: number | null, settlement: WireSettlement, stop_confirmed_at_us: number | null, };
 
 export type WireOutputKind = "progress" | "evaluation" | "result" | "reasoning";
 
@@ -34,7 +34,7 @@ export type WireProviderResponses = { job: string, responses: Array<WireProvider
 
 export type WireToolOutcomeKind = "completed" | "completed_withheld" | "not_applied" | "not_invoked" | "uncertain";
 
-export type WireToolCall = { tool_call_id: string, request: number, index: number, name: string, decision: string, outcome_kind: WireToolOutcomeKind | null, arguments: string | null, arguments_cut: boolean, result: string | null, result_cut: boolean, };
+export type WireToolCall = { tool_call_id: string, request: number, index: number, name: string, decision: string, outcome_kind: WireToolOutcomeKind | null, arguments: string | null, arguments_cut: boolean, result: string | null, result_cut: boolean, duration_ms?: number, };
 
 export type WireTools = { job: string, after: string | null, tools: Array<WireToolCall>, next_after: string | null, has_more: boolean, };
 
@@ -45,6 +45,8 @@ export type WireHold = { by: WireActor, };
 export type WireConversation = { root_job: string, tip_job: string, agent: string | null, title: string, project: string | null, state: string, on_hold: WireHold | null, tip_settlement_state: string, tip_created_at_us: number, };
 
 export type WireConversations = { conversations: Array<WireConversation>, has_more: boolean, next_before: string | null, };
+
+export type WireConversationLimits = { conversation: string, depth: number, remaining_depth: number, max_depth: number, max_auto_turns: number, max_iterations: number, };
 
 export type WireRecurrence = { interval_s: number, phase: string, due_us: number | null, };
 

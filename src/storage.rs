@@ -32,10 +32,10 @@ use crate::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
 };
 use crate::persistence::{
-    Actor, Appended, ApprovalDecision, ApprovalRecord, ConversationAction, ConversationSpec, Entry,
-    EntryKind, JobKind, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin, OutcomeKind,
-    PlanSource, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase, ResponseFormat,
-    StopProof, TurnEntry, TurnExecution,
+    Actor, Appended, ApprovalDecision, ApprovalRecord, ConversationAction, ConversationLimits,
+    ConversationSpec, Entry, EntryKind, JobKind, Notice, NoticeBody, NoticeClass, NoticeEvent,
+    Origin, OutcomeKind, PlanSource, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
+    ResponseFormat, StopProof, TurnEntry, TurnExecution,
 };
 use crate::persistence::{
     AgentBehavior, AgentConfig, ApproveClass, AttachmentId, AttachmentOrigin, AttachmentRecord,
@@ -114,8 +114,8 @@ pub(crate) use reads::{
     unneeded_content,
 };
 pub(crate) use reads::{
-    TurnContext, read_conversation_turns, read_notices, read_turn_context, read_turn_entries,
-    read_turn_execution,
+    TurnContext, read_conversation_limits, read_conversation_turns, read_notices,
+    read_turn_context, read_turn_entries, read_turn_execution,
 };
 pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow, usage_agent};
 use rows::{

@@ -381,6 +381,7 @@ pub struct JobOutputRecord {
 /// root. The Jobs of the conversation are never changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEdit {
+    Limits(super::ConversationLimits),
     Title(String),
     SuggestedTitle(String),
     /// Hides it from the conversation list, for good.
@@ -553,7 +554,7 @@ impl ApproveClass {
         match tool_name {
             "workspace_run_command" => Some(Self::Commands),
             "workspace_write_file" => Some(Self::Writes),
-            "job_dispatch" => Some(Self::Dispatch),
+            "job_dispatch" | "job_assign" => Some(Self::Dispatch),
             "job_close" => Some(Self::Close),
             _ => None,
         }

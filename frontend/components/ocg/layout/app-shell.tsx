@@ -1,7 +1,8 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { PanelRight } from "lucide-react";
+import { ArrowLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ChatScreen } from "../chat/chat-screen";
@@ -21,6 +22,7 @@ import { useI18n } from "../i18n";
 import { PageTitleVisibilityContext } from "./page-title";
 import { ConversationErrorsProvider, ConversationErrorScope, useConversationErrors } from "../chat/conversation-errors";
 import type { RuntimeStatus } from "../types";
+import { conversationAncestors, conversationPath, parseConversationPath } from "./conversation-path";
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -29,7 +31,8 @@ function currentLocation() {
   const url = new URL(window.location.href);
   const requested = url.searchParams.get("view") ?? url.pathname.slice(1).replace(/\.html$/, "");
   const job = url.searchParams.get("job");
-  return { view: isReachableView(requested) ? requested : "chat" as WorkspaceView, job: isJobIdentity(job) ? job : null };
+  const chain = parseConversationPath(url.pathname);
+  return { view: chain ? "chat" as WorkspaceView : isReachableView(requested) ? requested : "chat" as WorkspaceView, job: chain?.at(-1) ?? (isJobIdentity(job) ? job : null), chain };
 }
 
 type AppShellProps = {
@@ -50,6 +53,7 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
   const { t } = useI18n();
   const [location, setLocation] = useState(currentLocation);
   const [sessionId, setSessionId] = useState("");
+  const [ancestors, setAncestors] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
@@ -101,19 +105,26 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
     if (!location.job || location.view !== "chat" || !runtime.client.openConversation) return;
     let alive = true;
     setOpening(true);
-    void runtime.client.openConversation(location.job).then(id => {
-      if (alive) { transfer?.(location.job!, id); setSessionId(id); }
-    }).catch(cause => { if (alive) report?.(activeConversation.current, cause, { label: t("app.retryLoading"), run: () => setAttempt(value => value + 1) }); })
+    void (async () => {
+      const chain = await conversationAncestors(id => client.readJob(id), location.job!);
+      if (location.chain && conversationPath(chain) !== conversationPath(location.chain)) throw new Error(t("chat.child.invalidPath"));
+      if (!alive) return;
+      const id = await runtime.client.openConversation!(location.job!);
+      if (alive) {
+        transfer?.(location.job!, id); setSessionId(id); setAncestors(chain);
+        if (location.chain || chain.length > 1) window.history.replaceState(null, "", conversationPath(chain));
+      }
+    })().catch(cause => { if (alive) report?.(activeConversation.current, cause, { label: t("app.retryLoading"), run: () => setAttempt(value => value + 1) }); })
       .finally(() => { if (alive) setOpening(false); });
     return () => { alive = false; };
-  }, [location.job, location.view, runtime.client, attempt, report, transfer, t]);
+  }, [location.job, location.view, location.chain, runtime.client, client, attempt, report, transfer, t]);
 
   // Runtime actions such as Retry also admit successors, so their addresses must recover on reload.
   useEffect(() => {
-    if (location.view === "chat" && !opening && session?.sessionId) {
+    if (location.view === "chat" && !location.chain && ancestors.length <= 1 && !opening && session?.sessionId) {
       window.history.replaceState(null, "", `/?job=${session.sessionId}`);
     }
-  }, [location.view, opening, session?.sessionId]);
+  }, [location.view, location.chain, ancestors.length, opening, session?.sessionId]);
 
   const go = useCallback((view: WorkspaceView, job: string | null = null) => {
     if (!isReachableView(view)) return;
@@ -122,9 +133,20 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
     const path = view === "chat" ? "/" : `/${view}`;
     const href = `${path}${query.size ? `?${query}` : ""}`;
     window.history.pushState(null, "", href);
-    setLocation({ view, job });
+    setLocation({ view, job, chain: null });
+    setAncestors([]);
     setMobile(false);
   }, []);
+
+  async function openNestedConversation(job: string) {
+    const owner = activeConversation.current;
+    try {
+      const chain = await conversationAncestors(id => client.readJob(id), job);
+      if (activeConversation.current !== owner) return;
+      window.history.pushState(null, "", conversationPath(chain));
+      setSessionId(""); setLocation(currentLocation()); setMobile(false);
+    } catch (cause) { report?.(owner, cause); }
+  }
 
   const newChat = useCallback(async () => {
     const session = await runtime.createSession({ workType: "research" });
@@ -137,7 +159,7 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
     if (!session) throw new Error(t("app.createConversationFirst"));
     await runtime.sendMessage(session.id, { content: intent.text, selection: intent.selection, images: intent.images, mode: intent.mode });
     const updated = runtime.client.getSnapshot().sessions.find(item => item.id === session.id);
-    if (updated?.sessionId) {
+    if (updated?.sessionId && !location.chain && ancestors.length <= 1) {
       // Admission already installed the turn in the store; this only makes reload recover it.
       window.history.replaceState(null, "", `/?job=${updated.sessionId}`);
     }
@@ -165,12 +187,13 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
       <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view}
         titleVisible={location.view === "chat" || !pageTitleInView}
         onOpenMobileSidebar={() => setMobile(true)} syncStatus={runtime.sync?.status}
+        backButton={location.view === "chat" && ancestors.length > 1 ? <Button type="button" variant="ghost" size="icon" className="size-11 shrink-0 rounded-full bg-muted/80 backdrop-blur-sm" aria-label={t("chat.child.back")} title={t("chat.child.back")} onClick={() => { window.history.pushState(null, "", conversationPath(ancestors.slice(0,-1))); setSessionId(""); setLocation(currentLocation()); }}><ArrowLeft className="size-4" /></Button> : undefined}
         inspectorToggle={location.view === "chat" && !inspectorOpen ? <Button id="chat-inspector-toggle" type="button" variant="ghost" size="icon" className="size-11 shrink-0 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted" aria-label={t("topbar.expandInspector")} title={t("topbar.expandInspector")} aria-expanded={false} aria-controls="chat-inspector" onClick={() => setInspectorOpen(true)}><PanelRight className="size-4" /></Button> : undefined} />
-      {signOutError && <p role="alert" className="px-5 text-sm text-destructive">{signOutError}</p>}
+      {signOutError && <DismissibleNotice message={signOutError}  className="px-5 text-sm text-destructive">{signOutError}</DismissibleNotice>}
       <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
       <main key={location.view} className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
         {location.view === "chat" ? <>
-          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">{t("app.loadingConversation")}</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} onOpenConversation={job => { setSessionId(""); go("chat", job); }} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
+          {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">{t("app.loadingConversation")}</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} onOpenConversation={job => void openNestedConversation(job)} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
         </> : null}
         {location.view === "jobs" && <JobsSurface client={client} active job={location.job} onJob={job => go("jobs", job)} onOpenChat={job => { setSessionId(""); go("chat", job); }} />}
         {(location.view === "usage" || location.view === "health") && <ObservationsSurface key={location.view} client={client} kind={location.view} health={health} onJob={job => go("jobs", job)} />}

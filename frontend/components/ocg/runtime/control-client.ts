@@ -6,6 +6,7 @@ import {
   decodeAttachment,
   decodeControlError,
   decodeConversationEdit,
+  decodeConversationLimits,
   decodeConversations,
   decodeChildren,
   decodeCards,
@@ -66,7 +67,8 @@ export type ControlPoolUpdate =
 
 export type ControlConversationEdit =
   | { title: string; hidden?: never }
-  | { hidden: true; title?: never };
+  | { hidden: true; title?: never }
+  | { limits: Pick<ReturnType<typeof decodeConversationLimits>, "max_depth" | "max_auto_turns" | "max_iterations">; title?: never; hidden?: never };
 
 export type JobStreamEvent = ControlJobEvent | { type: "heartbeat"; };
 export type JobStreamEnd = "settled" | "stream_error" | "aborted";
@@ -486,6 +488,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const result = decodeConversationEdit(answer.input, root);
       conversationListeners.forEach((listener) => listener());
       return result;
+    },
+
+    async readConversationLimits(conversation: string, signal?: AbortSignal) {
+      jobIdentity(conversation);
+      return decodeConversationLimits((await send("GET", `/api/v1/conversations/${conversation}/limits`, { signal })).input, conversation);
     },
 
     async readJobs(settings: { before?: string; limit?: number; signal?: AbortSignal } = {}) {

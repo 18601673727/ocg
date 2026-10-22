@@ -34,6 +34,7 @@ function metadataFor(message: ChatMessage, messages: readonly ChatMessage[]): Oc
     reasoning: message.reasoning,
     reasoningDurationMs: message.reasoningDurationMs,
     intermediate: message.intermediate,
+    toolMetrics: Object.fromEntries((message.toolCalls ?? []).map(call => [call.tool_call_id, { durationMs: call.duration_ms, truncated: call.arguments_cut || call.result_cut }])),
     failureReason: message.failureReason,
     failureCode: message.failureCode,
     call: message.call ?? message.tool,

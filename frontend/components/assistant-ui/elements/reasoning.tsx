@@ -39,7 +39,7 @@ export function ReasoningContent({ children, streaming = false, ...props }: Comp
     return () => observer.disconnect();
   }, [children, streaming]);
   return <CollapsibleContent {...props} data-streaming={streaming ? "true" : undefined}>
-    <div ref={contentRef} role="region" aria-label={t("chat.thinking")} className="border-t border-border/60 px-3 py-2 text-[13px] leading-6 text-muted-foreground">{children}</div>
+    <div ref={contentRef} role="region" aria-label={t("chat.thinking")} className="border-b border-border/60 px-3 py-2 text-[13px] leading-6 text-muted-foreground">{children}</div>
   </CollapsibleContent>;
 }
 export function ReasoningText({ children }: { children: ReactNode }) { return <div>{children}</div>; }

@@ -743,7 +743,7 @@ impl Command {
                 ConversationEdit::Title(title) | ConversationEdit::SuggestedTitle(title) => {
                     byte_count(title.len())
                 }
-                ConversationEdit::Hide => 16,
+                ConversationEdit::Hide | ConversationEdit::Limits(_) => 16,
             },
             Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {
                 byte_count(config.name.len()).saturating_add(match &config.body {

@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, CirclePause, Repeat2 } from "lucide-react";
 
@@ -317,7 +318,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
           {t("common.refresh")}
         </Button>
       </div>
-      {failure ? <p role="alert" className="text-sm text-destructive">{failure}</p> : null}
+      {failure ? <DismissibleNotice message={failure}  className="text-sm text-destructive">{failure}</DismissibleNotice> : null}
       {loading && !tree ? <p role="status" className="text-sm text-muted-foreground">{t("common.loading")}</p> : null}
       {tree ? (
         <ul aria-label={t("jobs.tree.title")} className="flex flex-col">

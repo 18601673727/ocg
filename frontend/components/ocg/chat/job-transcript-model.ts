@@ -175,9 +175,22 @@ function providerMessages(
     }
     messages.push({ ...answer, content, reasoning: undefined, reasoningDurationMs: undefined, tools: undefined });
   }
-  return messages;
+  return groupConsecutiveTools(messages);
 }
 
+function groupConsecutiveTools(messages: TranscriptTurn[]): TranscriptTurn[] {
+  const grouped: TranscriptTurn[] = [];
+  for (const message of messages) {
+    if (message.intermediate && !message.content.trim() && !message.reasoning && !message.tools?.length && !message.detail) continue;
+    const previous = grouped.at(-1);
+    if (message.intermediate && !message.content.trim() && !message.reasoning && !message.detail
+      && message.tools?.length && previous?.tools?.length && previous.role === "assistant") {
+      previous.tools = [...previous.tools, ...message.tools];
+      if (message.status === "streaming" || message.status === "pending") previous.status = message.status;
+    } else grouped.push({ ...message });
+  }
+  return grouped;
+}
 
 function fallbackMessages(answer: TranscriptTurn, progress: string, visible: (text: string) => string): TranscriptTurn[] {
   if (answer.status !== "completed") return [answer];

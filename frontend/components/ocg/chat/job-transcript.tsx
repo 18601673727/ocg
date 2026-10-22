@@ -1,11 +1,14 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { cn } from "@/lib/utils";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { STATUS_TEXT } from "@/components/ocg/primitives";
 import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/contracts";
 import type { TranscriptTurn } from "./job-transcript-model";
 import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
+import { ToolActivityLabel } from "./tool-activity-label";
+import { ReasoningRoot, ReasoningTrigger, ReasoningContent, estimateReasoningTokens } from "@/components/assistant-ui/elements/reasoning";
 
 const STATUS_NOTE: Partial<Record<TranscriptTurn["status"], I18nKey>> = {
   streaming: "transcript.status.streaming",
@@ -28,7 +31,7 @@ function TurnRow({
   const { t } = useI18n();
   const isUser = turn.role === "user";
   const note = isUser ? undefined : STATUS_NOTE[turn.status];
-  const reasoning = !isUser && turn.reasoning ? <details className="rounded-md border border-border bg-muted/20 text-xs"><summary className="cursor-pointer px-3 py-2">{t("chat.thinking")}</summary><p className="whitespace-pre-wrap break-words px-3 pb-3">{turn.reasoning}</p></details> : null;
+  const reasoning = !isUser && turn.reasoning ? <ReasoningRoot defaultOpen={false}><ReasoningContent><p className="whitespace-pre-wrap break-words">{turn.reasoning}</p></ReasoningContent><ReasoningTrigger active={turn.status === "streaming" || turn.status === "pending"} duration={turn.reasoningDurationMs === undefined ? undefined : turn.reasoningDurationMs / 1000} tokens={estimateReasoningTokens(turn.reasoning)} /></ReasoningRoot> : null;
   const toolCalls = !isUser && turn.tools?.length ? <TurnToolCalls tools={turn.tools} isLive={turn.status === "streaming" || turn.status === "pending"} /> : null;
   if (!isUser && !turn.content && !turn.detail && !turn.attachments?.length) {
     if (reasoning || toolCalls) return <>{reasoning}{toolCalls}</>;
@@ -104,9 +107,9 @@ function TurnRow({
           {/* The Provider's text is shown as text: it is never interpreted as markup. */}
           <p className="whitespace-pre-wrap break-words">{turn.content}</p>
           {turn.detail ? (
-            <p role="alert" className="mt-2 whitespace-pre-wrap break-words text-xs">
+            <DismissibleNotice message={turn.detail}  className="mt-2 whitespace-pre-wrap break-words text-xs">
               {turn.detail}
-            </p>
+            </DismissibleNotice>
           ) : null}
           {note ? <span className="mt-1 block text-xs text-muted-foreground">{t(note)}</span> : null}
         </div>
@@ -174,7 +177,7 @@ function TurnToolCalls({
   return (
     <details className="mt-2.5 rounded-md border border-border bg-muted/20 text-xs">
       <summary className="cursor-pointer select-none px-3 py-2 font-medium text-muted-foreground hover:text-foreground">
-        {t("transcript.toolCalls", { count: tools.length })}
+        <ToolActivityLabel tools={tools.map(tool => ({ name: tool.name, arguments: tool.arguments, result: tool.result, durationMs: tool.duration_ms, truncated: tool.arguments_cut || tool.result_cut }))} />
       </summary>
       <div className="flex flex-col gap-2 p-3 pt-0">
         {tools.map((tool) => {

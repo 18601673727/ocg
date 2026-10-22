@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import type { ComponentPropsWithRef, ComponentPropsWithoutRef, ReactNode } from "react";
 import { ArrowUp, Command, ListPlus, Loader2, Paperclip, Sparkles, Square } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -130,9 +131,9 @@ export function ChatComposerInput({ textarea, suggestions, error, actions }: {
         />
       </div>
       {error && !errorInHeader && (
-        <p role="alert" className={`border-t border-border px-3 py-1.5 text-xs ${STATUS_TEXT['error']}`}>
+        <DismissibleNotice message={error}  className={`border-t border-border px-3 py-1.5 text-xs ${STATUS_TEXT['error']}`}>
           {error}
-        </p>
+        </DismissibleNotice>
       )}
       <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
         <Button

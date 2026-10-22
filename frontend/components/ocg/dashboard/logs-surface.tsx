@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
@@ -52,7 +53,7 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
         {snapshot?.files.map((name) => <option key={name} value={name}>{name}</option>)}
       </select>
     </label>
-    {error ? <p role="alert" className="text-sm text-destructive">{error} <Button variant="ghost" size="sm" onClick={() => { setFile(""); refresh(); }}>{t("logs.readLatest")}</Button></p> : null}
+    {error ? <DismissibleNotice message={error}  className="text-sm text-destructive">{error} <Button variant="ghost" size="sm" onClick={() => { setFile(""); refresh(); }}>{t("logs.readLatest")}</Button></DismissibleNotice> : null}
     {!snapshot && loading ? <p role="status">{t("logs.loading")}</p> : null}
     {snapshot ? <section aria-label={t("logs.output")} className="min-w-0 rounded-lg border border-border bg-card p-4">
       <div className="mb-3 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground"><span className="font-mono">{snapshot.file ?? t("logs.noFile")}</span><span>{t("logs.status", { count: snapshot.lines.length, mode: live ? t("logs.liveMode") : t("logs.refreshPaused") })}</span></div>

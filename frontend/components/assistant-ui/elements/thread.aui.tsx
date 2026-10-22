@@ -29,6 +29,8 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useConversationError } from "@/components/ocg/chat/conversation-errors";
+import { ToolActivityLabel } from "@/components/ocg/chat/tool-activity-label";
+import type { ToolActivity } from "@/components/ocg/chat/tool-activity-summary";
 import {
   ActionBarMorePrimitive,
   ActionBarPrimitive,
@@ -73,6 +75,7 @@ import {
   type ComponentType,
   type FC,
   type PropsWithChildren,
+  type ReactNode,
 } from "react";
 import { useI18n } from "@/components/ocg/i18n";
 
@@ -139,6 +142,7 @@ const taskAwareGroupBy = (
 export type ThreadProps = {
   components?: ThreadComponents | undefined;
   autoFocus?: boolean | undefined;
+  afterMessages?: ReactNode;
 };
 
 const EMPTY_COMPONENTS: ThreadComponents = {};
@@ -186,19 +190,21 @@ const ThreadHistorySkeleton: FC = () => {
 export const Thread: FC<ThreadProps> = ({
   components = EMPTY_COMPONENTS,
   autoFocus = true,
+  afterMessages,
 }) => {
   const isEmpty = useAuiState(isNewChatView);
 
   return (
     <ThreadComponentsContext.Provider value={components}>
-      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} />
+      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} afterMessages={afterMessages} />
     </ThreadComponentsContext.Provider>
   );
 };
 
-const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
+const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; afterMessages?: ReactNode }> = ({
   isEmpty,
   autoFocus,
+  afterMessages,
 }) => {
   const {
     Welcome = ThreadWelcome,
@@ -244,6 +250,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean }> = ({
             <ThreadPrimitive.Messages>
               {() => <ThreadMessage />}
             </ThreadPrimitive.Messages>
+            {afterMessages}
           </div>
 
           <ThreadPrimitive.ViewportFooter
@@ -646,6 +653,7 @@ const AssistantMessage: FC = () => {
   const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
   const latestReasoningIndex = useLatestReasoningIndex();
   const messageParts = useAuiState((s) => s.message.parts);
+  const toolMetrics = useAuiState((s) => s.message.metadata.custom.toolMetrics);
   const unsettled = useAuiState((s) => s.message.status?.type === "running");
   const intermediate = useAuiState((s) => s.message.metadata.custom.intermediate === true);
   const storedReasoningDuration = useAuiState((s) => {
@@ -695,6 +703,15 @@ const AssistantMessage: FC = () => {
                       <ToolGroupTrigger
                         count={part.indices.length}
                         active={part.status.type === "running"}
+                        summary={<ToolActivityLabel tools={part.indices.flatMap(index => {
+                          const call = messageParts[index];
+                          if (call?.type !== "tool-call") return [];
+                          const metric: unknown = toolMetrics && typeof toolMetrics === "object" ? Reflect.get(toolMetrics, call.toolCallId) : undefined;
+                          return [{ name: call.toolName, arguments: call.argsText, result: call.result,
+                            durationMs: metric && typeof metric === "object" && typeof Reflect.get(metric, "durationMs") === "number" ? Reflect.get(metric, "durationMs") as number : undefined,
+                            truncated: Boolean(metric && typeof metric === "object" && Reflect.get(metric, "truncated")),
+                          } satisfies ToolActivity];
+                        })} />}
                       />
                       <ToolGroupContent streaming={part.status.type === "running"}>{children}</ToolGroupContent>
                     </ToolGroupRoot>
@@ -708,6 +725,9 @@ const AssistantMessage: FC = () => {
                   const running = part.status.type === "running";
                   return (
                     <ReasoningRoot streaming={running} latest={part.indices.includes(latestReasoningIndex)}>
+                      <ReasoningContent streaming={running} aria-busy={running}>
+                        <ReasoningText>{children}</ReasoningText>
+                      </ReasoningContent>
                       <ReasoningTrigger
                         active={unsettled}
                         duration={storedReasoningDuration ?? reasoningDuration(part.timing)}
@@ -716,9 +736,6 @@ const AssistantMessage: FC = () => {
                           return item?.type === "reasoning" ? item.text : "";
                         }).join(""))}
                       />
-                      <ReasoningContent streaming={running} aria-busy={running}>
-                        <ReasoningText>{children}</ReasoningText>
-                      </ReasoningContent>
                     </ReasoningRoot>
                   );
                 }

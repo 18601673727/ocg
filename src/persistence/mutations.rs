@@ -591,7 +591,7 @@ fn require_conversation(batch: &mut Batch, id: JobId) -> OpResult<()> {
     }
 }
 
-/// Renames or hides a conversation. Hiding twice changes nothing, and no
+/// Edits conversation metadata or limits. Hiding twice changes nothing, and no
 /// Job is touched.
 pub(crate) fn set_conversation(
     batch: &mut Batch,
@@ -601,6 +601,9 @@ pub(crate) fn set_conversation(
     require_conversation(batch, root)?;
     let mut row = batch.conversation(root)?;
     match edit {
+        ConversationEdit::Limits(limits) => {
+            return batch.set_conversation_limits(root, limits, super::Actor::User);
+        }
         ConversationEdit::Title(title) => row.title = Some(title),
         ConversationEdit::SuggestedTitle(_) if row.title.is_some() => return Ok(()),
         ConversationEdit::SuggestedTitle(title) => row.title = Some(title),

@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useState } from "react";
 import type { ChatModelSelection, ControlAgentProfile, ControlProject } from "../contracts";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
@@ -96,7 +97,7 @@ export function ModelSelector({ sessionId, selection, onChange, onPreference, bu
       provider={{ value: agentId ?? "", options: agents.filter(option => !fixedAgent || option.id === fixedAgent).map(agent => ({ value: agent.id, label: agent.name })), onChange: value => choose(value) }}
       model={{ value: llmId ?? "", options: targets.map(target => ({ value: target.id, label: target.name.trim() || target.model })), onChange: value => { if (agentId) choose(agentId, value); } }}
       effort={{ value: executor ?? "", options: (llm?.executors ?? []).map(id => ({ value: id, label: id })), onChange: value => { if (agentId) choose(agentId, llmId, value); } }} />
-    {llm && !llm.declared_capabilities.includes("tools") && <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.toolsWarning")}</p>}
-    {llm && !llm.declared_capabilities.includes("vision") && <p role="status" className="mt-1 px-1 text-xs text-muted-foreground">{t("chat.visionWarning")}</p>}
+    {llm && !llm.declared_capabilities.includes("tools") && <DismissibleNotice tone="warning" message={t("chat.toolsWarning")} className="mt-1 px-1 text-xs text-muted-foreground" />}
+    {llm && !llm.declared_capabilities.includes("vision") && <DismissibleNotice tone="warning" message={t("chat.visionWarning")} className="mt-1 px-1 text-xs text-muted-foreground" />}
   </div>;
 }

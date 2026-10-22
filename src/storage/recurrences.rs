@@ -17,6 +17,7 @@ impl Recurrence {
                     RecurrenceHalt::Closed => 0,
                     RecurrenceHalt::ConfigUnavailable => 1,
                     RecurrenceHalt::Refused => 2,
+                    RecurrenceHalt::LimitReached => 3,
                 });
             }
         }
@@ -36,6 +37,7 @@ impl Recurrence {
                     0 => RecurrenceHalt::Closed,
                     1 => RecurrenceHalt::ConfigUnavailable,
                     2 => RecurrenceHalt::Refused,
+                    3 => RecurrenceHalt::LimitReached,
                     _ => return Err(StorageError::corrupted("invalid recurrence halt")),
                 },
             },
@@ -114,6 +116,10 @@ impl Batch {
             let RecurrencePhase::WaitingDue { due } = recurrence.phase else {
                 return self.corrupted("recurrence due outside WaitingDue".into());
             };
+            if recurrence.n >= u64::from(self.conversation_limits(conversation)?.0.max_iterations) {
+                self.halt_recurrence(conversation, RecurrenceHalt::LimitReached)?;
+                continue;
+            }
             let first = self.step(|tx| {
                 tx.open_table(CHILDREN)?
                     .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?

@@ -90,6 +90,7 @@ pub(super) fn settlement_view(record: &JobRecord) -> Result<WireSettlement, Refu
 pub(super) fn job_view(record: &JobRecord) -> Result<WireJob, Refusal> {
     Ok(WireJob {
         id: record.id.to_string(),
+        parent: record.parent_id.map(|id| id.to_string()),
         name: record.name.clone(),
         title: record.objective.clone(),
         is_chat: record.conversation.is_some(),
@@ -436,6 +437,14 @@ fn tool_view(record: &ToolEvidenceRecord) -> WireToolCall {
         arguments_cut,
         result: result.map(str::to_owned),
         result_cut,
+        duration_ms: record.outcome.as_ref().and_then(|outcome| {
+            outcome
+                .at
+                .as_unix_micros()
+                .checked_sub(record.decision.at.as_unix_micros())
+                .and_then(|micros| u64::try_from(micros).ok())
+                .map(|micros| micros / 1000)
+        }),
     }
 }
 
@@ -742,13 +751,13 @@ mod tests {
                     arguments: ToolPayload::new(format!("{{\"path\": \"{}\"}}", "a".repeat(3000))),
                     authorization: AuthorizationBasis::RegistryGrant,
                 }),
-                at: Timestamp::now(),
+                at: Timestamp::from_unix_micros(1_000_000),
             },
             outcome: Some(Recorded {
                 fact: ToolOutcome::Completed {
                     result: ToolPayload::new("result output".repeat(300)),
                 },
-                at: Timestamp::now(),
+                at: Timestamp::from_unix_micros(1_250_000),
             }),
             reconciliation: None,
         };
@@ -757,6 +766,7 @@ mod tests {
         assert_eq!(json["name"], "workspace_read_file");
         assert_eq!(json["decision"], "admitted");
         assert_eq!(json["outcome_kind"], "completed");
+        assert_eq!(json["duration_ms"], 250);
         assert_eq!(json["arguments_cut"], true);
         assert_eq!(json["result_cut"], true);
         assert!(json.get("outcome").is_none());
@@ -789,6 +799,7 @@ mod tests {
         assert_eq!(json_refused["name"], "workspace_run_command");
         assert_eq!(json_refused["decision"], "unauthorized");
         assert_eq!(json_refused["outcome_kind"], Value::Null);
+        assert!(json_refused.get("duration_ms").is_none());
         assert_eq!(json_refused["arguments"], Value::Null);
         assert_eq!(json_refused["arguments_cut"], false);
         assert_eq!(json_refused["result"], Value::Null);

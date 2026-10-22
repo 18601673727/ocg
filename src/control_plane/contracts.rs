@@ -82,6 +82,9 @@ contracts! {
     }
     struct WireJob {
         pub id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub parent: Option<String>,
         pub name: Option<String>,
         pub title: Option<String>,
         pub is_chat: bool,
@@ -163,6 +166,9 @@ contracts! {
         pub arguments_cut: bool,
         pub result: Option<String>,
         pub result_cut: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub duration_ms: Option<u64>,
     }
     struct WireTools {
         pub job: String,
@@ -197,6 +203,14 @@ contracts! {
         pub conversations: Vec<WireConversation>,
         pub has_more: bool,
         pub next_before: Option<String>,
+    }
+    struct WireConversationLimits {
+        pub conversation: String,
+        pub depth: u8,
+        pub remaining_depth: u8,
+        pub max_depth: u8,
+        pub max_auto_turns: u8,
+        pub max_iterations: u32,
     }
     struct WireRecurrence {
         pub interval_s: u32,

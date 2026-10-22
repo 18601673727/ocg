@@ -95,6 +95,7 @@ function jobRecord(input: unknown) {
   }
   return {
     id: identity(job.id, "job.id", "job:"),
+    ...(job.parent === undefined || job.parent === null ? {} : { parent: identity(job.parent, "job.parent", "job:") }),
     kind: job.kind === "conversation" ? "conversation" as const : job.kind === "turn" ? "turn" as const : (() => { throw new ContractError("job.kind", "conversation or turn"); })(),
     conversation: job.conversation === null ? null : identity(job.conversation, "job.conversation", "job:"),
     name: job.name === null ? null : string(job.name, "job.name"),
@@ -205,6 +206,18 @@ export function decodeProviderResponses(input: unknown, jobId: string) {
 }
 
 export type ControlProviderResponse = Omit<Wire.WireProviderResponse, "text_offset" | "text_complete">;
+
+export function decodeConversationLimits(input: unknown, conversation: string) {
+  const item = record(input, "response");
+  if (item.api_version !== CONTROL_API_VERSION || item.conversation !== conversation) throw new ContractError("conversation", conversation);
+  const depth = integer(item.depth, "depth");
+  const remaining_depth = integer(item.remaining_depth, "remaining_depth");
+  const max_depth = integer(item.max_depth, "max_depth");
+  const max_auto_turns = integer(item.max_auto_turns, "max_auto_turns");
+  const max_iterations = integer(item.max_iterations, "max_iterations");
+  if (depth > 16 || max_depth > 16 || max_auto_turns > 255 || max_iterations > 10000 || remaining_depth !== Math.max(0, max_depth - depth)) throw new ContractError("limits", "bounded conversation limits with matching remaining depth");
+  return { conversation, depth, remaining_depth, max_depth, max_auto_turns, max_iterations } satisfies Wire.WireConversationLimits;
+}
 
 /** What the host establishes about itself and its database, now. */
 export function decodeHealth(input: unknown) {
@@ -506,6 +519,7 @@ function toolCallRecord(value: unknown, path: string): ControlToolCall {
         ? null
         : string(item.result, `${path}.result`),
     result_cut: boolean(item.result_cut, `${path}.result_cut`),
+    ...(item.duration_ms === undefined || item.duration_ms === null ? {} : { duration_ms: integer(item.duration_ms, `${path}.duration_ms`) }),
   } satisfies Wire.WireToolCall;
 }
 

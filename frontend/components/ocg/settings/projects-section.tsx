@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import {
@@ -212,9 +213,9 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
       }
     >
       {loadError ? (
-        <p role="alert" className="py-2 text-sm text-destructive">
+        <DismissibleNotice message={loadError}  className="py-2 text-sm text-destructive">
           {loadError}
-        </p>
+        </DismissibleNotice>
       ) : null}
 
       <div className="divide-y divide-border/70 py-2">
@@ -429,9 +430,9 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
         </div>
 
         {error ? (
-          <p role="alert" className="text-sm text-destructive">
+          <DismissibleNotice message={error}  className="text-sm text-destructive">
             {error}
-          </p>
+          </DismissibleNotice>
         ) : null}
         {notice ? (
           <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">

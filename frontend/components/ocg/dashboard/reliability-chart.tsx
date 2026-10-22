@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
 import type { decodeAvailability, decodeUsage, decodeUsageBuckets, decodeUsageRetries } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
@@ -129,12 +130,12 @@ function ReliabilityChartData({ client, days, bucket }: { client: HttpCanonicalC
     void load();
     return () => controller.abort();
   }, [client, days, bucket]);
-  if (result.error) return <p role="alert" className="text-sm text-destructive">{result.error}</p>;
+  if (result.error) return <DismissibleNotice message={result.error}  className="text-sm text-destructive">{result.error}</DismissibleNotice>;
   if (!result.data) return <p role="status">{t("common.loading")}</p>;
   const empty = result.data.totalRequests === 0 && result.data.totalRetries === 0
     && result.data.ttfbCount === 0 && result.data.durationCount === 0;
   return <>
-    {result.data.partial ? <p role="status" className="mb-3 text-sm text-muted-foreground">{t("observations.reliabilityPartial")}</p> : null}
+    {result.data.partial ? <DismissibleNotice tone="warning" message={t("observations.reliabilityPartial")} className="mb-3 text-sm text-muted-foreground" /> : null}
     {empty ? <p className="py-4 text-sm text-muted-foreground">{t("observations.reliabilityNoData")}</p> : <ReliabilityPlot data={result.data} />}
   </>;
 }

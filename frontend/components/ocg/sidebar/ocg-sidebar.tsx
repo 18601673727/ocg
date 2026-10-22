@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useRef, useState } from "react";
 import {
   ChevronsLeft,
@@ -509,7 +510,7 @@ export function OcgSidebar({
               disabled={renaming}
               autoFocus
             />
-            {renameError && <p role="alert" className="break-words text-xs text-destructive">{renameError}</p>}
+            {renameError && <DismissibleNotice message={renameError}  className="break-words text-xs text-destructive">{renameError}</DismissibleNotice>}
             <DialogFooter>
               <Button type="button" variant="outline" disabled={renaming} onClick={() => setRenameTarget(null)}>
                 {t("common.cancel")}
@@ -528,7 +529,7 @@ export function OcgSidebar({
             <DialogTitle className="normal-case tracking-normal">{t("sidebar.hideChatTitle")}</DialogTitle>
             <DialogDescription>{t("sidebar.hideChatBody", { title: hideTarget?.title || t("sidebar.newChat") })}</DialogDescription>
           </DialogHeader>
-          {hideError && <p role="alert" className="break-words text-xs text-destructive">{hideError}</p>}
+          {hideError && <DismissibleNotice message={hideError}  className="break-words text-xs text-destructive">{hideError}</DismissibleNotice>}
           <DialogFooter>
             <Button ref={cancelHideRef} variant="outline" disabled={hiding} onClick={() => setHideTarget(null)}>{t("common.cancel")}</Button>
             <Button variant="destructive" disabled={hiding} onClick={() => void confirmHide()}>

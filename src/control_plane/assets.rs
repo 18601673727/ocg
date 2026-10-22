@@ -127,6 +127,23 @@ fn resolved(path: &str) -> Option<String> {
         return None;
     }
     let segments = rest.split('/').collect::<Vec<_>>();
+    if segments.first() == Some(&"jobs") && segments.get(1).is_some_and(|id| id.starts_with("job:"))
+    {
+        if segments.len() % 2 != 0
+            || segments.len() > 2 * (usize::from(crate::persistence::MAX_CONVERSATION_DEPTH) + 1)
+        {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        return segments
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|pair| {
+                pair[0] == "jobs" && super::routing::job_id(pair[1]).is_ok() && seen.insert(pair[1])
+            })
+            .then(String::new);
+    }
     if !segments.iter().all(|segment| named(segment)) {
         return None;
     }
@@ -185,4 +202,25 @@ pub(super) fn response(asset: Asset) -> HttpResponse {
         )
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(asset.body)
+}
+
+#[cfg(test)]
+mod nested_route_tests {
+    use super::resolved;
+
+    #[test]
+    fn nested_conversation_paths_serve_the_shared_chat_page() {
+        assert_eq!(
+            resolved("/jobs/job:1/jobs/job:3/jobs/job:5"),
+            Some(String::new())
+        );
+        for path in [
+            "/jobs/job:1/jobs",
+            "/jobs/job:1/jobs/job:1",
+            "/jobs/job:1/other/job:2",
+            "/jobs/job%3A1",
+        ] {
+            assert!(resolved(path).is_none(), "{path}");
+        }
+    }
 }

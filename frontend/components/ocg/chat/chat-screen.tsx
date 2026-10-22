@@ -258,9 +258,8 @@ export const ChatScreen: FC<ChatScreenProps> = ({
     <OcgAssistantProvider sessionId={session.id} projectId={session.projectId ?? ""}>
       <ChatComposerContext.Provider value={composerValue}>
         <div className={cn("flex h-full min-h-0 w-full flex-col", busy && "[&_[data-slot=aui-thread-viewport]]:scroll-smooth")}>
-          <ConversationChildrenStrip key={session.id} turn={session.sessionId} onOpen={onOpenConversation} />
           <ConversationCardStrip key={`cards:${session.id}`} turn={session.sessionId} onOpen={onOpenConversation} />
-          <Thread components={THREAD_COMPONENTS} autoFocus />
+          <Thread components={THREAD_COMPONENTS} autoFocus afterMessages={<ConversationChildrenStrip key={session.id} turn={session.sessionId} onOpen={onOpenConversation} />} />
         </div>
       </ChatComposerContext.Provider>
     </OcgAssistantProvider>

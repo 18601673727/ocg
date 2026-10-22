@@ -31,6 +31,7 @@ type OcgTopbarProps = {
    */
   projectSelector?: React.ReactNode;
   inspectorToggle?: React.ReactNode;
+  backButton?: React.ReactNode;
 };
 
 export function OcgTopbar({
@@ -43,6 +44,7 @@ export function OcgTopbar({
   syncStatus,
   projectSelector,
   inspectorToggle,
+  backButton,
 }: OcgTopbarProps) {
   const { t } = useI18n();
 
@@ -122,6 +124,7 @@ export function OcgTopbar({
         </div>
       )}
 
+      {backButton}
       {inspectorToggle}
 
     </header>

@@ -7,6 +7,7 @@ import {
   useState,
   type FC,
   type PropsWithChildren,
+  type ReactNode,
 } from "react";
 import { ChevronDownIcon, LoaderIcon } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
@@ -97,11 +98,13 @@ function ToolGroupRoot({
 function ToolGroupTrigger({
   count,
   active = false,
+  summary,
   className,
   ...props
 }: React.ComponentProps<typeof CollapsibleTrigger> & {
   count: number;
   active?: boolean;
+  summary?: ReactNode;
 }) {
   const { t } = useI18n();
   const label = t(count === 1 ? "aui.toolCalls.one" : "aui.toolCalls.other", { count });
@@ -134,7 +137,7 @@ function ToolGroupTrigger({
           active && "shimmer motion-reduce:animate-none",
         )}
       >
-        {label}
+        {summary ?? label}
       </span>
       <ChevronDownIcon
         data-slot="tool-group-trigger-chevron"

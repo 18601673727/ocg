@@ -437,11 +437,13 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
     finally { lock.current = false; setPending(null); }
   }
   if (!control || !children.length) return null;
-  return <section className="shrink-0 border-b border-border px-3 py-2" aria-label={t("chat.children")}>
-    <div className="flex max-h-40 gap-2 overflow-auto">
-      {children.map(child => <div key={child.id} className="min-w-56 rounded-md border border-border px-3 py-2 text-xs">
-        <p className="max-w-72 truncate font-medium" title={child.title}>{child.title || child.id}</p>
-        <p className="text-muted-foreground">{child.id} · {child.agent} · {t(`chat.child.${child.state}`)}{child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}</p>
+  return <section className="py-2" aria-label={t("chat.children")} data-slot="conversation-child-cards">
+    <div className="flex flex-wrap gap-3">
+      {children.map(child => <div key={child.id} className="w-64 max-w-full rounded-xl border border-border bg-muted/20 p-3 text-xs">
+        <button type="button" className="block w-full space-y-2 rounded-md text-left hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring" onClick={() => onOpen(child.id)} aria-label={t("chat.child.openNamed", { title: child.title || child.id })}>
+        <span className="block truncate font-medium" title={child.title}>{child.title || child.id}</span>
+        <span className="block text-muted-foreground">{child.id} · {child.agent} · {t(`chat.child.${child.state}`)}{child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}</span>
+        </button>
         {child.recurrence && <p className="text-muted-foreground">{t("chat.child.every", { seconds: child.recurrence.interval_s })} · {t(`chat.child.${child.recurrence.phase}`)}{child.recurrence.due_us !== null ? ` · ${new Date(child.recurrence.due_us / 1000).toLocaleString()}` : ""}</p>}
         <div className="mt-1 flex gap-1">
           <Button size="xs" variant="ghost" onClick={() => onOpen(child.id)}>{t("common.open")}</Button>

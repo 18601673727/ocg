@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
@@ -134,7 +135,7 @@ export function ObservationsSurface({ client, kind, health, onJob }: {
         <p className="my-3 text-sm text-muted-foreground">
           {kind === "usage" ? t("observations.usageNote") : t("observations.providerNote")}
         </p>
-        {page.error ? <p role="alert" className="mb-3 text-sm text-destructive">{page.error}</p> : null}
+        {page.error ? <DismissibleNotice message={page.error}  className="mb-3 text-sm text-destructive">{page.error}</DismissibleNotice> : null}
         {page.items.length === 0 && !page.error && (!page.ready || page.next || page.loading) ? <p role="status">{t("observations.loading")}</p> : null}
         {page.ready && page.items.length === 0 && !page.next && !page.loading && !page.error ? <p className="py-4 text-sm text-muted-foreground">{t("observations.empty")}</p> : null}
         {page.items.length > 0 ? <div className="overflow-x-auto">

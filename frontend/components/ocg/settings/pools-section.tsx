@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -161,14 +162,14 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
       }
     >
       {loadError ? (
-        <p role="alert" className="py-2 text-sm text-destructive">
+        <DismissibleNotice message={loadError}  className="py-2 text-sm text-destructive">
           {loadError}
-        </p>
+        </DismissibleNotice>
       ) : null}
       {actionError ? (
-        <p role="alert" className="py-2 text-sm text-destructive">
+        <DismissibleNotice message={actionError}  className="py-2 text-sm text-destructive">
           {actionError}
-        </p>
+        </DismissibleNotice>
       ) : null}
 
       <div className="divide-y divide-border/70 py-2">

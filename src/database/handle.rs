@@ -577,6 +577,13 @@ impl DatabaseHandle {
         })
         .await
     }
+    pub async fn conversation_limits(
+        &self,
+        conversation: JobId,
+    ) -> Result<Option<(crate::persistence::ConversationLimits, u8)>, DatabaseError> {
+        self.read(move |database| storage::read_conversation_limits(database, conversation))
+            .await
+    }
     pub async fn conversation_turns(
         &self,
         conversation: JobId,

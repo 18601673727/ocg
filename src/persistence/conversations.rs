@@ -1,5 +1,45 @@
 use super::*;
 
+pub const MAX_CONVERSATION_DEPTH: u8 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationLimits {
+    pub max_depth: u8,
+    pub max_auto_turns: u8,
+    pub max_iterations: u32,
+}
+
+impl Default for ConversationLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 3,
+            max_auto_turns: 8,
+            max_iterations: 100,
+        }
+    }
+}
+
+impl ConversationLimits {
+    pub const CEILING: Self = Self {
+        max_depth: MAX_CONVERSATION_DEPTH,
+        max_auto_turns: u8::MAX,
+        max_iterations: 10_000,
+    };
+
+    pub fn intersect(self, other: Self) -> Self {
+        Self {
+            max_depth: self.max_depth.min(other.max_depth),
+            max_auto_turns: self.max_auto_turns.min(other.max_auto_turns),
+            max_iterations: self.max_iterations.min(other.max_iterations),
+        }
+    }
+
+    pub fn within(self, ceiling: Self) -> bool {
+        self.intersect(ceiling) == self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
     User,
@@ -306,6 +346,7 @@ pub enum RecurrenceHalt {
     Closed,
     ConfigUnavailable,
     Refused,
+    LimitReached,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recurrence {

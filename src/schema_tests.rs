@@ -13397,7 +13397,7 @@ mod requests_and_tool_loop {
                 assert_eq!(
                     get(address, &format!("/api/v1/jobs/{turn}")).json()["job"],
                     json!({
-                        "id": turn.to_string(), "name": name, "title": null,
+                        "id": turn.to_string(), "parent": conversation.to_string(), "name": name, "title": null,
                         "is_chat": true, "execution_mode": "once",
                         "input": record.input.to_string(),
                         "previous": previous.map(|id| id.to_string()),
@@ -16132,7 +16132,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 24);
+            assert_eq!(crate::storage::FORMAT_VERSION, 25);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");

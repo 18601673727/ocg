@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, Download, Loader2, RotateCcw, X } from "lucide-react";
@@ -134,7 +135,7 @@ export function useImageAttachments(projectId?: string) {
 
 function AttachmentError({ message }: { message?: string | null }) {
   const inHeader = useConversationError(message);
-  return message && !inHeader ? <p role="alert" className="mt-1 break-words text-xs text-destructive">{message}</p> : null;
+  return message && !inHeader ? <DismissibleNotice message={message}  className="mt-1 break-words text-xs text-destructive">{message}</DismissibleNotice> : null;
 }
 
 export function AttachmentStaging({ state, disabled }: { state: ReturnType<typeof useImageAttachments>; disabled: boolean }) {
@@ -222,7 +223,7 @@ export function ImageGallery({ images, compact = false }: { images?: ChatImage[]
           </div>
           <Button type="button" size="xs" variant="outline" disabled={downloading} onClick={() => void download()}>{downloading ? <Loader2 className="size-3 animate-spin" /> : <Download className="size-3" />}{t("chat.downloadImage")}</Button>
         </div>
-        {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+        {error && <DismissibleNotice message={error}  className="text-xs text-destructive">{error}</DismissibleNotice>}
       </DialogContent>
     </Dialog>
   </>;

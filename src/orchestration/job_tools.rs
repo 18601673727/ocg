@@ -16,6 +16,24 @@ use crate::persistence::ToolEffect;
     deny_unknown_fields
 )]
 pub enum JobToolCall {
+    JobLimits {
+        conversation: Option<String>,
+        max_depth: Option<u8>,
+        max_auto_turns: Option<u8>,
+        max_iterations: Option<u32>,
+    },
+    JobAgents {
+        after: Option<String>,
+        limit: Option<u32>,
+    },
+    JobWorkers {
+        after: Option<String>,
+        limit: Option<u32>,
+    },
+    JobAssign {
+        conversation: String,
+        objective: String,
+    },
     JobDispatch {
         agent: String,
         project: Option<String>,
@@ -56,7 +74,11 @@ pub struct JobDependency {
 
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(crate) const NAMES: [&str; 7] = [
+pub(crate) const NAMES: [&str; 11] = [
+    "job_limits",
+    "job_agents",
+    "job_workers",
+    "job_assign",
     "job_dispatch",
     "job_message",
     "job_stop",
@@ -68,13 +90,14 @@ pub(crate) const NAMES: [&str; 7] = [
 
 struct HostOnly {
     version: String,
+    effect: ToolEffect,
 }
 impl ToolHandler for HostOnly {
     fn version(&self) -> &str {
         &self.version
     }
     fn effect(&self) -> ToolEffect {
-        ToolEffect::NonIdempotent
+        self.effect
     }
     fn call(&self, _arguments: Value) -> ToolFuture<'_> {
         Box::pin(async {
@@ -90,6 +113,28 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
     let profile = json!({"type":"string", "pattern":"^profile:[0-9]+$"});
     for name in NAMES {
         let (properties, required, description) = match name {
+            "job_limits" => (
+                json!({"conversation":conversation, "max_depth":{"type":"integer","minimum":0,"maximum":16}, "max_auto_turns":{"type":"integer","minimum":0,"maximum":255}, "max_iterations":{"type":"integer","minimum":0,"maximum":10000}}),
+                vec![],
+                "Read your conversation limits or tighten limits on your own conversation or descendants. max_depth is the absolute tree depth (root=0); defaults are 3 child levels, 8 automatic follow-up turns and 100 scheduled iterations. Agents cannot raise effective limits; the user controls the ceiling. Omit settings to read only. A limit of 0 disables that kind of new work.",
+            ),
+            "job_agents" | "job_workers" => (
+                json!({
+                    "after": if name == "job_agents" { profile.clone() } else { conversation.clone() },
+                    "limit": {"type":"integer", "minimum":1, "maximum":20}
+                }),
+                vec![],
+                if name == "job_agents" {
+                    "List allowed Agent profiles with their instructions summary, tool grant and model capabilities. Choose a suitable profile by its declared strengths; this does not grant new authority. Follow next_after when has_more is true."
+                } else {
+                    "List your direct child workers with idle eligibility, Agent profile and Project. Use job_assign only for an idle worker matching the task; otherwise job_dispatch creates a child from an allowed Agent. Follow next_after when has_more is true."
+                },
+            ),
+            "job_assign" => (
+                json!({"conversation":conversation, "objective":{"type":"string", "minLength":1}}),
+                vec!["conversation", "objective"],
+                "Assign a task to your own idle, open worker. Eligibility and dispatch authority are checked atomically; a busy, held, recurring or user-managed worker is refused. Results return through the existing child notices. Does not take over unrelated conversations.",
+            ),
             "job_dispatch" => (
                 json!({
                     "agent": profile,
@@ -122,14 +167,14 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
                 "Manage a conversation in your strict subtree. Queued or running user messages prevent agent management.",
             ),
         };
-        registry.register(name, Some(description), json!({"type":"object", "additionalProperties":false, "properties":properties, "required":required}), Arc::new(HostOnly { version: format!("{name}-1") }))?;
+        registry.register(name, Some(description), json!({"type":"object", "additionalProperties":false, "properties":properties, "required":required}), Arc::new(HostOnly { version: format!("{name}-1"), effect: if matches!(name, "job_agents" | "job_workers") { ToolEffect::ReadOnly } else { ToolEffect::NonIdempotent } }))?;
         registry.authorize(name)?;
     }
     Ok(())
 }
 
 pub(crate) fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
-    registry.register("ask_user", Some("Ask the deciding user a question and wait for their answer."), json!({"type":"object", "additionalProperties":false, "properties":{"question":{"type":"string", "minLength":1}}, "required":["question"]}), Arc::new(HostOnly { version:"ask_user-1".into() }))?;
+    registry.register("ask_user", Some("Ask the deciding user a question and wait for their answer."), json!({"type":"object", "additionalProperties":false, "properties":{"question":{"type":"string", "minLength":1}}, "required":["question"]}), Arc::new(HostOnly { version:"ask_user-1".into(), effect: ToolEffect::NonIdempotent }))?;
     registry.authorize("ask_user")
 }
 
@@ -170,6 +215,10 @@ pub(crate) fn add(
 impl JobToolCall {
     pub(crate) fn name(&self) -> &'static str {
         match self {
+            Self::JobLimits { .. } => "job_limits",
+            Self::JobAgents { .. } => "job_agents",
+            Self::JobWorkers { .. } => "job_workers",
+            Self::JobAssign { .. } => "job_assign",
             Self::JobDispatch { .. } => "job_dispatch",
             Self::JobMessage { .. } => "job_message",
             Self::JobStop { .. } => "job_stop",

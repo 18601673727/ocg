@@ -651,7 +651,7 @@ pub(super) async fn conversations(
     })))
 }
 
-/// Exactly one of the two fields.
+/// Exactly one edit operation.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireConversationEdit {
@@ -659,21 +659,41 @@ struct WireConversationEdit {
     title: Option<String>,
     #[serde(default)]
     hidden: Option<bool>,
+    limits: Option<crate::persistence::ConversationLimits>,
+}
+
+pub(super) async fn conversation_limits(
+    database: &DatabaseHandle,
+    conversation: JobId,
+) -> Result<Reply, Refusal> {
+    let (limits, depth) = database
+        .conversation_limits(conversation)
+        .await?
+        .ok_or(NOT_FOUND)?;
+    Ok(Reply::ok(envelope(WireConversationLimits {
+        conversation: conversation.to_string(),
+        depth,
+        remaining_depth: limits.max_depth.saturating_sub(depth),
+        max_depth: limits.max_depth,
+        max_auto_turns: limits.max_auto_turns,
+        max_iterations: limits.max_iterations,
+    })))
 }
 
 /// `POST /api/v1/conversations/{job}`: renames the conversation whose root
-/// is `root`, or hides it for good. No Job changes.
+/// is `root`, hides it for good, or updates its limits. No Job spec changes.
 pub(super) async fn edit_conversation(
     database: &DatabaseHandle,
     root: JobId,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let wire: WireConversationEdit = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
-    let edit = match (wire.title, wire.hidden) {
-        (Some(title), None) if submissions::text(&title, submissions::MAX_NAME_BYTES) => {
+    let edit = match (wire.title, wire.hidden, wire.limits) {
+        (Some(title), None, None) if submissions::text(&title, submissions::MAX_NAME_BYTES) => {
             ConversationEdit::Title(title)
         }
-        (None, Some(true)) => ConversationEdit::Hide,
+        (None, Some(true), None) => ConversationEdit::Hide,
+        (None, None, Some(limits)) => ConversationEdit::Limits(limits),
         _ => return Err(INVALID_REQUEST),
     };
     database

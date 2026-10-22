@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
@@ -56,8 +57,8 @@ export function HealthChart({ client, fromUs, untilUs }: { client: HttpCanonical
   return <section className="min-w-0 rounded-lg border border-border bg-card p-4" aria-labelledby={id}>
     <h3 id={id} className="font-medium">{t("observations.healthChartTitle")}</h3>
     <p className="mt-1 mb-5 text-sm text-muted-foreground">{t("observations.healthChartDescription")}</p>
-    {result.error ? <p role="alert" className="text-sm text-destructive">{result.error}</p> : !data ? <p role="status">{t("common.loading")}</p> : <>
-      {data.partial && <p role="status" className="mb-3 text-sm text-muted-foreground">{t("observations.availabilityPartial")}</p>}
+    {result.error ? <DismissibleNotice message={result.error}  className="text-sm text-destructive">{result.error}</DismissibleNotice> : !data ? <p role="status">{t("common.loading")}</p> : <>
+      {data.partial && <DismissibleNotice tone="warning" message={t("observations.availabilityPartial")} className="mb-3 text-sm text-muted-foreground" />}
       {!data.total ? <p className="py-4 text-sm text-muted-foreground">{t("observations.noAvailability")}</p> : <StackedBarChart integerTicks metricLabel={t("observations.requests")}
         ariaLabel={t("observations.healthChartAria", { from: dateLabel(fromUs), until: dateLabel(untilUs), count: number.format(data.total) })}
         series={classifications.map((key, rank) => ({ key, label: t(labels[rank]), color: colors[rank], share: data.totals[rank] / data.total }))}

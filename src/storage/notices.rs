@@ -282,7 +282,7 @@ impl Batch {
     }
     pub(crate) fn loop_hold_if_needed(&mut self, conversation: JobId) -> Result<(), BatchError> {
         let row = self.conversation(conversation)?;
-        if row.loop_count < 8
+        if row.loop_count < self.conversation_limits(conversation)?.0.max_auto_turns
             || row.on_hold.is_some()
             || row.closing.is_some()
             || matches!(
@@ -315,20 +315,17 @@ impl Batch {
         }
         let counts = self.step(|tx| {
             let mut attention = false;
-            for entry in tx.open_table(TURN_INPUTS)?.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+            for entry in tx
+                .open_table(TURN_INPUTS)?
+                .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+            {
                 match TurnEntry::decode(entry?.1.value())?.entry {
                     Entry::UserMessage { .. } => return Ok(false),
                     Entry::Notice { .. } => attention = true,
                     _ => {}
                 }
             }
-            if !attention { return Ok(false); }
-            for entry in tx.open_table(TOOL_CALLS)?.range((turn.get(), 0, 0)..=(turn.get(), u32::MAX, u32::MAX))? {
-                let (key, bytes) = entry?;
-                let record = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
-                if record.admission().is_some_and(|admission| admission.handler_version.starts_with("job_")) && matches!(record.outcome.map(|outcome| outcome.fact), Some(crate::persistence::ToolOutcome::Completed { result }) if serde_json::from_str::<serde_json::Value>(result.as_str()).is_ok_and(|result| result.get("refused").is_none())) { return Ok(true); }
-            }
-            Ok(false)
+            Ok(attention)
         })?;
         if counts {
             let mut row = self.conversation(conversation)?;

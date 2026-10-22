@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -45,7 +46,7 @@ export function JobsSurface({ client, job, active, onJob, onOpenChat }: {
           <Button variant="outline" size="sm" disabled={page.loading} onClick={page.refresh}>{t("common.refresh")}</Button>
         </div>
         <p className="mb-4 text-sm text-muted-foreground">{t("jobs.description")}</p>
-        {page.error ? <p role="alert" className="mb-3 text-sm text-destructive">{page.error}</p> : null}
+        {page.error ? <DismissibleNotice message={page.error}  className="mb-3 text-sm text-destructive">{page.error}</DismissibleNotice> : null}
         {!page.ready && page.loading ? <p role="status">{t("jobs.loading")}</p> : null}
         {page.ready && page.items.length === 0 ? <p className="text-sm text-muted-foreground">{t("jobs.empty")}</p> : null}
         <ul className="divide-y divide-border">

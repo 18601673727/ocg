@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useId } from "react";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
@@ -76,7 +77,7 @@ export function ModelSelectorView({
           </select>
         </label>
       </fieldset>
-      {error && !errorInHeader && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
+      {error && !errorInHeader && <DismissibleNotice message={error}  className="mt-2 break-words text-xs text-destructive">{error}</DismissibleNotice>}
     </div>
   );
 }

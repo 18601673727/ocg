@@ -95,10 +95,10 @@ const ReasoningGroupImpl: ReasoningGroupComponent = ({
 
   return (
     <ReasoningRoot streaming={isReasoningStreaming} latest={latestReasoningIndex >= startIndex && latestReasoningIndex <= endIndex}>
-      <ReasoningTrigger active={unsettled} duration={duration} tokens={estimateReasoningTokens(text)} />
       <ReasoningContent streaming={isReasoningStreaming} aria-busy={isReasoningStreaming}>
         <ReasoningText>{children}</ReasoningText>
       </ReasoningContent>
+      <ReasoningTrigger active={unsettled} duration={duration} tokens={estimateReasoningTokens(text)} />
     </ReasoningRoot>
   );
 };

@@ -1,5 +1,6 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -523,7 +524,7 @@ function JobWatchBody({
             <Button variant="outline" size="sm" onClick={() => void loadEarlierOutputs()} disabled={loadingEarlier}>
               {loadingEarlier ? t("common.loading") : t("job.loadEarlierOutputs")}
             </Button>
-            {earlierFailure ? <p role="alert" className="mt-2 text-sm text-destructive">{failureText(t, earlierFailure)}</p> : null}
+            {earlierFailure ? <DismissibleNotice message={failureText(t, earlierFailure)}  className="mt-2 text-sm text-destructive">{failureText(t, earlierFailure)}</DismissibleNotice> : null}
           </div>
         ) : null}
         <ol className="mt-2 flex flex-col gap-2">
@@ -560,7 +561,7 @@ function JobWatchBody({
   ) : null;
   const answer = job ? (
     <>
-      {evidenceFailure && <p role="alert" className="text-xs text-destructive">{evidenceFailure}</p>}
+      {evidenceFailure && <DismissibleNotice message={evidenceFailure}  className="text-xs text-destructive">{evidenceFailure}</DismissibleNotice>}
       <JobTranscript
         turns={turns}
         userLabel={presentation === "chat" ? t("job.you") : t("job.objective")}
@@ -602,12 +603,12 @@ function JobWatchBody({
       </header>
       {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
       {failure ? (
-        <div role="alert" className="flex flex-wrap items-center gap-3 text-sm text-destructive">
+        <DismissibleNotice message={failureText(t, failure)} className="text-sm text-destructive">
           <p>{failureText(t, failure)}</p>
           <Button variant="outline" size="sm" onClick={onRetry}>
             {t("common.retry")}
           </Button>
-        </div>
+        </DismissibleNotice>
       ) : null}
       {presentation === "chat" ? (
         <>
