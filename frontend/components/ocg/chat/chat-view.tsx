@@ -350,16 +350,21 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
     delayRef.current = CHILDREN_POLL_BASE_MS;
     signatureRef.current = null;
     const schedule = () => {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
       if (disposed || controller.signal.aborted) return;
       // A hidden tab schedules nothing; visibility restoration refreshes.
       if (typeof document !== "undefined" && document.hidden) return;
-      timer = setTimeout(() => void refresh(), delayRef.current);
+      timer = setTimeout(() => {
+        timer = undefined;
+        void refresh();
+      }, delayRef.current);
     };
     const refresh = async () => {
-      if (inFlight) {
-        schedule();
-        return;
-      }
+      if (disposed || controller.signal.aborted || inFlight) return;
+      if (typeof document !== "undefined" && document.hidden) return;
       inFlight = true;
       try {
         const items: ControlChildConversation[] = [];
@@ -390,13 +395,14 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
       }
     };
     const onVisibility = () => {
-      if (typeof document === "undefined" || document.hidden) return;
       if (disposed || controller.signal.aborted) return;
       if (timer !== undefined) {
         clearTimeout(timer);
         timer = undefined;
       }
+      if (typeof document === "undefined" || document.hidden) return;
       delayRef.current = CHILDREN_POLL_BASE_MS;
+      signatureRef.current = null;
       void refresh();
     };
     void refresh();

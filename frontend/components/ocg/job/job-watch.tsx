@@ -125,6 +125,8 @@ function JobWatchBody({
   // Automatically retained rows; earlier outputs load only on explicit request.
   const windowRef = useRef(JOB_WATCH_RESIDENT_OUTPUTS);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const [earlierFailure, setEarlierFailure] = useState<{ code: string; scope: "read" } | null>(null);
+  const earlierLoad = useRef<AbortController | null>(null);
   const [tools, setTools] = useState<ControlToolCall[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
@@ -138,6 +140,10 @@ function JobWatchBody({
   // unknown reason is refreshed on whichever arrives first, at most once
   // per watched Job.
   const unknownReasonRefreshed = useRef(false);
+  useEffect(() => () => {
+    earlierLoad.current?.abort();
+    earlierLoad.current = null;
+  }, [client, jobId]);
   useEffect(() => {
     unknownReasonRefreshed.current = false;
   }, [jobId]);
@@ -382,24 +388,39 @@ function JobWatchBody({
   // them is an explicit walk from the first stored sequence, merged by `seq`
   // with whatever the live stream appended meanwhile.
   async function loadEarlierOutputs() {
+    if (earlierLoad.current) return;
+    const controller = new AbortController();
+    earlierLoad.current = controller;
     const nextWindow = windowRef.current + JOB_WATCH_WINDOW_STEP;
-    windowRef.current = nextWindow;
     setLoadingEarlier(true);
+    setEarlierFailure(null);
     try {
-      const walked: ControlOutput[] = [];
+      let walked: ControlOutput[] = [];
       let after = 0;
       for (;;) {
-        const page = await client.readOutputs(jobId, { afterSeq: after });
-        walked.push(...page.outputs);
+        const page = await client.readOutputs(jobId, { afterSeq: after, signal: controller.signal });
+        if (controller.signal.aborted) return;
+        walked = mergeOutputWindow(walked, page.outputs, nextWindow);
         if (!page.has_more) break;
         const next = page.next_after_seq ?? page.outputs.at(-1)?.seq ?? after;
-        if (next <= after) break;
+        if (next <= after) throw new ContractError("next_after_seq", "an advancing output cursor");
         after = next;
       }
+      windowRef.current = nextWindow;
       const incoming = walked;
-      setOutputs((existing) => mergeOutputWindow(existing, incoming, windowRef.current));
+      setOutputs((existing) => mergeOutputWindow(existing, incoming, nextWindow));
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setEarlierFailure({
+          code: error instanceof ControlTransportError ? error.code : error instanceof ContractError ? "contract" : "unreachable",
+          scope: "read",
+        });
+      }
     } finally {
-      setLoadingEarlier(false);
+      if (earlierLoad.current === controller) {
+        earlierLoad.current = null;
+        setLoadingEarlier(false);
+      }
     }
   }
 
@@ -472,6 +493,7 @@ function JobWatchBody({
             <Button variant="outline" size="sm" onClick={() => void loadEarlierOutputs()} disabled={loadingEarlier}>
               {loadingEarlier ? t("common.loading") : t("job.loadEarlierOutputs")}
             </Button>
+            {earlierFailure ? <p role="alert" className="mt-2 text-sm text-destructive">{failureText(t, earlierFailure)}</p> : null}
           </div>
         ) : null}
         <ol className="mt-2 flex flex-col gap-2">
