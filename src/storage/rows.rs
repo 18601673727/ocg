@@ -18,6 +18,18 @@ use crate::token_usage::{RequestEligibility, UsageFinality};
 
 // ---- rows ------------------------------------------------------------------------
 
+/// Refuses a record stored under `key` whose embedded identity names another
+/// record: the table key is the authority, never a duplicate inside the value.
+fn check_table_key(table: &str, key: u64, embedded: u64) -> DecodeResult<()> {
+    if key == embedded {
+        Ok(())
+    } else {
+        Err(StorageError::corrupted(format!(
+            "{table} row stored under key {key} names {embedded}"
+        )))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct JobRow {
     pub(crate) id: JobId,
@@ -61,6 +73,13 @@ impl JobRow {
             parent_id,
             kind,
         })
+    }
+
+    /// Decodes the `job` row stored under `key`, which must name this Job.
+    pub(super) fn decode_at(key: u64, bytes: &[u8]) -> DecodeResult<Self> {
+        let row = Self::decode(bytes)?;
+        check_table_key("job", key, row.id.get())?;
+        Ok(row)
     }
 }
 
@@ -211,6 +230,13 @@ impl JobStateRow {
             stop_confirmed_at,
             stop_confirmed_by,
         })
+    }
+
+    /// Decodes the `job_state` row stored under `key`, which must name this Job.
+    pub(super) fn decode_at(key: u64, bytes: &[u8]) -> DecodeResult<Self> {
+        let state = Self::decode(bytes)?;
+        check_table_key("job_state", key, state.job_id.get())?;
+        Ok(state)
     }
 }
 
@@ -372,6 +398,13 @@ impl ConfigRow {
             body,
         })
     }
+
+    /// Decodes the `config` row stored under `key`, which must name this Config.
+    pub(super) fn decode_at(key: u64, bytes: &[u8]) -> DecodeResult<Self> {
+        let row = Self::decode(bytes)?;
+        check_table_key("config", key, row.id.get())?;
+        Ok(row)
+    }
 }
 
 pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
@@ -453,7 +486,7 @@ pub(super) fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
     e.0
 }
 
-pub(super) fn decode_attachment(bytes: &[u8]) -> DecodeResult<AttachmentRecord> {
+pub(super) fn decode_attachment(key: u64, bytes: &[u8]) -> DecodeResult<AttachmentRecord> {
     let mut d = Dec::new(bytes, TAG_ATTACHMENT)?;
     let a = AttachmentRecord {
         id: AttachmentId::new(d.u64()?),
@@ -471,6 +504,7 @@ pub(super) fn decode_attachment(bytes: &[u8]) -> DecodeResult<AttachmentRecord> 
         })?,
     };
     d.end()?;
+    check_table_key("attachment", key, a.id.get())?;
     Ok(a)
 }
 

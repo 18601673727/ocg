@@ -26,7 +26,7 @@ pub(super) fn frozen_llm_target(
     let Some(row) = rx
         .open_table(JOBS)?
         .get(job.get())?
-        .map(|bytes| JobRow::decode(bytes.value()))
+        .map(|bytes| JobRow::decode_at(job.get(), bytes.value()))
         .transpose()?
     else {
         return Ok(None);

@@ -301,7 +301,8 @@ impl Batch {
                 {
                     let waiter = JobId::new(entry?.0.value().1);
                     if let Some(bytes) = jobs.get(waiter.get())?
-                        && let Some(parent) = JobRow::decode(bytes.value())?.parent_id
+                        && let Some(parent) =
+                            JobRow::decode_at(waiter.get(), bytes.value())?.parent_id
                     {
                         waiting.insert(parent);
                     }

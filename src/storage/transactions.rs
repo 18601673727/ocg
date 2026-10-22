@@ -453,7 +453,8 @@ impl Batch {
             let held = tx.open_table(HELD_SLOTS)?;
             let mut pools = Vec::new();
             for entry in configs.iter()? {
-                let row = ConfigRow::decode(entry?.1.value())?;
+                let (key, bytes) = entry?;
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
                 let ConfigBody::Pool(body) = row.body else {
                     continue;
                 };
@@ -509,7 +510,7 @@ impl Batch {
                     for entry in ready.range((key, 0)..=(key, u64::MAX))? {
                         let id = entry?.0.value().1;
                         if let Some(row) = jobs.get(id)?
-                            && JobRow::decode(row.value())?.kind.is_stored()
+                            && JobRow::decode_at(id, row.value())?.kind.is_stored()
                         {
                             first = Some(id);
                             break;
@@ -718,10 +719,18 @@ impl Batch {
         self.step(|tx| {
             let mut unsettled = tx.open_table(UNSETTLED)?;
             let counts = unsettled.get(job.get())?.map(|counts| counts.value());
-            if let Some((dependencies, children)) = counts {
-                let children = u32::try_from(i64::from(children) + delta).unwrap_or(0);
-                unsettled.insert(job.get(), (dependencies, children))?;
-            }
+            let Some((dependencies, children)) = counts else {
+                return Ok(());
+            };
+            let children = i64::from(children)
+                .checked_add(delta)
+                .and_then(|children| u32::try_from(children).ok())
+                .ok_or_else(|| {
+                    StorageError::corrupted(format!(
+                        "{job} has {children} open children, which cannot change by {delta}"
+                    ))
+                })?;
+            unsettled.insert(job.get(), (dependencies, children))?;
             Ok(())
         })
     }

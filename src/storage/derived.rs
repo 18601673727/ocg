@@ -60,12 +60,15 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
     let mut jobs = BTreeMap::new();
     for entry in tx.open_table(JOBS)?.iter()? {
         let (key, bytes) = entry?;
-        jobs.insert(key.value(), JobRow::decode(bytes.value())?);
+        jobs.insert(key.value(), JobRow::decode_at(key.value(), bytes.value())?);
     }
     let mut states = BTreeMap::new();
     for entry in tx.open_table(JOB_STATES)?.iter()? {
         let (key, bytes) = entry?;
-        states.insert(key.value(), JobStateRow::decode(bytes.value())?);
+        states.insert(
+            key.value(),
+            JobStateRow::decode_at(key.value(), bytes.value())?,
+        );
     }
     let mut conversations = BTreeMap::new();
     for entry in tx.open_table(CONVERSATIONS)?.iter()? {
@@ -91,7 +94,12 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
                 for attachment in attachments {
                     attachment_refs.insert((attachment.get(), turn), ());
                 }
-                if let Some(conversation) = jobs[&turn].parent_id {
+                let row = jobs.get(&turn).ok_or_else(|| {
+                    StorageError::corrupted(format!(
+                        "turn input names job {turn}, which has no job row"
+                    ))
+                })?;
+                if let Some(conversation) = row.parent_id {
                     user_entry_at
                         .entry(conversation.get())
                         .or_insert(input.at.as_unix_micros());

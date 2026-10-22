@@ -321,7 +321,7 @@ impl Batch {
         let row = self.step(|tx| {
             tx.open_table(CONFIGS)?
                 .get(id.get())?
-                .map(|bytes| ConfigRow::decode(bytes.value()))
+                .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
                 .transpose()
         })?;
         Ok(row)
@@ -359,6 +359,16 @@ impl Batch {
             ConfigBody::Connection(_) => {}
             ConfigBody::Model(model) => {
                 self.require_config_kind(model.connection_id, ConfigKind::Connection)?;
+                for (field, value) in [
+                    ("temperature", model.parameters.temperature),
+                    ("top_p", model.parameters.top_p),
+                    ("presence_penalty", model.parameters.presence_penalty),
+                    ("frequency_penalty", model.parameters.frequency_penalty),
+                ] {
+                    if value.is_some_and(|value| !value.is_finite()) {
+                        return self.reject(Violation::InvalidValue(field, "must be finite"));
+                    }
+                }
             }
             ConfigBody::Agent(agent) => {
                 if agent.approve.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -478,7 +488,7 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(JOBS)?
                 .get(id.get())?
-                .map(|bytes| JobRow::decode(bytes.value()))
+                .map(|bytes| JobRow::decode_at(id.get(), bytes.value()))
                 .transpose()
         })
     }
@@ -494,7 +504,7 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(JOB_STATES)?
                 .get(id.get())?
-                .map(|bytes| JobStateRow::decode(bytes.value()))
+                .map(|bytes| JobStateRow::decode_at(id.get(), bytes.value()))
                 .transpose()
         })
     }
@@ -604,7 +614,7 @@ impl Batch {
         let record = self.step(|tx| {
             tx.open_table(ATTACHMENTS)?
                 .get(id.get())?
-                .map(|bytes| decode_attachment(bytes.value()))
+                .map(|bytes| decode_attachment(id.get(), bytes.value()))
                 .transpose()
         })?;
         match record {

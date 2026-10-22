@@ -18,7 +18,7 @@ pub(super) fn read(database: &Database) -> Result<ReadTransaction, StorageError>
 fn read_job_row(rx: &ReadTransaction, id: JobId) -> Result<Option<JobRow>, StorageError> {
     rx.open_table(JOBS)?
         .get(id.get())?
-        .map(|bytes| JobRow::decode(bytes.value()))
+        .map(|bytes| JobRow::decode_at(id.get(), bytes.value()))
         .transpose()
 }
 
@@ -33,7 +33,7 @@ fn read_conversation(rx: &ReadTransaction, id: JobId) -> Result<ConversationRow,
 fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobStateRow, StorageError> {
     rx.open_table(JOB_STATES)?
         .get(id.get())?
-        .map(|bytes| JobStateRow::decode(bytes.value()))
+        .map(|bytes| JobStateRow::decode_at(id.get(), bytes.value()))
         .transpose()?
         .ok_or_else(|| StorageError::corrupted(format!("{id} has no job_state")))
 }
@@ -56,7 +56,7 @@ pub(super) fn turn_execution(
             let bytes = jobs
                 .get(owner.get())?
                 .ok_or_else(|| StorageError::corrupted("missing execution owner"))?;
-            let owner = JobRow::decode(bytes.value())?;
+            let owner = JobRow::decode_at(owner.get(), bytes.value())?;
             match owner.kind {
                 JobKind::Turn {
                     execution: TurnExecution::Frozen(execution),
@@ -81,7 +81,7 @@ pub(super) fn turn_execution(
             let bytes = jobs
                 .get(conversation.get())?
                 .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
-            match JobRow::decode(bytes.value())?.kind {
+            match JobRow::decode_at(conversation.get(), bytes.value())?.kind {
                 JobKind::Conversation { project, agent, .. } => (project, agent),
                 JobKind::Turn { .. } => {
                     return Err(StorageError::corrupted(
@@ -320,7 +320,11 @@ pub(crate) fn read_jobs(
     let end = before.map_or(u64::MAX, JobId::get);
     let mut records = Vec::new();
     for entry in jobs.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
-        records.push(job_record(&rx, JobRow::decode(entry?.1.value())?)?);
+        let (key, bytes) = entry?;
+        records.push(job_record(
+            &rx,
+            JobRow::decode_at(key.value(), bytes.value())?,
+        )?);
     }
     Ok(records)
 }
@@ -529,7 +533,7 @@ fn agent_name(
     let name = rx
         .open_table(CONFIGS)?
         .get(agent.get())?
-        .map(|bytes| ConfigRow::decode(bytes.value()))
+        .map(|bytes| ConfigRow::decode_at(agent.get(), bytes.value()))
         .transpose()?
         .map(|row| row.name);
     names.insert(agent, name.clone());
@@ -600,7 +604,7 @@ fn dependency_state(
     let state = rx
         .open_table(JOB_STATES)?
         .get(dependency.get())?
-        .map(|bytes| JobStateRow::decode(bytes.value()))
+        .map(|bytes| JobStateRow::decode_at(dependency.get(), bytes.value()))
         .transpose()?;
     let completed = state
         .as_ref()
@@ -817,9 +821,15 @@ pub(crate) fn read_outputs(
         return Ok(conversation_result(&rx, job)?.into_iter().collect());
     }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
-    let start = after_seq.map_or(0, |seq| {
-        u32::try_from(seq).map_or(0, |seq| seq.saturating_add(1))
-    });
+    let start = match after_seq.map(u32::try_from) {
+        None => 0,
+        // A sequence at the end of the domain has nothing after it. A
+        // negative cursor is not a sequence; neither replays the page from
+        // the beginning.
+        Some(Err(_)) => return Ok(Vec::new()),
+        Some(Ok(u32::MAX)) => return Ok(Vec::new()),
+        Some(Ok(seq)) => seq + 1,
+    };
     let mut records = Vec::new();
     for entry in outputs
         .range((job.get(), start)..=(job.get(), u32::MAX))?
@@ -1024,7 +1034,7 @@ pub(crate) fn read_attachment(
     let rx = read(database)?;
     rx.open_table(ATTACHMENTS)?
         .get(id.get())?
-        .map(|bytes| decode_attachment(bytes.value()))
+        .map(|bytes| decode_attachment(id.get(), bytes.value()))
         .transpose()
 }
 
@@ -1038,7 +1048,8 @@ pub(crate) fn read_attachments(
     let end = before.map_or(u64::MAX, AttachmentId::get);
     let mut records = Vec::new();
     for entry in table.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
-        records.push(decode_attachment(entry?.1.value())?);
+        let (key, bytes) = entry?;
+        records.push(decode_attachment(key.value(), bytes.value())?);
     }
     Ok(records)
 }
@@ -1049,7 +1060,8 @@ pub(crate) fn content_available(
 ) -> Result<bool, StorageError> {
     let rx = read(database)?;
     for entry in rx.open_table(ATTACHMENTS)?.iter()? {
-        let record = decode_attachment(entry?.1.value())?;
+        let (key, bytes) = entry?;
+        let record = decode_attachment(key.value(), bytes.value())?;
         if record.sha256 == digest && record.is_available() {
             return Ok(true);
         }
@@ -1063,7 +1075,8 @@ pub(crate) fn unneeded_content(
     let rx = read(database)?;
     let mut contents = BTreeMap::new();
     for entry in rx.open_table(ATTACHMENTS)?.iter()? {
-        let record = decode_attachment(entry?.1.value())?;
+        let (key, bytes) = entry?;
+        let record = decode_attachment(key.value(), bytes.value())?;
         let needed = contents
             .entry(record.sha256)
             .or_insert((record.byte_length, false));
@@ -1086,7 +1099,7 @@ pub(crate) fn record_attachment_cleanup(
     {
         let mut table = tx.open_table(ATTACHMENTS)?;
         let mut record = match table.get(id.get())? {
-            Some(bytes) => decode_attachment(bytes.value())?,
+            Some(bytes) => decode_attachment(id.get(), bytes.value())?,
             None => return Err(StorageError::corrupted(format!("{id} is missing"))),
         };
         record.cleanup = Some(cleanup);
@@ -1163,7 +1176,7 @@ pub(crate) fn read_config(
     let rx = read(database)?;
     rx.open_table(CONFIGS)?
         .get(id.get())?
-        .map(|bytes| ConfigRow::decode(bytes.value()).map(config_record))
+        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()).map(config_record))
         .transpose()
 }
 
@@ -1180,7 +1193,8 @@ pub(crate) fn read_configs(
     let end = before.map_or(u64::MAX, ConfigId::get);
     let mut records = Vec::new();
     for entry in table.range(..end)?.rev() {
-        let row = ConfigRow::decode(entry?.1.value())?;
+        let (key, bytes) = entry?;
+        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         if kind.is_none_or(|kind| kind == row.kind) {
             records.push(config_record(row));
             if records.len() >= limit.min(MAX_PAGE) {
@@ -1217,7 +1231,7 @@ pub(crate) fn read_execution_pool(
     Ok(rx
         .open_table(CONFIGS)?
         .get(id.get())?
-        .map(|bytes| ConfigRow::decode(bytes.value()))
+        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
         .transpose()?
         .and_then(pool_view))
 }
@@ -1232,7 +1246,8 @@ pub(crate) fn read_execution_pools(
     let end = before.map_or(u64::MAX, ExecutionPoolId::get);
     let mut pools = Vec::new();
     for entry in configs.range(..end)?.rev() {
-        if let Some(pool) = pool_view(ConfigRow::decode(entry?.1.value())?) {
+        let (key, bytes) = entry?;
+        if let Some(pool) = pool_view(ConfigRow::decode_at(key.value(), bytes.value())?) {
             pools.push(pool);
             if pools.len() >= limit.min(MAX_PAGE) {
                 break;
@@ -1264,7 +1279,7 @@ pub(crate) fn read_executor(
     Ok(rx
         .open_table(CONFIGS)?
         .get(id.get())?
-        .map(|bytes| ConfigRow::decode(bytes.value()))
+        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
         .transpose()?
         .and_then(executor_view))
 }
@@ -1279,7 +1294,8 @@ pub(crate) fn read_executors(
     let end = before.map_or(u64::MAX, ExecutorId::get);
     let mut records = Vec::new();
     for entry in configs.range(..end)?.rev() {
-        if let Some(record) = executor_view(ConfigRow::decode(entry?.1.value())?) {
+        let (key, bytes) = entry?;
+        if let Some(record) = executor_view(ConfigRow::decode_at(key.value(), bytes.value())?) {
             records.push(record);
             if records.len() >= limit.min(MAX_PAGE) {
                 break;
@@ -1296,7 +1312,8 @@ fn pools_offering(
 ) -> Result<Vec<ExecutorId>, StorageError> {
     let mut pools = Vec::new();
     for entry in rx.open_table(CONFIGS)?.iter()? {
-        let row = ConfigRow::decode(entry?.1.value())?;
+        let (key, bytes) = entry?;
+        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         if row.archived_at.is_none()
             && let ConfigBody::Pool(body) = &row.body
             && body.enabled
@@ -1320,7 +1337,7 @@ pub(crate) fn read_compatible_executors(
     let configs = rx.open_table(CONFIGS)?;
     let Some(model) = configs
         .get(llm_profile.get())?
-        .map(|bytes| ConfigRow::decode(bytes.value()))
+        .map(|bytes| ConfigRow::decode_at(llm_profile.get(), bytes.value()))
         .transpose()?
     else {
         return Ok(Vec::new());
@@ -1330,7 +1347,7 @@ pub(crate) fn read_compatible_executors(
     };
     let Some(connection) = configs
         .get(model.connection_id.get())?
-        .map(|bytes| ConfigRow::decode(bytes.value()))
+        .map(|bytes| ConfigRow::decode_at(model.connection_id.get(), bytes.value()))
         .transpose()?
     else {
         return Ok(Vec::new());
@@ -1367,7 +1384,7 @@ pub(crate) fn read_pool_binding(
     let Some(bytes) = rx.open_table(JOB_STATES)?.get(job.get())? else {
         return Ok(None);
     };
-    let state = JobStateRow::decode(bytes.value())?;
+    let state = JobStateRow::decode_at(job.get(), bytes.value())?;
     Ok(state.claim.map(|claim| FrozenPoolBinding {
         pool: claim.pool_id.into(),
         edit_seq: claim.pool_edit_seq,
@@ -1432,7 +1449,7 @@ pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool,
         Probe::Claim(job) => rx
             .open_table(JOB_STATES)?
             .get(job.get())?
-            .map(|bytes| JobStateRow::decode(bytes.value()))
+            .map(|bytes| JobStateRow::decode_at(job.get(), bytes.value()))
             .transpose()?
             .is_some_and(|state| state.claim.is_some()),
         Probe::ToolCall(call) => rx
@@ -1448,7 +1465,7 @@ pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool,
         Probe::Outcome(job) => rx
             .open_table(JOB_STATES)?
             .get(job.get())?
-            .map(|bytes| JobStateRow::decode(bytes.value()))
+            .map(|bytes| JobStateRow::decode_at(job.get(), bytes.value()))
             .transpose()?
             .is_some_and(|state| state.outcome.is_some()),
     })
@@ -2283,7 +2300,8 @@ pub(crate) fn read_turn_context(
                 attachment_table
                     .get(id.get())?
                     .map(|bytes| {
-                        decode_attachment(bytes.value()).map(|attachment| attachment.byte_length)
+                        decode_attachment(id.get(), bytes.value())
+                            .map(|attachment| attachment.byte_length)
                     })
                     .transpose()?
                     .ok_or_else(|| StorageError::corrupted("turn attachment missing"))
@@ -2390,7 +2408,7 @@ pub(super) fn has_decider(
         let Some(bytes) = jobs.get(id.get())? else {
             return Ok(false);
         };
-        let row = JobRow::decode(bytes.value())?;
+        let row = JobRow::decode_at(id.get(), bytes.value())?;
         match row.kind {
             JobKind::Conversation {
                 origin: Origin::User,

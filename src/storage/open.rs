@@ -372,7 +372,8 @@ fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
     let states = batch.step(|tx| {
         let mut states = Vec::new();
         for entry in tx.open_table(JOB_STATES)?.iter()? {
-            states.push(JobStateRow::decode(entry?.1.value())?);
+            let (key, bytes) = entry?;
+            states.push(JobStateRow::decode_at(key.value(), bytes.value())?);
         }
         Ok(states)
     })?;

@@ -244,7 +244,9 @@ pub(crate) fn terminal_jobs(
     let mut terminal = Vec::new();
     for &job in jobs {
         if let Some(state) = states.get(job.get())?
-            && JobStateRow::decode(state.value())?.outcome.is_some()
+            && JobStateRow::decode_at(job.get(), state.value())?
+                .outcome
+                .is_some()
         {
             terminal.push(job);
         }
