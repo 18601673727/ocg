@@ -8,6 +8,9 @@ import type { Locale } from "./locale";
  * plural forms (`one` / `other`) since Chinese does not pluralize.
  */
 export const en = {
+  "chat.errors.show": "Show conversation errors ({count})",
+  "chat.errors.hide": "Hide conversation errors ({count})",
+  "chat.errors.history": "Conversation errors",
   "chat.card.cards": "Needs your attention",
   "chat.card.approve": "Approve",
   "chat.card.reject": "Reject",
@@ -1572,6 +1575,9 @@ export type I18nKey = keyof typeof en;
 export type Dictionary = Record<I18nKey, string>;
 
 export const zh: Dictionary = {
+  "chat.errors.show": "展开对话错误（{count}）",
+  "chat.errors.hide": "收起对话错误（{count}）",
+  "chat.errors.history": "对话错误记录",
   "chat.card.cards": "需要您处理",
   "chat.card.approve": "批准",
   "chat.card.reject": "拒绝",

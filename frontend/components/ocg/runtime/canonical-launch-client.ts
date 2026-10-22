@@ -50,8 +50,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return unsubscribe;
   }
 
-  private report(error: unknown) {
-    if (!this.disposed) this.emit({ type: "runtime.status-changed", status: { state: "failed", detail: error instanceof Error ? error.message : String(error) } });
+  private report(error: unknown, sessionId?: string) {
+    if (!this.disposed) this.emit({ type: "runtime.status-changed", status: { state: "failed", sessionId, detail: error instanceof Error ? error.message : String(error) } });
   }
 
   refreshConversations(): Promise<void> {
@@ -403,7 +403,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (this.disposed || this.turns.get(jobId) !== turn) return;
       turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Reopen this conversation to recover persisted output.`;
       this.publish(turn.sessionId);
-      this.report(error);
+      this.report(error, turn.sessionId);
     }).finally(() => {
       entry.stopped = true;
       if (entry.timer) clearTimeout(entry.timer);
@@ -469,7 +469,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.pending.delete(sessionId);
     this.publish(sessionId);
     if (record.settlement.state === "unsettled") this.watch(job);
-    void this.refreshConversations().catch(error => this.report(error));
+    void this.refreshConversations().catch(error => this.report(error, sessionId));
   }
 
   override async retryMessage(sessionId: string, messageId: string): Promise<void> {

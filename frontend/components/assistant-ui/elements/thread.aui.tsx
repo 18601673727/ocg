@@ -28,6 +28,7 @@ import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-ic
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
+import { useConversationError } from "@/components/ocg/chat/conversation-errors";
 import {
   ActionBarMorePrimitive,
   ActionBarPrimitive,
@@ -655,6 +656,9 @@ const AssistantMessage: FC = () => {
     const value = s.message.metadata.custom.failureReason;
     return typeof value === "string" ? value : null;
   });
+  const messageId = useAuiState((s) => s.message.id);
+  const failed = useAuiState((s) => s.message.status?.type === "incomplete" && s.message.status.reason === "error");
+  const errorInHeader = useConversationError(failureReason ?? (failed ? t("chat.failed") : null), messageId);
   const ACTION_BAR_PT = "pt-1.5";
   // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
   const ACTION_BAR_HEIGHT = `min-h-7.5 ${ACTION_BAR_PT}`;
@@ -749,8 +753,8 @@ const AssistantMessage: FC = () => {
               }
             }}
           </MessagePrimitive.GroupedParts>
-          <MessageError />
-          {failureReason && (
+          {!errorInHeader && <MessageError />}
+          {failureReason && !errorInHeader && (
             <p role="alert" className="text-destructive mt-2 text-sm whitespace-pre-wrap">
               {failureReason}
             </p>

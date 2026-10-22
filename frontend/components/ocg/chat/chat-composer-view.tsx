@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { STATUS_TEXT } from "@/components/ocg/primitives";
 import { useI18n } from "../i18n";
+import { useConversationError } from "./conversation-errors";
 
 type ComposerFormProps = Pick<ComponentPropsWithoutRef<"form">,
   "onSubmit" | "onDragEnter" | "onDragOver" | "onDragLeave" | "onDrop"
@@ -69,6 +70,7 @@ export function ChatComposerInput({ textarea, suggestions, error, actions }: {
 }) {
   const { t } = useI18n();
   const activeSuggestion = suggestions?.items[suggestions.activeIndex];
+  const errorInHeader = useConversationError(error);
   return (
     <>
       <div className="relative">
@@ -127,7 +129,7 @@ export function ChatComposerInput({ textarea, suggestions, error, actions }: {
           className="max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
         />
       </div>
-      {error && (
+      {error && !errorInHeader && (
         <p role="alert" className={`border-t border-border px-3 py-1.5 text-xs ${STATUS_TEXT['error']}`}>
           {error}
         </p>

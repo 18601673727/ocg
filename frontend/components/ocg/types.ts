@@ -79,6 +79,7 @@ export const RUNTIME_CONNECTION_STATES: readonly RuntimeConnectionState[] = [
 
 export type RuntimeStatus = {
   state: RuntimeConnectionState;
+  sessionId?: string;
   detailCode?: "provider-ready" | "configuration-required";
   detail?: string;
 };

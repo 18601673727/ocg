@@ -14,6 +14,7 @@ import {
 } from "@/components/ocg/primitives";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
+import { ConversationErrorHeader } from "../chat/conversation-errors";
 
 type OcgTopbarProps = {
   session?: ChatSession;
@@ -103,6 +104,7 @@ export function OcgTopbar({
         </h1>
       )}
       {projectSelector && <div className="flex min-w-0 shrink-0 items-center">{projectSelector}</div>}
+      {activeView === "chat" && <div className="mr-14 flex min-w-0 flex-1"><ConversationErrorHeader key={session?.id ?? "new"} /></div>}
 
       {syncStatus && sync && isDegradedSyncStatus(syncStatus) && (
         <div

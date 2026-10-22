@@ -2,6 +2,7 @@
 
 import { useId } from "react";
 import { useI18n } from "../i18n";
+import { useConversationError } from "./conversation-errors";
 
 type SelectorField = {
   value: string;
@@ -29,6 +30,7 @@ export function ModelSelectorView({
 }: ModelSelectorViewProps) {
   const { t } = useI18n();
   const id = useId();
+  const errorInHeader = useConversationError(error);
   const selectClass = "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
   return (
@@ -74,7 +76,7 @@ export function ModelSelectorView({
           </select>
         </label>
       </fieldset>
-      {error && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
+      {error && !errorInHeader && <p role="alert" className="mt-2 break-words text-xs text-destructive">{error}</p>}
     </div>
   );
 }

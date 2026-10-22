@@ -13,6 +13,7 @@ import type { ControlChildConversation } from "../contracts";
 import { type ActiveExecutionTarget, type ActivityStep, type ExecutionPhase } from "./execution-status";
 import { ChatComposerInput, ChatComposerView } from "./chat-composer-view";
 import { AttachmentStaging, useImageAttachments } from "./image-attachments";
+import { useConversationError } from "./conversation-errors";
 import {
   applyComposerSuggestion,
   matchComposerSuggestions,
@@ -226,7 +227,7 @@ export function ChatComposer({
           </div>
         </>
       }
-      unavailableMessage={chatReady ? undefined : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
+      unavailableMessage={chatReady ? undefined : runtimeStatus.state === "failed" ? t("chat.unavailable") : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`}
     >
       <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
         <AttachmentStaging state={images} disabled={submitting || cancelling} />
@@ -315,6 +316,7 @@ function useConversation(turn?: string) {
   const { control } = useOcgRuntime();
   const [conversation, setConversation] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useConversationError(error);
   useEffect(() => {
     if (!control || !turn) return;
     const controller = new AbortController();
@@ -331,13 +333,14 @@ function useConversation(turn?: string) {
 export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
-  const { conversation, error: resolutionError } = useConversation(turn);
+  const { conversation } = useConversation(turn);
   const [children, setChildren] = useState<ControlChildConversation[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [pages, setPages] = useState(1);
   const [revision, setRevision] = useState(0);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useConversationError(error);
   const lock = useRef(false);
   const delayRef = useRef(CHILDREN_POLL_BASE_MS);
   const signatureRef = useRef<string | null>(null);
@@ -433,7 +436,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { lock.current = false; setPending(null); }
   }
-  if (!control || (!children.length && !error && !resolutionError)) return null;
+  if (!control || !children.length) return null;
   return <section className="shrink-0 border-b border-border px-3 py-2" aria-label={t("chat.children")}>
     <div className="flex max-h-40 gap-2 overflow-auto">
       {children.map(child => <div key={child.id} className="min-w-56 rounded-md border border-border px-3 py-2 text-xs">
@@ -449,7 +452,6 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
       </div>)}
       {hasMore && <Button size="sm" variant="ghost" onClick={() => setPages(value => value + 1)}>{t("chat.child.more")}</Button>}
     </div>
-    {(error || resolutionError) && <p role="alert" className="text-xs text-destructive">{error || resolutionError}</p>}
   </section>;
 }
 
@@ -465,11 +467,12 @@ function ConversationQuestion({ question, disabled, answer }: { question: string
 export function ConversationCardStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
-  const { conversation, error: resolutionError } = useConversation(turn);
+  const { conversation } = useConversation(turn);
   const [cards, setCards] = useState<ControlConversationCard[]>([]);
   const [revision, setRevision] = useState(0);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useConversationError(error);
   const lock = useRef(false);
   useEffect(() => {
     if (!control || !conversation) return;
@@ -529,9 +532,8 @@ export function ConversationCardStrip({ turn, onOpen }: { turn?: string; onOpen:
       {[...groups].filter(([child, value]) => child !== id && value.parent === id).map(([child]) => <div key={child} className="ml-3 mt-2">{renderGroup(child, visited)}</div>)}
     </div>;
   }
-  if (!control || (!cards.length && !error && !resolutionError)) return null;
+  if (!control || !cards.length) return null;
   return <section className="shrink-0 border-b border-border px-3 py-2" aria-label={t("chat.card.cards")}>
     <div className="flex max-h-80 gap-2 overflow-auto">{[...groups].filter(([, group]) => !group.parent || !groups.has(group.parent)).map(([id]) => renderGroup(id, new Set()))}</div>
-    {(error || resolutionError) && <p role="alert" className="text-xs text-destructive">{error || resolutionError}</p>}
   </section>;
 }

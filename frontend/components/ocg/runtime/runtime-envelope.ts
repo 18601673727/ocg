@@ -507,6 +507,9 @@ export function validateRuntimeStatusValue(status: unknown): string | null {
   if (status.detail !== undefined && typeof status.detail !== "string") {
     return "status.detail must be a string when present.";
   }
+  if (status.sessionId !== undefined && !isNonEmptyString(status.sessionId)) {
+    return "status.sessionId must be a non-empty string when present.";
+  }
   return null;
 }
 

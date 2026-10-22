@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -19,6 +19,8 @@ import type { ComposerIntent } from "../composer/domain";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
 import { PageTitleVisibilityContext } from "./page-title";
+import { ConversationErrorsProvider, ConversationErrorScope, useConversationErrors } from "../chat/conversation-errors";
+import type { RuntimeStatus } from "../types";
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -30,14 +32,20 @@ function currentLocation() {
   return { view: isReachableView(requested) ? requested : "chat" as WorkspaceView, job: isJobIdentity(job) ? job : null };
 }
 
-export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signOutError, onSignOut }: {
+type AppShellProps = {
   client: HttpCanonicalControlClient;
   health: Health | null;
   sessionExpiresAtUs: number | null;
   signingOut: boolean;
   signOutError: string | null;
   onSignOut: () => void;
-}) {
+};
+
+export function AppShell(props: AppShellProps) {
+  return <ConversationErrorsProvider><AppShellContent {...props} /></ConversationErrorsProvider>;
+}
+
+function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signOutError, onSignOut }: AppShellProps) {
   const runtime = useOcgRuntime();
   const { t } = useI18n();
   const [location, setLocation] = useState(currentLocation);
@@ -45,11 +53,29 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [opening, setOpening] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [pageTitleInView, setPageTitleInView] = useState(true);
   const session = runtime.snapshot.sessions.find(session => session.id === sessionId);
+  const errors = useConversationErrors();
+  const report = errors?.report;
+  const transfer = errors?.transfer;
+  const conversationKey = sessionId || location.job || "new";
+  const observedStatus = useRef<RuntimeStatus | null>(null);
+  const activeConversation = useRef(conversationKey);
+  useEffect(() => { activeConversation.current = conversationKey; }, [conversationKey]);
+
+  useEffect(() => {
+    const status = runtime.snapshot.status;
+    if (observedStatus.current === status) return;
+    observedStatus.current = status;
+    if (location.view === "chat" && status.state === "failed" && status.detail) {
+      const owner = status.sessionId ?? conversationKey;
+      report?.(owner, status.detail, { label: t("app.refreshConversations"), run: () => {
+        void runtime.client.refreshConversations?.().catch(cause => report?.(owner, cause));
+      } });
+    }
+  }, [runtime.snapshot.status, runtime.client, conversationKey, location.view, report, t]);
   const closeInspector = useCallback(() => {
     setInspectorOpen(false);
     requestAnimationFrame(() => document.getElementById("chat-inspector-toggle")?.focus());
@@ -76,11 +102,11 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
     let alive = true;
     setOpening(true);
     void runtime.client.openConversation(location.job).then(id => {
-      if (alive) { setSessionId(id); setError(null); }
-    }).catch(cause => { if (alive) setError(cause instanceof Error ? cause.message : String(cause)); })
+      if (alive) { transfer?.(location.job!, id); setSessionId(id); }
+    }).catch(cause => { if (alive) report?.(activeConversation.current, cause, { label: t("app.retryLoading"), run: () => setAttempt(value => value + 1) }); })
       .finally(() => { if (alive) setOpening(false); });
     return () => { alive = false; };
-  }, [location.job, location.view, runtime.client, attempt]);
+  }, [location.job, location.view, runtime.client, attempt, report, transfer, t]);
 
   // Runtime actions such as Retry also admit successors, so their addresses must recover on reload.
   useEffect(() => {
@@ -103,7 +129,6 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
   const newChat = useCallback(async () => {
     const session = await runtime.createSession({ workType: "research" });
     setSessionId(session.id);
-    setError(null);
     go("chat");
   }, [runtime, go]);
 
@@ -120,7 +145,7 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
 
   const sidebar = <OcgSidebar sessions={runtime.snapshot.sessions.filter(session => runtime.client.isListedConversation?.(session.id) ?? true).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))}
     activeSessionId={sessionId} collapsed={collapsed} onToggle={() => setCollapsed(value => !value)}
-    onSelect={id => { const selected = runtime.snapshot.sessions.find(session => session.id === id); setSessionId(id); setError(null); go("chat", selected?.sessionId ?? null); }}
+    onSelect={id => { const selected = runtime.snapshot.sessions.find(session => session.id === id); setSessionId(id); go("chat", selected?.sessionId ?? null); }}
     onNewChat={() => void newChat()}
     onRename={runtime.client.renameSession ? (id, title) => runtime.client.renameSession!(id, title) : undefined}
     onHide={runtime.client.hideSession ? async (id) => {
@@ -133,7 +158,7 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
     runtimeStatus={runtime.snapshot.status} runtimeAuthority="canonical"
     activeView={location.view} onNavigate={view => go(view)} onSettingsClick={() => go("settings")} />;
 
-  return <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
+  return <ConversationErrorScope value={location.view === "chat" ? conversationKey : null}><div className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
     <aside className={cn("hidden shrink-0 border-r border-sidebar-border bg-sidebar lg:flex", collapsed ? "w-16" : "w-72")}>{sidebar}</aside>
     {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label={t("app.closeNavigation")} className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
@@ -145,8 +170,6 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
       <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
       <main key={location.view} className={cn("flex min-h-0 flex-1 flex-col", location.view === "chat" ? "overflow-hidden" : "overflow-auto")}>
         {location.view === "chat" ? <>
-          {runtime.snapshot.status.state === "failed" && <p role="alert" className="px-5 py-2 text-sm text-destructive">{runtime.snapshot.status.detail} <button className="underline" onClick={() => void runtime.client.refreshConversations?.().catch(cause => setError(String(cause)))}>{t("app.refreshConversations")}</button></p>}
-          {error && <p role="alert" className="px-5 py-2 text-sm text-destructive">{error} <button className="underline" onClick={() => setAttempt(value => value + 1)}>{t("app.retryLoading")}</button></p>}
           {opening ? <p role="status" className="m-auto text-sm text-muted-foreground">{t("app.loadingConversation")}</p> : session ? <div className="flex min-h-0 flex-1 flex-col"><ChatScreen key={session.id} onOpenConversation={job => { setSessionId(""); go("chat", job); }} session={session} execution={null} runtimeStatus={runtime.snapshot.status} onComposerIntent={intent} onCancel={() => runtime.cancel(session.id)} /></div> : <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center"><h1 className="text-2xl font-medium">{t("chat.newThread")}</h1><button type="button" className="rounded-md border border-border px-4 py-2 text-sm" onClick={() => void newChat()}>{t("sidebar.newChat")}</button></div>}
         </> : null}
         {location.view === "jobs" && <JobsSurface client={client} active job={location.job} onJob={job => go("jobs", job)} onOpenChat={job => { setSessionId(""); go("chat", job); }} />}
@@ -157,5 +180,5 @@ export function AppShell({ client, health, sessionExpiresAtUs, signingOut, signO
       </PageTitleVisibilityContext.Provider>
     </div>
     {location.view === "chat" && inspectorOpen && <ChatInspector session={session} messages={session ? runtime.snapshot.messagesBySession[session.id] ?? [] : []} onClose={closeInspector} onOpenJob={job => go("jobs", job)} />}
-  </div>;
+  </div></ConversationErrorScope>;
 }

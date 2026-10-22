@@ -9,6 +9,7 @@ import type { ChatImage } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgControlUrl } from "../profile/control-url";
 import { useOcgRuntime } from "../runtime/runtime-context";
+import { useConversationError } from "./conversation-errors";
 
 const MAX_IMAGES = 8;
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
@@ -131,6 +132,11 @@ export function useImageAttachments(projectId?: string) {
   }, images: attachments.flatMap(item => item.image ? [item.image] : []), ready: attachments.every(item => item.status === "ready") };
 }
 
+function AttachmentError({ message }: { message?: string | null }) {
+  const inHeader = useConversationError(message);
+  return message && !inHeader ? <p role="alert" className="mt-1 break-words text-xs text-destructive">{message}</p> : null;
+}
+
 export function AttachmentStaging({ state, disabled }: { state: ReturnType<typeof useImageAttachments>; disabled: boolean }) {
   const { t } = useI18n();
   if (!state.attachments.length && !state.error) return null;
@@ -147,11 +153,11 @@ export function AttachmentStaging({ state, disabled }: { state: ReturnType<typeo
           <p className="mt-1 flex items-center gap-1 text-xs text-muted-foreground" role="status">
             {item.status === "uploading" ? <><Loader2 className="size-3 animate-spin" />{t("chat.imageUploading")}</> : item.status === "ready" ? <><Check className="size-3 text-green-600" />{t("chat.imageReady")}</> : <span className="text-destructive">{t("chat.imageUploadFailed")}</span>}
           </p>
-          {item.status === "failed" && <><p role="alert" className="mt-1 line-clamp-2 break-words text-xs text-destructive" title={item.error}>{item.error}</p><Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => state.retry(item.id)}><RotateCcw className="size-3" />{t("common.retry")}</Button></>}
+          {item.status === "failed" && <><AttachmentError message={item.error} /><Button type="button" variant="ghost" size="xs" disabled={disabled} onClick={() => state.retry(item.id)}><RotateCcw className="size-3" />{t("common.retry")}</Button></>}
         </li>)}
       </ul>
     </>}
-    {state.error && <p role="alert" className="mt-1 text-xs text-destructive">{state.error}</p>}
+    <AttachmentError message={state.error} />
   </div>;
 }
 
