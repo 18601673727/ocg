@@ -23,7 +23,7 @@ export function ChatComposerView({ form, dragging, attachmentInput, selectors, c
   const { t } = useI18n();
   return (
     <div className="shrink-0 bg-transparent px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
-      <form {...form} className="relative mx-auto max-w-3xl">
+      <form {...form} className="relative mx-auto w-full">
         {dragging && <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-background/95 text-sm font-medium" role="status">{t("chat.dropImages")}</div>}
         {attachmentInput}
         {selectors}

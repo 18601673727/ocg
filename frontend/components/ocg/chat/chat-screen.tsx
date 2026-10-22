@@ -137,7 +137,7 @@ function QueuePanel({
   const { t } = useI18n();
   if (!queueState?.queue.length) return null;
   return (
-    <div className="mx-auto w-full max-w-3xl border-t border-border px-3 py-2 sm:px-5" aria-label={t("chat.queue")}>
+    <div className="mx-auto w-full border-t border-border px-3 py-2 sm:px-5" aria-label={t("chat.queue")}>
       <div className="mb-1 flex items-center gap-2 text-xs text-muted-foreground" role="status">
         <ListPlus className="size-3.5" aria-hidden="true" />
         {t("chat.queueCount", { count: queueState.queue.length })}
