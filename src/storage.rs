@@ -65,7 +65,6 @@ mod reads;
 mod recurrences;
 mod rows;
 mod schema;
-mod sequences;
 mod transactions;
 
 use crate::persistence::{
@@ -128,7 +127,6 @@ pub(crate) use schema::{
     CACHE_BYTES, DATABASE_FILE_NAME, FORMAT_NAME, FORMAT_VERSION, MAX_OBSERVATION_SCAN,
     MAX_OBSERVED_MODEL_SCAN, MAX_PAGE, MAX_PENDING_JOBS,
 };
-pub(crate) use sequences::Sequence;
 
 // ---- storage errors -------------------------------------------------------------
 

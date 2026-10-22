@@ -3553,13 +3553,33 @@ mod control_plane {
             assert_eq!(completed["outputs"][0]["summary"], "done");
 
             for (path, status, code) in [
-                ("/api/v1/jobs/job:999999", 404, "job_not_found"),
-                ("/api/v1/jobs/job:999999/outputs", 404, "job_not_found"),
+                (
+                    "/api/v1/jobs/000f423f-0000-7001-8000-0000000f423f",
+                    404,
+                    "job_not_found",
+                ),
+                (
+                    "/api/v1/jobs/000f423f-0000-7001-8000-0000000f423f/outputs",
+                    404,
+                    "job_not_found",
+                ),
                 ("/api/v1/jobs/7", 400, "invalid_request"),
-                ("/api/v1/jobs/job:01", 400, "invalid_request"),
+                (
+                    "/api/v1/jobs/00000001-0000-4001-8000-000000000001",
+                    400,
+                    "invalid_request",
+                ),
                 ("/api/v1/jobs/job%3A1", 400, "invalid_request"),
-                ("/api/v1/jobs/job:1?x=1", 400, "invalid_request"),
-                ("/api/v1/jobs/job:1/", 404, "not_found"),
+                (
+                    "/api/v1/jobs/00000001-0000-7001-8000-000000000001?x=1",
+                    400,
+                    "invalid_request",
+                ),
+                (
+                    "/api/v1/jobs/00000001-0000-7001-8000-000000000001/",
+                    404,
+                    "not_found",
+                ),
                 ("/api/v1/jobs", 404, "not_found"),
                 ("/", 404, "not_found"),
                 ("/ocg_db/ocg.redb", 404, "not_found"),
@@ -12067,8 +12087,7 @@ mod requests_and_tool_loop {
             fn job(&self) -> JobId {
                 let (status, job) = self.admission();
                 assert_eq!(status, "admitted", "{}", self.body);
-                job.and_then(|job| job.strip_prefix("job:")?.parse().ok())
-                    .map(JobId::new)
+                job.and_then(|job| job.parse().ok())
                     .expect("an admitted Job")
             }
 
@@ -12478,14 +12497,18 @@ mod requests_and_tool_loop {
             let conflict = submit(
                 address,
                 "c2-agent-0000000000001",
-                &body("profile:999999", configured.targeted, "c2 agent job"),
+                &body(
+                    "000f423f-0000-7002-8000-0000000f423f",
+                    configured.targeted,
+                    "c2 agent job",
+                ),
             );
             assert_eq!(conflict.error(), "idempotency_key_conflict");
 
             let refusals = [
                 (
                     "c2-agent-0000000000002",
-                    "profile:999999".to_owned(),
+                    "000f423f-0000-7002-8000-0000000f423f".to_owned(),
                     configured.targeted,
                     "agent_profile_not_found",
                 ),
@@ -12585,8 +12608,22 @@ mod requests_and_tool_loop {
                 &format!("/api/v1/jobs/{}/input", running.handle.genesis()),
             );
             assert_eq!(genesis.status, 404, "{}", genesis.body);
-            assert_eq!(get(address, "/api/v1/jobs/job:999999/input").status, 404);
-            assert_eq!(get(address, "/api/v1/jobs/job:1/input?x=1").status, 400);
+            assert_eq!(
+                get(
+                    address,
+                    "/api/v1/jobs/000f423f-0000-7001-8000-0000000f423f/input"
+                )
+                .status,
+                404
+            );
+            assert_eq!(
+                get(
+                    address,
+                    "/api/v1/jobs/00000001-0000-7001-8000-000000000001/input?x=1"
+                )
+                .status,
+                400
+            );
             running.stop();
         }
 
@@ -12660,7 +12697,7 @@ mod requests_and_tool_loop {
                 "?limit=0",
                 "?limit=101",
                 "?before=7",
-                "?after=profile:1",
+                "?after=00000001-0000-7002-8000-000000000001",
                 "?limit",
             ] {
                 let answer = get(address, &format!("/api/v1/agent-profiles{refused}"));
@@ -12781,7 +12818,7 @@ mod requests_and_tool_loop {
                     "project_root_invalid",
                 ),
                 (
-                    "/api/v1/projects/project:999".to_owned(),
+                    "/api/v1/projects/000003e7-0000-7004-8000-0000000003e7".to_owned(),
                     json!({"name": "missing", "description": null, "commands": []}),
                     404,
                     "project_not_found",
@@ -12819,7 +12856,7 @@ mod requests_and_tool_loop {
             let running = Running::start(&directory, LONG);
             let address = running.address();
             let pool = executor(&running.handle, "pooled", &[OPENAI]).expect("register");
-            let id = format!("execution_pool:{}", pool.get());
+            let id = pool.to_string();
             let listed = || {
                 get(address, "/api/v1/pools").json()["pools"]
                     .as_array()
@@ -12851,7 +12888,7 @@ mod requests_and_tool_loop {
             }
             let missing = post(
                 address,
-                "/api/v1/pools/execution_pool:999999",
+                "/api/v1/pools/000f423f-0000-7006-8000-0000000f423f",
                 r#"{"enabled":true}"#,
             );
             assert_eq!(
@@ -13684,7 +13721,11 @@ mod requests_and_tool_loop {
                 (404, "conversation_not_found")
             );
             assert!(!settled(&job_record(&handle, foreign)));
-            for job in [JobId::new(999_999), handle.genesis()] {
+            let unknown = JobId::new(
+                crate::persistence::parse_entity_id("00000001-0000-7001-8000-000000000001")
+                    .expect("a canonical UUIDv7"),
+            );
+            for job in [unknown, handle.genesis()] {
                 let missing = stop(address, job);
                 assert_eq!(
                     (missing.status, missing.error().as_str()),
@@ -13904,7 +13945,7 @@ mod requests_and_tool_loop {
             for line in [
                 "POST /api/v1/admissions",
                 "POST /api/v1/health",
-                "POST /api/v1/jobs/job:1",
+                "POST /api/v1/jobs/00000001-0000-7001-8000-000000000001",
             ] {
                 let answer = send(address, line, &replaced(&standard, &[]), body.as_bytes());
                 assert_eq!(
@@ -14021,7 +14062,7 @@ mod requests_and_tool_loop {
                 json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "credential_ref": "KEY"}).to_string(),
                 json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "endpoint": "https://evil.example/v1"}).to_string(),
                 json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "command": "rm -rf /"}).to_string(),
-                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "job": "job:1"}).to_string(),
+                json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string(), "objective": "x", "job": "00000001-0000-7001-8000-000000000001"}).to_string(),
                 json!({"llm_profile": target.llm.to_string(), "executor": target.executor.to_string()}).to_string(),
             ] {
                 let length = malformed.len().to_string();
@@ -14056,12 +14097,22 @@ mod requests_and_tool_loop {
             // free for one that can.
             for (llm, executor, code) in [
                 (
-                    ProfileId::new(999_999),
+                    ProfileId::new(
+                        crate::persistence::parse_entity_id("00000001-0000-7001-8000-000000000001")
+                            .expect("a canonical UUIDv7"),
+                    ),
                     target.executor,
                     "llm_profile_not_found",
                 ),
                 (agent, target.executor, "llm_profile_not_found"),
-                (target.llm, ExecutorId::new(999_999), "executor_not_found"),
+                (
+                    target.llm,
+                    ExecutorId::new(
+                        crate::persistence::parse_entity_id("00000001-0000-7001-8000-000000000001")
+                            .expect("a canonical UUIDv7"),
+                    ),
+                    "executor_not_found",
+                ),
                 (target.llm, system, "executor_incompatible"),
             ] {
                 let body = json!({
@@ -14292,7 +14343,7 @@ mod requests_and_tool_loop {
             let key = "c2f1-refused-00000001";
             let unrunnable = json!({
                 "llm_profile": target.llm.to_string(),
-                "executor": "executor:999999",
+                "executor": "000f423f-0000-7003-8000-0000000f423f",
                 "objective": "Never",
                 "name": "c2f1 refused",
             })
@@ -14954,7 +15005,7 @@ mod requests_and_tool_loop {
             assert!(head.starts_with("HTTP/1.1 201"), "{raw}");
             let answer: Value = serde_json::from_str(body).expect("JSON");
             let job = answer["admission"]["job"].as_str().expect("a Job");
-            JobId::new(job["job:".len()..].parse().expect("a number"))
+            job.parse().expect("a UUID")
         }
 
         #[test]
@@ -15404,11 +15455,17 @@ mod requests_and_tool_loop {
                 (400, "ambiguous_cursor".to_owned())
             );
             assert_eq!(
-                refused("GET /api/v1/jobs/job:999999/events", &with_cursor),
+                refused(
+                    "GET /api/v1/jobs/000f423f-0000-7001-8000-0000000f423f/events",
+                    &with_cursor
+                ),
                 (404, "job_not_found".to_owned())
             );
             assert_eq!(
-                refused("GET /api/v1/jobs/job:01/events", &with_cursor),
+                refused(
+                    "GET /api/v1/jobs/00000001-0000-4001-8000-000000000001/events",
+                    &with_cursor
+                ),
                 (400, "invalid_request".to_owned())
             );
             let posted = stream_with(address, &format!("POST {path}"), &with_cursor);
@@ -16132,7 +16189,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 25);
+            assert_eq!(crate::storage::FORMAT_VERSION, 26);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");

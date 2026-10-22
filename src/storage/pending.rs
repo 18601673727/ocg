@@ -4,7 +4,7 @@ use std::num::NonZeroUsize;
 use std::ops::Bound;
 use std::time::Instant;
 
-fn key(id: u64) -> PendingJobKey {
+fn key(id: u128) -> PendingJobKey {
     PendingJobKey {
         job: JobId::new(id),
     }
@@ -13,10 +13,9 @@ fn key(id: u64) -> PendingJobKey {
 fn fence(transaction: &ReadTransaction) -> Result<PendingFence, StorageError> {
     let index = transaction.open_table(PENDING)?;
     let high_water = transaction
-        .open_table(SEQUENCES)?
-        .get(Sequence::Job.key())?
-        .map(|v| v.value())
-        .unwrap_or(0);
+        .open_table(JOBS)?
+        .last()?
+        .map_or(0, |entry| entry.0.value());
     Ok(PendingFence {
         len: index.len()?,
         high_water: JobId::new(high_water),

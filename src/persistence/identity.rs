@@ -24,27 +24,41 @@ impl Timestamp {
     }
 }
 
+/// Parses only canonical lowercase, hyphenated UUIDv7 identities.
+pub fn parse_entity_id(text: &str) -> Option<u128> {
+    let id = uuid::Uuid::parse_str(text).ok()?;
+    (id.hyphenated().to_string() == text && id.get_version_num() == 7).then_some(id.as_u128())
+}
+
 macro_rules! record_id_type {
     ($name:ident, $table:literal) => {
-        /// A stable business identifier allocated by the database. A committed
-        /// identifier is never reused; one allocated by a transaction that
-        /// rolled back may be allocated again by a later transaction.
+        /// A durable UUID identity. New entities receive a monotonic UUIDv7
+        /// from the database worker; sequences within an entity remain numeric.
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub(super) u64);
+        pub struct $name(pub(super) u128);
 
         impl $name {
-            pub const fn new(value: u64) -> Self {
+            pub const fn new(value: u128) -> Self {
                 Self(value)
             }
 
-            pub const fn get(self) -> u64 {
+            pub const fn get(self) -> u128 {
                 self.0
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = &'static str;
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                parse_entity_id(text)
+                    .map(Self)
+                    .ok_or("expected a canonical UUID")
             }
         }
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, concat!($table, ":{}"), self.0)
+                uuid::Uuid::from_u128(self.0).hyphenated().fmt(f)
             }
         }
     };
@@ -62,6 +76,7 @@ record_id_type!(LlmProviderId, "llm_provider");
 record_id_type!(MetricsId, "metrics");
 record_id_type!(AvailabilityStatId, "availability_stat");
 record_id_type!(AttachmentId, "attachment");
+record_id_type!(RequestEventId, "request_event");
 
 impl From<ConfigId> for ProfileId {
     fn from(c: ConfigId) -> Self {

@@ -69,9 +69,9 @@ test("a canonical-shaped history payload still validates", () => {
   const envelope = factory.envelope("conversation.history-loaded", {
     messages: [
       {
-        id: "job:1:entry:1",
-        jobId: "job:1",
-        commandId: "job:1",
+        id: "00000001-0000-7001-8000-000000000001:entry:1",
+        jobId: "00000001-0000-7001-8000-000000000001",
+        commandId: "00000001-0000-7001-8000-000000000001",
         role: "user",
         content: "do it",
         status: "completed",
@@ -79,9 +79,9 @@ test("a canonical-shaped history payload still validates", () => {
         images: [],
       },
       {
-        id: "job:1:answer",
-        jobId: "job:1",
-        commandId: "job:1",
+        id: "00000001-0000-7001-8000-000000000001:answer",
+        jobId: "00000001-0000-7001-8000-000000000001",
+        commandId: "00000001-0000-7001-8000-000000000001",
         role: "assistant",
         content: "done",
         status: "completed",

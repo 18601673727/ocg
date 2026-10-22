@@ -109,8 +109,8 @@ impl ToolHandler for HostOnly {
 }
 
 pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
-    let conversation = json!({"type":"string", "pattern":"^job:[0-9]+$", "description":"A child conversation id (conversation from job_dispatch, or child from a notice), never an answered turn id."});
-    let profile = json!({"type":"string", "pattern":"^profile:[0-9]+$"});
+    let conversation = json!({"type":"string", "format":"uuid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", "description":"A child conversation id (conversation from job_dispatch, or child from a notice), never an answered turn id."});
+    let profile = json!({"type":"string", "format":"uuid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"});
     for name in NAMES {
         let (properties, required, description) = match name {
             "job_limits" => (
@@ -138,7 +138,7 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
             "job_dispatch" => (
                 json!({
                     "agent": profile,
-                    "project": {"type":"string", "pattern":"^project:[0-9]+$"},
+                    "project": {"type":"string", "format":"uuid", "pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
                     "objective": {"type":"string", "minLength":1},
                     "keep_open": {"type":"boolean"},
                     "every_seconds": {"type":"integer", "minimum":60, "maximum":2592000},
@@ -157,7 +157,7 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
                 "Message a conversation in your strict subtree.",
             ),
             "job_retry" => (
-                json!({"turn":{"type":"string","pattern":"^job:[0-9]+$","description":"The original turn id to retry, not its conversation id."}}),
+                json!({"turn":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$","description":"The original turn id to retry, not its conversation id."}}),
                 vec!["turn"],
                 "Retry a descendant turn, at most twice per original turn.",
             ),

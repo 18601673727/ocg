@@ -408,7 +408,7 @@ mod tests {
     fn metrics(id: u64, job: JobId, observed_micros: i64, counters: Counters) -> MetricsRecord {
         let [input, output, cache_read, cache_write, reasoning] = counters;
         MetricsRecord {
-            id: MetricsId::new(id),
+            id: MetricsId::new(u128::from(id)),
             job,
             request: RequestNumber::FIRST,
             target: None,

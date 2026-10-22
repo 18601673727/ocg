@@ -31,10 +31,11 @@ export function readModelPreference(projectId: string | undefined, sessionId: st
     const record = value as Record<string, unknown>;
     if (typeof record.model !== "string" || !record.model) return undefined;
     const selection: ChatModelSelection = { model: record.model, effort: typeof record.effort === "string" && record.effort ? record.effort : null };
-    for (const [key, prefix] of [["agentProfile", "profile"], ["llmProfile", "profile"], ["executor", "executor"], ["project", "project"]] as const) {
+    const uuidV7 = "[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+    for (const key of ["agentProfile", "llmProfile", "executor", "project"] as const) {
       const id = record[key];
       if (id !== undefined) {
-        if (typeof id !== "string" || !new RegExp(`^${prefix}:(0|[1-9][0-9]*)$`).test(id)) return undefined;
+        if (typeof id !== "string" || !new RegExp(`^${uuidV7}$`).test(id)) return undefined;
         selection[key] = id;
       }
     }

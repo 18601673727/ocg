@@ -22,8 +22,8 @@ impl Recurrence {
             }
         }
         e.u64(self.n);
-        e.u64(self.current_turn.get());
-        e.ou64(self.previous_turn.map(JobId::get));
+        e.u128(self.current_turn.get());
+        e.ou128(self.previous_turn.map(JobId::get));
         e.u32(self.interval_s);
         e.0
     }
@@ -46,8 +46,8 @@ impl Recurrence {
         let row = Self {
             phase,
             n: d.u64()?,
-            current_turn: JobId::new(d.u64()?),
-            previous_turn: d.ou64()?.map(JobId::new),
+            current_turn: JobId::new(d.u128()?),
+            previous_turn: d.ou128()?.map(JobId::new),
             interval_s: d.u32()?,
         };
         d.end()?;
@@ -105,7 +105,7 @@ impl Batch {
     pub(crate) fn boundary_b(&mut self, clock: i64) -> Result<(), BatchError> {
         let due = self.step(|tx| {
             tx.open_table(RECURRENCE_DUE)?
-                .range(..=(clock, u64::MAX))?
+                .range(..=(clock, u128::MAX))?
                 .map(|entry| Ok(JobId::new(entry?.0.value().1)))
                 .collect::<Result<Vec<_>, StorageError>>()
         })?;
@@ -122,7 +122,7 @@ impl Batch {
             }
             let first = self.step(|tx| {
                 tx.open_table(CHILDREN)?
-                    .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                    .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                     .next()
                     .transpose()?
                     .map(|(key, _)| JobId::new(key.value().1))

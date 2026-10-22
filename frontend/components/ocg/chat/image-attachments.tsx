@@ -163,7 +163,7 @@ export function AttachmentStaging({ state, disabled }: { state: ReturnType<typeo
 }
 
 function imageSource(url: string, baseUrl: string | null): string | null {
-  if (/^\/api\/v1\/attachments\/attachment:[0-9]+\/content$/.test(url)) return baseUrl ? `${baseUrl.replace(/\/$/, "")}${url}` : url;
+  if (/^\/api\/v1\/attachments\/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/content$/.test(url)) return baseUrl ? `${baseUrl.replace(/\/$/, "")}${url}` : url;
   if (/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(url) && url.length <= 6 * 1024 * 1024) return url;
   try {
     const parsed = new URL(url);

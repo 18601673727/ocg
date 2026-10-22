@@ -301,7 +301,7 @@ contracts! {
             reference: String,
         },
         Decision {
-            approval: (u64, u32, u32),
+            approval: (String, u32, u32),
         },
         RetryOf {
             turn: String,
@@ -654,14 +654,14 @@ contracts! {
         Approval {
             conversation: String,
             parent: Option<String>,
-            approval: (u64, u32, u32),
+            approval: (String, u32, u32),
             tool: String,
             arguments: String,
         },
         Question {
             conversation: String,
             parent: Option<String>,
-            approval: (u64, u32, u32),
+            approval: (String, u32, u32),
             tool: String,
             question: String,
         },
@@ -774,7 +774,7 @@ contracts! {
         pub conversation: String,
     }
     struct WireApprovalDecision {
-        pub approval: (u64, u32, u32),
+        pub approval: (String, u32, u32),
         pub decision: String,
         pub turn: String,
         pub seq: u32,

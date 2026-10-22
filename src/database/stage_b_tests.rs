@@ -681,9 +681,8 @@ fn a_sigkilled_supervisor_quarantines_the_capacity_its_surviving_child_uses() {
         if let Some(rest) = line.trim().strip_prefix("OCG_SUPERVISOR_READY") {
             supervisor_job = rest
                 .split_whitespace()
-                .find_map(|field| field.strip_prefix("job=job:"))
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(JobId::new);
+                .find_map(|field| field.strip_prefix("job="))
+                .and_then(|value| value.parse::<JobId>().ok());
             child_pid = rest
                 .split_whitespace()
                 .find_map(|field| field.strip_prefix("child="))

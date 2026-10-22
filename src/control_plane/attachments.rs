@@ -24,7 +24,7 @@ use serde::Deserialize;
 #[cfg(test)]
 use serde_json::json;
 
-use super::{INTERNAL, INVALID_REQUEST, Refusal, Reply, decimal};
+use super::{INTERNAL, INVALID_REQUEST, Refusal, Reply};
 use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::openai_compatible::image::MAX_IMAGE_BYTES;
@@ -86,10 +86,9 @@ struct WireUpload {
     display_name: Option<String>,
 }
 
-/// An Attachment written as OCG writes it: `attachment:<n>`.
+/// Parses a canonical Attachment UUID.
 pub(super) fn attachment_id(text: &str) -> Result<AttachmentId, Refusal> {
-    text.strip_prefix("attachment:")
-        .and_then(decimal::<u64>)
+    crate::persistence::parse_entity_id(text)
         .map(AttachmentId::new)
         .ok_or(INVALID_REQUEST)
 }
@@ -327,10 +326,7 @@ mod tests {
         let text_llm_id: ProfileId = text_llm.body["profile_id"]
             .as_str()
             .unwrap()
-            .strip_prefix("profile:")
-            .unwrap()
             .parse()
-            .map(ProfileId::new)
             .unwrap();
 
         // Profile with Vision
@@ -353,10 +349,7 @@ mod tests {
         let vision_llm_id: ProfileId = vision_llm.body["profile_id"]
             .as_str()
             .unwrap()
-            .strip_prefix("profile:")
-            .unwrap()
             .parse()
-            .map(ProfileId::new)
             .unwrap();
 
         // 6. Submitting image with text-only profile is refused

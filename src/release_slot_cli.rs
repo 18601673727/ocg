@@ -21,8 +21,9 @@ pub fn run(
     }
 
     let job_str = job_arg.ok_or("usage: ocg release-slot <job> [--yes]")?;
-    let raw = job_str.strip_prefix("job:").unwrap_or(&job_str);
-    let job = JobId::new(raw.parse()?);
+    let job: JobId = job_str
+        .parse()
+        .map_err(|_| "job must be a canonical UUID")?;
 
     let result = std::rc::Rc::new(std::cell::RefCell::new(None));
     let returned = result.clone();

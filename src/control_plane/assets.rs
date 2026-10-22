@@ -127,7 +127,11 @@ fn resolved(path: &str) -> Option<String> {
         return None;
     }
     let segments = rest.split('/').collect::<Vec<_>>();
-    if segments.first() == Some(&"jobs") && segments.get(1).is_some_and(|id| id.starts_with("job:"))
+    if segments.first() == Some(&"jobs")
+        && segments
+            .get(1)
+            .and_then(|id| crate::persistence::parse_entity_id(id))
+            .is_some()
     {
         if segments.len() % 2 != 0
             || segments.len() > 2 * (usize::from(crate::persistence::MAX_CONVERSATION_DEPTH) + 1)
@@ -211,13 +215,15 @@ mod nested_route_tests {
     #[test]
     fn nested_conversation_paths_serve_the_shared_chat_page() {
         assert_eq!(
-            resolved("/jobs/job:1/jobs/job:3/jobs/job:5"),
+            resolved(
+                "/jobs/00000001-0000-7001-8000-000000000001/jobs/00000003-0000-7001-8000-000000000003/jobs/00000005-0000-7001-8000-000000000005"
+            ),
             Some(String::new())
         );
         for path in [
-            "/jobs/job:1/jobs",
-            "/jobs/job:1/jobs/job:1",
-            "/jobs/job:1/other/job:2",
+            "/jobs/00000001-0000-7001-8000-000000000001/jobs",
+            "/jobs/00000001-0000-7001-8000-000000000001/jobs/00000001-0000-7001-8000-000000000001",
+            "/jobs/00000001-0000-7001-8000-000000000001/other/00000002-0000-7001-8000-000000000002",
             "/jobs/job%3A1",
         ] {
             assert!(resolved(path).is_none(), "{path}");

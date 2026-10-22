@@ -166,7 +166,7 @@ impl DatabaseHandle {
         &self,
         filter: crate::persistence::UsageSummaryFilter,
         bucketing: crate::persistence::UsageBucketing,
-        after: Option<(u64, u64)>,
+        after: Option<(u128, u128)>,
         limit: usize,
     ) -> Result<storage::UsageRetriesPage, DatabaseError> {
         self.read(move |database| {

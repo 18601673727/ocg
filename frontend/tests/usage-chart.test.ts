@@ -10,8 +10,8 @@ test("usage buckets zero-fill days and rank models separately from Other", () =>
     const model = index === 0 ? "Other" : index === 10 ? null : `model-${index}`;
     for (const bucket of [0, 2]) {
       rows.push({
-        bucket_us: bucket * day, agent: bucket === 0 ? "profile:1" : "profile:2",
-        provider: bucket === 0 ? "llm_provider:1" : "llm_provider:2", model,
+        bucket_us: bucket * day, agent: bucket === 0 ? "00000001-0000-7002-8000-000000000001" : "00000002-0000-7002-8000-000000000002",
+        provider: bucket === 0 ? "00000001-0000-7007-8000-000000000001" : "00000002-0000-7007-8000-000000000002", model,
         requests: 1, complete_requests: 1,
         input_tokens: bucket === 0 ? 11 - index : 0,
         output_tokens: bucket === 2 ? 11 - index : 0,

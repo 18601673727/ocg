@@ -13,7 +13,7 @@ use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
 
-use super::{INVALID_REQUEST, Refusal, Reply, decimal, profiles};
+use super::{INVALID_REQUEST, Refusal, Reply, profiles};
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{ExecutionPool, ExecutionPoolId, Violation};
 use crate::storage::MAX_PAGE;
@@ -32,8 +32,7 @@ struct WirePoolUpdate {
 }
 
 pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
-    text.strip_prefix("execution_pool:")
-        .and_then(decimal::<u64>)
+    crate::persistence::parse_entity_id(text)
         .map(ExecutionPoolId::new)
         .ok_or(INVALID_REQUEST)
 }

@@ -326,7 +326,7 @@ pub enum ExecutionRuntimeError {
     #[error("the Provider answered, but the Job was settled failed: {source}")]
     CompletionRefused {
         receipt: Box<ExecutionReceipt>,
-        source: Violation,
+        source: Box<Violation>,
         observations: Option<Box<DatabaseError>>,
     },
     /// The tools selected for the plan are no longer registered as selected,
@@ -377,6 +377,7 @@ pub enum ExecutionRuntimeError {
 /// Why a provider plan was not acknowledged as an admitted Job, see
 /// [`SchedulerHandle::admit_provider`].
 #[derive(Debug, thiserror::Error)]
+#[allow(clippy::result_large_err)]
 pub enum AdmissionError {
     /// The plan never started and no Job was created for it: it was refused
     /// before its Job was created, or the creation is known not to have
@@ -1181,6 +1182,7 @@ impl SchedulerHandle {
     /// # Errors
     ///
     /// Returns why no Job is known to have been admitted.
+    #[allow(clippy::result_large_err)]
     pub async fn admit_provider(
         &self,
         plan: ProviderExecutionPlan,
@@ -1199,6 +1201,7 @@ impl SchedulerHandle {
     /// # Errors
     ///
     /// As [`Self::admit_provider`].
+    #[allow(clippy::result_large_err)]
     pub async fn admit_submitted_provider(
         &self,
         plan: ProviderExecutionPlan,
@@ -1207,6 +1210,7 @@ impl SchedulerHandle {
         self.admit(plan, Some(submission), None).await
     }
 
+    #[allow(clippy::result_large_err)]
     async fn admit(
         &self,
         mut plan: ProviderExecutionPlan,
@@ -2224,6 +2228,7 @@ fn spawn_grant(
 /// persisted unless the Executor is registered, the tool limits are valid
 /// and the tools can still be offered. A `submission` is recorded with the
 /// Job in the transaction that creates it.
+#[allow(clippy::result_large_err)]
 async fn admit_provider_job(
     database: &DatabaseHandle,
     plan: &mut ProviderExecutionPlan,
@@ -3728,7 +3733,7 @@ impl CallSite<'_> {
 /// recorded, if any.
 struct Stopped {
     stop: ToolLoopStop,
-    evidence: Option<DatabaseError>,
+    evidence: Option<Box<DatabaseError>>,
 }
 
 impl From<ToolLoopStop> for Stopped {
@@ -3976,7 +3981,7 @@ async fn answer_calls(
                         index,
                         outcome: None,
                     },
-                    evidence: Some(error),
+                    evidence: Some(Box::new(error)),
                 });
             }
         }
@@ -4004,7 +4009,7 @@ async fn answer_calls(
                                 index,
                                 outcome: Some(ToolOutcomeKind::NotInvoked),
                             },
-                            evidence: Some(error),
+                            evidence: Some(Box::new(error)),
                         })?;
                     answers.push(serde_json::json!({"refused":refusal.kind.as_str(), "reason":refusal.message}).to_string());
                     continue;
@@ -4067,7 +4072,7 @@ async fn answer_calls(
                             index,
                             outcome: None,
                         },
-                        evidence: Some(error),
+                        evidence: Some(Box::new(error)),
                     });
                 }
             };
@@ -4082,7 +4087,7 @@ async fn answer_calls(
                             index,
                             outcome: None,
                         },
-                        evidence: Some(error),
+                        evidence: Some(Box::new(error)),
                     });
                 }
             } else if let Some(scheduler) = site.scheduler
@@ -4091,8 +4096,8 @@ async fn answer_calls(
                 for turn in running {
                     if let Some(id) = turn
                         .as_str()
-                        .and_then(|id| id.strip_prefix("job:"))
-                        .and_then(|id| id.parse::<u64>().ok())
+                        .and_then(|id| id.parse::<JobId>().ok())
+                        .map(JobId::get)
                     {
                         let cause = if call.name == "job_close" {
                             crate::persistence::StopCause::Closed
@@ -4195,7 +4200,7 @@ async fn answer_calls(
                                 index,
                                 outcome: Some(ToolOutcomeKind::NotApplied),
                             },
-                            evidence: Some(error),
+                            evidence: Some(Box::new(error)),
                         });
                     }
                     answers.push(
@@ -4245,7 +4250,7 @@ async fn answer_calls(
                                     index,
                                     outcome: Some(ToolOutcomeKind::Completed),
                                 },
-                                evidence: Some(error),
+                                evidence: Some(Box::new(error)),
                             });
                         }
                         budget.result_bytes = total;
@@ -4305,7 +4310,7 @@ async fn record_call_decision(
                 index: call.index,
                 outcome: None,
             },
-            evidence: Some(error),
+            evidence: Some(Box::new(error)),
         }),
     }
 }
@@ -4341,7 +4346,7 @@ async fn record_refusal(
         .await
         .map_err(|error| Stopped {
             stop: ToolLoopStop::Refused(refusal.clone()),
-            evidence: Some(error),
+            evidence: Some(Box::new(error)),
         })
 }
 
@@ -4369,14 +4374,14 @@ async fn conclude(
         Ok(()) => stop.into(),
         Err(error) if stop.is_unknown() => Stopped {
             stop,
-            evidence: Some(error),
+            evidence: Some(Box::new(error)),
         },
         Err(error) => Stopped {
             stop: ToolLoopStop::EvidenceNotRecorded {
                 index: call.index,
                 outcome: Some(kind),
             },
-            evidence: Some(error),
+            evidence: Some(Box::new(error)),
         },
     }
 }
@@ -4395,7 +4400,6 @@ async fn stop_tool_loop(
     let database = run.database;
     let job = run.job;
     let Stopped { stop, evidence } = stopped;
-    let evidence = evidence.map(Box::new);
     let finalization = if stop.is_unknown() {
         JobFinalization::Unknown
     } else {
@@ -4553,7 +4557,7 @@ async fn complete_provider_job(
     if let Some(source) = refused {
         return Err(ExecutionRuntimeError::CompletionRefused {
             receipt: Box::new(receipt),
-            source,
+            source: Box::new(source),
             observations: gap.map(Box::new),
         });
     }

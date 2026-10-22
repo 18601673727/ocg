@@ -8,7 +8,7 @@ function answer(text: string, settled = false, titleMetadata = true) {
     id: "output:1", seq: 1, kind: settled ? "result" : "progress", summary: text,
     code: null, goal_reached: null, value: null, created_at_us: 1,
   };
-  return jobTranscript("job:1", null, [output], { state: settled ? "completed" : "unsettled" }, !settled, undefined, undefined, titleMetadata)[0].content;
+  return jobTranscript("00000001-0000-7001-8000-000000000001", null, [output], { state: settled ? "completed" : "unsettled" }, !settled, undefined, undefined, titleMetadata)[0].content;
 }
 
 test("a streaming title stays hidden and the answer appears as it arrives", () => {

@@ -12,6 +12,7 @@ pub mod persistence;
 pub mod provider_execution;
 pub mod release_slot_cli;
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod schema_tests;
 mod storage;
 pub mod system_policy;

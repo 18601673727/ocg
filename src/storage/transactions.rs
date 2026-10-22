@@ -78,7 +78,7 @@ impl Batch {
         }
         self.validate_spec(&spec)?;
 
-        let job = JobId::new(self.next_id(Sequence::Job)?);
+        let job = JobId::new(self.next_id()?);
         spec.id = job;
         spec.created_at = self.now;
         self.insert_job(&spec)?;
@@ -427,7 +427,7 @@ impl Batch {
         let due = self.step(|tx| {
             let delayed = tx.open_table(DELAYED)?;
             let mut due = Vec::new();
-            for entry in delayed.range((i64::MIN, 0)..=(clock, u64::MAX))? {
+            for entry in delayed.range((i64::MIN, 0)..=(clock, u128::MAX))? {
                 due.push(entry?.0.value());
             }
             Ok(due)
@@ -460,7 +460,7 @@ impl Batch {
                 };
                 let id = row.id.get();
                 let mut count = 0u32;
-                for slot in held.range((id, 0)..=(id, u64::MAX))? {
+                for slot in held.range((id, 0)..=(id, u128::MAX))? {
                     slot?;
                     count += 1;
                 }
@@ -501,13 +501,13 @@ impl Batch {
                         .map(|(operation, protocol)| requirement(Some(*operation), *protocol))
                 })
                 .collect();
-            let mut candidate: Option<(u16, u64)> = None;
+            let mut candidate: Option<(u16, u128)> = None;
             for key in offered {
                 let first = self.step(|tx| {
                     let ready = tx.open_table(READY)?;
                     let jobs = tx.open_table(JOBS)?;
                     let mut first = None;
-                    for entry in ready.range((key, 0)..=(key, u64::MAX))? {
+                    for entry in ready.range((key, 0)..=(key, u128::MAX))? {
                         let id = entry?.0.value().1;
                         if let Some(row) = jobs.get(id)?
                             && JobRow::decode_at(id, row.value())?.kind.is_stored()
@@ -1034,7 +1034,7 @@ impl Batch {
         mut cause: Option<OutcomeCause>,
         result: Option<FinalResult>,
         ignore_stop_cause: bool,
-    ) -> Result<(OutcomeKind, Option<u32>), BatchError> {
+    ) -> Result<(OutcomeKind, Option<(u32, JobOutputId)>), BatchError> {
         let mut state = self.require_job_state(job)?;
         if state.outcome.is_some() {
             return self.reject(Violation::JobAlreadyFinalized(job));
@@ -1268,7 +1268,7 @@ impl Batch {
             let waiters = self.step(|tx| {
                 let table = tx.open_table(DEPENDENCY_WAITERS)?;
                 let mut waiters = Vec::new();
-                for entry in table.range((job.get(), 0)..=(job.get(), u64::MAX))? {
+                for entry in table.range((job.get(), 0)..=(job.get(), u128::MAX))? {
                     let (key, condition) = entry?;
                     waiters.push((key.value().1, condition.value()));
                 }

@@ -37,8 +37,8 @@ pub use execution::{
 };
 pub use identity::{
     AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,
-    JobOutputId, LlmProviderId, MetricsId, ProfileId, ProjectId, RecordRef, RequestNumber,
-    RequestRef, Timestamp,
+    JobOutputId, LlmProviderId, MetricsId, ProfileId, ProjectId, RecordRef, RequestEventId,
+    RequestNumber, RequestRef, Timestamp, parse_entity_id,
 };
 pub(crate) use mutations::{
     PublishedAttachment, append_job_output, bench_create_dependent_turn, check_new_attachment,

@@ -55,7 +55,7 @@ The Control Plane binds `127.0.0.1:<OCG_CONTROL_PORT>` and prints
 | `OCG_CONTROL_PORT` | No | The loopback TCP port (1–65535) the Control Plane listens on. It must be set together with `OCG_CONTROL_TOKEN`; setting only one is a startup error. |
 | `OCG_CONTROL_TOKEN` | No | The bearer token programmatic Control Plane clients present. It must be 32–512 characters with at least 8 distinct characters, using `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`, `+`, `/` or `=`. It is never logged. |
 | `OCG_UI_DIR` | No | A directory of the exported frontend for the Control Plane to serve. It must exist, is read only when the Control Plane is enabled, and without it no console or browser pairing is offered. |
-| `OCG_PROJECT` | `workspace-*` | The Project, written `project:<n>`, whose root is the Workspace the Job may use; see [Projects](#projects). It must exist, and its root must still pass the checks below. |
+| `OCG_PROJECT` | `workspace-*` | The Project, identified by its canonical UUID, whose root is the Workspace the Job may use; see [Projects](#projects). It must exist, and its root must still pass the checks below. |
 | `OCG_PROVIDER_ENDPOINT` | `register-llm` and `workspace-*` | The Provider's OpenAI-compatible endpoint, which must be an `https://` URL. |
 | `OCG_PROVIDER_MODEL` | `register-llm` and `workspace-*` | The Provider's model identifier. |
 | `OCG_PROVIDER_CREDENTIAL_REF` | `register-llm` and `workspace-*` | The name of the environment variable that holds the Provider's API key. That variable is read when a request is built; its value is never stored, printed or logged. |
@@ -101,8 +101,8 @@ curl -X POST http://127.0.0.1:7840/api/v1/projects \
   no secret in it.**
 - `POST /api/v1/projects/{project}` replaces the name, description and commands;
   a body that names `root` is refused. `GET /api/v1/projects` lists Projects
-  newest first with `before=project:<n>` and `limit`. There is no delete.
-- A Job names its Project when it is submitted (`"project": "project:<n>"`); a
+  newest first with `before=<project-uuid>` and `limit`. There is no delete.
+- A Job names its Project when it is submitted (`"project": "<project-uuid>"`); a
   conversation fixes its Project at creation. Follow-up messages name the
   conversation and omit `project`.
 
@@ -143,7 +143,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 25, with no migration;
+cancelled if reopened without a claim. The stored format is 26, with no migration;
 recreate data directories made by earlier versions.
 
 Conversation depth is derived from parent links. Limits default to depth 3
@@ -237,8 +237,8 @@ Each command below also needs `OCG_DATA_DIR`, except `--version` and `help`.
 
 - `ocg pool list` — print every Pool as `id`, name, concurrency limit and `enabled`/`disabled`.
 - `ocg pool create <name> [nonzero-concurrency]` — create an enabled Pool for OpenAI Chat Completions (default concurrency 16) and print its id.
-- `ocg pool enable <pool>` — enable the Pool named `execution_pool:<n>` or `<n>`.
-- `ocg pool disable <pool>` — disable the Pool named `execution_pool:<n>` or `<n>`.
+- `ocg pool enable <pool>` — enable the Pool named by its canonical UUID.
+- `ocg pool disable <pool>` — disable the Pool named by its canonical UUID.
 - `ocg pool set-limit <pool> <nonzero-concurrency>` — replace the Pool's concurrency limit.
 
 ### Workspace Jobs

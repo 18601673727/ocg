@@ -351,7 +351,13 @@ fn the_executable_admits_reconciles_and_stops_jobs_over_http() {
         400
     );
     assert_eq!(
-        request(address, "GET /api/v1/jobs/job:999999/responses", None, None).status,
+        request(
+            address,
+            "GET /api/v1/jobs/000f423f-0000-7001-8000-0000000f423f/responses",
+            None,
+            None
+        )
+        .status,
         404
     );
     let retries = request(

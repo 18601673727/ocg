@@ -68,11 +68,11 @@ export type WireInput = { id: string, objective: string | null, submitted_at_us:
 
 export type WireJobInput = { job: string, input: WireInput, };
 
-export type WireEntry = { "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [number, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, });
+export type WireEntry = { "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [string, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, });
 
 export type WireResponseFormat = { "type": "json_object" } | { "type": "json_schema", name: string, };
 
-export type WireTurnEntry = { seq: number, at_us: number, } & ({ "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [number, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, }));
+export type WireTurnEntry = { seq: number, at_us: number, } & ({ "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [string, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, }));
 
 export type WireUncertainCall = { request: number, index: number, tool: string, argv: string, };
 
@@ -170,7 +170,7 @@ export type WireOutputEvent = { job: string, output: WireOutput, };
 
 export type WireSettlementEvent = { job: string, settlement: WireSettlement, stop_confirmed_at_us: number | null, };
 
-export type WireCard = { "kind": "approval", conversation: string, parent: string | null, approval: [number, number, number], tool: string, arguments: string, } | { "kind": "question", conversation: string, parent: string | null, approval: [number, number, number], tool: string, question: string, } | { "kind": "loop_hold", conversation: string, parent: string | null, } | { "kind": "quarantine", conversation: string, parent: string | null, turn: string, };
+export type WireCard = { "kind": "approval", conversation: string, parent: string | null, approval: [string, number, number], tool: string, arguments: string, } | { "kind": "question", conversation: string, parent: string | null, approval: [string, number, number], tool: string, question: string, } | { "kind": "loop_hold", conversation: string, parent: string | null, } | { "kind": "quarantine", conversation: string, parent: string | null, turn: string, };
 
 export type WireCards = { conversation: string, cards: Array<WireCard>, };
 
@@ -204,6 +204,6 @@ export type WireStop = { conversation: string, status: string, record_seq: numbe
 
 export type WireConversationEdited = { conversation: string, };
 
-export type WireApprovalDecision = { approval: [number, number, number], decision: string, turn: string, seq: number, joined: boolean, };
+export type WireApprovalDecision = { approval: [string, number, number], decision: string, turn: string, seq: number, joined: boolean, };
 
 export type WireReleaseSlot = { status: string, };

@@ -41,9 +41,7 @@ use serde_json::Value;
 #[cfg(test)]
 use serde_json::json;
 
-use super::{
-    DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared, decimal,
-};
+use super::{DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared};
 use crate::attachments::AttachmentError;
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::openai_compatible::ResponseFormatWire;
@@ -260,8 +258,8 @@ pub(super) fn text(value: &str, max_bytes: usize) -> bool {
             .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
 }
 
-fn identity(text: &str, prefix: &str) -> Option<u64> {
-    text.strip_prefix(prefix).and_then(decimal::<u64>)
+fn identity(text: &str, _prefix: &str) -> Option<u128> {
+    crate::persistence::parse_entity_id(text)
 }
 
 impl JobRequest {
@@ -282,7 +280,8 @@ impl JobRequest {
             .as_deref()
             .map(|model| identity(model, "profile:").ok_or(INVALID_BODY))
             .transpose()?
-            .unwrap_or(0);
+            .map(ProfileId::new)
+            .unwrap_or_default();
         let executor = identity(&wire.executor, "executor:").ok_or(INVALID_BODY)?;
         let agent_profile = wire
             .agent_profile
@@ -350,7 +349,7 @@ impl JobRequest {
         }
         Ok(Self {
             agent_profile,
-            llm_profile: ProfileId::new(llm_profile),
+            llm_profile,
             executor: ExecutorId::new(executor),
             objective: wire.objective,
             name: wire.name,
@@ -1444,55 +1443,54 @@ pub(super) mod tests {
     #[test]
     fn requests_are_parsed_strictly_and_fingerprinted_as_parsed() {
         let request = JobRequest::parse(
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"Say hi"}"#,
         )
         .expect("valid");
         let respelled = JobRequest::parse(
-            br#" { "objective" : "Say hi", "executor":"executor:2", "name": null, "llm_profile":"profile:3" } "#,
+            br#" { "objective" : "Say hi", "executor":"00000002-0000-7003-8000-000000000002", "name": null, "llm_profile":"00000003-0000-7002-8000-000000000003" } "#,
         )
         .expect("valid");
         assert_eq!(request, respelled);
         assert_eq!(request.fingerprint(), respelled.fingerprint());
         for other in [
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi!"}"#
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"Say hi!"}"#
                 .as_slice(),
-            br#"{"llm_profile":"profile:4","executor":"executor:2","objective":"Say hi"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:3","objective":"Say hi"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","name":"n"}"#,
-            br#"{"agent_profile":"profile:2","llm_profile":"profile:3","executor":"executor:2","objective":"Say hi"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"Say hi","conversation":"job:2"}"#,
+            br#"{"llm_profile":"00000004-0000-7002-8000-000000000004","executor":"00000002-0000-7003-8000-000000000002","objective":"Say hi"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000003-0000-7003-8000-000000000003","objective":"Say hi"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"Say hi","name":"n"}"#,
+            br#"{"agent_profile":"00000002-0000-7002-8000-000000000002","llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"Say hi"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"Say hi","conversation":"00000002-0000-7001-8000-000000000002"}"#,
         ] {
             let other = JobRequest::parse(other).expect("valid");
             assert_ne!(request.fingerprint(), other.fingerprint(), "{other:?}");
         }
         let long_objective = format!(
-            r#"{{"llm_profile":"profile:3","executor":"executor:2","objective":"{}"}}"#,
+            r#"{{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"{}"}}"#,
             "a".repeat(MAX_OBJECTIVE_BYTES + 1)
         );
         let long_name = format!(
-            r#"{{"llm_profile":"profile:3","executor":"executor:2","objective":"o","name":"{}"}}"#,
+            r#"{{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","name":"{}"}}"#,
             "n".repeat(MAX_NAME_BYTES + 1)
         );
         for refused in [
             b"".as_slice(),
             b"[]",
             b"null",
-            br#"{"llm_profile":"profile:3","executor":"executor:2"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"   "}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"a\u0000b"}"#,
-            br#"{"llm_profile":"3","executor":"executor:2","objective":"o"}"#,
-            br#"{"agent_profile":"2","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
-            br#"{"agent_profile":"profile:02","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
-            br#"{"agent_profile":"executor:2","llm_profile":"profile:3","executor":"executor:2","objective":"o"}"#,
-            br#"{"llm_profile":"profile:03","executor":"executor:2","objective":"o"}"#,
-            br#"{"llm_profile":"profile:3","executor":"job:2","objective":"o"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","conversation":"2"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","conversation":"job:02"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","tools":[]}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","endpoint":"https://x"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","objective":"p"}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o","name":""}"#,
-            br#"{"llm_profile":"profile:3","executor":"executor:2","objective":"o"} trailing"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"   "}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"a\u0000b"}"#,
+            br#"{"llm_profile":"3","executor":"00000002-0000-7003-8000-000000000002","objective":"o"}"#,
+            br#"{"agent_profile":"2","llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o"}"#,
+            br#"{"agent_profile":"00000002-0000-4002-8000-000000000002","llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o"}"#,
+            br#"{"agent_profile":"00000002-0000-4003-8000-000000000002","llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-4001-8000-000000000002","objective":"o"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","conversation":"2"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","conversation":"00000002-0000-4001-8000-000000000002"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","tools":[]}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","endpoint":"https://x"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","objective":"p"}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o","name":""}"#,
+            br#"{"llm_profile":"00000003-0000-7002-8000-000000000003","executor":"00000002-0000-7003-8000-000000000002","objective":"o"} trailing"#,
             long_objective.as_bytes(),
             long_name.as_bytes(),
         ] {
@@ -1510,7 +1508,7 @@ pub(super) mod tests {
         use crate::openai_compatible::{ChatConversation, ChatMessage};
         use crate::persistence::LlmParameters;
         use crate::provider_execution::request_body;
-        let base = json!({"llm_profile":"profile:3", "executor":"executor:2", "objective":"o"});
+        let base = json!({"llm_profile":"00000003-0000-7002-8000-000000000003", "executor":"00000002-0000-7003-8000-000000000002", "objective":"o"});
         let parse = |format: Value| {
             let mut body = base.clone();
             body["response_format"] = format;
@@ -1803,9 +1801,7 @@ pub(super) mod tests {
         .expect("create llm profile");
         let llm_id: ProfileId = created_llm.body["profile_id"]
             .as_str()
-            .and_then(|s| s.strip_prefix("profile:"))
             .and_then(|s| s.parse().ok())
-            .map(ProfileId::new)
             .expect("llm profile id");
 
         let created_agent = wait(profiles::save_profile(
@@ -1823,9 +1819,7 @@ pub(super) mod tests {
         .expect("create agent profile");
         let agent_id: ProfileId = created_agent.body["profile_id"]
             .as_str()
-            .and_then(|s| s.strip_prefix("profile:"))
             .and_then(|s| s.parse().ok())
-            .map(ProfileId::new)
             .expect("agent profile id");
 
         let seen_conversations = Arc::new(Mutex::new(Vec::new()));
@@ -2005,7 +1999,11 @@ pub(super) async fn decide(
         .await
         .map_err(action_error)?;
     Ok(Reply::ok(envelope(WireApprovalDecision {
-        approval: (approval.job.get(), approval.request.get(), approval.index),
+        approval: (
+            approval.job.to_string(),
+            approval.request.get(),
+            approval.index,
+        ),
         decision: name.to_owned(),
         turn: appended.turn.to_string(),
         seq: appended.seq,

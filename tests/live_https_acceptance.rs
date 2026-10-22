@@ -170,7 +170,7 @@ fn fnv(text: &str) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct MetricFact {
-    id: u64,
+    id: u128,
     token: Option<String>,
     observed_at: i64,
     /// input, output, cache read, cache write, reasoning
@@ -180,7 +180,7 @@ struct MetricFact {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct AvailabilityFact {
-    id: u64,
+    id: u128,
     observed_at: i64,
     status_code: Option<u16>,
     classification: String,
@@ -191,14 +191,14 @@ struct AvailabilityFact {
 /// the two must be equal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Observed {
-    job: u64,
-    parent: u64,
-    input: u64,
+    job: u128,
+    parent: u128,
+    input: u128,
     objective: Option<String>,
-    assigned_executor: Option<u64>,
+    assigned_executor: Option<u128>,
     executor_is_llm: bool,
-    llm_profile: Option<u64>,
-    provider: Option<u64>,
+    llm_profile: Option<u128>,
+    provider: Option<u128>,
     endpoint_host: Option<String>,
     credential_ref: Option<String>,
     model: Option<String>,
@@ -209,7 +209,7 @@ struct Observed {
     failed_at: Option<i64>,
     cancelled_at: Option<i64>,
     unknown_at: Option<i64>,
-    final_output: Option<u64>,
+    final_output: Option<u128>,
     final_text_len: usize,
     final_text_fnv: Option<String>,
     progress_outputs: usize,
@@ -353,7 +353,7 @@ fn observe_job(handle: &DatabaseHandle, job: JobId) -> Observed {
 /// What must hold of a Job that executed successfully. These are facts of the
 /// durable record, never of the caller's expectations. Missing usage is
 /// reported by `coverage`, not failed.
-fn execution_problems(observed: &Observed, genesis: u64) -> Vec<String> {
+fn execution_problems(observed: &Observed, genesis: u128) -> Vec<String> {
     let mut problems = Vec::new();
     let mut check = |ok: bool, what: &str| {
         if !ok {
@@ -480,7 +480,7 @@ enum Mode {
 struct Manifest {
     mode: Mode,
     writer_pid: u32,
-    genesis: u64,
+    genesis: u128,
     /// The Job's own execution error, when the request did not complete.
     execution_error: Option<String>,
     /// Set when the Job settled but an observation write did not.

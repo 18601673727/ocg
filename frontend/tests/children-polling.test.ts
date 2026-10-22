@@ -37,11 +37,11 @@ test("request trace: an idle view issues far fewer requests than the fixed loop"
 
 test("a changed list returns to the base cadence", () => {
   const empty = childrenListSignature([], false);
-  const settled = childrenListSignature([{ id: "job:2" }], false);
-  const paged = childrenListSignature([{ id: "job:2" }, { id: "job:3" }], true);
+  const settled = childrenListSignature([{ id: "00000002-0000-7001-8000-000000000002" }], false);
+  const paged = childrenListSignature([{ id: "00000002-0000-7001-8000-000000000002" }, { id: "00000003-0000-7001-8000-000000000003" }], true);
   assert.notEqual(empty, settled);
   assert.notEqual(settled, paged);
-  assert.equal(paged, childrenListSignature([{ id: "job:2" }, { id: "job:3" }], true));
+  assert.equal(paged, childrenListSignature([{ id: "00000002-0000-7001-8000-000000000002" }, { id: "00000003-0000-7001-8000-000000000003" }], true));
   // An empty or settled list has a stable signature, so discovery backs off
   // without ever stopping.
   assert.equal(empty, childrenListSignature([], false));

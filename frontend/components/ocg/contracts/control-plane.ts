@@ -76,11 +76,10 @@ export function decodeControlError(input: unknown) {
   return { code: string(value.code, "error.code"), message: string(value.message, "error.message") } satisfies Wire.WireError;
 }
 
-function identity(value: unknown, path: string, prefix: string): string {
+function identity(value: unknown, path: string, _prefix: string): string {
   const text = string(value, path);
-  const number = text.slice(prefix.length);
-  if (!text.startsWith(prefix) || !/^(0|[1-9][0-9]*)$/.test(number)) {
-    throw new ContractError(path, `a canonical ${prefix.slice(0, -1)} identity`);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(text)) {
+    throw new ContractError(path, "a canonical UUIDv7 identity");
   }
   return text;
 }
@@ -1127,10 +1126,10 @@ export type ControlApproval = Wire.WireApprovalDecision["approval"];
 
 function approvalRef(input: unknown, path: string): ControlApproval {
   if (!Array.isArray(input) || input.length !== 3) throw new ContractError(path, "an approval triple");
-  const turn = integer(input[0], `${path}.turn`);
+  const turn = identity(input[0], `${path}.turn`, "job:");
   const request = integer(input[1], `${path}.request`);
   const index = integer(input[2], `${path}.index`);
-  if (turn === 0 || request === 0 || request > 0xffffffff || index > 0xffffffff) throw new ContractError(path, "a stored call reference");
+  if (request === 0 || request > 0xffffffff || index > 0xffffffff) throw new ContractError(path, "a stored call reference");
   return [turn, request, index];
 }
 

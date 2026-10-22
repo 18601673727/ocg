@@ -178,14 +178,13 @@ function sequence(value: number): number {
 }
 
 function jobIdentity(value: string): string {
-  if (!/^job:(0|[1-9][0-9]*)$/.test(value)) throw new ContractError("job", "a canonical Job identity");
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) throw new ContractError("job", "a canonical Job UUID");
   return value;
 }
 
-function identity(value: string, path: string, prefix: string): string {
-  const number = value.slice(prefix.length);
-  if (!value.startsWith(prefix) || !/^(0|[1-9][0-9]*)$/.test(number)) {
-    throw new ContractError(path, `a canonical ${prefix.slice(0, -1)} identity`);
+function identity(value: string, path: string, _prefix: string): string {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
+    throw new ContractError(path, "a canonical UUIDv7 identity");
   }
   return value;
 }
@@ -308,7 +307,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     if (cursor.sequence !== undefined) headers["Last-Event-ID"] = String(cursor.sequence);
     let response: Response;
     try {
-      // The route requires the canonical literal job:<n>; it does not decode %3A.
+      // Entity IDs are canonical UUIDv7 values and are safe as literal path segments.
       response = await fetchImpl(`${base}/api/v1/jobs/${jobId}/events`, {
         method: "GET", headers, signal,
         mode: "same-origin", credentials: programmatic ? "omit" : "same-origin",
@@ -596,9 +595,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeCards((await send("GET", `/api/v1/conversations/${conversation}/cards`, { signal })).input, conversation);
     },
     async decideApproval(approval: ControlApproval, decision: { decision: "approve" | "reject" } | { answer: string }, signal?: AbortSignal) {
-      approval.forEach(sequence);
+      jobIdentity(approval[0]);
+      sequence(approval[1]);
+      sequence(approval[2]);
       const [turn, request, index] = approval;
-      return decodeApprovalDecision((await send("POST", `/api/v1/approvals/job:${turn}/${request}/${index}`, { body: decision, sign: true, signal })).input, approval);
+      return decodeApprovalDecision((await send("POST", `/api/v1/approvals/${turn}/${request}/${index}`, { body: decision, sign: true, signal })).input, approval);
     },
     async releaseSlot(turn: string, confirm = false, signal?: AbortSignal) {
       jobIdentity(turn);
@@ -934,7 +935,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       } = {},
     ): JobStreamSubscription {
       if (closed) throw new ControlTransportError("client_closed", 0, false);
-      if (!/^job:(0|[1-9][0-9]*)$/.test(jobId)) throw new ContractError("job", "a canonical Job identity");
+      jobIdentity(jobId);
       // Each consumer acknowledges its own output; another view cannot skip it.
       const cursor = { sequence: settings.afterSeq === undefined ? undefined : sequence(settings.afterSeq) };
       const controller = new AbortController();

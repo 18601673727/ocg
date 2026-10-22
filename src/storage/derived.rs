@@ -15,44 +15,44 @@ use crate::persistence::{OutcomeKind, RequestEventRecord, RequestPayload};
 /// What every derived table must hold, given the authoritative rows.
 #[derive(Default)]
 pub(super) struct Derived {
-    pending: BTreeMap<u64, ()>,
-    ready: BTreeMap<(u16, u64), ()>,
-    delayed: BTreeMap<(i64, u64), ()>,
-    waiters: BTreeMap<(u64, u64), u8>,
-    unsettled: BTreeMap<u64, (u32, u32)>,
-    held: BTreeMap<(u64, u64), (u64, bool)>,
-    children: BTreeMap<(u64, u64), ()>,
-    successors: BTreeMap<u64, u64>,
-    tips: BTreeMap<u64, u64>,
-    recent: BTreeMap<(u64, u64), ()>,
-    child_conversations: BTreeMap<(u64, u64), ()>,
-    live_children: BTreeMap<(u64, u64), ()>,
-    user_entry_at: BTreeMap<u64, i64>,
-    notice_read: BTreeMap<u64, u32>,
-    answer_tips: BTreeMap<u64, (u64, u64)>,
-    active_turns: BTreeMap<u64, u64>,
-    tool_call_ids: BTreeMap<(u64, String), (u32, u32)>,
-    tool_totals: BTreeMap<u64, (u64, u64)>,
+    pending: BTreeMap<u128, ()>,
+    ready: BTreeMap<(u16, u128), ()>,
+    delayed: BTreeMap<(i64, u128), ()>,
+    waiters: BTreeMap<(u128, u128), u8>,
+    unsettled: BTreeMap<u128, (u32, u32)>,
+    held: BTreeMap<(u128, u128), (u64, bool)>,
+    children: BTreeMap<(u128, u128), ()>,
+    successors: BTreeMap<u128, u128>,
+    tips: BTreeMap<u128, u128>,
+    recent: BTreeMap<(u128, u128), ()>,
+    child_conversations: BTreeMap<(u128, u128), ()>,
+    live_children: BTreeMap<(u128, u128), ()>,
+    user_entry_at: BTreeMap<u128, i64>,
+    notice_read: BTreeMap<u128, u32>,
+    answer_tips: BTreeMap<u128, (u128, u128)>,
+    active_turns: BTreeMap<u128, u128>,
+    tool_call_ids: BTreeMap<(u128, String), (u32, u32)>,
+    tool_totals: BTreeMap<u128, (u64, u64)>,
     tool_stats: BTreeMap<String, schema::ToolStatValue>,
     usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
-    retries: BTreeMap<(u64, u64), bool>,
-    attachment_refs: BTreeMap<(u64, u64), ()>,
+    retries: BTreeMap<(u128, u128), bool>,
+    attachment_refs: BTreeMap<(u128, u128), ()>,
 }
 
 struct Authoritative {
-    jobs: BTreeMap<u64, JobRow>,
-    states: BTreeMap<u64, JobStateRow>,
-    conversations: BTreeMap<u64, ConversationRow>,
-    result_turns: BTreeSet<u64>,
-    executions: BTreeMap<u64, FrozenExecutionConfig>,
-    held_conversations: BTreeSet<u64>,
-    tool_call_ids: Vec<(u64, String, u32, u32)>,
-    tool_totals: BTreeMap<u64, (u64, u64)>,
+    jobs: BTreeMap<u128, JobRow>,
+    states: BTreeMap<u128, JobStateRow>,
+    conversations: BTreeMap<u128, ConversationRow>,
+    result_turns: BTreeSet<u128>,
+    executions: BTreeMap<u128, FrozenExecutionConfig>,
+    held_conversations: BTreeSet<u128>,
+    tool_call_ids: Vec<(u128, String, u32, u32)>,
+    tool_totals: BTreeMap<u128, (u64, u64)>,
     tool_stats: BTreeMap<String, schema::ToolStatValue>,
     usage_totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
-    attachment_refs: BTreeMap<(u64, u64), ()>,
-    user_entry_at: BTreeMap<u64, i64>,
-    retries: BTreeMap<(u64, u64), bool>,
+    attachment_refs: BTreeMap<(u128, u128), ()>,
+    user_entry_at: BTreeMap<u128, i64>,
+    retries: BTreeMap<(u128, u128), bool>,
     request_scopes_differ: bool,
 }
 
@@ -151,7 +151,7 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         }
     }
     let mut tool_call_ids = Vec::new();
-    let mut tool_totals: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let mut tool_totals: BTreeMap<u128, (u64, u64)> = BTreeMap::new();
     let mut tool_stats: BTreeMap<String, schema::ToolStatValue> = BTreeMap::new();
     for entry in tx.open_table(TOOL_CALLS)?.iter()? {
         let (key, bytes) = entry?;
@@ -280,10 +280,10 @@ pub(super) fn request_scope_key(
 /// decoded and counted, never collected, and the scopes differ when one is
 /// missing or the count does not match the table.
 fn usage_totals_from_events(
-    table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
+    table: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
     scopes: &impl ReadableTable<schema::RequestScopeKey, ()>,
-    jobs: &BTreeMap<u64, JobRow>,
-    executions: &BTreeMap<u64, FrozenExecutionConfig>,
+    jobs: &BTreeMap<u128, JobRow>,
+    executions: &BTreeMap<u128, FrozenExecutionConfig>,
 ) -> Result<
     (
         BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
@@ -294,7 +294,7 @@ fn usage_totals_from_events(
     let mut totals: BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue> = BTreeMap::new();
     let mut scopes_differ = false;
     let mut scopes_seen = 0u64;
-    let mut current: Option<(u64, u32)> = None;
+    let mut current: Option<(u128, u32)> = None;
     let mut events: Vec<crate::persistence::RequestEventRecord> = Vec::new();
     for entry in table.iter()? {
         let (key, bytes) = entry?;
@@ -330,9 +330,9 @@ fn usage_totals_from_events(
 /// totals: an evidence error drops only this request, logged by the rule.
 fn add_usage(
     totals: &mut BTreeMap<schema::UsageTotalKey, schema::UsageTotalValue>,
-    jobs: &BTreeMap<u64, JobRow>,
-    executions: &BTreeMap<u64, FrozenExecutionConfig>,
-    job: u64,
+    jobs: &BTreeMap<u128, JobRow>,
+    executions: &BTreeMap<u128, FrozenExecutionConfig>,
+    job: u128,
     request: u32,
     events: &[crate::persistence::RequestEventRecord],
 ) -> Result<(), StorageError> {
@@ -394,8 +394,8 @@ fn derive(auth: &Authoritative, clock: i64) -> Result<Derived, StorageError> {
     let mut derived = Derived::default();
     // Children have larger ids than their parents, so a descending pass knows
     // whether every child has settled before it reaches the parent.
-    let mut open_children: HashMap<u64, u32> = HashMap::new();
-    let mut settled: HashSet<u64> = HashSet::new();
+    let mut open_children: HashMap<u128, u32> = HashMap::new();
+    let mut settled: HashSet<u128> = HashSet::new();
     for (id, row) in auth.jobs.iter().rev() {
         let state = auth
             .states

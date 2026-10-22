@@ -9,8 +9,8 @@ function conversation(hold: unknown) {
   return {
     api_version: 1,
     conversations: [{
-      root_job: "job:1",
-      tip_job: "job:3",
+      root_job: "00000001-0000-7001-8000-000000000001",
+      tip_job: "00000003-0000-7001-8000-000000000003",
       agent: null,
       title: "chat",
       state: "open",
@@ -46,7 +46,7 @@ test("null and every valid hold actor decode", () => {
   assert.equal(decodeConversations(conversation(null)).conversations[0].on_hold, null);
   for (const by of [
     { kind: "user" },
-    { kind: "agent", conversation: "job:9" },
+    { kind: "agent", conversation: "00000009-0000-7001-8000-000000000009" },
     { kind: "loop" },
     { kind: "auto" },
   ] as const) {

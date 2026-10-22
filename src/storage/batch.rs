@@ -311,8 +311,8 @@ impl Batch {
         }
     }
 
-    pub(crate) fn next_id(&mut self, sequence: Sequence) -> Result<u64, BatchError> {
-        self.step(|tx| allocate(tx, sequence))
+    pub(crate) fn next_id(&mut self) -> Result<u128, BatchError> {
+        self.step(allocate)
     }
 
     // ---- configs ---------------------------------------------------------------------
@@ -424,7 +424,7 @@ impl Batch {
         body: ConfigBody,
     ) -> Result<ConfigId, BatchError> {
         self.check_config_body(&name, &body)?;
-        let id = ConfigId::new(self.next_id(Sequence::Config)?);
+        let id = ConfigId::new(self.next_id()?);
         let row = ConfigRow {
             id,
             kind: body.kind(),
@@ -561,7 +561,7 @@ impl Batch {
         code: Option<String>,
         goal_reached: Option<bool>,
         value: Option<serde_json::Value>,
-    ) -> Result<u32, BatchError> {
+    ) -> Result<(u32, JobOutputId), BatchError> {
         let seq = self.step(|tx| {
             let outputs = tx.open_table(JOB_OUTPUTS)?;
             let last = outputs
@@ -574,8 +574,9 @@ impl Batch {
         let Some(seq) = seq.checked_add(1) else {
             return self.reject(Violation::ValueOutOfRange("seq"));
         };
+        let id = JobOutputId::new(self.next_id()?);
         let record = JobOutputRecord {
-            id: JobOutputId::new(u64::from(seq)),
+            id,
             job,
             seq: i64::from(seq),
             kind,
@@ -590,7 +591,7 @@ impl Batch {
                 .insert((job.get(), seq), encode_output(&record).as_slice())?;
             Ok(())
         })?;
-        Ok(seq)
+        Ok((seq, id))
     }
 
     // ---- submissions, attachments, projects ----------------------------------------------
@@ -840,6 +841,7 @@ impl Batch {
             return self.reject(Violation::ValueOutOfRange("seq"));
         };
         let event = RequestEventRecord {
+            id: crate::persistence::RequestEventId::new(self.next_id()?),
             job_id: job,
             request,
             seq,

@@ -14,9 +14,7 @@ use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
 
-use super::{
-    INTERNAL, INVALID_REQUEST, Refusal, Reply, Shared, catalog, decimal, profiles, submissions,
-};
+use super::{INTERNAL, INVALID_REQUEST, Refusal, Reply, Shared, catalog, profiles, submissions};
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
     NewProject, ProjectCommand, ProjectId, ProjectRecord, RecordRef, Violation,
@@ -90,8 +88,7 @@ fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<S
 }
 
 pub(super) fn project_id(text: &str) -> Result<ProjectId, Refusal> {
-    text.strip_prefix("project:")
-        .and_then(decimal::<u64>)
+    crate::persistence::parse_entity_id(text)
         .map(ProjectId::new)
         .ok_or(INVALID_REQUEST)
 }

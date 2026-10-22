@@ -39,7 +39,7 @@ fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobStateRow, StorageErr
 }
 
 pub(super) fn turn_execution(
-    jobs: &impl ReadableTable<u64, &'static [u8]>,
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
     row: &JobRow,
 ) -> Result<(FrozenExecutionConfig, Option<ProjectId>, Option<ConfigId>), StorageError> {
     let JobKind::Turn {
@@ -318,7 +318,7 @@ pub(crate) fn read_jobs(
 ) -> Result<Vec<JobRecord>, StorageError> {
     let rx = read(database)?;
     let jobs = rx.open_table(JOBS)?;
-    let end = before.map_or(u64::MAX, JobId::get);
+    let end = before.map_or(u128::MAX, JobId::get);
     let mut records = Vec::new();
     for entry in jobs.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
         let (key, bytes) = entry?;
@@ -370,7 +370,7 @@ pub(crate) fn read_children(
     let start = after.map_or(0, |after| after.get().saturating_add(1));
     let mut children = Vec::new();
     for entry in table
-        .range((parent.get(), start)..=(parent.get(), u64::MAX))?
+        .range((parent.get(), start)..=(parent.get(), u128::MAX))?
         .take(limit.min(MAX_PAGE))
     {
         children.push(JobId::new(entry?.0.value().1));
@@ -470,7 +470,7 @@ fn child_page(
     let mut has_more = false;
     for entry in rx
         .open_table(CHILDREN)?
-        .range((parent.get(), start)..=(parent.get(), u64::MAX))?
+        .range((parent.get(), start)..=(parent.get(), u128::MAX))?
     {
         let child = JobId::new(entry?.0.value().1);
         if child == parent {
@@ -494,7 +494,7 @@ fn child_page(
 fn has_children(rx: &ReadTransaction, parent: JobId) -> Result<bool, StorageError> {
     Ok(rx
         .open_table(CHILDREN)?
-        .range((parent.get(), 0)..=(parent.get(), u64::MAX))?
+        .range((parent.get(), 0)..=(parent.get(), u128::MAX))?
         .next()
         .transpose()?
         .is_some())
@@ -800,7 +800,7 @@ pub(crate) fn read_retries(
     let table = rx.open_table(RETRIES)?;
     let mut retries = Vec::new();
     for entry in table
-        .range((original.get(), 0)..=(original.get(), u64::MAX))?
+        .range((original.get(), 0)..=(original.get(), u128::MAX))?
         .take(MAX_PAGE)
     {
         retries.push(JobId::new(entry?.0.value().1));
@@ -1046,7 +1046,7 @@ pub(crate) fn read_attachments(
 ) -> Result<Vec<AttachmentRecord>, StorageError> {
     let rx = read(database)?;
     let table = rx.open_table(ATTACHMENTS)?;
-    let end = before.map_or(u64::MAX, AttachmentId::get);
+    let end = before.map_or(u128::MAX, AttachmentId::get);
     let mut records = Vec::new();
     for entry in table.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
         let (key, bytes) = entry?;
@@ -1119,7 +1119,7 @@ pub(crate) fn read_attachment_inputs(
     let table = rx.open_table(ATTACHMENT_REFS)?;
     let mut inputs = Vec::new();
     for entry in table
-        .range((attachment.get(), 0)..=(attachment.get(), u64::MAX))?
+        .range((attachment.get(), 0)..=(attachment.get(), u128::MAX))?
         .take(MAX_PAGE)
     {
         inputs.push(JobInputId::new(entry?.0.value().1));
@@ -1147,7 +1147,7 @@ pub(crate) fn read_projects(
 ) -> Result<Vec<ProjectRecord>, StorageError> {
     let rx = read(database)?;
     let table = rx.open_table(PROJECTS)?;
-    let end = before.map_or(u64::MAX, ProjectId::get);
+    let end = before.map_or(u128::MAX, ProjectId::get);
     let mut records = Vec::new();
     for entry in table.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
         records.push(decode_project(entry?.1.value())?);
@@ -1191,7 +1191,7 @@ pub(crate) fn read_configs(
 ) -> Result<Vec<ConfigRecord>, StorageError> {
     let rx = read(database)?;
     let table = rx.open_table(CONFIGS)?;
-    let end = before.map_or(u64::MAX, ConfigId::get);
+    let end = before.map_or(u128::MAX, ConfigId::get);
     let mut records = Vec::new();
     for entry in table.range(..end)?.rev() {
         let (key, bytes) = entry?;
@@ -1244,7 +1244,7 @@ pub(crate) fn read_execution_pools(
 ) -> Result<Vec<ExecutionPool>, StorageError> {
     let rx = read(database)?;
     let configs = rx.open_table(CONFIGS)?;
-    let end = before.map_or(u64::MAX, ExecutionPoolId::get);
+    let end = before.map_or(u128::MAX, ExecutionPoolId::get);
     let mut pools = Vec::new();
     for entry in configs.range(..end)?.rev() {
         let (key, bytes) = entry?;
@@ -1292,7 +1292,7 @@ pub(crate) fn read_executors(
 ) -> Result<Vec<ExecutorRecord>, StorageError> {
     let rx = read(database)?;
     let configs = rx.open_table(CONFIGS)?;
-    let end = before.map_or(u64::MAX, ExecutorId::get);
+    let end = before.map_or(u128::MAX, ExecutorId::get);
     let mut records = Vec::new();
     for entry in configs.range(..end)?.rev() {
         let (key, bytes) = entry?;
@@ -1514,7 +1514,7 @@ fn conversation_summary(
         None => {
             let first = rx
                 .open_table(CHILDREN)?
-                .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 .next()
                 .transpose()?
                 .map(|entry| entry.0.value().1);
@@ -1584,7 +1584,7 @@ pub(crate) fn read_conversation_children(
     let mut children = Vec::new();
     for entry in rx
         .open_table(CHILD_CONVERSATIONS)?
-        .range((parent.get(), 0)..(parent.get(), before.map_or(u64::MAX, JobId::get)))?
+        .range((parent.get(), 0)..(parent.get(), before.map_or(u128::MAX, JobId::get)))?
         .rev()
         .take(limit.min(MAX_PAGE))
     {
@@ -1622,7 +1622,7 @@ pub(crate) fn read_conversations(
     let mut conversations = Vec::new();
     let limit = limit.clamp(1, 100);
     for item in recent
-        .range(..(before.map_or(u64::MAX, JobId::get), 0))?
+        .range(..(before.map_or(u128::MAX, JobId::get), 0))?
         .rev()
         .take(limit + 1)
     {
@@ -1680,12 +1680,19 @@ const MAX_USAGE_BUCKET_ROWS: usize = 1_000;
 
 fn resolve_model_name(
     rx: &ReadTransaction,
-    provider: u64,
+    provider: u128,
     model_hash: [u8; 32],
 ) -> Result<Option<String>, StorageError> {
     let scopes = rx.open_table(REQUEST_SCOPES)?;
     let start = (provider, model_hash, i64::MIN, 0, 0, 0);
-    let end = (provider, model_hash, i64::MAX, u64::MAX, u32::MAX, u32::MAX);
+    let end = (
+        provider,
+        model_hash,
+        i64::MAX,
+        u128::MAX,
+        u32::MAX,
+        u32::MAX,
+    );
     for entry in scopes.range(start..=end)? {
         let (key, _) = entry?;
         let (_provider, _hash, _obs, job, _req, _seq) = key.value();
@@ -1697,7 +1704,7 @@ fn resolve_model_name(
     Ok(None)
 }
 
-type UsageGroupKey = (i64, u64, u64, [u8; 32]);
+type UsageGroupKey = (i64, u128, u128, [u8; 32]);
 type UsageCounters = (u64, u64, u64, u64, u64, u64, u64);
 
 pub(crate) fn read_usage_summary(
@@ -1846,7 +1853,7 @@ fn scan_usage_totals(
         return Ok(UsageScan::default());
     }
     let start = (from_hour, 0, 0, [0u8; 32]);
-    let end = (until_hour, u64::MAX, u64::MAX, [0xffu8; 32]);
+    let end = (until_hour, u128::MAX, u128::MAX, [0xffu8; 32]);
 
     let mut current_bucket: Option<i64> = None;
     let mut resume_from_us = None;
@@ -1915,7 +1922,7 @@ fn scan_usage_totals(
         slot.6 = slot.6.saturating_add(reas);
     }
 
-    let mut model_cache: std::collections::HashMap<(u64, [u8; 32]), Option<String>> =
+    let mut model_cache: std::collections::HashMap<(u128, [u8; 32]), Option<String>> =
         std::collections::HashMap::new();
     let mut rows = Vec::with_capacity(grouped.len());
 
@@ -2253,7 +2260,7 @@ pub(crate) fn read_turn_context(
             .transpose()?;
         let first = rx
             .open_table(CHILDREN)?
-            .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+            .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
             .next()
             .transpose()?
             .map(|(key, _)| JobId::new(key.value().1));
@@ -2368,7 +2375,7 @@ pub(crate) fn read_turn_context(
             offset += 1;
             for entry in rx
                 .open_table(LIVE_CHILDREN)?
-                .range((parent.get(), 0)..=(parent.get(), u64::MAX))?
+                .range((parent.get(), 0)..=(parent.get(), u128::MAX))?
             {
                 let child = JobId::new(entry?.0.value().1);
                 let closing = read_conversation(&rx, child)?.closing;
@@ -2426,7 +2433,7 @@ pub(crate) fn read_turn_context(
 }
 
 pub(super) fn has_decider(
-    jobs: &impl ReadableTable<u64, &'static [u8]>,
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
     conversation: Option<JobId>,
 ) -> Result<bool, StorageError> {
     let mut current = conversation;
@@ -2461,10 +2468,9 @@ fn approved_calls(
 ) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
     let mut calls = Vec::new();
     let table = rx.open_table(TOOL_CALLS)?;
-    for entry in rx
-        .open_table(OPEN_APPROVALS)?
-        .range((conversation.get(), 0, 0, 0)..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX))?
-    {
+    for entry in rx.open_table(OPEN_APPROVALS)?.range(
+        (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
+    )? {
         let (key, state) = entry?;
         if state.value() != 1 {
             continue;
@@ -2518,7 +2524,7 @@ pub(crate) fn read_cards(
         let metadata = read_conversation(&rx, conversation)?;
         if origin != Origin::System {
             for entry in rx.open_table(OPEN_APPROVALS)?.range(
-                (conversation.get(), 0, 0, 0)..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX),
+                (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
             )? {
                 let (key, state) = entry?;
                 if state.value() != 0 {
@@ -2538,7 +2544,7 @@ pub(crate) fn read_cards(
                     .ok_or_else(|| StorageError::corrupted("awaiting admission missing"))?
                     .arguments
                     .as_str();
-                let mut card = json!({"kind": if matches!(call.decision.fact, crate::persistence::ToolDecision::AwaitingAnswer(_)) { "question" } else { "approval" }, "conversation": conversation.to_string(), "parent":parent, "approval":[turn,request,index], "tool":call.name});
+                let mut card = json!({"kind": if matches!(call.decision.fact, crate::persistence::ToolDecision::AwaitingAnswer(_)) { "question" } else { "approval" }, "conversation": conversation.to_string(), "parent":parent, "approval":[turn.to_string(),request,index], "tool":call.name});
                 if matches!(
                     call.decision.fact,
                     crate::persistence::ToolDecision::AwaitingAnswer(_)
@@ -2579,7 +2585,7 @@ pub(crate) fn read_cards(
         }
         for entry in rx
             .open_table(LIVE_CHILDREN)?
-            .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+            .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
         {
             pending.push(JobId::new(entry?.0.value().1));
         }
@@ -2589,7 +2595,7 @@ pub(crate) fn read_cards(
 
 pub(crate) struct UsageRetriesPage {
     pub rows: Vec<crate::persistence::UsageRetryRow>,
-    pub next: Option<(u64, u64)>,
+    pub next: Option<(u128, u128)>,
 }
 
 /// Scans at most `limit` retry keys, including those outside the time filter.
@@ -2598,7 +2604,7 @@ pub(crate) fn read_usage_retries(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,
     bucketing: crate::persistence::UsageBucketing,
-    after: Option<(u64, u64)>,
+    after: Option<(u128, u128)>,
     limit: usize,
 ) -> Result<UsageRetriesPage, StorageError> {
     let rx = read(database)?;

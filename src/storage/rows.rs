@@ -20,7 +20,7 @@ use crate::token_usage::{RequestEligibility, UsageFinality};
 
 /// Refuses a record stored under `key` whose embedded identity names another
 /// record: the table key is the authority, never a duplicate inside the value.
-fn check_table_key(table: &str, key: u64, embedded: u64) -> DecodeResult<()> {
+fn check_table_key(table: &str, key: u128, embedded: u128) -> DecodeResult<()> {
     if key == embedded {
         Ok(())
     } else {
@@ -38,7 +38,7 @@ pub(crate) struct JobRow {
     pub(crate) kind: JobKind,
 }
 
-pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u64 {
+pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u128 {
     match &row.kind {
         JobKind::Conversation { agent, .. } => agent.map_or(0, ConfigId::get),
         JobKind::Turn {
@@ -53,19 +53,19 @@ pub(crate) fn usage_agent(row: &JobRow, parent: Option<&JobRow>) -> u64 {
 impl JobRow {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);
-        e.u64(self.id.get());
+        e.u128(self.id.get());
         e.job_kind(&self.kind);
         e.ts(self.created_at);
-        e.ou64(self.parent_id.map(JobId::get));
+        e.ou128(self.parent_id.map(JobId::get));
         e.0
     }
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB)?;
-        let id = JobId::new(d.u64()?);
+        let id = JobId::new(d.u128()?);
         let kind = d.job_kind()?;
         let created_at = d.ts()?;
-        let parent_id = d.ou64()?.map(JobId::new);
+        let parent_id = d.ou128()?.map(JobId::new);
         d.end()?;
         Ok(JobRow {
             id,
@@ -76,7 +76,7 @@ impl JobRow {
     }
 
     /// Decodes the `job` row stored under `key`, which must name this Job.
-    pub(super) fn decode_at(key: u64, bytes: &[u8]) -> DecodeResult<Self> {
+    pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let row = Self::decode(bytes)?;
         check_table_key("job", key, row.id.get())?;
         Ok(row)
@@ -113,10 +113,10 @@ impl JobStateRow {
 
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB_STATE);
-        e.u64(self.job_id.get());
+        e.u128(self.job_id.get());
         e.opt(&self.claim, |e, c| {
             e.ts(c.started_at);
-            e.u64(c.pool_id.get());
+            e.u128(c.pool_id.get());
             e.u32(c.pool_edit_seq);
             e.u32(c.capabilities.len() as u32);
             for (op, proto) in &c.capabilities {
@@ -158,10 +158,10 @@ impl JobStateRow {
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB_STATE)?;
-        let job_id = JobId::new(d.u64()?);
+        let job_id = JobId::new(d.u128()?);
         let claim = d.opt(|d| {
             let started_at = d.ts()?;
-            let pool_id = ConfigId::new(d.u64()?);
+            let pool_id = ConfigId::new(d.u128()?);
             let pool_edit_seq = d.u32()?;
             let cap_len = d.u32()? as usize;
             let mut capabilities = BTreeSet::new();
@@ -233,7 +233,7 @@ impl JobStateRow {
     }
 
     /// Decodes the `job_state` row stored under `key`, which must name this Job.
-    pub(super) fn decode_at(key: u64, bytes: &[u8]) -> DecodeResult<Self> {
+    pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let state = Self::decode(bytes)?;
         check_table_key("job_state", key, state.job_id.get())?;
         Ok(state)
@@ -255,7 +255,7 @@ pub(crate) struct ConfigRow {
 impl ConfigRow {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_CONFIG);
-        e.u64(self.id.get());
+        e.u128(self.id.get());
         e.u8(self.kind as u8);
         e.str(&self.name);
         e.u32(self.edit_seq);
@@ -272,7 +272,7 @@ impl ConfigRow {
             }
             ConfigBody::Model(m) => {
                 e.u8(2);
-                e.u64(m.connection_id.get());
+                e.u128(m.connection_id.get());
                 e.str(&m.model);
                 e.ou32(m.context_window);
                 let p = &m.parameters;
@@ -308,7 +308,7 @@ impl ConfigRow {
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_CONFIG)?;
-        let id = ConfigId::new(d.u64()?);
+        let id = ConfigId::new(d.u128()?);
         let kind = match d.u8()? {
             1 => ConfigKind::Connection,
             2 => ConfigKind::Model,
@@ -343,7 +343,7 @@ impl ConfigRow {
                 })
             }
             ConfigKind::Model => {
-                let connection_id = ConfigId::new(d.u64()?);
+                let connection_id = ConfigId::new(d.u128()?);
                 let model = d.str()?;
                 let context_window = d.ou32()?;
                 let parameters = LlmParameters {
@@ -400,7 +400,7 @@ impl ConfigRow {
     }
 
     /// Decodes the `config` row stored under `key`, which must name this Config.
-    pub(super) fn decode_at(key: u64, bytes: &[u8]) -> DecodeResult<Self> {
+    pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let row = Self::decode(bytes)?;
         check_table_key("config", key, row.id.get())?;
         Ok(row)
@@ -409,6 +409,7 @@ impl ConfigRow {
 
 pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_OUTPUT);
+    e.u128(o.id.get());
     e.u8(o.kind.code());
     e.ostr(&o.summary);
     e.ostr(&o.code);
@@ -419,10 +420,11 @@ pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
 }
 
 pub(super) fn decode_output(
-    (job_id, seq): (u64, u32),
+    (job_id, seq): (u128, u32),
     bytes: &[u8],
 ) -> DecodeResult<JobOutputRecord> {
     let mut d = Dec::new(bytes, TAG_OUTPUT)?;
+    let id = JobOutputId::new(d.u128()?);
     let kind = d.code(OutputKind::from_code)?;
     let summary = d.ostr()?;
     let code = d.ostr()?;
@@ -431,7 +433,7 @@ pub(super) fn decode_output(
     let created_at = d.ts()?;
     d.end()?;
     Ok(JobOutputRecord {
-        id: JobOutputId::new(seq as u64),
+        id,
         job: JobId::new(job_id),
         seq: seq as i64,
         kind,
@@ -446,7 +448,7 @@ pub(super) fn decode_output(
 pub(super) fn encode_submission(record: &SubmissionRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_SUBMISSION);
     e.0.extend_from_slice(record.fingerprint.as_bytes());
-    e.u64(record.job.get());
+    e.u128(record.job.get());
     e.u32(record.seq);
     e.ts(record.recorded_at);
     e.0
@@ -457,7 +459,7 @@ pub(super) fn decode_submission(key: &[u8], bytes: &[u8]) -> DecodeResult<Submis
         .map_err(|_| StorageError::corrupted("a submission key is not a 32-byte digest"))?;
     let mut d = Dec::new(bytes, TAG_SUBMISSION)?;
     let fingerprint = RequestFingerprint::from_digest(d.take(32)?.try_into().expect("32 bytes"));
-    let job = JobId::new(d.u64()?);
+    let job = JobId::new(d.u128()?);
     let seq = d.u32()?;
     let recorded_at = d.ts()?;
     d.end()?;
@@ -472,7 +474,7 @@ pub(super) fn decode_submission(key: &[u8], bytes: &[u8]) -> DecodeResult<Submis
 
 pub(super) fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_ATTACHMENT);
-    e.u64(a.id.get());
+    e.u128(a.id.get());
     e.0.extend_from_slice(a.sha256.as_bytes());
     e.u64(a.byte_length);
     e.str(&a.mime);
@@ -486,10 +488,10 @@ pub(super) fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
     e.0
 }
 
-pub(super) fn decode_attachment(key: u64, bytes: &[u8]) -> DecodeResult<AttachmentRecord> {
+pub(super) fn decode_attachment(key: u128, bytes: &[u8]) -> DecodeResult<AttachmentRecord> {
     let mut d = Dec::new(bytes, TAG_ATTACHMENT)?;
     let a = AttachmentRecord {
-        id: AttachmentId::new(d.u64()?),
+        id: AttachmentId::new(d.u128()?),
         sha256: ContentDigest::from_bytes(d.take(32)?.try_into().expect("32 bytes")),
         byte_length: d.u64()?,
         mime: d.str()?,
@@ -510,7 +512,7 @@ pub(super) fn decode_attachment(key: u64, bytes: &[u8]) -> DecodeResult<Attachme
 
 pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_PROJECT);
-    e.u64(p.id.get());
+    e.u128(p.id.get());
     e.str(&p.name);
     e.ostr(&p.description);
     e.str(&p.root);
@@ -529,7 +531,7 @@ pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
 
 pub(super) fn decode_project(bytes: &[u8]) -> DecodeResult<ProjectRecord> {
     let mut d = Dec::new(bytes, TAG_PROJECT)?;
-    let id = ProjectId::new(d.u64()?);
+    let id = ProjectId::new(d.u128()?);
     let name = d.str()?;
     let description = d.ostr()?;
     let root = d.str()?;
@@ -561,7 +563,7 @@ pub(super) fn decode_project(bytes: &[u8]) -> DecodeResult<ProjectRecord> {
 /// The id and root of a stored Project, without its commands.
 pub(super) fn decode_project_root(bytes: &[u8]) -> DecodeResult<(ProjectId, String)> {
     let mut d = Dec::new(bytes, TAG_PROJECT)?;
-    let id = ProjectId::new(d.u64()?);
+    let id = ProjectId::new(d.u128()?);
     d.str()?;
     d.ostr()?;
     Ok((id, d.str()?))
@@ -783,7 +785,7 @@ pub(super) fn decode_tool_evidence(
 }
 
 pub(super) fn job_tool_evidence(
-    table: &impl ReadableTable<(u64, u32, u32), &'static [u8]>,
+    table: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
     job: JobId,
 ) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
     let mut records = Vec::new();
@@ -797,7 +799,7 @@ pub(super) fn job_tool_evidence(
     Ok(records)
 }
 
-pub(super) fn tool_call_ref((job, request, index): (u64, u32, u32)) -> DecodeResult<ToolCallRef> {
+pub(super) fn tool_call_ref((job, request, index): (u128, u32, u32)) -> DecodeResult<ToolCallRef> {
     Ok(ToolCallRef {
         job: JobId::new(job),
         request: RequestNumber::new(request)
@@ -806,12 +808,13 @@ pub(super) fn tool_call_ref((job, request, index): (u64, u32, u32)) -> DecodeRes
     })
 }
 
-pub(super) fn tool_call_key(call: ToolCallRef) -> (u64, u32, u32) {
+pub(super) fn tool_call_key(call: ToolCallRef) -> (u128, u32, u32) {
     (call.job.get(), call.request.get(), call.index)
 }
 
 pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_REQUEST_EVENT);
+    e.u128(r.id.get());
     e.ts(r.observed_at);
     e.ts(r.recorded_at);
     match &r.payload {
@@ -884,6 +887,7 @@ pub(super) fn decode_request_event(
     bytes: &[u8],
 ) -> DecodeResult<RequestEventRecord> {
     let mut d = Dec::new(bytes, TAG_REQUEST_EVENT)?;
+    let id = crate::persistence::RequestEventId::new(d.u128()?);
     let observed_at = d.ts()?;
     let recorded_at = d.ts()?;
     let payload = match d.u8()? {
@@ -972,6 +976,7 @@ pub(super) fn decode_request_event(
     };
     d.end()?;
     Ok(RequestEventRecord {
+        id,
         job_id,
         request,
         seq,
@@ -1009,9 +1014,9 @@ impl Notice {
                 reference,
             } => {
                 e.u8(0);
-                e.u64(child.get());
+                e.u128(child.get());
                 e.notice_event(event);
-                e.u64(reference.get());
+                e.u128(reference.get());
             }
             NoticeBody::Record { event, by, at } => {
                 e.u8(1);
@@ -1032,9 +1037,9 @@ impl Notice {
         };
         let body = match d.u8()? {
             0 => NoticeBody::Event {
-                child: JobId::new(d.u64()?),
+                child: JobId::new(d.u128()?),
                 event: d.notice_event()?,
-                reference: JobId::new(d.u64()?),
+                reference: JobId::new(d.u128()?),
             },
             1 => NoticeBody::Record {
                 event: match d.u8()? {

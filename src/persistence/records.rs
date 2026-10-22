@@ -690,6 +690,7 @@ pub enum RequestPayload {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RequestEventRecord {
+    pub id: RequestEventId,
     pub job_id: JobId,
     pub request: RequestNumber,
     pub seq: u32,
@@ -940,8 +941,8 @@ pub const USAGE_SUMMARY_HOUR_MICROS: i64 = 3_600_000_000;
 /// `null`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummaryRow {
-    pub agent: u64,
-    pub provider: u64,
+    pub agent: u128,
+    pub provider: u128,
     pub model: Option<String>,
     pub requests: u64,
     pub complete_requests: u64,
@@ -958,8 +959,8 @@ pub struct UsageSummaryRow {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageRetryRow {
     pub bucket_us: i64,
-    pub agent: u64,
-    pub provider: u64,
+    pub agent: u128,
+    pub provider: u128,
     pub model: Option<String>,
     pub retries: u64,
 }
@@ -980,7 +981,7 @@ pub struct UsageSummaryResponse {
 pub struct UsageSummaryFilter {
     pub from_us: Option<i64>,
     pub until_us: Option<i64>,
-    pub agent: Option<u64>,
+    pub agent: Option<u128>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

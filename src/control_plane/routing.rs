@@ -371,12 +371,15 @@ pub(super) fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
     canonical.then(|| text.parse().ok()).flatten()
 }
 
-/// A Job written as OCG writes it: `job:<n>`.
+/// Parses a canonical Job UUID.
 pub(super) fn job_id(text: &str) -> Result<JobId, Refusal> {
-    text.strip_prefix("job:")
-        .and_then(decimal::<u64>)
-        .map(JobId::new)
-        .ok_or(INVALID_REQUEST)
+    (if text == "00000000-0000-0000-0000-000000000000" {
+        Some(0)
+    } else {
+        crate::persistence::parse_entity_id(text)
+    })
+    .map(JobId::new)
+    .ok_or(INVALID_REQUEST)
 }
 
 /// `after_seq` and `limit`, each at most once, and nothing else.

@@ -372,13 +372,23 @@ mod tests {
 
     #[test]
     fn ids_and_queries_are_parsed_strictly() {
-        assert_eq!(job_id("job:7").ok(), Some(JobId::new(7)));
+        assert_eq!(
+            job_id("00000007-0000-7001-8000-000000000007").ok(),
+            Some("00000007-0000-7001-8000-000000000007".parse().unwrap())
+        );
         for text in [
-            "7", "job:", "job:07", "job:+7", "job:-7", "Job:7", "job:7 ", "job%3A7",
+            "7",
+            "job:",
+            "00000007-0000-4001-8000-000000000007",
+            "job:+7",
+            "job:-7",
+            "Job:7",
+            "00000007-0000-7001-8000-000000000007 ",
+            "job%3A7",
         ] {
             assert!(job_id(text).is_err(), "{text:?}");
         }
-        assert!(job_id(&format!("job:{}0", u64::MAX)).is_err());
+        assert!(job_id("00000007-0000-4001-8000-000000000007").is_err());
         assert_eq!(output_query("").ok(), Some((None, DEFAULT_OUTPUT_PAGE)));
         assert_eq!(
             output_query("after_seq=3&limit=10").ok(),

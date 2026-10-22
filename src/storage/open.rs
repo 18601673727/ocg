@@ -339,10 +339,31 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     Ok(())
 }
 
-pub(super) fn allocate(tx: &WriteTransaction, sequence: Sequence) -> Result<u64, StorageError> {
+/// Allocates monotonically across restarts and clock rollback. The persisted
+/// high water retains UUIDv7's random starting payload; a stale clock advances
+/// that payload as the UUIDv7 monotonic counter rather than reusing an ID.
+pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {
     let mut table = tx.open_table(SEQUENCES)?;
-    let next = table.get(sequence.key())?.map_or(0, |value| value.value()) + 1;
-    table.insert(sequence.key(), next)?;
+    let previous = table.get("entity")?.map_or(0, |value| value.value());
+    let fresh = uuid::Uuid::now_v7().as_u128();
+    let next = if fresh > previous {
+        fresh
+    } else {
+        let payload_mask = (1u128 << 74) - 1;
+        let payload = (((previous >> 64) & 0xfff) << 62) | (previous & ((1u128 << 62) - 1));
+        let next_payload = payload + 1;
+        let millis = (previous >> 80) + (next_payload >> 74);
+        if millis >= 1u128 << 48 {
+            return Err(StorageError::corrupted("UUIDv7 allocation space exhausted"));
+        }
+        let payload = next_payload & payload_mask;
+        (millis << 80)
+            | (7u128 << 76)
+            | ((payload >> 62) << 64)
+            | (2u128 << 62)
+            | (payload & ((1u128 << 62) - 1))
+    };
+    table.insert("entity", next)?;
     Ok(next)
 }
 
@@ -519,6 +540,122 @@ mod tests {
     use crate::persistence::{JobInputDraft, NewJob};
     use crate::test_support::{data_directory, execution_configuration, wait};
     use redb::ReadableTableMetadata;
+
+    const UUID_PAYLOAD_MASK: u128 = (1u128 << 74) - 1;
+
+    fn uuid_v7(millis: u128, payload: u128) -> u128 {
+        (millis << 80)
+            | (7u128 << 76)
+            | (((payload >> 62) & 0xfff) << 64)
+            | (2u128 << 62)
+            | (payload & ((1u128 << 62) - 1))
+    }
+
+    fn uuid_payload(id: u128) -> u128 {
+        (((id >> 64) & 0xfff) << 62) | (id & ((1u128 << 62) - 1))
+    }
+
+    fn persisted_entity(database: &Database) -> u128 {
+        let tx = database.begin_read().expect("read transaction");
+        tx.open_table(SEQUENCES)
+            .expect("sequence table")
+            .get("entity")
+            .expect("read entity high water")
+            .expect("entity high water")
+            .value()
+    }
+
+    #[test]
+    fn uuid_v7_allocator_advances_payload_carries_and_survives_abort_and_reopen() {
+        let (_root, directory) = data_directory("uuid-allocator", "high-water");
+        let path = database_file(directory.database_path());
+        let database = Database::builder().create(&path).expect("database");
+        let tx = database.begin_write().expect("initialize tables");
+        create_tables(&tx).expect("tables");
+        tx.commit().expect("tables committed");
+
+        let millis = (Timestamp::now().as_unix_micros() as u128 / 1_000) + 100_000;
+        let initial_payload = 0x1234_5678_9abcu128;
+        let initial = uuid_v7(millis, initial_payload);
+        let tx = database.begin_write().expect("seed high water");
+        tx.open_table(SEQUENCES)
+            .expect("sequence table")
+            .insert("entity", initial)
+            .expect("seed entity high water");
+        tx.commit().expect("seed committed");
+
+        let tx = database.begin_write().expect("same-millisecond allocation");
+        let same_millisecond = allocate(&tx).expect("allocate next UUID");
+        assert_eq!(same_millisecond >> 80, millis);
+        assert_eq!(uuid_payload(same_millisecond), initial_payload + 1);
+        assert_eq!(uuid::Uuid::from_u128(same_millisecond).get_version_num(), 7);
+        assert_eq!((same_millisecond >> 62) & 0b11, 0b10);
+        tx.commit().expect("allocation committed");
+
+        let carry_seed = uuid_v7(millis + 1, UUID_PAYLOAD_MASK);
+        let tx = database.begin_write().expect("seed payload carry");
+        tx.open_table(SEQUENCES)
+            .expect("sequence table")
+            .insert("entity", carry_seed)
+            .expect("seed maximum payload");
+        tx.commit().expect("carry seed committed");
+
+        let tx = database
+            .begin_write()
+            .expect("allocate across payload carry");
+        let carried = allocate(&tx).expect("carry into timestamp");
+        assert_eq!(carried >> 80, millis + 2);
+        assert_eq!(uuid_payload(carried), 0);
+        assert_eq!(uuid::Uuid::from_u128(carried).get_version_num(), 7);
+        assert_eq!((carried >> 62) & 0b11, 0b10);
+        tx.commit().expect("carried allocation committed");
+
+        let tx = database.begin_write().expect("allocate before abort");
+        let aborted = allocate(&tx).expect("temporary allocation");
+        assert!(aborted > carried);
+        tx.abort().expect("abort allocation");
+        assert_eq!(persisted_entity(&database), carried);
+        drop(database);
+
+        let database = Database::builder().create(&path).expect("reopen database");
+        let tx = database.begin_write().expect("allocate after reopen");
+        let reopened = allocate(&tx).expect("reopened allocation");
+        assert!(reopened > carried);
+        assert_eq!(
+            reopened, aborted,
+            "an aborted, never-published ID may be reused"
+        );
+        assert_eq!(reopened >> 80, millis + 2);
+        assert_eq!(uuid_payload(reopened), 1);
+        assert_eq!(uuid::Uuid::from_u128(reopened).get_version_num(), 7);
+        assert_eq!((reopened >> 62) & 0b11, 0b10);
+        tx.commit().expect("reopened allocation committed");
+        assert_eq!(persisted_entity(&database), reopened);
+    }
+
+    #[test]
+    fn uuid_v7_allocator_refuses_timestamp_overflow_on_payload_carry() {
+        let (_root, directory) = data_directory("uuid-allocator", "timestamp-overflow");
+        let database = Database::builder()
+            .create(database_file(directory.database_path()))
+            .expect("database");
+        let tx = database.begin_write().expect("initialize tables");
+        create_tables(&tx).expect("tables");
+        tx.commit().expect("tables committed");
+
+        let last_millis = (1u128 << 48) - 1;
+        let tx = database.begin_write().expect("seed exhausted high water");
+        tx.open_table(SEQUENCES)
+            .expect("sequence table")
+            .insert("entity", uuid_v7(last_millis, UUID_PAYLOAD_MASK))
+            .expect("seed last UUIDv7");
+        tx.commit().expect("seed committed");
+
+        let tx = database.begin_write().expect("exhausted allocation");
+        let error = allocate(&tx).expect_err("UUIDv7 timestamp space is exhausted");
+        assert_eq!(error.kind, StorageErrorKind::Corrupted);
+        tx.abort().expect("abort exhausted allocation");
+    }
 
     #[test]
     fn open_cancels_every_previous_pending_readiness_state_and_settles_the_graph() {

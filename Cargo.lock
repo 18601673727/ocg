@@ -1296,6 +1296,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "ts-rs",
+ "uuid",
  "webpki-roots",
 ]
 

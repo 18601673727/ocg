@@ -10,41 +10,41 @@ test("reliability buckets zero-fill days and sum errors, retries, cache and late
   const day = 86_400_000_000;
   const rows: Buckets["rows"] = [
     {
-      bucket_us: 0, agent: "profile:1", provider: "llm_provider:1", model: "model-a",
+      bucket_us: 0, agent: "00000001-0000-7002-8000-000000000001", provider: "00000001-0000-7007-8000-000000000001", model: "model-a",
       requests: 10, complete_requests: 7,
       input_tokens: 100, output_tokens: 50,
       cache_read_tokens: 30, cache_write_tokens: 5, reasoning_tokens: 0,
     },
     {
-      bucket_us: 2 * day, agent: null, provider: "llm_provider:2", model: null,
+      bucket_us: 2 * day, agent: null, provider: "00000002-0000-7007-8000-000000000002", model: null,
       requests: 4, complete_requests: 4,
       input_tokens: 40, output_tokens: 20,
       cache_read_tokens: 0, cache_write_tokens: 8, reasoning_tokens: 2,
     },
   ];
   const retryRows: ReturnType<typeof decodeUsageRetries>["retry_rows"] = [
-    { bucket_us: 0, agent: "profile:1", provider: "llm_provider:1", model: "model-a", retries: 2 },
-    { bucket_us: day, agent: null, provider: "llm_provider:2", model: null, retries: 1 },
+    { bucket_us: 0, agent: "00000001-0000-7002-8000-000000000001", provider: "00000001-0000-7007-8000-000000000001", model: "model-a", retries: 2 },
+    { bucket_us: day, agent: null, provider: "00000002-0000-7007-8000-000000000002", model: null, retries: 1 },
   ];
   const observations: Usage["observations"] = [
     {
-      id: "usage:1", job: "job:1", request: 1, observed_at_us: 1_000, model: "model-a", provider: "p",
+      id: "00000001-0000-7008-8000-000000000001", job: "00000001-0000-7001-8000-000000000001", request: 1, observed_at_us: 1_000, model: "model-a", provider: "p",
       llm_profile: null, input_tokens: 10, output_tokens: 5, cache_read_tokens: null,
       cache_write_tokens: null, reasoning_tokens: null, ttfb_ms: 100, finished_in_ms: 500,
       finality: "final", eligibility: "eligible",
     },
     {
-      id: "usage:2", job: "job:2", request: 1, observed_at_us: 2 * day + 1_000, model: null, provider: "p",
+      id: "00000002-0000-7008-8000-000000000002", job: "00000002-0000-7001-8000-000000000002", request: 1, observed_at_us: 2 * day + 1_000, model: null, provider: "p",
       llm_profile: null, input_tokens: null, output_tokens: null, cache_read_tokens: null,
       cache_write_tokens: null, reasoning_tokens: null, ttfb_ms: 300, finished_in_ms: null,
       finality: "cumulative", eligibility: null,
     },
   ];
   const availability: ReturnType<typeof decodeAvailability>["observations"] = [
-    { id: "availability:1", job: "job:1", request: 1, observed_at_us: 1_000, provider: "p", model: "model-a", status_code: 200, finish_reason: "stop", classification: "available" },
-    { id: "availability:2", job: "job:2", request: 1, observed_at_us: 2_000, provider: "p", model: "model-a", status_code: 503, finish_reason: null, classification: "unavailable" },
-    { id: "availability:3", job: "job:2", request: 1, observed_at_us: 3_000, provider: "p", model: "model-a", status_code: 503, finish_reason: null, classification: "unavailable" },
-    { id: "availability:4", job: "job:2", request: 2, observed_at_us: 2 * day + 1_000, provider: "p", model: "model-a", status_code: 200, finish_reason: "tool_calls", classification: "unconfirmed" },
+    { id: "00000001-0000-7009-8000-000000000001", job: "00000001-0000-7001-8000-000000000001", request: 1, observed_at_us: 1_000, provider: "p", model: "model-a", status_code: 200, finish_reason: "stop", classification: "available" },
+    { id: "00000002-0000-7009-8000-000000000002", job: "00000002-0000-7001-8000-000000000002", request: 1, observed_at_us: 2_000, provider: "p", model: "model-a", status_code: 503, finish_reason: null, classification: "unavailable" },
+    { id: "00000003-0000-7009-8000-000000000003", job: "00000002-0000-7001-8000-000000000002", request: 1, observed_at_us: 3_000, provider: "p", model: "model-a", status_code: 503, finish_reason: null, classification: "unavailable" },
+    { id: "00000004-0000-7009-8000-000000000004", job: "00000002-0000-7001-8000-000000000002", request: 2, observed_at_us: 2 * day + 1_000, provider: "p", model: "model-a", status_code: 200, finish_reason: "tool_calls", classification: "unconfirmed" },
   ];
   const summary = summarizeReliability(rows, retryRows, observations, 0, 3 * day, day, availability);
   assert.equal(summary.buckets.length, 3);
@@ -73,8 +73,8 @@ test("reliability buckets zero-fill days and sum errors, retries, cache and late
 
 
 test("missing token reports are not HTTP errors and cache writes are not inferred misses", () => {
-  const rows: Buckets["rows"] = [{ bucket_us: 0, agent: null, provider: "llm_provider:1", model: "m", requests: 1, complete_requests: 0, input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 50, reasoning_tokens: 0 }];
-  const availability: ReturnType<typeof decodeAvailability>["observations"] = [{ id: "availability:1", job: "job:1", request: 1, observed_at_us: 1, provider: "p", model: "m", status_code: 200, finish_reason: "stop", classification: "available" }];
+  const rows: Buckets["rows"] = [{ bucket_us: 0, agent: null, provider: "00000001-0000-7007-8000-000000000001", model: "m", requests: 1, complete_requests: 0, input_tokens: 1000, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 50, reasoning_tokens: 0 }];
+  const availability: ReturnType<typeof decodeAvailability>["observations"] = [{ id: "00000001-0000-7009-8000-000000000001", job: "00000001-0000-7001-8000-000000000001", request: 1, observed_at_us: 1, provider: "p", model: "m", status_code: 200, finish_reason: "stop", classification: "available" }];
   const result = summarizeReliability(rows, [], [], 0, 100, 100, availability);
   assert.equal(result.totalRequests, 1);
   assert.equal(result.totalErrors, 0);

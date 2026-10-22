@@ -886,7 +886,7 @@ mod tests {
         let mut command = std::process::Command::new("sleep");
         command.arg("30");
         let stop = StopSignal::new();
-        let job = JobId::new(u64::MAX);
+        let job = JobId::new(u128::from(u64::MAX));
         let process =
             Process::spawn(command, Kind::Command, stop.clone(), Some(job)).expect("spawn process");
         assert!(matches!(prove_job(job), JobProof::Live { .. }));

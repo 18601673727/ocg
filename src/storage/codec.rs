@@ -37,6 +37,9 @@ impl Enc {
     pub(super) fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
+    pub(super) fn u128(&mut self, v: u128) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
     pub(super) fn i64(&mut self, v: i64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
@@ -74,6 +77,9 @@ impl Enc {
     pub(super) fn ou64(&mut self, v: Option<u64>) {
         self.opt(&v, |e, v| e.u64(*v));
     }
+    pub(super) fn ou128(&mut self, v: Option<u128>) {
+        self.opt(&v, |e, v| e.u128(*v));
+    }
     pub(super) fn of64(&mut self, v: Option<f64>) {
         self.opt(&v, |e, v| e.f64(*v));
     }
@@ -85,21 +91,21 @@ impl Enc {
         self.u8(agent.behavior as u8);
         self.u32(u32::try_from(agent.models.len()).unwrap_or(u32::MAX));
         for model in &agent.models {
-            self.u64(model.get());
+            self.u128(model.get());
         }
         self.u32(agent.approve.len() as u32);
         for class in &agent.approve {
             self.u8(class.code());
         }
-        self.ou64(agent.default_model.map(ConfigId::get));
+        self.ou128(agent.default_model.map(ConfigId::get));
         self.ostr(&agent.tool_grant);
         self.u32(agent.dispatch_to.len() as u32);
         for agent in &agent.dispatch_to {
-            self.u64(agent.get());
+            self.u128(agent.get());
         }
     }
     pub(super) fn config_ref(&mut self, config: &ConfigRef) {
-        self.u64(config.id.get());
+        self.u128(config.id.get());
         self.u32(config.edit_seq);
     }
     pub(super) fn llm_config(&mut self, llm: &LlmConfig) {
@@ -122,7 +128,7 @@ impl Enc {
         self.llm_config(&frozen.config);
         self.config_ref(&frozen.model);
         let provider = &frozen.provider;
-        self.u64(provider.id.get());
+        self.u128(provider.id.get());
         self.u32(provider.edit_seq);
         self.str(&provider.name);
         self.u8(provider.transport.code());
@@ -203,6 +209,11 @@ impl<'a> Dec<'a> {
             self.take(8)?.try_into().expect("8 bytes"),
         ))
     }
+    pub(super) fn u128(&mut self) -> DecodeResult<u128> {
+        Ok(u128::from_le_bytes(
+            self.take(16)?.try_into().expect("16 bytes"),
+        ))
+    }
     pub(super) fn i64(&mut self) -> DecodeResult<i64> {
         Ok(i64::from_le_bytes(
             self.take(8)?.try_into().expect("8 bytes"),
@@ -248,6 +259,10 @@ impl<'a> Dec<'a> {
     pub(super) fn ou64(&mut self) -> DecodeResult<Option<u64>> {
         self.opt(Self::u64)
     }
+    pub(super) fn ou128(&mut self) -> DecodeResult<Option<u128>> {
+        self.opt(Dec::u128)
+    }
+
     pub(super) fn of64(&mut self) -> DecodeResult<Option<f64>> {
         self.opt(Self::f64)
     }
@@ -274,17 +289,17 @@ impl<'a> Dec<'a> {
         };
         let mut models = Vec::new();
         for _ in 0..self.u32()? {
-            models.push(ConfigId::new(self.u64()?));
+            models.push(ConfigId::new(self.u128()?));
         }
         let mut approve = Vec::new();
         for _ in 0..self.u32()? {
             approve.push(self.code(ApproveClass::from_code)?);
         }
-        let default_model = self.ou64()?.map(ConfigId::new);
+        let default_model = self.ou128()?.map(ConfigId::new);
         let tool_grant = self.ostr()?;
         let mut dispatch_to = Vec::new();
         for _ in 0..self.u32()? {
-            dispatch_to.push(ConfigId::new(self.u64()?));
+            dispatch_to.push(ConfigId::new(self.u128()?));
         }
         Ok(AgentConfig {
             instructions,
@@ -298,7 +313,7 @@ impl<'a> Dec<'a> {
     }
     pub(super) fn config_ref(&mut self) -> DecodeResult<ConfigRef> {
         Ok(ConfigRef {
-            id: ConfigId::new(self.u64()?),
+            id: ConfigId::new(self.u128()?),
             edit_seq: self.u32()?,
         })
     }
@@ -331,7 +346,7 @@ impl<'a> Dec<'a> {
         let config = self.llm_config()?;
         let model = self.config_ref()?;
         let provider = ProviderSnapshot {
-            id: LlmProviderId::new(self.u64()?),
+            id: LlmProviderId::new(self.u128()?),
             edit_seq: self.u32()?,
             name: self.str()?,
             transport: self.code(LlmTransport::from_code)?,
@@ -420,7 +435,7 @@ codes!(CleanupKind { CleanupKind::Manual = 1, CleanupKind::Automatic = 2 });
 
 impl Enc {
     pub(super) fn call_ref(&mut self, call: &crate::persistence::ToolCallRef) {
-        self.u64(call.job.get());
+        self.u128(call.job.get());
         self.u32(call.request.get());
         self.u32(call.index);
     }
@@ -429,7 +444,7 @@ impl Enc {
             Actor::Auto => self.u8(0),
             Actor::Agent { conversation } => {
                 self.u8(1);
-                self.u64(conversation.get());
+                self.u128(conversation.get());
             }
             Actor::User => self.u8(2),
             Actor::Loop => self.u8(3),
@@ -444,8 +459,8 @@ impl Enc {
                 keep_open,
             } => {
                 self.u8(0);
-                self.ou64(agent.map(ConfigId::get));
-                self.ou64(project.map(ProjectId::get));
+                self.ou128(agent.map(ConfigId::get));
+                self.ou128(project.map(ProjectId::get));
                 match origin {
                     Origin::User => self.u8(0),
                     Origin::Agent { call } => {
@@ -470,7 +485,7 @@ impl Enc {
                     }
                     TurnExecution::Ref(owner) => {
                         self.u8(1);
-                        self.u64(owner.get());
+                        self.u128(owner.get());
                     }
                 };
                 match plan_source {
@@ -479,10 +494,10 @@ impl Enc {
                         dependencies,
                     } => {
                         self.u8(0);
-                        self.ou64(previous.map(JobId::get));
+                        self.ou128(previous.map(JobId::get));
                         self.u32(dependencies.len() as u32);
                         for (job, condition) in dependencies {
-                            self.u64(job.get());
+                            self.u128(job.get());
                             self.u8(condition.code());
                         }
                     }
@@ -494,13 +509,13 @@ impl Enc {
                         attachments,
                     } => {
                         self.u8(1);
-                        self.ou64(project.map(ProjectId::get));
+                        self.ou128(project.map(ProjectId::get));
                         self.ostr(grant);
                         self.ots(*eligible_at);
                         self.ostr(objective);
                         self.u32(attachments.len() as u32);
                         for attachment in attachments {
-                            self.u64(attachment.get());
+                            self.u128(attachment.get());
                         }
                     }
                 }
@@ -523,7 +538,7 @@ impl Enc {
                 self.u8(7);
                 self.u32(waiting.len() as u32);
                 for conversation in waiting {
-                    self.u64(conversation.get());
+                    self.u128(conversation.get());
                 }
             }
             NoticeEvent::IterationCompleted => self.u8(9),
@@ -552,7 +567,7 @@ impl Enc {
                 self.str(text);
                 self.u32(attachments.len() as u32);
                 for attachment in attachments {
-                    self.u64(attachment.get());
+                    self.u128(attachment.get());
                 }
             }
             Entry::AgentMessage { text, call } => {
@@ -566,21 +581,21 @@ impl Enc {
                 reference,
             } => {
                 self.u8(2);
-                self.u64(child.get());
+                self.u128(child.get());
                 self.notice_event(event);
-                self.u64(reference.get());
+                self.u128(reference.get());
             }
             Entry::Decision {
                 approval: (turn, request, index),
             } => {
                 self.u8(3);
-                self.u64(turn.get());
+                self.u128(turn.get());
                 self.u32(*request);
                 self.u32(*index);
             }
             Entry::RetryOf { turn, by } => {
                 self.u8(4);
-                self.u64(turn.get());
+                self.u128(turn.get());
                 self.actor(by);
             }
             Entry::Iteration { n } => {
@@ -614,7 +629,7 @@ impl Dec<'_> {
     }
     pub(super) fn call_ref(&mut self) -> DecodeResult<crate::persistence::ToolCallRef> {
         Ok(crate::persistence::ToolCallRef {
-            job: JobId::new(self.u64()?),
+            job: JobId::new(self.u128()?),
             request: RequestNumber::new(self.u32()?)
                 .ok_or_else(|| StorageError::corrupted("invalid request"))?,
             index: self.u32()?,
@@ -624,7 +639,7 @@ impl Dec<'_> {
         Ok(match self.u8()? {
             0 => Actor::Auto,
             1 => Actor::Agent {
-                conversation: JobId::new(self.u64()?),
+                conversation: JobId::new(self.u128()?),
             },
             2 => Actor::User,
             3 => Actor::Loop,
@@ -634,8 +649,8 @@ impl Dec<'_> {
     pub(super) fn job_kind(&mut self) -> DecodeResult<JobKind> {
         Ok(match self.u8()? {
             0 => JobKind::Conversation {
-                agent: self.ou64()?.map(ConfigId::new),
-                project: self.ou64()?.map(ProjectId::new),
+                agent: self.ou128()?.map(ConfigId::new),
+                project: self.ou128()?.map(ProjectId::new),
                 origin: match self.u8()? {
                     0 => Origin::User,
                     1 => Origin::Agent {
@@ -650,16 +665,16 @@ impl Dec<'_> {
                 name: self.ostr()?,
                 execution: match self.u8()? {
                     0 => TurnExecution::Frozen(self.frozen_execution()?),
-                    1 => TurnExecution::Ref(JobId::new(self.u64()?)),
+                    1 => TurnExecution::Ref(JobId::new(self.u128()?)),
                     _ => return Err(StorageError::corrupted("invalid execution")),
                 },
                 plan_source: match self.u8()? {
                     0 => {
-                        let previous = self.ou64()?.map(JobId::new);
+                        let previous = self.ou128()?.map(JobId::new);
                         let mut dependencies = Vec::new();
                         for _ in 0..self.u32()? {
                             dependencies.push((
-                                JobId::new(self.u64()?),
+                                JobId::new(self.u128()?),
                                 self.code(DependencyCondition::from_code)?,
                             ));
                         }
@@ -669,14 +684,14 @@ impl Dec<'_> {
                         }
                     }
                     1 => PlanSource::Process {
-                        project: self.ou64()?.map(ProjectId::new),
+                        project: self.ou128()?.map(ProjectId::new),
                         grant: self.ostr()?,
                         eligible_at: self.ots()?,
                         objective: self.ostr()?,
                         attachments: {
                             let mut attachments = Vec::new();
                             for _ in 0..self.u32()? {
-                                attachments.push(AttachmentId::new(self.u64()?));
+                                attachments.push(AttachmentId::new(self.u128()?));
                             }
                             attachments
                         },
@@ -707,7 +722,7 @@ impl Dec<'_> {
             7 => {
                 let mut waiting = Vec::new();
                 for _ in 0..self.u32()? {
-                    waiting.push(JobId::new(self.u64()?));
+                    waiting.push(JobId::new(self.u128()?));
                 }
                 NoticeEvent::WaitersBlocked { waiting }
             }
@@ -723,7 +738,7 @@ impl Dec<'_> {
                 let n = self.u32()?;
                 let mut attachments = Vec::new();
                 for _ in 0..n {
-                    attachments.push(AttachmentId::new(self.u64()?));
+                    attachments.push(AttachmentId::new(self.u128()?));
                 }
                 Entry::UserMessage { text, attachments }
             }
@@ -732,15 +747,15 @@ impl Dec<'_> {
                 call: self.call_ref()?,
             },
             2 => Entry::Notice {
-                child: JobId::new(self.u64()?),
+                child: JobId::new(self.u128()?),
                 event: self.notice_event()?,
-                reference: JobId::new(self.u64()?),
+                reference: JobId::new(self.u128()?),
             },
             3 => Entry::Decision {
-                approval: (JobId::new(self.u64()?), self.u32()?, self.u32()?),
+                approval: (JobId::new(self.u128()?), self.u32()?, self.u32()?),
             },
             4 => Entry::RetryOf {
-                turn: JobId::new(self.u64()?),
+                turn: JobId::new(self.u128()?),
                 by: self.actor()?,
             },
             5 => Entry::Iteration { n: self.u64()? },

@@ -96,11 +96,11 @@ impl Batch {
                             crate::persistence::ModelCapability::Reasoning => "reasoning",
                         })
                         .collect();
-                    json!({"profile":format!("profile:{}", model.get()), "name":record.name, "model":body.model, "declared_capabilities":capabilities, "archived":record.archived_at.is_some()})
+                    json!({"profile":ProfileId::new(model.get()).to_string(), "name":record.name, "model":body.model, "declared_capabilities":capabilities, "archived":record.archived_at.is_some()})
                 }
                 None => Value::Null,
             };
-            agents.push(json!({"agent":format!("profile:{}",target.get()), "name":record.name, "archived":record.archived_at.is_some(), "instructions_summary":summary, "instructions_truncated":summary.len() < instructions.len(), "tool_grant":agent.tool_grant, "default_model":model}));
+            agents.push(json!({"agent":ProfileId::new(target.get()).to_string(), "name":record.name, "archived":record.archived_at.is_some(), "instructions_summary":summary, "instructions_truncated":summary.len() < instructions.len(), "tool_grant":agent.tool_grant, "default_model":model}));
         }
         let next_after = if has_more {
             agents.last().map(|agent| agent["agent"].clone())
@@ -121,12 +121,12 @@ impl Batch {
             .map(|id| self.job_tool_id(&id, "job:"))
             .transpose()?
             .unwrap_or(0);
-        if after == u64::MAX {
+        if after == u128::MAX {
             return Ok(json!({"workers":[], "has_more":false, "next_after":null}));
         }
         let ids = self.step(|tx| {
             tx.open_table(CHILD_CONVERSATIONS)?
-                .range((caller.get(), after.saturating_add(1))..=(caller.get(), u64::MAX))?
+                .range((caller.get(), after.saturating_add(1))..=(caller.get(), u128::MAX))?
                 .take(limit + 1)
                 .map(|entry| Ok(JobId::new(entry?.0.value().1)))
                 .collect::<Result<Vec<_>, StorageError>>()
@@ -138,7 +138,7 @@ impl Batch {
             let JobKind::Conversation { agent, project, .. } = row.kind else {
                 return self.corrupted("child is not a conversation".into());
             };
-            workers.push(json!({"conversation":worker.to_string(), "agent":agent.map(|id|format!("profile:{}",id.get())), "project":project.map(|id|id.to_string()), "title":self.conversation(worker)?.title, "idle":self.idle_worker(caller,worker)?}));
+            workers.push(json!({"conversation":worker.to_string(), "agent":agent.map(|id|ProfileId::new(id.get()).to_string()), "project":project.map(|id|id.to_string()), "title":self.conversation(worker)?.title, "idle":self.idle_worker(caller,worker)?}));
         }
         let next_after = if has_more {
             workers.last().map(|worker| worker["conversation"].clone())
@@ -148,17 +148,12 @@ impl Batch {
         Ok(json!({"workers":workers, "has_more":has_more, "next_after":next_after}))
     }
 
-    fn job_tool_id(&mut self, text: &str, prefix: &'static str) -> Result<u64, BatchError> {
-        match text
-            .strip_prefix(prefix)
-            .filter(|text| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
-            .and_then(|text| text.parse::<u64>().ok())
-            .filter(|id| *id != 0)
-        {
+    fn job_tool_id(&mut self, text: &str, _prefix: &'static str) -> Result<u128, BatchError> {
+        match crate::persistence::parse_entity_id(text) {
             Some(id) => Ok(id),
             None => self.reject(Violation::InvalidValue(
                 "invalid_target",
-                "expected a stable record id",
+                "expected a canonical UUID",
             )),
         }
     }

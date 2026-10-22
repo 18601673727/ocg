@@ -52,7 +52,7 @@ use ocg::orchestration::{workspace_command, workspace_discovery, workspace_write
 use ocg::persistence::{
     AvailabilityStatRecord, ContentDigest, ExecutionConfiguration, JobId, JobInputDraft,
     MetricsRecord, ModelCapability, NewAttachment, NewJob, OutputKind, ProjectId, RequestNumber,
-    ToolDecision, ToolOutcome,
+    ToolDecision, ToolOutcome, parse_entity_id,
 };
 use ocg::provider_execution::{
     CancellationToken, EnvironmentCredentialResolver, ProviderExecutionConfig,
@@ -208,6 +208,7 @@ impl Config {
     /// Reads the configuration from the environment, with the `mode`, the
     /// `image` path for a mode that takes one, and the `objective` given on
     /// the command line. The credential itself is only checked to exist.
+    #[allow(clippy::result_large_err)]
     pub fn from_environment(
         mode: Mode,
         image: Option<String>,
@@ -226,9 +227,9 @@ impl Config {
                 .filter(|value| !value.trim().is_empty())
                 .ok_or(Error::NotConfigured(name))
         };
-        let project = variable(PROJECT_VARIABLE)?
-            .strip_prefix("project:")
-            .and_then(|number| number.parse::<u64>().ok())
+        let project = variable(PROJECT_VARIABLE)
+            .ok()
+            .and_then(|value| parse_entity_id(&value))
             .map(ProjectId::new)
             .ok_or(Error::InvalidProject)?;
         let endpoint = variable(ENDPOINT_VARIABLE)?;
@@ -255,6 +256,7 @@ impl Config {
 /// Runs the host until the one Job has settled and been reported. Inside
 /// it, the Project is read and its root authorized before anything is
 /// recorded.
+#[allow(clippy::result_large_err)]
 pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> {
     let settled = Rc::new(RefCell::new(None));
     let slot = settled.clone();
@@ -273,6 +275,7 @@ pub fn run(data_directory: &DataDirectory, config: Config) -> Result<(), Error> 
 
 /// What the mode offers: the tools bound to the Project's Workspace, and the
 /// image to store when the mode sends one.
+#[allow(clippy::result_large_err)]
 async fn prepare(
     database: &DatabaseHandle,
     data_directory: &DataDirectory,
@@ -381,6 +384,7 @@ async fn prepare(
 /// The image at `path` in the Workspace: its type is the one its extension
 /// declares, and its bytes, read within the image limit, must be of that
 /// type.
+#[allow(clippy::result_large_err)]
 fn load_image(workspace: &Workspace, path: &str) -> Result<ImageInput, Error> {
     let declared = declared_type(path).ok_or_else(|| {
         Error::Image(
@@ -413,6 +417,7 @@ fn declared_type(path: &str) -> Option<ImageMime> {
 /// Submits the Job, with `image` stored as its Attachment when given,
 /// reports it once it has started, waits for it to settle, and prints what
 /// was recorded.
+#[allow(clippy::result_large_err)]
 async fn submit(
     context: &HostContext,
     data_directory: &DataDirectory,
@@ -789,7 +794,7 @@ mod tests {
         token: Option<TokenAnnotation>,
     ) -> MetricsRecord {
         MetricsRecord {
-            id: MetricsId::new(id),
+            id: MetricsId::new(u128::from(id)),
             job: JobId::new(3),
             request,
             target: Some(target()),
@@ -813,7 +818,7 @@ mod tests {
 
     fn stat(request: RequestNumber, finish: &str) -> AvailabilityStatRecord {
         AvailabilityStatRecord {
-            id: AvailabilityStatId::new(u64::from(request.get())),
+            id: AvailabilityStatId::new(u128::from(request.get())),
             job: JobId::new(3),
             request,
             target: target(),

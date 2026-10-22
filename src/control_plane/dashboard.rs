@@ -77,7 +77,7 @@ pub(super) async fn jobs(
     )
 }
 
-type CursorParts = (u64, [u8; 32], i64, u64, u32, u32);
+type CursorParts = (u128, [u8; 32], i64, u128, u32, u32);
 
 fn cursor(text: &str) -> Result<ObservationCursor, Refusal> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| INVALID_REQUEST)?;
@@ -362,8 +362,8 @@ pub(super) fn usage_summary_query(
 
 fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> WireUsageRow {
     WireUsageRow {
-        agent: (row.agent != 0).then(|| format!("profile:{}", row.agent)),
-        provider: format!("llm_provider:{}", row.provider),
+        agent: (row.agent != 0).then(|| ProfileId::new(row.agent).to_string()),
+        provider: LlmProviderId::new(row.provider).to_string(),
         model: row.model.clone(),
         requests: row.requests,
         complete_requests: row.complete_requests,
@@ -377,8 +377,8 @@ fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> WireUsageRow 
 
 fn usage_retry_row(row: &crate::persistence::UsageRetryRow) -> WireUsageRetryRow {
     WireUsageRetryRow {
-        agent: (row.agent != 0).then(|| format!("profile:{}", row.agent)),
-        provider: format!("llm_provider:{}", row.provider),
+        agent: (row.agent != 0).then(|| ProfileId::new(row.agent).to_string()),
+        provider: LlmProviderId::new(row.provider).to_string(),
         model: row.model.clone(),
         retries: row.retries,
         bucket_us: row.bucket_us,
@@ -437,7 +437,7 @@ pub(super) async fn usage_summary(
 pub(super) struct UsageRetriesQuery {
     filter: crate::persistence::UsageSummaryFilter,
     bucketing: crate::persistence::UsageBucketing,
-    after: Option<(u64, u64)>,
+    after: Option<(u128, u128)>,
     limit: usize,
 }
 
@@ -449,7 +449,7 @@ impl UsageRetriesQuery {
             .map(|cursor| {
                 let (original, retry) = cursor.split_once('.').ok_or(INVALID_REQUEST)?;
                 let positive = |value| {
-                    decimal::<u64>(value)
+                    crate::persistence::parse_entity_id(value)
                         .filter(|id| *id > 0)
                         .ok_or(INVALID_REQUEST)
                 };
@@ -667,15 +667,24 @@ mod tests {
     #[test]
     fn retry_pages_require_buckets_and_bounded_advancing_key_cursors() {
         let base = "from_us=0&until_us=86400000000&bucket=day";
-        let query = UsageRetriesQuery::parse(&format!("{base}&after=2.3&limit=1")).expect("query");
-        assert_eq!(query.after, Some((2, 3)));
+        let original = "00000002-0000-7001-8000-000000000002";
+        let retry = "00000003-0000-7001-8000-000000000003";
+        let query = UsageRetriesQuery::parse(&format!("{base}&after={original}.{retry}&limit=1"))
+            .expect("query");
+        assert_eq!(
+            query.after,
+            Some((
+                crate::persistence::parse_entity_id(original).unwrap(),
+                crate::persistence::parse_entity_id(retry).unwrap(),
+            ))
+        );
         assert_eq!(query.limit, 1);
         for suffix in [
             "after=0.1",
-            "after=1.0",
-            "after=01.2",
-            "after=1.2.3",
-            "after=1.2&after=2.3",
+            "after=00000002-0000-7001-8000-000000000002.0",
+            "after=00000002-0000-7001-8000-000000000002.3",
+            "after=00000002-0000-7001-8000-000000000002.00000003-0000-7001-8000-000000000003.4",
+            "after=00000002-0000-7001-8000-000000000002.00000003-0000-7001-8000-000000000003&after=00000002-0000-7001-8000-000000000002.00000003-0000-7001-8000-000000000003",
             "limit=0",
             "limit=101",
         ] {
@@ -694,16 +703,26 @@ mod tests {
         assert_eq!(filter.until_us, None);
         assert_eq!(filter.agent, None);
 
-        let filter = usage_summary_query("from_us=100&until_us=200&agent=profile:42")
-            .expect("profile query")
-            .0;
+        let filter = usage_summary_query(
+            "from_us=100&until_us=200&agent=0000002a-0000-7002-8000-00000000002a",
+        )
+        .expect("profile query")
+        .0;
         assert_eq!(filter.from_us, Some(100));
         assert_eq!(filter.until_us, Some(200));
-        assert_eq!(filter.agent, Some(42));
+        assert_eq!(
+            filter.agent,
+            Some(
+                "0000002a-0000-7002-8000-00000000002a"
+                    .parse::<crate::persistence::ProfileId>()
+                    .unwrap()
+                    .get()
+            )
+        );
 
         assert!(
             usage_summary_query("agent=42").is_err(),
-            "an agent is named profile:N, never a bare number"
+            "an agent is named by its canonical UUID"
         );
         assert!(usage_summary_query("from_us=200&until_us=100").is_err());
         assert!(

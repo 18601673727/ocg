@@ -365,7 +365,7 @@ impl Batch {
                 let mut waiting = BTreeSet::new();
                 for entry in tx
                     .open_table(DEPENDENCY_WAITERS)?
-                    .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                    .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 {
                     let waiter = JobId::new(entry?.0.value().1);
                     if let Some(bytes) = jobs.get(waiter.get())?
@@ -612,7 +612,7 @@ impl Batch {
         self.step(|tx| {
             let table = tx.open_table(LIVE_CHILDREN)?;
             table
-                .range((conversation.get(), 0)..=(conversation.get(), u64::MAX))?
+                .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 .map(|entry| Ok(JobId::new(entry?.0.value().1)))
                 .collect()
         })
@@ -925,7 +925,7 @@ impl Batch {
                     if !visited.insert(original) {
                         continue;
                     }
-                    for row in retries.range((original, 0)..=(original, u64::MAX))? {
+                    for row in retries.range((original, 0)..=(original, u128::MAX))? {
                         let (key, agent) = row?;
                         if agent.value() {
                             count += 1;
@@ -1019,7 +1019,7 @@ impl Batch {
                 .open_table(OPEN_APPROVALS)?
                 .range(
                     (conversation.get(), 0, 0, 0)
-                        ..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX),
+                        ..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
                 )?
                 .next()
                 .transpose()?
@@ -2702,12 +2702,8 @@ mod tests {
                 },
             );
             (
-                JobId::new(
-                    value["conversation"].as_str().unwrap()[4..]
-                        .parse()
-                        .unwrap(),
-                ),
-                JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap()),
+                value["conversation"].as_str().unwrap().parse().unwrap(),
+                value["turn"].as_str().unwrap().parse().unwrap(),
             )
         }
         fn complete_claimed(&self, turn: JobId) {
@@ -2744,16 +2740,13 @@ mod tests {
                 limit: Some(1),
             },
         );
-        assert_eq!(
-            catalog["agents"][0]["agent"],
-            format!("profile:{}", agent.get())
-        );
+        assert_eq!(catalog["agents"][0]["agent"], agent.to_string());
         assert_eq!(catalog["has_more"], false);
         let empty = fixture.apply(
             turn,
             1,
             JobToolCall::JobAgents {
-                after: Some(format!("profile:{}", agent.get())),
+                after: Some(agent.to_string()),
                 limit: None,
             },
         );
@@ -2786,7 +2779,7 @@ mod tests {
                 objective: "follow-up work".into(),
             },
         );
-        let next = JobId::new(assigned["turn"].as_str().unwrap()[4..].parse().unwrap());
+        let next = assigned["turn"].as_str().unwrap().parse().unwrap();
         assert_ne!(next, first);
         assert_eq!(
             wait(fixture.database.job(next)).unwrap().unwrap().parent_id,
@@ -3198,7 +3191,7 @@ mod tests {
                 text: "continue".into(),
             },
         );
-        let next = JobId::new(answer["turn"].as_str().unwrap()[4..].parse().unwrap());
+        let next = answer["turn"].as_str().unwrap().parse().unwrap();
         fixture.finish(next, OutcomeKind::Completed);
         let pending = wait(fixture.database.conversation_turns(parent, None, 1)).unwrap()[0].id;
         let before = wait(fixture.database.turn_entries(pending)).unwrap().len();
@@ -3246,7 +3239,7 @@ mod tests {
                 },
             );
             fixture.complete_claimed(current);
-            let next = JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap());
+            let next = value["turn"].as_str().unwrap().parse().unwrap();
             fixture.finish(next, OutcomeKind::Completed);
         }
         let parent_row = wait(fixture.database.conversations(None, 20))
@@ -3442,7 +3435,7 @@ mod tests {
                     turn: original.to_string(),
                 },
             );
-            let retry = JobId::new(value["turn"].as_str().unwrap()[4..].parse().unwrap());
+            let retry = value["turn"].as_str().unwrap().parse().unwrap();
             fixture.finish(retry, OutcomeKind::Failed);
             original = retry;
         }

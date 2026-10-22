@@ -452,7 +452,7 @@ impl Drop for Host {
     }
 }
 fn id(value: &str) -> ocg::persistence::JobId {
-    ocg::persistence::JobId::new(value.strip_prefix("job:").unwrap().parse().unwrap())
+    value.parse().unwrap()
 }
 fn db_wait<F: std::future::Future>(future: F) -> F::Output {
     struct WakeThread(std::thread::Thread);
@@ -1104,7 +1104,7 @@ fn scenario_06_stop_keeps_queued_input_and_close_voids_the_tree() {
         let stopped=db.job(id(&running)).await.unwrap().unwrap(); assert_eq!(stopped.outcome.as_ref().unwrap().kind,OutcomeKind::Unknown); assert!(matches!(stopped.outcome.unwrap().cause,Some(OutcomeCause::Stopped { .. })));
         assert!(db.turn_entries(id(&queued)).await.unwrap().iter().any(|(_,entry)|matches!(&entry.entry,Entry::UserMessage { text,.. } if text=="queued while running")));
         assert!(db.job(id(&tree)).await.unwrap().unwrap().subtree_settled);
-        assert!(matches!(db.tool_evidence(ocg::persistence::JobId::new(approval_turn),None,100).await.unwrap()[0].decision.fact,ToolDecision::AwaitingApproval(_)));
+        assert!(matches!(db.tool_evidence(ocg::persistence::JobId::new(u128::from(approval_turn)),None,100).await.unwrap()[0].decision.fact,ToolDecision::AwaitingApproval(_)));
     }); });
     let directory = DataDirectory::bootstrap(host.data.clone().into_os_string()).unwrap();
     let database = redb::Database::open(directory.database_path().join("ocg.redb")).unwrap();

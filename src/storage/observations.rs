@@ -13,12 +13,6 @@ use crate::persistence::{
 };
 use crate::token_usage::TokenAnnotation;
 
-/// The identity of a record within its Job: the request number and the
-/// event's number in it.
-fn pair(request: RequestNumber, seq: u32) -> u64 {
-    (u64::from(request.get()) << 32) | u64::from(seq)
-}
-
 pub(super) fn frozen_llm_target(
     rx: &ReadTransaction,
     job: JobId,
@@ -75,7 +69,7 @@ pub(super) fn metrics_of(
                     event.recorded_at,
                 ));
                 records.push(MetricsRecord {
-                    id: MetricsId::new(pair(event.request, event.seq)),
+                    id: MetricsId::new(event.id.get()),
                     job,
                     request: event.request,
                     target: target.clone(),
@@ -103,7 +97,7 @@ pub(super) fn metrics_of(
                 match records.last_mut() {
                     Some(record) if pairs => record.token = Some(annotation),
                     _ => records.push(MetricsRecord {
-                        id: MetricsId::new(pair(event.request, event.seq)),
+                        id: MetricsId::new(event.id.get()),
                         job,
                         request: event.request,
                         target: target.clone(),
@@ -162,7 +156,7 @@ fn availability_of(
         return None;
     };
     Some(AvailabilityStatRecord {
-        id: AvailabilityStatId::new(pair(event.request, event.seq)),
+        id: AvailabilityStatId::new(event.id.get()),
         job,
         request: event.request,
         target: target.clone(),
@@ -213,7 +207,7 @@ pub(crate) fn read_job_availability(
 
 // ---- queries over the scope index ---------------------------------------------------
 
-type ScopeKey = (u64, [u8; 32], i64, u64, u32, u32);
+type ScopeKey = (u128, [u8; 32], i64, u128, u32, u32);
 
 fn model_hash(model: &str) -> [u8; 32] {
     *ContentDigest::of(model.as_bytes()).as_bytes()
@@ -262,12 +256,12 @@ fn walk_scope(
 
     let model = filter.model.as_deref().map(model_hash);
     let min_provider = filter.provider.map_or(0, |provider| provider.get());
-    let max_provider = filter.provider.map_or(u64::MAX, |provider| provider.get());
+    let max_provider = filter.provider.map_or(u128::MAX, |provider| provider.get());
     let high = (
         max_provider,
         model.unwrap_or([0xff; 32]),
         i64::MAX,
-        u64::MAX,
+        u128::MAX,
         u32::MAX,
         u32::MAX,
     );
@@ -283,7 +277,7 @@ fn walk_scope(
             } else if ak.2 < from_micros {
                 Bound::Included((ak.0, ak.1, from_micros, 0, 0, 0))
             } else if ak.2 >= until_micros {
-                Bound::Excluded((ak.0, ak.1, i64::MAX, u64::MAX, u32::MAX, u32::MAX))
+                Bound::Excluded((ak.0, ak.1, i64::MAX, u128::MAX, u32::MAX, u32::MAX))
             } else {
                 Bound::Excluded(ak)
             }
@@ -341,7 +335,7 @@ fn walk_scope(
 
             if observed_at >= until_micros {
                 next_bound =
-                    Bound::Excluded((key.0, key.1, i64::MAX, u64::MAX, u32::MAX, u32::MAX));
+                    Bound::Excluded((key.0, key.1, i64::MAX, u128::MAX, u32::MAX, u32::MAX));
                 break;
             }
 
@@ -445,7 +439,7 @@ pub(crate) fn read_metrics(
                     .or_insert(metrics_of(job, &target, &job_events(&rx, job)?))
             }
         };
-        let id = MetricsId::new(pair(event.request, event.seq));
+        let id = MetricsId::new(event.id.get());
         if let Some(record) = all.iter().find(|record| record.id == id) {
             records.push(record.clone());
         }
@@ -503,9 +497,9 @@ pub(crate) fn read_observed_models(
     };
     // One entry per (Provider, model) the range holds, with what it holds.
     let mut choices: BTreeMap<ObservedModel, (bool, bool)> = BTreeMap::new();
-    let mut groups: HashMap<(u64, [u8; 32]), ObservedModel> = HashMap::new();
+    let mut groups: HashMap<(u128, [u8; 32]), ObservedModel> = HashMap::new();
     // Groups at or before the caller's cursor, which the page never holds.
-    let mut passed: HashSet<(u64, [u8; 32])> = HashSet::new();
+    let mut passed: HashSet<(u128, [u8; 32])> = HashSet::new();
     walk_scope(&rx, &range, None, usize::MAX, |key| {
         let group = (key.0, key.1);
         if passed.contains(&group) {

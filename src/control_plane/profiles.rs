@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use super::{
     DATABASE_BUSY, DATABASE_UNAVAILABLE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST, Refusal,
-    Reply, SHUTTING_DOWN, decimal,
+    Reply, SHUTTING_DOWN,
 };
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
@@ -129,8 +129,7 @@ const STORAGE_REFUSED: Refusal = Refusal::new(
 );
 
 pub(super) fn profile_id(text: &str) -> Result<ProfileId, Refusal> {
-    text.strip_prefix("profile:")
-        .and_then(decimal::<u64>)
+    crate::persistence::parse_entity_id(text)
         .map(ProfileId::new)
         .ok_or(INVALID_REQUEST)
 }
@@ -780,10 +779,7 @@ pub(super) async fn save_profile(
             }
             let mut parsed_targets: Vec<ConfigId> = Vec::with_capacity(llm_targets.len());
             for raw_target in &llm_targets {
-                let target_id = raw_target
-                    .trim()
-                    .strip_prefix("profile:")
-                    .and_then(decimal::<u64>)
+                let target_id = crate::persistence::parse_entity_id(raw_target.trim())
                     .map(ConfigId::new)
                     .ok_or(INVALID_LLM_TARGET)?;
                 if parsed_targets.contains(&target_id) {

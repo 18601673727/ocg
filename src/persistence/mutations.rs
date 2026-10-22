@@ -147,7 +147,7 @@ pub(crate) fn append_job_output(
     if state.outcome.is_some() {
         return batch.reject(Violation::JobHasTerminalOutcome(job));
     }
-    let seq = batch.append_output(
+    let (seq, output_id) = batch.append_output(
         job,
         output.kind.into(),
         output.summary,
@@ -156,7 +156,7 @@ pub(crate) fn append_job_output(
         output.value,
     )?;
     Ok(AppendedOutput {
-        output: JobOutputId::new(u64::from(seq)),
+        output: output_id,
         seq: i64::from(seq),
     })
 }
@@ -181,8 +181,8 @@ pub(crate) fn finalize_job(
         JobFinalization::Cancelled(result) => (OutcomeKind::Cancelled, Some(result)),
     };
     let (_, appended) = batch.finalize(job, kind, cause, result, ignore_stop_cause)?;
-    Ok(appended.map(|seq| AppendedOutput {
-        output: JobOutputId::new(u64::from(seq)),
+    Ok(appended.map(|(seq, output)| AppendedOutput {
+        output,
         seq: i64::from(seq),
     }))
 }
@@ -492,7 +492,7 @@ pub(crate) fn create_attachment(
     if attachment.byte_length == 0 {
         return batch.reject(Violation::InvalidValue("content", "cannot be empty"));
     }
-    let id = AttachmentId(batch.next_id(crate::storage::Sequence::Attachment)?);
+    let id = AttachmentId(batch.next_id()?);
     batch.insert_attachment(&AttachmentRecord {
         id,
         sha256: attachment.sha256,
@@ -543,7 +543,7 @@ pub(crate) fn create_project(batch: &mut Batch, project: NewProject) -> OpResult
             return batch.reject(Violation::ProjectRootOverlap { project: existing });
         }
     }
-    let id = ProjectId(batch.next_id(crate::storage::Sequence::Project)?);
+    let id = ProjectId(batch.next_id()?);
     let now = batch.now();
     batch.insert_project(&ProjectRecord {
         id,
@@ -666,7 +666,7 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
                 measurements: metrics.measurements,
             },
         )?;
-        id = Some(request_record_id(event.request, event.seq));
+        id = Some(event.id);
         inserted.push(event);
     }
     if let Some(token) = metrics.token {
@@ -679,17 +679,11 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: NewMetrics) -> OpResult
                 finality: token.finality,
             },
         )?;
-        id.get_or_insert(request_record_id(event.request, event.seq));
+        id.get_or_insert(event.id);
         inserted.push(event);
     }
     batch.update_usage_total(metrics.job, metrics.request, old_sample, events, inserted)?;
-    Ok(MetricsId::new(id.unwrap_or(0)))
-}
-
-/// The identity of a record within its Job: the request number and the
-/// event's number in it.
-fn request_record_id(request: RequestNumber, seq: u32) -> u64 {
-    (u64::from(request.get()) << 32) | u64::from(seq)
+    Ok(MetricsId::new(id.map_or(0, |event| event.get())))
 }
 
 /// Appends one availability observation of an LLM request made by a Job
@@ -720,8 +714,5 @@ pub(crate) fn record_availability_stat(
             failure: stat.observation.failure,
         },
     )?;
-    Ok(AvailabilityStatId::new(request_record_id(
-        event.request,
-        event.seq,
-    )))
+    Ok(AvailabilityStatId::new(event.id.get()))
 }

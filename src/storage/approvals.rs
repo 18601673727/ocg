@@ -2,7 +2,7 @@ use super::codec::TAG_APPROVAL;
 use super::*;
 use crate::persistence::{ToolCallRef, ToolDecision, Violation};
 
-pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u64, u64, u32, u32) {
+pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u128, u128, u32, u32) {
     (
         conversation.get(),
         call.job.get(),
@@ -156,7 +156,7 @@ impl Batch {
         let calls = self.step(|tx| {
             let mut calls = Vec::new();
             for entry in tx.open_table(OPEN_APPROVALS)?.range(
-                (conversation.get(), 0, 0, 0)..=(conversation.get(), u64::MAX, u32::MAX, u32::MAX),
+                (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
             )? {
                 let (key, value) = entry?;
                 if value.value() == 0 {

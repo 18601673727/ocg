@@ -113,13 +113,7 @@ pub(super) fn agent_profile_query(query: &str) -> Result<(Option<ProfileId>, usi
             let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
             match key {
                 "before" if before.is_none() => {
-                    before = Some(
-                        value
-                            .strip_prefix("profile:")
-                            .and_then(decimal::<u64>)
-                            .map(ProfileId::new)
-                            .ok_or(INVALID_REQUEST)?,
-                    );
+                    before = Some(super::profiles::profile_id(value)?);
                 }
                 "limit" if limit.is_none() => {
                     limit = Some(
@@ -198,7 +192,7 @@ pub(super) fn entry_json(seq: u32, entry: &crate::persistence::TurnEntry) -> Wir
             reference: reference.to_string(),
         },
         Entry::Decision { approval } => WireEntry::Decision {
-            approval: (approval.0.get(), approval.1, approval.2),
+            approval: (approval.0.to_string(), approval.1, approval.2),
         },
         Entry::RetryOf { turn, by } => WireEntry::RetryOf {
             turn: turn.to_string(),
@@ -717,16 +711,23 @@ mod tests {
         let (before, limit) = agent_profile_query("").expect("no query is the first page");
         assert_eq!((before, limit), (None, DEFAULT_PROFILE_PAGE));
         let (before, limit) =
-            agent_profile_query("before=profile:7&limit=3").expect("a cursor and a limit");
-        assert_eq!((before, limit), (Some(ProfileId::new(7)), 3));
+            agent_profile_query("before=00000007-0000-7002-8000-000000000007&limit=3")
+                .expect("a cursor and a limit");
+        assert_eq!(
+            (before, limit),
+            (
+                Some("00000007-0000-7002-8000-000000000007".parse().unwrap()),
+                3
+            )
+        );
         for refused in [
             "limit=0",
             "limit=101",
             "limit=03",
             "before=7",
-            "before=profile:07",
-            "before=profile:1&before=profile:2",
-            "after=profile:1",
+            "before=00000007-0000-4002-8000-000000000007",
+            "before=00000001-0000-7002-8000-000000000001&before=00000002-0000-7002-8000-000000000002",
+            "after=00000001-0000-7002-8000-000000000001",
             "limit",
         ] {
             assert!(agent_profile_query(refused).is_err(), "{refused}");
@@ -741,16 +742,24 @@ mod tests {
             (None, DEFAULT_TREE_PAGE, DEFAULT_TREE_DEPTH)
         );
         let (after, limit, depth) =
-            tree_query("after=job:3&limit=5&depth=4").expect("a cursor, a limit and a depth");
-        assert_eq!((after, limit, depth), (Some(JobId::new(3)), 5, 4));
+            tree_query("after=00000003-0000-7001-8000-000000000003&limit=5&depth=4")
+                .expect("a cursor, a limit and a depth");
+        assert_eq!(
+            (after, limit, depth),
+            (
+                Some("00000003-0000-7001-8000-000000000003".parse().unwrap()),
+                5,
+                4
+            )
+        );
         for refused in [
             "limit=0",
             "limit=101",
             "depth=0",
             "depth=5",
             "after=3",
-            "after=job:1&after=job:2",
-            "before=job:1",
+            "after=00000001-0000-7001-8000-000000000001&after=00000002-0000-7001-8000-000000000002",
+            "before=00000001-0000-7001-8000-000000000001",
             "depth",
         ] {
             assert!(tree_query(refused).is_err(), "{refused}");

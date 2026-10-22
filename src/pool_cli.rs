@@ -14,12 +14,9 @@ pub fn run(
         Limit(ExecutionPoolId, NonZeroU32),
     }
     let pool_id = |value: &str| -> Result<ExecutionPoolId, Box<dyn std::error::Error>> {
-        Ok(ExecutionPoolId::new(
-            value
-                .strip_prefix("execution_pool:")
-                .unwrap_or(value)
-                .parse()?,
-        ))
+        value
+            .parse::<ExecutionPoolId>()
+            .map_err(|_| "pool must be a canonical UUID".into())
     };
     let action = match arguments.as_slice() {
         [command] if command == "list" => Action::List,
