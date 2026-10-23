@@ -2,17 +2,12 @@
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import { ArrowLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { ChatScreen } from "../chat/chat-screen";
-import { ChatInspector } from "../chat/chat-inspector";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
-import { JobsSurface } from "../job/jobs-surface";
-import { ObservationsSurface } from "../dashboard/observations-surface";
-import { LogsSurface } from "../dashboard/logs-surface";
-import { SettingsSurface } from "../settings/control-settings-surface";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import type { decodeHealth } from "../contracts";
@@ -23,6 +18,18 @@ import { PageTitleVisibilityContext } from "./page-title";
 import { ConversationErrorsProvider, ConversationErrorScope, useConversationErrors } from "../chat/conversation-errors";
 import type { RuntimeStatus } from "../types";
 import { conversationAncestors, conversationPath, parseConversationPath } from "./conversation-path";
+
+function SurfaceLoading() {
+  const { t } = useI18n();
+  return <p role="status" className="m-auto text-sm text-muted-foreground">{t("common.loading")}</p>;
+}
+
+const ChatInspector = dynamic(() => import("../chat/chat-inspector").then(module => module.ChatInspector), { loading: SurfaceLoading });
+const ChatScreen = dynamic(() => import("../chat/chat-screen").then(module => module.ChatScreen), { loading: SurfaceLoading });
+const JobsSurface = dynamic(() => import("../job/jobs-surface").then(module => module.JobsSurface), { loading: SurfaceLoading });
+const ObservationsSurface = dynamic(() => import("../dashboard/observations-surface").then(module => module.ObservationsSurface), { loading: SurfaceLoading });
+const LogsSurface = dynamic(() => import("../dashboard/logs-surface").then(module => module.LogsSurface), { loading: SurfaceLoading });
+const SettingsSurface = dynamic(() => import("../settings/control-settings-surface").then(module => module.SettingsSurface), { loading: SurfaceLoading });
 
 export type { WorkspaceView } from "./view-domain";
 
@@ -68,6 +75,10 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
   const observedStatus = useRef<RuntimeStatus | null>(null);
   const activeConversation = useRef(conversationKey);
   useEffect(() => { activeConversation.current = conversationKey; }, [conversationKey]);
+
+  useEffect(() => {
+    if (location.view === "chat" && location.job) void import("../chat/chat-screen").catch(() => {});
+  }, [location.view, location.job]);
 
   useEffect(() => {
     const status = runtime.snapshot.status;
