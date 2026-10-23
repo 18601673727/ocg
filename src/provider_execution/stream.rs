@@ -405,6 +405,14 @@ async fn parse_stream_body(
                     None => response.unknown(message, status_code),
                 });
             }
+            if native && responses.terminal {
+                // The completed native snapshot owns the final answer and calls;
+                // already published deltas remain progress in the output history.
+                response = StreamedResponse {
+                    usage: std::mem::take(&mut response.usage),
+                    ..Default::default()
+                };
+            }
             let delta = consume_event(&event, &mut response, config.max_output_bytes).map_err(
                 |refused| match refused {
                     Refused::ToolCall(error) => {
@@ -440,6 +448,10 @@ async fn parse_stream_body(
             {
                 saw_delta = true;
             }
+            if native && responses.terminal {
+                response.raw_finish_reason = Some("completed".to_owned());
+                break 'stream;
+            }
             for (kind, delta) in delta {
                 output.buffer(kind, &delta).await.map_err(|error| {
                     local_stop(
@@ -449,10 +461,6 @@ async fn parse_stream_body(
                         response.raw_finish_reason.as_deref(),
                     )
                 })?;
-            }
-            if native && responses.terminal {
-                response.raw_finish_reason = Some("completed".to_owned());
-                break 'stream;
             }
         }
     }

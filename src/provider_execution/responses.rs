@@ -172,17 +172,18 @@ impl ResponseStream {
         Ok(false)
     }
 
-    fn suffix(previous: &mut String, value: &str, snapshot: bool) -> Result<String, &'static str> {
+    fn suffix(previous: &mut String, value: &str, snapshot: bool) -> String {
         if snapshot {
             let suffix = value
                 .strip_prefix(previous.as_str())
-                .ok_or("Responses snapshot conflicts with streamed output")?
+                .unwrap_or("")
                 .to_owned();
-            previous.push_str(&suffix);
-            Ok(suffix)
+            previous.clear();
+            previous.push_str(value);
+            suffix
         } else {
             previous.push_str(value);
-            Ok(value.to_owned())
+            value.to_owned()
         }
     }
 
@@ -196,15 +197,14 @@ impl ResponseStream {
         delta: &mut Value,
     ) -> Result<(), &'static str> {
         let item = self.item(index)?;
-        if item.done {
-            let previous = item.text.get(&(field.to_owned(), part));
-            if !snapshot || previous.is_none_or(|previous| previous != value) {
-                return Err("Responses text changed after its item completed");
-            }
+        if item.done && !snapshot {
+            return Err("Responses text changed after its item completed");
         }
         let text = item.text.entry((field.to_owned(), part)).or_default();
-        let suffix = Self::suffix(text, value, snapshot)?;
-        self.bytes = self.bytes.saturating_add(suffix.len());
+        let previous_len = text.len();
+        let suffix = Self::suffix(text, value, snapshot);
+        let added = suffix.len().max(text.len().saturating_sub(previous_len));
+        self.bytes = self.bytes.saturating_add(added);
         let old = delta[field].as_str().unwrap_or("");
         delta[field] = json!(format!("{old}{suffix}"));
         Ok(())
@@ -218,11 +218,15 @@ impl ResponseStream {
         delta: &mut Value,
     ) -> Result<(), &'static str> {
         let item = self.item(index)?;
-        if item.done && (!snapshot || item.arguments != value) {
+        if item.done && !snapshot {
             return Err("Responses arguments changed after its item completed");
         }
-        let suffix = Self::suffix(&mut item.arguments, value, snapshot)?;
-        self.bytes = self.bytes.saturating_add(suffix.len());
+        let previous_len = item.arguments.len();
+        let suffix = Self::suffix(&mut item.arguments, value, snapshot);
+        let added = suffix
+            .len()
+            .max(item.arguments.len().saturating_sub(previous_len));
+        self.bytes = self.bytes.saturating_add(added);
         if !suffix.is_empty() {
             Self::call_delta(
                 delta,
@@ -386,12 +390,15 @@ impl ResponseStream {
                 if output.len() > 128 {
                     return Err("Responses output has too many items");
                 }
+                let mut completed = Self::default();
                 for (index, item) in output.iter().enumerate() {
-                    self.snapshot(index as u32, item, true, &mut delta)?;
+                    self.snapshot(index as u32, item, true, &mut json!({}))?;
+                    completed.snapshot(index as u32, item, true, &mut delta)?;
                 }
                 if self.items.len() != output.len() {
                     return Err("Responses completion omitted streamed items");
                 }
+                self.bytes = self.bytes.max(completed.bytes);
                 // The terminal snapshot bounds encrypted reasoning and other retained metadata too.
                 if output.iter().map(|v| v.to_string().len()).sum::<usize>()
                     > limit.saturating_mul(6).saturating_add(MAX_SSE_LINE_BYTES)
@@ -511,16 +518,115 @@ mod tests {
     }
 
     #[test]
-    fn responses_reject_conflicts_truncation_failure_and_output_limits() {
+    fn responses_completed_snapshots_replace_previews_and_keep_streamed_progress() {
+        #[derive(Default)]
+        struct Progress(String);
+        impl ProviderOutputSink for Progress {
+            fn append<'a>(
+                &'a mut self,
+                _: IntermediateOutputKind,
+                text: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+                self.0.push_str(text);
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let cfg = config();
+        let mut progress = Progress::default();
+        let result = crate::test_support::wait(stream::read_response(
+            payload(
+                events(vec![
+                    text_delta("Draft"),
+                    json!({"type":"response.output_item.done","output_index":0,"item":message("Revised")}),
+                    complete(vec![message("Final answer")]),
+                ]),
+                cfg.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &cfg,
+            Some(&mut progress),
+            &ChatConversation::default(),
+        ))
+        .unwrap();
+        assert_eq!(progress.0, "Draft");
+        assert_eq!(result.text, "Final answer");
+        assert_eq!(result.response_items, vec![message("Final answer")]);
+        assert_eq!(result.usage.input_tokens, Some(12));
+        assert_eq!(result.raw_finish_reason.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn responses_completed_calls_use_final_arguments_and_reasoning() {
+        let cfg = config();
+        let reasoning = json!({"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Final summary"}]});
+        let call = json!({"type":"function_call","id":"fc_1","call_id":"call_1","name":"f","arguments":"{\"value\":2}","status":"completed"});
+        let result = crate::test_support::wait(stream::parse_stream(
+            payload(
+                events(vec![
+                    json!({"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"item_id":"rs_1","delta":"Draft summary"}),
+                    json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"f","arguments":""}}),
+                    json!({"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_1","delta":"{ \"value\" : 1 }"}),
+                    json!({"type":"response.function_call_arguments.done","output_index":1,"item_id":"fc_1","arguments":"{\"value\":1}"}),
+                    complete(vec![reasoning.clone(), call.clone()]),
+                ]),
+                cfg.cancellation.clone(),
+            ),
+            200,
+            Instant::now(),
+            None,
+            &cfg,
+            None,
+            &mut UsageCapture::default(),
+        ))
+        .unwrap();
+        assert_eq!(result.reasoning, "Final summary");
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].arguments, "{\"value\":2}");
+        assert_eq!(result.response_items, vec![reasoning, call]);
+    }
+
+    #[test]
+    fn responses_snapshot_revisions_still_require_completion_and_fit_limits() {
+        let done =
+            json!({"type":"response.output_item.done","output_index":0,"item":message("Revised")});
         assert!(matches!(
-            read(vec![text_delta("abc")], 1024),
+            read(vec![text_delta("Draft"), done.clone()], 1024),
             Err(ProviderExecutionError::Incomplete { .. })
         ));
         assert!(matches!(
             read(
-                vec![text_delta("abc"), complete(vec![message("different")])],
-                1024
+                vec![
+                    text_delta("a"),
+                    complete(vec![message("large replacement")])
+                ],
+                8
             ),
+            Err(ProviderExecutionError::Stopped { .. })
+        ));
+        assert!(matches!(
+            read(vec![text_delta("a"), done], 3),
+            Err(ProviderExecutionError::Stopped { .. })
+        ));
+        for output in [
+            vec![],
+            vec![
+                json!({"type":"message","id":"different","status":"completed","content":[{"type":"output_text","text":"Revised"}]}),
+            ],
+            vec![json!({"type":"message","id":"msg_1","status":"completed","content":[]})],
+        ] {
+            assert!(matches!(
+                read(vec![text_delta("Draft"), complete(output)], 1024),
+                Err(ProviderExecutionError::Incomplete { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn responses_reject_truncation_failure_and_output_limits() {
+        assert!(matches!(
+            read(vec![text_delta("abc")], 1024),
             Err(ProviderExecutionError::Incomplete { .. })
         ));
         assert!(matches!(
