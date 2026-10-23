@@ -722,7 +722,10 @@ impl Batch {
         frozen.agent_ref = None;
         frozen.llm.config.declared_capabilities = BTreeSet::from([ModelCapability::Chat]);
         frozen.llm.config.parameters = crate::persistence::LlmParameters {
-            max_tokens: Some(256),
+            max_tokens: Some(match frozen.llm.provider.transport {
+                LlmTransport::OpenAiChatCompletions => 256,
+                LlmTransport::OpenAiResponses => 4096,
+            }),
             ..Default::default()
         };
         let conversation = self.t1_submit(
@@ -4061,6 +4064,63 @@ mod tests {
         let child = children[0].conversation.root_job;
         let turns = wait(fixture.database.conversation_turns(child, None, 10)).unwrap();
         (child, turns[0].id)
+    }
+
+    #[test]
+    fn responses_title_jobs_allow_room_for_reasoning_tokens() {
+        use crate::persistence::{ConfigBody, NewConfig};
+
+        let mut fixture = Fixture::new("responses-title-budget");
+        let model = wait(
+            fixture
+                .database
+                .config(fixture.configuration.llm_profile.into()),
+        )
+        .unwrap()
+        .unwrap();
+        let ConfigBody::Model(model) = model.body else {
+            panic!("expected model");
+        };
+        let connection = wait(fixture.database.config(model.connection_id))
+            .unwrap()
+            .unwrap();
+        let ConfigBody::Connection(mut config) = connection.body else {
+            panic!("expected connection");
+        };
+        config.protocol = LlmTransport::OpenAiResponses;
+        wait(fixture.database.update_config(
+            model.connection_id,
+            NewConfig {
+                name: connection.name,
+                body: ConfigBody::Connection(config),
+            },
+        ))
+        .unwrap();
+        fixture.pool = wait(fixture.database.create_executor(NewExecutor {
+            name: "Responses worker".into(),
+            concurrency_limit: NonZeroU32::new(16).unwrap(),
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiResponses]),
+        }))
+        .unwrap();
+        let (root, first) = fixture.open();
+        finish_first_reply(&fixture, first);
+        let (_, title) = title_turn(&fixture, root);
+        let configuration = wait(fixture.database.job_configuration(title))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            configuration.frozen.llm.provider.transport,
+            LlmTransport::OpenAiResponses
+        );
+        assert_eq!(
+            configuration.frozen.llm.config.parameters.max_tokens,
+            Some(4096)
+        );
+        assert_eq!(
+            configuration.frozen.llm.config.declared_capabilities,
+            BTreeSet::from([ModelCapability::Chat])
+        );
+        fixture.worker.shutdown().unwrap();
     }
 
     #[test]
