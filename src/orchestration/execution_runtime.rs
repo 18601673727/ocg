@@ -3504,6 +3504,29 @@ pub(crate) async fn run_provider_job_with_window(
     result
 }
 
+fn insert_title_instruction(conversation: &mut ChatConversation, limits: ContextLimits) -> bool {
+    let before_user = conversation
+        .messages
+        .iter()
+        .position(|message| message.role != ChatRole::System)
+        .unwrap_or(conversation.messages.len());
+    conversation.messages.insert(
+        before_user,
+        ChatMessage::system(super::conversation_title::INSTRUCTION),
+    );
+    if limits.context_window.is_some_and(|window| {
+        estimate_request_tokens(conversation, limits.max_tokens) > u64::from(window)
+    }) {
+        conversation.messages.remove(before_user);
+        return false;
+    }
+    conversation.image_attachments = std::mem::take(&mut conversation.image_attachments)
+        .into_iter()
+        .map(|(index, attachments)| (index + usize::from(index >= before_user), attachments))
+        .collect();
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_provider_job_inner(
     run: ProviderRun,
@@ -3534,22 +3557,9 @@ async fn run_provider_job_inner(
                 ..
             }
         )
+        && insert_title_instruction(&mut conversation, context_limits)
     {
         sink.title_conversation = Some(root);
-        let before_user = conversation
-            .messages
-            .iter()
-            .position(|message| message.role != ChatRole::System)
-            .unwrap_or(conversation.messages.len());
-        conversation.messages.insert(
-            before_user,
-            ChatMessage::system(super::conversation_title::INSTRUCTION),
-        );
-        conversation.image_attachments = conversation
-            .image_attachments
-            .into_iter()
-            .map(|(index, attachments)| (index + usize::from(index >= before_user), attachments))
-            .collect();
     }
     sink.recorder.image_attachments = std::mem::take(&mut conversation.image_attachments);
     sink.dropped_turns = conversation.dropped_turns;
@@ -7187,5 +7197,61 @@ mod approval_runtime_tests {
             "ran\n"
         );
         worker.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod title_budget_tests {
+    use super::*;
+
+    #[test]
+    fn optional_title_does_not_displace_a_request_at_its_context_limit() {
+        let mut conversation = ChatConversation {
+            messages: vec![ChatMessage::system("system"), ChatMessage::user("user")],
+            ..Default::default()
+        };
+        let attachment = AttachmentId::new(42);
+        conversation.image_attachments.insert(1, vec![attachment]);
+        let before = serde_json::to_vec(&conversation.messages).unwrap();
+        let window = estimate_request_tokens(&conversation, Some(10)) as u32;
+        assert!(!insert_title_instruction(
+            &mut conversation,
+            ContextLimits {
+                context_window: Some(window),
+                max_tokens: Some(10)
+            }
+        ));
+        assert_eq!(serde_json::to_vec(&conversation.messages).unwrap(), before);
+        assert_eq!(
+            conversation.image_attachments.get(&1),
+            Some(&vec![attachment])
+        );
+        assert_eq!(
+            estimate_request_tokens(&conversation, Some(10)),
+            u64::from(window)
+        );
+    }
+
+    #[test]
+    fn optional_title_keeps_image_indices_when_there_is_room() {
+        let mut conversation = ChatConversation {
+            messages: vec![ChatMessage::system("system"), ChatMessage::user("user")],
+            ..Default::default()
+        };
+        let attachment = AttachmentId::new(42);
+        conversation.image_attachments.insert(1, vec![attachment]);
+        assert!(insert_title_instruction(
+            &mut conversation,
+            ContextLimits {
+                context_window: Some(128000),
+                max_tokens: Some(10)
+            }
+        ));
+        assert_eq!(conversation.messages.len(), 3);
+        assert_eq!(
+            conversation.image_attachments.get(&2),
+            Some(&vec![attachment])
+        );
+        assert!(!conversation.image_attachments.contains_key(&1));
     }
 }
