@@ -261,7 +261,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
     const evidence = await readTranscriptEvidence(this.control, turn.job.id, { signal: this.lifetime.signal });
     if (!isCurrent()) return null;
-    const outputs = evidence.responses === null
+    const outputs = turn.outputs_truncated || evidence.responses === null
       ? await this.control.readAllJobOutputs(turn.job.id, this.lifetime.signal) : turn.outputs;
     if (!isCurrent()) return null;
     const state: Turn = { sessionId, ...turn, outputs, tools: evidence.tools ?? [], responses: evidence.responses ?? [], toolError: evidence.error };

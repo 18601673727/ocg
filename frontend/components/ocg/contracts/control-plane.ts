@@ -13,7 +13,7 @@ type ProjectedEntry<E = Wire.WireTurnEntry> = E extends unknown
   ? Omit<E, "text" | "attachments" | "call" | "child" | "event" | "reference" | "approval" | "turn" | "by" | "n" | "type" | "name">
     & { text: string | null; attachments: string[] }
   : never;
-type ProjectedTurn = Omit<Wire.WireTurn, "entries" | "configuration" | "uncertain_calls" | "outputs_truncated"> & {
+type ProjectedTurn = Omit<Wire.WireTurn, "entries" | "configuration" | "uncertain_calls"> & {
   entries: ProjectedEntry[];
   input: ReturnType<typeof jobInputRecord>;
 };
@@ -664,7 +664,7 @@ export function decodeConversationTurns(input: unknown, conversationId: string) 
     const userEntries = entries.filter(entry => entry.kind === "user_message" || entry.kind === "agent_message");
     const frozenInput = jobInputRecord({ id: job.input, objective: userEntries.map(entry => entry.text ?? "").join("\n"), submitted_at_us: job.created_at_us, attachments: userEntries.flatMap(entry => entry.attachments), configuration: turn.configuration }, `${path}.input`, job.id);
     const outputs = listOf(turn.outputs, `${path}.outputs`, output => outputRecord(output));
-    return { job, entries, input: frozenInput, outputs } satisfies ProjectedTurn;
+    return { job, entries, input: frozenInput, outputs, outputs_truncated: boolean(turn.outputs_truncated, `${path}.outputs_truncated`) } satisfies ProjectedTurn;
   });
   return { conversation: conversationId, turns, has_more: boolean(envelope.has_more, "has_more"), next_before: envelope.next_before === null ? null : identity(envelope.next_before, "next_before") } satisfies Omit<Wire.WireTurns, "turns"> & { turns: ProjectedTurn[] };
 }

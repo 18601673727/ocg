@@ -462,7 +462,7 @@ pub(super) async fn respond(
             limit,
         } => {
             let reply = catalog::conversation_turns(database, conversation, before, limit).await?;
-            dashboard::bounded(shared, reply.body)
+            catalog::bound_conversation_turns(shared, reply.body)
         }
         Route::ConversationNotices {
             conversation,

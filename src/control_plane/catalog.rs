@@ -481,6 +481,58 @@ pub(super) async fn conversation_turns(
         },
     })))
 }
+pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Result<Reply, Refusal> {
+    let mut has_more = body["has_more"].as_bool().ok_or(INCONSISTENT_RECORD)?;
+    let records = std::mem::take(
+        body.get_mut("turns")
+            .and_then(Value::as_array_mut)
+            .ok_or(INCONSISTENT_RECORD)?,
+    );
+    body["has_more"] = Value::Bool(false);
+    body["next_before"] = body["conversation"].clone();
+    let mut size = body.to_string().len();
+    let mut turns = Vec::new();
+    let mut next_before = Value::Null;
+    for mut turn in records {
+        let mut cost = turn.to_string().len() + 1;
+        if size + cost > shared.response_bytes {
+            if !turns.is_empty() {
+                has_more = true;
+                break;
+            }
+            let outputs = std::mem::take(
+                turn.get_mut("outputs")
+                    .and_then(Value::as_array_mut)
+                    .ok_or(INCONSISTENT_RECORD)?,
+            );
+            turn["outputs_truncated"] = Value::Bool(true);
+            cost = turn.to_string().len() + 1;
+            if size + cost > shared.response_bytes {
+                return Err(super::OUTPUT_TOO_LARGE);
+            }
+            let preview = turn
+                .get_mut("outputs")
+                .and_then(Value::as_array_mut)
+                .ok_or(INCONSISTENT_RECORD)?;
+            for output in outputs {
+                let output_cost = output.to_string().len() + 1;
+                if size + cost + output_cost > shared.response_bytes {
+                    break;
+                }
+                cost += output_cost;
+                preview.push(output);
+            }
+        }
+        size += cost;
+        next_before = turn["job"]["id"].clone();
+        turns.push(turn);
+    }
+    body["turns"] = Value::Array(turns);
+    body["has_more"] = Value::Bool(has_more);
+    body["next_before"] = if has_more { next_before } else { Value::Null };
+    dashboard::bounded(shared, body)
+}
+
 pub(super) async fn conversation_notices(
     database: &DatabaseHandle,
     conversation: JobId,
