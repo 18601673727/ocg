@@ -486,7 +486,7 @@ function JobWatchBody({
         <div className="flex justify-between gap-2">
           <dt>{t("job.fact.input")}</dt>
           <dd>
-            <code className="font-geist-mono">{job.input}</code>
+            <code className="font-mono">{job.input}</code>
           </dd>
         </div>
       ) : null}
@@ -494,7 +494,7 @@ function JobWatchBody({
         <div className="flex justify-between gap-2">
           <dt>{t("job.fact.previous")}</dt>
           <dd>
-            <code className="font-geist-mono">{job.previous}</code>
+            <code className="font-mono">{job.previous}</code>
           </dd>
         </div>
       ) : null}
@@ -534,7 +534,7 @@ function JobWatchBody({
               className="flex flex-col gap-1.5 rounded-md border border-border p-3"
             >
               <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <code className="font-geist-mono">#{output.seq}</code>
+                <code className="font-mono">#{output.seq}</code>
                 <span className="rounded-full bg-muted px-2 py-0.5 font-semibold tracking-widest uppercase">
                   {output.kind}
                 </span>
@@ -545,12 +545,12 @@ function JobWatchBody({
               </div>
               {output.summary ? <p className="text-sm">{output.summary}</p> : null}
               {output.code ? (
-                <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-geist-mono text-xs">
+                <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
                   {output.code}
                 </pre>
               ) : null}
               {output.value === null || output.value === undefined ? null : (
-                <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-geist-mono text-xs">
+                <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
                   {JSON.stringify(output.value, null, 2)}
                 </pre>
               )}
@@ -579,7 +579,7 @@ function JobWatchBody({
         <div className="flex flex-col gap-1">
           <h2 className="font-heading text-lg">{job?.name ?? jobId}</h2>
           <p className="text-xs text-muted-foreground">
-            <code className="font-geist-mono">{jobId}</code>
+            <code className="font-mono">{jobId}</code>
             {job ? ` · ${job.execution_mode}` : ""}
             {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
           </p>

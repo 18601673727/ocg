@@ -199,7 +199,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
             aria-current={node.id === selected ? "true" : undefined}
             className="flex min-w-0 flex-1 flex-wrap items-center gap-2 rounded px-1 text-left hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
           >
-            <code className="font-geist-mono text-xs">{node.id}</code>
+            <code className="font-mono text-xs">{node.id}</code>
             <span className="break-words">{node.title || t("jobs.unnamed")}</span>
           </button>
           <span className={cn("rounded-full px-2 py-0.5 text-xs font-semibold tracking-widest uppercase", TONE_CLASS[STATE_TONE[node.state]])}>
@@ -246,7 +246,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
                 onClick={() => onSelect(dependency.job)}
                 className="flex items-center gap-1 rounded px-1 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
               >
-                <code className="font-geist-mono">{dependency.job}</code>
+                <code className="font-mono">{dependency.job}</code>
                 <span className={cn("rounded-full px-2 py-0.5 font-semibold tracking-widest uppercase", TONE_CLASS[DEPENDENCY_TONE[dependency.state]])}>
                   {t(`jobs.tree.dependency.${dependency.state}`)}
                 </span>
@@ -262,7 +262,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
               onClick={() => onSelect(activeTurn)}
               className="rounded px-1 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
             >
-              <code className="font-geist-mono">{activeTurn}</code>
+              <code className="font-mono">{activeTurn}</code>
             </button>
           </div>
         ) : null}
@@ -307,7 +307,7 @@ export function JobTree({ client, root, selected, onSelect, onReroot, onOpenChat
                 onClick={() => onReroot(ancestor)}
                 className="rounded px-1 hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
               >
-                <code className="font-geist-mono">{ancestor}</code>
+                <code className="font-mono">{ancestor}</code>
               </button>
             ))}
           </nav>
