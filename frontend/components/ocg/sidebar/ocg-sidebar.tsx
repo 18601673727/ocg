@@ -2,6 +2,7 @@
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useRef, useState } from "react";
+import Link from "next/link";
 import {
   ChevronsLeft,
   ChevronDown,
@@ -57,6 +58,7 @@ type OcgSidebarProps = {
   activeAncestors?: string[];
   onOpenConversation?: (conversation: string) => void;
   onNewChat: () => void;
+  onHome?: () => void;
   onRename?: (id: string, title: string) => Promise<void>;
   onHide?: (id: string) => Promise<void>;
   runtimeStatus: RuntimeStatus;
@@ -122,6 +124,7 @@ export function OcgSidebar({
   activeAncestors,
   onOpenConversation,
   onNewChat,
+  onHome,
   onRename,
   onHide,
   runtimeAuthority,
@@ -271,7 +274,9 @@ export function OcgSidebar({
     return (
       <TooltipProvider delay={100}>
         <div className="flex h-full w-full flex-col items-center gap-1 px-2 py-3">
-          <OcgLogo compact className="mb-2" />
+          <Link href="/" prefetch={false} onNavigate={onHome ? event => { event.preventDefault(); onHome(); } : undefined} aria-label={t("nav.home")} className="mb-2 rounded-sm focus-visible:outline-2 focus-visible:outline-ring">
+            <OcgLogo compact />
+          </Link>
           <RailButton label={t("sidebar.expand")} onClick={onToggle}>
             <ChevronsLeft className="size-4 rotate-180" />
           </RailButton>
@@ -360,7 +365,9 @@ export function OcgSidebar({
     <TooltipProvider delay={100}>
       <div className="flex h-full w-full flex-col">
         <div className="flex items-center gap-2 px-3 pt-3 pb-2">
-          <OcgLogo className="min-w-0 flex-1" />
+          <Link href="/" prefetch={false} onNavigate={onHome ? event => { event.preventDefault(); onHome(); } : undefined} aria-label={t("nav.home")} className="min-w-0 flex-1 rounded-sm focus-visible:outline-2 focus-visible:outline-ring">
+            <OcgLogo />
+          </Link>
           <ConversationSearch
             sessions={sessions}
             activeSessionId={activeSessionId}

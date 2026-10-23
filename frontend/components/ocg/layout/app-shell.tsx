@@ -181,6 +181,7 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
     activeSessionId={sessionId} collapsed={collapsed} onToggle={() => setCollapsed(value => !value)}
     onSelect={id => { const selected = runtime.snapshot.sessions.find(session => session.id === id); setSessionId(id); go("chat", selected?.sessionId ?? null); }}
     onNewChat={() => void newChat()}
+    onHome={() => { setSessionId(""); setInspectorOpen(false); go("chat"); }}
     onRename={runtime.client.renameSession ? (id, title) => runtime.client.renameSession!(id, title) : undefined}
     onHide={runtime.client.hideSession ? async (id) => {
       await runtime.client.hideSession!(id);
