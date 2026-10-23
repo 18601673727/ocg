@@ -82,12 +82,24 @@ async fn exchange(
     )?;
     let head_timeout = config.first_delta_timeout.unwrap_or(config.timeout);
     let client = provider_client(head_timeout).await?;
+    let session = endpoint
+        .parse::<ntex::http::Uri>()
+        .ok()
+        .filter(|uri| {
+            uri.host()
+                .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
+        })
+        .and(config.session_id)
+        .map(|id| format!("ocg-{}", id.get()));
 
     let request = client
         .post(endpoint)
         .set_header(CONTENT_TYPE, "application/json")
         .set_header(ACCEPT, "text/event-stream")
         .set_header("Cache-Control", "no-cache")
+        .if_some(session, |session, request| {
+            request.set_header("x-opencode-session", session)
+        })
         .if_some(authorization, |authorization, request| {
             request.set_header(AUTHORIZATION, authorization)
         });
@@ -221,6 +233,7 @@ pub(super) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExe
 
 pub(super) async fn provider_client(timeout: Duration) -> Result<Client, ProviderExecutionError> {
     Client::builder()
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
         .connector::<()>(proxy::connector()?)
         .disable_redirects()
         .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))

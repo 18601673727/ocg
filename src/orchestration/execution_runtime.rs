@@ -3184,6 +3184,7 @@ async fn run_started_provider_job(
     }
     let frozen = &configuration.frozen;
     let resolver = plan.credential_resolver.as_ref();
+    plan.provider_config.session_id = Some(job_record.conversation.unwrap_or(job));
     let config = &plan.provider_config;
     run_provider_job_inner(
         ProviderRun {

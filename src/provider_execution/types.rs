@@ -97,6 +97,7 @@ impl CredentialResolver for EnvironmentCredentialResolver {
 
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionConfig {
+    pub session_id: Option<crate::persistence::JobId>,
     pub timeout: Duration,
     pub first_delta_timeout: Option<Duration>,
     pub max_output_bytes: usize,
@@ -121,6 +122,7 @@ impl ProviderExecutionConfig {
 impl Default for ProviderExecutionConfig {
     fn default() -> Self {
         Self {
+            session_id: None,
             timeout: DEFAULT_TIMEOUT,
             first_delta_timeout: None,
             max_output_bytes: MAX_OUTPUT_BYTES,
