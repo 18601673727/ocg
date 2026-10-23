@@ -2,6 +2,7 @@
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { Check, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -23,6 +24,7 @@ import type {
 } from "@/components/ocg/runtime/control-client";
 import { Section, describeError, refusalText } from "./settings-parts";
 import { useI18n, type I18nKey } from "../i18n";
+import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { nextCommandDraftId, toCommandDrafts, toProjectCommands, type CommandDraft } from "./command-drafts";
 
 const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
@@ -58,6 +60,32 @@ function hasCommandPreset(commands: readonly CommandDraft[], preset: ControlProj
 
 function isEmptyCommand(command: CommandDraft): boolean {
   return command.name.trim().length === 0 && command.argvText.trim().length === 0;
+}
+
+/** Copies a Project's root path verbatim and reports the outcome inline. */
+function CopyRootButton({ project }: { project: ControlProject }) {
+  const { t } = useI18n();
+  const { isCopied, isCopyFailed, copyToClipboard } = useCopyToClipboard();
+
+  const label = isCopied
+    ? t("common.copied")
+    : isCopyFailed
+      ? t("common.copyFailed")
+      : t("common.copy");
+
+  return (
+    <Button
+      type="button"
+      variant="ghost"
+      size="xs"
+      className="shrink-0 px-1.5 tracking-normal normal-case"
+      aria-label={t("settings.projects.copyRootFor", { name: project.name })}
+      onClick={() => copyToClipboard(project.root)}
+    >
+      {isCopied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+      <span role="status">{label}</span>
+    </Button>
+  );
 }
 
 export function ProjectsSection({ client }: { client: HttpCanonicalControlClient }) {
@@ -239,7 +267,10 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
                 {project.description ? (
                   <p className="text-xs text-muted-foreground">{project.description}</p>
                 ) : null}
-                <p className="font-mono text-xs text-muted-foreground">{project.root}</p>
+                <div className="flex min-w-0 flex-wrap items-center gap-1">
+                  <p className="min-w-0 font-mono text-xs break-all text-muted-foreground">{project.root}</p>
+                  <CopyRootButton project={project} />
+                </div>
                 {project.commands.length > 0 ? (
                   <div className="flex flex-col gap-0.5 pt-1 text-xs text-muted-foreground">
                     {project.commands.map((cmd) => (
