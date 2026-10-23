@@ -22,7 +22,7 @@ export function ReasoningTrigger({ active = false, duration, tokens = 0, childre
   const { t, locale } = useI18n();
   const seconds = duration === undefined ? "—" : new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(duration);
   const count = new Intl.NumberFormat(locale).format(tokens);
-  return <CollapsibleTrigger title={!active ? t("chat.thinkingEstimateHint") : undefined} className="group/reasoning flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-muted-foreground"><ChevronDown className={cn("size-3.5 shrink-0 -rotate-90 transition-transform duration-[180ms] group-aria-expanded/reasoning:rotate-0 motion-reduce:transition-none", active && "animate-pulse")} aria-hidden="true" />{children ?? (active ? t("chat.thinking") : t("chat.thoughtFor", { seconds, tokens: `≈${count}` }))}</CollapsibleTrigger>;
+  return <CollapsibleTrigger title={!active ? t("chat.thinkingEstimateHint") : undefined} className="group/reasoning flex w-full items-center gap-2 px-3 py-2 text-left text-xs font-medium text-muted-foreground"><ChevronDown className="size-3.5 shrink-0 transition-transform duration-[180ms] group-aria-expanded/reasoning:rotate-180 motion-reduce:transition-none" aria-hidden="true" />{children ?? (active ? t("chat.thinking") : t("chat.thoughtFor", { seconds, tokens: `≈${count}` }))}</CollapsibleTrigger>;
 }
 
 export function ReasoningContent({ children, streaming = false, ...props }: ComponentProps<typeof CollapsibleContent> & { streaming?: boolean }) {

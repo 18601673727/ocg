@@ -1944,7 +1944,7 @@ export const zh: Dictionary = {
   "chat.activityProviderFailed": "Provider 响应失败",
   "chat.expandMessage": "展开",
   "chat.collapseMessage": "收起",
-  "chat.thinking": "思考过程",
+  "chat.thinking": "思考中",
   "chat.thoughtFor": "已思考 {seconds} 秒，Token {tokens}",
   "chat.thinkingEstimateHint": "Token 数根据可见思考文本估算；时长根据已记录的思考输出时间计算。",
   "chat.toggleThinking": "切换思考内容显示",

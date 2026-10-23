@@ -759,7 +759,7 @@ const AssistantMessage: FC = () => {
                     </div>
                   );
                 case "indicator":
-                  return (
+                  return intermediate ? null : (
                     <span
                       data-slot="aui_assistant-message-indicator"
                       className="animate-pulse font-sans"
