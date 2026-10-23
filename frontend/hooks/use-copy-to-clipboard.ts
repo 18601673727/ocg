@@ -10,6 +10,7 @@ export const useCopyToClipboard = ({
   copiedDuration = 3000,
 }: UseCopyToClipboardOptions = {}) => {
   const [isCopied, setIsCopied] = useState<boolean>(false);
+  const [isCopyFailed, setIsCopyFailed] = useState<boolean>(false);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
@@ -23,32 +24,47 @@ export const useCopyToClipboard = ({
       clearTimeout(copiedTimerRef.current);
       copiedTimerRef.current = undefined;
       setIsCopied(false);
+      setIsCopyFailed(false);
     },
     [],
   );
 
+  // One timer for both outcomes: a retry replaces the previous feedback.
+  const settle = (succeeded: boolean) => {
+    if (copiedTimerRef.current !== undefined) {
+      clearTimeout(copiedTimerRef.current);
+    }
+    setIsCopied(succeeded);
+    setIsCopyFailed(!succeeded);
+    copiedTimerRef.current = setTimeout(() => {
+      copiedTimerRef.current = undefined;
+      setIsCopied(false);
+      setIsCopyFailed(false);
+    }, copiedDuration);
+  };
+
   const copyToClipboard = (value: string) => {
-    if (!value || typeof navigator === "undefined" || !navigator.clipboard) {
+    if (!value) return;
+
+    const scopeGeneration = scopeGenerationRef.current;
+    if (typeof navigator === "undefined" || !navigator.clipboard) {
+      settle(false);
       return;
     }
 
-    const scopeGeneration = scopeGenerationRef.current;
     navigator.clipboard.writeText(value).then(
       () => {
         if (scopeGeneration !== scopeGenerationRef.current) return;
 
-        if (copiedTimerRef.current !== undefined) {
-          clearTimeout(copiedTimerRef.current);
-        }
-        setIsCopied(true);
-        copiedTimerRef.current = setTimeout(() => {
-          copiedTimerRef.current = undefined;
-          setIsCopied(false);
-        }, copiedDuration);
+        settle(true);
       },
-      () => {},
+      () => {
+        if (scopeGeneration !== scopeGenerationRef.current) return;
+
+        settle(false);
+      },
     );
   };
 
-  return { isCopied, copyToClipboard };
+  return { isCopied, isCopyFailed, copyToClipboard };
 };
