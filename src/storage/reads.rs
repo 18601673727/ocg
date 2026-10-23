@@ -1206,14 +1206,13 @@ pub(crate) fn read_configs(
     Ok(records)
 }
 
-/// One bounded page of Profiles: the active Model and Agent configs before
-/// `before`, the Connections those Models name, and the Pools compatible with
-/// them. `next_before` is the last config examined, so a page that finds no
-/// Profile still advances past the configs it read.
+/// One bounded page of active Model, Agent and Pool configs before `before`,
+/// plus point reads of the Connections those Models name. Pool protocol offers
+/// travel in the same catalog scan; compatibility is joined after paging.
+/// `next_before` advances even when no visible config is found.
 pub(crate) struct ProfilePageRecords {
     pub records: Vec<ConfigRecord>,
     pub connections: BTreeMap<ConfigId, ConnectionConfig>,
-    pub compatible: BTreeMap<ProfileId, Vec<ExecutorId>>,
     pub next_before: Option<ConfigId>,
 }
 
@@ -1240,8 +1239,10 @@ pub(crate) fn read_profile_page(
         let id = key.value();
         let row = ConfigRow::decode_at(id, bytes.value())?;
         last = Some(ConfigId::new(id));
-        if matches!(row.body, ConfigBody::Model(_) | ConfigBody::Agent(_))
-            && row.archived_at.is_none()
+        if matches!(
+            row.body,
+            ConfigBody::Model(_) | ConfigBody::Agent(_) | ConfigBody::Pool(_)
+        ) && row.archived_at.is_none()
         {
             records.push(config_record(row));
         }
@@ -1259,7 +1260,6 @@ pub(crate) fn read_profile_page(
     let next_before = more.then_some(last).flatten();
 
     let mut connections = BTreeMap::new();
-    let mut protocols = BTreeSet::new();
     for record in &records {
         let ConfigBody::Model(model) = &record.body else {
             continue;
@@ -1272,29 +1272,12 @@ pub(crate) fn read_profile_page(
         };
         let row = ConfigRow::decode_at(model.connection_id.get(), bytes.value())?;
         if let ConfigBody::Connection(connection) = row.body {
-            protocols.insert(connection.protocol);
             connections.insert(model.connection_id, connection);
         }
-    }
-    let mut pools = BTreeMap::new();
-    for protocol in protocols {
-        pools.insert(protocol, pools_offering(&rx, protocol)?);
-    }
-    let mut compatible = BTreeMap::new();
-    for record in &records {
-        let ConfigBody::Model(model) = &record.body else {
-            continue;
-        };
-        let executors = connections
-            .get(&model.connection_id)
-            .and_then(|connection| pools.get(&connection.protocol).cloned())
-            .unwrap_or_default();
-        compatible.insert(ProfileId::from(record.id), executors);
     }
     Ok(ProfilePageRecords {
         records,
         connections,
-        compatible,
         next_before,
     })
 }

@@ -543,7 +543,7 @@ pub(crate) fn read_observed_models(
                 // Continue the pair with the flags already seen in it.
                 flags = (cursor.has_metrics, cursor.has_availability_stats);
                 (
-                    Some((provider, hash, cursor.model.clone())),
+                    Some((provider, hash, cursor.model.clone(), key)),
                     Some(Bound::Excluded(key)),
                     Bound::Excluded(key),
                 )
@@ -557,7 +557,8 @@ pub(crate) fn read_observed_models(
     };
 
     loop {
-        let (provider, hash, model) = match current.take() {
+        let resumed = current.is_some();
+        let (provider, hash, model, discovered) = match current.take() {
             Some(current) => current,
             None => {
                 let mut range = table.range((bound, Bound::Included(high)))?;
@@ -569,10 +570,9 @@ pub(crate) fn read_observed_models(
                     break;
                 }
                 let (provider, hash) = (key.0, key.1);
-                let Some(target) = frozen_llm_target(&rx, JobId::new(key.3))? else {
-                    bound = Bound::Excluded(group_end(provider, hash));
-                    continue;
-                };
+                let target = frozen_llm_target(&rx, JobId::new(key.3))?.ok_or_else(|| {
+                    StorageError::corrupted("observed request has no frozen model")
+                })?;
                 flags = (false, false);
                 (
                     provider,
@@ -581,6 +581,7 @@ pub(crate) fn read_observed_models(
                         provider: LlmProviderId::new(provider),
                         model: target.frozen.config.model,
                     },
+                    key,
                 )
             }
         };
@@ -588,7 +589,7 @@ pub(crate) fn read_observed_models(
             .take()
             .unwrap_or(Bound::Included((provider, hash, from, 0, 0, 0)));
         let mut last = None;
-        let mut saw_event = false;
+        let mut saw_event = resumed;
         let mut complete = true;
         for entry in table.range((low, Bound::Included(group_high(provider, hash))))? {
             if examined >= scan_limit {
@@ -623,6 +624,13 @@ pub(crate) fn read_observed_models(
         }
         bound = Bound::Excluded(group_end(provider, hash));
         if !saw_event {
+            examined += 1;
+            if examined >= scan_limit {
+                return Ok(ObservedModelPage {
+                    choices,
+                    next: Some(observed_cursor(model, flags, true, discovered)),
+                });
+            }
             continue;
         }
         choices.push(ObservedModelChoice {

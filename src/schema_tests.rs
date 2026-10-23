@@ -18452,9 +18452,13 @@ fn observed_models_enumerate_more_than_two_thousand_pairs_without_omission() {
         .collect();
     let mut seen_filtered = BTreeSet::new();
     let mut after = None;
+    let mut empty_windows = 0;
     loop {
         let page = wait(handle.observed_models_scanned(filtered, after.clone(), 5, 7))
             .expect("filtered observed models page");
+        if page.choices.is_empty() && page.next.is_some() {
+            empty_windows += 1;
+        }
         for choice in page.choices {
             assert!(seen_filtered.insert(choice.model));
         }
@@ -18464,6 +18468,10 @@ fn observed_models_enumerate_more_than_two_thousand_pairs_without_omission() {
         }
     }
     assert_eq!(seen_filtered, expected_filtered);
+    assert!(
+        empty_windows >= 1_001 / 7,
+        "out-of-range pairs bypassed the scan budget"
+    );
     worker.shutdown().expect("shutdown");
 }
 

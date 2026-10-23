@@ -4378,5 +4378,32 @@ pub(crate) mod tests {
                 other => panic!("a credential-free rejection, got {other:?}"),
             }
         }
+
+        #[test]
+        fn alternative_json_escapes_are_removed_from_retained_bodies() {
+            let secret = "sk-synthetic/a";
+            for spelling in [r"sk-synthetic\/a", r"\u0073k-synthetic/a"] {
+                let body = format!(
+                    r#"{{"error":{{"message":"denied {spelling}","nested":["{spelling}"]}}}}"#
+                );
+                let error = failed(
+                    response(
+                        "400 Bad Request",
+                        &[("content-type", "application/json")],
+                        &body,
+                    ),
+                    Some(secret),
+                );
+                let ProviderExecutionError::Rejected { failure } = error else {
+                    panic!("expected rejection");
+                };
+                let retained: Value =
+                    serde_json::from_str(failure.response_body.as_deref().expect("body"))
+                        .expect("valid redacted JSON");
+                assert!(!retained.to_string().contains(secret));
+                assert_eq!(retained["error"]["nested"][0], "[redacted]");
+                assert_eq!(failure.message, "denied [redacted]");
+            }
+        }
     }
 }

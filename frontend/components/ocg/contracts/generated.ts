@@ -88,7 +88,7 @@ export type WireAgentProfile = { id: string, name: string, tool_grant: string | 
 
 export type WireAgentProfiles = { agent_profiles: Array<WireAgentProfile>, has_more: boolean, next_before: string | null, };
 
-export type WireLlmProfile = { id: string, name: string, model: string, context_window: number | null, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, parameters: WireLlmParameters, executors: Array<string>, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
+export type WireLlmProfile = { id: string, name: string, model: string, context_window: number | null, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, parameters: WireLlmParameters, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
 
 export type WireManagedAgent = { id: string, name: string, instructions: string | null, tool_grant: string | null, approve: Array<string>, dispatch_to: Array<string>, default_model: string | null, behavior: string, llm_targets: Array<string>, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
 
@@ -96,10 +96,17 @@ export type WireProvider = { protocol: string, endpoint: string | null, credenti
 
 export type WireProfiles = { llm_profiles: Array<WireLlmProfile>, agent_profiles: Array<WireManagedAgent>,
 /**
+ * Enabled executor capabilities on this page. Collect all pages
+ * and join these with each Model's protocol for compatibility.
+ */
+executor_protocols: Array<WireProfileExecutor>,
+/**
  * Provider groups for the LLM Profiles on this page, not for the
  * whole catalog; follow `next_before` to collect the rest.
  */
 providers: Array<WireProvider>, has_more: boolean, next_before: string | null, profile_id?: string, };
+
+export type WireProfileExecutor = { id: string, protocol: string, };
 
 export type WireProjectCommand = { name: string, argv: Array<string>, };
 

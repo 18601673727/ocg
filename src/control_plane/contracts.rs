@@ -393,7 +393,6 @@ contracts! {
         pub has_credential: bool,
         pub declared_capabilities: Vec<String>,
         pub parameters: WireLlmParameters,
-        pub executors: Vec<String>,
         pub editable: bool,
         pub blocking_jobs: Vec<String>,
         pub more_blocking_jobs: bool,
@@ -427,6 +426,9 @@ contracts! {
     struct WireProfiles {
         pub llm_profiles: Vec<WireLlmProfile>,
         pub agent_profiles: Vec<WireManagedAgent>,
+        /// Enabled executor capabilities on this page. Collect all pages
+        /// and join these with each Model's protocol for compatibility.
+        pub executor_protocols: Vec<WireProfileExecutor>,
         /// Provider groups for the LLM Profiles on this page, not for the
         /// whole catalog; follow `next_before` to collect the rest.
         pub providers: Vec<WireProvider>,
@@ -435,6 +437,10 @@ contracts! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub profile_id: Option<String>,
+    }
+    struct WireProfileExecutor {
+        pub id: String,
+        pub protocol: String,
     }
     struct WireProjectCommand {
         pub name: String,

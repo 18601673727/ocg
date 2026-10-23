@@ -850,8 +850,9 @@ function optionalInteger(value: unknown, path: string): number | null {
  * `POST /api/v1/profiles`, and `POST /api/v1/profiles/{profile}`, including
  * LLM Profiles, Agent Profiles, and the Provider projection of the LLM
  * Profiles on that page. Follow `next_before` until `has_more` is false for
- * the whole catalog; a mutation response names the saved Profile in
- * `profile_id` and returns the first page.
+ * the whole catalog, including `executor_protocols`. The client joins Model
+ * compatibility after collecting every page. A mutation response names the
+ * saved Profile in `profile_id` and returns the first page.
  */
 export function decodeProfiles(input: unknown) {
   const envelope = record(input, "response");
@@ -893,15 +894,14 @@ export function decodeProfiles(input: unknown) {
           presence_penalty: optionalFiniteNumber(params.presence_penalty, `${path}.parameters.presence_penalty`),
           frequency_penalty: optionalFiniteNumber(params.frequency_penalty, `${path}.parameters.frequency_penalty`),
         },
-        executors: listOf(llm.executors, `${path}.executors`,
-          (executor, executorPath) => identity(executor, executorPath)),
+        executors: [] as string[],
         editable: boolean(llm.editable, `${path}.editable`),
         blocking_jobs: listOf(llm.blocking_jobs, `${path}.blocking_jobs`,
           (job, jobPath) => identity(job, jobPath)),
         more_blocking_jobs: boolean(llm.more_blocking_jobs, `${path}.more_blocking_jobs`),
         created_at_us: integer(llm.created_at_us, `${path}.created_at_us`),
         updated_at_us: integer(llm.updated_at_us, `${path}.updated_at_us`),
-      } satisfies Wire.WireLlmProfile;
+      } satisfies Wire.WireLlmProfile & { executors: string[] };
     }),
     agent_profiles: listOf(envelope.agent_profiles, "agent_profiles", (entry, path) => {
       const agent = record(entry, path);
@@ -928,6 +928,14 @@ export function decodeProfiles(input: unknown) {
         created_at_us: integer(agent.created_at_us, `${path}.created_at_us`),
         updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`),
       } satisfies ProjectedManagedAgent;
+    }),
+    executor_protocols: listOf(envelope.executor_protocols, "executor_protocols", (entry, path) => {
+      const executor = record(entry, path);
+      const protocol = string(executor.protocol, `${path}.protocol`);
+      if (protocol !== "openai_chat_completions") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      }
+      return { id: identity(executor.id, `${path}.id`), protocol } satisfies Wire.WireProfileExecutor;
     }),
     providers: listOf(envelope.providers, "providers", (entry, path) => {
       const provider = record(entry, path);

@@ -1247,14 +1247,17 @@ pub(super) async fn action(
     }
     .map_err(action_error)?;
     for running in &result.running {
-        shared.scheduler.stop(
-            *running,
-            if action == "close" {
-                StopCause::Closed
-            } else {
-                StopCause::Stopped(result.record_seq.ok_or(INTERNAL)?)
-            },
-        );
+        shared
+            .scheduler
+            .stop(
+                *running,
+                if action == "close" {
+                    StopCause::Closed
+                } else {
+                    StopCause::Stopped(result.record_seq.ok_or(INTERNAL)?)
+                },
+            )
+            .await;
     }
     if result.already {
         let settled = shared

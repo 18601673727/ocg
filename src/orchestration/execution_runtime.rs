@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -455,8 +456,7 @@ enum SchedulerMessage {
     Schedule(Box<Submission>),
     Claim(flume::Sender<Result<super::scheduler::DispatchBatch<JobId>, DatabaseError>>),
     Grant(JobId),
-    Stop(JobId),
-    Finished(JobId),
+    Stop(JobId, Option<crate::persistence::StopCause>),
     Reconcile,
 }
 
@@ -1097,56 +1097,17 @@ fn lock(state: &SharedState) -> std::sync::MutexGuard<'_, RuntimeState> {
 /// How many lifecycle notifications may wait in the dispatch queue.
 const SCHEDULER_NOTIFICATIONS: usize = 64;
 
-/// A grant, stop or completion, in the order the dispatcher applies them
-/// when they are coalesced.
-#[derive(Clone, Copy)]
-enum JobSignal {
-    Grant,
-    Stop,
-    Finished,
-}
-
-#[derive(Clone, Copy, Default)]
-struct JobSignals {
-    grant: bool,
-    stop: bool,
-    finished: bool,
-}
-
-impl JobSignals {
-    fn of(signal: JobSignal) -> Self {
-        let mut signals = Self::default();
-        signals.add(signal);
-        signals
-    }
-
-    fn add(&mut self, signal: JobSignal) {
-        match signal {
-            JobSignal::Grant => self.grant = true,
-            JobSignal::Stop => self.stop = true,
-            JobSignal::Finished => self.finished = true,
-        }
-    }
-}
-
-/// The bounded path to the dispatcher. A producer that finds the queue full
-/// coalesces its signal into one entry per Job and wakes the dispatcher, so
-/// no worker thread waits for capacity and no lifecycle fact is lost. The
-/// backlog holds at most one entry per Job the runtime is tracking.
+/// Lifecycle requests wait for bounded channel capacity. Completions keep a
+/// flag on their already admitted execution and share a single wake pulse.
 #[derive(Clone)]
 pub(crate) struct SchedulerNotifications {
     messages: flume::Sender<SchedulerMessage>,
     wake: flume::Sender<()>,
-    backlog: Arc<Mutex<BTreeMap<JobId, JobSignals>>>,
 }
 
 impl SchedulerNotifications {
     fn new(messages: flume::Sender<SchedulerMessage>, wake: flume::Sender<()>) -> Self {
-        Self {
-            messages,
-            wake,
-            backlog: Arc::new(Mutex::new(BTreeMap::new())),
-        }
+        Self { messages, wake }
     }
 
     #[cfg(test)]
@@ -1156,55 +1117,11 @@ impl SchedulerNotifications {
         (Self::new(messages, wake), receiver)
     }
 
-    /// Sends a lifecycle signal without waiting. While a Job has a backlog
-    /// entry every further signal for it stays there too, so the dispatcher
-    /// applies that Job's signals in one place and in order.
-    fn notify(&self, job: JobId, signal: JobSignal) {
-        let mut backlog = self.backlog.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(signals) = backlog.get_mut(&job) {
-            signals.add(signal);
-            drop(backlog);
-            self.wake();
-            return;
-        }
-        let message = match signal {
-            JobSignal::Grant => SchedulerMessage::Grant(job),
-            JobSignal::Stop => SchedulerMessage::Stop(job),
-            JobSignal::Finished => SchedulerMessage::Finished(job),
-        };
-        match self.messages.try_send(message) {
-            Ok(()) | Err(flume::TrySendError::Disconnected(_)) => {}
-            Err(flume::TrySendError::Full(_)) => {
-                backlog.insert(job, JobSignals::of(signal));
-                drop(backlog);
-                self.wake();
-            }
-        }
-    }
-
-    /// Sends from an async producer, which may wait for capacity because the
-    /// dispatcher is the only consumer.
     async fn send(
         &self,
         message: SchedulerMessage,
     ) -> Result<(), flume::SendError<SchedulerMessage>> {
         self.messages.send_async(message).await
-    }
-
-    fn wake(&self) {
-        self.wake.try_send(()).ok();
-    }
-
-    fn has_backlog(&self) -> bool {
-        !self
-            .backlog
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
-    }
-
-    fn take_backlog(&self) -> BTreeMap<JobId, JobSignals> {
-        std::mem::take(&mut *self.backlog.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -1222,15 +1139,28 @@ pub(crate) struct StopHandle {
     state: SharedState,
 }
 impl StopHandle {
-    pub fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
-        let mut state = lock(&self.state);
-        let stopped = state.stops.entry(turn).or_default();
-        *stopped.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause);
-        if let Some(cancellation) = state.current.get(&turn) {
-            cancellation.cancel();
+    pub async fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
+        {
+            let mut state = lock(&self.state);
+            if state.current.contains_key(&turn) || state.stops.contains_key(&turn) {
+                *state
+                    .stops
+                    .entry(turn)
+                    .or_default()
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(cause);
+            }
+            if let Some(cancellation) = state.current.get(&turn) {
+                cancellation.cancel();
+            }
+            if state.closed {
+                return;
+            }
         }
-        drop(state);
-        self.notifications.notify(turn, JobSignal::Stop);
+        self.notifications
+            .send(SchedulerMessage::Stop(turn, Some(cause)))
+            .await
+            .ok();
     }
 }
 
@@ -1239,12 +1169,13 @@ impl SchedulerHandle {
     pub(crate) fn running_count(&self) -> usize {
         lock(&self.state).current.len()
     }
-    pub fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
+    pub async fn stop(&self, turn: JobId, cause: crate::persistence::StopCause) {
         StopHandle {
             notifications: self.notifications.clone(),
             state: self.state.clone(),
         }
-        .stop(turn, cause);
+        .stop(turn, cause)
+        .await;
     }
 
     /// Creates a pending Job through T1 and returns after that commit. Its
@@ -1581,7 +1512,10 @@ async fn dispatch_runtime(
                         }
                     },
                     |job| {
-                        sender.notify(job, JobSignal::Grant);
+                        let sender = sender.clone();
+                        async move {
+                            sender.send(SchedulerMessage::Grant(job)).await.ok();
+                        }
                     },
                 )
                 .await;
@@ -1597,10 +1531,14 @@ async fn dispatch_runtime(
         Closed,
     }
     loop {
-        // Coalesced signals wait until the queue itself is empty, so a Job's
-        // queued signals are always applied before its backlogged ones.
-        if receiver.is_empty() && sender.has_backlog() {
-            drain_notifications(&database, &mut pending, &mut running, &state, &sender).await;
+        let finished: Vec<_> = running
+            .iter()
+            .filter_map(|(job, task): (&JobId, &RunningExecution)| {
+                task.finished.load(Ordering::Acquire).then_some(*job)
+            })
+            .collect();
+        for job in finished {
+            finish_job(&database, job, &mut running, &state).await;
         }
         let incoming = async {
             if Instant::now() >= reconcile_at {
@@ -1632,10 +1570,6 @@ async fn dispatch_runtime(
         let message = match select(shutdown.cancelled(), incoming).await {
             Either::Left(()) | Either::Right(Incoming::Closed) => break,
             Either::Right(Incoming::Wake) => {
-                if receiver.is_empty() {
-                    drain_notifications(&database, &mut pending, &mut running, &state, &sender)
-                        .await;
-                }
                 continue;
             }
             Either::Right(Incoming::Message(message)) => message,
@@ -1729,7 +1663,7 @@ async fn dispatch_runtime(
                             if let Either::Left(()) =
                                 select(cancellation.cancelled(), done.cancelled()).await
                             {
-                                sender.notify(job, JobSignal::Stop);
+                                sender.send(SchedulerMessage::Stop(job, None)).await.ok();
                             }
                         }
                     });
@@ -1846,6 +1780,12 @@ async fn dispatch_runtime(
                 };
                 let batch = match claimed {
                     Ok(grants) => {
+                        {
+                            let mut state = lock(&state);
+                            for job in &grants {
+                                state.stops.entry(*job).or_default();
+                            }
+                        }
                         let next_due = match database.next_scheduled_delay().await {
                             Ok(due) => due,
                             Err(error) => {
@@ -1869,11 +1809,13 @@ async fn dispatch_runtime(
                     &mut running,
                 );
             }
-            SchedulerMessage::Stop(job) => {
+            SchedulerMessage::Stop(job, cause) => {
+                if let Some(cause) = cause
+                    && let Some(stopped) = lock(&state).stops.get(&job)
+                {
+                    *stopped.lock().unwrap_or_else(PoisonError::into_inner) = Some(cause);
+                }
                 stop_job(&database, job, &mut pending, &state).await;
-            }
-            SchedulerMessage::Finished(job) => {
-                finish_job(&database, job, &mut running, &state).await;
             }
         }
     }
@@ -1895,15 +1837,32 @@ async fn dispatch_runtime(
                 &state,
                 &mut running,
             ),
-            SchedulerMessage::Stop(_)
-            | SchedulerMessage::Finished(_)
-            | SchedulerMessage::Reconcile => {}
+            SchedulerMessage::Stop(..) | SchedulerMessage::Reconcile => {}
         }
     }
-    drain_grants(&database, &mut pending, &mut running, &state, &sender);
-    dispatcher
-        .await
-        .map_err(|_| ExecutionRuntimeError::WorkerPanicked)?;
+    let mut dispatcher = std::pin::pin!(dispatcher);
+    loop {
+        match select(dispatcher.as_mut(), receiver.recv_async()).await {
+            Either::Left(result) => {
+                result.map_err(|_| ExecutionRuntimeError::WorkerPanicked)?;
+                break;
+            }
+            Either::Right(Ok(SchedulerMessage::Grant(job))) => spawn_grant(
+                job,
+                pending.remove(&job),
+                &database,
+                &sender,
+                &state,
+                &mut running,
+            ),
+            Either::Right(Ok(SchedulerMessage::Claim(reply))) => {
+                reply.send(Err(DatabaseError::ShuttingDown)).ok();
+            }
+            Either::Right(Ok(SchedulerMessage::Schedule(submission))) => submission.refuse(),
+            Either::Right(Ok(SchedulerMessage::Stop(..) | SchedulerMessage::Reconcile)) => {}
+            Either::Right(Err(_)) => break,
+        }
+    }
     for message in receiver.drain() {
         match message {
             SchedulerMessage::Schedule(submission) => submission.refuse(),
@@ -1918,12 +1877,9 @@ async fn dispatch_runtime(
                 &state,
                 &mut running,
             ),
-            SchedulerMessage::Stop(_)
-            | SchedulerMessage::Finished(_)
-            | SchedulerMessage::Reconcile => {}
+            SchedulerMessage::Stop(..) | SchedulerMessage::Reconcile => {}
         }
     }
-    drain_grants(&database, &mut pending, &mut running, &state, &sender);
     for execution in pending.into_values() {
         cancel_pending(&database, &execution).await;
     }
@@ -1948,9 +1904,7 @@ async fn stop_job(
     if database
         .job(job)
         .await
-        .ok()
-        .flatten()
-        .is_some_and(|record| record.any_terminal())
+        .is_ok_and(|record| record.is_none_or(|record| record.any_terminal()))
     {
         lock(state).stops.remove(&job);
     }
@@ -1967,59 +1921,6 @@ async fn finish_job(
     }
     lock(state).current.remove(&job);
     lock(state).stops.remove(&job);
-}
-
-/// Applies coalesced signals in the order a Job's lifecycle needs. The
-/// dispatcher runs this only when the queue itself is empty, so a Job's
-/// queued signals always precede its backlogged ones.
-async fn drain_notifications(
-    database: &DatabaseHandle,
-    pending: &mut BTreeMap<JobId, PendingExecution>,
-    running: &mut BTreeMap<JobId, RunningExecution>,
-    state: &SharedState,
-    notifications: &SchedulerNotifications,
-) {
-    for (job, signals) in notifications.take_backlog() {
-        if signals.grant {
-            spawn_grant(
-                job,
-                pending.remove(&job),
-                database,
-                notifications,
-                state,
-                running,
-            );
-        }
-        if signals.stop {
-            stop_job(database, job, pending, state).await;
-        }
-        if signals.finished {
-            finish_job(database, job, running, state).await;
-        }
-    }
-}
-
-/// Shutdown starts only grants that were already committed; pending Jobs are
-/// cancelled and running ones finished afterwards.
-fn drain_grants(
-    database: &DatabaseHandle,
-    pending: &mut BTreeMap<JobId, PendingExecution>,
-    running: &mut BTreeMap<JobId, RunningExecution>,
-    state: &SharedState,
-    notifications: &SchedulerNotifications,
-) {
-    for (job, signals) in notifications.take_backlog() {
-        if signals.grant {
-            spawn_grant(
-                job,
-                pending.remove(&job),
-                database,
-                notifications,
-                state,
-                running,
-            );
-        }
-    }
 }
 
 async fn stop_pending(
@@ -2095,16 +1996,18 @@ async fn cancel_pending(database: &DatabaseHandle, execution: &PendingExecution)
 struct RunningExecution {
     task: ntex::rt::JoinHandle<Result<ExecutionReceipt, ExecutionRuntimeError>>,
     reply: Option<ExecutionReply>,
+    finished: Arc<AtomicBool>,
 }
 
 struct NotifyFinished {
-    job: JobId,
-    notifications: SchedulerNotifications,
+    finished: Arc<AtomicBool>,
+    wake: flume::Sender<()>,
 }
 
 impl Drop for NotifyFinished {
     fn drop(&mut self) {
-        self.notifications.notify(self.job, JobSignal::Finished);
+        self.finished.store(true, Ordering::Release);
+        self.wake.try_send(()).ok();
     }
 }
 
@@ -2233,15 +2136,33 @@ async fn finalize_claim_error(
 /// Finalizations that failed, kept until the database accepts them: a pure
 /// low-space lock never reopens the database, so open reconcile would not
 /// settle them.
-static UNSETTLED: Mutex<Vec<(DatabaseHandle, JobId, JobFinalization)>> = Mutex::new(Vec::new());
+type RetainedFinalization = (
+    DatabaseHandle,
+    JobId,
+    JobFinalization,
+    Option<crate::persistence::NewProviderAnswer>,
+);
+static UNSETTLED: Mutex<Vec<RetainedFinalization>> = Mutex::new(Vec::new());
 
 fn retain_unsettled(database: DatabaseHandle, job: JobId, outcome: JobFinalization) {
+    retain_finalization(database, job, outcome, None);
+}
+
+fn retain_finalization(
+    database: DatabaseHandle,
+    job: JobId,
+    outcome: JobFinalization,
+    answer: Option<crate::persistence::NewProviderAnswer>,
+) {
     let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
-    if !unsettled
-        .iter()
-        .any(|(existing, retained, _)| existing.same_database(&database) && *retained == job)
-    {
-        unsettled.push((database, job, outcome));
+    if let Some(existing) = unsettled.iter().position(|(existing, retained, _, _)| {
+        existing.same_database(&database) && *retained == job
+    }) {
+        if answer.is_some() {
+            unsettled[existing].3 = answer;
+        }
+    } else {
+        unsettled.push((database, job, outcome, answer));
     }
 }
 
@@ -2253,11 +2174,18 @@ async fn retry_unsettled(owner: &DatabaseHandle) {
         let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
         let (mine, others) = std::mem::take(&mut *unsettled)
             .into_iter()
-            .partition(|(database, _, _)| database.same_database(owner));
+            .partition(|(database, _, _, _)| database.same_database(owner));
         *unsettled = others;
         mine
     };
-    for (database, job, outcome) in retained {
+    for (database, job, outcome, answer) in retained {
+        if let Some(answer) = answer
+            && let Err(error) = persist_completion(&database, &answer).await
+        {
+            log::warn!("Job {job} completion evidence remains unpersisted: {error}");
+            retain_finalization(database, job, outcome, Some(answer));
+            continue;
+        }
         match database.finalize_job(job, outcome.clone()).await {
             Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
             Err(DatabaseError::ShuttingDown | DatabaseError::StorageUnavailable(_)) => {}
@@ -2300,9 +2228,10 @@ fn spawn_grant(
     {
         execution.cancellation.cancel();
     }
+    let finished = Arc::new(AtomicBool::new(false));
     let notify = NotifyFinished {
-        job,
-        notifications: sender.clone(),
+        finished: finished.clone(),
+        wake: sender.wake.clone(),
     };
     let reply = execution
         .as_mut()
@@ -2440,7 +2369,14 @@ fn spawn_grant(
         }))
         .await
     });
-    running.insert(job, RunningExecution { task, reply });
+    running.insert(
+        job,
+        RunningExecution {
+            task,
+            reply,
+            finished,
+        },
+    );
 }
 
 /// Admits the pending Job of a provider plan through T1, once the plan is
@@ -4331,7 +4267,7 @@ async fn answer_calls(
                             };
                             crate::persistence::StopCause::Stopped(record)
                         };
-                        scheduler.stop(JobId::new(id), cause);
+                        scheduler.stop(JobId::new(id), cause).await;
                     }
                 }
             }
@@ -4973,12 +4909,39 @@ impl ProviderOutputSink for DatabaseOutputSink {
     }
 }
 
+async fn persist_completion(
+    database: &DatabaseHandle,
+    answer: &crate::persistence::NewProviderAnswer,
+) -> Result<(), DatabaseError> {
+    if let Some(response) = database
+        .provider_request(answer.stat.job, answer.stat.request)
+        .await?
+        .and_then(|record| record.response)
+    {
+        let body = crate::persistence::MessageBody::new(&response).map_err(|_| {
+            DatabaseError::Read(crate::storage::StorageError::corrupted(
+                "invalid completed response",
+            ))
+        })?;
+        if body.digest() == answer.response.digest() {
+            return Ok(());
+        }
+        return Err(DatabaseError::Rejected(Violation::InvalidValue(
+            "response",
+            "a different completed response is already recorded",
+        )));
+    }
+    database.record_provider_answer(answer.clone()).await
+}
+
 /// Settles a failed provider execution. Its Job outcome follows the error
 /// alone; its availability observations record only the facts the error
 /// carries, see [`provider_execution::error_observations`]. Each is
 /// attempted, and the first that could not be written is reported. The
 /// execution has returned; finalization checks `no_live_process` and releases
-/// capacity in the same commit when no process can remain.
+/// capacity in the same commit when no process can remain. A completed response
+/// whose output flush failed is retained as response evidence, without running
+/// its tool calls; failed writes are retried before retained finalization.
 pub(crate) async fn settle_provider_error(
     database: DatabaseHandle,
     executor: ExecutorId,
@@ -4987,14 +4950,6 @@ pub(crate) async fn settle_provider_error(
     request: RequestNumber,
     error: ProviderExecutionError,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-    if let ProviderExecutionError::CompletionUnpersisted { message, result } = &error {
-        log::warn!(
-            "provider response for Job {job} completed, but its final output could not be persisted: {message}; retained in memory only: {} text bytes, {} reasoning bytes, {} tool calls, none run",
-            result.text.len(),
-            result.reasoning.len(),
-            result.tool_calls.len(),
-        );
-    }
     let failure = match &error {
         ProviderExecutionError::Rejected { failure } => Some((
             PROVIDER_REJECTED,
@@ -5025,17 +4980,46 @@ pub(crate) async fn settle_provider_error(
     };
     let observed_at = Timestamp::now();
     let mut gap = None;
-    for observation in provider_execution::error_observations(&error) {
-        let recorded = database
-            .record_availability_stat(NewAvailabilityStat {
+    if let ProviderExecutionError::CompletionUnpersisted { result, .. } = &error {
+        log::warn!(
+            "Job {job} completed its provider response but its final output flush failed; retaining the response as evidence without executing its tool calls"
+        );
+        let mut message = serde_json::json!(assistant_message(result));
+        if !result.reasoning.is_empty() {
+            message["reasoning_content"] = serde_json::Value::String(result.reasoning.clone());
+        }
+        let response = crate::persistence::MessageBody::new(&message)
+            .map_err(|error| ExecutionRuntimeError::Provider(error.to_string()))?;
+        let answer = crate::persistence::NewProviderAnswer {
+            stat: NewAvailabilityStat {
                 job,
                 request,
                 observed_at,
-                observation,
-            })
-            .await;
-        if let Err(error) = recorded {
-            gap.get_or_insert(error);
+                observation: provider_execution::success_observation(result),
+            },
+            measurements: provider_execution::metrics(result),
+            response,
+        };
+        if let Err(source) = persist_completion(&database, &answer).await {
+            log::warn!(
+                "Job {job} completion evidence remains unpersisted and is retained for retry: {source}"
+            );
+            retain_finalization(database.clone(), job, settlement.clone(), Some(answer));
+            gap = Some(source);
+        }
+    } else {
+        for observation in provider_execution::error_observations(&error) {
+            let recorded = database
+                .record_availability_stat(NewAvailabilityStat {
+                    job,
+                    request,
+                    observed_at,
+                    observation,
+                })
+                .await;
+            if let Err(error) = recorded {
+                gap.get_or_insert(error);
+            }
         }
     }
     let result = match database.finalize_job(job, settlement.clone()).await {
@@ -5073,32 +5057,182 @@ mod failure_tests {
     };
 
     #[test]
-    fn a_full_notification_queue_coalesces_signals_per_job() {
+    fn a_full_notification_queue_backpressures_and_completions_coalesce_without_a_backlog() {
         let (notifications, messages) = SchedulerNotifications::test_channel();
         for index in 0..SCHEDULER_NOTIFICATIONS {
-            notifications.notify(JobId::new(index as u128 + 1), JobSignal::Stop);
+            notifications
+                .messages
+                .try_send(SchedulerMessage::Stop(JobId::new(index as u128 + 1), None))
+                .expect("capacity");
         }
-        let backlogged = JobId::new(1000);
-        for signal in [
-            JobSignal::Finished,
-            JobSignal::Stop,
-            JobSignal::Grant,
-            JobSignal::Finished,
-        ] {
-            notifications.notify(backlogged, signal);
-        }
+        let mut sending =
+            std::pin::pin!(notifications.send(SchedulerMessage::Grant(JobId::new(1000))));
+        assert!(poll_once(sending.as_mut()).is_none());
+        messages.try_recv().expect("free one slot");
+        assert!(
+            poll_once(sending.as_mut())
+                .expect("capacity wakes sender")
+                .is_ok()
+        );
         assert_eq!(messages.len(), SCHEDULER_NOTIFICATIONS);
-        let backlog = notifications.take_backlog();
-        let signals = backlog.get(&backlogged).expect("coalesced signals");
-        assert!(signals.grant && signals.stop && signals.finished);
-        assert_eq!(backlog.len(), 1);
-        assert!(notifications.take_backlog().is_empty());
-        messages.drain().count();
-        notifications.notify(backlogged, JobSignal::Finished);
-        assert!(matches!(
-            messages.recv().expect("queued signal"),
-            SchedulerMessage::Finished(job) if job == backlogged
-        ));
+        let (wake, wakes) = flume::bounded(1);
+        let completed: Vec<_> = (0..16).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        for finished in &completed {
+            drop(NotifyFinished {
+                finished: finished.clone(),
+                wake: wake.clone(),
+            });
+        }
+        assert_eq!(wakes.len(), 1);
+        assert!(
+            completed
+                .iter()
+                .all(|finished| finished.load(Ordering::Acquire))
+        );
+    }
+
+    #[test]
+    fn a_claimed_job_keeps_an_early_stop_while_the_queue_is_full() {
+        let (notifications, _messages) = SchedulerNotifications::test_channel();
+        for _ in 0..SCHEDULER_NOTIFICATIONS {
+            notifications
+                .messages
+                .try_send(SchedulerMessage::Reconcile)
+                .expect("capacity");
+        }
+        let job = JobId::new(1);
+        let state = SharedState::default();
+        lock(&state).stops.entry(job).or_default();
+        let stops = StopHandle {
+            notifications,
+            state: state.clone(),
+        };
+        let mut stop = std::pin::pin!(stops.stop(job, crate::persistence::StopCause::Closed));
+        assert!(poll_once(stop.as_mut()).is_none());
+        assert_eq!(
+            *lock(&state).stops[&job].lock().expect("cause"),
+            Some(crate::persistence::StopCause::Closed)
+        );
+        let mut unknown =
+            std::pin::pin!(stops.stop(JobId::new(2), crate::persistence::StopCause::Closed));
+        assert!(poll_once(unknown.as_mut()).is_none());
+        assert_eq!(
+            lock(&state).stops.len(),
+            1,
+            "unowned stops must not allocate per-Job state"
+        );
+    }
+
+    #[test]
+    fn completed_response_survives_a_failed_flush_and_retries_without_running_tools() {
+        use crate::disk_protection::{ProtectedArea, ProtectionReason, SpaceShortage};
+        use crate::openai_compatible::ChatFinishReason;
+        use crate::openai_compatible::NormalizedUsage;
+
+        for fail_capture in [false, true] {
+            let (_root, directory) = data_directory(
+                "provider-flush",
+                if fail_capture { "retry" } else { "capture" },
+            );
+            let worker = DatabaseWorker::start(&directory).expect("database");
+            let database = worker.handle();
+            let executor = executor(&database);
+            let job =
+                wait(database.create_claimed_fixture(spec(&database), executor)).expect("claim");
+            let input = wait(database.job(job)).expect("read").expect("job").input;
+            let database_path = directory.database_path().to_path_buf();
+            on_system(move || async move {
+                let mut sink = output_sink(database.clone(), job);
+                sink.sending(&serde_json::json!({"model":"mock", "messages":[{"role":"user", "content":"hi"}]}))
+                    .await.expect("Sent");
+                if fail_capture {
+                    assert!(database.activate_filesystem_protection(
+                        ProtectionReason::InsufficientSpace(SpaceShortage {
+                            area: ProtectedArea::Database,
+                            path: database_path,
+                            available_bytes: 0,
+                            expected_write_bytes: 0,
+                            threshold_bytes: 1,
+                        })
+                    ));
+                }
+                let outcome = settle_provider_error(
+                    database.clone(),
+                    executor,
+                    input,
+                    job,
+                    RequestNumber::FIRST,
+                    ProviderExecutionError::CompletionUnpersisted {
+                        message: "flush failed".into(),
+                        result: Box::new(ProviderExecutionResult {
+                            text: "completed text".into(),
+                            reasoning: "completed reasoning".into(),
+                            tool_calls: vec![CompletedToolCall {
+                                index: 0,
+                                id: "call-1".into(),
+                                name: "unexecuted".into(),
+                                arguments: "{}".into(),
+                            }],
+                            refused: vec![],
+                            usage: NormalizedUsage::default(),
+                            finish_reason: Some(ChatFinishReason::ToolCalls),
+                            raw_finish_reason: Some("tool_calls".into()),
+                            status_code: 200,
+                            request_id: None,
+                            ttfb: Duration::ZERO,
+                            finished_in: Duration::ZERO,
+                        }),
+                    },
+                )
+                .await;
+                if fail_capture {
+                    assert!(matches!(
+                        outcome,
+                        Err(ExecutionRuntimeError::NotSettled { .. })
+                    ));
+                    database.recover_storage().await.expect("recover writes");
+                    retry_unsettled(&database).await;
+                    retry_unsettled(&database).await;
+                } else {
+                    assert!(outcome.expect("settled Unknown").result.is_none());
+                }
+                let record = database.job(job).await.expect("read").expect("job");
+                assert!(record.unknown_at.is_some());
+                assert!(record.stop_confirmed_at.is_some());
+                assert!(record.completed_at.is_none());
+                assert!(
+                    database
+                        .tool_evidence(job, None, 10)
+                        .await
+                        .expect("tools")
+                        .is_empty()
+                );
+                assert_eq!(
+                    database
+                        .provider_responses(job, None, 10, usize::MAX)
+                        .await
+                        .expect("responses")
+                        .responses
+                        .len(),
+                    1
+                );
+            });
+            worker.shutdown().expect("shutdown");
+            let reopened = DatabaseWorker::start(&directory).expect("reopen");
+            let response = wait(
+                reopened
+                    .handle()
+                    .provider_request(job, RequestNumber::FIRST),
+            )
+            .expect("read persisted request")
+            .expect("Sent")
+            .response
+            .expect("Received");
+            assert_eq!(response["content"], "completed text");
+            assert_eq!(response["reasoning_content"], "completed reasoning");
+            assert_eq!(response["tool_calls"][0]["function"]["name"], "unexecuted");
+            reopened.shutdown().expect("shutdown");
+        }
     }
 
     #[test]
@@ -5501,7 +5635,7 @@ mod failure_tests {
                 .expect("failed read keeps the pending stop");
             assert!(retained.cancellation.is_cancelled());
             assert!(!retained.done.is_cancelled());
-            let (sender, messages) = SchedulerNotifications::test_channel();
+            let (sender, _messages) = SchedulerNotifications::test_channel();
             let mut running = BTreeMap::new();
             let (reply, response) = flume::bounded(1);
             let mut execution = pending(job, executor);
@@ -5513,9 +5647,6 @@ mod failure_tests {
                 &sender,
                 &SharedState::default(),
                 &mut running,
-            );
-            assert!(
-                matches!(messages.recv_async().await, Ok(SchedulerMessage::Finished(id)) if id == job)
             );
             finish_grant(&database, job, running.remove(&job).expect("task")).await;
             assert!(matches!(
@@ -5558,7 +5689,6 @@ mod failure_tests {
                 &state,
                 &mut running,
             );
-            messages.recv_async().await.expect("stopped task finished");
             finish_grant(&database, stopped, running.remove(&stopped).expect("task")).await;
             assert!(
                 database

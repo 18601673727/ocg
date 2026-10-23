@@ -34,11 +34,15 @@ impl Scheduler {
         }
     }
 
-    pub(crate) async fn run<G, Claim, ClaimFuture, Spawn>(self, mut claim: Claim, mut spawn: Spawn)
-    where
+    pub(crate) async fn run<G, Claim, ClaimFuture, Spawn, SpawnFuture>(
+        self,
+        mut claim: Claim,
+        mut spawn: Spawn,
+    ) where
         Claim: FnMut() -> ClaimFuture,
         ClaimFuture: Future<Output = Result<DispatchBatch<G>, DatabaseError>>,
-        Spawn: FnMut(G),
+        Spawn: FnMut(G) -> SpawnFuture,
+        SpawnFuture: Future<Output = ()>,
     {
         let mut previous_batch = None;
         let mut next_due = None;
@@ -87,7 +91,7 @@ impl Scheduler {
                 Ok(batch) => {
                     next_due = batch.next_due;
                     for grant in batch.grants {
-                        spawn(grant);
+                        spawn(grant).await;
                     }
                 }
                 Err(error) => {
@@ -138,6 +142,7 @@ mod tests {
                         if grant == 3 {
                             shutdown.cancel();
                         }
+                        std::future::ready(())
                     },
                 )
                 .await;
@@ -164,7 +169,10 @@ mod tests {
                         shutdown.cancel();
                         std::future::ready(Err::<DispatchBatch<u32>, _>(DatabaseError::QueueFull))
                     },
-                    |grant| spawned.borrow_mut().push(grant),
+                    |grant| {
+                        spawned.borrow_mut().push(grant);
+                        std::future::ready(())
+                    },
                 )
                 .await;
             assert!(spawned.borrow().is_empty());

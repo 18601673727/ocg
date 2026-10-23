@@ -467,10 +467,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   async function readAllProfiles(signal?: AbortSignal) {
     const pages: Array<ReturnType<typeof decodeProfiles>> = [];
     const providers = new Map<string, ReturnType<typeof decodeProfiles>["providers"][number]>();
+    const executors = new Map<string, ReturnType<typeof decodeProfiles>["executor_protocols"][number]>();
     let before: string | undefined;
     for (;;) {
       const page = await readProfilePage({ before, signal });
       pages.push(page);
+      for (const executor of page.executor_protocols) {
+        executors.set(executor.id, executor);
+      }
       for (const provider of page.providers) {
         const key = JSON.stringify([provider.protocol, provider.endpoint, provider.credential_ref]);
         const merged = providers.get(key);
@@ -491,7 +495,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         merged.has_credential ||= provider.has_credential;
       }
       if (!page.has_more) break;
-      if (!page.next_before || page.next_before === before) {
+      if (!page.next_before || (before !== undefined && page.next_before >= before)) {
         throw new ContractError("next_before", "an advancing Profile cursor");
       }
       before = page.next_before;
@@ -499,8 +503,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     const first = pages[0];
     return {
       profile_id: first?.profile_id ?? null,
-      llm_profiles: pages.flatMap((page) => page.llm_profiles),
+      llm_profiles: pages.flatMap((page) => page.llm_profiles).map((profile) => ({
+        ...profile,
+        executors: [...executors.values()].filter((executor) => executor.protocol === profile.protocol)
+          .map((executor) => executor.id).sort(),
+      })),
       agent_profiles: pages.flatMap((page) => page.agent_profiles),
+      executor_protocols: [...executors.values()],
       providers: [...providers.values()],
       has_more: false,
       next_before: null,

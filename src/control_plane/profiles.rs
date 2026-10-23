@@ -25,8 +25,8 @@ use super::{
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
     AgentBehavior, AgentConfig, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig,
-    LlmParameters, LlmTransport, ModelCapability, ModelConfig, NewConfig, NewExecutor, ProfileId,
-    RecordRef, Violation,
+    ExecutionOperation, LlmParameters, LlmTransport, ModelCapability, ModelConfig, NewConfig,
+    NewExecutor, ProfileId, RecordRef, Violation,
 };
 
 const MAX_PROFILE_NAME_BYTES: usize = 128;
@@ -418,11 +418,11 @@ fn build_profiles_page(
     let crate::storage::ProfilePageRecords {
         records,
         connections,
-        compatible,
         next_before,
     } = page;
     let mut llm_profiles = Vec::new();
     let mut agent_profiles = Vec::new();
+    let mut executor_protocols = Vec::new();
 
     #[derive(Ord, PartialOrd, Eq, PartialEq)]
     struct ProviderKey {
@@ -447,13 +447,6 @@ fn build_profiles_page(
                 let Some(connection) = connections.get(&model.connection_id).cloned() else {
                     return Err(INCONSISTENT_RECORD);
                 };
-                let executors = compatible
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|executor| executor.to_string())
-                    .collect::<Vec<_>>();
                 let protocol = match connection.protocol {
                     LlmTransport::OpenAiChatCompletions => "openai_chat_completions",
                 };
@@ -478,7 +471,6 @@ fn build_profiles_page(
                     has_credential,
                     declared_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
                     parameters: WireLlmParameters::from_parameters(&model.parameters),
-                    executors,
                     editable: true,
                     blocking_jobs: Vec::new(),
                     more_blocking_jobs: false,
@@ -546,7 +538,26 @@ fn build_profiles_page(
                 agent_profiles.push(profile);
                 last_emitted = Some(record.id);
             }
-            ConfigBody::Connection(_) | ConfigBody::Pool(_) => {}
+            ConfigBody::Pool(pool) => {
+                if pool.enabled
+                    && pool.offers(
+                        ExecutionOperation::LlmRequest,
+                        Some(LlmTransport::OpenAiChatCompletions),
+                    )
+                {
+                    let executor = WireProfileExecutor {
+                        id: record.id.to_string(),
+                        protocol: "openai_chat_completions".to_owned(),
+                    };
+                    if !fits_profile_page(&executor, &mut page_bytes)? {
+                        next_before = last_emitted;
+                        break;
+                    }
+                    executor_protocols.push(executor);
+                    last_emitted = Some(record.id);
+                }
+            }
+            ConfigBody::Connection(_) => {}
         }
     }
     // Newest first, as Profiles have always been listed.
@@ -572,6 +583,7 @@ fn build_profiles_page(
     Ok(envelope(WireProfiles {
         llm_profiles,
         agent_profiles,
+        executor_protocols,
         providers,
         has_more: next_before.is_some(),
         next_before: next_before.map(|id| ProfileId::from(id).to_string()),
@@ -1638,7 +1650,7 @@ mod reasoning_parameter_tests {
                 })
                 .await
                 .expect("connection");
-            database
+            let executor = database
                 .create_executor(NewExecutor {
                     name: "pool".into(),
                     concurrency_limit: NonZeroU32::new(2).expect("limit"),
@@ -1647,30 +1659,35 @@ mod reasoning_parameter_tests {
                 .await
                 .expect("executor");
             let mut expected = BTreeSet::new();
-            for index in 0..1_005 {
-                let id = if index % 3 == 0 {
-                    database
-                        .create_config(NewConfig {
-                            name: format!("agent {index}"),
-                            body: ConfigBody::Agent(AgentConfig::default()),
-                        })
-                        .await
-                } else {
-                    database
-                        .create_config(NewConfig {
-                            name: format!("model {index}"),
-                            body: ConfigBody::Model(ModelConfig {
-                                connection_id: connection,
-                                model: format!("model-{index}"),
-                                context_window: None,
-                                parameters: LlmParameters::default(),
-                                declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
-                            }),
-                        })
-                        .await
+            for chunk in (0..1_005).collect::<Vec<_>>().chunks(128) {
+                let mut queued = Vec::new();
+                for &index in chunk {
+                    let database = database.clone();
+                    queued.push(ntex::rt::spawn(async move {
+                        database
+                            .create_config(NewConfig {
+                                name: format!("profile {index}"),
+                                body: if index % 3 == 0 {
+                                    ConfigBody::Agent(AgentConfig::default())
+                                } else {
+                                    ConfigBody::Model(ModelConfig {
+                                        connection_id: connection,
+                                        model: format!("model-{index}"),
+                                        context_window: None,
+                                        parameters: LlmParameters::default(),
+                                        declared_capabilities: BTreeSet::from([
+                                            ModelCapability::Chat,
+                                        ]),
+                                    })
+                                },
+                            })
+                            .await
+                            .expect("profile")
+                    }));
                 }
-                .expect("profile");
-                expected.insert(id);
+                for task in queued {
+                    expected.insert(task.await.expect("config task"));
+                }
             }
             // Newer Connections fill the first scan window without a Profile,
             // so its page advances through an empty page.
@@ -1690,6 +1707,7 @@ mod reasoning_parameter_tests {
             let mut before = None;
             let mut seen = BTreeSet::new();
             let mut pages = 0;
+            let mut seen_executors = BTreeSet::new();
             loop {
                 let reply = list_profiles(&database, before, 7).await.expect("page");
                 pages += 1;
@@ -1700,19 +1718,23 @@ mod reasoning_parameter_tests {
                 );
                 let llm = reply.body["llm_profiles"].as_array().expect("llm");
                 let agents = reply.body["agent_profiles"].as_array().expect("agents");
-                assert!(llm.len() + agents.len() <= 7);
+                let executors = reply.body["executor_protocols"]
+                    .as_array()
+                    .expect("executors");
+                assert!(llm.len() + agents.len() + executors.len() <= 7);
+                for offered in executors {
+                    assert_eq!(offered["protocol"], "openai_chat_completions");
+                    assert!(
+                        seen_executors
+                            .insert(offered["id"].as_str().expect("executor id").to_owned())
+                    );
+                }
                 for profile in llm {
                     let id = ConfigId::from(
                         profile_id(profile["id"].as_str().expect("id")).expect("identity"),
                     );
                     assert!(seen.insert(id));
                     assert_eq!(profile["endpoint"], "https://old.example");
-                    assert!(
-                        !profile["executors"]
-                            .as_array()
-                            .expect("executors")
-                            .is_empty()
-                    );
                 }
                 for profile in agents {
                     let id = ConfigId::from(
@@ -1733,6 +1755,7 @@ mod reasoning_parameter_tests {
                 }
             }
             assert_eq!(seen, expected);
+            assert_eq!(seen_executors, BTreeSet::from([executor.to_string()]));
         });
         worker.shutdown().expect("shutdown");
     }

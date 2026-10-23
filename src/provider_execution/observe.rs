@@ -87,6 +87,36 @@ impl Redactor {
         text
     }
 
+    fn json(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.text(text),
+            Value::Array(values) => values.iter_mut().for_each(|value| self.json(value)),
+            Value::Object(values) => {
+                *values = std::mem::take(values)
+                    .into_iter()
+                    .map(|(key, mut value)| {
+                        self.json(&mut value);
+                        (self.text(&key), value)
+                    })
+                    .collect();
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+
+    pub(crate) fn body(&self, body: &str) -> String {
+        if self.secrets.is_empty() {
+            return body.to_owned();
+        }
+        match serde_json::from_str::<Value>(body) {
+            Ok(mut value) => {
+                self.json(&mut value);
+                value.to_string()
+            }
+            Err(_) => self.text(body),
+        }
+    }
+
     fn optional(&self, text: Option<String>) -> Option<String> {
         text.map(|text| self.text(&text))
     }
@@ -99,7 +129,7 @@ impl Redactor {
     pub(crate) fn failure(&self, mut failure: ProviderFailure) -> ProviderFailure {
         failure.message = self.text(&failure.message);
         failure.provider_code = self.optional(failure.provider_code);
-        failure.response_body = self.optional(failure.response_body);
+        failure.response_body = failure.response_body.map(|body| self.body(&body));
         failure.request_id = self.optional(failure.request_id);
         failure
     }
@@ -147,7 +177,12 @@ impl Redactor {
                     stream: Box::new(self.error(*stream)),
                 }
             }
-            ProviderExecutionError::CompletionUnpersisted { message, result } => {
+            ProviderExecutionError::CompletionUnpersisted {
+                message,
+                mut result,
+            } => {
+                result.raw_finish_reason = self.optional(result.raw_finish_reason);
+                result.request_id = self.optional(result.request_id);
                 ProviderExecutionError::CompletionUnpersisted {
                     message: self.text(&message),
                     result,

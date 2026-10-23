@@ -143,3 +143,39 @@ test("a reconnect resumes after the output this subscriber processed", async () 
   assert.deepEqual(processed, [1, 2]);
   client.close();
 });
+
+test("profile paging joins executor compatibility across empty and separate pages", async () => {
+  const protocol = "openai_chat_completions";
+  const model = { id: uuid7(30), name: "Model", model: "model", context_window: null, protocol,
+    endpoint: "https://provider.example", credential_ref: null, has_credential: false,
+    declared_capabilities: ["chat"], parameters: { temperature: null, top_p: null, max_tokens: 100,
+      reasoning_effort: null, max_completion_tokens: null, presence_penalty: null, frequency_penalty: null },
+    editable: true, blocking_jobs: [], more_blocking_jobs: false, created_at_us: 1, updated_at_us: 1 };
+  const provider = { protocol, endpoint: model.endpoint, credential_ref: null, has_credential: false,
+    profile_ids: [model.id], models: [model.model] };
+  const empty = { api_version: 1, llm_profiles: [], agent_profiles: [], providers: [], executor_protocols: [], has_more: true };
+  const requested: (string | null)[] = [];
+  const pages = [
+    { ...empty, llm_profiles: [model], providers: [provider], next_before: uuid7(30) },
+    { ...empty, next_before: uuid7(20) },
+    { ...empty, executor_protocols: [{ id: uuid7(10), protocol }], has_more: false, next_before: null },
+  ];
+  const client = createHttpCanonicalControlClient({ baseUrl: "http://localhost:3000", fetch: async (input) => {
+    requested.push(new URL(String(input)).searchParams.get("before"));
+    return Response.json(pages[requested.length - 1]);
+  } });
+  const profiles = await client.readProfiles();
+  assert.deepEqual(requested, [null, uuid7(30), uuid7(20)]);
+  assert.deepEqual(profiles.llm_profiles[0].executors, [uuid7(10)]);
+  assert.deepEqual(profiles.providers, [provider]);
+  client.close();
+
+  let calls = 0;
+  const regressing = createHttpCanonicalControlClient({ baseUrl: "http://localhost:3000", fetch: async () => {
+    calls++;
+    return Response.json({ ...empty, next_before: uuid7(calls === 1 ? 20 : 30) });
+  } });
+  await assert.rejects(regressing.readProfiles(), /advancing Profile cursor/);
+  assert.equal(calls, 2);
+  regressing.close();
+});

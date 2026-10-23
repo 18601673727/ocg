@@ -159,7 +159,7 @@ async fn exchange(
         };
         // The raw body is redacted before it is parsed, so the message and
         // code read from it cannot carry the credential either.
-        let body = body.map(|body| redactor.text(&body));
+        let body = body.map(|body| redactor.body(&body));
         return Err(ProviderExecutionError::Rejected {
             failure: observe::with_retry_after(
                 redactor.failure(rejected_failure(conversation, status, request_id, body)),
