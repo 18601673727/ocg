@@ -3,15 +3,17 @@
 /**
  * Full-screen conversation search.
  *
- * The overlay searches the *current* session list by title and by recent
- * message text: an empty query shows the sidebar's own project-filtered
- * list, while a non-empty query asks the control server's conversation
- * search (titles plus recent user/agent messages, terms combined by AND)
- * and keeps only the sessions the sidebar already renders. Selecting a
- * result goes through the same session-selection callback the sidebar list
- * uses, so navigation, URL state and attention handling stay identical.
- * Without a control client, or when the search request fails, it falls back
- * to the local title filter.
+ * The overlay searches across projects within this account only: an empty
+ * query shows the sidebar's own list, while a non-empty query asks the
+ * control server's conversation search (titles plus recent user/agent
+ * messages, terms combined by AND) through the same account's control
+ * client and keeps only the sessions the sidebar already renders.
+ * Selecting a result goes through the same session-selection callback the
+ * sidebar list uses, so navigation, URL state and attention handling stay
+ * identical. The server reads only this account's database, so one
+ * account's search never sees another account's conversations. Without a
+ * control client, or when the search request fails, it falls back to the
+ * local title filter.
  *
  * It follows the Project switcher's overlay conventions: the same Dialog
  * primitive, so Escape and dismissal return focus to the trigger, and the same
@@ -40,14 +42,12 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 export type ConversationSearchProps = {
   /** Element used to open the overlay; receives the dialog's trigger props. */
   trigger: ReactElement;
-  /** The already project-filtered session list, in the sidebar's own order. */
+  /** This account's session list, in the sidebar's own order. */
   sessions: readonly ChatSession[];
   activeSessionId: string;
-  /** Name of the Project the search is scoped to, shown as the scope line. */
-  projectName?: string;
   /** The same selection callback the sidebar list uses. */
   onSelect: (id: string) => void;
-  /** Control client for full-text search; omitting it keeps title filtering. */
+  /** This account's control client for full-text search; omitting it keeps title filtering. */
   control?: HttpCanonicalControlClient;
 };
 
@@ -61,7 +61,6 @@ export function ConversationSearch({
   trigger,
   sessions,
   activeSessionId,
-  projectName,
   onSelect,
   control,
 }: ConversationSearchProps) {
@@ -106,8 +105,9 @@ export function ConversationSearch({
   const matches = useMemo(() => {
     if (!needle) return sessions;
     if (serverKeys) {
-      // The server already matched titles and messages; keep the sidebar's
-      // own order and scope, including hidden-session handling upstream.
+      // The server already matched titles and messages across projects;
+      // keep the sidebar's own order, including hidden-session handling
+      // upstream. The keys come from this account's control client only.
       return sessions.filter(session => sessionKeys(session).some(key => serverKeys.has(key)));
     }
     const lowered = needle.toLowerCase();
@@ -183,11 +183,6 @@ export function ConversationSearch({
               className="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
           </div>
-          {projectName && (
-            <p className={cn("mt-2 truncate text-muted-foreground", TYPOGRAPHY_SCALE.caption)}>
-              {t("sidebar.currentProject", { name: projectName })}
-            </p>
-          )}
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">

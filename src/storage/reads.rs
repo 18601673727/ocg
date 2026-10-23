@@ -1753,10 +1753,12 @@ const MAX_SEARCH_TURNS_PER_CONVERSATION: usize = 100;
 /// Conversations newest first whose title or recent user/agent message text
 /// holds every term. `terms` are already lowercased and non-empty; matching
 /// is case-insensitive substring per term, with the terms combined by AND
-/// across the title and the message texts. The cursor and paging mean the
-/// same as [`read_conversations`]: `before` is the `tip` the page starts
-/// strictly before, and `next_before` is the `tip` the next page starts
-/// strictly before.
+/// across the title and the message texts. The search spans projects on
+/// purpose and stays inside this database alone, which is one account's
+/// data directory, so one account never reads another's conversations.
+/// The cursor and paging mean the same as [`read_conversations`]: `before`
+/// is the `tip` the page starts strictly before, and `next_before` is the
+/// `tip` the next page starts strictly before.
 pub(crate) fn read_conversation_search(
     database: &Database,
     terms: &[String],

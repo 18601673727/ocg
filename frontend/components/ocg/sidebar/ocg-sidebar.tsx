@@ -66,8 +66,6 @@ type OcgSidebarProps = {
   runtimeAuthority: RuntimeAuthority;
   /** Active top-level workspace, used to highlight the navigation group. */
   activeView?: WorkspaceView;
-  /** Name of the active Project, shown as the conversation search's scope line. */
-  projectName?: string;
   /** Unresolved attention count shown as a quiet badge next to Attention. */
   attentionCount?: number;
   /**
@@ -129,7 +127,6 @@ export function OcgSidebar({
   onHide,
   runtimeAuthority,
   activeView = "chat",
-  projectName,
   attentionCount = 0,
   onNavigate,
   onSettingsClick,
@@ -286,7 +283,6 @@ export function OcgSidebar({
           <ConversationSearch
             sessions={sessions}
             activeSessionId={activeSessionId}
-            projectName={projectName}
             onSelect={onSelect}
             control={control}
             trigger={
@@ -372,7 +368,6 @@ export function OcgSidebar({
           <ConversationSearch
             sessions={sessions}
             activeSessionId={activeSessionId}
-            projectName={projectName}
             onSelect={onSelect}
             control={control}
             trigger={
