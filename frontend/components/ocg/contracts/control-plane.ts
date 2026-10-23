@@ -261,6 +261,11 @@ export function decodeJob(input: unknown) {
   return { ...jobRecord(envelope.job), unknown_reason } satisfies Wire.WireJob & Omit<Wire.WireJobDetails, "job" | "result" | "usage">;
 }
 
+export function decodeJobDetails(input: unknown) {
+  const envelope = record(input, "response");
+  return { ...decodeJob(input), result: envelope.result === null ? null : outputRecord(envelope.result) } satisfies Wire.WireJob & Pick<Wire.WireJobDetails, "result" | "unknown_reason">;
+}
+
 export function decodeJobs(input: unknown) {
   const envelope = record(input, "response");
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));

@@ -21,6 +21,7 @@ import {
   decodeAvailability,
   decodeLogs,
   decodeJob,
+  decodeJobDetails,
   decodeConversationTurns,
   decodeJobInput,
   decodeJobEvent,
@@ -606,6 +607,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     async readJob(job: string, signal?: AbortSignal) {
       jobIdentity(job);
       return decodeJob((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
+    },
+
+    async readJobDetails(job: string, signal?: AbortSignal) {
+      jobIdentity(job);
+      return decodeJobDetails((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
     },
 
     /** The Job's frozen input: its objective as text, never inferred from its identity. */

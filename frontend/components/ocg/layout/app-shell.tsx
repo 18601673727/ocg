@@ -177,6 +177,7 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
   }
 
   const sidebar = <OcgSidebar sessions={runtime.snapshot.sessions.filter(session => runtime.client.isListedConversation?.(session.id) ?? true).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))}
+    control={client} activeAncestors={ancestors} onOpenConversation={job => void openNestedConversation(job)}
     activeSessionId={sessionId} collapsed={collapsed} onToggle={() => setCollapsed(value => !value)}
     onSelect={id => { const selected = runtime.snapshot.sessions.find(session => session.id === id); setSessionId(id); go("chat", selected?.sessionId ?? null); }}
     onNewChat={() => void newChat()}
@@ -192,8 +193,8 @@ function AppShellContent({ client, health, sessionExpiresAtUs, signingOut, signO
     activeView={location.view} onNavigate={view => go(view)} onSettingsClick={() => go("settings")} />;
 
   return <ConversationErrorScope value={location.view === "chat" ? conversationKey : null}><div className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
-    <aside className={cn("hidden shrink-0 border-r border-sidebar-border bg-sidebar lg:flex", collapsed ? "w-16" : "w-72")}>{sidebar}</aside>
-    {mobile && <div className="fixed inset-0 z-50 flex lg:hidden"><button type="button" aria-label={t("app.closeNavigation")} className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
+    <aside className={cn("hidden shrink-0 border-r border-sidebar-border bg-sidebar md:flex", collapsed ? "w-16" : "w-72")}>{sidebar}</aside>
+    {mobile && <div className="fixed inset-0 z-50 flex md:hidden"><button type="button" aria-label={t("app.closeNavigation")} className="absolute inset-0 bg-black/40" onClick={() => setMobile(false)} /><aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">{sidebar}</aside></div>}
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <OcgTopbar session={location.view === "chat" ? session : undefined} activeView={location.view}
         titleVisible={location.view === "chat" || !pageTitleInView}

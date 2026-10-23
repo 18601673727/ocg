@@ -4,9 +4,10 @@ import { createContext, useCallback, useContext, useEffect, useId, useMemo, useR
 import { AlertCircle, ChevronDown, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
+import { dismissNotice, isNoticeDismissed, noticeIdentity } from "@/lib/notice-dismissal";
 
 type Retry = { label: string; run: () => void };
-type ConversationError = { id: number; message: string; at: number; retry?: Retry; identity?: string; dismissed?: boolean };
+type ConversationError = { id: number; message: string; at: number; retry?: Retry; identity?: string; dismissalKey: string; dismissed?: boolean };
 type Histories = Record<string, readonly ConversationError[]>;
 type ErrorStore = {
   histories: Histories;
@@ -25,26 +26,29 @@ export function ConversationErrorsProvider({ children }: { children: ReactNode }
     const message = cause instanceof Error ? cause.message : String(cause);
     if (!message.trim()) return;
     const error = { id: ++sequence.current, message, at: Date.now(), retry, identity };
-    setHistories(current => {
-      const previous = current[conversation] ?? [];
-      if (identity && previous.some(item => item.identity === identity && item.message === message)) return current;
-      const latest = previous.at(-1);
-      if (latest?.message === message && !latest.dismissed && (!identity || !latest.identity || latest.identity === identity)) {
-        if ((retry && !latest.retry) || (identity && !latest.identity)) {
-          return { ...current, [conversation]: [...previous.slice(0, -1), { ...latest, retry: latest.retry ?? retry, identity: latest.identity ?? identity }] };
+    void noticeIdentity(identity ? `error:${identity}` : `conversation:${conversation}`, message).then(dismissalKey => {
+      const dismissed = isNoticeDismissed(dismissalKey);
+      setHistories(current => {
+        const previous = current[conversation] ?? [];
+        const existing = previous.find(item => item.dismissalKey === dismissalKey);
+        if (existing) {
+          if (retry && !existing.retry) return { ...current, [conversation]: previous.map(item => item === existing ? { ...item, retry } : item) };
+          return current;
         }
-        return current;
-      }
-      return { ...current, [conversation]: [...previous, error] };
+        return { ...current, [conversation]: [...previous, { ...error, dismissalKey, dismissed }].sort((a, b) => a.id - b.id) };
+      });
     });
   }, []);
   const dismiss = useCallback((conversation: string, through: number) => {
+    for (const error of histories[conversation] ?? []) {
+      if (error.id <= through) dismissNotice(error.dismissalKey);
+    }
     setHistories(current => {
       const history = current[conversation];
       if (!history?.some(error => error.id <= through && !error.dismissed)) return current;
       return { ...current, [conversation]: history.map(error => error.id <= through ? { ...error, dismissed: true } : error) };
     });
-  }, []);
+  }, [histories]);
   const transfer = useCallback((from: string, to: string) => {
     if (from === to) return;
     setHistories(current => {

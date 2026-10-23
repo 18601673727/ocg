@@ -60,7 +60,6 @@ import {
   DownloadIcon,
   MicIcon,
   MoreHorizontalIcon,
-  PencilIcon,
   PhoneIcon,
   RefreshCwIcon,
   SquareIcon,
@@ -927,15 +926,15 @@ const UserActionBar: FC = () => {
   const { t } = useI18n();
   return (
     <ActionBarPrimitive.Root
-      hideWhenRunning
       autohide="not-last"
       className="aui-user-action-bar-root flex flex-col items-end"
     >
-      <ActionBarPrimitive.Edit asChild>
-        <TooltipIconButton tooltip={t("common.edit")} className="aui-user-action-edit">
-          <PencilIcon />
+      <ActionBarPrimitive.Copy asChild>
+        <TooltipIconButton tooltip={t("common.copySource")} className="aui-user-action-copy">
+          <AuiIf condition={(s) => s.message.isCopied}><CheckIcon /></AuiIf>
+          <AuiIf condition={(s) => !s.message.isCopied}><CopyIcon /></AuiIf>
         </TooltipIconButton>
-      </ActionBarPrimitive.Edit>
+      </ActionBarPrimitive.Copy>
     </ActionBarPrimitive.Root>
   );
 };

@@ -87,7 +87,7 @@ export function OcgTopbar({
             <Button
               variant="ghost"
               size="icon-xs"
-              className="size-11 rounded-md lg:hidden"
+              className="size-11 rounded-md md:hidden"
               onClick={onOpenMobileSidebar}
               aria-label={t("topbar.openNavigation")}
             >

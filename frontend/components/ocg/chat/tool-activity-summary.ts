@@ -50,7 +50,7 @@ export function toolActivitySummary(tools: readonly ToolActivity[]) {
 
 export function toolActivityLabels(tools: readonly ToolActivity[], t: TranslateFn, locale: string) {
   const summary = toolActivitySummary(tools);
-  const format = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
+  const format = new Intl.NumberFormat(locale, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return {
     categories: summary.categories.map(({ category, count }) => t(`chat.tools.${category}.${count === 1 ? "one" : "other"}`, { count })).join(" · "),
     tokens: t("chat.tools.tokens", { count: `≈${new Intl.NumberFormat(locale).format(summary.tokens)}${summary.truncated ? "+" : ""}` }),

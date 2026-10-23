@@ -30,13 +30,14 @@ import {
 } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus } from "../types";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
-import { ControlTransportError } from "../runtime/control-client";
+import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
 import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { AccountMenu } from "./account-menu";
 import { ConversationSearch } from "./conversation-search";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 import { OcgLogo } from "../primitives/ocg-logo";
+import { SidebarConversationChildren } from "./conversation-children";
 
 const WORKSPACE_NAV: { target: WorkspaceView; labelKey: "nav.usage" | "nav.home" | "nav.attention" | "nav.chat" | "nav.controlCenter" | "nav.ledger" | "nav.jobExecution" | "nav.health" | "nav.logs" | "nav.canonical"; icon: typeof Search }[] = [
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
@@ -52,6 +53,9 @@ type OcgSidebarProps = {
   collapsed: boolean;
   onToggle: () => void;
   onSelect: (id: string) => void;
+  control?: HttpCanonicalControlClient;
+  activeAncestors?: string[];
+  onOpenConversation?: (conversation: string) => void;
   onNewChat: () => void;
   onRename?: (id: string, title: string) => Promise<void>;
   onHide?: (id: string) => Promise<void>;
@@ -114,6 +118,9 @@ export function OcgSidebar({
   collapsed,
   onToggle,
   onSelect,
+  control,
+  activeAncestors,
+  onOpenConversation,
   onNewChat,
   onRename,
   onHide,
@@ -135,6 +142,8 @@ export function OcgSidebar({
   const [renameError, setRenameError] = useState<string | null>(null);
 
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [expandedSessions, setExpandedSessions] = useState<Record<string, boolean>>({});
+  const activeRoot = activeAncestors?.[0] ?? activeSessionId;
   const cancelHideRef = useRef<HTMLButtonElement>(null);
 
   const email = useAccountEmail();
@@ -339,7 +348,7 @@ export function OcgSidebar({
               <RailButton
                 key={session.id}
                 label={session.title || t("sidebar.newChat")}
-                active={session.id === activeSessionId}
+                active={session.id === activeRoot}
                 onClick={() => onSelect(session.id)}
               >
                 <MessageSquare className="size-4" />
@@ -413,8 +422,17 @@ export function OcgSidebar({
             {sessions.map((session) => {
               const active = session.id === activeSessionId;
               const isMenuOpen = openMenuId === session.id;
+              const expanded = expandedSessions[session.id] ?? session.id === activeRoot;
+              const canExpand = Boolean(control && onOpenConversation && session.conversationId);
               return (
-                <li key={session.id} className={cn("group/session relative flex min-w-0 items-center rounded-md transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
+                <li key={session.id} className="min-w-0" data-sidebar-level="1">
+                <div className={cn("group/session relative flex min-w-0 items-center rounded-md transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
+                  {canExpand && <button type="button" aria-expanded={expanded}
+                    aria-label={t(expanded ? "sidebar.hideChildren" : "sidebar.showChildren", { title: session.title || t("sidebar.newChat") })}
+                    className="flex h-8 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+                    onClick={() => setExpandedSessions(current => ({ ...current, [session.id]: !expanded }))}>
+                    <ChevronDown className={cn("size-3.5 transition-transform motion-reduce:transition-none", !expanded && "-rotate-90")} aria-hidden="true" />
+                  </button>}
                   <button
                     type="button"
                     onClick={() => onSelect(session.id)}
@@ -478,6 +496,8 @@ export function OcgSidebar({
                       </DropdownMenuContent>
                     </DropdownMenu>
                   )}
+                </div>
+                {expanded && control && onOpenConversation && session.conversationId && <SidebarConversationChildren conversation={session.conversationId} control={control} activeChild={activeAncestors?.[1]} onOpen={onOpenConversation} />}
                 </li>
               );
             })}

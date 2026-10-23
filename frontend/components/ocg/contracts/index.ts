@@ -60,6 +60,7 @@ export type {
 export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./view-models";
 
 export { ContractError, decode } from "./decode";
+export { decodeJobDetails } from "./control-plane";
 export type { DecodeResult, Decoder } from "./decode";
 
 export {

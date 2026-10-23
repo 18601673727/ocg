@@ -1,12 +1,13 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Pause, Play, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useI18n, runtimeStatusDetail } from "../i18n";
 import type { RuntimeStatus } from "../types";
 import { ModelSelector } from "./model-selector";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { ControlTransportError } from "../runtime/control-client";
+import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
 import type { ControlConversationCard } from "../contracts";
 import type { ChatModelSelection } from "../contracts";
 import type { ControlChildConversation } from "../contracts";
@@ -330,6 +331,51 @@ function useConversation(turn?: string) {
   return { conversation, error };
 }
 
+function ChildConversationCard({ child, agentName, control, pending, onOpen, onAct }: {
+  child: ControlChildConversation;
+  agentName?: string;
+  control: HttpCanonicalControlClient;
+  pending: boolean;
+  onOpen: (conversation: string) => void;
+  onAct: (child: ControlChildConversation, action: "stop" | "close" | "hold" | "unhold") => Promise<void>;
+}) {
+  const { t, locale } = useI18n();
+  const [detail, setDetail] = useState<Awaited<ReturnType<HttpCanonicalControlClient["readJobDetails"]>> | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useConversationError(error, child.id);
+  const phase = child.recurrence?.phase;
+  const due = child.recurrence?.due_us;
+  useEffect(() => {
+    const controller = new AbortController();
+    void control.readJobDetails(child.id, controller.signal).then(result => {
+      if (!controller.signal.aborted) { setDetail(result); setError(null); }
+    }).catch(cause => {
+      if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+    });
+    return () => controller.abort();
+  }, [control, child.id, child.state, phase, due]);
+  const state = detail?.settlement.state;
+  const status = state && state !== "unsettled" ? t(`state.${state}`) : t(`chat.child.${child.state}`);
+  const title = child.title || t("chat.child.untitled");
+  const summary = detail?.result?.summary?.trim().split(/\n+/)[0]
+    ?.replace(/^#{1,6}\s*/, "").replace(/[*`]/g, "").slice(0, 240);
+  return <div className="relative w-72 max-w-full rounded-xl border border-border bg-muted/20 p-3 text-xs transition-colors hover:border-primary/50 focus-within:border-primary/50" data-slot="conversation-child-card">
+    <button type="button" className="absolute inset-0 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-ring" onClick={() => onOpen(child.id)} aria-label={t("chat.child.openNamed", { title })}
+      title={`${t("chat.child.conversationId")}\n${child.id}\n${t("chat.agent")}\n${child.agent ?? "—"}`} />
+    <div className="pointer-events-none space-y-2">
+      <span className="line-clamp-2 font-medium" title={child.title}>{title}</span>
+      <span className="block text-muted-foreground">{agentName || t("chat.agent")} · {status}{child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}</span>
+      <span className="line-clamp-3 text-muted-foreground">{summary || detail?.unknown_reason || t(child.state === "settled" ? "chat.child.noResult" : "chat.child.pendingResult")}</span>
+    </div>
+    {child.recurrence && <p className="pointer-events-none mt-2 text-muted-foreground">{t("chat.child.every", { seconds: child.recurrence.interval_s })} · {t(`chat.child.${child.recurrence.phase}`)}{child.recurrence.due_us !== null ? ` · ${new Date(child.recurrence.due_us / 1000).toLocaleString(locale)}` : ""}</p>}
+    <div className="relative mt-2 flex w-fit gap-1">
+      <Button size="icon-xs" variant="ghost" title={t("chat.child.stop")} aria-label={t("chat.child.stop")} disabled={pending || child.state !== "open"} onClick={() => void onAct(child, "stop")}><Square aria-hidden="true" /></Button>
+      <Button size="icon-xs" variant="ghost" title={t("common.close")} aria-label={t("common.close")} disabled={pending || child.state !== "open"} onClick={() => void onAct(child, "close")}><X aria-hidden="true" /></Button>
+      <Button size="icon-xs" variant="ghost" title={t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")} aria-label={t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")} disabled={pending || child.state !== "open"} onClick={() => void onAct(child, child.on_hold ? "unhold" : "hold")}>{child.on_hold ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}</Button>
+    </div>
+  </div>;
+}
+
 export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onOpen: (conversation: string) => void }) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
@@ -340,10 +386,26 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
   const [revision, setRevision] = useState(0);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [agentNames, setAgentNames] = useState<Record<string, string>>({});
   useConversationError(error);
   const lock = useRef(false);
   const delayRef = useRef(CHILDREN_POLL_BASE_MS);
   const signatureRef = useRef<string | null>(null);
+  const hasChildren = children.length > 0;
+  useEffect(() => {
+    if (!control || !hasChildren) return;
+    const controller = new AbortController();
+    const refresh = () => {
+      void control.readProfiles(controller.signal).then(profiles => {
+        if (!controller.signal.aborted) setAgentNames(Object.fromEntries(profiles.agent_profiles.map(agent => [agent.id, agent.name])));
+      }).catch(cause => {
+        if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    };
+    refresh();
+    const unsubscribe = control.onProfilesChanged(refresh);
+    return () => { controller.abort(); unsubscribe(); };
+  }, [control, hasChildren]);
   useEffect(() => {
     if (!control || !conversation) return;
     const controller = new AbortController();
@@ -439,19 +501,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
   if (!control || !children.length) return null;
   return <section className="py-2" aria-label={t("chat.children")} data-slot="conversation-child-cards">
     <div className="flex flex-wrap gap-3">
-      {children.map(child => <div key={child.id} className="w-64 max-w-full rounded-xl border border-border bg-muted/20 p-3 text-xs">
-        <button type="button" className="block w-full space-y-2 rounded-md text-left hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring" onClick={() => onOpen(child.id)} aria-label={t("chat.child.openNamed", { title: child.title || child.id })}>
-        <span className="block truncate font-medium" title={child.title}>{child.title || child.id}</span>
-        <span className="block text-muted-foreground">{child.id} · {child.agent} · {t(`chat.child.${child.state}`)}{child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}</span>
-        </button>
-        {child.recurrence && <p className="text-muted-foreground">{t("chat.child.every", { seconds: child.recurrence.interval_s })} · {t(`chat.child.${child.recurrence.phase}`)}{child.recurrence.due_us !== null ? ` · ${new Date(child.recurrence.due_us / 1000).toLocaleString()}` : ""}</p>}
-        <div className="mt-1 flex gap-1">
-          <Button size="xs" variant="ghost" onClick={() => onOpen(child.id)}>{t("common.open")}</Button>
-          <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, "stop")}>{t("chat.child.stop")}</Button>
-          <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, "close")}>{t("common.close")}</Button>
-          <Button size="xs" variant="ghost" disabled={pending !== null || child.state !== "open"} onClick={() => void act(child, child.on_hold ? "unhold" : "hold")}>{t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")}</Button>
-        </div>
-      </div>)}
+      {children.map(child => <ChildConversationCard key={child.id} child={child} agentName={child.agent ? agentNames[child.agent] : undefined} control={control} pending={pending !== null} onOpen={onOpen} onAct={act} />)}
       {hasMore && <Button size="sm" variant="ghost" onClick={() => setPages(value => value + 1)}>{t("chat.child.more")}</Button>}
     </div>
   </section>;
