@@ -1,7 +1,9 @@
 use super::*;
 use crate::persistence::{
-    AdoptionId, ArtifactId, ContextPreparation, ContextUse, PreparationStatus, SourceBoundary,
-    SourceFingerprint,
+    ChoiceOption, CompactionMode, CompactionPolicy, CompactionPreset, CustomPolicy,
+    DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
+    DecisionQuestion, DecisionRequest, DecisionWork, FrozenDecisionConfig, PredictiveCompaction,
+    ScoreLevel, WorkspaceAccess,
 };
 
 // ---- explicit versioned encoding ----------------------------------------------
@@ -106,6 +108,105 @@ impl Enc {
         self.u32(agent.dispatch_to.len() as u32);
         for agent in &agent.dispatch_to {
             self.u128(agent.get());
+        }
+        self.ou128(agent.decision_assistance.map(ConfigId::get));
+        self.opt(&agent.compaction_policy, Enc::compaction_policy);
+    }
+    pub(super) fn compaction_policy(&mut self, policy: &CompactionPolicy) {
+        match policy.mode {
+            CompactionMode::Off => self.u8(0),
+            CompactionMode::Auto { preset } => {
+                self.u8(1);
+                self.u8(match preset {
+                    CompactionPreset::Conservative => 0,
+                    CompactionPreset::Balanced => 1,
+                    CompactionPreset::Aggressive => 2,
+                });
+            }
+            CompactionMode::Custom { policy } => {
+                self.u8(2);
+                for value in [
+                    policy.trigger_tokens,
+                    policy.target_tokens,
+                    policy.reserved_output_tokens,
+                    policy.minimum_source_tokens,
+                    policy.minimum_savings_tokens,
+                    policy.preserve_recent_turns,
+                    policy.cooldown_seconds,
+                ] {
+                    self.u32(value);
+                }
+            }
+        }
+        self.ou128(policy.summarization_model.map(ConfigId::get));
+        self.opt(&policy.predictive, |e, p| {
+            e.u128(p.decision_agent.get());
+            e.u32(p.minimum_interval_seconds);
+            e.u32(p.max_preparations);
+            e.u32(p.max_prediction_tokens);
+            e.u32(p.max_preparation_tokens);
+        });
+    }
+    pub(super) fn decision_model(&mut self, model: &DecisionModelConfig) {
+        self.u128(model.connection_id.get());
+        self.str(&model.model);
+        self.u8(model.protocol.code());
+        for limit in [
+            model.limits.max_input_tokens_per_request,
+            model.limits.max_output_tokens_per_request,
+            model.limits.max_input_tokens_per_question,
+            model.limits.max_output_tokens_per_question,
+        ] {
+            self.ou32(limit);
+        }
+        self.u32(model.declared_capabilities.len() as u32);
+        for cap in &model.declared_capabilities {
+            self.u8(cap.code());
+        }
+    }
+    pub(super) fn decision_agent(&mut self, agent: &DecisionAgentConfig) {
+        self.ostr(&agent.instructions);
+        self.u32(agent.models.len() as u32);
+        for model in &agent.models {
+            self.u128(model.get());
+        }
+        self.ou128(agent.default_model.map(ConfigId::get));
+        self.u8(agent.workspace_access.code());
+    }
+    fn decision_work(&mut self, work: &DecisionWork) {
+        let frozen = &work.frozen;
+        self.decision_agent(&frozen.agent);
+        self.config_ref(&frozen.agent_ref);
+        self.decision_model(&frozen.model);
+        self.config_ref(&frozen.model_ref);
+        self.config_ref(&frozen.connection_ref);
+        self.ostr(&frozen.endpoint);
+        self.ostr(&frozen.credential_ref);
+        self.u32(work.request.schema_version);
+        self.str(&work.request.state.to_string());
+        match &work.request.question {
+            DecisionQuestion::Choice { prompt, options } => {
+                self.u8(0);
+                self.str(prompt);
+                self.u32(options.len() as u32);
+                for option in options {
+                    self.str(&option.id);
+                    self.str(&option.description);
+                }
+            }
+            DecisionQuestion::BinaryProbability { prompt } => {
+                self.u8(1);
+                self.str(prompt);
+            }
+            DecisionQuestion::OrdinalScore { prompt, levels } => {
+                self.u8(2);
+                self.str(prompt);
+                self.u32(levels.len() as u32);
+                for level in levels {
+                    self.0.extend_from_slice(&level.value.to_le_bytes());
+                    self.str(&level.description);
+                }
+            }
         }
     }
     pub(super) fn config_ref(&mut self, config: &ConfigRef) {
@@ -313,7 +414,153 @@ impl<'a> Dec<'a> {
             tool_grant,
             dispatch_to,
             approve,
+            decision_assistance: self.ou128()?.map(ConfigId::new),
+            compaction_policy: self.opt(Dec::compaction_policy)?,
         })
+    }
+    pub(super) fn compaction_policy(&mut self) -> DecodeResult<CompactionPolicy> {
+        let mode = match self.u8()? {
+            0 => CompactionMode::Off,
+            1 => CompactionMode::Auto {
+                preset: match self.u8()? {
+                    0 => CompactionPreset::Conservative,
+                    1 => CompactionPreset::Balanced,
+                    2 => CompactionPreset::Aggressive,
+                    _ => return Err(StorageError::corrupted("invalid compaction preset")),
+                },
+            },
+            2 => CompactionMode::Custom {
+                policy: CustomPolicy {
+                    trigger_tokens: self.u32()?,
+                    target_tokens: self.u32()?,
+                    reserved_output_tokens: self.u32()?,
+                    minimum_source_tokens: self.u32()?,
+                    minimum_savings_tokens: self.u32()?,
+                    preserve_recent_turns: self.u32()?,
+                    cooldown_seconds: self.u32()?,
+                },
+            },
+            _ => return Err(StorageError::corrupted("invalid compaction mode")),
+        };
+        let policy = CompactionPolicy {
+            mode,
+            summarization_model: self.ou128()?.map(ConfigId::new),
+            predictive: self.opt(|d| {
+                Ok(PredictiveCompaction {
+                    decision_agent: ConfigId::new(d.u128()?),
+                    minimum_interval_seconds: d.u32()?,
+                    max_preparations: d.u32()?,
+                    max_prediction_tokens: d.u32()?,
+                    max_preparation_tokens: d.u32()?,
+                })
+            })?,
+        };
+        policy.validate().map_err(StorageError::corrupted)?;
+        Ok(policy)
+    }
+    pub(super) fn decision_model(&mut self) -> DecodeResult<DecisionModelConfig> {
+        let connection_id = ConfigId::new(self.u128()?);
+        let model = self.str()?;
+        let protocol = self.code(DecisionProtocol::from_code)?;
+        let limits = DecisionLimits {
+            max_input_tokens_per_request: self.ou32()?,
+            max_output_tokens_per_request: self.ou32()?,
+            max_input_tokens_per_question: self.ou32()?,
+            max_output_tokens_per_question: self.ou32()?,
+        };
+        let count = self.u32()?;
+        if count > 3 {
+            return Err(StorageError::corrupted("invalid decision capability count"));
+        }
+        let mut declared_capabilities = BTreeSet::new();
+        for _ in 0..count {
+            let cap = self.code(DecisionCapability::from_code)?;
+            if !declared_capabilities.insert(cap) {
+                return Err(StorageError::corrupted("duplicate decision capability"));
+            }
+        }
+        Ok(DecisionModelConfig {
+            connection_id,
+            model,
+            protocol,
+            limits,
+            declared_capabilities,
+        })
+    }
+    pub(super) fn decision_agent(&mut self) -> DecodeResult<DecisionAgentConfig> {
+        let instructions = self.ostr()?;
+        let count = self.u32()?;
+        if count > 256 {
+            return Err(StorageError::corrupted("too many decision targets"));
+        }
+        let mut models = Vec::new();
+        for _ in 0..count {
+            models.push(ConfigId::new(self.u128()?));
+        }
+        Ok(DecisionAgentConfig {
+            instructions,
+            models,
+            default_model: self.ou128()?.map(ConfigId::new),
+            workspace_access: self.code(WorkspaceAccess::from_code)?,
+        })
+    }
+    fn decision_work(&mut self) -> DecodeResult<DecisionWork> {
+        let frozen = FrozenDecisionConfig {
+            agent: self.decision_agent()?,
+            agent_ref: self.config_ref()?,
+            model: self.decision_model()?,
+            model_ref: self.config_ref()?,
+            connection_ref: self.config_ref()?,
+            endpoint: self.ostr()?,
+            credential_ref: self.ostr()?,
+        };
+        let schema_version = self.u32()?;
+        let state = serde_json::from_str(&self.str()?)
+            .map_err(|_| StorageError::corrupted("invalid decision state"))?;
+        let kind = self.u8()?;
+        let prompt = self.str()?;
+        let question = match kind {
+            0 => {
+                let count = self.u32()?;
+                if count > 256 {
+                    return Err(StorageError::corrupted("too many choice options"));
+                }
+                let mut options = Vec::new();
+                for _ in 0..count {
+                    options.push(ChoiceOption {
+                        id: self.str()?,
+                        description: self.str()?,
+                    });
+                }
+                DecisionQuestion::Choice { prompt, options }
+            }
+            1 => DecisionQuestion::BinaryProbability { prompt },
+            2 => {
+                let count = self.u32()?;
+                if count > 256 {
+                    return Err(StorageError::corrupted("too many score levels"));
+                }
+                let mut levels = Vec::new();
+                for _ in 0..count {
+                    levels.push(ScoreLevel {
+                        value: self.u32()? as i32,
+                        description: self.str()?,
+                    });
+                }
+                DecisionQuestion::OrdinalScore { prompt, levels }
+            }
+            _ => return Err(StorageError::corrupted("invalid decision primitive")),
+        };
+        let work = DecisionWork {
+            frozen,
+            request: DecisionRequest {
+                schema_version,
+                state,
+                question,
+            },
+        };
+        work.validate().map_err(StorageError::corrupted)?;
+        Ok(work)
     }
     pub(super) fn config_ref(&mut self) -> DecodeResult<ConfigRef> {
         Ok(ConfigRef {
@@ -487,6 +734,10 @@ impl Enc {
                         self.u8(0);
                         self.frozen_execution(frozen);
                     }
+                    TurnExecution::Decision(work) => {
+                        self.u8(2);
+                        self.decision_work(work);
+                    }
                     TurnExecution::Ref(owner) => {
                         self.u8(1);
                         self.u128(owner.get());
@@ -496,7 +747,6 @@ impl Enc {
                     PlanSource::Stored {
                         previous,
                         dependencies,
-                        preparation,
                     } => {
                         self.u8(0);
                         self.ou128(previous.map(JobId::get));
@@ -505,7 +755,6 @@ impl Enc {
                             self.u128(job.get());
                             self.u8(condition.code());
                         }
-                        self.opt(preparation, |e, p| e.context_preparation(p));
                     }
                     PlanSource::Process {
                         project,
@@ -550,36 +799,6 @@ impl Enc {
             NoticeEvent::IterationCompleted => self.u8(9),
             NoticeEvent::RecurrenceHalted => self.u8(10),
         }
-    }
-    pub(super) fn context_preparation(&mut self, prep: &ContextPreparation) {
-        self.u8(prep.status.code());
-        self.u32(prep.source_boundaries.len() as u32);
-        for boundary in &prep.source_boundaries {
-            self.u128(boundary.turn.get());
-            self.u32(boundary.offset);
-            self.u32(boundary.length);
-        }
-        self.opt(&prep.source_fingerprint, |e, fp| {
-            e.u32(fp.digest.len() as u32);
-            for &b in &fp.digest {
-                e.u8(b);
-            }
-            e.u32(fp.schema_version);
-        });
-        self.opt(&prep.producing_artifact_job, |e, job| {
-            e.u128(job.get());
-        });
-        self.opt(&prep.artifact_id, |e, id| {
-            e.u64(id.get());
-        });
-        self.opt(&prep.adoption_id, |e, id| {
-            e.u64(id.get());
-        });
-        self.opt(&prep.context_use, |e, use_| {
-            e.u32(use_.input_tokens);
-            e.u32(use_.retained_turns);
-            e.u32(use_.summarized_turns);
-        });
     }
     pub(super) fn response_format(&mut self, format: &ResponseFormat) {
         match format {
@@ -638,6 +857,18 @@ impl Enc {
                 self.u8(5);
                 self.u64(*n);
             }
+            Entry::ContextPreparation {
+                job,
+                policy_revision,
+            } => {
+                self.u8(7);
+                self.u128(job.get());
+                self.u64(*policy_revision);
+            }
+            Entry::ContextUse { artifact } => {
+                self.u8(8);
+                self.ou128(artifact.map(JobId::get));
+            }
             Entry::ResponseFormat { format } => {
                 self.u8(6);
                 self.response_format(format);
@@ -651,47 +882,6 @@ pub(crate) fn encode_response_format(format: &ResponseFormat) -> Vec<u8> {
     e.0
 }
 impl Dec<'_> {
-    fn context_preparation(&mut self) -> DecodeResult<ContextPreparation> {
-        let status = self.code(PreparationStatus::from_code)?;
-        let mut source_boundaries = Vec::new();
-        for _ in 0..self.u32()? {
-            source_boundaries.push(SourceBoundary {
-                turn: JobId::new(self.u128()?),
-                offset: self.u32()?,
-                length: self.u32()?,
-            });
-        }
-        let source_fingerprint = self.opt(|d| {
-            let len = d.u32()? as usize;
-            let mut digest = Vec::new();
-            for _ in 0..len {
-                digest.push(d.u8()?);
-            }
-            Ok(SourceFingerprint {
-                digest,
-                schema_version: d.u32()?,
-            })
-        })?;
-        let producing_artifact_job = self.opt(|d| Ok(JobId::new(d.u128()?)))?;
-        let artifact_id = self.opt(|d| Ok(ArtifactId::new(d.u64()?)))?;
-        let adoption_id = self.opt(|d| Ok(AdoptionId::new(d.u64()?)))?;
-        let context_use = self.opt(|d| {
-            Ok(ContextUse {
-                input_tokens: d.u32()?,
-                retained_turns: d.u32()?,
-                summarized_turns: d.u32()?,
-            })
-        })?;
-        Ok(ContextPreparation {
-            status,
-            source_boundaries,
-            source_fingerprint,
-            producing_artifact_job,
-            artifact_id,
-            adoption_id,
-            context_use,
-        })
-    }
     fn response_format(&mut self) -> DecodeResult<ResponseFormat> {
         Ok(match self.u8()? {
             0 => ResponseFormat::JsonObject,
@@ -743,6 +933,7 @@ impl Dec<'_> {
                 execution: match self.u8()? {
                     0 => TurnExecution::Frozen(self.frozen_execution()?),
                     1 => TurnExecution::Ref(JobId::new(self.u128()?)),
+                    2 => TurnExecution::Decision(self.decision_work()?),
                     _ => return Err(StorageError::corrupted("invalid execution")),
                 },
                 plan_source: match self.u8()? {
@@ -758,7 +949,6 @@ impl Dec<'_> {
                         PlanSource::Stored {
                             previous,
                             dependencies,
-                            preparation: self.opt(Dec::context_preparation)?,
                         }
                     }
                     1 => PlanSource::Process {
@@ -837,6 +1027,13 @@ impl Dec<'_> {
                 by: self.actor()?,
             },
             5 => Entry::Iteration { n: self.u64()? },
+            7 => Entry::ContextPreparation {
+                job: JobId::new(self.u128()?),
+                policy_revision: self.u64()?,
+            },
+            8 => Entry::ContextUse {
+                artifact: self.ou128()?.map(JobId::new),
+            },
             6 => Entry::ResponseFormat {
                 format: self.response_format()?,
             },
@@ -860,6 +1057,14 @@ mod responses_protocol_tests {
             LlmTransport::from_code(2),
             Some(LlmTransport::OpenAiResponses)
         );
-        assert_eq!(FORMAT_VERSION, 27);
+        assert_eq!(FORMAT_VERSION, 28);
+    }
+    #[test]
+    fn older_decision_foundation_formats_are_refused_at_open() {
+        for version in [26u32, 27] {
+            assert!(
+                matches!(super::super::open::format_verdict(Some(FORMAT_NAME.to_vec()), Some(version.to_le_bytes().to_vec()), 1), Err(super::super::OpenError::UnsupportedFormat { found }) if found == version)
+            );
+        }
     }
 }

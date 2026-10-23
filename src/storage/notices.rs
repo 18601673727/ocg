@@ -33,7 +33,10 @@ fn completed_class(causes: &BTreeSet<EntryKind>) -> Option<NoticeClass> {
     let mut class = None;
     for cause in causes {
         match cause {
-            EntryKind::UserMessage | EntryKind::ResponseFormat => {}
+            EntryKind::UserMessage
+            | EntryKind::ContextPreparation
+            | EntryKind::ContextUse
+            | EntryKind::ResponseFormat => {}
             EntryKind::AgentMessage => return Some(NoticeClass::Attention),
             EntryKind::Notice | EntryKind::Decision | EntryKind::RetryOf | EntryKind::Iteration => {
                 class = Some(NoticeClass::Progress)
@@ -152,7 +155,12 @@ impl Batch {
             {
                 let (key, bytes) = entry?;
                 let kind = TurnEntry::decode(bytes.value())?.entry.kind();
-                if kind == EntryKind::ResponseFormat {
+                if matches!(
+                    kind,
+                    EntryKind::ResponseFormat
+                        | EntryKind::ContextPreparation
+                        | EntryKind::ContextUse
+                ) {
                     continue;
                 }
                 causes.insert(

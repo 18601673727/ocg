@@ -374,6 +374,13 @@ impl Batch {
                 }
             }
             ConfigBody::Agent(agent) => {
+                if let Some(decision) = agent.decision_assistance {
+                    self.require_config_kind(decision, ConfigKind::DecisionAgent)?;
+                }
+                if let Some(policy) = agent.compaction_policy {
+                    self.check_compaction_policy(&policy)?;
+                }
+
                 if agent.approve.windows(2).any(|pair| pair[0] >= pair[1]) {
                     return self.reject(Violation::InvalidValue(
                         "approve",
@@ -418,7 +425,30 @@ impl Batch {
             }
             ConfigBody::DecisionModel(dm) => {
                 self.require_config_kind(dm.connection_id, ConfigKind::Connection)?;
-                if dm.model.is_empty() || dm.model.len() > 512 {
+                for (question, request) in [
+                    (
+                        dm.limits.max_input_tokens_per_question,
+                        dm.limits.max_input_tokens_per_request,
+                    ),
+                    (
+                        dm.limits.max_output_tokens_per_question,
+                        dm.limits.max_output_tokens_per_request,
+                    ),
+                ] {
+                    if question.zip(request).is_some_and(|(q, r)| q > r) {
+                        return self.reject(Violation::InvalidValue(
+                            "limits",
+                            "per-question limit cannot exceed per-request limit",
+                        ));
+                    }
+                }
+                if dm.declared_capabilities.is_empty() {
+                    return self.reject(Violation::InvalidValue(
+                        "declared_capabilities",
+                        "decision models require at least one supported primitive",
+                    ));
+                }
+                if dm.model.trim().is_empty() || dm.model.len() > 512 {
                     return self.reject(Violation::InvalidValue("model", "must be 1 to 512 bytes"));
                 }
                 if dm
@@ -463,6 +493,24 @@ impl Batch {
                 }
             }
             ConfigBody::DecisionAgent(da) => {
+                if da
+                    .instructions
+                    .as_ref()
+                    .is_some_and(|text| text.len() > 64 * 1024)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "instructions",
+                        "decision instructions exceed 64 KiB",
+                    ));
+                }
+                // Empty model lists are valid drafts, but cannot be frozen for execution.
+                if da.models.len() > 256 {
+                    return self.reject(Violation::InvalidValue(
+                        "models",
+                        "at most 256 decision targets",
+                    ));
+                }
+
                 if da.models.windows(2).any(|pair| pair[0] >= pair[1]) {
                     return self.reject(Violation::InvalidValue(
                         "models",
@@ -481,6 +529,35 @@ impl Batch {
                         "must be one of the Agent's models",
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_compaction_policy(
+        &mut self,
+        policy: &crate::persistence::CompactionPolicy,
+    ) -> Result<(), BatchError> {
+        if let Err(reason) = policy.validate() {
+            return self.reject(Violation::InvalidValue("compaction_policy", reason));
+        }
+        if let Some(model) = policy.summarization_model {
+            self.require_config_kind(model, ConfigKind::Model)?;
+        }
+        if let Some(predictive) = policy.predictive {
+            let agent =
+                self.require_config_kind(predictive.decision_agent, ConfigKind::DecisionAgent)?;
+            let ConfigBody::DecisionAgent(body) = agent.body else {
+                return self.corrupted("mismatched decision agent".into());
+            };
+            if body.models.is_empty() {
+                return self.reject(Violation::InvalidValue(
+                    "decision_agent",
+                    "predictive compaction requires a configured decision model",
+                ));
+            }
+            for model in body.models {
+                self.require_config_kind(model, ConfigKind::DecisionModel)?;
             }
         }
         Ok(())
@@ -649,7 +726,7 @@ impl Batch {
 
     pub(crate) fn archive_model(&mut self, id: ConfigId) -> Result<(), BatchError> {
         let mut row = self.require_config(id)?;
-        if row.kind != ConfigKind::Model {
+        if !matches!(row.kind, ConfigKind::Model | ConfigKind::DecisionModel) {
             return self.reject(Violation::WrongConfigKind {
                 config: id,
                 expected: ConfigKind::Model,
@@ -664,7 +741,19 @@ impl Batch {
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
                 let row = ConfigRow::decode_at(key.value(), value.value())?;
-                if row.archived_at.is_none() && matches!(&row.body, ConfigBody::Agent(agent) if agent.models.contains(&id) || agent.default_model == Some(id)) {
+                let references_model = match &row.body {
+                    ConfigBody::Agent(agent) => {
+                        agent.models.contains(&id) || agent.default_model == Some(id)
+                    }
+                    ConfigBody::DecisionAgent(agent) => {
+                        agent.models.contains(&id) || agent.default_model == Some(id)
+                    }
+                    ConfigBody::Connection(_)
+                    | ConfigBody::Model(_)
+                    | ConfigBody::DecisionModel(_)
+                    | ConfigBody::Pool(_) => false,
+                };
+                if row.archived_at.is_none() && references_model {
                     agents.push(row);
                 }
             }
@@ -672,6 +761,12 @@ impl Batch {
         })?;
         for mut agent_row in agents {
             if let ConfigBody::Agent(agent) = &mut agent_row.body {
+                agent.models.retain(|model| *model != id);
+                if agent.default_model == Some(id) {
+                    agent.default_model = None;
+                }
+            }
+            if let ConfigBody::DecisionAgent(agent) = &mut agent_row.body {
                 agent.models.retain(|model| *model != id);
                 if agent.default_model == Some(id) {
                     agent.default_model = None;

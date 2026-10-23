@@ -112,6 +112,8 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
             | Entry::Notice { .. }
             | Entry::Decision { .. }
             | Entry::Iteration { .. }
+            | Entry::ContextPreparation { .. }
+            | Entry::ContextUse { .. }
             | Entry::ResponseFormat { .. } => {}
         }
     }

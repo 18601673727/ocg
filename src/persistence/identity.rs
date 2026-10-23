@@ -59,6 +59,18 @@ macro_rules! record_id_type {
             }
         }
 
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_str(self)
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+                text.parse().map_err(serde::de::Error::custom)
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 uuid::Uuid::from_u128(self.0).hyphenated().fmt(f)
@@ -137,7 +149,10 @@ impl From<ExecutionPoolId> for ConfigId {
 /// the rounds of a tool loop; every Metrics and AvailabilityStat record
 /// belongs to exactly one of them, and evidence is reduced per request,
 /// never across the requests of a Job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "u32", into = "u32")]
 pub struct RequestNumber(u32);
 
 impl RequestNumber {
@@ -163,6 +178,18 @@ impl RequestNumber {
     }
 }
 
+impl TryFrom<u32> for RequestNumber {
+    type Error = &'static str;
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("request number must be nonzero")
+    }
+}
+impl From<RequestNumber> for u32 {
+    fn from(value: RequestNumber) -> Self {
+        value.get()
+    }
+}
+
 impl fmt::Display for RequestNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "request {}", self.0)
@@ -170,7 +197,10 @@ impl fmt::Display for RequestNumber {
 }
 
 /// One Provider request: the Job that sent it and its number in that Job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct RequestRef {
     pub job: JobId,
     pub request: RequestNumber,

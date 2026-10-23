@@ -68,11 +68,11 @@ export type WireInput = { id: string, objective: string | null, submitted_at_us:
 
 export type WireJobInput = { job: string, input: WireInput, };
 
-export type WireEntry = { "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [string, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, });
+export type WireEntry = { "kind": "context_preparation", job: string, policy_revision: string, } | { "kind": "context_use", artifact: string | null, } | { "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [string, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, });
 
 export type WireResponseFormat = { "type": "json_object" } | { "type": "json_schema", name: string, };
 
-export type WireTurnEntry = { seq: number, at_us: number, } & ({ "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [string, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, }));
+export type WireTurnEntry = { seq: number, at_us: number, } & ({ "kind": "context_preparation", job: string, policy_revision: string, } | { "kind": "context_use", artifact: string | null, } | { "kind": "user_message", text: string, attachments: Array<string>, } | { "kind": "agent_message", text: string, call: string, } | { "kind": "notice", child: string, event: string, reference: string, } | { "kind": "decision", approval: [string, number, number], } | { "kind": "retry_of", turn: string, by: WireActor, } | { "kind": "iteration", n: number, } | { "kind": "response_format", } & ({ "type": "json_object" } | { "type": "json_schema", name: string, }));
 
 export type WireUncertainCall = { request: number, index: number, tool: string, argv: string, };
 

@@ -16,7 +16,15 @@ fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow
         ));
     }
     let frozen = match job.configuration {
-        Some(configuration) => Some(batch.freeze_configuration(configuration)?),
+        Some(configuration) => match batch.freeze_configuration(configuration)? {
+            FrozenConfiguration::Generative(frozen) => Some(frozen),
+            FrozenConfiguration::Decision(_) => {
+                return batch.reject(Violation::InvalidValue(
+                    "execution",
+                    "decision work requires the typed decision runtime",
+                ));
+            }
+        },
         None => None,
     };
     if stored && job.eligible_at.is_some() {
@@ -60,7 +68,6 @@ fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow
                 PlanSource::Stored {
                     previous: job.previous,
                     dependencies: Vec::new(),
-                    preparation: None,
                 }
             } else {
                 PlanSource::Process {
@@ -617,6 +624,24 @@ pub(crate) fn set_conversation(
     match edit {
         ConversationEdit::Limits(limits) => {
             return batch.set_conversation_limits(root, limits, super::Actor::User);
+        }
+        ConversationEdit::CompactionPolicy(policy) => {
+            if let Some(policy) = policy {
+                batch.check_compaction_policy(&policy)?;
+            }
+            if row.compaction_policy == policy {
+                return Ok(());
+            }
+            row.compaction_policy = policy;
+            row.compaction_revision = match row.compaction_revision.checked_add(1) {
+                Some(revision) => revision,
+                None => {
+                    return batch.reject(Violation::InvalidValue(
+                        "compaction_policy",
+                        "policy revision exhausted",
+                    ));
+                }
+            };
         }
         ConversationEdit::Title(title) => row.title = Some(title),
         ConversationEdit::SuggestedTitle(_) if row.title.is_some() => return Ok(()),

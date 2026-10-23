@@ -14,12 +14,12 @@ mod availability;
 mod conversations;
 pub(crate) use conversations::parse_suggested_title;
 pub use conversations::{
-    Actor, AdoptionId, Appended, ArtifactId, CompactionMode, CompactionPolicy, ContextPreparation,
-    ContextUse, ConversationAction, ConversationLimits, ConversationSpec, CustomPolicy, Entry,
-    EntryKind, JobKind, MAX_CONVERSATION_DEPTH, Notice, NoticeBody, NoticeClass, NoticeEvent,
-    Origin, PlanSource, PreparationStatus, RecordEvent, Recurrence, RecurrenceHalt,
-    RecurrencePhase, ResponseFormat, SourceBoundary, SourceFingerprint, StopCause, StopProof,
-    TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
+    Actor, Appended, CompactionMode, CompactionPolicy, CompactionPreset, ContextSourceManifest,
+    ConversationAction, ConversationLimits, ConversationSpec, CustomPolicy, Entry, EntryKind,
+    JobKind, MAX_CONVERSATION_DEPTH, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin,
+    PlanSource, PredictiveCompaction, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
+    ResponseFormat, SourceBoundary, StopCause, StopProof, SummarizationResult, TITLE_JOB_NAME,
+    TurnEntry, TurnExecution, title_prompt,
 };
 mod execution;
 mod identity;
@@ -39,9 +39,11 @@ pub use availability::{
     ObservedModelFilter, ObservedModelPage, RejectionCause, TimeRange, UnavailableCause,
 };
 pub use execution::{
-    AppendedOutput, DependencyCondition, DependencyState, ExecutionConfiguration, FinalResult,
-    IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, NewExecutor, NewJob,
-    NewJobOutput, OutputKind,
+    AppendedOutput, ChoiceOption, DECISION_SCHEMA_VERSION, DecisionAnswer, DecisionConfidence,
+    DecisionOutcome, DecisionQuestion, DecisionRequest, DecisionResult, DecisionWork,
+    DependencyCondition, DependencyState, ExecutionConfiguration, FinalResult,
+    IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, MAX_DECISION_OPTIONS,
+    MAX_DECISION_REQUEST_BYTES, NewExecutor, NewJob, NewJobOutput, OutputKind, ScoreLevel,
 };
 pub use identity::{
     AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,
@@ -64,17 +66,18 @@ pub use records::{
     AttachmentRecord, BUILT_IN_COMMANDS, CapabilitySet, ClaimRecord, CleanupKind, ConfigBody,
     ConfigKind, ConfigRecord, ConfigRef, ConnectionConfig, ContentDigest, ConversationEdit,
     DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
-    ExecutionOperation, ExecutionPool, ExecutionPoolConfig, ExecutorRecord, FrozenExecutionConfig,
-    FrozenLlmConfig, JobInputRecord, JobOutputRecord, JobRecord, LlmConfig, LlmParameters,
-    LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES,
-    MAX_ATTACHMENT_NAME_BYTES, Measurements, MetricsRecord, ModelCapability, ModelConfig,
-    NewAttachment, NewConfig, NewExecutionPool, NewMetrics, NewProject, NewSubmission,
-    OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey, PendingJobsPage, PoolConfig,
-    ProjectCommand, ProjectRecord, ProviderSnapshot, RequestEventRecord, RequestFingerprint,
-    RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord, SubmittedConfiguration,
-    ToolCallRecord, ToolStatRecord, USAGE_SUMMARY_HOUR_MICROS, UsageBucketResponse, UsageBucketRow,
-    UsageBucketWidth, UsageBucketing, UsageCursor, UsageRetryRow, UsageSummaryFilter,
-    UsageSummaryResponse, UsageSummaryRow, WorkspaceAccess, validate_project_commands,
+    ExecutionOperation, ExecutionPool, ExecutionPoolConfig, ExecutorRecord, FrozenConfiguration,
+    FrozenDecisionConfig, FrozenExecutionConfig, FrozenLlmConfig, JobInputRecord, JobOutputRecord,
+    JobRecord, LlmConfig, LlmParameters, LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_MIME_BYTES, MAX_ATTACHMENT_NAME_BYTES, Measurements, MetricsRecord,
+    ModelCapability, ModelConfig, NewAttachment, NewConfig, NewExecutionPool, NewMetrics,
+    NewProject, NewSubmission, OutcomeCause, OutcomeKind, OutcomeRecord, PendingJobKey,
+    PendingJobsPage, PoolConfig, ProjectCommand, ProjectRecord, ProviderSnapshot,
+    RequestEventRecord, RequestFingerprint, RequestPayload, RequestPayloadKind, SubmissionKey,
+    SubmissionRecord, SubmittedConfiguration, ToolCallRecord, ToolStatRecord,
+    USAGE_SUMMARY_HOUR_MICROS, UsageBucketResponse, UsageBucketRow, UsageBucketWidth,
+    UsageBucketing, UsageCursor, UsageRetryRow, UsageSummaryFilter, UsageSummaryResponse,
+    UsageSummaryRow, WorkspaceAccess, validate_project_commands,
 };
 pub use scheduling::*;
 pub use tool_evidence::{

@@ -272,6 +272,16 @@ pub(super) fn entry_json(seq: u32, entry: &crate::persistence::TurnEntry) -> Wir
             turn: turn.to_string(),
             by: actor_view(by),
         },
+        Entry::ContextPreparation {
+            job,
+            policy_revision,
+        } => WireEntry::ContextPreparation {
+            job: job.to_string(),
+            policy_revision: policy_revision.to_string(),
+        },
+        Entry::ContextUse { artifact } => WireEntry::ContextUse {
+            artifact: artifact.map(|job| job.to_string()),
+        },
         Entry::Iteration { n } => WireEntry::Iteration { n: *n },
         Entry::ResponseFormat { format } => WireEntry::ResponseFormat {
             format: match format {

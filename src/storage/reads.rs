@@ -52,6 +52,11 @@ pub(super) fn turn_execution(
     };
     let execution = match execution {
         TurnExecution::Frozen(execution) => execution.clone(),
+        TurnExecution::Decision(_) => {
+            return Err(StorageError::corrupted(
+                "decision work cannot use the generative context reader",
+            ));
+        }
         TurnExecution::Ref(owner) => {
             let bytes = jobs
                 .get(owner.get())?
@@ -1857,6 +1862,8 @@ fn conversation_matches(
                 | Entry::Decision { .. }
                 | Entry::RetryOf { .. }
                 | Entry::Iteration { .. }
+                | Entry::ContextPreparation { .. }
+                | Entry::ContextUse { .. }
                 | Entry::ResponseFormat { .. } => continue,
             };
             let text = text.to_lowercase();
@@ -2374,6 +2381,21 @@ pub(crate) fn read_conversation_turns(
     Ok(turns)
 }
 
+pub(crate) fn read_compaction_policy(
+    database: &Database,
+    conversation: JobId,
+) -> Result<Option<(Option<crate::persistence::CompactionPolicy>, u64)>, StorageError> {
+    let rx = read(database)?;
+    let Some(job) = read_job_row(&rx, conversation)? else {
+        return Ok(None);
+    };
+    if !job.kind.is_conversation() {
+        return Ok(None);
+    }
+    let row = read_conversation(&rx, conversation)?;
+    Ok(Some((row.compaction_policy, row.compaction_revision)))
+}
+
 pub(crate) fn read_conversation_limits(
     database: &Database,
     conversation: JobId,
@@ -2466,7 +2488,10 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
                 for (_, original) in turn_entries(rx, *current)? {
                     if !matches!(
                         original.entry,
-                        Entry::RetryOf { .. } | Entry::ResponseFormat { .. }
+                        Entry::RetryOf { .. }
+                            | Entry::ResponseFormat { .. }
+                            | Entry::ContextPreparation { .. }
+                            | Entry::ContextUse { .. }
                     ) {
                         text.push('\n');
                         text.push_str(&entry_text(rx, &original.entry)?);
@@ -2528,7 +2553,9 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
             }
         }
         Entry::Iteration { n } => format!("Iteration {n}"),
-        Entry::ResponseFormat { .. } => String::new(),
+        Entry::ResponseFormat { .. }
+        | Entry::ContextPreparation { .. }
+        | Entry::ContextUse { .. } => String::new(),
     })
 }
 pub(crate) fn read_turn_context(
@@ -2615,7 +2642,12 @@ pub(crate) fn read_turn_context(
             iteration_context
                 .is_none_or(|(first, previous)| Some(id) != previous || id == first || id == turn)
         }) {
-            if matches!(entry.entry, Entry::ResponseFormat { .. }) {
+            if matches!(
+                entry.entry,
+                Entry::ResponseFormat { .. }
+                    | Entry::ContextPreparation { .. }
+                    | Entry::ContextUse { .. }
+            ) {
                 continue;
             }
             if !text.is_empty() {

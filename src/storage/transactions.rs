@@ -11,10 +11,10 @@ use redb::ReadableTableMetadata;
 use super::*;
 use crate::persistence::{
     ClaimGrant, ClaimRecord, ClaimRefusal, ConfigBody, ConfigId, ConfigKind, DependencyCondition,
-    DependencyState, ExecutionConfiguration, FrozenPoolBinding, GLOBAL_EXECUTION_LIMIT, LlmConfig,
-    OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig, Recorded, RequestFingerprint,
-    SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome,
-    Violation,
+    DependencyState, ExecutionConfiguration, FrozenConfiguration, FrozenDecisionConfig,
+    FrozenPoolBinding, GLOBAL_EXECUTION_LIMIT, LlmConfig, OutcomeCause, OutcomeKind, OutcomeRecord,
+    PoolConfig, Recorded, RequestFingerprint, SubmissionKey, SubmissionRecord, ToolCallRef,
+    ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
 };
 
 /// The key of a Job in `ready`: what a Pool must offer to run it. The high
@@ -163,6 +163,18 @@ impl Batch {
     /// All T1 refusals occur before allocating or writing any rows. Event
     /// appends can keep their source transaction and fall back to a notice.
     pub(crate) fn validate_spec(&mut self, spec: &JobRow) -> Result<(), BatchError> {
+        if matches!(
+            spec.kind,
+            JobKind::Turn {
+                execution: TurnExecution::Decision(_),
+                ..
+            }
+        ) {
+            return self.reject(Violation::InvalidValue(
+                "execution",
+                "decision work requires the typed decision runtime",
+            ));
+        }
         self.check_spec_references(spec)?;
         for (dependency, _) in spec.kind.dependencies() {
             if Some(*dependency) == spec.kind.previous() {
@@ -329,7 +341,13 @@ impl Batch {
     pub(crate) fn freeze_configuration(
         &mut self,
         configuration: ExecutionConfiguration,
-    ) -> Result<FrozenExecutionConfig, BatchError> {
+    ) -> Result<FrozenConfiguration, BatchError> {
+        let selected = self.require_config(configuration.llm_profile.into())?;
+        if selected.kind == ConfigKind::DecisionModel {
+            return self
+                .freeze_decision_configuration(configuration)
+                .map(FrozenConfiguration::Decision);
+        }
         let model =
             self.require_config_kind(configuration.llm_profile.into(), ConfigKind::Model)?;
         let ConfigBody::Model(model_body) = model.body.clone() else {
@@ -362,7 +380,7 @@ impl Batch {
                 )
             }
         };
-        Ok(FrozenExecutionConfig {
+        Ok(FrozenConfiguration::Generative(FrozenExecutionConfig {
             agent,
             agent_ref,
             llm: FrozenLlmConfig {
@@ -385,6 +403,56 @@ impl Batch {
                     edit_seq: model.edit_seq,
                 },
             },
+        }))
+    }
+
+    fn freeze_decision_configuration(
+        &mut self,
+        configuration: ExecutionConfiguration,
+    ) -> Result<FrozenDecisionConfig, BatchError> {
+        let Some(agent_profile) = configuration.agent_profile else {
+            return self.reject(Violation::InvalidValue(
+                "agent",
+                "decision execution requires a Decision Profile",
+            ));
+        };
+        let model =
+            self.require_config_kind(configuration.llm_profile.into(), ConfigKind::DecisionModel)?;
+        let ConfigBody::DecisionModel(model_body) = model.body else {
+            return self.corrupted("mismatched decision model".into());
+        };
+        let agent = self.require_config_kind(agent_profile.into(), ConfigKind::DecisionAgent)?;
+        let ConfigBody::DecisionAgent(agent_body) = agent.body else {
+            return self.corrupted("mismatched decision agent".into());
+        };
+        if !agent_body.models.contains(&model.id) {
+            return self.reject(Violation::NotAConfiguredTarget {
+                agent_profile,
+                llm_profile: configuration.llm_profile,
+            });
+        }
+        let connection =
+            self.require_config_kind(model_body.connection_id, ConfigKind::Connection)?;
+        let ConfigBody::Connection(connection_body) = connection.body else {
+            return self.corrupted("mismatched connection".into());
+        };
+        Ok(FrozenDecisionConfig {
+            agent: agent_body,
+            agent_ref: ConfigRef {
+                id: agent.id,
+                edit_seq: agent.edit_seq,
+            },
+            model: model_body,
+            model_ref: ConfigRef {
+                id: model.id,
+                edit_seq: model.edit_seq,
+            },
+            connection_ref: ConfigRef {
+                id: connection.id,
+                edit_seq: connection.edit_seq,
+            },
+            endpoint: connection_body.endpoint,
+            credential_ref: connection_body.credential_ref,
         })
     }
 

@@ -10,7 +10,7 @@ type ProjectedManagedAgent = Omit<Wire.WireManagedAgent, "approve" | "dispatch_t
   default_model?: Wire.WireManagedAgent["default_model"];
 };
 type ProjectedEntry<E = Wire.WireTurnEntry> = E extends unknown
-  ? Omit<E, "text" | "attachments" | "call" | "child" | "event" | "reference" | "approval" | "turn" | "by" | "n" | "type" | "name">
+  ? Omit<E, "text" | "attachments" | "call" | "child" | "event" | "reference" | "approval" | "turn" | "by" | "n" | "type" | "name" | "job" | "policy_revision" | "artifact">
     & { text: string | null; attachments: string[] }
   : never;
 type ProjectedTurn = Omit<Wire.WireTurn, "entries" | "configuration" | "uncertain_calls"> & {
@@ -127,8 +127,8 @@ function outputRecord(input: unknown) {
   const seq = integer(output.seq, "output.seq");
   if (seq === 0) throw new ContractError("output.seq", "a positive stored sequence");
   const kind = output.kind;
-  if (kind !== "progress" && kind !== "evaluation" && kind !== "result" && kind !== "reasoning") {
-    throw new ContractError("output.kind", "progress, evaluation, result or reasoning");
+  if (kind !== "progress" && kind !== "evaluation" && kind !== "result" && kind !== "reasoning" && kind !== "decision" && kind !== "summarization") {
+    throw new ContractError("output.kind", "progress, evaluation, result, reasoning, decision or summarization");
   }
   if (output.goal_reached !== null && typeof output.goal_reached !== "boolean") {
     throw new ContractError("output.goal_reached", "a boolean or null");
@@ -657,8 +657,8 @@ export function decodeConversationTurns(input: unknown, conversationId: string) 
     const job = jobRecord(turn.job);
     const entries = listOf(turn.entries, `${path}.entries`, (input, path) => {
       const entry = record(input, path);
-      const kind = oneOf(entry.kind, `${path}.kind`, ["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format"] as const);
-      if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
+      const kind = oneOf(entry.kind, `${path}.kind`, ["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format", "context_preparation", "context_use"] as const);
+      if (!["user_message", "agent_message", "notice", "decision", "retry_of", "iteration", "response_format", "context_preparation", "context_use"].includes(kind)) throw new ContractError(`${path}.kind`, "a turn entry kind");
       return { seq: integer(entry.seq, `${path}.seq`), kind, text: entry.text === undefined ? null : string(entry.text, `${path}.text`), attachments: entry.attachments === undefined ? [] : listOf(entry.attachments, `${path}.attachments`, (id, path) => identity(id, path)), at_us: integer(entry.at_us, `${path}.at_us`) } satisfies ProjectedEntry;
     });
     const userEntries = entries.filter(entry => entry.kind === "user_message" || entry.kind === "agent_message");

@@ -144,7 +144,9 @@ pub struct JobInputRecord {
 /// The SHA-256 of an Attachment's content. It names the immutable file
 /// that holds the content, never the Attachment: several Attachments may
 /// share one content file.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ContentDigest([u8; 32]);
 
 impl ContentDigest {
@@ -382,6 +384,7 @@ pub struct JobOutputRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConversationEdit {
     Limits(super::ConversationLimits),
+    CompactionPolicy(Option<super::CompactionPolicy>),
     Title(String),
     SuggestedTitle(String),
     /// Hides it from the conversation list, for good.
@@ -538,33 +541,39 @@ impl ModelCapability {
 }
 
 /// A capability a user declares for a decision model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionCapability {
     Choice,
-    Score,
-    Noul,
+    OrdinalScore,
+    BinaryProbability,
 }
 
 impl DecisionCapability {
     pub fn code(self) -> u8 {
         match self {
             Self::Choice => 1,
-            Self::Score => 2,
-            Self::Noul => 3,
+            Self::OrdinalScore => 2,
+            Self::BinaryProbability => 3,
         }
     }
     pub fn from_code(code: u8) -> Option<Self> {
         match code {
             1 => Some(Self::Choice),
-            2 => Some(Self::Score),
-            3 => Some(Self::Noul),
+            2 => Some(Self::OrdinalScore),
+            3 => Some(Self::BinaryProbability),
             _ => None,
         }
     }
 }
 
 /// What workspace state a decision agent may read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceAccess {
     /// No access to files, diagnostics, or other workspace state.
     None,
@@ -593,9 +602,10 @@ impl WorkspaceAccess {
 }
 
 /// The protocol a decision model speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DecisionProtocol {
-    /// TypeSafe System One JSON-RPC protocol.
+    /// TypeSafe System One REST JSON protocol.
     TypeSafeSystemOne,
 }
 
@@ -666,6 +676,8 @@ pub struct AgentConfig {
     pub dispatch_to: Vec<ConfigId>,
     pub approve: Vec<ApproveClass>,
     pub tool_grant: Option<String>,
+    pub decision_assistance: Option<ConfigId>,
+    pub compaction_policy: Option<CompactionPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -723,12 +735,15 @@ impl Default for AgentConfig {
             dispatch_to: Vec::new(),
             approve: Vec::new(),
             tool_grant: None,
+            decision_assistance: None,
+            compaction_policy: None,
         }
     }
 }
 
 /// Limits for a decision model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionLimits {
     pub max_input_tokens_per_request: Option<u32>,
     pub max_output_tokens_per_request: Option<u32>,
@@ -737,7 +752,8 @@ pub struct DecisionLimits {
 }
 
 /// The body of a Decision Model config.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionModelConfig {
     pub connection_id: ConfigId,
     pub model: String,
@@ -747,7 +763,8 @@ pub struct DecisionModelConfig {
 }
 
 /// The body of a Decision Agent config.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionAgentConfig {
     pub instructions: Option<String>,
     pub models: Vec<ConfigId>,
@@ -904,7 +921,7 @@ pub struct ProviderSnapshot {
 }
 
 /// A config row and the edit counter it had when a Job froze its values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConfigRef {
     pub id: ConfigId,
     pub edit_seq: u32,
@@ -1245,4 +1262,27 @@ pub struct UsageBucketResponse {
     pub complete: bool,
     pub resume_after: Option<UsageCursor>,
     pub rows: Vec<UsageBucketRow>,
+}
+
+/// Tool-free snapshot for the typed decision runtime. References name the
+/// versions captured in one database transaction; credentials remain references.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenDecisionConfig {
+    pub agent: DecisionAgentConfig,
+    pub agent_ref: ConfigRef,
+    pub model: DecisionModelConfig,
+    pub model_ref: ConfigRef,
+    pub connection_ref: ConfigRef,
+    pub endpoint: Option<String>,
+    pub credential_ref: Option<String>,
+}
+
+/// Shared freeze result. A caller must dispatch on execution class; a decision
+/// snapshot cannot be passed to a generative runner by structural coincidence.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum FrozenConfiguration {
+    Generative(FrozenExecutionConfig),
+    Decision(FrozenDecisionConfig),
 }

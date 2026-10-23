@@ -40,140 +40,184 @@ impl ConversationLimits {
     }
 }
 
-/// When to compact conversation context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Automatic policy selection. Preset token budgets are resolved against the
+/// actual generative model by the policy runtime, never by message count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPreset {
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomPolicy {
+    pub trigger_tokens: u32,
+    pub target_tokens: u32,
+    pub reserved_output_tokens: u32,
+    pub minimum_source_tokens: u32,
+    pub minimum_savings_tokens: u32,
+    pub preserve_recent_turns: u32,
+    pub cooldown_seconds: u32,
+}
+
+impl CustomPolicy {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.trigger_tokens == 0
+            || self.target_tokens == 0
+            || self.target_tokens >= self.trigger_tokens
+            || self.reserved_output_tokens == 0
+            || self.minimum_source_tokens == 0
+            || self.minimum_savings_tokens == 0
+            || self.minimum_savings_tokens > self.trigger_tokens - self.target_tokens
+            || self.preserve_recent_turns == 0
+            || self.cooldown_seconds == 0
+        {
+            return Err(
+                "custom policy requires positive token budgets, savings, recent turns and cooldown; target must be below trigger",
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CompactionMode {
     Off,
-    Auto,
-    Custom,
+    Auto { preset: CompactionPreset },
+    Custom { policy: CustomPolicy },
 }
 
-impl CompactionMode {
-    pub fn code(self) -> u8 {
-        match self {
-            Self::Off => 1,
-            Self::Auto => 2,
-            Self::Custom => 3,
-        }
-    }
-    pub fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::Off),
-            2 => Some(Self::Auto),
-            3 => Some(Self::Custom),
-            _ => None,
-        }
-    }
+/// Presence of this binding is explicit predictive opt-in. No default or
+/// assistance assignment may manufacture it. Runtime eligibility is rechecked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictiveCompaction {
+    pub decision_agent: ConfigId,
+    pub minimum_interval_seconds: u32,
+    pub max_preparations: u32,
+    pub max_prediction_tokens: u32,
+    pub max_preparation_tokens: u32,
 }
 
-/// Custom compaction thresholds.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CustomPolicy {
-    pub trigger_fraction: Option<u8>,
-    pub target_fraction: Option<u8>,
-}
-
-/// Context compaction policy for a conversation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
-    pub custom: Option<CustomPolicy>,
+    pub summarization_model: Option<ConfigId>,
+    pub predictive: Option<PredictiveCompaction>,
 }
 
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
-            mode: CompactionMode::Auto,
-            custom: None,
+            mode: CompactionMode::Off,
+            summarization_model: None,
+            predictive: None,
         }
     }
 }
 
-/// Metadata about prepared context for a turn.
-/// Artifact identifier: a summarization Job result that may be adopted by a consuming turn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ArtifactId(pub u64);
-
-impl ArtifactId {
-    pub fn new(value: u64) -> Self {
-        ArtifactId(value)
-    }
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Adoption identity: unique identifier for a specific context-use adoption selection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AdoptionId(pub u64);
-
-impl AdoptionId {
-    pub fn new(value: u64) -> Self {
-        AdoptionId(value)
-    }
-    pub fn get(self) -> u64 {
-        self.0
-    }
-}
-
-/// Source fingerprint: digest of the sealed source boundary for adoption validation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SourceFingerprint {
-    pub digest: Vec<u8>,
-    pub schema_version: u32,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContextPreparation {
-    pub status: PreparationStatus,
-    pub source_boundaries: Vec<SourceBoundary>,
-    pub source_fingerprint: Option<SourceFingerprint>,
-    pub producing_artifact_job: Option<JobId>,
-    pub artifact_id: Option<ArtifactId>,
-    pub adoption_id: Option<AdoptionId>,
-    pub context_use: Option<ContextUse>,
-}
-
-/// Outcome of context preparation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PreparationStatus {
-    Uncompacted,
-    Compacted,
-    CompactionSkipped,
-}
-
-impl PreparationStatus {
-    pub fn code(self) -> u8 {
-        match self {
-            Self::Uncompacted => 1,
-            Self::Compacted => 2,
-            Self::CompactionSkipped => 3,
+impl CompactionPolicy {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let CompactionMode::Custom { policy } = self.mode {
+            policy.validate()?;
         }
-    }
-    pub fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::Uncompacted),
-            2 => Some(Self::Compacted),
-            3 => Some(Self::CompactionSkipped),
-            _ => None,
+        if self.predictive.is_some_and(|p| {
+            p.minimum_interval_seconds == 0
+                || p.max_preparations != 1
+                || p.max_prediction_tokens == 0
+                || p.max_preparation_tokens == 0
+        }) {
+            return Err(
+                "predictive preparation requires positive budgets and interval, with at most one preparation",
+            );
         }
+        Ok(())
+    }
+    /// Whole-policy replacement: conversation > Profile > host. An explicit
+    /// Off policy suppresses inherited automatic behavior. Predictive is off
+    /// unless explicitly present on the selected Profile/conversation policy;
+    /// host defaults never opt a conversation into predictive work.
+    pub fn resolve(host: Self, profile: Option<Self>, conversation: Option<Self>) -> Self {
+        conversation.or(profile).unwrap_or(Self {
+            predictive: None,
+            ..host
+        })
     }
 }
 
-/// Boundary marking a source segment in prepared context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A sealed source range. High-water marks are inclusive input/output
+/// sequences; `content` hashes the exact canonical source bytes captured by
+/// the source reader. Appends beyond these marks remain an uncompacted tail.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceBoundary {
     pub turn: JobId,
-    pub offset: u32,
-    pub length: u32,
+    pub input_through: u32,
+    pub output_through: u32,
+    pub content: ContentDigest,
 }
 
-/// Token usage of prepared context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ContextUse {
-    pub input_tokens: u32,
-    pub retained_turns: u32,
-    pub summarized_turns: u32,
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSourceManifest {
+    pub schema_version: u32,
+    pub conversation: JobId,
+    pub through_turn: JobId,
+    pub turns: Vec<SourceBoundary>,
+    /// An earlier artifact included as source, not a second copy of its text.
+    pub base_artifact: Option<JobId>,
+}
+
+impl ContextSourceManifest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 1
+            || self.turns.is_empty()
+            || self.turns.len() > 4096
+            || self.turns.last().map(|source| source.turn) != Some(self.through_turn)
+            || self.turns.iter().any(|source| source.input_through == 0)
+            || self
+                .turns
+                .windows(2)
+                .any(|pair| pair[0].turn >= pair[1].turn)
+        {
+            return Err("invalid sealed context source manifest");
+        }
+        Ok(())
+    }
+}
+
+/// Stored once in the producing Job's FinalResult.value. The result's Job ID
+/// is the artifact identity; the consuming turn/input sequence is its use identity.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummarizationResult {
+    pub schema_version: u32,
+    pub source: ContextSourceManifest,
+    pub summary: String,
+    /// Information loss is explicit. Original records remain recoverable.
+    pub omitted_details: Vec<String>,
+}
+
+impl SummarizationResult {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.source.validate()?;
+        if self.schema_version != 1
+            || self.summary.trim().is_empty()
+            || self.summary.len() > 1024 * 1024
+            || self.omitted_details.len() > 256
+            || self
+                .omitted_details
+                .iter()
+                .any(|detail| detail.len() > 4096)
+        {
+            return Err("invalid summarization result");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +249,7 @@ pub enum StopProof {
 pub enum TurnExecution {
     Frozen(FrozenExecutionConfig),
     Ref(JobId),
+    Decision(DecisionWork),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -212,7 +257,6 @@ pub enum PlanSource {
     Stored {
         previous: Option<JobId>,
         dependencies: Vec<(JobId, DependencyCondition)>,
-        preparation: Option<ContextPreparation>,
     },
     Process {
         project: Option<ProjectId>,
@@ -349,6 +393,8 @@ pub enum EntryKind {
     RetryOf,
     Iteration,
     ResponseFormat,
+    ContextPreparation,
+    ContextUse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,6 +437,17 @@ pub enum Entry {
     ResponseFormat {
         format: ResponseFormat,
     },
+    /// Internal pre-claim metadata; outcome/status comes from this Job.
+    ContextPreparation {
+        job: JobId,
+        policy_revision: u64,
+    },
+    /// Candidate selection only. Adoption must validate the sealed source in the
+    /// claim transaction before it can affect model context.
+    ContextUse {
+        /// None explicitly selects original context, superseding an earlier candidate.
+        artifact: Option<JobId>,
+    },
 }
 impl Entry {
     pub fn kind(&self) -> EntryKind {
@@ -402,6 +459,8 @@ impl Entry {
             Self::RetryOf { .. } => EntryKind::RetryOf,
             Self::Iteration { .. } => EntryKind::Iteration,
             Self::ResponseFormat { .. } => EntryKind::ResponseFormat,
+            Self::ContextPreparation { .. } => EntryKind::ContextPreparation,
+            Self::ContextUse { .. } => EntryKind::ContextUse,
         }
     }
 }

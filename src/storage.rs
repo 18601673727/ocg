@@ -120,8 +120,8 @@ pub(crate) use reads::{
     read_usage_retries, read_usage_summary, unneeded_content,
 };
 pub(crate) use reads::{
-    TurnContext, read_conversation_limits, read_conversation_turns, read_notices,
-    read_turn_context, read_turn_entries, read_turn_execution,
+    TurnContext, read_compaction_policy, read_conversation_limits, read_conversation_turns,
+    read_notices, read_turn_context, read_turn_entries, read_turn_execution,
 };
 #[cfg(test)]
 pub(crate) use reads::{read_usage_buckets_scanned, read_usage_summary_scanned};

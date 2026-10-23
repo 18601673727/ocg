@@ -258,6 +258,34 @@ impl Batch {
         )?;
         Ok((conversation, appended))
     }
+    fn check_context_job(&mut self, consumer: &JobRow, producer: JobId) -> Result<(), BatchError> {
+        let source = self.require_job(producer)?;
+        let Some(parent) = source.parent_id else {
+            return self.reject(Violation::InvalidValue(
+                "context_job",
+                "requires a system child turn",
+            ));
+        };
+        let owner = self.require_job(parent)?;
+        if source.id == consumer.id
+            || !source.kind.is_stored()
+            || owner.parent_id != consumer.parent_id
+            || !matches!(
+                owner.kind,
+                JobKind::Conversation {
+                    origin: Origin::System,
+                    ..
+                }
+            )
+        {
+            return self.reject(Violation::InvalidValue(
+                "context_job",
+                "requires a system child turn of this conversation",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn insert_turn_input(
         &mut self,
         turn: JobId,
@@ -270,6 +298,72 @@ impl Batch {
                 "turn_input",
                 "input is frozen by claim or outcome",
             ));
+        }
+        match &entry {
+            Entry::ContextPreparation {
+                job,
+                policy_revision,
+            } => {
+                self.check_context_job(&row, *job)?;
+                let Some(conversation) = row.parent_id else {
+                    return self.corrupted("stored turn has no conversation".into());
+                };
+                if *policy_revision != self.conversation(conversation)?.compaction_revision {
+                    return self.reject(Violation::InvalidValue(
+                        "context_preparation",
+                        "policy revision has changed",
+                    ));
+                }
+            }
+            Entry::ContextUse {
+                artifact: Some(artifact),
+            } => {
+                self.check_context_job(&row, *artifact)?;
+                let state = self.require_job_state(*artifact)?;
+                if !state
+                    .outcome
+                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "context_use",
+                        "artifact Job must have completed successfully",
+                    ));
+                }
+                let result = self.step(|tx| {
+                    let outputs = tx.open_table(JOB_OUTPUTS)?;
+                    let last = outputs
+                        .range((artifact.get(), 0)..=(artifact.get(), u32::MAX))?
+                        .next_back()
+                        .transpose()?;
+                    last.map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+                        .transpose()
+                })?;
+                let valid = result
+                    .filter(|output| output.kind == OutputKind::Result)
+                    .and_then(|output| output.value)
+                    .and_then(|value| {
+                        serde_json::from_value::<crate::persistence::SummarizationResult>(value)
+                            .ok()
+                    })
+                    .is_some_and(|result| {
+                        result.validate().is_ok()
+                            && Some(result.source.conversation) == row.parent_id
+                    });
+                if !valid {
+                    return self.reject(Violation::InvalidValue(
+                        "context_use",
+                        "requires a validated summarization result for this conversation",
+                    ));
+                }
+            }
+            Entry::ContextUse { artifact: None }
+            | Entry::UserMessage { .. }
+            | Entry::AgentMessage { .. }
+            | Entry::Notice { .. }
+            | Entry::Decision { .. }
+            | Entry::RetryOf { .. }
+            | Entry::Iteration { .. }
+            | Entry::ResponseFormat { .. } => {}
         }
         if let Entry::UserMessage { attachments, .. } = &entry {
             if !attachments.is_empty() {
@@ -357,6 +451,8 @@ impl Batch {
                 | Entry::Notice { .. }
                 | Entry::Decision { .. }
                 | Entry::Iteration { .. }
+                | Entry::ContextPreparation { .. }
+                | Entry::ContextUse { .. }
                 | Entry::ResponseFormat { .. } => {}
             }
             Ok((seq, first_user))
@@ -444,6 +540,15 @@ impl Batch {
                 joined: existing.seq > 1,
             });
         }
+        if matches!(
+            entry,
+            Entry::ContextPreparation { .. } | Entry::ContextUse { .. }
+        ) {
+            return self.reject(Violation::InvalidValue(
+                "entry",
+                "context metadata must be selected on an existing unclaimed turn",
+            ));
+        }
         let row = self.require_job(conversation)?;
         if !row.kind.is_conversation() {
             return self.reject(Violation::InvalidValue(
@@ -482,7 +587,17 @@ impl Batch {
                 match freeze {
                     Some(configuration) => {
                         let frozen = (|| {
-                            let frozen = self.freeze_configuration(configuration)?;
+                            let frozen = match self.freeze_configuration(configuration)? {
+                                crate::persistence::FrozenConfiguration::Generative(frozen) => {
+                                    frozen
+                                }
+                                crate::persistence::FrozenConfiguration::Decision(_) => {
+                                    return self.reject(Violation::InvalidValue(
+                                        "execution",
+                                        "decision work requires the typed decision runtime",
+                                    ));
+                                }
+                            };
                             let agent = frozen.agent.as_ref();
                             if tip.is_none()
                                 && agent.is_some_and(|a| !a.approve.is_empty())
@@ -538,6 +653,15 @@ impl Batch {
                                 execution: TurnExecution::Frozen(_),
                                 ..
                             } => TurnExecution::Ref(tip.id),
+                            JobKind::Turn {
+                                execution: TurnExecution::Decision(_),
+                                ..
+                            } => {
+                                return self.reject(Violation::InvalidValue(
+                                    "execution",
+                                    "decision work requires the typed decision runtime",
+                                ));
+                            }
                             JobKind::Conversation { .. } => {
                                 return self.corrupted("conversation tip is not a turn".into());
                             }
@@ -555,7 +679,6 @@ impl Batch {
                     plan_source: PlanSource::Stored {
                         previous: tip,
                         dependencies,
-                        preparation: None,
                     },
                 },
             };
@@ -1516,7 +1639,6 @@ mod tests {
                             (JobId::new(1), DependencyCondition::Success),
                             (JobId::new(2), DependencyCondition::Settled),
                         ],
-                        preparation: None,
                     },
                 },
             ];
@@ -1572,6 +1694,7 @@ mod tests {
                     loop_count: 3,
                     closing,
                     compaction_policy: None,
+                    compaction_revision: 0,
                 };
                 assert_eq!(ConversationRow::decode(&row.encode())?, row);
             }
@@ -1614,7 +1737,6 @@ mod tests {
                     plan_source: PlanSource::Stored {
                         previous: Some(second),
                         dependencies: Vec::new(),
-                        preparation: None,
                     },
                 };
                 batch.t1_submit(None, row)
@@ -4315,5 +4437,583 @@ mod tests {
                 .is_empty()
         );
         fixture.worker.shutdown().unwrap();
+    }
+    fn decision_configs(fixture: &Fixture) -> (ConfigId, ConfigId) {
+        use crate::persistence::*;
+        let gen_model = wait(
+            fixture
+                .database
+                .config(fixture.configuration.llm_profile.into()),
+        )
+        .expect("read")
+        .expect("model");
+        let ConfigBody::Model(gen_model) = gen_model.body else {
+            panic!("generative model");
+        };
+        let model = wait(fixture.database.create_config(NewConfig {
+            name: "decision model".into(),
+            body: ConfigBody::DecisionModel(DecisionModelConfig {
+                connection_id: gen_model.connection_id,
+                model: "decision-v1".into(),
+                protocol: DecisionProtocol::TypeSafeSystemOne,
+                limits: DecisionLimits {
+                    max_input_tokens_per_request: Some(64000),
+                    max_input_tokens_per_question: Some(32000),
+                    ..Default::default()
+                },
+                declared_capabilities: BTreeSet::from([
+                    DecisionCapability::Choice,
+                    DecisionCapability::BinaryProbability,
+                ]),
+            }),
+        }))
+        .expect("decision model");
+        let agent = wait(fixture.database.create_config(NewConfig {
+            name: "decision agent".into(),
+            body: ConfigBody::DecisionAgent(DecisionAgentConfig {
+                instructions: Some("Classify supplied evidence.".into()),
+                models: vec![model],
+                default_model: Some(model),
+                workspace_access: WorkspaceAccess::None,
+            }),
+        }))
+        .expect("decision agent");
+        (model, agent)
+    }
+
+    #[test]
+    fn decision_configs_reopen_without_breaking_ordinary_claims() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("decision-reopen");
+        let (model, agent) = decision_configs(&fixture);
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .configs(Some(ConfigKind::DecisionModel), None, 10)
+            )
+            .expect("list")
+            .len(),
+            1
+        );
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .configs(Some(ConfigKind::DecisionAgent), None, 10)
+            )
+            .expect("list")
+            .len(),
+            1
+        );
+        let (_, turn) = fixture.open();
+        assert!(
+            wait(fixture.database.claim_batch())
+                .expect("claim with decision rows")
+                .contains(&turn)
+        );
+        wait(
+            fixture
+                .database
+                .finalize_job(turn, JobFinalization::Completed(result("answer"))),
+        )
+        .expect("finalize");
+        let model_record = wait(fixture.database.config(model))
+            .expect("read")
+            .expect("model");
+        let agent_record = wait(fixture.database.config(agent))
+            .expect("read")
+            .expect("agent");
+        fixture.worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&fixture.directory).expect("reopen");
+        assert_eq!(
+            wait(worker.handle().config(model)).expect("read"),
+            Some(model_record)
+        );
+        assert_eq!(
+            wait(worker.handle().config(agent)).expect("read"),
+            Some(agent_record)
+        );
+        assert_eq!(
+            wait(worker.handle().job(turn))
+                .expect("read")
+                .expect("job")
+                .outcome
+                .expect("outcome")
+                .kind,
+            OutcomeKind::Completed
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn decision_admission_refuses_wrong_kinds_bounds_and_capabilities() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("decision-admission");
+        let (model, agent) = decision_configs(&fixture);
+        let record = wait(fixture.database.config(model))
+            .expect("read")
+            .expect("model");
+        let ConfigBody::DecisionModel(body) = record.body else {
+            panic!("decision");
+        };
+        let mut invalid_models = Vec::new();
+        let mut invalid = body.clone();
+        invalid.declared_capabilities.clear();
+        invalid_models.push(invalid);
+        let mut invalid = body.clone();
+        invalid.connection_id = agent;
+        invalid_models.push(invalid);
+        let mut invalid = body.clone();
+        invalid.limits.max_input_tokens_per_question = Some(65000);
+        invalid_models.push(invalid);
+        let mut invalid = body.clone();
+        invalid.limits.max_input_tokens_per_request = Some(0);
+        invalid_models.push(invalid);
+        let mut invalid = body;
+        invalid.model = " ".into();
+        invalid_models.push(invalid);
+        for invalid in invalid_models {
+            assert!(matches!(
+                wait(fixture.database.create_config(NewConfig {
+                    name: "invalid".into(),
+                    body: ConfigBody::DecisionModel(invalid)
+                })),
+                Err(crate::database::DatabaseError::Rejected(_))
+            ));
+        }
+        for invalid in [
+            DecisionAgentConfig {
+                models: vec![fixture.configuration.llm_profile.into()],
+                ..Default::default()
+            },
+            DecisionAgentConfig {
+                models: vec![model, model],
+                ..Default::default()
+            },
+            DecisionAgentConfig {
+                models: vec![model],
+                default_model: Some(agent),
+                ..Default::default()
+            },
+            DecisionAgentConfig {
+                instructions: Some("x".repeat(65537)),
+                ..Default::default()
+            },
+            DecisionAgentConfig {
+                models: vec![model; 257],
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                wait(fixture.database.create_config(NewConfig {
+                    name: "invalid".into(),
+                    body: ConfigBody::DecisionAgent(invalid)
+                })),
+                Err(crate::database::DatabaseError::Rejected(_))
+            ));
+        }
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .configs(Some(ConfigKind::DecisionModel), None, 10)
+            )
+            .expect("list")
+            .len(),
+            1
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn decision_freeze_preserves_versions_and_refuses_text_execution_and_archived_targets() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("decision-freeze");
+        let (model, agent) = decision_configs(&fixture);
+        let config = ExecutionConfiguration {
+            agent_profile: Some(agent.into()),
+            llm_profile: model.into(),
+        };
+        let snapshot = wait(fixture.database.with_database(move |database| {
+            let outcome = run_batch_with(database, 1, Commit::Durable, |batch| {
+                batch.freeze_configuration(config)
+            });
+            let FrozenConfiguration::Decision(snapshot) = outcome.result.expect("freeze") else {
+                panic!("decision snapshot");
+            };
+            Ok(snapshot)
+        }))
+        .expect("snapshot");
+        let frozen_work = DecisionWork {
+            frozen: snapshot.clone(),
+            request: DecisionRequest {
+                schema_version: DECISION_SCHEMA_VERSION,
+                state: serde_json::json!({"tokens": 24000}),
+                question: DecisionQuestion::BinaryProbability {
+                    prompt: "Will pressure increase?".into(),
+                },
+            },
+        };
+        wait(fixture.database.with_database(move |database| {
+            let spec = JobRow {
+                id: JobId::new(1),
+                created_at: Timestamp::now(),
+                parent_id: None,
+                kind: JobKind::Turn {
+                    name: None,
+                    execution: TurnExecution::Decision(frozen_work),
+                    plan_source: PlanSource::Process {
+                        project: None,
+                        grant: None,
+                        eligible_at: None,
+                        objective: None,
+                        attachments: Vec::new(),
+                    },
+                },
+            };
+            assert_eq!(JobRow::decode(&spec.encode())?, spec);
+            assert!(matches!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .t1_submit(None, spec))
+                .result,
+                Err(BatchFailure::Rejected(_))
+            ));
+            Ok(())
+        }))
+        .expect("typed work codec and admission gate");
+        let original = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let mut changed = wait(fixture.database.config(model))
+            .expect("read")
+            .expect("model");
+        if let ConfigBody::DecisionModel(body) = &mut changed.body {
+            body.model = "decision-v2".into();
+        }
+        wait(fixture.database.update_config(
+            model,
+            NewConfig {
+                name: changed.name,
+                body: changed.body,
+            },
+        ))
+        .expect("edit");
+        assert_eq!(snapshot.model.model, "decision-v1");
+        assert_eq!(
+            serde_json::from_value::<FrozenDecisionConfig>(original).expect("decode snapshot"),
+            snapshot
+        );
+        let refusal = wait(fixture.database.open_conversation(
+            None,
+            ConversationSpec {
+                name: None,
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            message("not generative"),
+            config,
+            None,
+        ));
+        assert!(matches!(
+            refusal,
+            Err(crate::database::DatabaseError::Rejected(_))
+        ));
+        wait(fixture.database.archive_model(model)).expect("archive decision model");
+        assert!(
+            wait(fixture.database.config(model))
+                .expect("read")
+                .expect("archived")
+                .archived_at
+                .is_some()
+        );
+        let ConfigBody::DecisionAgent(body) = wait(fixture.database.config(agent))
+            .expect("read")
+            .expect("agent")
+            .body
+        else {
+            panic!("decision agent");
+        };
+        assert!(body.models.is_empty() && body.default_model.is_none());
+        wait(fixture.database.with_database(move |database| {
+            assert!(matches!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .freeze_configuration(config))
+                .result,
+                Err(BatchFailure::Rejected(_))
+            ));
+            Ok(())
+        }))
+        .expect("archived refusal");
+        assert_eq!(snapshot.model.model, "decision-v1");
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn compaction_policy_revision_round_trips_and_off_overrides_inheritance() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("compaction-policy");
+        let (_, agent) = decision_configs(&fixture);
+        let (conversation, _) = fixture.open();
+        let policy = CompactionPolicy {
+            mode: CompactionMode::Custom {
+                policy: CustomPolicy {
+                    trigger_tokens: 24000,
+                    target_tokens: 12000,
+                    reserved_output_tokens: 4000,
+                    minimum_source_tokens: 8000,
+                    minimum_savings_tokens: 4000,
+                    preserve_recent_turns: 3,
+                    cooldown_seconds: 120,
+                },
+            },
+            summarization_model: Some(fixture.configuration.llm_profile.into()),
+            predictive: Some(PredictiveCompaction {
+                decision_agent: agent,
+                minimum_interval_seconds: 120,
+                max_preparations: 1,
+                max_prediction_tokens: 1000,
+                max_preparation_tokens: 12000,
+            }),
+        };
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .conversation_compaction_policy(conversation)
+            )
+            .expect("read"),
+            Some((None, 0))
+        );
+        wait(fixture.database.set_conversation(
+            conversation,
+            ConversationEdit::CompactionPolicy(Some(policy)),
+        ))
+        .expect("set policy");
+        wait(fixture.database.set_conversation(
+            conversation,
+            ConversationEdit::CompactionPolicy(Some(policy)),
+        ))
+        .expect("idempotent value");
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .conversation_compaction_policy(conversation)
+            )
+            .expect("read"),
+            Some((Some(policy), 1))
+        );
+        let off = CompactionPolicy::default();
+        assert_eq!(CompactionPolicy::resolve(policy, None, Some(off)), off);
+        assert!(
+            CompactionPolicy::resolve(policy, None, None)
+                .predictive
+                .is_none()
+        );
+        assert_eq!(CompactionPolicy::resolve(off, Some(policy), None), policy);
+        let invalid = CompactionPolicy {
+            predictive: Some(PredictiveCompaction {
+                max_preparations: 2,
+                ..policy.predictive.expect("predictive")
+            }),
+            ..policy
+        };
+        assert!(
+            wait(fixture.database.set_conversation(
+                conversation,
+                ConversationEdit::CompactionPolicy(Some(invalid))
+            ))
+            .is_err()
+        );
+        let invalid = CompactionPolicy {
+            summarization_model: Some(agent),
+            ..policy
+        };
+        assert!(
+            wait(fixture.database.set_conversation(
+                conversation,
+                ConversationEdit::CompactionPolicy(Some(invalid))
+            ))
+            .is_err()
+        );
+        fixture.worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&fixture.directory).expect("reopen");
+        assert_eq!(
+            wait(worker.handle().conversation_compaction_policy(conversation)).expect("read"),
+            Some((Some(policy), 1))
+        );
+        wait(
+            worker
+                .handle()
+                .set_conversation(conversation, ConversationEdit::CompactionPolicy(Some(off))),
+        )
+        .expect("disable");
+        assert_eq!(
+            wait(worker.handle().conversation_compaction_policy(conversation)).expect("read"),
+            Some((Some(off), 2))
+        );
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn context_metadata_is_append_only_frozen_by_claim_and_absent_from_prompt() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("context-metadata");
+        let (conversation, consumer) = fixture.open();
+        let (system, appended) = wait(fixture.database.open_conversation(
+            Some(conversation),
+            ConversationSpec {
+                name: Some("prepare".into()),
+                agent: None,
+                project: None,
+                origin: Origin::System,
+                keep_open: false,
+            },
+            message("summarize sealed source"),
+            fixture.configuration,
+            None,
+        ))
+        .expect("system child");
+        let producer = appended.turn;
+        wait(fixture.database.with_database(move |database| {
+            let preparation = Entry::ContextPreparation {
+                job: producer,
+                policy_revision: 0,
+            };
+            assert_eq!(
+                TurnEntry::decode(
+                    &TurnEntry {
+                        entry: preparation.clone(),
+                        at: Timestamp::now()
+                    }
+                    .encode()
+                )?
+                .entry,
+                preparation
+            );
+            assert!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .insert_turn_input(consumer, preparation))
+                .result
+                .is_ok()
+            );
+            assert!(matches!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .insert_turn_input(
+                        consumer,
+                        Entry::ContextUse {
+                            artifact: Some(producer)
+                        }
+                    ))
+                .result,
+                Err(BatchFailure::Rejected(_))
+            ));
+            Ok(())
+        }))
+        .expect("metadata");
+        let artifact = SummarizationResult {
+            schema_version: 1,
+            source: ContextSourceManifest {
+                schema_version: 1,
+                conversation,
+                through_turn: consumer,
+                turns: vec![SourceBoundary {
+                    turn: consumer,
+                    input_through: 1,
+                    output_through: 0,
+                    content: ContentDigest::of(b"sealed input"),
+                }],
+                base_artifact: None,
+            },
+            summary: "durable task facts".into(),
+            omitted_details: vec!["incidental wording".into()],
+        };
+        artifact.validate().expect("artifact");
+        fixture.claim(producer);
+        wait(fixture.database.finalize_job(
+            producer,
+            JobFinalization::Completed(FinalResult {
+                value: Some(serde_json::to_value(&artifact).expect("artifact")),
+                ..result("summary prepared")
+            }),
+        ))
+        .expect("finish");
+        wait(fixture.database.with_database(move |database| {
+            assert!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .insert_turn_input(
+                        consumer,
+                        Entry::ContextUse {
+                            artifact: Some(producer)
+                        }
+                    ))
+                .result
+                .is_ok()
+            );
+            Ok(())
+        }))
+        .expect("candidate selection");
+        let context = wait(fixture.database.read_turn_context(consumer, 10000)).expect("context");
+        let text = context
+            .turns
+            .iter()
+            .map(|turn| turn.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("durable task facts"));
+        assert!(!text.contains(&producer.to_string()));
+        let entries = wait(fixture.database.turn_entries(consumer)).expect("entries");
+        assert_eq!(entries.len(), 3);
+        wait(fixture.database.with_database(move |database| {
+            assert!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .insert_turn_input(consumer, Entry::ContextUse { artifact: None }))
+                .result
+                .is_ok()
+            );
+            Ok(())
+        }))
+        .expect("explicit original-context fallback");
+        let entries = wait(fixture.database.turn_entries(consumer)).expect("entries");
+        assert!(matches!(
+            entries.last().expect("fallback").1.entry,
+            Entry::ContextUse { artifact: None }
+        ));
+        assert!(
+            wait(fixture.database.append(
+                conversation,
+                Entry::ContextUse {
+                    artifact: Some(producer)
+                },
+                None,
+                None
+            ))
+            .is_err()
+        );
+        fixture.claim(consumer);
+        wait(fixture.database.with_database(move |database| {
+            assert!(matches!(
+                run_batch_with(database, 1, Commit::Durable, |batch| batch
+                    .insert_turn_input(
+                        consumer,
+                        Entry::ContextUse {
+                            artifact: Some(producer)
+                        }
+                    ))
+                .result,
+                Err(BatchFailure::Rejected(_))
+            ));
+            Ok(())
+        }))
+        .expect("claim boundary");
+        assert!(wait(fixture.database.job(system)).expect("read").is_some());
+        fixture.worker.shutdown().expect("shutdown");
+        let worker = DatabaseWorker::start(&fixture.directory).expect("reopen");
+        assert_eq!(
+            wait(worker.handle().turn_entries(consumer)).expect("entries"),
+            entries
+        );
+        worker.shutdown().expect("shutdown");
     }
 }

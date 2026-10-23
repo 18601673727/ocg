@@ -298,6 +298,8 @@ contracts! {
     }
     #[serde(tag = "kind", rename_all = "snake_case")]
     enum WireEntry {
+        ContextPreparation { job: String, policy_revision: String },
+        ContextUse { artifact: Option<String> },
         UserMessage {
             text: String,
             attachments: Vec<String>,

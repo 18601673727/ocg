@@ -5,15 +5,14 @@ use super::*;
 use crate::openai_compatible::ChatFinishReason;
 use crate::persistence::{
     AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
-    ClaimRecord, CleanupKind, CompactionMode, CompactionPolicy, ConfigBody, ConfigId, ConfigKind,
-    ConnectionConfig, ContentDigest, CustomPolicy, DecisionAgentConfig, DecisionCapability,
-    DecisionLimits, DecisionModelConfig, DecisionProtocol, EffectConclusion, ExecutionOperation,
-    JobId, JobOutputId, JobOutputRecord, LlmParameters, LlmTransport, Measurements,
-    ModelCapability, ModelConfig, NotInvokedReason, OutcomeCause, OutcomeKind, OutcomeRecord,
-    PoolConfig, ProjectCommand, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
-    RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, Timestamp,
-    ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
-    ToolPayload, ToolReconciliation, UncertainCause, WithheldReason, WorkspaceAccess,
+    ClaimRecord, CleanupKind, CompactionPolicy, ConfigBody, ConfigId, ConfigKind, ConnectionConfig,
+    ContentDigest, EffectConclusion, ExecutionOperation, JobId, JobOutputId, JobOutputRecord,
+    LlmParameters, LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason,
+    OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand, ProjectId, ProjectRecord,
+    Recorded, RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey,
+    SubmissionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
+    ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
+    WithheldReason,
 };
 use crate::token_usage::{RequestEligibility, UsageFinality};
 
@@ -303,30 +302,13 @@ impl ConfigRow {
                 e.u32(p.concurrency_limit);
                 e.bool(p.enabled);
             }
-            ConfigBody::DecisionModel(dm) => {
+            ConfigBody::DecisionModel(model) => {
                 e.u8(5);
-                e.u128(dm.connection_id.get());
-                e.str(&dm.model);
-                e.u8(dm.protocol.code());
-                let l = &dm.limits;
-                e.ou32(l.max_input_tokens_per_request);
-                e.ou32(l.max_output_tokens_per_request);
-                e.ou32(l.max_input_tokens_per_question);
-                e.ou32(l.max_output_tokens_per_question);
-                e.u32(dm.declared_capabilities.len() as u32);
-                for cap in &dm.declared_capabilities {
-                    e.u8(cap.code());
-                }
+                e.decision_model(model);
             }
-            ConfigBody::DecisionAgent(da) => {
+            ConfigBody::DecisionAgent(agent) => {
                 e.u8(6);
-                e.ostr(&da.instructions);
-                e.u32(da.models.len() as u32);
-                for m in &da.models {
-                    e.u128(m.get());
-                }
-                e.ou128(da.default_model.map(ConfigId::get));
-                e.u8(da.workspace_access.code());
+                e.decision_agent(agent);
             }
         }
         e.0
@@ -413,50 +395,8 @@ impl ConfigRow {
                     enabled,
                 })
             }
-            ConfigKind::DecisionModel => {
-                let connection_id = ConfigId::new(d.u128()?);
-                let model = d.str()?;
-                let protocol = d.code(DecisionProtocol::from_code)?;
-                let limits = DecisionLimits {
-                    max_input_tokens_per_request: d.ou32()?,
-                    max_output_tokens_per_request: d.ou32()?,
-                    max_input_tokens_per_question: d.ou32()?,
-                    max_output_tokens_per_question: d.ou32()?,
-                };
-                let mut declared_capabilities = BTreeSet::new();
-                for _ in 0..d.u32()? {
-                    let cap_code = d.u8()?;
-                    if let Some(cap) = DecisionCapability::from_code(cap_code) {
-                        declared_capabilities.insert(cap);
-                    } else {
-                        return Err(StorageError::corrupted(format!(
-                            "invalid decision capability code {cap_code}"
-                        )));
-                    }
-                }
-                ConfigBody::DecisionModel(DecisionModelConfig {
-                    connection_id,
-                    model,
-                    protocol,
-                    limits,
-                    declared_capabilities,
-                })
-            }
-            ConfigKind::DecisionAgent => {
-                let instructions = d.ostr()?;
-                let mut models = Vec::new();
-                for _ in 0..d.u32()? {
-                    models.push(ConfigId::new(d.u128()?));
-                }
-                let default_model = d.ou128()?.map(ConfigId::new);
-                let workspace_access = d.code(WorkspaceAccess::from_code)?;
-                ConfigBody::DecisionAgent(DecisionAgentConfig {
-                    instructions,
-                    models,
-                    default_model,
-                    workspace_access,
-                })
-            }
+            ConfigKind::DecisionModel => ConfigBody::DecisionModel(d.decision_model()?),
+            ConfigKind::DecisionAgent => ConfigBody::DecisionAgent(d.decision_agent()?),
         };
         d.end()?;
         Ok(ConfigRow {
@@ -651,6 +591,7 @@ pub(crate) struct ConversationRow {
     pub(crate) loop_count: u8,
     pub(crate) closing: Option<Closing>,
     pub(crate) compaction_policy: Option<CompactionPolicy>,
+    pub(crate) compaction_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -677,13 +618,8 @@ impl ConversationRow {
             e.u8(limits.max_auto_turns);
             e.u32(limits.max_iterations);
         });
-        e.opt(&self.compaction_policy, |e, policy| {
-            e.u8(policy.mode.code());
-            e.opt(&policy.custom, |e, custom| {
-                e.opt(&custom.trigger_fraction, |e, tf| e.u8(*tf));
-                e.opt(&custom.target_fraction, |e, tf| e.u8(*tf));
-            });
-        });
+        e.opt(&self.compaction_policy, Enc::compaction_policy);
+        e.u64(self.compaction_revision);
         e.0
     }
 
@@ -708,19 +644,8 @@ impl ConversationRow {
                     max_iterations: d.u32()?,
                 })
             })?,
-            compaction_policy: d.opt(|d| {
-                let mode_code = d.u8()?;
-                let mode = CompactionMode::from_code(mode_code).ok_or_else(|| {
-                    StorageError::corrupted("invalid compaction mode".to_string())
-                })?;
-                let custom = d.opt(|d| {
-                    Ok(CustomPolicy {
-                        trigger_fraction: d.opt(|d| d.u8())?,
-                        target_fraction: d.opt(|d| d.u8())?,
-                    })
-                })?;
-                Ok(CompactionPolicy { mode, custom })
-            })?,
+            compaction_policy: d.opt(Dec::compaction_policy)?,
+            compaction_revision: d.u64()?,
         };
         d.end()?;
         Ok(row)

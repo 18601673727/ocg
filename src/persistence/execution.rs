@@ -162,94 +162,547 @@ pub struct AppendedOutput {
     pub seq: i64,
 }
 
-/// Schema version identifier for a typed decision request/result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(dead_code)]
-pub struct SchemaVersion(pub u32);
+/// The normalized decision contract, independent of a provider's wire format.
+pub const DECISION_SCHEMA_VERSION: u32 = 1;
+pub const MAX_DECISION_REQUEST_BYTES: usize = 1024 * 1024;
+pub const MAX_DECISION_OPTIONS: usize = 256;
 
-impl SchemaVersion {
-    #[allow(dead_code)]
-    pub fn code(self) -> u32 {
-        self.0
-    }
-    #[allow(dead_code)]
-    pub fn from_code(code: u32) -> Self {
-        SchemaVersion(code)
-    }
-}
-
-/// Finite ordered option with semantic label.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct Option_ {
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChoiceOption {
     pub id: String,
-    pub label: Option<String>,
+    pub description: String,
 }
 
-/// Ordered score level with semantic label.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScoreLevel {
-    pub level: u32,
-    pub label: Option<String>,
+    pub value: i32,
+    pub description: String,
 }
 
-/// Choice decision result: selected option with optional probability distribution.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-pub struct ChoiceResult {
-    pub selected: String,
-    pub requested_options: Vec<Option_>,
-    pub confidence: Option<f64>,
-    pub distribution: Option<Vec<f64>>,
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionQuestion {
+    Choice {
+        prompt: String,
+        options: Vec<ChoiceOption>,
+    },
+    BinaryProbability {
+        prompt: String,
+    },
+    OrdinalScore {
+        prompt: String,
+        levels: Vec<ScoreLevel>,
+    },
 }
 
-/// Score decision result: selected score level with optional expectation distribution.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-pub struct ScoreResult {
-    pub selected_level: u32,
-    pub requested_levels: Vec<ScoreLevel>,
-    pub confidence: Option<f64>,
-    pub expectation: Option<f64>,
-    pub distribution: Option<Vec<f64>>,
+impl DecisionQuestion {
+    pub fn capability(&self) -> DecisionCapability {
+        match self {
+            Self::Choice { .. } => DecisionCapability::Choice,
+            Self::BinaryProbability { .. } => DecisionCapability::BinaryProbability,
+            Self::OrdinalScore { .. } => DecisionCapability::OrdinalScore,
+        }
+    }
 }
 
-/// Noul (boolean probability) decision result: true probability.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-pub struct NoulResult {
-    pub true_probability: f64,
-}
-
-/// Typed decision answer discriminated by primitive type.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-pub enum DecisionAnswer {
-    Choice(ChoiceResult),
-    Score(ScoreResult),
-    Noul(NoulResult),
-}
-
-/// A single decision request to a Decision Agent, with schema version and primitive type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionRequest {
-    pub schema_version: SchemaVersion,
-    pub question: String,
-    pub context: String,
-    pub workspace_snapshot: Option<String>,
+    pub schema_version: u32,
+    /// Explicit caller-supplied evidence, never an implicit workspace grant.
+    pub state: serde_json::Value,
+    pub question: DecisionQuestion,
 }
 
-/// The typed result of a decision request, including model provenance and usage references.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
+impl DecisionRequest {
+    pub fn validate(
+        &self,
+        capabilities: &BTreeSet<DecisionCapability>,
+    ) -> Result<(), &'static str> {
+        if self.schema_version != DECISION_SCHEMA_VERSION {
+            return Err("unsupported decision schema version");
+        }
+        if !capabilities.contains(&self.question.capability()) {
+            return Err("decision primitive is not supported by the model");
+        }
+        if serde_json::to_vec(self)
+            .map_err(|_| "invalid decision request")?
+            .len()
+            > MAX_DECISION_REQUEST_BYTES
+        {
+            return Err("decision request exceeds 1 MiB");
+        }
+        let prompt = match &self.question {
+            DecisionQuestion::Choice { prompt, options } => {
+                if !(2..=MAX_DECISION_OPTIONS).contains(&options.len()) {
+                    return Err("choice requires 2 to 256 options");
+                }
+                let mut ids = BTreeSet::new();
+                for option in options {
+                    if option.id.trim().is_empty()
+                        || option.id.len() > 128
+                        || !ids.insert(&option.id)
+                    {
+                        return Err(
+                            "choice option IDs must be nonempty, unique and at most 128 bytes",
+                        );
+                    }
+                    if option.description.trim().is_empty() {
+                        return Err("choice options require descriptions");
+                    }
+                }
+                prompt
+            }
+            DecisionQuestion::OrdinalScore { prompt, levels } => {
+                if !(2..=MAX_DECISION_OPTIONS).contains(&levels.len())
+                    || levels.windows(2).any(|pair| pair[0].value >= pair[1].value)
+                    || levels
+                        .iter()
+                        .any(|level| level.description.trim().is_empty())
+                {
+                    return Err("score requires 2 to 256 increasing, described levels");
+                }
+                prompt
+            }
+            DecisionQuestion::BinaryProbability { prompt } => prompt,
+        };
+        if prompt.trim().is_empty() {
+            return Err("decision prompt must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Immutable work payload carried by the existing Turn execution descriptor.
+/// Admission stays closed until an executor implements the typed decision path.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionWork {
+    pub frozen: FrozenDecisionConfig,
+    pub request: DecisionRequest,
+}
+
+impl DecisionWork {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let frozen = &self.frozen;
+        if frozen.agent_ref.edit_seq == 0
+            || frozen.model_ref.edit_seq == 0
+            || frozen.connection_ref.edit_seq == 0
+            || frozen.model.connection_id != frozen.connection_ref.id
+            || !frozen.agent.models.contains(&frozen.model_ref.id)
+        {
+            return Err("decision work has inconsistent frozen identities");
+        }
+        self.request.validate(&frozen.model.declared_capabilities)
+    }
+}
+
+/// Provider-specific uncertainty evidence. `semantics` identifies its formula;
+/// a consumer must recognize that meaning before applying any threshold.
+/// It is not a calibrated probability of correctness by default.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionConfidence {
+    pub value: f64,
+    pub semantics: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionAnswer {
+    Choice {
+        selected: String,
+        distribution: Option<std::collections::BTreeMap<String, f64>>,
+        confidence: Option<DecisionConfidence>,
+    },
+    BinaryProbability {
+        true_probability: f64,
+    },
+    OrdinalScore {
+        expectation: f64,
+        /// Probabilities in the request's level order, when supplied.
+        distribution: Option<Vec<f64>>,
+        confidence: Option<DecisionConfidence>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecisionOutcome {
+    Answer { answer: DecisionAnswer },
+    Uncertain { reason: String },
+    Unusable { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionResult {
-    pub schema_version: SchemaVersion,
-    pub answer: Option<DecisionAnswer>,
-    pub reasoning: Option<String>,
-    pub model_reported_as: Option<String>,
-    pub model_version_pinned: Option<String>,
-    pub model_capabilities: BTreeSet<String>,
-    pub usage_request_id: Option<u64>,
+    pub schema_version: u32,
+    pub outcome: DecisionOutcome,
+    pub requested_model: String,
+    pub reported_model: Option<String>,
+    /// Only present when a provider or a pinned configuration establishes it.
+    pub model_version: Option<String>,
+    pub model: ConfigRef,
+    pub agent: ConfigRef,
+    pub connection: ConfigRef,
+    /// Existing provider-request identity; usage and native evidence belong there.
+    pub request: RequestRef,
+}
+
+impl DecisionResult {
+    pub fn validate(
+        &self,
+        input: &DecisionRequest,
+        frozen: &FrozenDecisionConfig,
+        request: RequestRef,
+    ) -> Result<(), &'static str> {
+        input.validate(&frozen.model.declared_capabilities)?;
+        if self.schema_version != DECISION_SCHEMA_VERSION
+            || self.request != request
+            || self.model != frozen.model_ref
+            || self.agent != frozen.agent_ref
+            || self.connection != frozen.connection_ref
+            || self.requested_model != frozen.model.model
+        {
+            return Err("decision result provenance does not match the frozen request");
+        }
+        if [&self.reported_model, &self.model_version]
+            .into_iter()
+            .any(|identity| {
+                identity
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 512)
+            })
+        {
+            return Err("reported model identities must be nonempty and at most 512 bytes");
+        }
+        let answer = match &self.outcome {
+            DecisionOutcome::Answer { answer } => answer,
+            DecisionOutcome::Uncertain { reason } | DecisionOutcome::Unusable { reason } => {
+                return if reason.trim().is_empty() || reason.len() > 4096 {
+                    Err("unusable predictions require a bounded reason")
+                } else {
+                    Ok(())
+                };
+            }
+        };
+        let confidence = match (&input.question, answer) {
+            (
+                DecisionQuestion::Choice { options, .. },
+                DecisionAnswer::Choice {
+                    selected,
+                    distribution,
+                    confidence,
+                },
+            ) => {
+                if !options.iter().any(|option| option.id == *selected) {
+                    return Err("unknown choice selection");
+                }
+                if let Some(distribution) = distribution {
+                    if distribution.len() != options.len()
+                        || options
+                            .iter()
+                            .any(|option| !distribution.contains_key(&option.id))
+                    {
+                        return Err(
+                            "choice distribution does not cover exactly the requested options",
+                        );
+                    }
+                    validate_distribution(distribution.values().copied())?;
+                }
+                confidence
+            }
+            (
+                DecisionQuestion::BinaryProbability { .. },
+                DecisionAnswer::BinaryProbability { true_probability },
+            ) => {
+                if !probability(*true_probability) {
+                    return Err("invalid binary probability");
+                }
+                return Ok(());
+            }
+            (
+                DecisionQuestion::OrdinalScore { levels, .. },
+                DecisionAnswer::OrdinalScore {
+                    expectation,
+                    distribution,
+                    confidence,
+                },
+            ) => {
+                let low = f64::from(levels[0].value);
+                let high = f64::from(levels[levels.len() - 1].value);
+                if !expectation.is_finite() || !(low..=high).contains(expectation) {
+                    return Err("invalid score expectation");
+                }
+                if let Some(distribution) = distribution {
+                    if distribution.len() != levels.len() {
+                        return Err("score distribution does not cover requested levels");
+                    }
+                    validate_distribution(distribution.iter().copied())?;
+                    let derived: f64 = levels
+                        .iter()
+                        .zip(distribution)
+                        .map(|(level, p)| f64::from(level.value) * p)
+                        .sum();
+                    if (derived - expectation).abs() > 1e-6 * (1.0 + low.abs().max(high.abs())) {
+                        return Err("score expectation disagrees with distribution");
+                    }
+                }
+                confidence
+            }
+            _ => return Err("decision result primitive differs from request"),
+        };
+        if confidence.as_ref().is_some_and(|confidence| {
+            !confidence.value.is_finite()
+                || confidence.semantics.trim().is_empty()
+                || confidence.semantics.len() > 256
+        }) {
+            return Err("confidence requires a finite value and bounded semantic identifier");
+        }
+        Ok(())
+    }
+}
+
+fn probability(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
+}
+
+fn validate_distribution(values: impl Iterator<Item = f64>) -> Result<(), &'static str> {
+    let mut sum = 0.0;
+    for value in values {
+        if !probability(value) {
+            return Err("invalid distribution probability");
+        }
+        sum += value;
+    }
+    if (sum - 1.0).abs() > 1e-6 {
+        return Err("distribution must sum to one within 1e-6");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn frozen() -> FrozenDecisionConfig {
+        let id: ConfigId = "00000001-0000-7000-8000-000000000001"
+            .parse()
+            .expect("UUID");
+        FrozenDecisionConfig {
+            agent: DecisionAgentConfig::default(),
+            agent_ref: ConfigRef { id, edit_seq: 1 },
+            model: DecisionModelConfig {
+                connection_id: id,
+                model: "requested-alias".into(),
+                protocol: DecisionProtocol::TypeSafeSystemOne,
+                limits: DecisionLimits::default(),
+                declared_capabilities: BTreeSet::from([
+                    DecisionCapability::Choice,
+                    DecisionCapability::BinaryProbability,
+                    DecisionCapability::OrdinalScore,
+                ]),
+            },
+            model_ref: ConfigRef { id, edit_seq: 2 },
+            connection_ref: ConfigRef { id, edit_seq: 3 },
+            endpoint: None,
+            credential_ref: None,
+        }
+    }
+    fn request(question: DecisionQuestion) -> DecisionRequest {
+        DecisionRequest {
+            schema_version: DECISION_SCHEMA_VERSION,
+            state: serde_json::json!({"utilization_tokens": 50000}),
+            question,
+        }
+    }
+    fn result(outcome: DecisionOutcome) -> (DecisionResult, FrozenDecisionConfig, RequestRef) {
+        let frozen = frozen();
+        let request = RequestRef {
+            job: "00000002-0000-7000-8000-000000000002"
+                .parse()
+                .expect("UUID"),
+            request: RequestNumber::FIRST,
+        };
+        (
+            DecisionResult {
+                schema_version: DECISION_SCHEMA_VERSION,
+                outcome,
+                requested_model: frozen.model.model.clone(),
+                reported_model: None,
+                model_version: None,
+                model: frozen.model_ref,
+                agent: frozen.agent_ref,
+                connection: frozen.connection_ref,
+                request,
+            },
+            frozen,
+            request,
+        )
+    }
+    fn choice() -> DecisionRequest {
+        request(DecisionQuestion::Choice {
+            prompt: "prepare?".into(),
+            options: vec![
+                ChoiceOption {
+                    id: "skip".into(),
+                    description: "no pressure".into(),
+                },
+                ChoiceOption {
+                    id: "prepare".into(),
+                    description: "pressure expected".into(),
+                },
+            ],
+        })
+    }
+    #[test]
+    fn decision_requests_require_typed_answer_spaces_and_capabilities() {
+        let mut input = choice();
+        assert!(
+            input
+                .validate(&frozen().model.declared_capabilities)
+                .is_ok()
+        );
+        assert!(input.validate(&BTreeSet::new()).is_err());
+        if let DecisionQuestion::Choice { options, .. } = &mut input.question {
+            options[1].id = "skip".into();
+        }
+        assert!(
+            input
+                .validate(&frozen().model.declared_capabilities)
+                .is_err()
+        );
+        let input = request(DecisionQuestion::OrdinalScore {
+            prompt: "pressure".into(),
+            levels: vec![
+                ScoreLevel {
+                    value: 2,
+                    description: "high".into(),
+                },
+                ScoreLevel {
+                    value: 1,
+                    description: "low".into(),
+                },
+            ],
+        });
+        assert!(
+            input
+                .validate(&frozen().model.declared_capabilities)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DecisionRequest>(
+                serde_json::json!({"schema_version":1,"state":{},"question":"text"})
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn decision_results_validate_distributions_uncertainty_and_provenance() {
+        let (mut answer, frozen, reference) = result(DecisionOutcome::Answer {
+            answer: DecisionAnswer::Choice {
+                selected: "prepare".into(),
+                distribution: Some(BTreeMap::from([
+                    ("skip".into(), 0.2),
+                    ("prepare".into(), 0.8),
+                ])),
+                confidence: Some(DecisionConfidence {
+                    value: 0.6,
+                    semantics: "provider.choice.margin.v1".into(),
+                }),
+            },
+        });
+        assert!(answer.validate(&choice(), &frozen, reference).is_ok());
+        let encoded = serde_json::to_value(&answer).expect("serialize");
+        assert_eq!(encoded["request"]["job"], reference.job.to_string());
+        assert_eq!(
+            serde_json::from_value::<DecisionResult>(encoded).expect("decode"),
+            answer
+        );
+        answer.model.edit_seq += 1;
+        assert!(answer.validate(&choice(), &frozen, reference).is_err());
+        answer.model = frozen.model_ref;
+        for distribution in [
+            BTreeMap::from([("skip".into(), 0.2)]),
+            BTreeMap::from([("skip".into(), 0.5), ("prepare".into(), f64::NAN)]),
+            BTreeMap::from([("skip".into(), 0.2), ("prepare".into(), 0.2)]),
+        ] {
+            answer.outcome = DecisionOutcome::Answer {
+                answer: DecisionAnswer::Choice {
+                    selected: "prepare".into(),
+                    distribution: Some(distribution),
+                    confidence: None,
+                },
+            };
+            assert!(answer.validate(&choice(), &frozen, reference).is_err());
+        }
+        answer.outcome = DecisionOutcome::Uncertain {
+            reason: "insufficient growth evidence".into(),
+        };
+        assert!(answer.validate(&choice(), &frozen, reference).is_ok());
+        answer.outcome = DecisionOutcome::Unusable {
+            reason: String::new(),
+        };
+        assert!(answer.validate(&choice(), &frozen, reference).is_err());
+    }
+    #[test]
+    fn decision_probability_and_score_keep_distinct_semantics() {
+        let binary = request(DecisionQuestion::BinaryProbability {
+            prompt: "pressure soon?".into(),
+        });
+        let (mut output, frozen, reference) = result(DecisionOutcome::Answer {
+            answer: DecisionAnswer::BinaryProbability {
+                true_probability: 0.5,
+            },
+        });
+        assert!(output.validate(&binary, &frozen, reference).is_ok());
+        for value in [-0.1, 1.1, f64::INFINITY, f64::NAN] {
+            output.outcome = DecisionOutcome::Answer {
+                answer: DecisionAnswer::BinaryProbability {
+                    true_probability: value,
+                },
+            };
+            assert!(output.validate(&binary, &frozen, reference).is_err());
+        }
+        let score = request(DecisionQuestion::OrdinalScore {
+            prompt: "pressure?".into(),
+            levels: vec![
+                ScoreLevel {
+                    value: 0,
+                    description: "low".into(),
+                },
+                ScoreLevel {
+                    value: 10,
+                    description: "high".into(),
+                },
+            ],
+        });
+        output.outcome = DecisionOutcome::Answer {
+            answer: DecisionAnswer::OrdinalScore {
+                expectation: 7.5,
+                distribution: Some(vec![0.25, 0.75]),
+                confidence: None,
+            },
+        };
+        assert!(output.validate(&score, &frozen, reference).is_ok());
+        assert!(output.validate(&binary, &frozen, reference).is_err());
+        output.outcome = DecisionOutcome::Answer {
+            answer: DecisionAnswer::OrdinalScore {
+                expectation: 2.0,
+                distribution: Some(vec![0.25, 0.75]),
+                confidence: None,
+            },
+        };
+        assert!(output.validate(&score, &frozen, reference).is_err());
+        assert!(
+            serde_json::from_value::<RequestRef>(
+                serde_json::json!({"job":reference.job,"request":0})
+            )
+            .is_err()
+        );
+    }
 }

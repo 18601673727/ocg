@@ -775,6 +775,7 @@ impl Command {
                     byte_count(title.len())
                 }
                 ConversationEdit::Hide | ConversationEdit::Limits(_) => 16,
+                ConversationEdit::CompactionPolicy(_) => 128,
             },
             Self::ArchiveModel { .. } => 16,
             Self::ImportModels {
@@ -816,7 +817,7 @@ impl Command {
                         .saturating_add(byte_count(dm.declared_capabilities.len()))
                         .saturating_add(32),
                     ConfigBody::DecisionAgent(da) => text_bytes(&da.instructions)
-                        .saturating_add(byte_count(da.models.len().saturating_mul(8)))
+                        .saturating_add(byte_count(da.models.len().saturating_mul(16)))
                         .saturating_add(32),
                 })
             }
@@ -979,4 +980,31 @@ pub(super) fn output_bytes(
     text_bytes(summary)
         .saturating_add(text_bytes(code))
         .saturating_add(json_bytes(value))
+}
+
+#[cfg(test)]
+mod decision_budget_tests {
+    use super::*;
+    #[test]
+    fn decision_payload_estimate_counts_uuid_targets_and_variable_text() {
+        use crate::persistence::{DecisionAgentConfig, WorkspaceAccess};
+        let estimate = |instructions: &str, count: usize| {
+            let (reply, _) = flume::bounded(1);
+            Command::CreateConfig {
+                config: NewConfig {
+                    name: "decision".into(),
+                    body: ConfigBody::DecisionAgent(DecisionAgentConfig {
+                        instructions: Some(instructions.into()),
+                        models: (0..count).map(|n| ConfigId::new(n as u128)).collect(),
+                        default_model: None,
+                        workspace_access: WorkspaceAccess::None,
+                    }),
+                },
+                reply,
+            }
+            .expected_write_bytes()
+        };
+        assert_eq!(estimate("", 256) - estimate("", 0), 2 * 256 * 16);
+        assert_eq!(estimate(&"x".repeat(65536), 0) - estimate("", 0), 2 * 65536);
+    }
 }

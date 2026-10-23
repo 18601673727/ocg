@@ -967,6 +967,8 @@ pub(super) async fn save_profile(
                     default_model,
                     dispatch_to: parsed_dispatch,
                     tool_grant,
+                    decision_assistance: prior.decision_assistance,
+                    compaction_policy: prior.compaction_policy,
                 }),
             }
         }

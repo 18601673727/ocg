@@ -349,7 +349,7 @@ tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
 confirmation. Successful replies are `released` or `already_released`. This route
 is available for any origin; the CLI continues to record operator confirmation.
 
-Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 27).
+Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 28).
 
 ## OpenAI Responses providers
 
@@ -372,6 +372,40 @@ Responses usage and output items are retained in provider history. A terminal
 responses never authorize tool execution.
 
 Responses adds protocol code 2 alongside the unchanged Chat Completions code 1.
-Database format 27 is retained: existing data opens without migration. Once
-Responses configurations have been saved, use a build with Responses support;
-older builds cannot decode the added protocol code.
+Database format 28 changes Decision Profile, compaction-policy, turn-metadata
+and frozen Agent encodings. Format-26 and format-27 directories are refused
+without migration or deletion; use a separate fresh directory for this build.
+
+Decision Model and Decision Agent configs are backend foundation types. They
+reuse config identities, edit counters and archival. Decision agents expose
+read-only context access and have no tool grants, dispatch or approval authority.
+The shared freeze contract distinguishes generative and decision snapshots.
+Ordinary text submissions refuse decision execution until the typed runner is
+available. Native TypeSafe transport and decision Profile HTTP/UI support are
+separate implementation phases.
+
+Normalized decisions specify Choice, BinaryProbability or OrdinalScore answer
+spaces. Results validate against that request and its frozen model/config and
+provider-request identities. Provider confidence has an explicit semantic
+identifier; it is not assumed to be a calibrated probability of correctness.
+Unknown or insufficient evidence has explicit unusable/uncertain outcomes.
+
+Conversation compaction policies are stored overrides with a revision counter.
+Resolution replaces the whole policy: conversation, then Agent, then host.
+The default is Off. Auto selects Conservative, Balanced or Aggressive; Custom
+stores token trigger/target/output reserve, minimum source and savings, recent
+turn preservation and cooldown. Model-budget preset resolution and automatic
+execution are supplied by the policy runtime, not this storage foundation.
+Predictive opt-in is an explicit Decision Agent binding with bounded preparation
+and token budgets, independent of generative decision assistance. Manual
+compaction requires neither that binding nor automatic mode.
+
+Compaction artifacts are typed summarization Job results; original history is
+kept. Source manifests carry ordered turn identities, inclusive input/output
+high-water marks and fixed SHA-256 content digests. Pending turns can record
+internal preparation/candidate-use entries before claim. These entries do not
+enter prompts, titles, search text or completion causes, and do not themselves
+adopt a summary. A null artifact selection explicitly restores original context;
+claim-time selection determines adoption. Source capture, compatibility checks, atomic adoption and the
+manual/automatic/predictive runners remain separate runtime phases. No context
+is reduced by this foundation alone.

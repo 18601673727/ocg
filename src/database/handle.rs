@@ -639,6 +639,15 @@ impl DatabaseHandle {
         })
         .await
     }
+    /// The stored override and opt-in revision; preset resolution is model-specific.
+    pub async fn conversation_compaction_policy(
+        &self,
+        conversation: JobId,
+    ) -> Result<Option<(Option<crate::persistence::CompactionPolicy>, u64)>, DatabaseError> {
+        self.read(move |database| storage::read_compaction_policy(database, conversation))
+            .await
+    }
+
     pub async fn conversation_limits(
         &self,
         conversation: JobId,
