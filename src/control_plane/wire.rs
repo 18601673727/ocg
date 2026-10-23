@@ -208,15 +208,16 @@ pub(super) async fn answer(
 ) -> HttpResponse {
     match admit(&request, &shared) {
         Err(refusal) => refusal.response(),
-        Ok(Destination::Asset) => match shared
-            .assets
-            .as_ref()
-            .map(|assets| assets.serve(request.path()))
-            .unwrap_or(Err(NOT_FOUND))
-        {
-            Ok(asset) => assets::response(asset),
-            Err(refusal) => refusal.response(),
-        },
+        Ok(Destination::Asset) => {
+            let served = match shared.assets.as_ref() {
+                Some(assets) => assets.serve(request.path()).await,
+                None => Err(NOT_FOUND),
+            };
+            match served {
+                Ok(asset) => assets::response(asset),
+                Err(refusal) => refusal.response(),
+            }
+        }
         Ok(Destination::Api(caller)) => {
             match route(&request).and_then(|route| authorize(&caller, route)) {
                 Ok(Route::Events { job, after_seq }) => {

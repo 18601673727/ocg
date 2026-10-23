@@ -1172,6 +1172,38 @@ mod tests {
             .expect("open");
             (conversation, appended.turn)
         }
+        fn agent(&self, name: &str) -> crate::persistence::ProfileId {
+            wait(self.database.create_config(crate::persistence::NewConfig {
+                name: name.into(),
+                body: crate::persistence::ConfigBody::Agent(AgentConfig {
+                    dispatch_to: Vec::new(),
+                    models: vec![self.configuration.llm_profile.into()],
+                    ..Default::default()
+                }),
+            }))
+            .expect("Agent config")
+            .into()
+        }
+        fn open_as(&self, agent: crate::persistence::ProfileId) -> (JobId, JobId) {
+            let (conversation, appended) = wait(self.database.open_conversation(
+                None,
+                ConversationSpec {
+                    name: None,
+                    agent: Some(agent.into()),
+                    project: None,
+                    origin: Origin::User,
+                    keep_open: true,
+                },
+                message("first"),
+                ExecutionConfiguration {
+                    agent_profile: Some(agent),
+                    llm_profile: self.configuration.llm_profile,
+                },
+                None,
+            ))
+            .expect("open");
+            (conversation, appended.turn)
+        }
         fn child(&self, parent: JobId, keep_open: bool) -> (JobId, JobId) {
             let agent = wait(self.database.create_config(crate::persistence::NewConfig {
                 name: "child Agent".into(),
@@ -2263,6 +2295,91 @@ mod tests {
         );
         fixture.worker.shutdown().expect("shutdown");
     }
+    #[test]
+    fn retry_pages_advance_through_filtered_rows_without_duplicates() {
+        let fixture = Fixture::new("retry-usage-interleaved");
+        let first_agent = fixture.agent("first retry Agent");
+        let other_agent = fixture.agent("other retry Agent");
+        let (first_conversation, first_turn) = fixture.open_as(first_agent);
+        fixture.finish(first_turn, OutcomeKind::Completed);
+        let (other_conversation, other_turn) = fixture.open_as(other_agent);
+        fixture.finish(other_turn, OutcomeKind::Completed);
+        let (last_conversation, last_turn) = fixture.open_as(first_agent);
+        fixture.finish(last_turn, OutcomeKind::Completed);
+        wait(
+            fixture
+                .database
+                .retry(first_conversation, first_turn, Actor::User),
+        )
+        .expect("first retry");
+        wait(
+            fixture
+                .database
+                .retry(other_conversation, other_turn, Actor::User),
+        )
+        .expect("filtered retry");
+        wait(
+            fixture
+                .database
+                .retry(last_conversation, last_turn, Actor::User),
+        )
+        .expect("last retry");
+
+        let now_us = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_micros(),
+        )
+        .expect("time fits");
+        let day = 86_400_000_000;
+        let filter = UsageSummaryFilter {
+            from_us: Some(now_us - 2 * day),
+            until_us: Some(now_us + 2 * day),
+            agent: Some(first_agent.get()),
+        };
+        let bucketing = UsageBucketing {
+            width: UsageBucketWidth::Day,
+            offset_minutes: 0,
+        };
+
+        let mut after = None;
+        let mut pages = 0;
+        let mut retries = 0;
+        let mut empty_page_with_continuation = false;
+        loop {
+            pages += 1;
+            assert!(pages < 10, "retry cursor did not reach exhaustion");
+            let page = wait(
+                fixture
+                    .database
+                    .usage_retries(filter.clone(), bucketing, after, 1),
+            )
+            .expect("page");
+            empty_page_with_continuation |= page.rows.is_empty() && page.next.is_some();
+            retries += page.rows.iter().map(|row| row.retries).sum::<u64>();
+            match page.next {
+                Some(next) => {
+                    assert_ne!(after, Some(next), "retry cursor did not advance");
+                    after = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert!(pages > 2);
+        assert!(
+            empty_page_with_continuation,
+            "a filtered raw key is an empty page with a continuation"
+        );
+        assert_eq!(retries, 2, "only the first Agent's retries are counted");
+
+        let complete = wait(fixture.database.usage_retries(filter, bucketing, None, 100))
+            .expect("complete scan");
+        assert_eq!(complete.rows.iter().map(|row| row.retries).sum::<u64>(), 2);
+        assert!(complete.next.is_none());
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
     #[test]
     fn a_retry_of_a_retry_still_quotes_the_root_prompt() {
         let fixture = Fixture::new("retry-of-retry");

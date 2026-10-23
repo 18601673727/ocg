@@ -372,18 +372,55 @@ async fn resolve_or_create_connection(
         .map_err(map_mutation_error)
 }
 
-/// Reads all LLM and Agent Profiles and computes the derived Provider
-/// projection from the LLM Profiles.
-pub(super) async fn list_profiles(database: &DatabaseHandle) -> Result<Reply, Refusal> {
-    let snapshot = build_profiles_snapshot(database, None).await?;
-    Ok(Reply::ok(snapshot))
+/// The default Profile page size.
+const DEFAULT_PROFILE_PAGE: usize = 50;
+/// How many configs one page examines per Profile it may return.
+const PROFILE_SCAN_FACTOR: usize = 4;
+/// The serialized budget one Profile page may exceed only for a single entry.
+const MAX_PROFILE_PAGE_BYTES: usize = 512 * 1024;
+
+/// Reads one page of LLM and Agent Profiles, newest first, and the Provider
+/// projection of the LLM Profiles on that page. `next_before` continues from
+/// the last Profile returned, or from the last config examined when the scan
+/// or byte budget ended the page first; `None` means the configs were
+/// exhausted.
+pub(super) async fn list_profiles(
+    database: &DatabaseHandle,
+    before: Option<ConfigId>,
+    limit: usize,
+) -> Result<Reply, Refusal> {
+    let page = database
+        .profile_page(before, limit, limit.saturating_mul(PROFILE_SCAN_FACTOR))
+        .await?;
+    Ok(Reply::ok(build_profiles_page(database, page, None)?))
 }
 
+/// The first page after a mutation, which also names the Profile it saved.
 async fn build_profiles_snapshot(
     database: &DatabaseHandle,
     saved_profile: Option<ProfileId>,
 ) -> Result<Value, Refusal> {
-    let records = database.all_configs(None).await?;
+    let page = database
+        .profile_page(
+            None,
+            DEFAULT_PROFILE_PAGE,
+            DEFAULT_PROFILE_PAGE.saturating_mul(PROFILE_SCAN_FACTOR),
+        )
+        .await?;
+    build_profiles_page(database, page, saved_profile)
+}
+
+fn build_profiles_page(
+    database: &DatabaseHandle,
+    page: crate::storage::ProfilePageRecords,
+    saved_profile: Option<ProfileId>,
+) -> Result<Value, Refusal> {
+    let crate::storage::ProfilePageRecords {
+        records,
+        connections,
+        compatible,
+        next_before,
+    } = page;
     let mut llm_profiles = Vec::new();
     let mut agent_profiles = Vec::new();
 
@@ -399,31 +436,21 @@ async fn build_profiles_snapshot(
         models: BTreeSet<String>,
     }
     let mut provider_groups: BTreeMap<ProviderKey, ProviderGroup> = BTreeMap::new();
-    let connections: BTreeMap<ConfigId, ConnectionConfig> = records
-        .iter()
-        .filter_map(|record| match &record.body {
-            ConfigBody::Connection(body) => Some((record.id, body.clone())),
-            _ => None,
-        })
-        .collect();
+    let mut last_emitted = None;
+    let mut page_bytes = 0;
+    let mut next_before = next_before;
 
     for record in records {
-        if record.archived_at.is_some() {
-            continue;
-        }
         let id = ProfileId::from(record.id);
         match record.body {
             ConfigBody::Model(model) => {
-                let connection = match connections.get(&model.connection_id) {
-                    Some(connection) => connection.clone(),
-                    None => match database.config(model.connection_id).await?.map(|r| r.body) {
-                        Some(ConfigBody::Connection(connection)) => connection,
-                        _ => return Err(INCONSISTENT_RECORD),
-                    },
+                let Some(connection) = connections.get(&model.connection_id).cloned() else {
+                    return Err(INCONSISTENT_RECORD);
                 };
-                let executors = database
-                    .compatible_executors(id)
-                    .await?
+                let executors = compatible
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|executor| executor.to_string())
                     .collect::<Vec<_>>();
@@ -440,28 +467,14 @@ async fn build_profiles_snapshot(
                     .map(|cap| capability_str(*cap))
                     .collect::<Vec<_>>();
                 let id_str = id.to_string();
-
-                let key = ProviderKey {
-                    protocol,
-                    endpoint: connection.endpoint.clone(),
-                    credential_ref: connection.credential_ref.clone(),
-                };
-                let group = provider_groups.entry(key).or_insert_with(|| ProviderGroup {
-                    has_credential,
-                    profile_ids: Vec::new(),
-                    models: BTreeSet::new(),
-                });
-                group.profile_ids.push(id_str.clone());
-                group.models.insert(model.model.clone());
-
-                llm_profiles.push(WireLlmProfile {
-                    id: id_str,
+                let profile = WireLlmProfile {
+                    id: id_str.clone(),
                     name: record.name,
-                    model: model.model,
+                    model: model.model.clone(),
                     context_window: model.context_window,
                     protocol: protocol.to_owned(),
-                    endpoint: connection.endpoint,
-                    credential_ref: connection.credential_ref,
+                    endpoint: connection.endpoint.clone(),
+                    credential_ref: connection.credential_ref.clone(),
                     has_credential,
                     declared_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
                     parameters: WireLlmParameters::from_parameters(&model.parameters),
@@ -471,10 +484,28 @@ async fn build_profiles_snapshot(
                     more_blocking_jobs: false,
                     created_at_us: record.created_at.as_unix_micros(),
                     updated_at_us: record.updated_at.as_unix_micros(),
+                };
+                if !fits_profile_page(&profile, &mut page_bytes)? {
+                    next_before = last_emitted;
+                    break;
+                }
+                let key = ProviderKey {
+                    protocol,
+                    endpoint: connection.endpoint,
+                    credential_ref: connection.credential_ref,
+                };
+                let group = provider_groups.entry(key).or_insert_with(|| ProviderGroup {
+                    has_credential,
+                    profile_ids: Vec::new(),
+                    models: BTreeSet::new(),
                 });
+                group.profile_ids.push(id_str);
+                group.models.insert(model.model);
+                llm_profiles.push(profile);
+                last_emitted = Some(record.id);
             }
             ConfigBody::Agent(agent) => {
-                agent_profiles.push(WireManagedAgent {
+                let profile = WireManagedAgent {
                     id: id.to_string(),
                     name: record.name,
                     instructions: agent.instructions,
@@ -507,7 +538,13 @@ async fn build_profiles_snapshot(
                     more_blocking_jobs: false,
                     created_at_us: record.created_at.as_unix_micros(),
                     updated_at_us: record.updated_at.as_unix_micros(),
-                });
+                };
+                if !fits_profile_page(&profile, &mut page_bytes)? {
+                    next_before = last_emitted;
+                    break;
+                }
+                agent_profiles.push(profile);
+                last_emitted = Some(record.id);
             }
             ConfigBody::Connection(_) | ConfigBody::Pool(_) => {}
         }
@@ -536,8 +573,21 @@ async fn build_profiles_snapshot(
         llm_profiles,
         agent_profiles,
         providers,
+        has_more: next_before.is_some(),
+        next_before: next_before.map(|id| ProfileId::from(id).to_string()),
         profile_id: saved_profile.map(|id| id.to_string()),
     }))
+}
+
+/// Whether `entry` fits the page budget. The first entry always does, so a
+/// page that starts on an oversized Profile still advances.
+fn fits_profile_page(entry: &impl serde::Serialize, bytes: &mut usize) -> Result<bool, Refusal> {
+    let size = serde_json::to_vec(entry).map_err(|_| INCONSISTENT_RECORD)?;
+    if *bytes > 0 && *bytes + size.len() > MAX_PROFILE_PAGE_BYTES {
+        return Ok(false);
+    }
+    *bytes += size.len();
+    Ok(true)
 }
 
 pub(super) async fn save_profile(
@@ -914,6 +964,7 @@ pub(super) async fn save_profile(
         // the whole save succeeded.
         database
             .set_credential(&target_ref, &secret_value)
+            .await
             .map_err(|_| CREDENTIAL_NOT_SAVED)?;
     }
     let snapshot = build_profiles_snapshot(database, Some(profile_id)).await?;
@@ -1183,7 +1234,7 @@ mod provider_network_tests {
     use super::*;
     use crate::database::DatabaseWorker;
     use crate::provider_execution::scripted;
-    use crate::test_support::{data_directory, on_system};
+    use crate::test_support::{data_directory, on_system, wait};
 
     #[test]
     fn provider_network_http_is_local_only_at_save_and_send_without_credentials() {
@@ -1242,9 +1293,7 @@ mod provider_network_tests {
         let (_root, directory) = data_directory("provider-network", "models");
         let worker = DatabaseWorker::start(&directory).expect("database");
         let database = worker.handle();
-        database
-            .set_credential("MODEL_TEST_KEY", "saved-secret")
-            .expect("save credential");
+        wait(database.set_credential("MODEL_TEST_KEY", "saved-secret")).expect("save credential");
         on_system(move || async move {
             database
                 .create_config(NewConfig {
@@ -1361,9 +1410,7 @@ mod provider_network_tests {
         let (_root, directory) = data_directory("provider-network", "models-credential-ref");
         let worker = DatabaseWorker::start(&directory).expect("database");
         let database = worker.handle();
-        database
-            .set_credential("SAVED_REF", "saved-secret")
-            .expect("save credential");
+        wait(database.set_credential("SAVED_REF", "saved-secret")).expect("save credential");
         on_system(move || async move {
             scripted::install_http("https://credential-ref.example/v1/models", |_| {
                 panic!("a credential_ref that names no saved Connection is never sent")
@@ -1559,7 +1606,9 @@ mod reasoning_parameter_tests {
                 )
                 .is_some()
             );
-            let listed = list_profiles(&handle).await.expect("GET profiles");
+            let listed = list_profiles(&handle, None, 50)
+                .await
+                .expect("GET profiles");
             assert_eq!(
                 listed.body["llm_profiles"][0]["parameters"]["reasoning_effort"],
                 "xhigh"
@@ -1570,6 +1619,122 @@ mod reasoning_parameter_tests {
             );
             worker.shutdown().expect("close");
         });
+    }
+
+    #[test]
+    fn profiles_page_old_connections_and_empty_scan_windows() {
+        let (_root, directory) = crate::test_support::data_directory("profiles", "paging");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        crate::test_support::on_system(move || async move {
+            let connection = database
+                .create_config(NewConfig {
+                    name: "old connection".into(),
+                    body: ConfigBody::Connection(ConnectionConfig {
+                        protocol: LlmTransport::OpenAiChatCompletions,
+                        endpoint: Some("https://old.example".into()),
+                        credential_ref: None,
+                    }),
+                })
+                .await
+                .expect("connection");
+            database
+                .create_executor(NewExecutor {
+                    name: "pool".into(),
+                    concurrency_limit: NonZeroU32::new(2).expect("limit"),
+                    llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+                })
+                .await
+                .expect("executor");
+            let mut expected = BTreeSet::new();
+            for index in 0..1_005 {
+                let id = if index % 3 == 0 {
+                    database
+                        .create_config(NewConfig {
+                            name: format!("agent {index}"),
+                            body: ConfigBody::Agent(AgentConfig::default()),
+                        })
+                        .await
+                } else {
+                    database
+                        .create_config(NewConfig {
+                            name: format!("model {index}"),
+                            body: ConfigBody::Model(ModelConfig {
+                                connection_id: connection,
+                                model: format!("model-{index}"),
+                                context_window: None,
+                                parameters: LlmParameters::default(),
+                                declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
+                            }),
+                        })
+                        .await
+                }
+                .expect("profile");
+                expected.insert(id);
+            }
+            // Newer Connections fill the first scan window without a Profile,
+            // so its page advances through an empty page.
+            for index in 0..30 {
+                database
+                    .create_config(NewConfig {
+                        name: format!("noise {index}"),
+                        body: ConfigBody::Connection(ConnectionConfig {
+                            protocol: LlmTransport::OpenAiChatCompletions,
+                            endpoint: Some("https://noise.example".into()),
+                            credential_ref: None,
+                        }),
+                    })
+                    .await
+                    .expect("connection");
+            }
+            let mut before = None;
+            let mut seen = BTreeSet::new();
+            let mut pages = 0;
+            loop {
+                let reply = list_profiles(&database, before, 7).await.expect("page");
+                pages += 1;
+                assert!(pages <= 1_005);
+                assert!(
+                    serde_json::to_vec(&reply.body).expect("body").len()
+                        <= MAX_PROFILE_PAGE_BYTES + 4_096
+                );
+                let llm = reply.body["llm_profiles"].as_array().expect("llm");
+                let agents = reply.body["agent_profiles"].as_array().expect("agents");
+                assert!(llm.len() + agents.len() <= 7);
+                for profile in llm {
+                    let id = ConfigId::from(
+                        profile_id(profile["id"].as_str().expect("id")).expect("identity"),
+                    );
+                    assert!(seen.insert(id));
+                    assert_eq!(profile["endpoint"], "https://old.example");
+                    assert!(
+                        !profile["executors"]
+                            .as_array()
+                            .expect("executors")
+                            .is_empty()
+                    );
+                }
+                for profile in agents {
+                    let id = ConfigId::from(
+                        profile_id(profile["id"].as_str().expect("id")).expect("identity"),
+                    );
+                    assert!(seen.insert(id));
+                }
+                let next = reply.body["next_before"]
+                    .as_str()
+                    .map(|raw| ConfigId::from(profile_id(raw).expect("continuation identity")));
+                assert_eq!(reply.body["has_more"], json!(next.is_some()));
+                match next {
+                    Some(next) => {
+                        assert!(before.is_none_or(|previous| next < previous));
+                        before = Some(next);
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(seen, expected);
+        });
+        worker.shutdown().expect("shutdown");
     }
 }
 

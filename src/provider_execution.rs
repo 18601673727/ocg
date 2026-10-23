@@ -52,8 +52,8 @@ pub use exchange::{execute_chat_with_sink, execute_conversation};
 #[cfg(test)]
 pub(crate) use observe::retry_after_ms;
 pub(crate) use observe::unannounced_fact;
+use observe::{Redactor, announce_at, bounded_body, classify_client_error, trim_ascii};
 pub(crate) use observe::{announce, rejected_failure};
-use observe::{announce_at, bounded_body, classify_client_error, trim_ascii};
 pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecutionError> {
     exchange::endpoint(endpoint, "models")
 }
@@ -387,6 +387,9 @@ pub(crate) mod tests {
     struct RecordingSink {
         deltas: Vec<String>,
         fail: Option<&'static str>,
+        /// Successful appends before `fail` starts refusing, so a test can
+        /// fail the final flush alone.
+        fail_after_appends: Option<usize>,
         observations: Vec<ProviderObservation>,
     }
 
@@ -411,10 +414,16 @@ pub(crate) mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
             Box::pin(async move {
                 match self.fail {
-                    Some(message) => Err(OutputSinkError {
-                        message: message.to_owned(),
-                    }),
-                    None => {
+                    Some(message)
+                        if self
+                            .fail_after_appends
+                            .is_none_or(|count| self.deltas.len() >= count) =>
+                    {
+                        Err(OutputSinkError {
+                            message: message.to_owned(),
+                        })
+                    }
+                    _ => {
                         self.deltas.push(text.to_owned());
                         Ok(())
                     }
@@ -598,7 +607,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_local_output_failure_keeps_the_facts_of_the_event_that_failed() {
+    fn a_local_output_failure_keeps_the_completed_response_and_its_facts() {
         let mut sink = RecordingSink {
             fail: Some("database could not persist provider output"),
             ..RecordingSink::default()
@@ -611,15 +620,65 @@ pub(crate) mod tests {
         )
         .expect_err("a sink failure stops the stream");
         match error {
-            ProviderExecutionError::Stopped { message, facts } => {
+            ProviderExecutionError::CompletionUnpersisted { message, result } => {
                 assert_eq!(message, "database could not persist provider output");
+                assert_eq!(result.text, "hi");
                 assert_eq!(
-                    facts,
-                    self::facts(Some(ChatFinishReason::Stop), Some("stop"))
+                    (
+                        result.status_code,
+                        result.finish_reason,
+                        result.raw_finish_reason
+                    ),
+                    (200, Some(ChatFinishReason::Stop), Some("stop".to_owned()))
                 );
             }
-            other => panic!("a local write failure is a local stop, got {other:?}"),
+            other => panic!("a completed response keeps its result, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_final_flush_keeps_text_reasoning_and_tool_calls_as_evidence() {
+        let size = STREAM_OUTPUT_BUFFER_BYTES;
+        let text = "x".repeat(size);
+        let first = leaked(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\n"
+        ));
+        let mut sink = RecordingSink {
+            fail: Some("database could not persist provider output"),
+            fail_after_appends: Some(1),
+            ..RecordingSink::default()
+        };
+        let error = read(
+            vec![
+                Step::Chunk(first),
+                Step::Chunk(
+                    "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+                ),
+                Step::Chunk(tool_delta(
+                    r#"[{"id":"call","function":{"name":"f","arguments":"{}"}}]"#,
+                )),
+                Step::Chunk(TOOL_CALLS),
+            ],
+            &offering(&["f"]),
+            Some(&mut sink),
+        )
+        .expect_err("only the final flush fails");
+        match error {
+            ProviderExecutionError::CompletionUnpersisted { message, result } => {
+                assert_eq!(message, "database could not persist provider output");
+                assert_eq!(result.text, text);
+                assert_eq!(result.reasoning, "think");
+                assert_eq!(result.tool_calls.len(), 1);
+                assert_eq!(result.finish_reason, Some(ChatFinishReason::ToolCalls));
+                assert!(result.tool_calls[0].name == "f");
+            }
+            other => panic!("the completed response is kept, got {other:?}"),
+        }
+        assert_eq!(
+            sink.deltas,
+            [text],
+            "the prefix that was persisted once is not written again"
+        );
     }
 
     #[test]
@@ -4077,6 +4136,247 @@ pub(crate) mod tests {
                     ..ProviderFailure::default()
                 }
             );
+        }
+    }
+
+    mod credential_redaction {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        use super::*;
+        use crate::persistence::{
+            ConfigId, ConfigRef, FrozenLlmConfig, LlmConfig, LlmProviderId, LlmTransport,
+            ProviderSnapshot,
+        };
+        use crate::test_support::on_system;
+
+        const SECRET: &str = "sk-C6-redaction-secret-0123456789";
+
+        struct FixedCredential(Option<&'static str>);
+
+        impl CredentialResolver for FixedCredential {
+            fn resolve(&self, _: Option<&str>) -> Result<Option<String>, ProviderExecutionError> {
+                Ok(self.0.map(str::to_owned))
+            }
+        }
+
+        fn frozen(endpoint: &str, credential_ref: Option<&str>) -> FrozenExecutionConfig {
+            FrozenExecutionConfig {
+                agent: None,
+                agent_ref: None,
+                llm: FrozenLlmConfig {
+                    config: LlmConfig {
+                        model: "test-model".to_owned(),
+                        context_window: None,
+                        parameters: LlmParameters::default(),
+                        declared_capabilities: Default::default(),
+                    },
+                    provider: ProviderSnapshot {
+                        id: LlmProviderId::new(1),
+                        edit_seq: 1,
+                        name: "test".to_owned(),
+                        transport: LlmTransport::OpenAiChatCompletions,
+                        endpoint: Some(endpoint.to_owned()),
+                        credential_ref: credential_ref.map(str::to_owned),
+                    },
+                    model: ConfigRef {
+                        id: ConfigId::new(1),
+                        edit_seq: 1,
+                    },
+                },
+            }
+        }
+
+        fn response(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+            let mut text = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+            for (name, value) in headers {
+                text.push_str(&format!("{name}: {value}\r\n"));
+            }
+            text.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+            text.push_str(body);
+            text.into_bytes()
+        }
+
+        /// Serves one HTTP answer on a local port and returns its endpoint.
+        fn serve(answer: Vec<u8>) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+            let address = listener.local_addr().expect("local address");
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let mut needed = None;
+                while needed.is_none_or(|needed| request.len() < needed) {
+                    let read = stream.read(&mut buffer).expect("read the request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if needed.is_none()
+                        && let Some(end) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        needed = Some(end + 4 + length);
+                    }
+                }
+                stream.write_all(&answer).expect("write the answer");
+                stream.flush().ok();
+            });
+            format!("http://{address}/v1")
+        }
+
+        fn failed(answer: Vec<u8>, secret: Option<&'static str>) -> ProviderExecutionError {
+            let endpoint = serve(answer);
+            let frozen = frozen(&endpoint, secret.map(|_| "C6_TEST_CREDENTIAL"));
+            on_system(move || async move {
+                execute_conversation(
+                    &frozen,
+                    &objective_conversation(&frozen, Some("say hi")),
+                    &FixedCredential(secret),
+                    &ProviderExecutionConfig::default(),
+                    None,
+                )
+                .await
+            })
+            .expect_err("the scripted answer is a failure")
+        }
+
+        #[test]
+        fn an_http_rejection_keeps_its_diagnostics_without_the_credential() {
+            let body = format!(
+                "{{\"error\":{{\"message\":\"bad key {SECRET}\",\"code\":\"invalid_api_key\"}}}}"
+            );
+            let error = failed(
+                response(
+                    "400 Bad Request",
+                    &[
+                        ("content-type", "application/json"),
+                        ("x-request-id", SECRET),
+                    ],
+                    &body,
+                ),
+                Some(SECRET),
+            );
+            assert!(!format!("{error}").contains(SECRET));
+            match error {
+                ProviderExecutionError::Rejected { failure } => {
+                    assert!(failure.message.contains("bad key"));
+                    assert!(!failure.message.contains(SECRET));
+                    assert_eq!(failure.provider_code.as_deref(), Some("invalid_api_key"));
+                    assert!(
+                        failure
+                            .response_body
+                            .as_deref()
+                            .is_some_and(|body| !body.contains(SECRET)),
+                        "the raw body is kept without the credential"
+                    );
+                    assert!(
+                        failure
+                            .request_id
+                            .as_deref()
+                            .is_some_and(|request| !request.contains(SECRET))
+                    );
+                }
+                other => panic!("an HTTP rejection, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_streamed_error_never_returns_the_credential() {
+            let body = format!(
+                "data: {{\"error\":{{\"message\":\"invalid api key {SECRET}\",\"status\":401,\"code\":\"invalid_api_key\"}}}}\n\n"
+            );
+            let error = failed(
+                response(
+                    "200 OK",
+                    &[
+                        ("content-type", "text/event-stream"),
+                        ("x-request-id", SECRET),
+                    ],
+                    &body,
+                ),
+                Some(SECRET),
+            );
+            assert!(!format!("{error}").contains(SECRET));
+            match error {
+                ProviderExecutionError::Rejected { failure } => {
+                    assert!(failure.message.contains("invalid api key"));
+                    assert!(!failure.message.contains(SECRET));
+                    assert_eq!(failure.status_code, Some(401));
+                    assert_eq!(failure.provider_code.as_deref(), Some("invalid_api_key"));
+                    assert!(
+                        failure
+                            .request_id
+                            .as_deref()
+                            .is_some_and(|request| !request.contains(SECRET))
+                    );
+                }
+                other => panic!("a streamed rejection, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_json_escaped_echo_is_redacted_before_and_after_parsing() {
+            let secret = "sk-\"quoted\"\\key";
+            let body = serde_json::json!({
+                "error": {"message": format!("key {secret} rejected")}
+            })
+            .to_string();
+            assert!(
+                body.contains("quoted"),
+                "the body echoes the secret escaped"
+            );
+            let error = failed(
+                response(
+                    "400 Bad Request",
+                    &[("content-type", "application/json")],
+                    &body,
+                ),
+                Some(secret),
+            );
+            match error {
+                ProviderExecutionError::Rejected { failure } => {
+                    assert!(failure.message.contains("rejected"));
+                    assert!(!failure.message.contains("quoted"));
+                    assert!(!failure.message.contains('\\'));
+                    assert!(
+                        failure
+                            .response_body
+                            .as_deref()
+                            .is_some_and(|body| !body.contains("quoted"))
+                    );
+                }
+                other => panic!("a JSON-escaped rejection, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_credential_free_request_keeps_the_provider_text() {
+            let body = format!("{{\"error\":{{\"message\":\"bad key {SECRET}\"}}}}");
+            let error = failed(
+                response(
+                    "400 Bad Request",
+                    &[("content-type", "application/json")],
+                    &body,
+                ),
+                None,
+            );
+            match error {
+                ProviderExecutionError::Rejected { failure } => {
+                    assert_eq!(failure.message, format!("bad key {SECRET}"));
+                }
+                other => panic!("a credential-free rejection, got {other:?}"),
+            }
         }
     }
 }

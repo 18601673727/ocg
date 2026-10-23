@@ -1174,10 +1174,11 @@ mod tests {
                     agent: None,
                 },
                 bucketing,
+                None,
             ))
             .unwrap();
             assert!(summary.complete);
-            assert_eq!(summary.resume_from_us, None);
+            assert_eq!(summary.resume_after, None);
             assert_eq!(summary.from_us, bucketing.start_of(0).unwrap());
             assert_eq!(summary.until_us, bucketing.end_of(7 * D - 1).unwrap());
             assert_eq!(
@@ -1273,7 +1274,7 @@ mod tests {
 
         // Check summary so far: the scan finished, though the usage is not final.
         let summary =
-            wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default()))
+            wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default(), None))
                 .unwrap();
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].requests, 1);
@@ -1281,7 +1282,7 @@ mod tests {
         assert_eq!(summary.rows[0].input_tokens, 10);
         assert_eq!(summary.rows[0].output_tokens, 5);
         assert!(summary.complete, "complete says the scan finished");
-        assert_eq!(summary.resume_from_us, None);
+        assert_eq!(summary.resume_after, None);
 
         // 2. Final metrics for the same request
         wait(database.record_metrics(NewMetrics {
@@ -1303,7 +1304,7 @@ mod tests {
         .unwrap();
 
         let summary =
-            wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default()))
+            wait(database.usage_summary(crate::persistence::UsageSummaryFilter::default(), None))
                 .unwrap();
         assert_eq!(summary.rows.len(), 1);
         assert_eq!(summary.rows[0].requests, 1);
@@ -1354,26 +1355,28 @@ mod tests {
         .unwrap();
 
         // Filter by agent_1
-        let summary_agent1 = wait(
-            database.usage_summary(crate::persistence::UsageSummaryFilter {
+        let summary_agent1 = wait(database.usage_summary(
+            crate::persistence::UsageSummaryFilter {
                 from_us: None,
                 until_us: None,
                 agent: Some(agent_1.get()),
-            }),
-        )
+            },
+            None,
+        ))
         .unwrap();
         assert_eq!(summary_agent1.rows.len(), 1);
         assert_eq!(summary_agent1.rows[0].agent, agent_1.get());
         assert_eq!(summary_agent1.rows[0].input_tokens, 10);
 
         // Filter by agent_2
-        let summary_agent2 = wait(
-            database.usage_summary(crate::persistence::UsageSummaryFilter {
+        let summary_agent2 = wait(database.usage_summary(
+            crate::persistence::UsageSummaryFilter {
                 from_us: None,
                 until_us: None,
                 agent: Some(agent_2.get()),
-            }),
-        )
+            },
+            None,
+        ))
         .unwrap();
         assert_eq!(summary_agent2.rows.len(), 1);
         assert_eq!(summary_agent2.rows[0].agent, agent_2.get());
@@ -1381,39 +1384,42 @@ mod tests {
 
         // An empty range: `until_us` is exclusive, so equal bounds cover no
         // instant and no bucket, even when the bound starts an hour.
-        let summary_empty = wait(
-            database.usage_summary(crate::persistence::UsageSummaryFilter {
+        let summary_empty = wait(database.usage_summary(
+            crate::persistence::UsageSummaryFilter {
                 from_us: Some(3_600_000_000),
                 until_us: Some(3_600_000_000),
                 agent: None,
-            }),
-        )
+            },
+            None,
+        ))
         .unwrap();
         assert!(summary_empty.rows.is_empty());
         assert!(summary_empty.complete);
-        assert_eq!(summary_empty.resume_from_us, None);
+        assert_eq!(summary_empty.resume_after, None);
 
         // Hour 1 only: [3_600_000_000, 7_200_000_000) rounds up to a bucket
         // end exclusive of hour 2.
-        let summary_hour1 = wait(
-            database.usage_summary(crate::persistence::UsageSummaryFilter {
+        let summary_hour1 = wait(database.usage_summary(
+            crate::persistence::UsageSummaryFilter {
                 from_us: Some(3_600_000_000),
                 until_us: Some(7_200_000_000),
                 agent: None,
-            }),
-        )
+            },
+            None,
+        ))
         .unwrap();
         assert_eq!(summary_hour1.rows.len(), 1);
         assert_eq!(summary_hour1.rows[0].agent, agent_1.get());
 
         // Hour 2 only: [7_200_000_000, 10_800_000_000).
-        let summary_hour2 = wait(
-            database.usage_summary(crate::persistence::UsageSummaryFilter {
+        let summary_hour2 = wait(database.usage_summary(
+            crate::persistence::UsageSummaryFilter {
                 from_us: Some(7_200_000_000),
                 until_us: Some(10_800_000_000),
                 agent: None,
-            }),
-        )
+            },
+            None,
+        ))
         .unwrap();
         assert_eq!(summary_hour2.rows.len(), 1);
         assert_eq!(summary_hour2.rows[0].agent, agent_2.get());

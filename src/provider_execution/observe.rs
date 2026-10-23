@@ -13,7 +13,8 @@ pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
         | ProviderExecutionError::Rejected { .. }
         | ProviderExecutionError::Incomplete { .. }
         | ProviderExecutionError::Interrupted { .. }
-        | ProviderExecutionError::Stopped { .. } => ProviderFact::Delivered,
+        | ProviderExecutionError::Stopped { .. }
+        | ProviderExecutionError::CompletionUnpersisted { .. } => ProviderFact::Delivered,
         ProviderExecutionError::OutputPersistence { stream, .. } => unannounced_fact(stream),
     }
 }
@@ -43,6 +44,117 @@ pub(super) async fn bounded_body(response: ClientResponse, limit: usize) -> Opti
         .await
         .ok()
         .and_then(|body| String::from_utf8(body.to_vec()).ok())
+}
+
+/// The replacement written wherever a resolved credential is found.
+const REDACTED: &str = "[redacted]";
+
+/// Removes a resolved credential from provider-controlled values before they
+/// can leave provider execution. One is built in `exchange`, while the
+/// credential is still known, and every failure that can reach persistence,
+/// an API response, a log or `Display` passes through it. Both the credential
+/// as sent and its JSON-escaped spelling are covered, so a secret echoed
+/// inside a JSON error body cannot survive as the parsed message either.
+#[derive(Debug, Default)]
+pub(crate) struct Redactor {
+    secrets: Vec<String>,
+}
+
+impl Redactor {
+    pub(crate) fn new(credential: Option<&str>) -> Self {
+        let mut secrets = Vec::new();
+        if let Some(secret) = credential.filter(|secret| !secret.is_empty()) {
+            let escaped = serde_json::to_string(secret)
+                .ok()
+                .and_then(|quoted| {
+                    quoted
+                        .strip_prefix('"')
+                        .and_then(|quoted| quoted.strip_suffix('"'))
+                        .map(str::to_owned)
+                })
+                .filter(|escaped| escaped != secret);
+            secrets.push(secret.to_owned());
+            secrets.extend(escaped);
+        }
+        Self { secrets }
+    }
+
+    pub(crate) fn text(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        for secret in &self.secrets {
+            text = text.replace(secret.as_str(), REDACTED);
+        }
+        text
+    }
+
+    fn optional(&self, text: Option<String>) -> Option<String> {
+        text.map(|text| self.text(&text))
+    }
+
+    fn facts(&self, mut facts: ResponseFacts) -> ResponseFacts {
+        facts.raw_finish_reason = self.optional(facts.raw_finish_reason);
+        facts
+    }
+
+    pub(crate) fn failure(&self, mut failure: ProviderFailure) -> ProviderFailure {
+        failure.message = self.text(&failure.message);
+        failure.provider_code = self.optional(failure.provider_code);
+        failure.response_body = self.optional(failure.response_body);
+        failure.request_id = self.optional(failure.request_id);
+        failure
+    }
+
+    pub(crate) fn error(&self, error: ProviderExecutionError) -> ProviderExecutionError {
+        match error {
+            ProviderExecutionError::Build { message } => ProviderExecutionError::Build {
+                message: self.text(&message),
+            },
+            ProviderExecutionError::NotDelivered { message } => {
+                ProviderExecutionError::NotDelivered {
+                    message: self.text(&message),
+                }
+            }
+            ProviderExecutionError::Unknown {
+                message,
+                facts,
+                finished,
+            } => ProviderExecutionError::Unknown {
+                message: self.text(&message),
+                facts: facts.map(|facts| self.facts(facts)),
+                finished,
+            },
+            ProviderExecutionError::Rejected { failure } => ProviderExecutionError::Rejected {
+                failure: self.failure(failure),
+            },
+            ProviderExecutionError::Incomplete { message, facts } => {
+                ProviderExecutionError::Incomplete {
+                    message: self.text(&message),
+                    facts: self.facts(facts),
+                }
+            }
+            ProviderExecutionError::Interrupted { message } => {
+                ProviderExecutionError::Interrupted {
+                    message: self.text(&message),
+                }
+            }
+            ProviderExecutionError::Stopped { message, facts } => ProviderExecutionError::Stopped {
+                message: self.text(&message),
+                facts: self.facts(facts),
+            },
+            ProviderExecutionError::OutputPersistence { message, stream } => {
+                ProviderExecutionError::OutputPersistence {
+                    message: self.text(&message),
+                    stream: Box::new(self.error(*stream)),
+                }
+            }
+            ProviderExecutionError::CompletionUnpersisted { message, result } => {
+                ProviderExecutionError::CompletionUnpersisted {
+                    message: self.text(&message),
+                    result,
+                }
+            }
+        }
+    }
 }
 
 /// What OCG keeps of a non-200 response to `conversation`. A Provider or
@@ -215,6 +327,14 @@ pub fn error_observations(
             vec![observed(facts, Some(failure()))]
         }
         ProviderExecutionError::OutputPersistence { stream, .. } => error_observations(stream),
+        ProviderExecutionError::CompletionUnpersisted { result, .. } => {
+            let facts = ResponseFacts {
+                status_code: result.status_code,
+                finish_reason: result.finish_reason,
+                raw_finish_reason: result.raw_finish_reason.clone(),
+            };
+            vec![observed(&facts, None)]
+        }
     }
 }
 

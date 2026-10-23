@@ -955,7 +955,10 @@ pub struct UsageSummaryRow {
 
 /// One aggregated row in a usage summary retry breakdown. The grouping
 /// matches [`UsageSummaryRow`]: `agent` is 0 for work submitted without an
-/// Agent, and `bucket_us` is the requested day or week bucket start.
+/// Agent, and `bucket_us` is the requested day or week bucket start. A page
+/// can return the same key more than once across pages, so a consumer sums
+/// `retries` by `(bucket_us, agent, provider, model)` to obtain the exact
+/// count.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageRetryRow {
     pub bucket_us: i64,
@@ -965,14 +968,29 @@ pub struct UsageRetryRow {
     pub retries: u64,
 }
 
+/// A position in the usage totals: the last source row a page examined.
+/// Continuing strictly after it reads every remaining row exactly once, even
+/// inside one dense hour or chart bucket.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub struct UsageCursor {
+    pub hour: i64,
+    pub agent: u128,
+    pub provider: u128,
+    pub model_hash: [u8; 32],
+}
+
 /// The aggregated token usage summary response. `complete` says the scan
-/// finished; `resume_from_us` is set exactly when it did not.
+/// reached the end of the requested range; `resume_after` is set exactly
+/// when it did not. A page can hold partial aggregates for groups that the
+/// next page continues, so a consumer merges rows by their group key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummaryResponse {
     pub from_us: i64,
     pub until_us: i64,
     pub complete: bool,
-    pub resume_from_us: Option<i64>,
+    pub resume_after: Option<UsageCursor>,
     pub rows: Vec<UsageSummaryRow>,
 }
 
@@ -1028,11 +1046,14 @@ pub struct UsageBucketRow {
     pub row: UsageSummaryRow,
 }
 
+/// One page of chart buckets. As with [`UsageSummaryResponse`], a page can
+/// hold partial aggregates and `resume_after` continues strictly after the
+/// last source row examined.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageBucketResponse {
     pub from_us: i64,
     pub until_us: i64,
     pub complete: bool,
-    pub resume_from_us: Option<i64>,
+    pub resume_after: Option<UsageCursor>,
     pub rows: Vec<UsageBucketRow>,
 }

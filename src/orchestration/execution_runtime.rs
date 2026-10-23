@@ -1094,17 +1094,131 @@ fn lock(state: &SharedState) -> std::sync::MutexGuard<'_, RuntimeState> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How many lifecycle notifications may wait in the dispatch queue.
+const SCHEDULER_NOTIFICATIONS: usize = 64;
+
+/// A grant, stop or completion, in the order the dispatcher applies them
+/// when they are coalesced.
+#[derive(Clone, Copy)]
+enum JobSignal {
+    Grant,
+    Stop,
+    Finished,
+}
+
+#[derive(Clone, Copy, Default)]
+struct JobSignals {
+    grant: bool,
+    stop: bool,
+    finished: bool,
+}
+
+impl JobSignals {
+    fn of(signal: JobSignal) -> Self {
+        let mut signals = Self::default();
+        signals.add(signal);
+        signals
+    }
+
+    fn add(&mut self, signal: JobSignal) {
+        match signal {
+            JobSignal::Grant => self.grant = true,
+            JobSignal::Stop => self.stop = true,
+            JobSignal::Finished => self.finished = true,
+        }
+    }
+}
+
+/// The bounded path to the dispatcher. A producer that finds the queue full
+/// coalesces its signal into one entry per Job and wakes the dispatcher, so
+/// no worker thread waits for capacity and no lifecycle fact is lost. The
+/// backlog holds at most one entry per Job the runtime is tracking.
+#[derive(Clone)]
+pub(crate) struct SchedulerNotifications {
+    messages: flume::Sender<SchedulerMessage>,
+    wake: flume::Sender<()>,
+    backlog: Arc<Mutex<BTreeMap<JobId, JobSignals>>>,
+}
+
+impl SchedulerNotifications {
+    fn new(messages: flume::Sender<SchedulerMessage>, wake: flume::Sender<()>) -> Self {
+        Self {
+            messages,
+            wake,
+            backlog: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_channel() -> (Self, flume::Receiver<SchedulerMessage>) {
+        let (messages, receiver) = flume::bounded(SCHEDULER_NOTIFICATIONS);
+        let (wake, _wakes) = flume::bounded(1);
+        (Self::new(messages, wake), receiver)
+    }
+
+    /// Sends a lifecycle signal without waiting. While a Job has a backlog
+    /// entry every further signal for it stays there too, so the dispatcher
+    /// applies that Job's signals in one place and in order.
+    fn notify(&self, job: JobId, signal: JobSignal) {
+        let mut backlog = self.backlog.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(signals) = backlog.get_mut(&job) {
+            signals.add(signal);
+            drop(backlog);
+            self.wake();
+            return;
+        }
+        let message = match signal {
+            JobSignal::Grant => SchedulerMessage::Grant(job),
+            JobSignal::Stop => SchedulerMessage::Stop(job),
+            JobSignal::Finished => SchedulerMessage::Finished(job),
+        };
+        match self.messages.try_send(message) {
+            Ok(()) | Err(flume::TrySendError::Disconnected(_)) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                backlog.insert(job, JobSignals::of(signal));
+                drop(backlog);
+                self.wake();
+            }
+        }
+    }
+
+    /// Sends from an async producer, which may wait for capacity because the
+    /// dispatcher is the only consumer.
+    async fn send(
+        &self,
+        message: SchedulerMessage,
+    ) -> Result<(), flume::SendError<SchedulerMessage>> {
+        self.messages.send_async(message).await
+    }
+
+    fn wake(&self) {
+        self.wake.try_send(()).ok();
+    }
+
+    fn has_backlog(&self) -> bool {
+        !self
+            .backlog
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+
+    fn take_backlog(&self) -> BTreeMap<JobId, JobSignals> {
+        std::mem::take(&mut *self.backlog.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
 /// A cloneable endpoint for scheduler submissions.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     sender: flume::Sender<Box<Submission>>,
-    notifications: flume::Sender<SchedulerMessage>,
+    notifications: SchedulerNotifications,
     state: SharedState,
 }
 
 #[derive(Clone)]
 pub(crate) struct StopHandle {
-    notifications: flume::Sender<SchedulerMessage>,
+    notifications: SchedulerNotifications,
     state: SharedState,
 }
 impl StopHandle {
@@ -1116,7 +1230,7 @@ impl StopHandle {
             cancellation.cancel();
         }
         drop(state);
-        self.notifications.send(SchedulerMessage::Stop(turn)).ok();
+        self.notifications.notify(turn, JobSignal::Stop);
     }
 }
 
@@ -1375,7 +1489,9 @@ impl ExecutionRuntime {
         let wake = database
             .take_scheduler_wake()
             .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
-        let (sender, receiver) = flume::unbounded();
+        let (messages, receiver) = flume::bounded(SCHEDULER_NOTIFICATIONS);
+        let (wakeups, wakes) = flume::bounded(1);
+        let sender = SchedulerNotifications::new(messages, wakeups);
         let (admission, admissions) = flume::bounded(64);
         let state = SharedState::default();
         let shutdown = CancellationToken::default();
@@ -1383,6 +1499,7 @@ impl ExecutionRuntime {
             database,
             scope,
             wake,
+            wakes,
             sender.clone(),
             receiver,
             admissions,
@@ -1435,7 +1552,8 @@ async fn dispatch_runtime(
     database: DatabaseHandle,
     scope: ClaimScope,
     wake: crate::database::SchedulerWakeSubscription,
-    sender: flume::Sender<SchedulerMessage>,
+    wakes: flume::Receiver<()>,
+    sender: SchedulerNotifications,
     receiver: flume::Receiver<SchedulerMessage>,
     admissions: flume::Receiver<Box<Submission>>,
     state: SharedState,
@@ -1454,6 +1572,7 @@ async fn dispatch_runtime(
                             let (reply, response) = flume::bounded(1);
                             sender
                                 .send(SchedulerMessage::Claim(reply))
+                                .await
                                 .map_err(|_| DatabaseError::ShuttingDown)?;
                             response
                                 .recv_async()
@@ -1462,7 +1581,7 @@ async fn dispatch_runtime(
                         }
                     },
                     |job| {
-                        sender.send(SchedulerMessage::Grant(job)).ok();
+                        sender.notify(job, JobSignal::Grant);
                     },
                 )
                 .await;
@@ -1472,28 +1591,56 @@ async fn dispatch_runtime(
     let mut running = BTreeMap::new();
     let mut reconcile_at = Instant::now() + Duration::from_secs(30);
     let mut unconfirmed_stopped = BTreeSet::new();
+    enum Incoming {
+        Message(Result<SchedulerMessage, flume::RecvError>),
+        Wake,
+        Closed,
+    }
     loop {
+        // Coalesced signals wait until the queue itself is empty, so a Job's
+        // queued signals are always applied before its backlogged ones.
+        if receiver.is_empty() && sender.has_backlog() {
+            drain_notifications(&database, &mut pending, &mut running, &state, &sender).await;
+        }
         let incoming = async {
             if Instant::now() >= reconcile_at {
-                return Ok(SchedulerMessage::Reconcile);
+                return Incoming::Message(Ok(SchedulerMessage::Reconcile));
             }
             match select(
                 receiver.recv_async(),
                 select(
-                    admissions.recv_async(),
-                    ntex::time::sleep(reconcile_at.saturating_duration_since(Instant::now())),
+                    wakes.recv_async(),
+                    select(
+                        admissions.recv_async(),
+                        ntex::time::sleep(reconcile_at.saturating_duration_since(Instant::now())),
+                    ),
                 ),
             )
             .await
             {
-                Either::Left(message) => message,
-                Either::Right(Either::Left(submission)) => {
-                    submission.map(SchedulerMessage::Schedule)
+                Either::Left(message) => Incoming::Message(message),
+                Either::Right(Either::Left(Ok(()))) => Incoming::Wake,
+                Either::Right(Either::Left(Err(_))) => Incoming::Closed,
+                Either::Right(Either::Right(Either::Left(submission))) => {
+                    Incoming::Message(submission.map(SchedulerMessage::Schedule))
                 }
-                Either::Right(Either::Right(())) => Ok(SchedulerMessage::Reconcile),
+                Either::Right(Either::Right(Either::Right(()))) => {
+                    Incoming::Message(Ok(SchedulerMessage::Reconcile))
+                }
             }
         };
-        let Either::Right(Ok(message)) = select(shutdown.cancelled(), incoming).await else {
+        let message = match select(shutdown.cancelled(), incoming).await {
+            Either::Left(()) | Either::Right(Incoming::Closed) => break,
+            Either::Right(Incoming::Wake) => {
+                if receiver.is_empty() {
+                    drain_notifications(&database, &mut pending, &mut running, &state, &sender)
+                        .await;
+                }
+                continue;
+            }
+            Either::Right(Incoming::Message(message)) => message,
+        };
+        let Ok(message) = message else {
             break;
         };
         match message {
@@ -1582,7 +1729,7 @@ async fn dispatch_runtime(
                             if let Either::Left(()) =
                                 select(cancellation.cancelled(), done.cancelled()).await
                             {
-                                sender.send(SchedulerMessage::Stop(job)).ok();
+                                sender.notify(job, JobSignal::Stop);
                             }
                         }
                     });
@@ -1723,25 +1870,10 @@ async fn dispatch_runtime(
                 );
             }
             SchedulerMessage::Stop(job) => {
-                stop_pending(&database, job, &mut pending, &state).await;
-                // A committed Stop may reach us after Finished removed its task.
-                // Keep the cause through a grant race, but do not retain terminal Jobs.
-                if database
-                    .job(job)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some_and(|record| record.any_terminal())
-                {
-                    lock(&state).stops.remove(&job);
-                }
+                stop_job(&database, job, &mut pending, &state).await;
             }
             SchedulerMessage::Finished(job) => {
-                if let Some(task) = running.remove(&job) {
-                    finish_grant(&database, job, task).await;
-                }
-                lock(&state).current.remove(&job);
-                lock(&state).stops.remove(&job);
+                finish_job(&database, job, &mut running, &state).await;
             }
         }
     }
@@ -1768,6 +1900,7 @@ async fn dispatch_runtime(
             | SchedulerMessage::Reconcile => {}
         }
     }
+    drain_grants(&database, &mut pending, &mut running, &state, &sender);
     dispatcher
         .await
         .map_err(|_| ExecutionRuntimeError::WorkerPanicked)?;
@@ -1790,6 +1923,7 @@ async fn dispatch_runtime(
             | SchedulerMessage::Reconcile => {}
         }
     }
+    drain_grants(&database, &mut pending, &mut running, &state, &sender);
     for execution in pending.into_values() {
         cancel_pending(&database, &execution).await;
     }
@@ -1800,6 +1934,92 @@ async fn dispatch_runtime(
     lock(&state).current.clear();
     lock(&state).stops.clear();
     Ok(())
+}
+
+/// Applies a Stop. A committed Stop may reach us after Finished removed its
+/// task: keep the cause through a grant race, but do not retain terminal Jobs.
+async fn stop_job(
+    database: &DatabaseHandle,
+    job: JobId,
+    pending: &mut BTreeMap<JobId, PendingExecution>,
+    state: &SharedState,
+) {
+    stop_pending(database, job, pending, state).await;
+    if database
+        .job(job)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|record| record.any_terminal())
+    {
+        lock(state).stops.remove(&job);
+    }
+}
+
+async fn finish_job(
+    database: &DatabaseHandle,
+    job: JobId,
+    running: &mut BTreeMap<JobId, RunningExecution>,
+    state: &SharedState,
+) {
+    if let Some(task) = running.remove(&job) {
+        finish_grant(database, job, task).await;
+    }
+    lock(state).current.remove(&job);
+    lock(state).stops.remove(&job);
+}
+
+/// Applies coalesced signals in the order a Job's lifecycle needs. The
+/// dispatcher runs this only when the queue itself is empty, so a Job's
+/// queued signals always precede its backlogged ones.
+async fn drain_notifications(
+    database: &DatabaseHandle,
+    pending: &mut BTreeMap<JobId, PendingExecution>,
+    running: &mut BTreeMap<JobId, RunningExecution>,
+    state: &SharedState,
+    notifications: &SchedulerNotifications,
+) {
+    for (job, signals) in notifications.take_backlog() {
+        if signals.grant {
+            spawn_grant(
+                job,
+                pending.remove(&job),
+                database,
+                notifications,
+                state,
+                running,
+            );
+        }
+        if signals.stop {
+            stop_job(database, job, pending, state).await;
+        }
+        if signals.finished {
+            finish_job(database, job, running, state).await;
+        }
+    }
+}
+
+/// Shutdown starts only grants that were already committed; pending Jobs are
+/// cancelled and running ones finished afterwards.
+fn drain_grants(
+    database: &DatabaseHandle,
+    pending: &mut BTreeMap<JobId, PendingExecution>,
+    running: &mut BTreeMap<JobId, RunningExecution>,
+    state: &SharedState,
+    notifications: &SchedulerNotifications,
+) {
+    for (job, signals) in notifications.take_backlog() {
+        if signals.grant {
+            spawn_grant(
+                job,
+                pending.remove(&job),
+                database,
+                notifications,
+                state,
+                running,
+            );
+        }
+    }
 }
 
 async fn stop_pending(
@@ -1879,12 +2099,12 @@ struct RunningExecution {
 
 struct NotifyFinished {
     job: JobId,
-    sender: flume::Sender<SchedulerMessage>,
+    notifications: SchedulerNotifications,
 }
 
 impl Drop for NotifyFinished {
     fn drop(&mut self) {
-        self.sender.send(SchedulerMessage::Finished(self.job)).ok();
+        self.notifications.notify(self.job, JobSignal::Finished);
     }
 }
 
@@ -2066,7 +2286,7 @@ fn spawn_grant(
     job: JobId,
     mut execution: Option<PendingExecution>,
     database: &DatabaseHandle,
-    sender: &flume::Sender<SchedulerMessage>,
+    sender: &SchedulerNotifications,
     state: &SharedState,
     running: &mut BTreeMap<JobId, RunningExecution>,
 ) {
@@ -2082,7 +2302,7 @@ fn spawn_grant(
     }
     let notify = NotifyFinished {
         job,
-        sender: sender.clone(),
+        notifications: sender.clone(),
     };
     let reply = execution
         .as_mut()
@@ -4767,6 +4987,14 @@ pub(crate) async fn settle_provider_error(
     request: RequestNumber,
     error: ProviderExecutionError,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    if let ProviderExecutionError::CompletionUnpersisted { message, result } = &error {
+        log::warn!(
+            "provider response for Job {job} completed, but its final output could not be persisted: {message}; retained in memory only: {} text bytes, {} reasoning bytes, {} tool calls, none run",
+            result.text.len(),
+            result.reasoning.len(),
+            result.tool_calls.len(),
+        );
+    }
     let failure = match &error {
         ProviderExecutionError::Rejected { failure } => Some((
             PROVIDER_REJECTED,
@@ -4783,7 +5011,8 @@ pub(crate) async fn settle_provider_error(
         | ProviderExecutionError::Incomplete { .. }
         | ProviderExecutionError::Interrupted { .. }
         | ProviderExecutionError::Stopped { .. }
-        | ProviderExecutionError::OutputPersistence { .. } => None,
+        | ProviderExecutionError::OutputPersistence { .. }
+        | ProviderExecutionError::CompletionUnpersisted { .. } => None,
     };
     let settlement = match failure {
         None => JobFinalization::Unknown,
@@ -4842,6 +5071,35 @@ mod failure_tests {
     use crate::test_support::{
         data_directory, execution_configuration, on_system, poll_once, wait,
     };
+
+    #[test]
+    fn a_full_notification_queue_coalesces_signals_per_job() {
+        let (notifications, messages) = SchedulerNotifications::test_channel();
+        for index in 0..SCHEDULER_NOTIFICATIONS {
+            notifications.notify(JobId::new(index as u128 + 1), JobSignal::Stop);
+        }
+        let backlogged = JobId::new(1000);
+        for signal in [
+            JobSignal::Finished,
+            JobSignal::Stop,
+            JobSignal::Grant,
+            JobSignal::Finished,
+        ] {
+            notifications.notify(backlogged, signal);
+        }
+        assert_eq!(messages.len(), SCHEDULER_NOTIFICATIONS);
+        let backlog = notifications.take_backlog();
+        let signals = backlog.get(&backlogged).expect("coalesced signals");
+        assert!(signals.grant && signals.stop && signals.finished);
+        assert_eq!(backlog.len(), 1);
+        assert!(notifications.take_backlog().is_empty());
+        messages.drain().count();
+        notifications.notify(backlogged, JobSignal::Finished);
+        assert!(matches!(
+            messages.recv().expect("queued signal"),
+            SchedulerMessage::Finished(job) if job == backlogged
+        ));
+    }
 
     #[test]
     fn stop_confirmation_retries_only_pending_outcomes_and_database_failures() {
@@ -5243,7 +5501,7 @@ mod failure_tests {
                 .expect("failed read keeps the pending stop");
             assert!(retained.cancellation.is_cancelled());
             assert!(!retained.done.is_cancelled());
-            let (sender, messages) = flume::unbounded();
+            let (sender, messages) = SchedulerNotifications::test_channel();
             let mut running = BTreeMap::new();
             let (reply, response) = flume::bounded(1);
             let mut execution = pending(job, executor);
@@ -5679,9 +5937,10 @@ mod failure_tests {
         let database = worker.handle();
         let job = spec(&database);
         let (sender, receiver) = flume::bounded(64);
+        let (notifications, _messages) = SchedulerNotifications::test_channel();
         let scheduler = SchedulerHandle {
             sender,
-            notifications: flume::unbounded().0,
+            notifications,
             state: SharedState::default(),
         };
         for index in 0..65 {
@@ -6242,7 +6501,7 @@ mod provider_record_tests {
                 .responses;
             assert_eq!(replies.len(), 1);
             assert_eq!(replies[0].request.get(), 2, "Sent alone is not a reply");
-            assert_eq!(replies[0].text, "answer");
+            assert_eq!(&*replies[0].text, "answer");
             assert!(!replies[0].requests_tools);
             handle.record_provider_answer(crate::persistence::NewProviderAnswer {
                 stat: NewAvailabilityStat {

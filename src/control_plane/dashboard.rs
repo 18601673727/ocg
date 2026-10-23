@@ -7,7 +7,7 @@ use super::contracts::*;
 use super::*;
 use crate::persistence::{
     AvailabilityClassification, LlmProviderId, ObservationCursor, ObservationFilter, RequestNumber,
-    TimeRange, Timestamp,
+    TimeRange, Timestamp, UsageCursor,
 };
 use crate::token_usage::{RequestEligibility, UsageFinality};
 
@@ -254,6 +254,7 @@ pub(super) fn usage_summary_query(
     (
         crate::persistence::UsageSummaryFilter,
         Option<crate::persistence::UsageBucketing>,
+        Option<UsageCursor>,
     ),
     Refusal,
 > {
@@ -347,6 +348,7 @@ pub(super) fn usage_summary_query(
         .remove("agent")
         .map(|value| super::profiles::profile_id(value).map(|id| id.get()))
         .transpose()?;
+    let after = values.remove("after").map(usage_cursor).transpose()?;
     if !values.is_empty() {
         return Err(INVALID_REQUEST);
     }
@@ -357,7 +359,36 @@ pub(super) fn usage_summary_query(
             agent,
         },
         bucketing,
+        after,
     ))
+}
+
+/// Decodes the opaque usage continuation: a source row position.
+fn usage_cursor(text: &str) -> Result<UsageCursor, Refusal> {
+    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| INVALID_REQUEST)?;
+    let (hour, agent, provider, model_hash): (i64, u128, u128, [u8; 32]) =
+        serde_json::from_slice(&bytes).map_err(|_| INVALID_REQUEST)?;
+    Ok(UsageCursor {
+        hour,
+        agent,
+        provider,
+        model_hash,
+    })
+}
+
+fn usage_next_cursor(cursor: Option<UsageCursor>) -> Result<Option<String>, Refusal> {
+    cursor
+        .map(|cursor| {
+            serde_json::to_vec(&(
+                cursor.hour,
+                cursor.agent,
+                cursor.provider,
+                cursor.model_hash,
+            ))
+            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            .map_err(|_| INVALID_REQUEST)
+        })
+        .transpose()
 }
 
 fn usage_summary_row(row: &crate::persistence::UsageSummaryRow) -> WireUsageRow {
@@ -389,10 +420,11 @@ pub(super) async fn usage_summary(
     shared: &Shared,
     filter: crate::persistence::UsageSummaryFilter,
     bucketing: Option<crate::persistence::UsageBucketing>,
+    after: Option<UsageCursor>,
 ) -> Result<Reply, Refusal> {
     let val = match bucketing {
         None => {
-            let summary = shared.database.usage_summary(filter).await?;
+            let summary = shared.database.usage_summary(filter, after).await?;
             let rows = summary
                 .rows
                 .iter()
@@ -402,12 +434,15 @@ pub(super) async fn usage_summary(
                 from_us: summary.from_us,
                 until_us: summary.until_us,
                 complete: summary.complete,
-                resume_from_us: summary.resume_from_us,
+                resume_after: usage_next_cursor(summary.resume_after)?,
                 rows,
             })
         }
         Some(bucketing) => {
-            let summary = shared.database.usage_buckets(filter, bucketing).await?;
+            let summary = shared
+                .database
+                .usage_buckets(filter, bucketing, after)
+                .await?;
             let rows = summary
                 .rows
                 .iter()
@@ -424,7 +459,7 @@ pub(super) async fn usage_summary(
                 from_us: summary.from_us,
                 until_us: summary.until_us,
                 complete: summary.complete,
-                resume_from_us: summary.resume_from_us,
+                resume_after: usage_next_cursor(summary.resume_after)?,
                 rows,
                 bucket: bucket.to_owned(),
                 tz_offset_minutes: bucketing.offset_minutes,
@@ -462,7 +497,7 @@ impl UsageRetriesQuery {
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join("&");
-        let (mut filter, bucketing) = usage_summary_query(&rest)?;
+        let (mut filter, bucketing, _) = usage_summary_query(&rest)?;
         let bucketing = bucketing.ok_or(INVALID_REQUEST)?;
         filter.from_us = filter.from_us.and_then(|us| bucketing.start_of(us));
         filter.until_us = filter
@@ -760,5 +795,32 @@ mod tests {
         ] {
             assert!(usage_summary_query(query).is_err(), "{query}");
         }
+    }
+
+    #[test]
+    fn usage_continuation_is_an_opaque_source_row() {
+        let cursor = UsageCursor {
+            hour: 7,
+            agent: 11,
+            provider: 13,
+            model_hash: [9; 32],
+        };
+        let encoded = usage_next_cursor(Some(cursor))
+            .expect("encode")
+            .expect("a cursor");
+        assert_eq!(usage_cursor(&encoded).expect("decode"), cursor);
+        let (_, _, after) = usage_summary_query(&format!(
+            "bucket=day&from_us=0&until_us=86400000000&after={encoded}"
+        ))
+        .expect("continuation query");
+        assert_eq!(after, Some(cursor));
+        assert!(usage_next_cursor(None).expect("none").is_none());
+        assert!(usage_cursor("not-base64").is_err());
+        assert!(usage_cursor(&URL_SAFE_NO_PAD.encode(b"{}")).is_err());
+        assert!(usage_cursor(&URL_SAFE_NO_PAD.encode(b"[1,2,3,4]")).is_err());
+        assert!(
+            usage_summary_query(&format!("after={encoded}&after={encoded}")).is_err(),
+            "a continuation is named once"
+        );
     }
 }

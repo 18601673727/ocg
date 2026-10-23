@@ -2309,12 +2309,12 @@ fn observability(options: &Options) -> Result<()> {
 
             let filter = ocg::persistence::UsageSummaryFilter::default();
             // The unfiltered summary returns one row per (hour, Agent,
-            // Provider, model) key, which is also how many rows the scan
-            // examined when it finished.
-            let scanned = block_on(handle.usage_summary(filter.clone()))?;
+            // Provider, model) group in one bounded page; `complete` says
+            // whether the whole range fit.
+            let scanned = block_on(handle.usage_summary(filter.clone(), None))?;
             let rows_scanned = scanned.rows.len();
             let (usage_samples, elapsed_usage) = measure(iterations, || {
-                Ok(block_on(handle.usage_summary(filter.clone()))?)
+                Ok(block_on(handle.usage_summary(filter.clone(), None))?)
             })?;
             report("observability.usage_summary", &parameters, usage_samples, Some(elapsed_usage));
 
@@ -2325,7 +2325,7 @@ fn observability(options: &Options) -> Result<()> {
                 "iterations": iterations,
                 "rows_scanned": rows_scanned,
                 "complete": scanned.complete,
-                "resume_from_us": scanned.resume_from_us,
+                "resume_after": scanned.resume_after,
             });
             let agent_filter = ocg::persistence::UsageSummaryFilter {
                 from_us: None,
@@ -2333,7 +2333,7 @@ fn observability(options: &Options) -> Result<()> {
                 agent: Some(agent.get()),
             };
             let (usage_agent_samples, elapsed_agent_usage) = measure(iterations, || {
-                Ok(block_on(handle.usage_summary(agent_filter.clone()))?)
+                Ok(block_on(handle.usage_summary(agent_filter.clone(), None))?)
             })?;
             report(
                 "observability.usage_summary_agent",
@@ -2348,7 +2348,7 @@ fn observability(options: &Options) -> Result<()> {
                 agent: None,
             };
             let (usage_30d_samples, elapsed_30d_usage) = measure(iterations, || {
-                Ok(block_on(handle.usage_summary(filter_30d.clone()))?)
+                Ok(block_on(handle.usage_summary(filter_30d.clone(), None))?)
             })?;
             report("observability.usage_summary_30d", &parameters, usage_30d_samples, Some(elapsed_30d_usage));
 
@@ -2358,7 +2358,7 @@ fn observability(options: &Options) -> Result<()> {
                 agent: None,
             };
             let (usage_1d_samples, elapsed_1d_usage) = measure(iterations, || {
-                Ok(block_on(handle.usage_summary(filter_1d.clone()))?)
+                Ok(block_on(handle.usage_summary(filter_1d.clone(), None))?)
             })?;
             report("observability.usage_summary_1d", &parameters, usage_1d_samples, Some(elapsed_1d_usage));
 
@@ -2427,10 +2427,19 @@ fn observability(options: &Options) -> Result<()> {
                     if total_admitted != (obs_jobs * 2) as u64 {
                         return Err(format!("mismatched total admitted tool calls: {total_admitted}").into());
                     }
-                    let summary = block_on(
-                        reopened_handle.usage_summary(ocg::persistence::UsageSummaryFilter::default())
-                    )?;
-                    let total_requests: u64 = summary.rows.iter().map(|r| r.requests).sum();
+                    let mut after = None;
+                    let mut total_requests = 0u64;
+                    loop {
+                        let summary = block_on(reopened_handle.usage_summary(
+                            ocg::persistence::UsageSummaryFilter::default(),
+                            after,
+                        ))?;
+                        total_requests += summary.rows.iter().map(|r| r.requests).sum::<u64>();
+                        match summary.resume_after {
+                            Some(next) => after = Some(next),
+                            None => break,
+                        }
+                    }
                     if total_requests != (obs_jobs * 3) as u64 {
                         return Err(format!("mismatched usage total requests: {total_requests}").into());
                     }

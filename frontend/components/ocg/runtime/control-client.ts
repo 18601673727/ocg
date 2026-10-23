@@ -459,6 +459,54 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     return decodeProjects((await send("GET", `/api/v1/projects${suffix}`, { signal: settings.signal })).input);
   }
 
+  async function readProfilePage(settings: { before?: string; signal?: AbortSignal } = {}) {
+    const suffix = settings.before === undefined ? "" : `?before=${identity(settings.before, "before")}`;
+    return decodeProfiles((await send("GET", `/api/v1/profiles${suffix}`, { signal: settings.signal })).input);
+  }
+
+  async function readAllProfiles(signal?: AbortSignal) {
+    const pages: Array<ReturnType<typeof decodeProfiles>> = [];
+    const providers = new Map<string, ReturnType<typeof decodeProfiles>["providers"][number]>();
+    let before: string | undefined;
+    for (;;) {
+      const page = await readProfilePage({ before, signal });
+      pages.push(page);
+      for (const provider of page.providers) {
+        const key = JSON.stringify([provider.protocol, provider.endpoint, provider.credential_ref]);
+        const merged = providers.get(key);
+        if (!merged) {
+          providers.set(key, {
+            ...provider,
+            profile_ids: [...provider.profile_ids],
+            models: [...provider.models],
+          });
+          continue;
+        }
+        for (const id of provider.profile_ids) {
+          if (!merged.profile_ids.includes(id)) merged.profile_ids.push(id);
+        }
+        for (const model of provider.models) {
+          if (!merged.models.includes(model)) merged.models.push(model);
+        }
+        merged.has_credential ||= provider.has_credential;
+      }
+      if (!page.has_more) break;
+      if (!page.next_before || page.next_before === before) {
+        throw new ContractError("next_before", "an advancing Profile cursor");
+      }
+      before = page.next_before;
+    }
+    const first = pages[0];
+    return {
+      profile_id: first?.profile_id ?? null,
+      llm_profiles: pages.flatMap((page) => page.llm_profiles),
+      agent_profiles: pages.flatMap((page) => page.agent_profiles),
+      providers: [...providers.values()],
+      has_more: false,
+      next_before: null,
+    };
+  }
+
   return {
     onProfilesChanged(listener: () => void) {
       profileListeners.add(listener);
@@ -504,17 +552,18 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeUsage((await send("GET", `/api/v1/usage${observationQuery(settings)}`, { signal: settings.signal })).input);
     },
 
-    async readUsageBuckets({ fromUs, untilUs, bucket, tzOffsetMinutes, signal }: {
+    async readUsageBuckets({ fromUs, untilUs, bucket, tzOffsetMinutes, after, signal }: {
       fromUs: number;
       untilUs: number;
       bucket: "day" | "week";
       tzOffsetMinutes: number;
+      after?: string;
       signal?: AbortSignal;
     }) {
       if (!Number.isSafeInteger(tzOffsetMinutes)) {
         throw new ContractError("tz_offset_minutes", "a signed safe integer");
       }
-      const query = `from_us=${sequence(fromUs)}&until_us=${sequence(untilUs)}&bucket=${bucket}&tz_offset_minutes=${tzOffsetMinutes}`;
+      const query = `from_us=${sequence(fromUs)}&until_us=${sequence(untilUs)}&bucket=${bucket}&tz_offset_minutes=${tzOffsetMinutes}${after ? `&after=${encodeURIComponent(after)}` : ""}`;
       return decodeUsageBuckets((await send("GET", `/api/v1/usage/summary?${query}`, { signal })).input);
     },
 
@@ -698,24 +747,25 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodePoolAnswer(answer.input);
     },
 
-    /** Full Profile catalog (LLM Profiles, Agent Profiles) and computed Provider projection. */
+    /** Every Profile (LLM Profiles, Agent Profiles) and the merged Provider projection. */
     async readProfiles(signal?: AbortSignal) {
-      return decodeProfiles((await send("GET", "/api/v1/profiles", { signal })).input);
+      return readAllProfiles(signal);
     },
 
-    /** Creates an LLM Profile or Agent Profile. */
+    /** Creates an LLM Profile or Agent Profile and returns the refreshed catalog. */
     async createProfile(profile: ControlProfileWriteRequest, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/profiles", {
         body: profile,
         sign: true,
         signal,
       });
-      const snapshot = decodeProfiles(answer.input);
+      const saved = decodeProfiles(answer.input).profile_id;
+      const snapshot = await readAllProfiles(signal);
       profileListeners.forEach((listener) => listener());
-      return snapshot;
+      return { ...snapshot, profile_id: saved };
     },
 
-    /** Updates an existing LLM Profile or Agent Profile. */
+    /** Updates an existing LLM Profile or Agent Profile and returns the refreshed catalog. */
     async updateProfile(profileId: string, profile: ControlProfileWriteRequest, signal?: AbortSignal) {
       identity(profileId, "profile");
       const answer = await send("POST", `/api/v1/profiles/${profileId}`, {
@@ -723,9 +773,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const snapshot = decodeProfiles(answer.input);
+      const saved = decodeProfiles(answer.input).profile_id;
+      const snapshot = await readAllProfiles(signal);
       profileListeners.forEach((listener) => listener());
-      return snapshot;
+      return { ...snapshot, profile_id: saved };
     },
 
     /** One stored page of the Job's outputs, in `seq` order. */

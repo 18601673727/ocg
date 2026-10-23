@@ -24,7 +24,7 @@ use crate::persistence::{
     ExecutorId, JobFinalization, JobId, JobInputId, JobOutputRecord, JobRecord, MetricsId,
     MetricsRecord, NewAttachment, NewAvailabilityStat, NewConfig, NewExecutionPool, NewExecutor,
     NewJob, NewJobOutput, NewMetrics, NewProject, NewProviderAnswer, NewSentRequest, NewSubmission,
-    NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModel,
+    NewToolEvidence, ObservationCursor, ObservationFilter, ObservationPage, ObservedModelCursor,
     ObservedModelFilter, ObservedModelPage, OperationId, OperationKind, ProjectCommand, ProjectId,
     ProjectRecord, ProviderRequestRecord, PublishedAttachment, RequestNumber, SubmissionKey,
     SubmissionRecord, ToolCallRef, ToolEvidenceRecord, ToolOutcome, ToolReconciliation, Violation,
@@ -32,10 +32,7 @@ use crate::persistence::{
 use crate::persistence::{
     Actor, Appended, ConversationAction, ConversationSpec, Entry, ExecutionConfiguration, StopProof,
 };
-use crate::persistence::{
-    ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding, PendingCapturePage,
-    PendingReadFault, PendingSnapshot,
-};
+use crate::persistence::{ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding};
 use crate::storage::{
     self, BatchError, BatchFailure, Commit, CompactFailure, OpenError, OpenedFile, Probe,
 };

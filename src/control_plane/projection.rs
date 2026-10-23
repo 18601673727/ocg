@@ -289,11 +289,7 @@ fn provider_response_page(
         let mut bytes = 0;
         let mut end = offset;
         for character in record.text[offset..].chars() {
-            let cost = match character {
-                '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
-                c if c <= '\u{1f}' => 6,
-                c => c.len_utf8(),
-            };
+            let cost = crate::storage::escaped_json_char_cost(character);
             if bytes + cost > available {
                 break;
             }
@@ -595,14 +591,14 @@ mod tests {
             if after.is_none() || offset > 0 {
                 responses.push(crate::storage::ProviderResponse {
                     request: RequestNumber::FIRST,
-                    text: text.clone(),
+                    text: std::sync::Arc::from(text.as_str()),
                     requests_tools: true,
                     recorded_at: crate::persistence::Timestamp::from_unix_micros(1),
                 });
             }
             responses.push(crate::storage::ProviderResponse {
                 request: RequestNumber::new(2).expect("number"),
-                text: "final answer".to_owned(),
+                text: "final answer".into(),
                 requests_tools: false,
                 recorded_at: crate::persistence::Timestamp::from_unix_micros(2),
             });

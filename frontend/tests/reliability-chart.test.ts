@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { decodeAvailability, decodeUsage, decodeUsageBuckets, decodeUsageRetries } from "../components/ocg/contracts/control-plane";
+import { decodeUsageRetries } from "../components/ocg/contracts/control-plane";
+import type { decodeAvailability, decodeUsage, decodeUsageBuckets } from "../components/ocg/contracts/control-plane";
 import { summarizeReliability } from "../components/ocg/dashboard/reliability-chart-data";
 
 type Buckets = ReturnType<typeof decodeUsageBuckets>;
@@ -80,4 +81,36 @@ test("missing token reports are not HTTP errors and cache writes are not inferre
   assert.equal(result.totalErrors, 0);
   assert.equal(result.totalCacheWrites, 50);
   assert.equal(result.totalCacheReads, 0);
+});
+
+
+test("retry pages use canonical UUID cursors and allow empty continuations", () => {
+  const cursor = "00000002-0000-7001-8000-000000000002.00000003-0000-7001-8000-000000000003";
+  const page = decodeUsageRetries({ api_version: 1, retry_rows: [], next_after: cursor });
+  assert.equal(page.next_after, cursor);
+  assert.deepEqual(page.retry_rows, []);
+  assert.throws(
+    () => decodeUsageRetries({ api_version: 1, retry_rows: [], next_after: "2.3" }),
+    /retry cursor/,
+  );
+  assert.throws(
+    () => decodeUsageRetries({ api_version: 1, retry_rows: [], next_after: `${cursor}.4` }),
+    /retry cursor/,
+  );
+});
+
+test("partial retry groups from several pages sum by their stable key", () => {
+  const day = 86_400_000_000;
+  const key = { bucket_us: 0, agent: null, provider: "00000001-0000-7007-8000-000000000001", model: "model-a" };
+  const summary = summarizeReliability(
+    [],
+    [{ ...key, retries: 2 }, { ...key, retries: 3 }],
+    [],
+    0,
+    day,
+    day,
+    [],
+  );
+  assert.equal(summary.buckets[0].retries, 5);
+  assert.equal(summary.totalRetries, 5);
 });

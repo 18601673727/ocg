@@ -8,7 +8,6 @@ pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;
 pub(crate) const MAX_OBSERVED_MODEL_SCAN: usize = 2_000;
-pub(crate) const MAX_PENDING_JOBS: u64 = P_MAX;
 
 // ---- Authoritative tables ---------------------------------------------------------
 

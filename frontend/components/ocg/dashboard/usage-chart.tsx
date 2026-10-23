@@ -53,20 +53,22 @@ function UsageChartData({ client, days, bucket }: { client: HttpCanonicalControl
         const offset = Math.round(-new Date().getTimezoneOffset() / 60) * 60;
         const offsetUs = offset * 60_000_000;
         const until = (Math.floor((Date.now() * 1000 + offsetUs) / DAY_US) + 1) * DAY_US - offsetUs;
-        let from = until - days * DAY_US;
+        const from = until - days * DAY_US;
         let firstFrom = from;
         let lastUntil = from;
+        let after: string | undefined;
         let partial = false;
         const rows: ReturnType<typeof decodeUsageBuckets>["rows"] = [];
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
-          const page = await client.readUsageBuckets({ fromUs: from, untilUs: until, bucket, tzOffsetMinutes: offset, signal });
+          const page = await client.readUsageBuckets({ fromUs: from, untilUs: until, bucket, tzOffsetMinutes: offset, after, signal });
           if (signal.aborted) return;
           if (pageNumber === 0) firstFrom = page.from_us;
           lastUntil = page.until_us;
           rows.push(...page.rows);
           partial = !page.complete;
-          if (page.complete || page.resume_from_us === null) break;
-          from = page.resume_from_us;
+          if (page.complete || page.resume_after === null) break;
+          if (page.resume_after === after) throw new Error("Usage cursor did not advance.");
+          after = page.resume_after;
         }
         if (!signal.aborted) {
           setResult({ data: { ...summarize(rows, firstFrom, lastUntil, bucket === "day" ? DAY_US : 7 * DAY_US), fromUs: firstFrom, untilUs: lastUntil, offset, partial }, error: null });

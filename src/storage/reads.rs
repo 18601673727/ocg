@@ -4,9 +4,9 @@ use redb::ReadableTableMetadata;
 
 use super::*;
 use crate::persistence::{
-    ConfigBody, ConfigId, ConfigKind, ConfigRecord, DependencyState, ExecutionConfiguration,
-    ExecutionOperation, ExecutionPoolConfig, FrozenPoolBinding, JobInputRecord, OutcomeKind,
-    SubmittedConfiguration,
+    ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig, DependencyState,
+    ExecutionConfiguration, ExecutionOperation, ExecutionPoolConfig, FrozenPoolBinding,
+    JobInputRecord, OutcomeKind, SubmittedConfiguration,
 };
 
 // ---- typed reads ---------------------------------------------------------------
@@ -1206,6 +1206,99 @@ pub(crate) fn read_configs(
     Ok(records)
 }
 
+/// One bounded page of Profiles: the active Model and Agent configs before
+/// `before`, the Connections those Models name, and the Pools compatible with
+/// them. `next_before` is the last config examined, so a page that finds no
+/// Profile still advances past the configs it read.
+pub(crate) struct ProfilePageRecords {
+    pub records: Vec<ConfigRecord>,
+    pub connections: BTreeMap<ConfigId, ConnectionConfig>,
+    pub compatible: BTreeMap<ProfileId, Vec<ExecutorId>>,
+    pub next_before: Option<ConfigId>,
+}
+
+pub(crate) fn read_profile_page(
+    database: &Database,
+    before: Option<ConfigId>,
+    limit: usize,
+    scan: usize,
+) -> Result<ProfilePageRecords, StorageError> {
+    let rx = read(database)?;
+    let configs = rx.open_table(CONFIGS)?;
+    let end = before.map_or(u128::MAX, ConfigId::get);
+    let limit = limit.max(1);
+    let scan = scan.max(limit);
+    let mut records = Vec::new();
+    let mut last = None;
+    let mut more = false;
+    for (examined, entry) in configs.range(..end)?.rev().enumerate() {
+        if examined >= scan {
+            more = true;
+            break;
+        }
+        let (key, bytes) = entry?;
+        let id = key.value();
+        let row = ConfigRow::decode_at(id, bytes.value())?;
+        last = Some(ConfigId::new(id));
+        if matches!(row.body, ConfigBody::Model(_) | ConfigBody::Agent(_))
+            && row.archived_at.is_none()
+        {
+            records.push(config_record(row));
+        }
+        if records.len() >= limit {
+            more = true;
+            break;
+        }
+    }
+    if more
+        && let Some(last) = last
+        && configs.range(..last.get())?.next().is_none()
+    {
+        more = false;
+    }
+    let next_before = more.then_some(last).flatten();
+
+    let mut connections = BTreeMap::new();
+    let mut protocols = BTreeSet::new();
+    for record in &records {
+        let ConfigBody::Model(model) = &record.body else {
+            continue;
+        };
+        if connections.contains_key(&model.connection_id) {
+            continue;
+        }
+        let Some(bytes) = configs.get(model.connection_id.get())? else {
+            continue;
+        };
+        let row = ConfigRow::decode_at(model.connection_id.get(), bytes.value())?;
+        if let ConfigBody::Connection(connection) = row.body {
+            protocols.insert(connection.protocol);
+            connections.insert(model.connection_id, connection);
+        }
+    }
+    let mut pools = BTreeMap::new();
+    for protocol in protocols {
+        pools.insert(protocol, pools_offering(&rx, protocol)?);
+    }
+    let mut compatible = BTreeMap::new();
+    for record in &records {
+        let ConfigBody::Model(model) = &record.body else {
+            continue;
+        };
+        let executors = connections
+            .get(&model.connection_id)
+            .and_then(|connection| pools.get(&connection.protocol).cloned())
+            .unwrap_or_default();
+        compatible.insert(ProfileId::from(record.id), executors);
+    }
+    Ok(ProfilePageRecords {
+        records,
+        connections,
+        compatible,
+        next_before,
+    })
+}
+
 fn pool_view(row: ConfigRow) -> Option<ExecutionPool> {
     let ConfigBody::Pool(body) = row.body else {
         return None;
@@ -1676,7 +1769,10 @@ pub(crate) fn read_tool_stats(
 }
 
 pub const MAX_USAGE_SCAN: usize = 100_000;
-const MAX_USAGE_BUCKET_ROWS: usize = 1_000;
+/// The most groups one page holds. A row is at most a 256-byte model name
+/// plus identifiers and counters, so this also keeps the serialized page
+/// below the server's response budget.
+const MAX_USAGE_PAGE_GROUPS: usize = 512;
 
 fn resolve_model_name(
     rx: &ReadTransaction,
@@ -1710,6 +1806,23 @@ type UsageCounters = (u64, u64, u64, u64, u64, u64, u64);
 pub(crate) fn read_usage_summary(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,
+    after: Option<crate::persistence::UsageCursor>,
+) -> Result<crate::persistence::UsageSummaryResponse, StorageError> {
+    read_usage_summary_scanned(
+        database,
+        filter,
+        after,
+        MAX_USAGE_SCAN,
+        MAX_USAGE_PAGE_GROUPS,
+    )
+}
+
+pub(crate) fn read_usage_summary_scanned(
+    database: &Database,
+    filter: &crate::persistence::UsageSummaryFilter,
+    after: Option<crate::persistence::UsageCursor>,
+    row_budget: usize,
+    group_budget: usize,
 ) -> Result<crate::persistence::UsageSummaryResponse, StorageError> {
     use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse};
 
@@ -1757,7 +1870,7 @@ pub(crate) fn read_usage_summary(
             from_us: requested_from_us.unwrap_or(0),
             until_us: until_end_us.unwrap_or(0),
             complete: true,
-            resume_from_us: None,
+            resume_after: None,
             rows: Vec::new(),
         });
     }
@@ -1766,31 +1879,39 @@ pub(crate) fn read_usage_summary(
         rows,
         earliest_hour,
         latest_hour,
-        resume_from_us,
-    } = scan_usage_totals(database, filter, from_hour, until_hour, None)?;
+        next,
+    } = scan_usage_totals(
+        database,
+        filter,
+        from_hour,
+        until_hour,
+        None,
+        after,
+        UsageBudget {
+            rows: row_budget,
+            groups: group_budget,
+        },
+    )?;
     let rows = rows.into_iter().map(|bucket| bucket.row).collect();
 
     let effective_from_us = requested_from_us
         .or_else(|| earliest_hour.map(|hour| hour.saturating_mul(HOUR)))
         .unwrap_or(0);
 
-    let effective_until_us = match resume_from_us {
-        Some(resume) => resume,
-        None => match until_end_us {
-            Some(until) => until,
-            None => latest_hour
-                .and_then(|hour| hour.checked_add(1))
-                .map_or(0, |hour| hour.saturating_mul(HOUR)),
-        },
+    let effective_until_us = match until_end_us {
+        Some(until) => until,
+        None => latest_hour
+            .and_then(|hour| hour.checked_add(1))
+            .map_or(0, |hour| hour.saturating_mul(HOUR)),
     };
 
     Ok(UsageSummaryResponse {
         from_us: effective_from_us,
         until_us: effective_until_us,
         // Complete says the scan finished, not that every request's usage is
-        // final. `resume_from_us` is set exactly when it did not finish.
-        complete: resume_from_us.is_none(),
-        resume_from_us,
+        // final. `resume_after` is set exactly when it did not.
+        complete: next.is_none(),
+        resume_after: next,
         rows,
     })
 }
@@ -1799,6 +1920,25 @@ pub(crate) fn read_usage_buckets(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,
     bucketing: &crate::persistence::UsageBucketing,
+    after: Option<crate::persistence::UsageCursor>,
+) -> Result<crate::persistence::UsageBucketResponse, StorageError> {
+    read_usage_buckets_scanned(
+        database,
+        filter,
+        bucketing,
+        after,
+        MAX_USAGE_SCAN,
+        MAX_USAGE_PAGE_GROUPS,
+    )
+}
+
+pub(crate) fn read_usage_buckets_scanned(
+    database: &Database,
+    filter: &crate::persistence::UsageSummaryFilter,
+    bucketing: &crate::persistence::UsageBucketing,
+    after: Option<crate::persistence::UsageCursor>,
+    row_budget: usize,
+    group_budget: usize,
 ) -> Result<crate::persistence::UsageBucketResponse, StorageError> {
     use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketResponse};
 
@@ -1820,14 +1960,25 @@ pub(crate) fn read_usage_buckets(
         from_us.div_euclid(HOUR),
         until_us.div_euclid(HOUR) - 1,
         Some(bucketing),
+        after,
+        UsageBudget {
+            rows: row_budget,
+            groups: group_budget,
+        },
     )?;
     Ok(UsageBucketResponse {
         from_us,
-        until_us: scan.resume_from_us.unwrap_or(until_us),
-        complete: scan.resume_from_us.is_none(),
-        resume_from_us: scan.resume_from_us,
+        until_us,
+        complete: scan.next.is_none(),
+        resume_after: scan.next,
         rows: scan.rows,
     })
+}
+
+#[derive(Clone, Copy)]
+struct UsageBudget {
+    rows: usize,
+    groups: usize,
 }
 
 #[derive(Default)]
@@ -1835,35 +1986,75 @@ struct UsageScan {
     rows: Vec<crate::persistence::UsageBucketRow>,
     earliest_hour: Option<i64>,
     latest_hour: Option<i64>,
-    resume_from_us: Option<i64>,
+    next: Option<crate::persistence::UsageCursor>,
 }
 
+/// Reads one bounded window of `usage_total` rows, newest bucket last. Every
+/// examined row counts against `row_budget`, including rows the agent filter
+/// excludes, and every group counts against `group_budget`. A window may end
+/// inside a group, so a page's rows can be partial aggregates; `next` is the
+/// last row examined and continues strictly after it. `earliest_hour` and
+/// `latest_hour` describe the whole requested range, not just this window, so
+/// every page of one traversal reports the same effective bounds.
 fn scan_usage_totals(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,
     from_hour: i64,
     until_hour: i64,
     bucketing: Option<&crate::persistence::UsageBucketing>,
+    after: Option<crate::persistence::UsageCursor>,
+    budget: UsageBudget,
 ) -> Result<UsageScan, StorageError> {
-    use crate::persistence::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketRow, UsageSummaryRow};
+    use crate::persistence::{
+        USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketRow, UsageCursor, UsageSummaryRow,
+    };
 
     let rx = read(database)?;
     let table = rx.open_table(USAGE_TOTALS)?;
-    if from_hour > until_hour {
+    if from_hour > until_hour || budget.rows == 0 || budget.groups == 0 {
         return Ok(UsageScan::default());
     }
-    let start = (from_hour, 0, 0, [0u8; 32]);
+    let range_start = (from_hour, 0, 0, [0u8; 32]);
     let end = (until_hour, u128::MAX, u128::MAX, [0xffu8; 32]);
 
-    let mut current_bucket: Option<i64> = None;
-    let mut resume_from_us = None;
-    let mut earliest_hour: Option<i64> = None;
-    let mut latest_hour: Option<i64> = None;
+    let earliest_hour = table
+        .range(range_start..=end)?
+        .next()
+        .transpose()?
+        .map(|(key, _)| key.value().0);
+    let latest_hour = table
+        .range(range_start..=end)?
+        .next_back()
+        .transpose()?
+        .map(|(key, _)| key.value().0);
+
+    let start = match after {
+        Some(cursor) => {
+            let key = (
+                cursor.hour,
+                cursor.agent,
+                cursor.provider,
+                cursor.model_hash,
+            );
+            if key < range_start {
+                Bound::Included(range_start)
+            } else {
+                Bound::Excluded(key)
+            }
+        }
+        None => Bound::Included(range_start),
+    };
 
     let mut grouped: std::collections::BTreeMap<UsageGroupKey, UsageCounters> =
         std::collections::BTreeMap::new();
+    let mut last = None;
+    let mut stopped = false;
 
-    for (scanned_rows, entry) in table.range(start..=end)?.enumerate() {
+    for (examined, entry) in table.range((start, Bound::Included(end)))?.enumerate() {
+        if examined >= budget.rows {
+            stopped = true;
+            break;
+        }
         let (key, value) = entry?;
         let (hour, agent, provider, model_hash) = key.value();
 
@@ -1874,29 +2065,23 @@ fn scan_usage_totals(
                 .ok_or_else(|| StorageError::corrupted("usage bucket overflows"))?,
             None => hour,
         };
-        if let Some(cur) = current_bucket {
-            if bucket_us != cur {
-                if scanned_rows >= MAX_USAGE_SCAN
-                    || (bucketing.is_some() && grouped.len() >= MAX_USAGE_BUCKET_ROWS)
-                {
-                    resume_from_us = Some(match bucketing {
-                        Some(_) => bucket_us,
-                        None => hour.checked_mul(HOUR).ok_or_else(|| {
-                            StorageError::corrupted("usage summary resume point overflows")
-                        })?,
-                    });
-                    break;
-                }
-                current_bucket = Some(bucket_us);
-            }
-        } else {
-            current_bucket = Some(bucket_us);
+        let group = (
+            if bucketing.is_some() { bucket_us } else { 0 },
+            agent,
+            provider,
+            model_hash,
+        );
+        if !grouped.contains_key(&group) && grouped.len() >= budget.groups {
+            stopped = true;
+            break;
         }
 
-        if earliest_hour.is_none() {
-            earliest_hour = Some(hour);
-        }
-        latest_hour = Some(hour);
+        last = Some(UsageCursor {
+            hour,
+            agent,
+            provider,
+            model_hash,
+        });
 
         if let Some(target_agent) = filter.agent
             && agent != target_agent
@@ -1905,14 +2090,7 @@ fn scan_usage_totals(
         }
 
         let (reqs, comp, inp, out, cr, cw, reas) = value.value();
-        let slot = grouped
-            .entry((
-                if bucketing.is_some() { bucket_us } else { 0 },
-                agent,
-                provider,
-                model_hash,
-            ))
-            .or_insert((0, 0, 0, 0, 0, 0, 0));
+        let slot = grouped.entry(group).or_insert((0, 0, 0, 0, 0, 0, 0));
         slot.0 = slot.0.saturating_add(reqs);
         slot.1 = slot.1.saturating_add(comp);
         slot.2 = slot.2.saturating_add(inp);
@@ -1921,6 +2099,27 @@ fn scan_usage_totals(
         slot.5 = slot.5.saturating_add(cw);
         slot.6 = slot.6.saturating_add(reas);
     }
+
+    let next = if stopped {
+        match last {
+            Some(cursor) => {
+                let key = (
+                    cursor.hour,
+                    cursor.agent,
+                    cursor.provider,
+                    cursor.model_hash,
+                );
+                table
+                    .range((Bound::Excluded(key), Bound::Included(end)))?
+                    .next()
+                    .transpose()?
+                    .map(|_| cursor)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     let mut model_cache: std::collections::HashMap<(u128, [u8; 32]), Option<String>> =
         std::collections::HashMap::new();
@@ -1957,7 +2156,7 @@ fn scan_usage_totals(
         rows,
         earliest_hour,
         latest_hour,
-        resume_from_us,
+        next,
     })
 }
 
@@ -2594,12 +2793,20 @@ pub(crate) fn read_cards(
 }
 
 pub(crate) struct UsageRetriesPage {
+    /// Partial groups: the same `(bucket_us, agent, provider, model)` key may
+    /// appear again on the next page, and its `retries` must be summed.
     pub rows: Vec<crate::persistence::UsageRetryRow>,
+    /// The last raw retry key scanned. It is set exactly when more keys
+    /// remain, so `rows.is_empty()` with `next` is a valid continuation, not
+    /// exhaustion.
     pub next: Option<(u128, u128)>,
 }
 
-/// Scans at most `limit` retry keys, including those outside the time filter.
-/// The cursor advances over scanned keys even when the page has no matches.
+/// Scans at most `limit` retry keys, including those outside the time and
+/// agent filters, and groups the matches. A group can span pages because the
+/// scan window ends at a raw key, not at a group boundary; consumers merge
+/// partial rows by their stable key. The cursor advances over scanned keys
+/// even when the page has no matches, and is `None` only at real exhaustion.
 pub(crate) fn read_usage_retries(
     database: &Database,
     filter: &crate::persistence::UsageSummaryFilter,

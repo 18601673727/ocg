@@ -49,7 +49,13 @@ macro_rules! contracts {
                 output.push_str(&$name::decl(&config));
                 output.push_str("\n\n");
             )*
-            output.trim_end().to_owned() + "\n"
+            let output = output
+                .trim_end()
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>()
+                .join("\n");
+            output + "\n"
         }
     };
 }
@@ -421,7 +427,11 @@ contracts! {
     struct WireProfiles {
         pub llm_profiles: Vec<WireLlmProfile>,
         pub agent_profiles: Vec<WireManagedAgent>,
+        /// Provider groups for the LLM Profiles on this page, not for the
+        /// whole catalog; follow `next_before` to collect the rest.
         pub providers: Vec<WireProvider>,
+        pub has_more: bool,
+        pub next_before: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub profile_id: Option<String>,
@@ -522,21 +532,27 @@ contracts! {
         pub bucket_us: i64,
     }
     struct WireUsageRetries {
+        /// Partial groups to sum by their stable key; a page may be empty
+        /// while `next_after` still continues the traversal.
         pub retry_rows: Vec<WireUsageRetryRow>,
+        /// The canonical `original.retry` UUID cursor, `None` exactly at real
+        /// exhaustion.
         pub next_after: Option<String>,
     }
     struct WireUsageSummary {
         pub from_us: i64,
         pub until_us: i64,
         pub complete: bool,
-        pub resume_from_us: Option<i64>,
+        /// The opaque source-row continuation; `None` exactly when complete.
+        pub resume_after: Option<String>,
         pub rows: Vec<WireUsageRow>,
     }
     struct WireUsageBuckets {
         pub from_us: i64,
         pub until_us: i64,
         pub complete: bool,
-        pub resume_from_us: Option<i64>,
+        /// The opaque source-row continuation; `None` exactly when complete.
+        pub resume_after: Option<String>,
         pub rows: Vec<WireUsageBucket>,
         pub bucket: String,
         pub tz_offset_minutes: i32,

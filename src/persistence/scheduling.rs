@@ -1,6 +1,4 @@
 use super::*;
-use std::num::NonZeroUsize;
-use std::time::Duration;
 
 pub const GLOBAL_EXECUTION_LIMIT: u8 = 16;
 
@@ -52,56 +50,4 @@ pub enum ClaimRefusal {
         prerequisite: JobId,
     },
     RecipeInvalid,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PendingFence {
-    pub len: u64,
-    pub high_water: JobId,
-    pub end: Option<PendingJobKey>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PendingIndexFault {
-    MissingJob,
-    WrongJobIdentity,
-    NotPending,
-    Genesis,
-    KeyMismatch,
-    JobDecode,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PendingReadFault {
-    IndexEntry {
-        fence: PendingFence,
-        key: PendingJobKey,
-        kind: PendingIndexFault,
-        service_time: Duration,
-    },
-    Allocation {
-        fence: PendingFence,
-        service_time: Duration,
-    },
-    InvalidFence,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingCapturePage {
-    pub fence: PendingFence,
-    pub page: PendingJobsPage,
-    pub service_time: Duration,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingSnapshot {
-    pub fence: PendingFence,
-    pub keys: Vec<PendingJobKey>,
-    pub complete: bool,
-    pub resume_after: Option<JobId>,
-    pub service_time: Duration,
-}
-
-pub(crate) fn bounded_page(limit: NonZeroUsize) -> usize {
-    limit.get().min(1_000)
 }

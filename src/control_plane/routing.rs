@@ -13,10 +13,11 @@ pub(super) enum Route {
         limit: usize,
     },
     Usage(dashboard::ObservationQuery),
-    UsageSummary(
-        crate::persistence::UsageSummaryFilter,
-        Option<crate::persistence::UsageBucketing>,
-    ),
+    UsageSummary {
+        filter: crate::persistence::UsageSummaryFilter,
+        bucketing: Option<crate::persistence::UsageBucketing>,
+        after: Option<crate::persistence::UsageCursor>,
+    },
     UsageRetries(dashboard::UsageRetriesQuery),
     ToolStats,
     Availability(dashboard::ObservationQuery),
@@ -50,7 +51,10 @@ pub(super) enum Route {
         before: Option<ProfileId>,
         limit: usize,
     },
-    Profiles,
+    Profiles {
+        before: Option<ProfileId>,
+        limit: usize,
+    },
     ProfileCreate,
     ProviderModels,
     ProfileUpdate(ProfileId),
@@ -114,7 +118,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Jobs { .. }
             | Route::Conversations { .. }
             | Route::Usage(_)
-            | Route::UsageSummary(..)
+            | Route::UsageSummary { .. }
             | Route::UsageRetries(_)
             | Route::ToolStats
             | Route::Availability(_)
@@ -130,7 +134,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Tools { .. }
             | Route::JobTree { .. }
             | Route::AgentProfiles { .. }
-            | Route::Profiles
+            | Route::Profiles { .. }
             | Route::ProviderModels
             | Route::ProfileCreate
             | Route::ProfileUpdate(_)
@@ -235,15 +239,23 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["conversations"] => catalog::conversations_query(query)
             .map(|(before, limit)| Route::Conversations { before, limit }),
         ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
-        ["usage", "summary"] => dashboard::usage_summary_query(query)
-            .map(|(filter, bucketing)| Route::UsageSummary(filter, bucketing)),
+        ["usage", "summary"] => {
+            dashboard::usage_summary_query(query).map(|(filter, bucketing, after)| {
+                Route::UsageSummary {
+                    filter,
+                    bucketing,
+                    after,
+                }
+            })
+        }
         ["usage", "retries"] => dashboard::UsageRetriesQuery::parse(query).map(Route::UsageRetries),
         ["tool-stats"] => no_query(query).map(|()| Route::ToolStats),
         ["availability"] => dashboard::ObservationQuery::parse(query).map(Route::Availability),
         ["logs"] => dashboard::LogQuery::parse(query).map(Route::Logs),
         ["admissions"] => no_query(query).map(|()| Route::Admission),
         ["session"] => no_query(query).map(|()| Route::SessionStatus),
-        ["profiles"] => no_query(query).map(|()| Route::Profiles),
+        ["profiles"] => catalog::agent_profile_query(query)
+            .map(|(before, limit)| Route::Profiles { before, limit }),
         ["projects"] => {
             projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
         }
@@ -417,9 +429,11 @@ pub(super) async fn respond(
             catalog::conversations(database, before, limit).await
         }
         Route::Usage(query) => dashboard::usage(shared, query).await,
-        Route::UsageSummary(filter, bucketing) => {
-            dashboard::usage_summary(shared, filter, bucketing).await
-        }
+        Route::UsageSummary {
+            filter,
+            bucketing,
+            after,
+        } => dashboard::usage_summary(shared, filter, bucketing, after).await,
         Route::UsageRetries(query) => dashboard::usage_retries(shared, query).await,
         Route::ToolStats => dashboard::tool_stats(shared).await,
         Route::Availability(query) => dashboard::availability(shared, query).await,
@@ -481,7 +495,9 @@ pub(super) async fn respond(
         Route::AgentProfiles { before, limit } => {
             catalog::agent_profiles(database, before, limit).await
         }
-        Route::Profiles => profiles::list_profiles(database).await,
+        Route::Profiles { before, limit } => {
+            profiles::list_profiles(database, before.map(Into::into), limit).await
+        }
         Route::ProviderModels => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::provider_models(database, &body).await

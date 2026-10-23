@@ -344,8 +344,9 @@ pub struct ObservedModelFilter {
 
 /// A Provider and an exact, case-sensitive model name that observations
 /// were recorded against, as their Jobs froze them. Choices are ordered by
-/// Provider ID and then by the model name's UTF-8 bytes, and a choice is
-/// also the cursor that continues strictly after it.
+/// Provider ID and then by the model name's SHA-256 digest, the order of the
+/// request-scope index, so a bounded scan and its continuation agree; the
+/// order is stable but not alphabetical.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObservedModel {
     pub provider: LlmProviderId,
@@ -360,11 +361,28 @@ pub struct ObservedModelChoice {
     pub has_availability_stats: bool,
 }
 
+/// A position in the observed-model enumeration. `model` names the pair being
+/// read and the flags already seen in it, and the remaining fields are the
+/// last request-scope row examined, which the next page continues after.
+/// `complete` says the pair was fully read and its choice returned; otherwise
+/// the pair continues on the next page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedModelCursor {
+    pub model: ObservedModel,
+    pub has_metrics: bool,
+    pub has_availability_stats: bool,
+    pub complete: bool,
+    pub observed_at: Timestamp,
+    pub job: JobId,
+    pub request: RequestNumber,
+    pub seq: u32,
+}
+
 /// One page of choices. `next` is `None` once no later pair exists; a page
-/// may be empty while `next` is set, when every pair it examined had no
+/// may be empty while `next` is set, when the scan window held no pair with a
 /// record within the time range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedModelPage {
     pub choices: Vec<ObservedModelChoice>,
-    pub next: Option<ObservedModel>,
+    pub next: Option<ObservedModelCursor>,
 }

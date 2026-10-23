@@ -56,43 +56,54 @@ impl UiAssets {
 
     /// The file `path` names within the root, or why it is refused. The
     /// path is taken literally: it may not name a parent, carry an
-    /// encoding or resolve, through a symlink, outside the root.
-    pub(super) fn serve(&self, path: &str) -> Result<Asset, Refusal> {
-        let Some(relative) = resolved(path) else {
-            return Err(NOT_FOUND);
-        };
-        let (file, immutable) = self.file(&relative)?;
-        let bytes = std::fs::read(&file).map_err(|_| NOT_FOUND)?;
-        let content_type = content_type(&file).ok_or(NOT_FOUND)?;
-        Ok(Asset {
-            body: bytes,
-            content_type,
-            immutable,
-        })
+    /// encoding or resolve, through a symlink, outside the root. The
+    /// canonicalization, metadata and read run on a blocking worker, so a
+    /// slow filesystem never holds the async worker answering the request.
+    pub(super) async fn serve(&self, path: &str) -> Result<Asset, Refusal> {
+        let root = self.root.clone();
+        let path = path.to_owned();
+        ntex::rt::spawn_blocking(move || serve_file(&root, &path))
+            .await
+            .unwrap_or(Err(NOT_FOUND))
     }
+}
 
-    /// The one regular file `relative` names under the root, resolved on
-    /// disk and kept under the root however it is reached.
-    fn file(&self, relative: &str) -> Result<(PathBuf, bool), Refusal> {
-        for candidate in candidates(relative) {
-            let path = self.root.join(&candidate);
-            let Ok(resolved) = std::fs::canonicalize(&path) else {
-                continue;
-            };
-            // A symlink that leaves the root is refused with everything
-            // else that does not name a file under it.
-            if !resolved.starts_with(&self.root) {
-                return Err(NOT_FOUND);
-            }
-            let Ok(metadata) = std::fs::metadata(&resolved) else {
-                continue;
-            };
-            if metadata.is_file() && metadata.len() <= MAX_ASSET_BYTES {
-                return Ok((resolved, candidate.starts_with("_next/static/")));
-            }
+/// Serves one file under `root`; the blocking half of [`UiAssets::serve`].
+fn serve_file(root: &std::path::Path, path: &str) -> Result<Asset, Refusal> {
+    let Some(relative) = resolved(path) else {
+        return Err(NOT_FOUND);
+    };
+    let (file, immutable) = file_under(root, &relative)?;
+    let bytes = std::fs::read(&file).map_err(|_| NOT_FOUND)?;
+    let content_type = content_type(&file).ok_or(NOT_FOUND)?;
+    Ok(Asset {
+        body: bytes,
+        content_type,
+        immutable,
+    })
+}
+
+/// The one regular file `relative` names under the root, resolved on disk
+/// and kept under the root however it is reached.
+fn file_under(root: &std::path::Path, relative: &str) -> Result<(PathBuf, bool), Refusal> {
+    for candidate in candidates(relative) {
+        let path = root.join(&candidate);
+        let Ok(resolved) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        // A symlink that leaves the root is refused with everything
+        // else that does not name a file under it.
+        if !resolved.starts_with(root) {
+            return Err(NOT_FOUND);
         }
-        Err(NOT_FOUND)
+        let Ok(metadata) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.len() <= MAX_ASSET_BYTES {
+            return Ok((resolved, candidate.starts_with("_next/static/")));
+        }
     }
+    Err(NOT_FOUND)
 }
 
 /// The relative file names `path` may name, in order: what it names, then

@@ -60,21 +60,23 @@ function ReliabilityChartData({ client, days, bucket }: { client: HttpCanonicalC
         const offset = Math.round(-new Date().getTimezoneOffset() / 60) * 60;
         const offsetUs = offset * 60_000_000;
         const until = (Math.floor((Date.now() * 1000 + offsetUs) / DAY_US) + 1) * DAY_US - offsetUs;
-        let from = until - days * DAY_US;
+        const from = until - days * DAY_US;
         let firstFrom = from;
         let lastUntil = from;
+        let bucketAfter: string | undefined;
         let bucketsPartial = false;
         const rows: ReturnType<typeof decodeUsageBuckets>["rows"] = [];
         const retryRows: ReturnType<typeof decodeUsageRetries>["retry_rows"] = [];
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
-          const page = await client.readUsageBuckets({ fromUs: from, untilUs: until, bucket, tzOffsetMinutes: offset, signal });
+          const page = await client.readUsageBuckets({ fromUs: from, untilUs: until, bucket, tzOffsetMinutes: offset, after: bucketAfter, signal });
           if (signal.aborted) return;
           if (pageNumber === 0) firstFrom = page.from_us;
           lastUntil = page.until_us;
           rows.push(...page.rows);
           bucketsPartial = !page.complete;
-          if (page.complete || page.resume_from_us === null) break;
-          from = page.resume_from_us;
+          if (page.complete || page.resume_after === null) break;
+          if (page.resume_after === bucketAfter) throw new Error("Usage cursor did not advance.");
+          bucketAfter = page.resume_after;
         }
         let retriesPartial = false;
         let retryAfter: string | undefined;

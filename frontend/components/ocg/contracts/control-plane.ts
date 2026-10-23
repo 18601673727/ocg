@@ -76,9 +76,13 @@ export function decodeControlError(input: unknown) {
   return { code: string(value.code, "error.code"), message: string(value.message, "error.message") } satisfies Wire.WireError;
 }
 
+const CANONICAL_IDENTITY = "[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+const IDENTITY = new RegExp(`^${CANONICAL_IDENTITY}$`);
+const RETRY_CURSOR = new RegExp(`^${CANONICAL_IDENTITY}\\.${CANONICAL_IDENTITY}$`);
+
 function identity(value: unknown, path: string): string {
   const text = string(value, path);
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(text)) {
+  if (!IDENTITY.test(text)) {
     throw new ContractError(path, "a canonical UUIDv7 identity");
   }
   return text;
@@ -372,16 +376,16 @@ export function decodeUsageBuckets(input: unknown) {
     throw new ContractError("tz_offset_minutes", "whole hours from -840 to 840 minutes");
   }
   const complete = boolean(envelope.complete, "complete");
-  const resume = envelope.resume_from_us === null ? null : signedInteger(envelope.resume_from_us, "resume_from_us");
+  const resume = envelope.resume_after === null ? null : string(envelope.resume_after, "resume_after");
   if (complete !== (resume === null)) {
-    throw new ContractError("resume_from_us", "null exactly when complete");
+    throw new ContractError("resume_after", "null exactly when complete");
   }
   return {
     api_version: CONTROL_API_VERSION,
     from_us: signedInteger(envelope.from_us, "from_us"),
     until_us: signedInteger(envelope.until_us, "until_us"),
     complete,
-    resume_from_us: resume,
+    resume_after: resume,
     bucket,
     tz_offset_minutes: offset,
     rows: listOf(envelope.rows, "rows", (input, path) => {
@@ -408,7 +412,7 @@ export function decodeUsageRetries(input: unknown) {
   const envelope = record(input, "response");
   if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   const next = envelope.next_after;
-  if (next !== null && (typeof next !== "string" || !/^[1-9]\d*\.[1-9]\d*$/.test(next))) throw new ContractError("next_after", "a retry cursor or null");
+  if (next !== null && (typeof next !== "string" || !RETRY_CURSOR.test(next))) throw new ContractError("next_after", "a retry cursor or null");
   return {
     next_after: next,
     retry_rows: listOf(envelope.retry_rows, "retry_rows", (input, path) => {
@@ -842,9 +846,12 @@ function optionalInteger(value: unknown, path: string): number | null {
 }
 
 /**
- * Full Profile management snapshot from `GET /api/v1/profiles`,
+ * One page of Profile management data from `GET /api/v1/profiles`,
  * `POST /api/v1/profiles`, and `POST /api/v1/profiles/{profile}`, including
- * LLM Profiles, Agent Profiles, and the computed Provider projection.
+ * LLM Profiles, Agent Profiles, and the Provider projection of the LLM
+ * Profiles on that page. Follow `next_before` until `has_more` is false for
+ * the whole catalog; a mutation response names the saved Profile in
+ * `profile_id` and returns the first page.
  */
 export function decodeProfiles(input: unknown) {
   const envelope = record(input, "response");
@@ -939,6 +946,10 @@ export function decodeProfiles(input: unknown) {
           (model, modelPath) => string(model, modelPath)),
       } satisfies Wire.WireProvider;
     }),
+    has_more: boolean(envelope.has_more, "has_more"),
+    next_before: envelope.next_before === undefined || envelope.next_before === null
+      ? null
+      : identity(envelope.next_before, "next_before"),
   } satisfies Omit<Wire.WireProfiles, "profile_id" | "agent_profiles"> & { profile_id: string | null; agent_profiles: ProjectedManagedAgent[] };
 }
 

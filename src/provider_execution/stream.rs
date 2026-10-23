@@ -66,12 +66,10 @@ pub(super) async fn parse_stream(
     let flushed = output.flush().await;
     match (result, flushed) {
         (result, Ok(())) => result,
-        (Ok(result), Err(error)) => Err(local_stop(
-            &error.message,
-            status_code,
-            result.finish_reason,
-            result.raw_finish_reason.as_deref(),
-        )),
+        (Ok(result), Err(error)) => Err(ProviderExecutionError::CompletionUnpersisted {
+            message: error.message,
+            result: Box::new(result),
+        }),
         (Err(stream), Err(error)) => Err(ProviderExecutionError::OutputPersistence {
             message: error.message,
             stream: Box::new(stream),

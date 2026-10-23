@@ -68,6 +68,7 @@ async fn exchange(
     )?;
 
     let credential = resolver.resolve(provider.credential_ref.as_deref())?;
+    let redactor = Redactor::new(credential.as_deref());
     let authorization = credential.as_deref().map(authorization).transpose()?;
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
@@ -126,7 +127,7 @@ async fn exchange(
     let request_id = response
         .header("x-request-id")
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .map(|value| redactor.text(value));
     let retry_after_ms = response
         .header("retry-after")
         .and_then(|value| value.to_str().ok())
@@ -137,7 +138,7 @@ async fn exchange(
         if conversation.carries_images() {
             return Err(ProviderExecutionError::Rejected {
                 failure: observe::with_retry_after(
-                    rejected_failure(conversation, status, request_id, None),
+                    redactor.failure(rejected_failure(conversation, status, request_id, None)),
                     retry_after_ms,
                 ),
             });
@@ -156,9 +157,12 @@ async fn exchange(
             Either::Right(Ok(body)) => body,
             Either::Right(Err(())) => None,
         };
+        // The raw body is redacted before it is parsed, so the message and
+        // code read from it cannot carry the credential either.
+        let body = body.map(|body| redactor.text(&body));
         return Err(ProviderExecutionError::Rejected {
             failure: observe::with_retry_after(
-                rejected_failure(conversation, status, request_id, body),
+                redactor.failure(rejected_failure(conversation, status, request_id, body)),
                 retry_after_ms,
             ),
         });
@@ -175,6 +179,7 @@ async fn exchange(
         conversation,
     )
     .await
+    .map_err(|error| redactor.error(error))
 }
 
 pub(super) fn incomplete_tool_calls(

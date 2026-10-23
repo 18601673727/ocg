@@ -18,6 +18,30 @@ pub struct Vitals {
     pub peak_rss_bytes: Option<u64>,
 }
 
+/// The database file's size and the space free beside it. Both readings are
+/// optional: a probe that fails stays unknown rather than becoming zero.
+fn filesystem_vitals(directory: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    let db_file = crate::storage::database_file(directory);
+    (
+        std::fs::metadata(&db_file)
+            .map(|metadata| metadata.len())
+            .ok(),
+        fs4::available_space(directory).ok(),
+    )
+}
+
+/// Reads [`filesystem_vitals`] on a blocking worker, so a slow filesystem
+/// never holds an async worker.
+async fn filesystem_vitals_async(directory: std::path::PathBuf) -> (Option<u64>, Option<u64>) {
+    #[cfg(test)]
+    if ntex::rt::System::try_current().is_none() {
+        return filesystem_vitals(&directory);
+    }
+    ntex::rt::spawn_blocking(move || filesystem_vitals(&directory))
+        .await
+        .unwrap_or((None, None))
+}
+
 fn process_memory() -> (Option<u64>, Option<u64>) {
     let mut peak = None;
     #[cfg(unix)]
@@ -96,9 +120,8 @@ impl DatabaseHandle {
     }
 
     pub async fn vitals(&self) -> Vitals {
-        let db_file = crate::storage::database_file(&self.shared.database_directory);
-        let database_bytes = std::fs::metadata(&db_file).map(|m| m.len()).ok();
-        let available_bytes = fs4::available_space(&self.shared.database_directory).ok();
+        let directory = self.shared.database_directory.clone();
+        let (database_bytes, available_bytes) = filesystem_vitals_async(directory).await;
 
         let queue_counts = match self.read(storage::queue_counts).await {
             Ok(counts) => (Some(counts.0), Some(counts.1), Some(counts.2)),
@@ -148,8 +171,9 @@ impl DatabaseHandle {
     pub async fn usage_summary(
         &self,
         filter: crate::persistence::UsageSummaryFilter,
+        after: Option<crate::persistence::UsageCursor>,
     ) -> Result<crate::persistence::UsageSummaryResponse, DatabaseError> {
-        self.read(move |database| storage::read_usage_summary(database, &filter))
+        self.read(move |database| storage::read_usage_summary(database, &filter, after))
             .await
     }
 
@@ -157,9 +181,47 @@ impl DatabaseHandle {
         &self,
         filter: crate::persistence::UsageSummaryFilter,
         bucketing: crate::persistence::UsageBucketing,
+        after: Option<crate::persistence::UsageCursor>,
     ) -> Result<crate::persistence::UsageBucketResponse, DatabaseError> {
-        self.read(move |database| storage::read_usage_buckets(database, &filter, &bucketing))
+        self.read(move |database| storage::read_usage_buckets(database, &filter, &bucketing, after))
             .await
+    }
+
+    /// [`Self::usage_buckets`] with explicit scan budgets, so a test can
+    /// exercise continuation inside and between small windows.
+    #[cfg(test)]
+    pub(crate) async fn usage_buckets_scanned(
+        &self,
+        filter: crate::persistence::UsageSummaryFilter,
+        bucketing: crate::persistence::UsageBucketing,
+        after: Option<crate::persistence::UsageCursor>,
+        scan: usize,
+        groups: usize,
+    ) -> Result<crate::persistence::UsageBucketResponse, DatabaseError> {
+        self.read(move |database| {
+            let page = storage::read_usage_buckets_scanned(
+                database, &filter, &bucketing, after, scan, groups,
+            )?;
+            Ok(page)
+        })
+        .await
+    }
+
+    /// [`Self::usage_summary`] with explicit scan budgets, so a test can
+    /// exercise continuation inside and between small windows.
+    #[cfg(test)]
+    pub(crate) async fn usage_summary_scanned(
+        &self,
+        filter: crate::persistence::UsageSummaryFilter,
+        after: Option<crate::persistence::UsageCursor>,
+        scan: usize,
+        groups: usize,
+    ) -> Result<crate::persistence::UsageSummaryResponse, DatabaseError> {
+        self.read(move |database| {
+            let page = storage::read_usage_summary_scanned(database, &filter, after, scan, groups)?;
+            Ok(page)
+        })
+        .await
     }
 
     pub(crate) async fn usage_retries(
@@ -652,32 +714,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn pending_capture_page(
-        &self,
-        after: Option<JobId>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<Result<PendingCapturePage, PendingReadFault>, DatabaseError> {
-        self.read(move |database| storage::read_pending_capture_page(database, after, limit))
-            .await
-    }
-
-    pub async fn pending_keys(
-        &self,
-        after: Option<JobId>,
-        limit: std::num::NonZeroUsize,
-    ) -> Result<Result<PendingCapturePage, PendingReadFault>, DatabaseError> {
-        self.read(move |database| storage::read_pending_keys(database, after, limit))
-            .await
-    }
-
-    pub async fn pending_snapshot(
-        &self,
-        budget: std::num::NonZeroUsize,
-    ) -> Result<Result<PendingSnapshot, PendingReadFault>, DatabaseError> {
-        self.read(move |database| storage::read_pending_snapshot(database, budget))
-            .await
-    }
-
     pub async fn claim_execution(
         &self,
         request: ClaimRequest,
@@ -925,11 +961,12 @@ impl DatabaseHandle {
 
     /// One page of the distinct (Provider, model) pairs that LLM Metrics or
     /// AvailabilityStats observed within `filter`'s time range were recorded
-    /// against, as their Jobs froze them, ordered by Provider ID and then by
-    /// model name bytes, strictly after `after` when given. Pass the
-    /// returned `next` back as `after` to continue; a page can be empty while
-    /// `next` is set. At most `limit` choices (clamped to 1..=1,000) and
-    /// [`MAX_OBSERVED_MODEL_SCAN`] examined pairs per call.
+    /// against, as their Jobs froze them. Choices follow the request-scope
+    /// index order: Provider ID, then the model name's SHA-256 digest. Pass
+    /// the returned `next` back as `after` to continue; a page can be empty
+    /// while `next` is set, and a pair's flags accumulate across the pages
+    /// that read it. At most `limit` choices (clamped to 1..=1,000) and
+    /// [`MAX_OBSERVED_MODEL_SCAN`] examined rows per call.
     ///
     /// Each call reads one snapshot; separate calls do not share one. Records
     /// are never removed, so a pair a page returned never stops being a
@@ -939,7 +976,7 @@ impl DatabaseHandle {
     pub async fn observed_models(
         &self,
         filter: ObservedModelFilter,
-        after: Option<ObservedModel>,
+        after: Option<ObservedModelCursor>,
         limit: usize,
     ) -> Result<ObservedModelPage, DatabaseError> {
         self.read(move |database| {
@@ -950,6 +987,22 @@ impl DatabaseHandle {
                 limit,
                 MAX_OBSERVED_MODEL_SCAN,
             )
+        })
+        .await
+    }
+
+    /// [`Self::observed_models`] with an explicit scan budget, so a test can
+    /// exercise continuation inside and between small windows.
+    #[cfg(test)]
+    pub(crate) async fn observed_models_scanned(
+        &self,
+        filter: ObservedModelFilter,
+        after: Option<ObservedModelCursor>,
+        limit: usize,
+        scan: usize,
+    ) -> Result<ObservedModelPage, DatabaseError> {
+        self.read(move |database| {
+            storage::read_observed_models(database, &filter, after.as_ref(), limit, scan)
         })
         .await
     }
@@ -1070,6 +1123,21 @@ impl DatabaseHandle {
                 return Ok(all);
             }
         }
+    }
+
+    /// One bounded page of active Profile configs (Models and Agents), newest
+    /// first and strictly before `before`, with the Connections those Models
+    /// name and their compatible Executors read in the same transaction.
+    /// `scan` bounds the configs examined, so an empty page can still advance
+    /// its `next_before`; `None` there means the configs were exhausted.
+    pub(crate) async fn profile_page(
+        &self,
+        before: Option<ConfigId>,
+        limit: usize,
+        scan: usize,
+    ) -> Result<storage::ProfilePageRecords, DatabaseError> {
+        self.read(move |database| storage::read_profile_page(database, before, limit, scan))
+            .await
     }
 
     /// Creates a Connection, Model, Agent or Pool config. Its references must
@@ -1784,9 +1852,9 @@ impl DatabaseHandle {
             .await
     }
 
-    pub fn set_credential(&self, reference: &str, secret: &str) -> Result<(), String> {
-        let reference = reference.trim();
-        let secret = secret.trim();
+    pub async fn set_credential(&self, reference: &str, secret: &str) -> Result<(), String> {
+        let reference = reference.trim().to_owned();
+        let secret = secret.trim().to_owned();
         if reference.is_empty() || reference.len() > 128 || reference.chars().any(char::is_control)
         {
             return Err("credential reference must be 1..=128 non-control bytes".to_string());
@@ -1805,47 +1873,14 @@ impl DatabaseHandle {
                 .unwrap_or_else(PoisonError::into_inner);
             admitted(&admission).map_err(|error| error.to_string())?;
         }
-        let mut guard = self
-            .shared
-            .credentials
-            .write()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut updated = guard.clone();
-        updated.insert(reference.to_string(), secret.to_string());
-        let serialized = serde_json::to_vec(&updated)
-            .map_err(|error| format!("failed to serialize credentials: {error}"))?;
-        let temp_path = self.shared.credentials_path.with_extension(format!(
-            "json.{}.{}.tmp",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(
-            &mut options,
-            rustix::fs::OFlags::NOFOLLOW.bits() as i32,
-        );
-        crate::data_directory::private_file(&mut options);
-        let mut file = options
-            .open(&temp_path)
-            .map_err(|error| format!("failed to open credential staging file: {error}"))?;
-        file.write_all(&serialized)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("failed to write credential staging file: {error}"))?;
-        drop(file);
-        if let Err(error) = std::fs::rename(&temp_path, &self.shared.credentials_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(format!("failed to commit credential store: {error}"));
+        let shared = self.shared.clone();
+        #[cfg(test)]
+        if ntex::rt::System::try_current().is_none() {
+            return shared.publish_credential(&reference, &secret);
         }
-        std::fs::File::open(&self.shared.database_directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("failed to sync the credential directory: {error}"))?;
-        let _ = crate::data_directory::restrict_file(&self.shared.credentials_path);
-        *guard = updated;
-        Ok(())
+        ntex::rt::spawn_blocking(move || shared.publish_credential(&reference, &secret))
+            .await
+            .map_err(|error| format!("credential writer failed: {error}"))?
     }
 
     pub fn has_credential(&self, reference: &str) -> bool {

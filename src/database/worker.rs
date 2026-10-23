@@ -258,6 +258,7 @@ impl DatabaseWorker {
                     probes: std::sync::Mutex::new(std::collections::HashMap::new()),
                     credentials_path,
                     credentials: RwLock::new(credentials),
+                    credentials_writer: std::sync::Mutex::new(()),
                     #[cfg(test)]
                     probe: GroupProbe::default(),
                 });

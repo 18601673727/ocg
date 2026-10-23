@@ -60,16 +60,13 @@ mod job_tools;
 mod notices;
 mod observations;
 mod open;
-mod pending;
 mod reads;
 mod recurrences;
 mod rows;
 mod schema;
 mod transactions;
 
-use crate::persistence::{
-    AvailabilityStatId, PendingCapturePage, PendingFence, PendingReadFault, PendingSnapshot,
-};
+use crate::persistence::AvailabilityStatId;
 use batch::Failure;
 pub(crate) use batch::{
     Batch, BatchError, BatchFailure, BatchOutcome, Commit, CompactFailure, Probe, allocated_bytes,
@@ -82,6 +79,16 @@ use codec::{
 };
 #[cfg(test)]
 pub(crate) use derived::relationship_inconsistencies;
+/// The bytes `character` costs inside a JSON string. Projection chunks text
+/// by this cost so every serialized page fits the response budget.
+pub(crate) fn escaped_json_char_cost(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if c <= '\u{1f}' => 6,
+        c => c.len_utf8(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) use observations::ProviderResponse;
 pub(crate) use observations::{
@@ -90,7 +97,7 @@ pub(crate) use observations::{
 };
 use open::allocate;
 pub(crate) use open::{OpenError, OpenedFile, database_file, open};
-pub(crate) use pending::{read_pending_capture_page, read_pending_keys, read_pending_snapshot};
+pub(crate) use reads::ProfilePageRecords;
 use reads::read;
 #[cfg(test)]
 pub(crate) use reads::record_attachment_cleanup;
@@ -107,15 +114,17 @@ pub(crate) use reads::{
     read_conversations, read_execution_pool, read_execution_pools, read_executor, read_executors,
     read_job, read_job_compatible_executors, read_job_configuration, read_job_details,
     read_job_input, read_job_input_for_job, read_job_tree, read_jobs, read_latest_output,
-    read_occupancy, read_outputs, read_pending_jobs, read_pool_binding, read_project,
-    read_projects, read_retries, read_submission, read_tool_evidence, read_tool_stats,
-    read_unresolved_executions, read_usage_buckets, read_usage_retries, read_usage_summary,
-    unneeded_content,
+    read_occupancy, read_outputs, read_pending_jobs, read_pool_binding, read_profile_page,
+    read_project, read_projects, read_retries, read_submission, read_tool_evidence,
+    read_tool_stats, read_unresolved_executions, read_usage_buckets, read_usage_retries,
+    read_usage_summary, unneeded_content,
 };
 pub(crate) use reads::{
     TurnContext, read_conversation_limits, read_conversation_turns, read_notices,
     read_turn_context, read_turn_entries, read_turn_execution,
 };
+#[cfg(test)]
+pub(crate) use reads::{read_usage_buckets_scanned, read_usage_summary_scanned};
 pub(crate) use rows::{ConfigRow, ConversationRow, JobRow, JobStateRow, usage_agent};
 use rows::{
     decode_attachment, decode_output, decode_project, decode_project_root, decode_submission,
@@ -125,7 +134,7 @@ use rows::{
 use schema::*;
 pub(crate) use schema::{
     CACHE_BYTES, DATABASE_FILE_NAME, FORMAT_NAME, FORMAT_VERSION, MAX_OBSERVATION_SCAN,
-    MAX_OBSERVED_MODEL_SCAN, MAX_PAGE, MAX_PENDING_JOBS,
+    MAX_OBSERVED_MODEL_SCAN, MAX_PAGE,
 };
 
 // ---- storage errors -------------------------------------------------------------

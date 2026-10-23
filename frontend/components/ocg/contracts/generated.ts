@@ -94,7 +94,12 @@ export type WireManagedAgent = { id: string, name: string, instructions: string 
 
 export type WireProvider = { protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, profile_ids: Array<string>, models: Array<string>, };
 
-export type WireProfiles = { llm_profiles: Array<WireLlmProfile>, agent_profiles: Array<WireManagedAgent>, providers: Array<WireProvider>, profile_id?: string, };
+export type WireProfiles = { llm_profiles: Array<WireLlmProfile>, agent_profiles: Array<WireManagedAgent>,
+/**
+ * Provider groups for the LLM Profiles on this page, not for the
+ * whole catalog; follow `next_before` to collect the rest.
+ */
+providers: Array<WireProvider>, has_more: boolean, next_before: string | null, profile_id?: string, };
 
 export type WireProjectCommand = { name: string, argv: Array<string>, };
 
@@ -126,11 +131,29 @@ export type WireUsageBucket = { bucket_us: number, agent: string | null, provide
 
 export type WireUsageRetryRow = { agent: string | null, provider: string, model: string | null, retries: number, bucket_us: number, };
 
-export type WireUsageRetries = { retry_rows: Array<WireUsageRetryRow>, next_after: string | null, };
+export type WireUsageRetries = {
+/**
+ * Partial groups to sum by their stable key; a page may be empty
+ * while `next_after` still continues the traversal.
+ */
+retry_rows: Array<WireUsageRetryRow>,
+/**
+ * The canonical `original.retry` UUID cursor, `None` exactly at real
+ * exhaustion.
+ */
+next_after: string | null, };
 
-export type WireUsageSummary = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageRow>, };
+export type WireUsageSummary = { from_us: number, until_us: number, complete: boolean,
+/**
+ * The opaque source-row continuation; `None` exactly when complete.
+ */
+resume_after: string | null, rows: Array<WireUsageRow>, };
 
-export type WireUsageBuckets = { from_us: number, until_us: number, complete: boolean, resume_from_us: number | null, rows: Array<WireUsageBucket>, bucket: string, tz_offset_minutes: number, };
+export type WireUsageBuckets = { from_us: number, until_us: number, complete: boolean,
+/**
+ * The opaque source-row continuation; `None` exactly when complete.
+ */
+resume_after: string | null, rows: Array<WireUsageBucket>, bucket: string, tz_offset_minutes: number, };
 
 export type WireToolStatsRow = { name: string, admitted: number, refused_arguments: number, completed: number, failed: number, open: number, duration_us_mean: number | null, duration_us_max: number, };
 

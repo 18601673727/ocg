@@ -17,13 +17,13 @@ use crate::orchestration::execution_runtime::{
 use crate::persistence::{
     AgentBehavior, AgentConfig, AvailabilityClassification, AvailabilityObservation,
     AvailabilityRequestSample, AvailabilityStatRecord, ConfigBody, ConfigId, ConfigKind,
-    ConnectionConfig, ConversationEdit, DependencyCondition, ExecutionConfiguration, ExecutorId,
-    FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft, JobOutcome,
-    JobRecord, LlmParameters, LlmProviderId, LlmTransport, Measurements, MetricsRecord,
+    ConnectionConfig, ContentDigest, ConversationEdit, DependencyCondition, ExecutionConfiguration,
+    ExecutorId, FinalResult, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
+    JobOutcome, JobRecord, LlmParameters, LlmProviderId, LlmTransport, Measurements, MetricsRecord,
     MixedRequests, ModelCapability, ModelConfig, NewAvailabilityStat, NewConfig, NewExecutor,
-    NewJob, NewJobOutput, NewMetrics, NewProject, ObservationFilter, OutputKind, ProfileId,
-    ProjectCommand, ProjectId, RecordRef, RejectionCause, RequestNumber, TimeRange, Timestamp,
-    UnavailableCause, Violation,
+    NewJob, NewJobOutput, NewMetrics, NewProject, ObservationFilter, ObservedModel,
+    ObservedModelFilter, OutputKind, ProfileId, ProjectCommand, ProjectId, RecordRef,
+    RejectionCause, RequestNumber, TimeRange, Timestamp, UnavailableCause, Violation,
 };
 use crate::provider_execution::{ProviderExecutionError, ResponseFacts};
 use crate::test_support::{TestRoot, data_directory as test_data_directory, poll_once, wait};
@@ -18165,4 +18165,276 @@ mod requests_and_tool_loop {
             worker.shutdown().expect("shutdown");
         }
     }
+}
+
+#[test]
+fn observed_models_are_complete_across_small_scan_windows() {
+    let (_root, directory) = data_directory("observed-model-windows");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let provider = provider(&handle, "observed");
+    let names = [
+        "z-model", "a-model", "m-model", "b-model", "y-model", "c-model", "x-model", "d-model",
+    ];
+    let mut expected = BTreeSet::new();
+    for (index, name) in names.iter().enumerate() {
+        let llm = llm_profile(
+            &handle,
+            provider,
+            llm_config(name, &[ModelCapability::Chat]),
+        );
+        let job = llm_job(&handle, llm);
+        expected.insert(ObservedModel {
+            provider,
+            model: (*name).into(),
+        });
+        // The first pair spans several scan windows, so its flags are
+        // collected across pages before its choice is returned.
+        for step in 0..if index == 0 { 7 } else { 1 } {
+            wait(handle.record_metrics(token_metrics(job, 1_000 + step, None, [Some(1), None])))
+                .expect("Metrics");
+        }
+        if index == 1 {
+            wait(handle.record_availability_stat(NewAvailabilityStat {
+                job,
+                request: RequestNumber::FIRST,
+                observed_at: at(2_000),
+                observation: response(200),
+            }))
+            .expect("AvailabilityStat");
+        }
+    }
+    let filter = ObservedModelFilter {
+        observed: TimeRange {
+            from: at(0),
+            until: at(10_000),
+        },
+        provider: None,
+    };
+    let mut expected_order = names.to_vec();
+    expected_order.sort_by_key(|name| *ContentDigest::of(name.as_bytes()).as_bytes());
+
+    let mut order = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut after = None;
+    let mut pages = 0;
+    let mut saw_empty_page = false;
+    loop {
+        pages += 1;
+        assert!(pages < 100, "the cursor did not reach exhaustion");
+        let page = wait(handle.observed_models_scanned(filter, after.clone(), 2, 3))
+            .expect("observed models page");
+        saw_empty_page |= page.choices.is_empty() && page.next.is_some();
+        for choice in page.choices {
+            assert!(
+                seen.insert(choice.model.clone()),
+                "a pair was returned twice"
+            );
+            assert!(choice.has_metrics, "metrics were lost across pages");
+            assert_eq!(
+                choice.has_availability_stats,
+                choice.model.model == "a-model"
+            );
+            order.push(choice.model.model);
+        }
+        match page.next {
+            Some(next) => {
+                assert_ne!(after.as_ref(), Some(&next), "the cursor did not advance");
+                after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected);
+    assert_eq!(order, expected_order);
+    assert!(saw_empty_page, "no page advanced without a choice");
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
+fn usage_pages_continue_inside_a_dense_bucket_and_summary() {
+    use crate::persistence::{
+        USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketWidth, UsageBucketing, UsageSummaryFilter,
+    };
+
+    type Counters = (u64, u64, u64, u64, u64, u64, u64);
+    fn add(total: &mut Counters, row: &crate::persistence::UsageSummaryRow) {
+        total.0 += row.requests;
+        total.1 += row.complete_requests;
+        total.2 += row.input_tokens;
+        total.3 += row.output_tokens;
+        total.4 += row.cache_read_tokens;
+        total.5 += row.cache_write_tokens;
+        total.6 += row.reasoning_tokens;
+    }
+
+    let (_root, directory) = data_directory("usage-windows");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let provider = provider(&handle, "usage");
+    let models = (0..4)
+        .map(|index| {
+            llm_profile(
+                &handle,
+                provider,
+                llm_config(&format!("model-{index}"), &[ModelCapability::Chat]),
+            )
+        })
+        .collect::<Vec<_>>();
+    for model in &models {
+        for observed_hour in 0..3 {
+            let job = llm_job(&handle, *model);
+            wait(handle.record_metrics(token_metrics(
+                job,
+                observed_hour * HOUR + 1_000,
+                Some(crate::token_usage::TokenAnnotation::eligible(
+                    crate::token_usage::UsageFinality::Final,
+                )),
+                [Some(1), Some(2)],
+            )))
+            .expect("Metrics");
+        }
+    }
+
+    let bucketing = UsageBucketing {
+        width: UsageBucketWidth::Day,
+        offset_minutes: 0,
+    };
+    let filter = UsageSummaryFilter {
+        from_us: Some(0),
+        until_us: Some(86_400_000_000),
+        agent: None,
+    };
+
+    let reference =
+        wait(handle.usage_buckets_scanned(filter.clone(), bucketing, None, usize::MAX, usize::MAX))
+            .expect("reference buckets");
+    assert!(reference.complete);
+    let mut expected: std::collections::BTreeMap<(i64, u128, u128, Option<String>), Counters> =
+        Default::default();
+    for bucket in &reference.rows {
+        add(
+            expected
+                .entry((
+                    bucket.bucket_us,
+                    bucket.row.agent,
+                    bucket.row.provider,
+                    bucket.row.model.clone(),
+                ))
+                .or_default(),
+            &bucket.row,
+        );
+    }
+    assert!(expected.len() > 2);
+
+    let mut merged = expected.clone();
+    merged.clear();
+    let mut after = None;
+    let mut pages = 0;
+    let mut empty_advancing = false;
+    loop {
+        pages += 1;
+        assert!(pages < 100, "chart cursor did not reach exhaustion");
+        let page = wait(handle.usage_buckets_scanned(filter.clone(), bucketing, after, 5, 2))
+            .expect("bucket page");
+        assert!(page.rows.len() <= 2);
+        empty_advancing |= page.rows.is_empty() && page.resume_after.is_some();
+        for bucket in &page.rows {
+            add(
+                merged
+                    .entry((
+                        bucket.bucket_us,
+                        bucket.row.agent,
+                        bucket.row.provider,
+                        bucket.row.model.clone(),
+                    ))
+                    .or_default(),
+                &bucket.row,
+            );
+        }
+        match page.resume_after {
+            Some(next) => {
+                assert_ne!(after, Some(next), "chart cursor did not advance");
+                after = Some(next);
+            }
+            None => {
+                assert!(page.complete);
+                break;
+            }
+        }
+    }
+    assert_eq!(merged, expected);
+
+    let reference =
+        wait(handle.usage_summary_scanned(filter.clone(), None, usize::MAX, usize::MAX))
+            .expect("reference summary");
+    assert!(reference.complete);
+    let mut expected: std::collections::BTreeMap<(u128, u128, Option<String>), Counters> =
+        Default::default();
+    for row in &reference.rows {
+        add(
+            expected
+                .entry((row.agent, row.provider, row.model.clone()))
+                .or_default(),
+            row,
+        );
+    }
+    assert!(expected.len() > 2);
+    let mut merged = expected.clone();
+    merged.clear();
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 100, "summary cursor did not reach exhaustion");
+        let page =
+            wait(handle.usage_summary_scanned(filter.clone(), after, 5, 2)).expect("summary page");
+        assert!(page.rows.len() <= 2);
+        for row in &page.rows {
+            add(
+                merged
+                    .entry((row.agent, row.provider, row.model.clone()))
+                    .or_default(),
+                row,
+            );
+        }
+        match page.resume_after {
+            Some(next) => {
+                assert_ne!(after, Some(next), "summary cursor did not advance");
+                after = Some(next);
+            }
+            None => {
+                assert!(page.complete);
+                break;
+            }
+        }
+    }
+    assert_eq!(merged, expected);
+
+    // A filter that matches nothing still advances one bounded window at a
+    // time and terminates at real exhaustion.
+    let empty_filter = UsageSummaryFilter {
+        agent: Some(999),
+        ..filter
+    };
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages < 100, "empty cursor did not reach exhaustion");
+        let page = wait(handle.usage_summary_scanned(empty_filter.clone(), after, 5, 2))
+            .expect("empty page");
+        assert!(page.rows.is_empty());
+        empty_advancing |= page.resume_after.is_some();
+        match page.resume_after {
+            Some(next) => {
+                assert_ne!(after, Some(next));
+                after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert!(pages > 1);
+    assert!(empty_advancing);
+    worker.shutdown().expect("shutdown");
 }

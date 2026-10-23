@@ -214,6 +214,15 @@ pub enum ProviderExecutionError {
         message: String,
         stream: Box<ProviderExecutionError>,
     },
+    /// The Provider response completed, but its last buffered output could not
+    /// be persisted. The completed result travels with the failure so its
+    /// text, reasoning and tool calls are not lost; the local persistence gap
+    /// still leaves the outcome unknown, and no call of it is run.
+    #[error("provider response completed but its output could not be persisted: {message}")]
+    CompletionUnpersisted {
+        message: String,
+        result: Box<ProviderExecutionResult>,
+    },
 }
 
 impl ProviderExecutionResult {
