@@ -3,7 +3,7 @@
 import { cn } from "@/lib/utils";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ChevronDown } from "lucide-react";
-import { useLayoutEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
+import { useState, type ComponentProps, type ReactNode } from "react";
 import { useI18n } from "@/components/ocg/i18n";
 
 export const ANIMATION_DURATION = 180;
@@ -27,19 +27,8 @@ export function ReasoningTrigger({ active = false, duration, tokens = 0, childre
 
 export function ReasoningContent({ children, streaming = false, ...props }: ComponentProps<typeof CollapsibleContent> & { streaming?: boolean }) {
   const { t } = useI18n();
-  const contentRef = useRef<HTMLDivElement>(null);
-  useLayoutEffect(() => {
-    const content = contentRef.current;
-    const viewport = content?.closest<HTMLElement>('[data-slot="aui_thread-viewport"]');
-    if (!streaming || !content || !viewport) return;
-    const follow = () => viewport.scrollTo({ top: viewport.scrollHeight, behavior: "instant" });
-    follow();
-    const observer = new ResizeObserver(follow);
-    observer.observe(content);
-    return () => observer.disconnect();
-  }, [children, streaming]);
   return <CollapsibleContent {...props} data-streaming={streaming ? "true" : undefined}>
-    <div ref={contentRef} role="region" aria-label={t("chat.thinking")} className="border-b border-border/60 px-3 py-2 text-[13px] leading-6 text-muted-foreground">{children}</div>
+    <div role="region" aria-label={t("chat.thinking")} className="border-b border-border/60 px-3 py-2 text-[13px] leading-6 text-muted-foreground">{children}</div>
   </CollapsibleContent>;
 }
 export function ReasoningText({ children }: { children: ReactNode }) { return <div>{children}</div>; }
