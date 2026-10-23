@@ -143,7 +143,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 26, with no migration;
+cancelled if reopened without a claim. The stored format is 27, with no migration;
 recreate data directories made by earlier versions.
 
 Conversation depth is derived from parent links. Limits default to depth 3
@@ -349,7 +349,7 @@ tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
 confirmation. Successful replies are `released` or `already_released`. This route
 is available for any origin; the CLI continues to record operator confirmation.
 
-Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 26).
+Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 27).
 
 ## OpenAI Responses providers
 
@@ -372,6 +372,6 @@ Responses usage and output items are retained in provider history. A terminal
 responses never authorize tool execution.
 
 Responses adds protocol code 2 alongside the unchanged Chat Completions code 1.
-Database format 26 is retained: existing data opens without migration. Once
+Database format 27 is retained: existing data opens without migration. Once
 Responses configurations have been saved, use a build with Responses support;
 older builds cannot decode the added protocol code.

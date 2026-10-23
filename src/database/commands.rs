@@ -784,7 +784,11 @@ impl Command {
                     ConfigBody::Connection(body) => {
                         text_bytes(&body.endpoint).saturating_add(text_bytes(&body.credential_ref))
                     }
-                    ConfigBody::Model(_) | ConfigBody::Agent(_) | ConfigBody::Pool(_) => 0,
+                    ConfigBody::Model(_)
+                    | ConfigBody::Agent(_)
+                    | ConfigBody::Pool(_)
+                    | ConfigBody::DecisionModel(_)
+                    | ConfigBody::DecisionAgent(_) => 0,
                 };
                 models.iter().fold(
                     base.saturating_add(byte_count(connection.name.len())),
@@ -807,6 +811,8 @@ impl Command {
                     ConfigBody::Connection(connection) => text_bytes(&connection.endpoint)
                         .saturating_add(text_bytes(&connection.credential_ref)),
                     ConfigBody::Pool(_) => 32,
+                    ConfigBody::DecisionModel(_) => 32,
+                    ConfigBody::DecisionAgent(_) => 64,
                 })
             }
             Self::CreateAttachment { attachment, .. } => byte_count(attachment.mime.len())

@@ -416,6 +416,8 @@ impl Batch {
                     ));
                 }
             }
+            ConfigBody::DecisionModel(_) => {}
+            ConfigBody::DecisionAgent(_) => {}
         }
         Ok(())
     }

@@ -60,6 +60,7 @@ fn spec_of(batch: &mut Batch, job: &NewJob, allow_stored: bool) -> Result<JobRow
                 PlanSource::Stored {
                     previous: job.previous,
                     dependencies: Vec::new(),
+                    preparation: None,
                 }
             } else {
                 PlanSource::Process {

@@ -517,6 +517,102 @@ pub enum ModelCapability {
     Reasoning,
 }
 
+impl ModelCapability {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Chat => 1,
+            Self::Tools => 2,
+            Self::Vision => 3,
+            Self::Reasoning => 4,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Chat),
+            2 => Some(Self::Tools),
+            3 => Some(Self::Vision),
+            4 => Some(Self::Reasoning),
+            _ => None,
+        }
+    }
+}
+
+/// A capability a user declares for a decision model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DecisionCapability {
+    Choice,
+    Score,
+    Noul,
+}
+
+impl DecisionCapability {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Choice => 1,
+            Self::Score => 2,
+            Self::Noul => 3,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Choice),
+            2 => Some(Self::Score),
+            3 => Some(Self::Noul),
+            _ => None,
+        }
+    }
+}
+
+/// What workspace state a decision agent may read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WorkspaceAccess {
+    /// No access to files, diagnostics, or other workspace state.
+    None,
+    /// May read file metadata and diagnostics, but not file contents.
+    Metadata,
+    /// May read full workspace state including file contents.
+    Full,
+}
+
+impl WorkspaceAccess {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::None => 1,
+            Self::Metadata => 2,
+            Self::Full => 3,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::None),
+            2 => Some(Self::Metadata),
+            3 => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// The protocol a decision model speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DecisionProtocol {
+    /// TypeSafe System One JSON-RPC protocol.
+    TypeSafeSystemOne,
+}
+
+impl DecisionProtocol {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::TypeSafeSystemOne => 1,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::TypeSafeSystemOne),
+            _ => None,
+        }
+    }
+}
+
 /// Request parameters the OpenAI-compatible transport already forwards.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LlmParameters {
@@ -545,6 +641,19 @@ pub struct LlmConfig {
 pub enum AgentBehavior {
     Chat = 1,
     General = 2,
+}
+
+impl AgentBehavior {
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Chat),
+            2 => Some(Self::General),
+            _ => None,
+        }
+    }
 }
 
 /// The body of an Agent config.
@@ -585,6 +694,23 @@ impl ApproveClass {
             Self::Close => "close",
         }
     }
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Commands => 1,
+            Self::Writes => 2,
+            Self::Dispatch => 3,
+            Self::Close => 4,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Commands),
+            2 => Some(Self::Writes),
+            3 => Some(Self::Dispatch),
+            4 => Some(Self::Close),
+            _ => None,
+        }
+    }
 }
 
 impl Default for AgentConfig {
@@ -601,12 +727,53 @@ impl Default for AgentConfig {
     }
 }
 
+/// Limits for a decision model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DecisionLimits {
+    pub max_input_tokens_per_request: Option<u32>,
+    pub max_output_tokens_per_request: Option<u32>,
+    pub max_input_tokens_per_question: Option<u32>,
+    pub max_output_tokens_per_question: Option<u32>,
+}
+
+/// The body of a Decision Model config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionModelConfig {
+    pub connection_id: ConfigId,
+    pub model: String,
+    pub protocol: DecisionProtocol,
+    pub limits: DecisionLimits,
+    pub declared_capabilities: BTreeSet<DecisionCapability>,
+}
+
+/// The body of a Decision Agent config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionAgentConfig {
+    pub instructions: Option<String>,
+    pub models: Vec<ConfigId>,
+    pub default_model: Option<ConfigId>,
+    pub workspace_access: WorkspaceAccess,
+}
+
+impl Default for DecisionAgentConfig {
+    fn default() -> Self {
+        Self {
+            instructions: None,
+            models: Vec::new(),
+            default_model: None,
+            workspace_access: WorkspaceAccess::None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConfigKind {
     Connection = 1,
     Model = 2,
     Agent = 3,
     Pool = 4,
+    DecisionModel = 5,
+    DecisionAgent = 6,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -638,6 +805,8 @@ pub enum ConfigBody {
     Model(ModelConfig),
     Agent(AgentConfig),
     Pool(PoolConfig),
+    DecisionModel(DecisionModelConfig),
+    DecisionAgent(DecisionAgentConfig),
 }
 
 impl ConfigBody {
@@ -647,6 +816,8 @@ impl ConfigBody {
             Self::Model(_) => ConfigKind::Model,
             Self::Agent(_) => ConfigKind::Agent,
             Self::Pool(_) => ConfigKind::Pool,
+            Self::DecisionModel(_) => ConfigKind::DecisionModel,
+            Self::DecisionAgent(_) => ConfigKind::DecisionAgent,
         }
     }
 }

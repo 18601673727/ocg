@@ -40,6 +40,105 @@ impl ConversationLimits {
     }
 }
 
+/// When to compact conversation context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionMode {
+    Off,
+    Auto,
+    Custom,
+}
+
+impl CompactionMode {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Off => 1,
+            Self::Auto => 2,
+            Self::Custom => 3,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Off),
+            2 => Some(Self::Auto),
+            3 => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// Custom compaction thresholds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CustomPolicy {
+    pub trigger_fraction: Option<u8>,
+    pub target_fraction: Option<u8>,
+}
+
+/// Context compaction policy for a conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionPolicy {
+    pub mode: CompactionMode,
+    pub custom: Option<CustomPolicy>,
+}
+
+impl Default for CompactionPolicy {
+    fn default() -> Self {
+        Self {
+            mode: CompactionMode::Auto,
+            custom: None,
+        }
+    }
+}
+
+/// Metadata about prepared context for a turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextPreparation {
+    pub status: PreparationStatus,
+    pub source_boundaries: Vec<SourceBoundary>,
+    pub context_use: Option<ContextUse>,
+}
+
+/// Outcome of context preparation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparationStatus {
+    Uncompacted,
+    Compacted,
+    CompactionSkipped,
+}
+
+impl PreparationStatus {
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Uncompacted => 1,
+            Self::Compacted => 2,
+            Self::CompactionSkipped => 3,
+        }
+    }
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Uncompacted),
+            2 => Some(Self::Compacted),
+            3 => Some(Self::CompactionSkipped),
+            _ => None,
+        }
+    }
+}
+
+/// Boundary marking a source segment in prepared context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceBoundary {
+    pub turn: JobId,
+    pub offset: u32,
+    pub length: u32,
+}
+
+/// Token usage of prepared context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextUse {
+    pub input_tokens: u32,
+    pub retained_turns: u32,
+    pub summarized_turns: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
     User,
@@ -76,6 +175,7 @@ pub enum PlanSource {
     Stored {
         previous: Option<JobId>,
         dependencies: Vec<(JobId, DependencyCondition)>,
+        preparation: Option<ContextPreparation>,
     },
     Process {
         project: Option<ProjectId>,

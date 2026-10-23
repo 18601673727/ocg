@@ -302,6 +302,31 @@ impl ConfigRow {
                 e.u32(p.concurrency_limit);
                 e.bool(p.enabled);
             }
+            ConfigBody::DecisionModel(dm) => {
+                e.u8(5);
+                e.u128(dm.connection_id.get());
+                e.str(&dm.model);
+                e.u8(dm.protocol.code());
+                let l = &dm.limits;
+                e.ou32(l.max_input_tokens_per_request);
+                e.ou32(l.max_output_tokens_per_request);
+                e.ou32(l.max_input_tokens_per_question);
+                e.ou32(l.max_output_tokens_per_question);
+                e.u32(dm.declared_capabilities.len() as u32);
+                for cap in &dm.declared_capabilities {
+                    e.u8(cap.code());
+                }
+            }
+            ConfigBody::DecisionAgent(da) => {
+                e.u8(6);
+                e.ostr(&da.instructions);
+                e.u32(da.models.len() as u32);
+                for m in &da.models {
+                    e.u128(m.get());
+                }
+                e.ou128(da.default_model.map(ConfigId::get));
+                e.u8(da.workspace_access.code());
+            }
         }
         e.0
     }
@@ -314,6 +339,8 @@ impl ConfigRow {
             2 => ConfigKind::Model,
             3 => ConfigKind::Agent,
             4 => ConfigKind::Pool,
+            5 => ConfigKind::DecisionModel,
+            6 => ConfigKind::DecisionAgent,
             code => {
                 return Err(StorageError::corrupted(format!(
                     "invalid config kind {code}"
@@ -384,6 +411,18 @@ impl ConfigRow {
                     concurrency_limit,
                     enabled,
                 })
+            }
+            ConfigKind::DecisionModel => {
+                // TODO: decode DecisionModelConfig
+                return Err(StorageError::corrupted(
+                    "DecisionModel decode not yet implemented".to_string(),
+                ));
+            }
+            ConfigKind::DecisionAgent => {
+                // TODO: decode DecisionAgentConfig
+                return Err(StorageError::corrupted(
+                    "DecisionAgent decode not yet implemented".to_string(),
+                ));
             }
         };
         d.end()?;

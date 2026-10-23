@@ -555,6 +555,7 @@ impl Batch {
                     plan_source: PlanSource::Stored {
                         previous: tip,
                         dependencies,
+                        preparation: None,
                     },
                 },
             };
@@ -1515,6 +1516,7 @@ mod tests {
                             (JobId::new(1), DependencyCondition::Success),
                             (JobId::new(2), DependencyCondition::Settled),
                         ],
+                        preparation: None,
                     },
                 },
             ];
@@ -1611,6 +1613,7 @@ mod tests {
                     plan_source: PlanSource::Stored {
                         previous: Some(second),
                         dependencies: Vec::new(),
+                        preparation: None,
                     },
                 };
                 batch.t1_submit(None, row)

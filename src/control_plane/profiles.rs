@@ -564,6 +564,8 @@ fn build_profiles_page(
                 }
             }
             ConfigBody::Connection(_) => {}
+            ConfigBody::DecisionModel(_) => {}
+            ConfigBody::DecisionAgent(_) => {}
         }
     }
     // Newest first, as Profiles have always been listed.

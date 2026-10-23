@@ -7,6 +7,8 @@ pub enum IntermediateOutputKind {
     Progress,
     Evaluation,
     Reasoning,
+    Decision,
+    Summarization,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,6 +17,8 @@ pub enum OutputKind {
     Evaluation,
     Reasoning,
     Result,
+    Decision,
+    Summarization,
 }
 
 impl From<IntermediateOutputKind> for OutputKind {
@@ -23,6 +27,8 @@ impl From<IntermediateOutputKind> for OutputKind {
             IntermediateOutputKind::Progress => Self::Progress,
             IntermediateOutputKind::Evaluation => Self::Evaluation,
             IntermediateOutputKind::Reasoning => Self::Reasoning,
+            IntermediateOutputKind::Decision => Self::Decision,
+            IntermediateOutputKind::Summarization => Self::Summarization,
         }
     }
 }
@@ -154,4 +160,30 @@ pub struct NewExecutor {
 pub struct AppendedOutput {
     pub output: JobOutputId,
     pub seq: i64,
+}
+
+/// A decision request to a Decision Agent.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionRequest {
+    pub question: String,
+    pub context: String,
+    pub workspace_snapshot: Option<String>,
+}
+
+/// A single answer from a decision model.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionAnswer {
+    pub text: String,
+    pub confidence: Option<f64>,
+}
+
+/// The result of a decision request.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecisionResult {
+    pub answers: Vec<DecisionAnswer>,
+    pub reasoning: Option<String>,
+    pub protocol_metadata: Option<serde_json::Value>,
 }

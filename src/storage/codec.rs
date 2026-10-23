@@ -1,4 +1,5 @@
 use super::*;
+use crate::persistence::{ContextPreparation, ContextUse, PreparationStatus, SourceBoundary};
 
 // ---- explicit versioned encoding ----------------------------------------------
 
@@ -410,7 +411,7 @@ pub(super) trait Code: Sized + Copy {
     fn from_code(code: u8) -> Option<Self>;
 }
 
-codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3, OutputKind::Reasoning = 4 });
+codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3, OutputKind::Reasoning = 4, OutputKind::Decision = 5, OutputKind::Summarization = 6 });
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
 codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2 });
@@ -492,6 +493,7 @@ impl Enc {
                     PlanSource::Stored {
                         previous,
                         dependencies,
+                        preparation,
                     } => {
                         self.u8(0);
                         self.ou128(previous.map(JobId::get));
@@ -500,6 +502,7 @@ impl Enc {
                             self.u128(job.get());
                             self.u8(condition.code());
                         }
+                        self.opt(preparation, |e, p| e.context_preparation(p));
                     }
                     PlanSource::Process {
                         project,
@@ -544,6 +547,20 @@ impl Enc {
             NoticeEvent::IterationCompleted => self.u8(9),
             NoticeEvent::RecurrenceHalted => self.u8(10),
         }
+    }
+    pub(super) fn context_preparation(&mut self, prep: &ContextPreparation) {
+        self.u8(prep.status.code());
+        self.u32(prep.source_boundaries.len() as u32);
+        for boundary in &prep.source_boundaries {
+            self.u128(boundary.turn.get());
+            self.u32(boundary.offset);
+            self.u32(boundary.length);
+        }
+        self.opt(&prep.context_use, |e, use_| {
+            e.u32(use_.input_tokens);
+            e.u32(use_.retained_turns);
+            e.u32(use_.summarized_turns);
+        });
     }
     pub(super) fn response_format(&mut self, format: &ResponseFormat) {
         match format {
@@ -615,6 +632,29 @@ pub(crate) fn encode_response_format(format: &ResponseFormat) -> Vec<u8> {
     e.0
 }
 impl Dec<'_> {
+    fn context_preparation(&mut self) -> DecodeResult<ContextPreparation> {
+        let status = self.code(PreparationStatus::from_code)?;
+        let mut source_boundaries = Vec::new();
+        for _ in 0..self.u32()? {
+            source_boundaries.push(SourceBoundary {
+                turn: JobId::new(self.u128()?),
+                offset: self.u32()?,
+                length: self.u32()?,
+            });
+        }
+        let context_use = self.opt(|d| {
+            Ok(ContextUse {
+                input_tokens: d.u32()?,
+                retained_turns: d.u32()?,
+                summarized_turns: d.u32()?,
+            })
+        })?;
+        Ok(ContextPreparation {
+            status,
+            source_boundaries,
+            context_use,
+        })
+    }
     fn response_format(&mut self) -> DecodeResult<ResponseFormat> {
         Ok(match self.u8()? {
             0 => ResponseFormat::JsonObject,
@@ -681,6 +721,7 @@ impl Dec<'_> {
                         PlanSource::Stored {
                             previous,
                             dependencies,
+                            preparation: self.opt(Dec::context_preparation)?,
                         }
                     }
                     1 => PlanSource::Process {
@@ -782,6 +823,6 @@ mod responses_protocol_tests {
             LlmTransport::from_code(2),
             Some(LlmTransport::OpenAiResponses)
         );
-        assert_eq!(FORMAT_VERSION, 26);
+        assert_eq!(FORMAT_VERSION, 27);
     }
 }
