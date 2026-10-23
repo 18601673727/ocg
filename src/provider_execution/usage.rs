@@ -5,7 +5,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ReportedUsage {
     pub(super) usage: NormalizedUsage,
-    finality: UsageFinality,
+    pub(super) finality: UsageFinality,
 }
 
 fn counter(value: Option<&Value>) -> Option<u32> {

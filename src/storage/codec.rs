@@ -664,7 +664,7 @@ pub(super) trait Code: Sized + Copy {
 codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3, OutputKind::Reasoning = 4, OutputKind::Decision = 5, OutputKind::Summarization = 6 });
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
-codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2 });
+codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2, LlmTransport::AnthropicMessages = 3 });
 codes!(ExecutionOperation { ExecutionOperation::LlmRequest = 1 });
 codes!(ChatFinishReason {
     ChatFinishReason::Stop = 1, ChatFinishReason::Length = 2, ChatFinishReason::ToolCalls = 3,
@@ -1057,11 +1057,16 @@ mod responses_protocol_tests {
             LlmTransport::from_code(2),
             Some(LlmTransport::OpenAiResponses)
         );
-        assert_eq!(FORMAT_VERSION, 28);
+        assert_eq!(LlmTransport::AnthropicMessages.code(), 3);
+        assert_eq!(
+            LlmTransport::from_code(3),
+            Some(LlmTransport::AnthropicMessages)
+        );
+        assert_eq!(FORMAT_VERSION, 29);
     }
     #[test]
     fn older_decision_foundation_formats_are_refused_at_open() {
-        for version in [26u32, 27] {
+        for version in [26u32, 27, 28] {
             assert!(
                 matches!(super::super::open::format_verdict(Some(FORMAT_NAME.to_vec()), Some(version.to_le_bytes().to_vec()), 1), Err(super::super::OpenError::UnsupportedFormat { found }) if found == version)
             );

@@ -223,7 +223,7 @@ export function SettingsSurface({
     setLlmContextWindow(profile.context_window === null ? "" : String(profile.context_window));
     setLlmName(profile.name);
     setLlmModel(profile.model);
-    setLlmProtocol(profile.protocol === "openai_responses" ? "openai_responses" : "openai_chat_completions");
+    setLlmProtocol(profile.protocol);
     setLlmEndpoint(profile.endpoint ?? "");
     setLlmCredentialRef(profile.credential_ref ?? "");
     // Never populate raw credentials back into the browser.

@@ -2,7 +2,7 @@
 
 import { useI18n } from "../i18n";
 
-export type LlmProtocol = "openai_chat_completions" | "openai_responses";
+export type LlmProtocol = "openai_chat_completions" | "openai_responses" | "anthropic_messages";
 
 export function ProtocolSelect({ value, onChange, disabled = false }: {
   value: LlmProtocol;
@@ -14,10 +14,11 @@ export function ProtocolSelect({ value, onChange, disabled = false }: {
     {t("settings.llm.protocolLabel")}
     <select value={value} disabled={disabled} onChange={(event) => {
       const next = event.target.value;
-      if (next === "openai_chat_completions" || next === "openai_responses") onChange(next);
+      if (next === "openai_chat_completions" || next === "openai_responses" || next === "anthropic_messages") onChange(next);
     }} className="h-9 rounded-md border border-input bg-background px-3 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
       <option value="openai_chat_completions">OpenAI Chat Completions</option>
       <option value="openai_responses">OpenAI Responses</option>
+      <option value="anthropic_messages">Anthropic Messages</option>
     </select>
   </label>;
 }

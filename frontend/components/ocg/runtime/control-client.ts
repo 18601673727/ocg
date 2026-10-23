@@ -124,7 +124,7 @@ export type ControlProfileWriteRequest =
       name: string;
       model: string;
       context_window?: number | null;
-      protocol?: "openai_chat_completions" | "openai_responses";
+      protocol?: "openai_chat_completions" | "openai_responses" | "anthropic_messages";
       endpoint?: string | null;
       credential_ref?: string | null;
       credential?: string | null;
@@ -539,14 +539,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
 
     /**
-     * Full-text conversation search: titles and recent user/agent messages,
+     * Full-text conversation search: titles, all user/agent messages and saved assistant replies,
      * newest first. Terms are the whitespace-separated words of `query`,
      * combined by AND; matching is case-insensitive substring per term.
      */
     async searchConversations(settings: { query: string; before?: string; limit?: number; signal?: AbortSignal }) {
       const trimmed = settings.query.trim();
       if (!trimmed) throw new ContractError("query", "a non-empty search query");
-      if (trimmed.length > 500) throw new ContractError("query", "a search query of at most 500 characters");
+      if (new TextEncoder().encode(trimmed).length > 500) throw new ContractError("query", "a search query of at most 500 UTF-8 bytes");
       const query = [`query=${encodeURIComponent(trimmed)}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       query.push(`limit=${settings.limit ?? 50}`);
@@ -786,12 +786,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return readAllProfiles(signal);
     },
 
-    async discoverProviderModels(connection: { endpoint: string; credential_ref?: string | null; credential?: string }, signal?: AbortSignal) {
+    async discoverProviderModels(connection: { protocol?: "openai_chat_completions" | "openai_responses" | "anthropic_messages"; endpoint: string; credential_ref?: string | null; credential?: string }, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/provider-models", { body: connection, sign: true, signal });
       return decodeProviderModels(answer.input);
     },
 
-    async importModels(source: string | { protocol?: "openai_chat_completions" | "openai_responses"; name: string; endpoint: string; credential?: string; credential_ref?: string }, models: ControlProviderModel[], capabilities: ControlCapability[]) {
+    async importModels(source: string | { protocol?: "openai_chat_completions" | "openai_responses" | "anthropic_messages"; name: string; endpoint: string; credential?: string; credential_ref?: string }, models: ControlProviderModel[], capabilities: ControlCapability[]) {
       if (typeof source === "string") identity(source, "source_profile_id");
       const connection = typeof source === "string" ? { source_profile_id: source } : { provider: source };
       const answer = await send("POST", "/api/v1/profiles/import", {

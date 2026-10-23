@@ -68,7 +68,7 @@ const MAX_SEARCH_TERMS: usize = 10;
 
 /// `query` once, `before` and `limit` each at most once, and nothing else.
 /// `query` is percent-decoded (`+` means a space, like a browser form), then
-/// split on whitespace into lowercased AND terms.
+/// split into lowercased AND terms, with double quotes keeping phrases together.
 pub(super) fn conversation_search_query(
     query: &str,
 ) -> Result<(Vec<String>, Option<JobId>, usize), Refusal> {
@@ -99,11 +99,28 @@ pub(super) fn conversation_search_query(
     if decoded.len() > MAX_SEARCH_QUERY_BYTES {
         return Err(INVALID_REQUEST);
     }
-    let terms = decoded
-        .split_whitespace()
-        .map(|term| term.to_lowercase())
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
+    let mut terms = Vec::new();
+    let mut term = String::new();
+    let mut quoted = false;
+    for ch in decoded.chars() {
+        if ch == '"' {
+            quoted = !quoted;
+        } else if ch.is_whitespace() && !quoted {
+            if !term.is_empty() {
+                terms.push(std::mem::take(&mut term).to_lowercase());
+            }
+        } else {
+            term.push(ch);
+        }
+    }
+    if quoted {
+        return Err(INVALID_REQUEST);
+    }
+    if !term.is_empty() {
+        terms.push(term.to_lowercase());
+    }
+    terms.sort();
+    terms.dedup();
     if terms.is_empty() || terms.len() > MAX_SEARCH_TERMS {
         return Err(INVALID_REQUEST);
     }
@@ -865,6 +882,24 @@ pub(super) async fn edit_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_search_parses_quoted_phrases_deduplicates_terms_and_bounds_queries() {
+        let (terms, before, limit) =
+            conversation_search_query("query=Proxy+%22Connection+Reset%22+proxy&limit=2").unwrap();
+        assert_eq!(terms, ["connection reset", "proxy"]);
+        assert_eq!(before, None);
+        assert_eq!(limit, 2);
+        for query in [
+            "query=%22unfinished",
+            "query=%22%22",
+            "query=%FF",
+            "query=a&query=b",
+            "query=a&limit=0",
+        ] {
+            assert!(conversation_search_query(query).is_err(), "{query}");
+        }
+    }
 
     #[test]
     fn the_profile_query_names_only_before_and_limit_once() {

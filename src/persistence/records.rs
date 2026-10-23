@@ -492,6 +492,7 @@ pub enum LlmTransport {
     /// [`crate::openai_compatible`] Chat Completions.
     OpenAiChatCompletions,
     OpenAiResponses,
+    AnthropicMessages,
 }
 
 impl LlmTransport {
@@ -499,6 +500,7 @@ impl LlmTransport {
         match self {
             Self::OpenAiChatCompletions => "openai_chat_completions",
             Self::OpenAiResponses => "openai_responses",
+            Self::AnthropicMessages => "anthropic_messages",
         }
     }
 
@@ -506,6 +508,7 @@ impl LlmTransport {
         match value {
             "openai_chat_completions" => Some(Self::OpenAiChatCompletions),
             "openai_responses" => Some(Self::OpenAiResponses),
+            "anthropic_messages" => Some(Self::AnthropicMessages),
             _ => None,
         }
     }

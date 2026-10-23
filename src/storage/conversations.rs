@@ -427,6 +427,11 @@ impl Batch {
                 .encode()
                 .as_slice(),
             )?;
+            if let Some(conversation) = row.parent_id
+                && let Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } = &entry
+            {
+                derived::index_search_text(tx, conversation, turn, 0, seq, text)?;
+            }
             match entry {
                 Entry::UserMessage { attachments, .. } => {
                     for attachment in attachments {
@@ -849,6 +854,7 @@ impl Batch {
             max_tokens: Some(match frozen.llm.provider.transport {
                 LlmTransport::OpenAiChatCompletions => 256,
                 LlmTransport::OpenAiResponses => 4096,
+                LlmTransport::AnthropicMessages => 256,
             }),
             ..Default::default()
         };
@@ -1570,6 +1576,121 @@ mod tests {
             goal_reached: None,
             value: None,
         }
+    }
+
+    #[test]
+    fn full_text_search_covers_old_inputs_results_unicode_and_exact_phrases() {
+        let fixture = Fixture::new("full-text-history");
+        let (conversation, first) = fixture.open();
+        wait(fixture.database.append(
+            conversation,
+            message("Archive NEEDLE connection reset ΟΣ 中文"),
+            None,
+            None,
+        ))
+        .expect("join input");
+        fixture.finish(first, OutcomeKind::Completed);
+        for _ in 0..101 {
+            let turn = wait(
+                fixture
+                    .database
+                    .append(conversation, message("later"), None, None),
+            )
+            .expect("append")
+            .turn;
+            fixture.finish(turn, OutcomeKind::Completed);
+        }
+        for terms in [
+            vec!["needle"],
+            vec!["connection reset", "中文"],
+            vec!["ος"],
+            vec!["answer"],
+        ] {
+            let terms = terms.into_iter().map(str::to_owned).collect();
+            let page =
+                wait(fixture.database.search_conversations(terms, None, 10)).expect("search");
+            assert_eq!(
+                page.conversations
+                    .iter()
+                    .map(|item| item.root_job)
+                    .collect::<Vec<_>>(),
+                vec![conversation]
+            );
+        }
+        let page = wait(fixture.database.search_conversations(
+            vec!["connection missing".into()],
+            None,
+            10,
+        ))
+        .expect("search");
+        assert!(
+            page.conversations.is_empty(),
+            "gram candidates still need exact source verification"
+        );
+        assert!(
+            wait(fixture.database.with_database(derived::inconsistencies))
+                .expect("index invariants")
+                .is_empty()
+        );
+        fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn full_text_search_pages_without_skipping_lookahead_and_rebuilds_its_index() {
+        let fixture = Fixture::new("full-text-pages");
+        let mut roots = Vec::new();
+        for _ in 0..3 {
+            let (conversation, _) = fixture.open();
+            wait(
+                fixture
+                    .database
+                    .append(conversation, message("unique match"), None, None),
+            )
+            .expect("join");
+            roots.push(conversation);
+        }
+        let mut cursor = None;
+        let mut found = Vec::new();
+        loop {
+            let page = wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["match".into()], cursor, 1),
+            )
+            .expect("page");
+            found.extend(page.conversations.iter().map(|item| item.root_job));
+            if !page.has_more {
+                break;
+            }
+            assert_ne!(cursor, page.next_before);
+            cursor = page.next_before;
+        }
+        roots.reverse();
+        assert_eq!(found, roots);
+        wait(fixture.database.with_database(|database| {
+            let tx = database.begin_write()?;
+            tx.delete_table(CONVERSATION_SEARCH)?;
+            tx.open_table(CONVERSATION_SEARCH)?;
+            tx.commit()?;
+            assert!(derived::inconsistencies(database)?.contains(&"conversation_search"));
+            let tx = database.begin_write()?;
+            derived::rebuild(&tx, open::promotion_clock())?;
+            tx.commit()?;
+            Ok(())
+        }))
+        .expect("rebuild");
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["unique".into()], None, 10)
+            )
+            .expect("rebuilt search")
+            .conversations
+            .len(),
+            3
+        );
+        fixture.worker.shutdown().expect("shutdown");
     }
 
     #[test]
@@ -4963,6 +5084,30 @@ mod tests {
             .join("\n");
         assert!(!text.contains("durable task facts"));
         assert!(!text.contains(&producer.to_string()));
+        let metadata_matches = wait(fixture.database.search_conversations(
+            vec![producer.to_string()],
+            None,
+            10,
+        ))
+        .expect("search metadata reference");
+        assert!(metadata_matches.conversations.is_empty());
+        let history_matches = wait(fixture.database.search_conversations(
+            vec!["first".into()],
+            None,
+            10,
+        ))
+        .expect("search original history");
+        assert!(
+            history_matches
+                .conversations
+                .iter()
+                .any(|entry| entry.root_job == conversation)
+        );
+        assert!(
+            wait(fixture.database.with_database(derived::inconsistencies))
+                .expect("search index with context metadata")
+                .is_empty()
+        );
         let entries = wait(fixture.database.turn_entries(consumer)).expect("entries");
         assert_eq!(entries.len(), 3);
         wait(fixture.database.with_database(move |database| {

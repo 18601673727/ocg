@@ -3,7 +3,7 @@ use super::*;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
-pub(crate) const FORMAT_VERSION: u32 = 28;
+pub(crate) const FORMAT_VERSION: u32 = 29;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;
@@ -47,6 +47,10 @@ pub(super) const HELD_SLOTS: TableDefinition<(u128, u128), (u64, bool)> =
 pub(super) const CHILDREN: TableDefinition<(u128, u128), ()> = TableDefinition::new("children");
 pub(super) const SUCCESSORS: TableDefinition<u128, u128> = TableDefinition::new("successor");
 pub(super) const TIPS: TableDefinition<u128, u128> = TableDefinition::new("tip");
+/// (conversation, Unicode gram, turn, source: input=0/result=1, sequence)
+pub(crate) type ConversationSearchKey = (u128, u128, u128, u8, u32);
+pub(super) const CONVERSATION_SEARCH: TableDefinition<ConversationSearchKey, ()> =
+    TableDefinition::new("conversation_search");
 pub(super) const RECENT: TableDefinition<(u128, u128), ()> = TableDefinition::new("recent");
 pub(super) const CHILD_CONVERSATIONS: TableDefinition<(u128, u128), ()> =
     TableDefinition::new("child_conversation");

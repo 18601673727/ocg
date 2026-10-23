@@ -786,12 +786,17 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
     let decoded = DecodedMessage {
         escaped_len: text.chars().map(super::escaped_json_char_cost).sum(),
         text: Arc::from(text),
-        requests_tools: output
-            .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call"))
-            || message
-                .get("tool_calls")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|calls| !calls.is_empty()),
+        requests_tools: output.is_some_and(|items| {
+            items.iter().any(|item| {
+                item["type"] == "function_call"
+                    || item["content"]
+                        .as_array()
+                        .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use"))
+            })
+        }) || message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty()),
     };
 
     let mut cache = lock_message_cache();

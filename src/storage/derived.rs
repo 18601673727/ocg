@@ -12,6 +12,55 @@ use redb::ReadableTableMetadata;
 use super::*;
 use crate::persistence::{OutcomeKind, RequestEventRecord, RequestPayload};
 
+/// Encodes up to three Unicode scalars, including the length.
+pub(super) fn search_gram(chars: &[char]) -> u128 {
+    chars.iter().fold(chars.len() as u128, |key, ch| {
+        (key << 21) | u128::from(u32::from(*ch))
+    })
+}
+
+pub(super) fn search_grams(text: &str) -> BTreeSet<u128> {
+    let mut grams = BTreeSet::new();
+    let mut window = [char::default(); 3];
+    let mut count = 0;
+    for ch in text.to_lowercase().chars() {
+        window.rotate_left(1);
+        window[2] = ch;
+        count = (count + 1).min(3);
+        for length in 1..=count {
+            grams.insert(search_gram(&window[3 - length..]));
+        }
+    }
+    grams
+}
+
+pub(super) fn index_search_text(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+    source: u8,
+    seq: u32,
+    text: &str,
+) -> Result<(), StorageError> {
+    let mut table = tx.open_table(CONVERSATION_SEARCH)?;
+    for gram in search_grams(text) {
+        table.insert((conversation.get(), gram, turn.get(), source, seq), ())?;
+    }
+    Ok(())
+}
+
+pub(super) fn search_output_text(output: &JobOutputRecord) -> Option<&str> {
+    if output.kind != OutputKind::Result {
+        return None;
+    }
+    output
+        .value
+        .as_ref()
+        .and_then(|value| value.get("text"))
+        .and_then(serde_json::Value::as_str)
+        .or(output.summary.as_deref())
+}
+
 /// What every derived table must hold, given the authoritative rows.
 #[derive(Default)]
 pub(super) struct Derived {
@@ -54,6 +103,7 @@ struct Authoritative {
     user_entry_at: BTreeMap<u128, i64>,
     retries: BTreeMap<(u128, u128), bool>,
     request_scopes_differ: bool,
+    search: BTreeMap<schema::ConversationSearchKey, ()>,
 }
 
 fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageError> {
@@ -76,10 +126,22 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         conversations.insert(key.value(), ConversationRow::decode(bytes.value())?);
     }
     let mut result_turns = BTreeSet::new();
+    let mut search = BTreeMap::new();
     for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
         let (key, bytes) = entry?;
-        if decode_output(key.value(), bytes.value())?.kind == OutputKind::Result {
+        let output = decode_output(key.value(), bytes.value())?;
+        if output.kind == OutputKind::Result {
             result_turns.insert(key.value().0);
+            if let Some(conversation) = jobs.get(&key.value().0).and_then(|row| row.parent_id)
+                && let Some(text) = search_output_text(&output)
+            {
+                for gram in search_grams(text) {
+                    search.insert(
+                        (conversation.get(), gram, key.value().0, 1, key.value().1),
+                        (),
+                    );
+                }
+            }
         }
     }
     let mut attachment_refs = BTreeMap::new();
@@ -89,6 +151,13 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         let (key, bytes) = entry?;
         let (turn, _) = key.value();
         let input = TurnEntry::decode(bytes.value())?;
+        if let Some(conversation) = jobs.get(&turn).and_then(|row| row.parent_id)
+            && let Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } = &input.entry
+        {
+            for gram in search_grams(text) {
+                search.insert((conversation.get(), gram, turn, 0, key.value().1), ());
+            }
+        }
         match &input.entry {
             Entry::UserMessage { attachments, .. } => {
                 for attachment in attachments {
@@ -242,6 +311,7 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         user_entry_at,
         retries,
         request_scopes_differ,
+        search,
     })
 }
 
@@ -669,6 +739,11 @@ pub(super) fn rebuild(
     note("successor", sync!(tx, SUCCESSORS, derived.successors), true);
     note("tip", sync!(tx, TIPS, derived.tips), true);
     note("recent", sync!(tx, RECENT, derived.recent), true);
+    note(
+        "conversation_search",
+        sync!(tx, CONVERSATION_SEARCH, auth.search),
+        true,
+    );
     note(
         "child_conversation",
         sync!(tx, CHILD_CONVERSATIONS, derived.child_conversations),

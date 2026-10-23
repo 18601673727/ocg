@@ -233,6 +233,8 @@ async fn parse_stream_body(
     let mut response = StreamedResponse::default();
     let native = config.transport == crate::persistence::LlmTransport::OpenAiResponses;
     let mut responses = responses::ResponseStream::default();
+    let anthropic = config.transport == crate::persistence::LlmTransport::AnthropicMessages;
+    let mut messages = anthropic::MessageStream::default();
     let line_limit = if native {
         config
             .max_output_bytes
@@ -342,7 +344,27 @@ async fn parse_stream_body(
             // The usage is taken before anything else of the event, so
             // neither a refused part of the event nor a failed delta write
             // loses its counters.
-            let reported = if native {
+            let event = if anthropic {
+                messages
+                    .event(&event, config.max_output_bytes)
+                    .map_err(|message| {
+                        if message == "Anthropic output exceeded its limit" {
+                            local_stop(
+                                message,
+                                status_code,
+                                response.finish_reason,
+                                response.raw_finish_reason.as_deref(),
+                            )
+                        } else {
+                            response.incomplete(message, status_code)
+                        }
+                    })?
+            } else {
+                event
+            };
+            let reported = if anthropic {
+                messages.reported_usage()
+            } else if native {
                 usage::reported_responses_usage(&event)
             } else {
                 reported_usage(&event)
@@ -452,6 +474,9 @@ async fn parse_stream_body(
                 response.raw_finish_reason = Some("completed".to_owned());
                 break 'stream;
             }
+            if anthropic && messages.terminal {
+                response.raw_finish_reason = messages.stop_reason.clone();
+            }
             for (kind, delta) in delta {
                 output.buffer(kind, &delta).await.map_err(|error| {
                     local_stop(
@@ -461,6 +486,9 @@ async fn parse_stream_body(
                         response.raw_finish_reason.as_deref(),
                     )
                 })?;
+            }
+            if anthropic && messages.terminal {
+                break 'stream;
             }
         }
     }
@@ -473,6 +501,9 @@ async fn parse_stream_body(
             response.finish_reason,
             response.raw_finish_reason.as_deref(),
         ));
+    }
+    if anthropic && !messages.terminal {
+        return Err(response.incomplete("Anthropic stream ended without message_stop", status_code));
     }
     if !buffer.is_empty() {
         return Err(response.incomplete(
@@ -499,7 +530,11 @@ async fn parse_stream_body(
             })?;
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
-        response_items: responses.output,
+        response_items: if anthropic {
+            messages.output()
+        } else {
+            responses.output
+        },
         text: response.text,
         reasoning: response.reasoning,
         tool_calls,

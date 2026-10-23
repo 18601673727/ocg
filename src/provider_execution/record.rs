@@ -69,8 +69,22 @@ impl RequestRecorder {
             return Err(record_error("recorded messages must only be appended"));
         }
         let mut user_index = 0;
+        let mut image_index = 0;
         for (index, value) in messages.iter().enumerate() {
-            let attachments = if responses {
+            let attachments = if value
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+            {
+                let attachments = self
+                    .image_attachments
+                    .values()
+                    .filter(|attachments| !attachments.is_empty())
+                    .nth(image_index)
+                    .map_or(&[][..], Vec::as_slice);
+                image_index += 1;
+                attachments
+            } else if responses {
                 if value.get("role").and_then(Value::as_str) == Some("user") {
                     let attachments = self
                         .image_attachments
@@ -213,6 +227,16 @@ fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(),
     };
     let mut attachments = attachments.iter();
     for part in parts {
+        if part["type"] == "image" {
+            if part["source"]["type"] != "base64" || !part["source"]["data"].is_string() {
+                return Err(record_error("request image is not base64"));
+            }
+            let attachment = attachments
+                .next()
+                .ok_or_else(|| record_error("request image has no stored Attachment"))?;
+            part["source"] = json!({"type":"attachment","attachment":attachment.to_string()});
+            continue;
+        }
         let url = match part.get("type").and_then(Value::as_str) {
             Some("image_url") => part
                 .get_mut("image_url")

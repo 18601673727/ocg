@@ -62,17 +62,30 @@ async fn exchange(
             message: error.to_string(),
         })?;
     let provider = &frozen.llm.provider;
+    let anthropic = config.transport == crate::persistence::LlmTransport::AnthropicMessages;
     let endpoint = endpoint(
-        provider.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT),
+        provider.endpoint.as_deref().unwrap_or(if anthropic {
+            anthropic::DEFAULT_ENDPOINT
+        } else {
+            DEFAULT_ENDPOINT
+        }),
         match config.transport {
             crate::persistence::LlmTransport::OpenAiChatCompletions => "chat/completions",
             crate::persistence::LlmTransport::OpenAiResponses => "responses",
+            crate::persistence::LlmTransport::AnthropicMessages => "messages",
         },
     )?;
 
     let credential = resolver.resolve(provider.credential_ref.as_deref())?;
     let redactor = Redactor::new(credential.as_deref());
-    let authorization = credential.as_deref().map(authorization).transpose()?;
+    let authorization = credential
+        .as_deref()
+        .map(if anthropic {
+            anthropic::api_key
+        } else {
+            authorization
+        })
+        .transpose()?;
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
             message: "provider execution was cancelled before sending".to_owned(),
@@ -85,6 +98,9 @@ async fn exchange(
     )?;
     let body = match config.transport {
         crate::persistence::LlmTransport::OpenAiChatCompletions => chat_body,
+        crate::persistence::LlmTransport::AnthropicMessages => {
+            anthropic::request_body(chat_body, conversation)?
+        }
         crate::persistence::LlmTransport::OpenAiResponses => {
             responses::request_body(chat_body, conversation)?
         }
@@ -110,8 +126,20 @@ async fn exchange(
             request.set_header("x-opencode-session", session)
         })
         .if_some(authorization, |authorization, request| {
-            request.set_header(AUTHORIZATION, authorization)
+            request.set_header(
+                if anthropic {
+                    "x-api-key"
+                } else {
+                    "authorization"
+                },
+                authorization,
+            )
         });
+    let request = if anthropic {
+        request.set_header("anthropic-version", anthropic::API_VERSION)
+    } else {
+        request
+    };
 
     if let Some(sink) = sink.as_deref_mut() {
         sink.sending(&body)
@@ -146,7 +174,11 @@ async fn exchange(
     announce(borrow_output_sink(sink), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
     let request_id = response
-        .header("x-request-id")
+        .header(if anthropic {
+            "request-id"
+        } else {
+            "x-request-id"
+        })
         .and_then(|value| value.to_str().ok())
         .map(|value| redactor.text(value));
     let retry_after_ms = response
@@ -259,6 +291,7 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
     let base = endpoint
         .strip_suffix("/chat/completions")
         .or_else(|| endpoint.strip_suffix("/responses"))
+        .or_else(|| endpoint.strip_suffix("/messages"))
         .unwrap_or(endpoint);
     let url = format!("{base}/{resource}");
     let uri = url.parse::<ntex::http::Uri>().ok();
