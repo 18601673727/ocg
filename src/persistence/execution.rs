@@ -162,28 +162,94 @@ pub struct AppendedOutput {
     pub seq: i64,
 }
 
-/// A decision request to a Decision Agent.
+/// Schema version identifier for a typed decision request/result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[allow(dead_code)]
+pub struct SchemaVersion(pub u32);
+
+impl SchemaVersion {
+    #[allow(dead_code)]
+    pub fn code(self) -> u32 {
+        self.0
+    }
+    #[allow(dead_code)]
+    pub fn from_code(code: u32) -> Self {
+        SchemaVersion(code)
+    }
+}
+
+/// Finite ordered option with semantic label.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct Option_ {
+    pub id: String,
+    pub label: Option<String>,
+}
+
+/// Ordered score level with semantic label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ScoreLevel {
+    pub level: u32,
+    pub label: Option<String>,
+}
+
+/// Choice decision result: selected option with optional probability distribution.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub struct ChoiceResult {
+    pub selected: String,
+    pub requested_options: Vec<Option_>,
+    pub confidence: Option<f64>,
+    pub distribution: Option<Vec<f64>>,
+}
+
+/// Score decision result: selected score level with optional expectation distribution.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub struct ScoreResult {
+    pub selected_level: u32,
+    pub requested_levels: Vec<ScoreLevel>,
+    pub confidence: Option<f64>,
+    pub expectation: Option<f64>,
+    pub distribution: Option<Vec<f64>>,
+}
+
+/// Noul (boolean probability) decision result: true probability.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub struct NoulResult {
+    pub true_probability: f64,
+}
+
+/// Typed decision answer discriminated by primitive type.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
+pub enum DecisionAnswer {
+    Choice(ChoiceResult),
+    Score(ScoreResult),
+    Noul(NoulResult),
+}
+
+/// A single decision request to a Decision Agent, with schema version and primitive type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct DecisionRequest {
+    pub schema_version: SchemaVersion,
     pub question: String,
     pub context: String,
     pub workspace_snapshot: Option<String>,
 }
 
-/// A single answer from a decision model.
-#[allow(dead_code)]
+/// The typed result of a decision request, including model provenance and usage references.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DecisionAnswer {
-    pub text: String,
-    pub confidence: Option<f64>,
-}
-
-/// The result of a decision request.
 #[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq)]
 pub struct DecisionResult {
-    pub answers: Vec<DecisionAnswer>,
+    pub schema_version: SchemaVersion,
+    pub answer: Option<DecisionAnswer>,
     pub reasoning: Option<String>,
-    pub protocol_metadata: Option<serde_json::Value>,
+    pub model_reported_as: Option<String>,
+    pub model_version_pinned: Option<String>,
+    pub model_capabilities: BTreeSet<String>,
+    pub usage_request_id: Option<u64>,
 }

@@ -114,6 +114,8 @@ contracts! {
         Evaluation,
         Result,
         Reasoning,
+        Decision,
+        Summarization,
     }
     struct WireOutput {
         pub id: String,

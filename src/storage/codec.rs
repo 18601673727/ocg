@@ -1,5 +1,8 @@
 use super::*;
-use crate::persistence::{ContextPreparation, ContextUse, PreparationStatus, SourceBoundary};
+use crate::persistence::{
+    AdoptionId, ArtifactId, ContextPreparation, ContextUse, PreparationStatus, SourceBoundary,
+    SourceFingerprint,
+};
 
 // ---- explicit versioned encoding ----------------------------------------------
 
@@ -556,6 +559,22 @@ impl Enc {
             self.u32(boundary.offset);
             self.u32(boundary.length);
         }
+        self.opt(&prep.source_fingerprint, |e, fp| {
+            e.u32(fp.digest.len() as u32);
+            for &b in &fp.digest {
+                e.u8(b);
+            }
+            e.u32(fp.schema_version);
+        });
+        self.opt(&prep.producing_artifact_job, |e, job| {
+            e.u128(job.get());
+        });
+        self.opt(&prep.artifact_id, |e, id| {
+            e.u64(id.get());
+        });
+        self.opt(&prep.adoption_id, |e, id| {
+            e.u64(id.get());
+        });
         self.opt(&prep.context_use, |e, use_| {
             e.u32(use_.input_tokens);
             e.u32(use_.retained_turns);
@@ -642,6 +661,20 @@ impl Dec<'_> {
                 length: self.u32()?,
             });
         }
+        let source_fingerprint = self.opt(|d| {
+            let len = d.u32()? as usize;
+            let mut digest = Vec::new();
+            for _ in 0..len {
+                digest.push(d.u8()?);
+            }
+            Ok(SourceFingerprint {
+                digest,
+                schema_version: d.u32()?,
+            })
+        })?;
+        let producing_artifact_job = self.opt(|d| Ok(JobId::new(d.u128()?)))?;
+        let artifact_id = self.opt(|d| Ok(ArtifactId::new(d.u64()?)))?;
+        let adoption_id = self.opt(|d| Ok(AdoptionId::new(d.u64()?)))?;
         let context_use = self.opt(|d| {
             Ok(ContextUse {
                 input_tokens: d.u32()?,
@@ -652,6 +685,10 @@ impl Dec<'_> {
         Ok(ContextPreparation {
             status,
             source_boundaries,
+            source_fingerprint,
+            producing_artifact_job,
+            artifact_id,
+            adoption_id,
             context_use,
         })
     }

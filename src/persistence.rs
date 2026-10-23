@@ -12,7 +12,15 @@ use crate::token_usage::{RequestEligibility, TokenAnnotation, UsageFinality};
 
 mod availability;
 mod conversations;
-pub use conversations::*;
+pub(crate) use conversations::parse_suggested_title;
+pub use conversations::{
+    Actor, AdoptionId, Appended, ArtifactId, CompactionMode, CompactionPolicy, ContextPreparation,
+    ContextUse, ConversationAction, ConversationLimits, ConversationSpec, CustomPolicy, Entry,
+    EntryKind, JobKind, MAX_CONVERSATION_DEPTH, Notice, NoticeBody, NoticeClass, NoticeEvent,
+    Origin, PlanSource, PreparationStatus, RecordEvent, Recurrence, RecurrenceHalt,
+    RecurrencePhase, ResponseFormat, SourceBoundary, SourceFingerprint, StopCause, StopProof,
+    TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
+};
 mod execution;
 mod identity;
 mod mutations;
@@ -55,6 +63,7 @@ pub use records::{
     AgentBehavior, AgentConfig, ApproveClass, AttachmentCleanup, AttachmentOrigin,
     AttachmentRecord, BUILT_IN_COMMANDS, CapabilitySet, ClaimRecord, CleanupKind, ConfigBody,
     ConfigKind, ConfigRecord, ConfigRef, ConnectionConfig, ContentDigest, ConversationEdit,
+    DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
     ExecutionOperation, ExecutionPool, ExecutionPoolConfig, ExecutorRecord, FrozenExecutionConfig,
     FrozenLlmConfig, JobInputRecord, JobOutputRecord, JobRecord, LlmConfig, LlmParameters,
     LlmTarget, LlmTransport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES,
@@ -65,7 +74,7 @@ pub use records::{
     RequestPayload, RequestPayloadKind, SubmissionKey, SubmissionRecord, SubmittedConfiguration,
     ToolCallRecord, ToolStatRecord, USAGE_SUMMARY_HOUR_MICROS, UsageBucketResponse, UsageBucketRow,
     UsageBucketWidth, UsageBucketing, UsageCursor, UsageRetryRow, UsageSummaryFilter,
-    UsageSummaryResponse, UsageSummaryRow, validate_project_commands,
+    UsageSummaryResponse, UsageSummaryRow, WorkspaceAccess, validate_project_commands,
 };
 pub use scheduling::*;
 pub use tool_evidence::{

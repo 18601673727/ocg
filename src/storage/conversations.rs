@@ -1571,6 +1571,7 @@ mod tests {
                     on_hold: Some(2),
                     loop_count: 3,
                     closing,
+                    compaction_policy: None,
                 };
                 assert_eq!(ConversationRow::decode(&row.encode())?, row);
             }

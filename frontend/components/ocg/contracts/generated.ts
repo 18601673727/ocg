@@ -20,7 +20,7 @@ export type WireSettlement = { state: WireSettlementState, settled_at_us: number
 
 export type WireJob = { id: string, parent?: string, name: string | null, title: string | null, is_chat: boolean, execution_mode: string, input: string, previous: string | null, kind: WireJobKind, conversation: string | null, assigned_executor: string | null, created_at_us: number, updated_at_us: number, started_at_us: number | null, paused_at_us: number | null, sterilized_at_us: number | null, settlement: WireSettlement, stop_confirmed_at_us: number | null, };
 
-export type WireOutputKind = "progress" | "evaluation" | "result" | "reasoning";
+export type WireOutputKind = "progress" | "evaluation" | "result" | "reasoning" | "decision" | "summarization";
 
 export type WireOutput = { id: string, seq: number, kind: WireOutputKind, summary: string | null, code: string | null, goal_reached: boolean | null, value: unknown, created_at_us: number, };
 

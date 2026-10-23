@@ -123,8 +123,8 @@ pub(super) fn output_view(record: &JobOutputRecord) -> WireOutput {
             OutputKind::Evaluation => WireOutputKind::Evaluation,
             OutputKind::Result => WireOutputKind::Result,
             OutputKind::Reasoning => WireOutputKind::Reasoning,
-            OutputKind::Decision => WireOutputKind::Reasoning, // Map to Reasoning for now
-            OutputKind::Summarization => WireOutputKind::Progress, // Map to Progress for now
+            OutputKind::Decision => WireOutputKind::Decision,
+            OutputKind::Summarization => WireOutputKind::Summarization,
         },
         summary: record.summary.clone(),
         code: record.code.clone(),

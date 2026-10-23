@@ -811,8 +811,13 @@ impl Command {
                     ConfigBody::Connection(connection) => text_bytes(&connection.endpoint)
                         .saturating_add(text_bytes(&connection.credential_ref)),
                     ConfigBody::Pool(_) => 32,
-                    ConfigBody::DecisionModel(_) => 32,
-                    ConfigBody::DecisionAgent(_) => 64,
+                    ConfigBody::DecisionModel(dm) => byte_count(dm.model.len())
+                        .saturating_add(16)
+                        .saturating_add(byte_count(dm.declared_capabilities.len()))
+                        .saturating_add(32),
+                    ConfigBody::DecisionAgent(da) => text_bytes(&da.instructions)
+                        .saturating_add(byte_count(da.models.len().saturating_mul(8)))
+                        .saturating_add(32),
                 })
             }
             Self::CreateAttachment { attachment, .. } => byte_count(attachment.mime.len())

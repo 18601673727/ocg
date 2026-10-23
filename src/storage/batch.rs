@@ -416,8 +416,72 @@ impl Batch {
                     ));
                 }
             }
-            ConfigBody::DecisionModel(_) => {}
-            ConfigBody::DecisionAgent(_) => {}
+            ConfigBody::DecisionModel(dm) => {
+                self.require_config_kind(dm.connection_id, ConfigKind::Connection)?;
+                if dm.model.is_empty() || dm.model.len() > 512 {
+                    return self.reject(Violation::InvalidValue("model", "must be 1 to 512 bytes"));
+                }
+                if dm
+                    .limits
+                    .max_input_tokens_per_request
+                    .is_some_and(|v| v == 0 || v > 1_000_000)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "max_input_tokens_per_request",
+                        "must be between 1 and 1000000",
+                    ));
+                }
+                if dm
+                    .limits
+                    .max_output_tokens_per_request
+                    .is_some_and(|v| v == 0 || v > 1_000_000)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "max_output_tokens_per_request",
+                        "must be between 1 and 1000000",
+                    ));
+                }
+                if dm
+                    .limits
+                    .max_input_tokens_per_question
+                    .is_some_and(|v| v == 0 || v > 1_000_000)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "max_input_tokens_per_question",
+                        "must be between 1 and 1000000",
+                    ));
+                }
+                if dm
+                    .limits
+                    .max_output_tokens_per_question
+                    .is_some_and(|v| v == 0 || v > 1_000_000)
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "max_output_tokens_per_question",
+                        "must be between 1 and 1000000",
+                    ));
+                }
+            }
+            ConfigBody::DecisionAgent(da) => {
+                if da.models.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return self.reject(Violation::InvalidValue(
+                        "models",
+                        "must be sorted and unique",
+                    ));
+                }
+                for model in &da.models {
+                    self.require_config_kind(*model, ConfigKind::DecisionModel)?;
+                }
+                if da
+                    .default_model
+                    .is_some_and(|default| !da.models.contains(&default))
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "default_model",
+                        "must be one of the Agent's models",
+                    ));
+                }
+            }
         }
         Ok(())
     }
