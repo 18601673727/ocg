@@ -57,8 +57,7 @@ export function StackedBarChart({ bars, series, metricLabel, ariaLabel, integerT
       {active ? <div role="tooltip" className="pointer-events-none absolute left-16 top-8 z-10 max-h-64 max-w-[calc(100%-4rem)] overflow-y-auto whitespace-pre-line rounded-md border border-border bg-popover px-3 py-2 text-xs text-popover-foreground shadow-md">{active.tooltip}</div> : null}
     </div>
     <ol className="min-w-0 space-y-3 text-sm">
-      {series.map((entry, rank) => <li key={entry.key} className="flex items-center gap-2">
-        <span className="w-4 shrink-0 text-right text-xs text-muted-foreground">{rank + 1}</span>
+      {series.map(entry => <li key={entry.key} className="flex items-center gap-2">
         <span className="h-3 w-3 shrink-0 rounded-sm" style={{ backgroundColor: entry.color }} />
         <span className="min-w-0 flex-1 break-words">{entry.label}</span>
         <span className="shrink-0 tabular-nums text-muted-foreground">{percent.format(entry.share)}</span>
