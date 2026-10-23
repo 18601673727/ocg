@@ -141,6 +141,7 @@ export function SettingsSurface({
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmError, setLlmError] = useState<string | null>(null);
   const [llmNotice, setLlmNotice] = useState<string | null>(null);
+  const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
 
   // Agent Profile form state
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -422,7 +423,7 @@ export function SettingsSurface({
                 if (editingLlmId === id) resetLlmForm();
                 setAgentTargets((current) => current.filter((target) => target !== id));
                 setAgentDefaultModel((current) => current === id ? "" : current);
-                setDeletingModel(null); setLlmNotice(t("settings.llm.deleted"));
+                setDeletingModel(null); setCatalogNotice(t("settings.llm.deleted"));
               }).catch((error) => setDeleteError(describeError(error, t))).finally(() => setDeleting(false));
             }}>{deleting ? t("settings.saving") : t("common.remove")}</Button>
           </DialogFooter>
@@ -445,7 +446,7 @@ export function SettingsSurface({
               description={t("settings.llm.description")}
               action={
                 <div className="flex shrink-0 flex-wrap justify-end gap-2">
-                <ProviderModelImport client={client} snapshot={snapshot} onImported={(message) => { setLlmNotice(message); void refreshProfiles(); }} />
+                <ProviderModelImport client={client} snapshot={snapshot} onImported={(message) => { setCatalogNotice(message); void refreshProfiles(); }} />
                 <Button
                   variant="ghost"
                   size="sm"
@@ -463,6 +464,7 @@ export function SettingsSurface({
                   {loadError}
                 </DismissibleNotice>
               ) : null}
+              {catalogNotice && <p role="status" className="pt-3 text-sm text-emerald-700 dark:text-emerald-400">{catalogNotice}</p>}
               <div className="divide-y divide-border/70 py-2">
                 {llmProfiles.length === 0 ? (
                   <p className="py-2 text-sm text-muted-foreground">

@@ -99,7 +99,7 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
       <DialogTitle>{t("settings.llm.importModels")}</DialogTitle>
       <DialogDescription>{t("settings.llm.importDescription")}</DialogDescription>
     </DialogHeader>
-    <>
+    <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto overscroll-contain">
       <div role="group" aria-label={t("settings.llm.provider")} className="flex max-h-28 shrink-0 flex-wrap gap-2 overflow-y-auto">
         {providers.map((entry) => {
           const id = entry.profile_ids[0];
@@ -112,13 +112,13 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
       </div>
       {sourceId === "new" && <div className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2">
         <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.provider")}<Input value={newName} disabled={saving} onChange={(event) => changeNewConnection(() => setNewName(event.target.value))} placeholder="Provider" autoComplete="off" /></label>
-        <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.endpoint")}<Input value={newEndpoint} disabled={saving} onChange={(event) => changeNewConnection(() => setNewEndpoint(event.target.value))} placeholder="https://api.example.com/v1" spellCheck={false} autoComplete="off" /></label>
+        <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.importEndpoint")}<Input value={newEndpoint} disabled={saving} onChange={(event) => changeNewConnection(() => setNewEndpoint(event.target.value))} placeholder="https://api.example.com/v1" spellCheck={false} autoComplete="off" /></label>
         <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.apiKey")}<Input type="password" value={newSecret} disabled={saving} onChange={(event) => changeNewConnection(() => setNewSecret(event.target.value))} autoComplete="new-password" spellCheck={false} /></label>
         <Button className="self-end" variant="outline" disabled={saving || loading} onClick={fetchNewModels}>{loading ? t("settings.llm.fetching") : t("settings.llm.fetchModels")}</Button>
       </div>}
       <div className="flex gap-2">
         <Input aria-label={t("settings.llm.searchModels")} placeholder={t("settings.llm.searchModels")} value={query} disabled={saving} onChange={(event) => setQuery(event.target.value)} />
-        <Button variant="outline" size="sm" disabled={loading || saving || (sourceId === "new" && !newConnection)} onClick={() => sourceId === "new" ? fetchNewModels() : reload()}>{t("settings.llm.fetchModels")}</Button>
+        {sourceId !== "new" && <Button variant="outline" size="sm" disabled={loading || saving} onClick={() => reload()}>{t("settings.llm.fetchModels")}</Button>}
       </div>
       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
         <Button variant="ghost" size="xs" disabled={saving || loading} onClick={() => setSelected(new Set(matching.filter((model) => !existing.has(model.id)).slice(0, 200).map((model) => model.id)))}>{t("settings.llm.selectVisible")}</Button>
@@ -140,7 +140,7 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
         <p className="mt-2 text-xs leading-5 text-muted-foreground">{t("settings.llm.capabilityNote")}</p>
       </fieldset>
       <p className="text-xs text-muted-foreground">{t("settings.llm.importLimit")}</p>
-    </>
+    </div>
     {error && <p role="alert" className="break-words text-sm text-destructive">{error}</p>}
     {result && <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">{result}</p>}
     <DialogFooter>
