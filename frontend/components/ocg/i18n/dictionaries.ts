@@ -594,14 +594,14 @@ export const en = {
   "sidebar.showChildren": "Show child conversations of {title}",
   "sidebar.hideChildren": "Hide child conversations of {title}",
   "sidebar.searchChats": "Search chats",
-  "sidebar.searchChatsLabel": "Filter chat sessions by title",
+  "sidebar.searchChatsLabel": "Search titles and messages",
   "sidebar.noSearchMatches": "No chats match your search",
-  // Full-screen conversation search: it filters the current Project's
-  // conversation titles only, and opens from the sidebar search control. The
+  // Full-screen conversation search: it searches the current session list by
+  // title and recent message text, and opens from the sidebar search control. The
   // existing `searchChatsLabel` / `noSearchMatches` keys are its field label
   // and its no-results state.
   "sidebar.searchConversations": "Search conversations",
-  "sidebar.searchConversationsBody": "Filters the conversations in the current project by title.",
+  "sidebar.searchConversationsBody": "Searches titles and recent messages.",
   "sidebar.searchNoConversations": "This project has no conversations yet",
   "sidebar.currentProject": "Project: {name}",
   "sidebar.account": "Account",
@@ -2255,10 +2255,10 @@ export const zh: Dictionary = {
   "sidebar.showChildren": "展开 {title} 的子对话",
   "sidebar.hideChildren": "收起 {title} 的子对话",
   "sidebar.searchChats": "搜索对话",
-  "sidebar.searchChatsLabel": "按标题筛选会话",
+  "sidebar.searchChatsLabel": "搜索标题和消息内容",
   "sidebar.noSearchMatches": "没有匹配的对话",
   "sidebar.searchConversations": "搜索对话",
-  "sidebar.searchConversationsBody": "按标题筛选当前项目中的对话。",
+  "sidebar.searchConversationsBody": "搜索标题和最近的消息内容。",
   "sidebar.searchNoConversations": "当前项目还没有对话",
   "sidebar.currentProject": "项目：{name}",
   "sidebar.account": "账户",

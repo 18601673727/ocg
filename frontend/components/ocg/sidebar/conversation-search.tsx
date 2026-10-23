@@ -3,19 +3,22 @@
 /**
  * Full-screen conversation search.
  *
- * The overlay filters the *current* Project's conversation titles and nothing
- * else: there is no message-body or full-text search, no index, and no request
- * to the control server. It reads the same project-filtered session list the
- * sidebar already renders, and selecting a result goes through the same
- * session-selection callback the sidebar list uses, so navigation, URL state
- * and attention handling stay identical.
+ * The overlay searches the *current* session list by title and by recent
+ * message text: an empty query shows the sidebar's own project-filtered
+ * list, while a non-empty query asks the control server's conversation
+ * search (titles plus recent user/agent messages, terms combined by AND)
+ * and keeps only the sessions the sidebar already renders. Selecting a
+ * result goes through the same session-selection callback the sidebar list
+ * uses, so navigation, URL state and attention handling stay identical.
+ * Without a control client, or when the search request fails, it falls back
+ * to the local title filter.
  *
  * It follows the Project switcher's overlay conventions: the same Dialog
  * primitive, so Escape and dismissal return focus to the trigger, and the same
  * `listbox` / `option` markup for the selectable entries.
  */
 
-import { useMemo, useRef, useState, type ReactElement } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
 import { MessageSquare, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
@@ -32,6 +35,7 @@ import {
 } from "@/components/ui/dialog";
 import type { ChatSession } from "../types";
 import { useI18n } from "../i18n";
+import type { HttpCanonicalControlClient } from "../runtime/control-client";
 
 export type ConversationSearchProps = {
   /** Element used to open the overlay; receives the dialog's trigger props. */
@@ -43,7 +47,15 @@ export type ConversationSearchProps = {
   projectName?: string;
   /** The same selection callback the sidebar list uses. */
   onSelect: (id: string) => void;
+  /** Control client for full-text search; omitting it keeps title filtering. */
+  control?: HttpCanonicalControlClient;
 };
+
+function sessionKeys(session: ChatSession): string[] {
+  const keys = [session.id];
+  if (session.conversationId && session.conversationId !== session.id) keys.push(session.conversationId);
+  return keys;
+}
 
 export function ConversationSearch({
   trigger,
@@ -51,22 +63,58 @@ export function ConversationSearch({
   activeSessionId,
   projectName,
   onSelect,
+  control,
 }: ConversationSearchProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [serverKeys, setServerKeys] = useState<ReadonlySet<string> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const needle = query.trim();
+  useEffect(() => {
+    if (!open || !control || !needle) return;
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      void control
+        .searchConversations({ query: needle, limit: 50, signal: controller.signal })
+        .then(page => {
+          if (cancelled) return;
+          const keys = new Set<string>();
+          for (const conversation of page.conversations) {
+            keys.add(conversation.root_job);
+            keys.add(conversation.tip_job);
+          }
+          setServerKeys(keys);
+        })
+        .catch(() => {
+          // A failed search keeps the local title filter, never an empty list.
+          if (!cancelled) setServerKeys(null);
+        });
+    }, 200);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, control, needle]);
 
   // An untitled session is shown as "New chat", so it is matched under that
   // name too rather than only against its empty title. Same rule as the list.
   const untitledLabel = t("sidebar.newChat");
   const matches = useMemo(() => {
-    const needle = query.trim().toLowerCase();
     if (!needle) return sessions;
+    if (serverKeys) {
+      // The server already matched titles and messages; keep the sidebar's
+      // own order and scope, including hidden-session handling upstream.
+      return sessions.filter(session => sessionKeys(session).some(key => serverKeys.has(key)));
+    }
+    const lowered = needle.toLowerCase();
     return sessions.filter(session =>
-      (session.title || untitledLabel).toLowerCase().includes(needle),
+      (session.title || untitledLabel).toLowerCase().includes(lowered),
     );
-  }, [sessions, query, untitledLabel]);
+  }, [sessions, needle, serverKeys, untitledLabel]);
 
   const close = () => setOpen(false);
   const select = (id: string) => {
@@ -80,7 +128,10 @@ export function ConversationSearch({
       onOpenChange={next => {
         setOpen(next);
         // A reopened dialog starts from the unfiltered list, like the sidebar.
-        if (!next) setQuery("");
+        if (!next) {
+          setQuery("");
+          setServerKeys(null);
+        }
       }}
     >
       <DialogTrigger render={trigger} />
@@ -117,9 +168,13 @@ export function ConversationSearch({
               placeholder={t("sidebar.searchChats")}
               aria-label={t("sidebar.searchChatsLabel")}
               value={query}
-              onChange={event => setQuery(event.target.value)}
+              onChange={event => {
+                setQuery(event.target.value);
+                // A new needle invalidates the previous server result.
+                setServerKeys(null);
+              }}
               onKeyDown={event => {
-                // Enter takes the first title match; Escape belongs to the dialog.
+                // Enter takes the first match; Escape belongs to the dialog.
                 if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
                 event.preventDefault();
                 const first = matches[0];

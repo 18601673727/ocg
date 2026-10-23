@@ -1738,8 +1738,138 @@ pub(crate) fn read_conversations(
     })
 }
 
-/// The number of Jobs in each readiness queue. A failed read is an error, so
-/// a caller never reports a queue as empty when it could not be read.
+/// The most `recent` rows one conversation search examines. The search is a
+/// single read transaction that walks conversations newest first and, for
+/// each, its most recent turns; the cap keeps that transaction short no
+/// matter how large the database grows. A page that stops at the cap
+/// reports `has_more` with the last row examined, so the next page resumes
+/// where this one stopped.
+pub(crate) const MAX_CONVERSATION_SEARCH_SCAN: usize = 1000;
+/// The most recent turns one conversation search reads per conversation.
+/// Titles match without any turn read; message text only needs the recent
+/// turns that a person searching usually means.
+const MAX_SEARCH_TURNS_PER_CONVERSATION: usize = 100;
+
+/// Conversations newest first whose title or recent user/agent message text
+/// holds every term. `terms` are already lowercased and non-empty; matching
+/// is case-insensitive substring per term, with the terms combined by AND
+/// across the title and the message texts. The cursor and paging mean the
+/// same as [`read_conversations`]: `before` is the `tip` the page starts
+/// strictly before, and `next_before` is the `tip` the next page starts
+/// strictly before.
+pub(crate) fn read_conversation_search(
+    database: &Database,
+    terms: &[String],
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<ConversationsPage, StorageError> {
+    let rx = read(database)?;
+    let recent = rx.open_table(RECENT)?;
+    let limit = limit.clamp(1, 100);
+    let mut conversations = Vec::new();
+    let mut last_examined: Option<JobId> = None;
+    let mut exhausted = true;
+    for (scanned, item) in recent
+        .range(..(before.map_or(u128::MAX, JobId::get), 0))?
+        .rev()
+        .take(MAX_CONVERSATION_SEARCH_SCAN + 1)
+        .enumerate()
+    {
+        if scanned >= MAX_CONVERSATION_SEARCH_SCAN {
+            exhausted = false;
+            break;
+        }
+        let (tip, conversation) = item?.0.value();
+        let tip = JobId::new(tip);
+        let conversation = JobId::new(conversation);
+        last_examined = Some(tip);
+        let summary = conversation_summary(&rx, conversation, tip)?;
+        if conversation_matches(&rx, &summary.title, tip, terms)? {
+            conversations.push(summary);
+            if conversations.len() > limit {
+                break;
+            }
+        }
+    }
+    if conversations.len() > limit {
+        let next_before = conversations.last().map(|entry| entry.tip_job);
+        conversations.truncate(limit);
+        return Ok(ConversationsPage {
+            next_before,
+            conversations,
+            has_more: true,
+        });
+    }
+    if !exhausted {
+        return Ok(ConversationsPage {
+            next_before: last_examined,
+            conversations,
+            has_more: true,
+        });
+    }
+    Ok(ConversationsPage {
+        next_before: None,
+        conversations,
+        has_more: false,
+    })
+}
+
+/// Whether `title` or the recent turn message texts starting at `tip` hold
+/// every term. The title is checked first so a title match never reads a
+/// turn; turns walk from the tip through `previous` links, newest first,
+// like [`read_conversation_turns`].
+fn conversation_matches(
+    rx: &ReadTransaction,
+    title: &str,
+    tip: JobId,
+    terms: &[String],
+) -> Result<bool, StorageError> {
+    let title = title.to_lowercase();
+    let mut matched = terms
+        .iter()
+        .map(|term| title.contains(term))
+        .collect::<Vec<_>>();
+    if matched.iter().all(|matched| *matched) {
+        return Ok(true);
+    }
+    let mut cursor = Some(tip);
+    let mut turns = 0usize;
+    while let Some(turn) = cursor {
+        if turns >= MAX_SEARCH_TURNS_PER_CONVERSATION {
+            break;
+        }
+        turns += 1;
+        let Some(row) = read_job_row(rx, turn)? else {
+            return Err(StorageError::corrupted("missing turn"));
+        };
+        cursor = row.kind.previous();
+        for entry in rx
+            .open_table(TURN_INPUTS)?
+            .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+        {
+            let (_, value) = entry?;
+            let entry = TurnEntry::decode(value.value())?;
+            let text = match &entry.entry {
+                Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => text,
+                Entry::Notice { .. }
+                | Entry::Decision { .. }
+                | Entry::RetryOf { .. }
+                | Entry::Iteration { .. }
+                | Entry::ResponseFormat { .. } => continue,
+            };
+            let text = text.to_lowercase();
+            for (term, matched) in terms.iter().zip(matched.iter_mut()) {
+                if !*matched && text.contains(term) {
+                    *matched = true;
+                }
+            }
+            if matched.iter().all(|matched| *matched) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(matched.iter().all(|matched| *matched))
+}
 pub(crate) fn queue_counts(database: &Database) -> Result<(u64, u64, u64), StorageError> {
     let rx = read(database)?;
     let pending = rx.open_table(PENDING)?.len()?;

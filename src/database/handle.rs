@@ -701,6 +701,22 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Conversations newest first whose title or recent message text holds
+    /// every term. `terms` are already lowercased query terms. The scan is
+    /// bounded inside storage; `before` and `limit` page like
+    /// [`Self::conversations`].
+    pub async fn search_conversations(
+        &self,
+        terms: Vec<String>,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<storage::ConversationsPage, DatabaseError> {
+        self.read(move |database| {
+            storage::read_conversation_search(database, &terms, before, limit)
+        })
+        .await
+    }
+
     /// The Jobs that are submitted but neither started nor settled, oldest
     /// first by Job ID, strictly after `after` when given.
     /// At most `limit`, and never more than 1,000, index entries are

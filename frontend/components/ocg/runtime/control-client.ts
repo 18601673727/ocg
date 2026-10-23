@@ -538,6 +538,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeConversations((await send("GET", `/api/v1/conversations?${query.join("&")}`, { signal: settings.signal })).input);
     },
 
+    /**
+     * Full-text conversation search: titles and recent user/agent messages,
+     * newest first. Terms are the whitespace-separated words of `query`,
+     * combined by AND; matching is case-insensitive substring per term.
+     */
+    async searchConversations(settings: { query: string; before?: string; limit?: number; signal?: AbortSignal }) {
+      const trimmed = settings.query.trim();
+      if (!trimmed) throw new ContractError("query", "a non-empty search query");
+      if (trimmed.length > 500) throw new ContractError("query", "a search query of at most 500 characters");
+      const query = [`query=${encodeURIComponent(trimmed)}`];
+      if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
+      query.push(`limit=${settings.limit ?? 50}`);
+      return decodeConversations((await send("GET", `/api/v1/conversations/search?${query.join("&")}`, { signal: settings.signal })).input);
+    },
+
     /** Renames a conversation or hides it for good. */
     async editConversation(root: string, edit: ControlConversationEdit, signal?: AbortSignal) {
       jobIdentity(root);

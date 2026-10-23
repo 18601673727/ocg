@@ -288,6 +288,7 @@ export function OcgSidebar({
             activeSessionId={activeSessionId}
             projectName={projectName}
             onSelect={onSelect}
+            control={control}
             trigger={
               <button
                 type="button"
@@ -373,6 +374,7 @@ export function OcgSidebar({
             activeSessionId={activeSessionId}
             projectName={projectName}
             onSelect={onSelect}
+            control={control}
             trigger={
               <Button variant="ghost" size="icon-xs" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
                 <Search className="size-4" aria-hidden="true" />

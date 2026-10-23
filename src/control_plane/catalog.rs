@@ -59,6 +59,80 @@ pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize),
     page_query(query, routing::job_id)
 }
 
+/// The most bytes a conversation search query may hold after decoding, and
+/// the most terms it may hold. Both keep one read transaction short: terms
+/// combine by AND, so more terms only narrow the walk, but an unbounded
+/// query could still waste a scan on noise.
+const MAX_SEARCH_QUERY_BYTES: usize = 500;
+const MAX_SEARCH_TERMS: usize = 10;
+
+/// `query` once, `before` and `limit` each at most once, and nothing else.
+/// `query` is percent-decoded (`+` means a space, like a browser form), then
+/// split on whitespace into lowercased AND terms.
+pub(super) fn conversation_search_query(
+    query: &str,
+) -> Result<(Vec<String>, Option<JobId>, usize), Refusal> {
+    let (mut raw, mut before, mut limit) = (None, None, None);
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+            match key {
+                "query" if raw.is_none() => {
+                    raw = Some(value);
+                }
+                "before" if before.is_none() => {
+                    before = Some(routing::job_id(value)?);
+                }
+                "limit" if limit.is_none() => {
+                    limit = Some(
+                        decimal::<usize>(value)
+                            .filter(|limit| (1..=MAX_CONVERSATION_PAGE).contains(limit))
+                            .ok_or(INVALID_REQUEST)?,
+                    );
+                }
+                _ => return Err(INVALID_REQUEST),
+            }
+        }
+    }
+    let raw = raw.ok_or(INVALID_REQUEST)?;
+    let decoded = decode_query_value(raw).ok_or(INVALID_REQUEST)?;
+    if decoded.len() > MAX_SEARCH_QUERY_BYTES {
+        return Err(INVALID_REQUEST);
+    }
+    let terms = decoded
+        .split_whitespace()
+        .map(|term| term.to_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect::<Vec<_>>();
+    if terms.is_empty() || terms.len() > MAX_SEARCH_TERMS {
+        return Err(INVALID_REQUEST);
+    }
+    if terms.iter().any(|term| term.chars().count() > 50) {
+        return Err(INVALID_REQUEST);
+    }
+    Ok((terms, before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
+}
+
+/// Percent-decodes `value`, with `+` as a space. Returns `None` when an
+/// escape is truncated, non-hexadecimal, or the result is not UTF-8.
+fn decode_query_value(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'+' {
+            decoded.push(b' ');
+        } else if byte == b'%' {
+            let high = bytes.next()?;
+            let low = bytes.next()?;
+            let digit = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+            decoded.push(digit(high)? * 16 + digit(low)?);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 /// The most children one page of a tree lists, and the default.
 const MAX_TREE_PAGE: usize = 100;
 const DEFAULT_TREE_PAGE: usize = 50;
@@ -683,6 +757,22 @@ pub(super) async fn conversations(
     limit: usize,
 ) -> Result<Reply, Refusal> {
     let page = database.conversations(before, limit).await?;
+    Ok(Reply::ok(envelope(conversation_page(page))))
+}
+
+/// One page of conversations newest first whose title or recent message text
+/// holds every term. Paging means the same as [`conversations`].
+pub(super) async fn search_conversations(
+    database: &DatabaseHandle,
+    terms: Vec<String>,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Reply, Refusal> {
+    let page = database.search_conversations(terms, before, limit).await?;
+    Ok(Reply::ok(envelope(conversation_page(page))))
+}
+
+fn conversation_page(page: crate::storage::ConversationsPage) -> WireConversations {
     let items = page
         .conversations
         .into_iter()
@@ -698,11 +788,11 @@ pub(super) async fn conversations(
             tip_created_at_us: c.tip_created_at.as_unix_micros(),
         })
         .collect::<Vec<_>>();
-    Ok(Reply::ok(envelope(WireConversations {
+    WireConversations {
         conversations: items,
         has_more: page.has_more,
         next_before: page.next_before.map(|j| j.to_string()),
-    })))
+    }
 }
 
 /// Exactly one edit operation.

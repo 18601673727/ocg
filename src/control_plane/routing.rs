@@ -12,6 +12,11 @@ pub(super) enum Route {
         before: Option<JobId>,
         limit: usize,
     },
+    ConversationSearch {
+        query: Vec<String>,
+        before: Option<JobId>,
+        limit: usize,
+    },
     Usage(dashboard::ObservationQuery),
     UsageSummary {
         filter: crate::persistence::UsageSummaryFilter,
@@ -119,6 +124,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             Route::Health
             | Route::Jobs { .. }
             | Route::Conversations { .. }
+            | Route::ConversationSearch { .. }
             | Route::Usage(_)
             | Route::UsageSummary { .. }
             | Route::UsageRetries(_)
@@ -247,6 +253,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         }
         ["conversations"] => catalog::conversations_query(query)
             .map(|(before, limit)| Route::Conversations { before, limit }),
+        ["conversations", "search"] => {
+            catalog::conversation_search_query(query).map(|(query, before, limit)| {
+                Route::ConversationSearch {
+                    query,
+                    before,
+                    limit,
+                }
+            })
+        }
         ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
         ["usage", "summary"] => {
             dashboard::usage_summary_query(query).map(|(filter, bucketing, after)| {
@@ -437,6 +452,11 @@ pub(super) async fn respond(
         Route::Conversations { before, limit } => {
             catalog::conversations(database, before, limit).await
         }
+        Route::ConversationSearch {
+            query,
+            before,
+            limit,
+        } => catalog::search_conversations(database, query, before, limit).await,
         Route::Usage(query) => dashboard::usage(shared, query).await,
         Route::UsageSummary {
             filter,
