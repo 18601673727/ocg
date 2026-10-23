@@ -372,6 +372,14 @@ mod tests {
         let seen_conversations = Arc::new(Mutex::new(Vec::new()));
         let captured = seen_conversations.clone();
         provider_seam::install("https://vision-test.invalid/v1", move |conv| {
+            if serde_json::to_value(conv).unwrap()["response_format"]["type"] == "json_object" {
+                return Response {
+                    gate: None,
+                    steps: vec![Step::Chunk(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"title\\\":\\\"Image inspection\\\"}\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )],
+                };
+            }
             captured
                 .lock()
                 .unwrap()
@@ -417,9 +425,9 @@ mod tests {
         let sent = seen_conversations.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
         let messages = sent[0]["messages"].as_array().expect("messages");
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        let content_parts = messages[1]["content"].as_array().expect("parts");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let content_parts = messages[0]["content"].as_array().expect("parts");
         assert_eq!(content_parts.len(), 2);
         assert_eq!(content_parts[0]["type"], "text");
         assert_eq!(content_parts[0]["text"], "What is in this image?");

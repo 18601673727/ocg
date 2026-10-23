@@ -1574,7 +1574,13 @@ fn conversation_summary(
 ) -> Result<ConversationEntry, StorageError> {
     let row = read_job_row(rx, conversation)?
         .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
-    let JobKind::Conversation { agent, project, .. } = row.kind else {
+    let JobKind::Conversation {
+        agent,
+        project,
+        origin,
+        ..
+    } = row.kind
+    else {
         return Err(StorageError::corrupted(
             "recent entry is not a conversation",
         ));
@@ -1595,6 +1601,15 @@ fn conversation_summary(
                 .transpose()?
                 .map(|entry| entry.0.value().1);
             match first {
+                Some(first) if matches!(origin, Origin::System) => {
+                    let first = JobId::new(first);
+                    match read_job_row(rx, first)?
+                        .and_then(|row| row.kind.name().map(str::to_owned))
+                    {
+                        Some(name) => name,
+                        None => first_entry_text(rx, first)?,
+                    }
+                }
                 Some(first) => first_entry_text(rx, JobId::new(first))?,
                 None => String::new(),
             }
@@ -2560,6 +2575,18 @@ pub(crate) fn read_turn_context(
                 .range((parent.get(), 0)..=(parent.get(), u128::MAX))?
             {
                 let child = JobId::new(entry?.0.value().1);
+                let child_row = read_job_row(&rx, child)?
+                    .ok_or_else(|| StorageError::corrupted("live child missing"))?;
+                if matches!(
+                    child_row.kind,
+                    JobKind::Conversation {
+                        origin: Origin::System,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+
                 let closing = read_conversation(&rx, child)?.closing;
                 status_rows.push(format!(
                     "{child}: {}",

@@ -275,7 +275,7 @@ impl Batch {
                 origin,
                 ..
             } => {
-                if agent.is_none() && !matches!(origin, Origin::User) {
+                if agent.is_none() && matches!(origin, Origin::Agent { .. }) {
                     return self.reject(Violation::InvalidValue(
                         "agent",
                         "this origin requires an Agent",
@@ -1106,6 +1106,19 @@ impl Batch {
             at: self.now,
             cause,
         });
+        if kind == OutcomeKind::Completed
+            && let Some(target) = self.title_target(&row)?
+            && let Some(title) = result
+                .as_ref()
+                .and_then(|result| result.summary.as_deref())
+                .and_then(crate::persistence::parse_suggested_title)
+        {
+            crate::persistence::set_conversation(
+                self,
+                target,
+                crate::persistence::ConversationEdit::SuggestedTitle(title),
+            )?;
+        }
         let mut appended = None;
         if let Some(result) = result
             && kind != OutcomeKind::Unknown
@@ -1159,6 +1172,9 @@ impl Batch {
         }
         self.put_job_state(job, &state)?;
         self.index_answer(&row, kind, appended.is_some())?;
+        if kind == OutcomeKind::Completed {
+            self.schedule_title_job(&row)?;
+        }
         self.settle(job)?;
         self.turn_ended(job)?;
         self.probe = Some(Probe::Outcome(job));

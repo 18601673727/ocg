@@ -3504,29 +3504,6 @@ pub(crate) async fn run_provider_job_with_window(
     result
 }
 
-fn insert_title_instruction(conversation: &mut ChatConversation, limits: ContextLimits) -> bool {
-    let before_user = conversation
-        .messages
-        .iter()
-        .position(|message| message.role != ChatRole::System)
-        .unwrap_or(conversation.messages.len());
-    conversation.messages.insert(
-        before_user,
-        ChatMessage::system(super::conversation_title::INSTRUCTION),
-    );
-    if limits.context_window.is_some_and(|window| {
-        estimate_request_tokens(conversation, limits.max_tokens) > u64::from(window)
-    }) {
-        conversation.messages.remove(before_user);
-        return false;
-    }
-    conversation.image_attachments = std::mem::take(&mut conversation.image_attachments)
-        .into_iter()
-        .map(|(index, attachments)| (index + usize::from(index >= before_user), attachments))
-        .collect();
-    true
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_provider_job_inner(
     run: ProviderRun,
@@ -3542,25 +3519,6 @@ async fn run_provider_job_inner(
     ) -> Result<ProviderExecutionResult, ProviderExecutionError>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
     let mut sink = output_sink(run.database.clone(), run.job);
-    if conversation.response_format.is_none()
-        && let Some(turn) = run.database.job(run.job).await?
-        && turn.kind.is_stored()
-        && turn.previous.is_none()
-        && let Some(root) = turn.conversation
-        && let Some(parent) = run.database.job(root).await?
-        && parent.parent_id.is_none()
-        && parent.name.is_none()
-        && matches!(
-            parent.kind,
-            crate::persistence::JobKind::Conversation {
-                origin: crate::persistence::Origin::User,
-                ..
-            }
-        )
-        && insert_title_instruction(&mut conversation, context_limits)
-    {
-        sink.title_conversation = Some(root);
-    }
     sink.recorder.image_attachments = std::mem::take(&mut conversation.image_attachments);
     sink.dropped_turns = conversation.dropped_turns;
     if let Some(Err(error)) = tools.map(|tools| tools.limits.validate()) {
@@ -3659,19 +3617,6 @@ async fn run_provider_job_inner(
             } else {
                 execution
             };
-            if let Ok(result) = &execution
-                && let Some(root) = sink.title_conversation
-                && let Some((title, _)) = super::conversation_title::split(&result.text)
-                && let Err(error) = sink
-                    .database
-                    .set_conversation(
-                        root,
-                        crate::persistence::ConversationEdit::SuggestedTitle(title.to_owned()),
-                    )
-                    .await
-            {
-                sink.gap.get_or_insert(error);
-            }
             let Err(error) = &execution else {
                 break execution;
             };
@@ -4660,13 +4605,6 @@ async fn complete_provider_job(
     summary: String,
     answer: Option<&ChatMessage>,
 ) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
-    let summary = if sink.title_conversation.is_some()
-        && let Some((_, answer)) = super::conversation_title::split(&summary)
-    {
-        answer.to_owned()
-    } else {
-        summary
-    };
     let mut gap = sink.gap.take();
     let mut refused = None;
     let mut settlement = JobFinalization::Completed(FinalResult {
@@ -4817,7 +4755,6 @@ pub(crate) struct DatabaseOutputSink {
     recorder: provider_execution::RequestRecorder,
     dropped_turns: u32,
     response_digest: Option<crate::persistence::ContentDigest>,
-    title_conversation: Option<JobId>,
 }
 
 pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutputSink {
@@ -4829,7 +4766,6 @@ pub(crate) fn output_sink(database: DatabaseHandle, job: JobId) -> DatabaseOutpu
         recorder: provider_execution::RequestRecorder::default(),
         dropped_turns: 0,
         response_digest: None,
-        title_conversation: None,
     }
 }
 
@@ -7197,61 +7133,5 @@ mod approval_runtime_tests {
             "ran\n"
         );
         worker.shutdown().unwrap();
-    }
-}
-
-#[cfg(test)]
-mod title_budget_tests {
-    use super::*;
-
-    #[test]
-    fn optional_title_does_not_displace_a_request_at_its_context_limit() {
-        let mut conversation = ChatConversation {
-            messages: vec![ChatMessage::system("system"), ChatMessage::user("user")],
-            ..Default::default()
-        };
-        let attachment = AttachmentId::new(42);
-        conversation.image_attachments.insert(1, vec![attachment]);
-        let before = serde_json::to_vec(&conversation.messages).unwrap();
-        let window = estimate_request_tokens(&conversation, Some(10)) as u32;
-        assert!(!insert_title_instruction(
-            &mut conversation,
-            ContextLimits {
-                context_window: Some(window),
-                max_tokens: Some(10)
-            }
-        ));
-        assert_eq!(serde_json::to_vec(&conversation.messages).unwrap(), before);
-        assert_eq!(
-            conversation.image_attachments.get(&1),
-            Some(&vec![attachment])
-        );
-        assert_eq!(
-            estimate_request_tokens(&conversation, Some(10)),
-            u64::from(window)
-        );
-    }
-
-    #[test]
-    fn optional_title_keeps_image_indices_when_there_is_room() {
-        let mut conversation = ChatConversation {
-            messages: vec![ChatMessage::system("system"), ChatMessage::user("user")],
-            ..Default::default()
-        };
-        let attachment = AttachmentId::new(42);
-        conversation.image_attachments.insert(1, vec![attachment]);
-        assert!(insert_title_instruction(
-            &mut conversation,
-            ContextLimits {
-                context_window: Some(128000),
-                max_tokens: Some(10)
-            }
-        ));
-        assert_eq!(conversation.messages.len(), 3);
-        assert_eq!(
-            conversation.image_attachments.get(&2),
-            Some(&vec![attachment])
-        );
-        assert!(!conversation.image_attachments.contains_key(&1));
     }
 }

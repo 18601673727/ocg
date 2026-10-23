@@ -348,3 +348,5 @@ process-group proof. A live group refuses with `slot_live`. When no group is
 tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
 confirmation. Successful replies are `released` or `already_released`. This route
 is available for any origin; the CLI continues to record operator confirmation.
+
+Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 26).

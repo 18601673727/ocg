@@ -126,6 +126,16 @@ impl Batch {
         event: NoticeEvent,
         reference: JobId,
     ) -> Result<(), BatchError> {
+        let child_row = self.require_job(child)?;
+        if matches!(
+            child_row.kind,
+            JobKind::Conversation {
+                origin: Origin::System,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
         let Some(parent) = self.require_job(child)?.parent_id else {
             return Ok(());
         };

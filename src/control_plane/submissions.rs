@@ -1828,18 +1828,24 @@ pub(super) mod tests {
 
         let seen_conversations = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen_conversations.clone();
+        let title_requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_titles = title_requests.clone();
         let mut replies = vec![
-            "data: {\"choices\":[{\"delta\":{\"content\":\"<ocg-title>Remembering cobalt</ocg-title>\\nReply 1: Remembered cobalt.\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 1: Remembered cobalt.\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 2: Your word is cobalt.\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"Reply 3: tlaboc.\"}}]}\n\n",
         ]
         .into_iter();
         provider_seam::install("https://multi-turn.invalid/v1", move |conversation| {
-            recorded
-                .lock()
-                .expect("lock")
-                .push(serde_json::to_value(conversation).expect("json"));
-            let chunk = replies.next().expect("reply chunk");
+            let value = serde_json::to_value(conversation).expect("json");
+            let title = value["response_format"]["type"] == "json_object";
+            let chunk = if title {
+                recorded_titles.lock().expect("lock").push(value);
+                "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"title\\\":\\\"Remembering cobalt\\\"}\"}}]}\n\n"
+            } else {
+                recorded.lock().expect("lock").push(value);
+                replies.next().expect("reply chunk")
+            };
             Response {
                 gate: None,
                 steps: vec![
@@ -1886,11 +1892,28 @@ pub(super) mod tests {
             .expect("turn")
             .conversation
             .expect("conversation");
-        assert_eq!(
-            wait(catalog::conversations(&handle, None, 20))
+        let deadline = std::time::Instant::now() + crate::test_support::WAIT;
+        loop {
+            let title = wait(catalog::conversations(&handle, None, 20))
                 .expect("conversations")
-                .body["conversations"][0]["title"],
-            "Remembering cobalt"
+                .body["conversations"][0]["title"]
+                .clone();
+            if title == "Remembering cobalt" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "title Job did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let title_calls = title_requests.lock().expect("lock").clone();
+        assert_eq!(title_calls.len(), 1);
+        assert_eq!(title_calls[0]["tools"], Value::Null);
+        assert!(
+            !title_calls[0]
+                .to_string()
+                .contains("Be concise and remember context")
         );
         let outputs = wait(handle.job_outputs(job1, None, 20)).expect("outputs");
         assert!(outputs.iter().any(
@@ -1916,13 +1939,12 @@ pub(super) mod tests {
 
         let sent = seen_conversations.lock().expect("lock").clone();
         assert_eq!(sent.len(), 3);
-        assert_eq!(sent[0]["messages"].as_array().expect("msgs").len(), 3);
-        assert_eq!(sent[0]["messages"][1]["role"], "system");
+        assert_eq!(sent[0]["messages"].as_array().expect("msgs").len(), 2);
+        assert_eq!(sent[0]["messages"][1]["role"], "user");
         assert!(
-            sent[0]["messages"][1]["content"]
-                .as_str()
-                .expect("instruction")
-                .contains("<ocg-title>")
+            !sent
+                .iter()
+                .any(|request| request.to_string().contains("<ocg-title>"))
         );
         assert_eq!(sent[1]["messages"].as_array().expect("msgs").len(), 4);
         assert_eq!(
