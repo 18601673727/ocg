@@ -1041,6 +1041,7 @@ export function decodeChildren(input: unknown, conversationId: string) {
     if (interval !== null && (interval < 60 || interval > 2592000)) throw new ContractError(`${path}.recurrence.interval_s`, "60 to 2592000");
     return {
       id: identity(child.id, `${path}.id`), title: string(child.title, `${path}.title`),
+      ...(child.origin === undefined ? {} : { origin: oneOf(child.origin, `${path}.origin`, ["user", "agent", "system"] as const) }),
       agent: child.agent === null ? null : identity(child.agent, `${path}.agent`), state,
       on_hold: by === null ? null : { by: by === "agent"
         ? { kind: by, conversation: identity(hold?.conversation, `${path}.on_hold.by.conversation`) }

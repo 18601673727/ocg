@@ -1662,6 +1662,7 @@ fn conversation_summary(
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildConversationEntry {
     pub conversation: ConversationEntry,
+    pub origin: Origin,
     pub keep_open: bool,
     pub recurrence: Option<Recurrence>,
 }
@@ -1682,7 +1683,10 @@ pub(crate) fn read_conversation_children(
         let child = JobId::new(entry?.0.value().1);
         let row = read_job_row(&rx, child)?
             .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
-        let JobKind::Conversation { keep_open, .. } = row.kind else {
+        let JobKind::Conversation {
+            origin, keep_open, ..
+        } = row.kind
+        else {
             return Err(StorageError::corrupted("child is not a conversation"));
         };
         let tip = rx
@@ -1692,6 +1696,7 @@ pub(crate) fn read_conversation_children(
             .ok_or_else(|| StorageError::corrupted("child tip missing"))?;
         children.push(ChildConversationEntry {
             conversation: conversation_summary(&rx, child, tip)?,
+            origin,
             keep_open,
             recurrence: rx
                 .open_table(RECURRENCES)?

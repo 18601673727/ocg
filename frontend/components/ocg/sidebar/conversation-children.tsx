@@ -33,7 +33,7 @@ export function SidebarConversationChildren({ conversation, control, activeChild
           let more = false;
           for (let page = 0; page < pages; page++) {
             const result = await control.readChildren(conversation, before, 20, controller.signal);
-            items.push(...result.children);
+            items.push(...result.children.filter(child => child.origin !== "system"));
             more = result.has_more;
             before = result.next_before ?? undefined;
             if (!more) break;
@@ -55,7 +55,7 @@ export function SidebarConversationChildren({ conversation, control, activeChild
   }, [control, conversation, pages]);
   return <>
     {error && <DismissibleNotice message={error} className="ml-6 px-2 py-1 text-xs" />}
-    {children.length > 0 && <ul className="ml-5 border-l border-border pl-2" aria-label={t("chat.children")}>
+    {(children.length > 0 || hasMore) && <ul className="ml-5 border-l border-border pl-2" aria-label={t("chat.children")}>
       {children.map(child => <li key={child.id} data-sidebar-level="2">
         <button type="button" onClick={() => onOpen(child.id)} aria-current={activeChild === child.id ? "true" : undefined}
           title={child.title || t("chat.child.untitled")}

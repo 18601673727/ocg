@@ -437,7 +437,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
         let more = false;
         for (let page = 0; page < pages; page++) {
           const reply = await control.readChildren(conversation, before, 20, controller.signal);
-          items.push(...reply.children);
+          items.push(...reply.children.filter(child => child.origin !== "system"));
           more = reply.has_more;
           before = reply.next_before ?? undefined;
           if (!more) break;
@@ -498,7 +498,7 @@ export function ConversationChildrenStrip({ turn, onOpen }: { turn?: string; onO
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { lock.current = false; setPending(null); }
   }
-  if (!control || !children.length) return null;
+  if (!control || (!children.length && !hasMore)) return null;
   return <section className="py-2" aria-label={t("chat.children")} data-slot="conversation-child-cards">
     <div className="flex flex-wrap gap-3">
       {children.map(child => <ChildConversationCard key={child.id} child={child} agentName={child.agent ? agentNames[child.agent] : undefined} control={control} pending={pending !== null} onOpen={onOpen} onAct={act} />)}

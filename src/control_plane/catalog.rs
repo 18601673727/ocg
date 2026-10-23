@@ -233,6 +233,14 @@ pub(super) async fn conversation_children(
         let c = &record.conversation;
         children.push(WireChild {
             id: c.root_job.to_string(),
+            origin: Some(
+                match record.origin {
+                    crate::persistence::Origin::User => "user",
+                    crate::persistence::Origin::Agent { .. } => "agent",
+                    crate::persistence::Origin::System => "system",
+                }
+                .to_owned(),
+            ),
             title: c.title.clone(),
             agent: c.agent.map(|id| ProfileId::from(id).to_string()),
             state: c.state.to_owned(),

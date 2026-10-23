@@ -50,7 +50,7 @@ export type WireConversationLimits = { conversation: string, depth: number, rema
 
 export type WireRecurrence = { interval_s: number, phase: string, due_us: number | null, };
 
-export type WireChild = { id: string, title: string, agent: string | null, state: string, on_hold: WireHold | null, keep_open: boolean, recurrence: WireRecurrence | null, };
+export type WireChild = { id: string, origin?: string, title: string, agent: string | null, state: string, on_hold: WireHold | null, keep_open: boolean, recurrence: WireRecurrence | null, };
 
 export type WireChildren = { conversation: string, children: Array<WireChild>, has_more: boolean, next_before: string | null, };
 

@@ -225,6 +225,9 @@ contracts! {
     }
     struct WireChild {
         pub id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub origin: Option<String>,
         pub title: String,
         pub agent: Option<String>,
         pub state: String,
