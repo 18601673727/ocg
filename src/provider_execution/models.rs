@@ -19,44 +19,109 @@ pub(crate) enum ModelListError {
 pub(crate) async fn list_models(
     endpoint: &str,
     credential: Option<&str>,
+    protocol: crate::persistence::LlmTransport,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
-    let endpoint =
-        exchange::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
+    let base = exchange::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
+    let anthropic = protocol == crate::persistence::LlmTransport::AnthropicMessages;
     let authorization = credential
-        .map(exchange::authorization)
+        .map(if anthropic {
+            anthropic::api_key
+        } else {
+            exchange::authorization
+        })
         .transpose()
         .map_err(|_| ModelListError::Unreachable)?;
     ntex::time::timeout(Duration::from_secs(30), async {
-        #[cfg(test)]
-        if let Some(response) = scripted::http_response(&endpoint, authorization.as_ref()) {
-            let (status, body) = response.map_err(|()| ModelListError::Unreachable)?;
-            return parse_models(status, &body, credential);
-        }
         let client = exchange::provider_client(Duration::from_secs(30))
             .await
             .map_err(|_| ModelListError::Unreachable)?;
-        let response = client
-            .get(endpoint)
-            .set_header(ACCEPT, "application/json")
-            .if_some(authorization, |authorization, request| {
-                request.set_header(AUTHORIZATION, authorization)
-            })
-            .send()
-            .await
-            .map_err(|_| ModelListError::Unreachable)?;
-        let status = response.status().as_u16();
-        if status == 404 {
-            return Err(ModelListError::NotListed);
-        }
-        let body = response.body().limit(1024 * 1024).await;
-        match body {
-            Ok(body) => parse_models(status, &body, credential),
-            Err(ntex::http::error::PayloadError::Overflow) if (200..300).contains(&status) => {
-                Err(ModelListError::NotListed)
+        let mut endpoint = if anthropic {
+            format!("{base}?limit=1000")
+        } else {
+            base.clone()
+        };
+        let mut models = BTreeMap::new();
+        let mut cursors = std::collections::BTreeSet::new();
+        for _ in 0..100 {
+            #[cfg(test)]
+            let scripted = scripted::http_response(&endpoint, authorization.as_ref());
+            #[cfg(not(test))]
+            let scripted: Option<Result<(u16, Vec<u8>), ()>> = None;
+            let (status, body) = if let Some(response) = scripted {
+                response.map_err(|()| ModelListError::Unreachable)?
+            } else {
+                let request = client
+                    .get(&endpoint)
+                    .set_header(ACCEPT, "application/json")
+                    .if_some(authorization.clone(), |authorization, request| {
+                        request.set_header(
+                            if anthropic {
+                                "x-api-key"
+                            } else {
+                                "authorization"
+                            },
+                            authorization,
+                        )
+                    });
+                let request = if anthropic {
+                    request.set_header("anthropic-version", anthropic::API_VERSION)
+                } else {
+                    request
+                };
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|_| ModelListError::Unreachable)?;
+                let status = response.status().as_u16();
+                if status == 404 {
+                    return Err(ModelListError::NotListed);
+                }
+                let body = match response.body().limit(1024 * 1024).await {
+                    Ok(body) => body.to_vec(),
+                    Err(ntex::http::error::PayloadError::Overflow)
+                        if (200..300).contains(&status) =>
+                    {
+                        return Err(ModelListError::NotListed);
+                    }
+                    Err(_) if !(200..300).contains(&status) => Vec::new(),
+                    Err(_) => return Err(ModelListError::Unreachable),
+                };
+                (status, body)
+            };
+            for model in parse_models(status, &body, credential)? {
+                models.insert(model.id, model.context_window);
             }
-            Err(_) if !(200..300).contains(&status) => parse_models(status, &[], credential),
-            Err(_) => Err(ModelListError::Unreachable),
+            let value =
+                serde_json::from_slice::<Value>(&body).map_err(|_| ModelListError::NotListed)?;
+            if !anthropic || value["has_more"] == false {
+                return Ok(models
+                    .into_iter()
+                    .map(|(id, context_window)| ProviderModel { id, context_window })
+                    .collect());
+            }
+            if value["has_more"] != true {
+                return Err(ModelListError::NotListed);
+            }
+            let cursor = value["last_id"]
+                .as_str()
+                .filter(|cursor| !cursor.is_empty() && cursor.len() <= 1024)
+                .ok_or(ModelListError::NotListed)?;
+            if !cursors.insert(cursor.to_owned()) {
+                return Err(ModelListError::NotListed);
+            }
+            let cursor = cursor
+                .bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                        char::from(byte).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect::<String>();
+            endpoint = format!("{base}?limit=1000&after_id={cursor}");
         }
+        Err(ModelListError::NotListed)
     })
     .await
     .map_err(|_| ModelListError::Unreachable)?
@@ -112,9 +177,14 @@ fn parse_models(
         if credential.is_some_and(|secret| !secret.is_empty() && id.contains(secret)) {
             continue;
         }
-        let context = ["context_length", "context_window", "max_context_length"]
-            .iter()
-            .find_map(|key| entry.get(key).and_then(Value::as_u64));
+        let context = [
+            "context_length",
+            "context_window",
+            "max_context_length",
+            "max_input_tokens",
+        ]
+        .iter()
+        .find_map(|key| entry.get(key).and_then(Value::as_u64));
         models
             .entry(id.to_owned())
             .and_modify(|existing| *existing = (*existing).max(context))

@@ -143,7 +143,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 26, with no migration;
+cancelled if reopened without a claim. The stored format is 27, with no migration;
 recreate data directories made by earlier versions.
 
 Conversation depth is derived from parent links. Limits default to depth 3
@@ -349,7 +349,7 @@ tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
 confirmation. Successful replies are `released` or `already_released`. This route
 is available for any origin; the CLI continues to record operator confirmation.
 
-Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 26).
+Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and uses the stored Job layout (format 27).
 
 ## OpenAI Responses providers
 
@@ -372,6 +372,51 @@ Responses usage and output items are retained in provider history. A terminal
 responses never authorize tool execution.
 
 Responses adds protocol code 2 alongside the unchanged Chat Completions code 1.
-Database format 26 is retained: existing data opens without migration. Once
-Responses configurations have been saved, use a build with Responses support;
-older builds cannot decode the added protocol code.
+The current database format is 27. Older data directories are refused without
+migration; protocol codes 1 and 2 retain their existing meanings.
+
+
+## Conversation full-text search
+
+`GET /api/v1/conversations/search?query=...&limit=50` searches titles, all
+user/agent messages and saved assistant results across projects in the current
+account. Hidden conversations stay excluded. Matching is case-insensitive literal
+substring matching; whitespace-separated terms are combined with AND across the
+conversation. Double quotes keep a phrase together, for example
+`query=%22connection+reset%22+proxy`. Queries take at most 500 UTF-8 bytes and ten
+unique terms or phrases, each at most 50 Unicode characters. Unclosed quotes
+are refused. `next_before` resumes the next page without skipping a result;
+The sidebar search exposes additional pages with **Load more search results**.
+
+A derived Unicode gram index points to immutable message and result rows. It is
+updated in the same transaction as its source and rebuilt from source rows after
+an unclean shutdown. Search verifies candidate text against those rows, with no
+100-turn history cutoff. Each page still scans at most 1,000 recent conversations;
+a short or empty page with `has_more: true` must be followed using its cursor.
+
+## Anthropic Messages providers
+
+Select **Anthropic Messages** in Settings, or use
+`protocol: "anthropic_messages"` when creating or importing an LLM profile.
+Use `https://api.anthropic.com/v1` (or the full `/v1/messages` endpoint), a model
+available to your account, and your API key. Environment registration accepts
+`OCG_PROVIDER_PROTOCOL=anthropic_messages`. OCG uses the native Messages API with
+`x-api-key` and the stable `anthropic-version: 2023-06-01` header. Credentials
+remain sensitive headers and are redacted from provider failures.
+
+Streaming text, images, tool calls/results, signed thinking continuation and
+paginated native model discovery are supported. System messages become the
+top-level `system` prompt. Images are sent as base64 content blocks, while request
+history keeps attachment references. Anthropic input usage includes ordinary,
+cache-read and cache-write input tokens; cache counters are also retained
+separately. Only `message_stop` completes a stream; truncated responses never
+run tools.
+
+`max_tokens` or `max_completion_tokens` maps to `max_tokens`, defaulting to 4,096.
+Setting both is refused. `json_schema` response formats map to
+`output_config.format`; `json_object` is refused, so supply an explicit schema.
+Presence/frequency penalties are refused. Reasoning effort enables adaptive
+thinking and maps to `output_config.effort` (`minimal` maps to `low`, `none`
+disables thinking); choose a model that supports these options. OCG does not
+infer model support from names. Anthropic uses stored protocol code 3; the
+protocol and search index are included in database format 27, without migration.

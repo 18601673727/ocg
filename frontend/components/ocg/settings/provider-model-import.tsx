@@ -53,21 +53,22 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
   const [error, setError] = useState<string | null>(null);
   // A committed import stays committed even when the following catalog refresh fails.
   const [result, setResult] = useState<string | null>(null);
-  const endpoint = sourceId === "new" ? newConnection?.endpoint : provider?.endpoint ?? "https://api.openai.com/v1";
+  const endpoint = sourceId === "new" ? newConnection?.endpoint : provider?.endpoint ?? (provider?.protocol === "anthropic_messages" ? "https://api.anthropic.com/v1" : "https://api.openai.com/v1");
+  const protocol = sourceId === "new" ? newConnection?.protocol : provider?.protocol;
   const credentialRef = sourceId === "new" ? undefined : provider?.credential_ref;
   const credential = sourceId === "new" ? newConnection?.credential : undefined;
   useEffect(() => {
     if (!endpoint) return;
     const controller = new AbortController();
     let active = true;
-    void client.discoverProviderModels({ endpoint, credential_ref: credentialRef, credential }, controller.signal)
+    void client.discoverProviderModels({ endpoint, protocol, credential_ref: credentialRef, credential }, controller.signal)
       .then((answer) => {
         if (active) setModels([...new Map(answer.models.map((model) => [model.id, model])).values()].sort((a, b) => a.id.localeCompare(b.id)));
       })
       .catch((reason) => { if (active) setError(describeError(reason, t)); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; controller.abort(); };
-  }, [client, endpoint, credentialRef, credential, sourceId, revision, t]);
+  }, [client, endpoint, protocol, credentialRef, credential, sourceId, revision, t]);
   const existing = new Set(provider?.models ?? []);
   const matching = useMemo(() => models.filter((model) => model.id.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())), [models, query]);
   function reload(id = sourceId) {

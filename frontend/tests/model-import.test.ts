@@ -50,3 +50,25 @@ test("Responses provider imports preserve the explicitly selected protocol", asy
   assert.deepEqual(sent, { provider: source, models: [{ id: "m", context_window: null }], declared_capabilities: ["chat"] });
   client.close();
 });
+
+test("Anthropic discovery and imports preserve native protocol and reject unknown protocols", async () => {
+  const { decodeProfiles } = await import("../components/ocg/contracts");
+  const snapshot = { api_version: 1, llm_profiles: [], agent_profiles: [], executor_protocols: [{ id, protocol: "anthropic_messages" }], providers: [{ protocol: "anthropic_messages", endpoint: "https://api.anthropic.com/v1", credential_ref: null, has_credential: false, profile_ids: [id], models: ["claude-test"] }], has_more: false, next_before: null };
+  assert.equal(decodeProfiles(snapshot).providers[0].protocol, "anthropic_messages");
+  assert.equal(decodeProfiles(snapshot).executor_protocols[0].protocol, "anthropic_messages");
+  assert.throws(() => decodeProfiles({ ...snapshot, providers: [{ ...snapshot.providers[0], protocol: "unknown" }] }), ContractError);
+  const calls: unknown[] = [];
+  const client = createHttpCanonicalControlClient({ baseUrl: "http://localhost:7841", csrfToken: () => "test-csrf", fetch: async (url, init) => {
+    calls.push(JSON.parse(String(init?.body)));
+    return new URL(String(url)).pathname.endsWith("provider-models")
+      ? Response.json({ api_version: 1, models: [{ id: "claude-test", context_window: 200000 }] })
+      : Response.json({ api_version: 1, profile_ids: [id], created: 1, existing: 0 });
+  } });
+  const source = { name: "Anthropic", endpoint: "https://api.anthropic.com/v1", protocol: "anthropic_messages" as const };
+  const connection = { endpoint: source.endpoint, protocol: source.protocol };
+  const models = await client.discoverProviderModels(connection);
+  await client.importModels(source, models.models, ["chat", "tools"]);
+  assert.deepEqual(calls[0], connection);
+  assert.deepEqual(calls[1], { provider: source, models: models.models, declared_capabilities: ["chat", "tools"] });
+  client.close();
+});

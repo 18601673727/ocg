@@ -318,6 +318,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(NOTICES)?;
     tx.open_table(TIPS)?;
     tx.open_table(RECENT)?;
+    tx.open_table(CONVERSATION_SEARCH)?;
     tx.open_table(CHILD_CONVERSATIONS)?;
     tx.open_table(LIVE_CHILDREN)?;
     tx.open_table(USER_ENTRY_AT)?;

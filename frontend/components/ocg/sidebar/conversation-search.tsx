@@ -5,8 +5,8 @@
  *
  * The overlay searches across projects within this account only: an empty
  * query shows the sidebar's own list, while a non-empty query asks the
- * control server's conversation search (titles plus recent user/agent
- * messages, terms combined by AND) through the same account's control
+ * control server's conversation search (titles plus user/agent
+ * messages and assistant replies, terms combined by AND) through the same account's control
  * client and keeps only the sessions the sidebar already renders.
  * Selecting a result goes through the same session-selection callback the
  * sidebar list uses, so navigation, URL state and attention handling stay
@@ -68,36 +68,41 @@ export function ConversationSearch({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [serverKeys, setServerKeys] = useState<ReadonlySet<string> | null>(null);
+  const [nextBefore, setNextBefore] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [page, setPage] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
-
   const needle = query.trim();
+  const cursorRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!open || !control || !needle) return;
     let cancelled = false;
     const controller = new AbortController();
+    const before = page === 0 ? undefined : cursorRef.current ?? undefined;
     const timer = setTimeout(() => {
-      void control
-        .searchConversations({ query: needle, limit: 50, signal: controller.signal })
-        .then(page => {
+      setLoading(true);
+      setFailed(false);
+      void control.searchConversations({ query: needle, before, limit: 50, signal: controller.signal })
+        .then(answer => {
           if (cancelled) return;
-          const keys = new Set<string>();
-          for (const conversation of page.conversations) {
-            keys.add(conversation.root_job);
-            keys.add(conversation.tip_job);
-          }
-          setServerKeys(keys);
+          setServerKeys(previous => {
+            const keys = new Set(page === 0 ? [] : previous ?? []);
+            for (const conversation of answer.conversations) {
+              keys.add(conversation.root_job);
+              keys.add(conversation.tip_job);
+            }
+            return keys;
+          });
+          cursorRef.current = answer.has_more ? answer.next_before : null;
+          setNextBefore(cursorRef.current);
         })
-        .catch(() => {
-          // A failed search keeps the local title filter, never an empty list.
-          if (!cancelled) setServerKeys(null);
-        });
-    }, 200);
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [open, control, needle]);
+        .catch(() => { if (!cancelled) setFailed(true); })
+        .finally(() => { if (!cancelled) setLoading(false); });
+    }, page === 0 ? 200 : 0);
+    return () => { cancelled = true; clearTimeout(timer); controller.abort(); };
+  }, [open, control, needle, page]);
 
   // An untitled session is shown as "New chat", so it is matched under that
   // name too rather than only against its empty title. Same rule as the list.
@@ -131,6 +136,11 @@ export function ConversationSearch({
         if (!next) {
           setQuery("");
           setServerKeys(null);
+          setNextBefore(null);
+          setLoading(false);
+          setFailed(false);
+          setPage(0);
+          cursorRef.current = null;
         }
       }}
     >
@@ -170,8 +180,14 @@ export function ConversationSearch({
               value={query}
               onChange={event => {
                 setQuery(event.target.value);
+                if (event.target.value.trim() === needle) return;
                 // A new needle invalidates the previous server result.
                 setServerKeys(null);
+                setNextBefore(null);
+                setFailed(false);
+                setLoading(Boolean(control && event.target.value.trim()));
+                setPage(0);
+                cursorRef.current = null;
               }}
               onKeyDown={event => {
                 // Enter takes the first match; Escape belongs to the dialog.
@@ -186,7 +202,9 @@ export function ConversationSearch({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">
-          <ul role="listbox" aria-label={t("nav.chatSessions")} className="flex flex-col gap-px pb-2">
+          {loading && <p role="status" className="px-2 py-2 text-sm text-muted-foreground">{t("common.loading")}</p>}
+          {failed && <div role="alert" className="px-2 py-2 text-sm text-destructive"><p>{t("sidebar.searchFailed")}</p><Button variant="outline" size="sm" onClick={() => { setLoading(true); setPage(value => value + 1); }}>{t("common.retry")}</Button></div>}
+          <ul aria-busy={loading} role="listbox" aria-label={t("nav.chatSessions")} className="flex flex-col gap-px pb-2">
             {matches.map(session => {
               const active = session.id === activeSessionId;
               return (
@@ -213,7 +231,7 @@ export function ConversationSearch({
                 </li>
               );
             })}
-            {matches.length === 0 && (
+            {matches.length === 0 && !loading && !failed && (
               <li
                 role="status"
                 className={cn("px-2 py-6 text-center text-muted-foreground", TYPOGRAPHY_SCALE.caption)}
@@ -222,6 +240,7 @@ export function ConversationSearch({
               </li>
             )}
           </ul>
+          {nextBefore && <Button variant="outline" size="sm" disabled={loading} onClick={() => { setLoading(true); setPage(value => value + 1); }}>{t("sidebar.searchMore")}</Button>}
         </div>
       </DialogContent>
     </Dialog>

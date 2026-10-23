@@ -730,6 +730,12 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(JOB_OUTPUTS)?
                 .insert((job.get(), seq), encode_output(&record).as_slice())?;
+            if let Some(text) = derived::search_output_text(&record)
+                && let Some(row) = tx.open_table(JOBS)?.get(job.get())?
+                && let Some(conversation) = JobRow::decode_at(job.get(), row.value())?.parent_id
+            {
+                derived::index_search_text(tx, conversation, job, 1, seq, text)?;
+            }
             Ok(())
         })?;
         Ok((seq, id))

@@ -62,7 +62,7 @@ const INVALID_MODEL: Refusal = Refusal::new(
 const UNSUPPORTED_PROTOCOL: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "unsupported_protocol",
-    "protocol must be openai_chat_completions or openai_responses",
+    "protocol must be openai_chat_completions, openai_responses or anthropic_messages",
 );
 const INVALID_ENDPOINT: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -544,6 +544,7 @@ fn build_profiles_page(
                 let offered: Vec<_> = [
                     LlmTransport::OpenAiChatCompletions,
                     LlmTransport::OpenAiResponses,
+                    LlmTransport::AnthropicMessages,
                 ]
                 .into_iter()
                 .filter(|protocol| {
@@ -1570,6 +1571,7 @@ mod tests {
 #[serde(deny_unknown_fields)]
 struct ProviderModelsRequest {
     endpoint: String,
+    protocol: Option<String>,
     credential: Option<String>,
     credential_ref: Option<String>,
 }
@@ -1580,6 +1582,12 @@ pub(super) async fn provider_models(
 ) -> Result<Reply, Refusal> {
     let request: ProviderModelsRequest =
         serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
+    let protocol = request
+        .protocol
+        .as_deref()
+        .map(LlmTransport::parse)
+        .unwrap_or(Some(LlmTransport::OpenAiChatCompletions))
+        .ok_or(UNSUPPORTED_PROTOCOL)?;
     if request.endpoint.len() > MAX_ENDPOINT_BYTES
         || crate::provider_execution::model_endpoint(&request.endpoint).is_err()
     {
@@ -1616,6 +1624,7 @@ pub(super) async fn provider_models(
     let (code, message, status_code) = match crate::provider_execution::list_models(
         &request.endpoint,
         credential.as_deref(),
+        protocol,
     )
     .await
     {

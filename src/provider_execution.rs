@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
 use ntex::client::{Client, ClientResponse, error::ClientError};
-use ntex::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+#[cfg(test)]
+use ntex::http::header::AUTHORIZATION;
+use ntex::http::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
 use ntex::http::{Payload, StatusCode};
 use ntex::time::Millis;
 use ntex::util::{Either, select};
@@ -30,6 +32,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const STREAM_OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
 const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
+mod anthropic;
 mod cancellation;
 mod conversation;
 mod exchange;

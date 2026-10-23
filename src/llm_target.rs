@@ -33,7 +33,9 @@ pub enum Error {
     NotConfigured(&'static str),
     #[error("{ENDPOINT_VARIABLE} must be an https:// URL")]
     NotHttps,
-    #[error("OCG_PROVIDER_PROTOCOL must be openai_chat_completions or openai_responses")]
+    #[error(
+        "OCG_PROVIDER_PROTOCOL must be openai_chat_completions, openai_responses or anthropic_messages"
+    )]
     InvalidProtocol,
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
     CredentialMissing,

@@ -1739,18 +1739,12 @@ pub(crate) fn read_conversations(
 }
 
 /// The most `recent` rows one conversation search examines. The search is a
-/// single read transaction that walks conversations newest first and, for
-/// each, its most recent turns; the cap keeps that transaction short no
-/// matter how large the database grows. A page that stops at the cap
+/// single read transaction that walks conversations newest first and looks
+/// up candidate messages in the derived text index. A page that stops at the cap
 /// reports `has_more` with the last row examined, so the next page resumes
 /// where this one stopped.
 pub(crate) const MAX_CONVERSATION_SEARCH_SCAN: usize = 1000;
-/// The most recent turns one conversation search reads per conversation.
-/// Titles match without any turn read; message text only needs the recent
-/// turns that a person searching usually means.
-const MAX_SEARCH_TURNS_PER_CONVERSATION: usize = 100;
-
-/// Conversations newest first whose title or recent user/agent message text
+/// Conversations newest first whose title, user/agent message text or assistant result text
 /// holds every term. `terms` are already lowercased and non-empty; matching
 /// is case-insensitive substring per term, with the terms combined by AND
 /// across the title and the message texts. The search spans projects on
@@ -1786,7 +1780,7 @@ pub(crate) fn read_conversation_search(
         let conversation = JobId::new(conversation);
         last_examined = Some(tip);
         let summary = conversation_summary(&rx, conversation, tip)?;
-        if conversation_matches(&rx, &summary.title, tip, terms)? {
+        if conversation_matches(&rx, conversation, &summary.title, terms)? {
             conversations.push(summary);
             if conversations.len() > limit {
                 break;
@@ -1794,8 +1788,8 @@ pub(crate) fn read_conversation_search(
         }
     }
     if conversations.len() > limit {
-        let next_before = conversations.last().map(|entry| entry.tip_job);
         conversations.truncate(limit);
+        let next_before = conversations.last().map(|entry| entry.tip_job);
         return Ok(ConversationsPage {
             next_before,
             conversations,
@@ -1816,61 +1810,68 @@ pub(crate) fn read_conversation_search(
     })
 }
 
-/// Whether `title` or the recent turn message texts starting at `tip` hold
-/// every term. The title is checked first so a title match never reads a
-/// turn; turns walk from the tip through `previous` links, newest first,
-// like [`read_conversation_turns`].
+/// Gram postings locate candidate source rows across the whole history.
+/// Source verification preserves literal substring matching, including Unicode
+/// and punctuation, without treating the index as authoritative text.
 fn conversation_matches(
     rx: &ReadTransaction,
+    conversation: JobId,
     title: &str,
-    tip: JobId,
     terms: &[String],
 ) -> Result<bool, StorageError> {
     let title = title.to_lowercase();
-    let mut matched = terms
-        .iter()
-        .map(|term| title.contains(term))
-        .collect::<Vec<_>>();
-    if matched.iter().all(|matched| *matched) {
-        return Ok(true);
-    }
-    let mut cursor = Some(tip);
-    let mut turns = 0usize;
-    while let Some(turn) = cursor {
-        if turns >= MAX_SEARCH_TURNS_PER_CONVERSATION {
-            break;
+    let index = rx.open_table(CONVERSATION_SEARCH)?;
+    for term in terms {
+        if title.contains(term) {
+            continue;
         }
-        turns += 1;
-        let Some(row) = read_job_row(rx, turn)? else {
-            return Err(StorageError::corrupted("missing turn"));
-        };
-        cursor = row.kind.previous();
-        for entry in rx
-            .open_table(TURN_INPUTS)?
-            .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
-        {
-            let (_, value) = entry?;
-            let entry = TurnEntry::decode(value.value())?;
-            let text = match &entry.entry {
-                Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => text,
-                Entry::Notice { .. }
-                | Entry::Decision { .. }
-                | Entry::RetryOf { .. }
-                | Entry::Iteration { .. }
-                | Entry::ResponseFormat { .. } => continue,
-            };
-            let text = text.to_lowercase();
-            for (term, matched) in terms.iter().zip(matched.iter_mut()) {
-                if !*matched && text.contains(term) {
-                    *matched = true;
+        let chars = term.chars().take(3).collect::<Vec<_>>();
+        let gram = derived::search_gram(&chars);
+        let mut matched = false;
+        for candidate in index.range(
+            (conversation.get(), gram, 0, 0, 0)
+                ..=(conversation.get(), gram, u128::MAX, u8::MAX, u32::MAX),
+        )? {
+            let (_, _, turn, source, seq) = candidate?.0.value();
+            let text = match source {
+                0 => {
+                    let table = rx.open_table(TURN_INPUTS)?;
+                    let bytes = table
+                        .get((turn, seq))?
+                        .ok_or_else(|| StorageError::corrupted("search input missing"))?;
+                    match TurnEntry::decode(bytes.value())?.entry {
+                        Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => text,
+                        Entry::Notice { .. }
+                        | Entry::Decision { .. }
+                        | Entry::RetryOf { .. }
+                        | Entry::Iteration { .. }
+                        | Entry::ResponseFormat { .. } => {
+                            return Err(StorageError::corrupted("search input is not a message"));
+                        }
+                    }
                 }
-            }
-            if matched.iter().all(|matched| *matched) {
-                return Ok(true);
+                1 => {
+                    let table = rx.open_table(JOB_OUTPUTS)?;
+                    let bytes = table
+                        .get((turn, seq))?
+                        .ok_or_else(|| StorageError::corrupted("search output missing"))?;
+                    let output = decode_output((turn, seq), bytes.value())?;
+                    derived::search_output_text(&output)
+                        .ok_or_else(|| StorageError::corrupted("search output is not text"))?
+                        .to_owned()
+                }
+                _ => return Err(StorageError::corrupted("invalid search source")),
+            };
+            if text.to_lowercase().contains(term) {
+                matched = true;
+                break;
             }
         }
+        if !matched {
+            return Ok(false);
+        }
     }
-    Ok(matched.iter().all(|matched| *matched))
+    Ok(true)
 }
 pub(crate) fn queue_counts(database: &Database) -> Result<(u64, u64, u64), StorageError> {
     let rx = read(database)?;

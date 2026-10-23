@@ -701,7 +701,7 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Conversations newest first whose title or recent message text holds
+    /// Conversations newest first whose title or message and result text holds
     /// every term. `terms` are already lowercased query terms. The scan is
     /// bounded inside storage; `before` and `limit` page like
     /// [`Self::conversations`].
