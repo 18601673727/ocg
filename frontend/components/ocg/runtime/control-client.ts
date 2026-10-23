@@ -32,6 +32,9 @@ import {
   decodePoolAnswer,
   decodePools,
   decodeProfiles,
+  decodeProviderModels,
+  decodeImportedModels,
+  type ControlProviderModel,
   decodeProjectAnswer,
   decodeProjects,
   decodeSession,
@@ -120,6 +123,7 @@ export type ControlProfileWriteRequest =
       kind: "llm";
       name: string;
       model: string;
+      context_window?: number | null;
       protocol?: "openai_chat_completions";
       endpoint?: string | null;
       credential_ref?: string | null;
@@ -765,6 +769,30 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     /** Every Profile (LLM Profiles, Agent Profiles) and the merged Provider projection. */
     async readProfiles(signal?: AbortSignal) {
       return readAllProfiles(signal);
+    },
+
+    async discoverProviderModels(connection: { endpoint: string; credential_ref?: string | null; credential?: string }, signal?: AbortSignal) {
+      const answer = await send("POST", "/api/v1/provider-models", { body: connection, sign: true, signal });
+      return decodeProviderModels(answer.input);
+    },
+
+    async importModels(source: string | { name: string; endpoint: string; credential?: string; credential_ref?: string }, models: ControlProviderModel[], capabilities: ControlCapability[]) {
+      if (typeof source === "string") identity(source, "source_profile_id");
+      const connection = typeof source === "string" ? { source_profile_id: source } : { provider: source };
+      const answer = await send("POST", "/api/v1/profiles/import", {
+        body: { ...connection, models, declared_capabilities: capabilities }, sign: true,
+      });
+      const result = decodeImportedModels(answer.input);
+      profileListeners.forEach((listener) => listener());
+      return result;
+    },
+
+    async deleteLlmProfile(profileId: string) {
+      identity(profileId, "profile");
+      const answer = await send("DELETE", `/api/v1/profiles/${profileId}`, { sign: true });
+      decodeProfiles(answer.input);
+      profileListeners.forEach((listener) => listener());
+      return readAllProfiles();
     },
 
     /** Creates an LLM Profile or Agent Profile and returns the refreshed catalog. */

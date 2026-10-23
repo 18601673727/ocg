@@ -114,6 +114,11 @@ pub(super) const SESSION_METHODS: Refusal = Refusal {
     allow: "GET, POST, DELETE",
     ..METHOD_NOT_ALLOWED
 };
+pub(super) const PROFILE_METHODS: Refusal = Refusal {
+    message: "only POST or DELETE is accepted",
+    allow: "POST, DELETE",
+    ..METHOD_NOT_ALLOWED
+};
 pub(super) const URI_TOO_LONG: Refusal = Refusal::new(
     StatusCode::URI_TOO_LONG,
     "uri_too_long",

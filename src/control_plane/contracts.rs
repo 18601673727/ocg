@@ -737,6 +737,11 @@ contracts! {
         pub id: String,
         pub context_window: Option<u64>,
     }
+    struct WireImportedModels {
+        pub profile_ids: Vec<String>,
+        pub created: usize,
+        pub existing: usize,
+    }
     struct WireProviderModels {
         pub models: Vec<WireProviderModel>,
     }

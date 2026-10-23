@@ -1,9 +1,9 @@
 use super::rows::{decode_request_event, encode_request_event};
 use super::*;
 use crate::persistence::{
-    AttachmentId, ConfigBody, ConfigId, ConfigKind, JobId, OutputKind, ProjectId, ProjectRecord,
-    RequestEventRecord, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord,
-    ToolCallRef, ToolEvidenceRecord, Violation,
+    AttachmentId, ConfigBody, ConfigId, ConfigKind, JobId, NewConfig, OutputKind, ProjectId,
+    ProjectRecord, RequestEventRecord, RequestNumber, RequestPayload, SubmissionKey,
+    SubmissionRecord, ToolCallRef, ToolEvidenceRecord, Violation,
 };
 
 // ---- batches -------------------------------------------------------------------
@@ -341,6 +341,9 @@ impl Batch {
         kind: ConfigKind,
     ) -> Result<ConfigRow, BatchError> {
         let row = self.require_config(id)?;
+        if row.archived_at.is_some() {
+            return self.reject(Violation::NotFound(RecordRef::Profile(id.into())));
+        }
         if row.kind != kind {
             return self.reject(Violation::WrongConfigKind {
                 config: id,
@@ -455,6 +458,9 @@ impl Batch {
         body: ConfigBody,
     ) -> Result<(), BatchError> {
         let existing = self.require_config(id)?;
+        if existing.archived_at.is_some() {
+            return self.reject(Violation::NotFound(RecordRef::Profile(id.into())));
+        }
         if existing.kind != body.kind() {
             return self.reject(Violation::WrongConfigKind {
                 config: id,
@@ -475,6 +481,141 @@ impl Batch {
             body,
             ..existing
         };
+        self.step(|tx| {
+            tx.open_table(CONFIGS)?
+                .insert(id.get(), row.encode().as_slice())?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn import_models(
+        &mut self,
+        connection: NewConfig,
+        models: Vec<(String, Option<u32>)>,
+        capabilities: std::collections::BTreeSet<crate::persistence::ModelCapability>,
+    ) -> Result<(Vec<ConfigId>, usize), BatchError> {
+        use crate::persistence::{LlmParameters, ModelConfig};
+        let ConfigBody::Connection(wanted) = &connection.body else {
+            return self.reject(Violation::InvalidValue(
+                "connection",
+                "must be a Connection",
+            ));
+        };
+        if models.is_empty() || models.len() > 200 || capabilities.is_empty() {
+            return self.reject(Violation::InvalidValue(
+                "models",
+                "select 1 to 200 models with capabilities",
+            ));
+        }
+        let existing = self.step(|tx| {
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, value) = entry?;
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
+                if row.archived_at.is_none()
+                    && matches!(&row.body, ConfigBody::Connection(body) if body == wanted)
+                {
+                    return Ok(Some(row.id));
+                }
+            }
+            Ok(None)
+        })?;
+        let connection_id = match existing {
+            Some(id) => id,
+            None => self.create_config(connection.name, connection.body)?,
+        };
+        let mut known = self.step(|tx| {
+            let mut known = std::collections::BTreeMap::new();
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, value) = entry?;
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
+                if row.archived_at.is_none()
+                    && let ConfigBody::Model(model) = row.body
+                    && model.connection_id == connection_id
+                    && models.iter().any(|(name, _)| name == &model.model)
+                {
+                    known.entry(model.model).or_insert(row.id);
+                }
+            }
+            Ok(known)
+        })?;
+        let mut ids = Vec::with_capacity(models.len());
+        let mut created = 0;
+        for (model, context_window) in models {
+            if model.trim().is_empty()
+                || model.len() > 256
+                || model.chars().any(char::is_control)
+                || context_window == Some(0)
+            {
+                return self.reject(Violation::InvalidValue(
+                    "model",
+                    "invalid model or context window",
+                ));
+            }
+            let id = match known.get(&model) {
+                Some(id) => *id,
+                None => {
+                    let name: String = model
+                        .chars()
+                        .scan(0usize, |bytes, ch| {
+                            *bytes += ch.len_utf8();
+                            (*bytes <= 128).then_some(ch)
+                        })
+                        .collect();
+                    let id = self.create_config(
+                        name,
+                        ConfigBody::Model(ModelConfig {
+                            connection_id,
+                            model: model.clone(),
+                            context_window,
+                            parameters: LlmParameters::default(),
+                            declared_capabilities: capabilities.clone(),
+                        }),
+                    )?;
+                    known.insert(model, id);
+                    created += 1;
+                    id
+                }
+            };
+            ids.push(id);
+        }
+        Ok((ids, created))
+    }
+
+    pub(crate) fn archive_model(&mut self, id: ConfigId) -> Result<(), BatchError> {
+        let mut row = self.require_config(id)?;
+        if row.kind != ConfigKind::Model {
+            return self.reject(Violation::WrongConfigKind {
+                config: id,
+                expected: ConfigKind::Model,
+                found: row.kind,
+            });
+        }
+        if row.archived_at.is_some() {
+            return Ok(());
+        }
+        let agents = self.step(|tx| {
+            let mut agents = Vec::new();
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, value) = entry?;
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
+                if row.archived_at.is_none() && matches!(&row.body, ConfigBody::Agent(agent) if agent.models.contains(&id) || agent.default_model == Some(id)) {
+                    agents.push(row);
+                }
+            }
+            Ok(agents)
+        })?;
+        for mut agent_row in agents {
+            if let ConfigBody::Agent(agent) = &mut agent_row.body {
+                agent.models.retain(|model| *model != id);
+                if agent.default_model == Some(id) {
+                    agent.default_model = None;
+                }
+            }
+            self.update_config(agent_row.id, agent_row.name, agent_row.body)?;
+        }
+        row.archived_at = Some(self.now);
+        row.updated_at = self.now;
+        row.edit_seq += 1;
         self.step(|tx| {
             tx.open_table(CONFIGS)?
                 .insert(id.get(), row.encode().as_slice())?;

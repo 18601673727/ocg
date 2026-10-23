@@ -41,12 +41,13 @@ pub use identity::{
     RequestNumber, RequestRef, Timestamp, parse_entity_id,
 };
 pub(crate) use mutations::{
-    PublishedAttachment, append_job_output, bench_create_dependent_turn, check_new_attachment,
-    claim_execution, cleanup_attachment, confirm_job_stopped, create_attachment, create_config,
-    create_execution_pool, create_executor, create_job, create_project, create_submitted_job,
-    finalize_job, reconcile_tool_effect, record_availability_stat, record_metrics,
-    record_tool_decision, record_tool_outcome, set_conversation, set_execution_pool_enabled,
-    update_config, update_execution_pool, update_project,
+    PublishedAttachment, append_job_output, archive_model, bench_create_dependent_turn,
+    check_new_attachment, claim_execution, cleanup_attachment, confirm_job_stopped,
+    create_attachment, create_config, create_execution_pool, create_executor, create_job,
+    create_project, create_submitted_job, finalize_job, import_models, reconcile_tool_effect,
+    record_availability_stat, record_metrics, record_tool_decision, record_tool_outcome,
+    set_conversation, set_execution_pool_enabled, update_config, update_execution_pool,
+    update_project,
 };
 pub use mutations::{is_handler_version, sanitize_display_name};
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};

@@ -1147,6 +1147,28 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Imports missing models and their Provider connection in one transaction.
+    pub async fn import_models(
+        &self,
+        connection: NewConfig,
+        models: Vec<(String, Option<u32>)>,
+        capabilities: std::collections::BTreeSet<crate::persistence::ModelCapability>,
+    ) -> Result<(Vec<ConfigId>, usize), DatabaseError> {
+        self.submit(|reply| Command::ImportModels {
+            connection,
+            models,
+            capabilities,
+            reply,
+        })
+        .await
+    }
+
+    /// Archives a model and removes it from Agent choices, preserving frozen Jobs.
+    pub async fn archive_model(&self, id: ConfigId) -> Result<(), DatabaseError> {
+        self.submit(|reply| Command::ArchiveModel { id, reply })
+            .await
+    }
+
     /// Edits a config in place: a new name and body of the same kind. Every
     /// edit is allowed and raises the edit counter; Jobs that froze the old
     /// values keep them.

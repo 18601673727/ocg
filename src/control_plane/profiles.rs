@@ -16,7 +16,9 @@ use std::num::NonZeroU32;
 use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 use super::{
     DATABASE_BUSY, DATABASE_UNAVAILABLE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST, Refusal,
@@ -695,6 +697,9 @@ pub(super) async fn save_profile(
                 let Some(existing_record) = database.config(id.into()).await? else {
                     return Err(PROFILE_NOT_FOUND);
                 };
+                if existing_record.archived_at.is_some() {
+                    return Err(PROFILE_NOT_FOUND);
+                }
                 let ConfigBody::Model(existing_model) = existing_record.body else {
                     return Err(WRONG_PROFILE_KIND);
                 };
@@ -983,12 +988,407 @@ pub(super) async fn save_profile(
     Ok(Reply::new(status, snapshot))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportModelsRequest {
+    source_profile_id: Option<String>,
+    provider: Option<ImportProvider>,
+    models: Vec<ImportModel>,
+    declared_capabilities: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportProvider {
+    name: String,
+    endpoint: String,
+    credential_ref: Option<String>,
+    credential: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportModel {
+    id: String,
+    context_window: Option<u32>,
+}
+
+pub(super) async fn import_models(
+    database: &DatabaseHandle,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    let request: ImportModelsRequest =
+        serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
+    if request.models.is_empty() || request.models.len() > 200 {
+        return Err(INVALID_MODEL);
+    }
+    let mut models = BTreeMap::new();
+    for model in request.models {
+        if !valid_single_line(&model.id, MAX_MODEL_BYTES) || model.context_window == Some(0) {
+            return Err(INVALID_MODEL);
+        }
+        models
+            .entry(model.id.trim().to_owned())
+            .or_insert(model.context_window);
+    }
+    let mut capabilities = BTreeSet::new();
+    for value in request.declared_capabilities {
+        capabilities.insert(parse_capability(&value).ok_or(INVALID_CAPABILITIES)?);
+    }
+    if capabilities.is_empty() {
+        return Err(INVALID_CAPABILITIES);
+    }
+    let mut credential_to_save = None;
+    let connection = match (request.source_profile_id, request.provider) {
+        (Some(id), None) => {
+            let id = profile_id(&id)?;
+            let source = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
+            if source.archived_at.is_some() {
+                return Err(PROFILE_NOT_FOUND);
+            }
+            let ConfigBody::Model(model) = source.body else {
+                return Err(WRONG_PROFILE_KIND);
+            };
+            let connection = database
+                .config(model.connection_id)
+                .await?
+                .ok_or(INCONSISTENT_RECORD)?;
+            if connection.archived_at.is_some() {
+                return Err(PROFILE_NOT_FOUND);
+            }
+            let ConfigBody::Connection(_) = &connection.body else {
+                return Err(INCONSISTENT_RECORD);
+            };
+            NewConfig {
+                name: connection.name,
+                body: connection.body,
+            }
+        }
+        (None, Some(provider)) => {
+            if !valid_single_line(&provider.name, MAX_PROFILE_NAME_BYTES) {
+                return Err(INVALID_PROFILE_NAME);
+            }
+            let endpoint = provider.endpoint.trim();
+            if endpoint.len() > MAX_ENDPOINT_BYTES
+                || endpoint.chars().any(char::is_whitespace)
+                || crate::provider_execution::model_endpoint(endpoint).is_err()
+            {
+                return Err(INVALID_ENDPOINT);
+            }
+            let reference = provider.credential_ref.filter(|value| !value.is_empty());
+            if reference
+                .as_deref()
+                .is_some_and(|value| !valid_credential_ref(value))
+            {
+                return Err(INVALID_CREDENTIAL_REF);
+            }
+            let credential = provider.credential.filter(|value| !value.is_empty());
+            if credential.as_ref().is_some_and(|secret| {
+                secret.len() > 4096
+                    || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}"))
+                        .is_err()
+            }) {
+                return Err(INVALID_CREDENTIAL);
+            }
+            let reference = match credential {
+                Some(secret) => {
+                    let reference = match reference {
+                        Some(reference) => reference,
+                        None => {
+                            let base = default_credential_ref(provider.name.trim());
+                            let connections =
+                                database.all_configs(Some(ConfigKind::Connection)).await?;
+                            let mut candidate = base.clone();
+                            let mut suffix = 2;
+                            while connections.iter().any(|record| matches!(&record.body, ConfigBody::Connection(body) if body.credential_ref.as_deref() == Some(candidate.as_str()))) {
+                                candidate = format!("{base}_{suffix}"); suffix += 1;
+                            }
+                            candidate
+                        }
+                    };
+                    credential_to_save = Some((reference.clone(), secret));
+                    Some(reference)
+                }
+                None => reference,
+            };
+            NewConfig {
+                name: format!("{} provider", provider.name.trim()),
+                body: ConfigBody::Connection(ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(endpoint.to_owned()),
+                    credential_ref: reference,
+                }),
+            }
+        }
+        (None, None) | (Some(_), Some(_)) => return Err(INVALID_PROFILE_BODY),
+    };
+    ensure_compatible_executor(database).await?;
+    let (ids, created) = database
+        .import_models(connection, models.into_iter().collect(), capabilities)
+        .await
+        .map_err(map_mutation_error)?;
+    if let Some((reference, credential)) = credential_to_save {
+        database
+            .set_credential(&reference, &credential)
+            .await
+            .map_err(|_| CREDENTIAL_NOT_SAVED)?;
+    }
+    let existing = ids.len().saturating_sub(created);
+    Ok(Reply::new(
+        StatusCode::CREATED,
+        envelope(WireImportedModels {
+            profile_ids: ids
+                .into_iter()
+                .map(|id| ProfileId::from(id).to_string())
+                .collect(),
+            created,
+            existing,
+        }),
+    ))
+}
+
+pub(super) async fn delete_model(
+    database: &DatabaseHandle,
+    id: ProfileId,
+) -> Result<Reply, Refusal> {
+    database
+        .archive_model(id.into())
+        .await
+        .map_err(map_mutation_error)?;
+    Ok(Reply::ok(
+        build_profiles_snapshot(database, Some(id)).await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::database::DatabaseWorker;
     use crate::persistence::{ExecutionConfiguration, JobInputDraft, NewJob};
     use crate::test_support::data_directory;
+
+    #[test]
+    fn model_import_is_atomic_and_repeated_import_preserves_edits() {
+        crate::test_support::on_system(|| async {
+            let (_root, directory) = data_directory("profiles", "model-import");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let database = worker.handle();
+            let connection = NewConfig {
+                name: "provider".into(),
+                body: ConfigBody::Connection(ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some("https://example.com/v1".into()),
+                    credential_ref: None,
+                }),
+            };
+            let capabilities = BTreeSet::from([ModelCapability::Chat]);
+            assert!(
+                database
+                    .import_models(
+                        connection.clone(),
+                        vec![("valid".into(), None), ("invalid".into(), Some(0))],
+                        capabilities.clone()
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(database.all_configs(None).await.unwrap().is_empty());
+            let (ids, created) = database
+                .import_models(
+                    connection.clone(),
+                    vec![("a".into(), Some(128000)), ("b".into(), None)],
+                    capabilities.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created, 2);
+            let original = database.config(ids[0]).await.unwrap().unwrap();
+            let mut edited = original.body;
+            if let ConfigBody::Model(model) = &mut edited {
+                model.parameters.temperature = Some(0.3);
+            }
+            database
+                .update_config(
+                    ids[0],
+                    NewConfig {
+                        name: "My model".into(),
+                        body: edited,
+                    },
+                )
+                .await
+                .unwrap();
+            let (again, created) = database
+                .import_models(
+                    connection,
+                    vec![("a".into(), Some(42)), ("b".into(), None)],
+                    BTreeSet::from([ModelCapability::Tools]),
+                )
+                .await
+                .unwrap();
+            assert_eq!(again, ids);
+            assert_eq!(created, 0);
+            assert_eq!(
+                database
+                    .all_configs(Some(ConfigKind::Connection))
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let preserved = database.config(ids[0]).await.unwrap().unwrap();
+            assert_eq!(preserved.name, "My model");
+            let ConfigBody::Model(model) = preserved.body else {
+                panic!()
+            };
+            assert_eq!(model.context_window, Some(128000));
+            assert_eq!(model.parameters.temperature, Some(0.3));
+            assert_eq!(model.declared_capabilities, capabilities);
+            worker.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn deleting_a_model_removes_agent_choices_but_keeps_frozen_history() {
+        crate::test_support::on_system(|| async {
+            let (_root, directory) = data_directory("profiles", "delete-model");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let saved = save_profile(&db, None, br#"{"kind":"llm","name":"old","model":"original","declared_capabilities":["chat"]}"#).await.unwrap();
+            let model = profile_id(saved.body["profile_id"].as_str().unwrap()).unwrap();
+            let agent = save_profile(&db, None, &serde_json::to_vec(&json!({"kind":"agent","name":"agent","llm_targets":[model.to_string()],"default_model":model.to_string()})).unwrap()).await.unwrap();
+            let agent = profile_id(agent.body["profile_id"].as_str().unwrap()).unwrap();
+            let job = db
+                .create_job(NewJob {
+                    process_grant: None,
+                    name: None,
+                    eligible_at: None,
+                    parent: db.genesis(),
+                    project: None,
+                    input: JobInputDraft {
+                        objective: Some("history".into()),
+                        ..Default::default()
+                    },
+                    configuration: Some(ExecutionConfiguration {
+                        agent_profile: Some(agent),
+                        llm_profile: model,
+                    }),
+                    previous: None,
+                })
+                .await
+                .unwrap();
+            delete_model(&db, model).await.unwrap();
+            delete_model(&db, model).await.unwrap();
+            assert!(
+                db.config(model.into())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .archived_at
+                    .is_some()
+            );
+            let ConfigBody::Agent(body) = db.config(agent.into()).await.unwrap().unwrap().body
+            else {
+                panic!()
+            };
+            assert!(body.models.is_empty());
+            assert_eq!(body.default_model, None);
+            assert_eq!(
+                db.job_configuration(job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .frozen
+                    .llm
+                    .config
+                    .model,
+                "original"
+            );
+            let response = list_profiles(&db, None, 50).await.unwrap();
+            assert!(response.body["llm_profiles"].as_array().unwrap().is_empty());
+            let invalid = save_profile(
+                &db,
+                None,
+                &serde_json::to_vec(
+                    &json!({"kind":"agent","name":"new","llm_targets":[model.to_string()]}),
+                )
+                .unwrap(),
+            )
+            .await;
+            assert!(invalid.is_err());
+            assert!(delete_model(&db, agent).await.is_err());
+            worker.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn new_provider_import_saves_credentials_without_returning_them() {
+        crate::test_support::on_system(|| async {
+            let (_root, directory) = data_directory("profiles", "import-new-provider");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let body = json!({"provider":{"name":"New","endpoint":"https://example.com/v1","credential":"test-only-secret","credential_ref":"IMPORT_TEST_KEY"},"models":[{"id":"a"},{"id":"b"}],"declared_capabilities":["chat"]});
+            let reply = import_models(&db, &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(reply.body["created"], 2);
+            assert!(!reply.body.to_string().contains("test-only-secret"));
+            assert_eq!(
+                db.credential_resolver()
+                    .resolve(Some("IMPORT_TEST_KEY"))
+                    .unwrap()
+                    .as_deref(),
+                Some("test-only-secret")
+            );
+            assert_eq!(
+                db.all_configs(Some(ConfigKind::Connection))
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let again = import_models(&db, &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(again.body["created"], 0);
+            assert_eq!(again.body["existing"], 2);
+            worker.shutdown().unwrap();
+        });
+    }
+
+    #[test]
+    fn import_models_validates_and_deduplicates_the_selected_models() {
+        crate::test_support::on_system(|| async {
+            let (_root, directory) = data_directory("profiles", "import-api");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let saved = save_profile(
+                &db,
+                None,
+                br#"{"kind":"llm","name":"provider","model":"a","declared_capabilities":["chat"]}"#,
+            )
+            .await
+            .unwrap();
+            let source = saved.body["profile_id"].as_str().unwrap();
+            let mut body = json!({"source_profile_id":source,"models":[{"id":"a"},{"id":"b","context_window":65536},{"id":"b"}],"declared_capabilities":["chat"]});
+            let reply = import_models(&db, &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(reply.body["api_version"], super::super::API_VERSION);
+            assert_eq!(reply.body["created"], 1);
+            assert_eq!(reply.body["existing"], 1);
+            body["models"] = json!([{"id":"c","context_window":0}]);
+            assert!(
+                import_models(&db, &serde_json::to_vec(&body).unwrap())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                db.all_configs(Some(ConfigKind::Model)).await.unwrap().len(),
+                2
+            );
+            worker.shutdown().unwrap();
+        });
+    }
 
     #[test]
     fn agent_dispatch_and_default_model_round_trip_and_reject_a_model_target() {
@@ -1200,14 +1600,14 @@ pub(super) async fn provider_models(
     .await
     {
         Ok(models) => {
-            return Ok(Reply::ok(json!(WireProviderModels {
+            return Ok(Reply::ok(envelope(WireProviderModels {
                 models: models
                     .into_iter()
                     .map(|model| WireProviderModel {
                         id: model.id,
-                        context_window: model.context_window
+                        context_window: model.context_window,
                     })
-                    .collect()
+                    .collect(),
             })));
         }
         Err(ModelListError::Unreachable) => (
@@ -1329,7 +1729,7 @@ mod provider_network_tests {
             let reply = provider_models(&database, &request).await.expect("models");
             assert_eq!(
                 reply.body,
-                json!({"models":[{"id":"a","context_window":16384},{"id":"b","context_window":4096},{"id":"z","context_window":null}]})
+                json!({"api_version": super::super::API_VERSION, "models":[{"id":"a","context_window":16384},{"id":"b","context_window":4096},{"id":"z","context_window":null}]})
             );
             for (status, body, code) in [
                 (

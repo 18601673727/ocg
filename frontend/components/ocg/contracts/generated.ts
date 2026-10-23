@@ -212,6 +212,8 @@ export type WireProviderRequest = { job: string, request: number, messages: Arra
 
 export type WireProviderModel = { id: string, context_window: number | null, };
 
+export type WireImportedModels = { profile_ids: Array<string>, created: number, existing: number, };
+
 export type WireProviderModels = { models: Array<WireProviderModel>, };
 
 export type WireProviderError = { code: string, message: string, status_code?: number, };

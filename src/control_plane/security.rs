@@ -43,6 +43,13 @@ fn takes_post(path: &str) -> bool {
     }
 }
 
+/// Whether `path` names a route that is removed with `DELETE`: one Profile
+/// member, whose LLM Profile is archived in place.
+fn takes_delete(path: &str) -> bool {
+    path.strip_prefix("/api/v1/")
+        .is_some_and(|rest| member(rest, "profiles"))
+}
+
 /// The largest JSON body `path` accepts with `POST`, or `None` when it
 /// accepts none.
 fn json_post_limit(path: &str) -> Option<usize> {
@@ -98,11 +105,14 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
     let login = path == "/api/v1/session";
     let api = login || path.starts_with("/api/");
     let takes_post = takes_post(path);
+    let takes_delete = takes_delete(path);
     let method = request.method();
     let allowed = if login {
         *method == Method::GET || *method == Method::POST || *method == Method::DELETE
     } else if api {
-        *method == Method::GET || (takes_post && *method == Method::POST)
+        *method == Method::GET
+            || (takes_post && *method == Method::POST)
+            || (takes_delete && *method == Method::DELETE)
     } else {
         *method == Method::GET
     };
@@ -110,7 +120,11 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
         return Err(if login {
             SESSION_METHODS
         } else if takes_post {
-            ONLY_POST
+            if takes_delete {
+                PROFILE_METHODS
+            } else {
+                ONLY_POST
+            }
         } else {
             METHOD_NOT_ALLOWED
         });

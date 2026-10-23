@@ -56,6 +56,8 @@ pub(super) enum Route {
         limit: usize,
     },
     ProfileCreate,
+    ProfileImport,
+    ProfileDelete(ProfileId),
     ProviderModels,
     ProfileUpdate(ProfileId),
     Projects {
@@ -136,6 +138,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::AgentProfiles { .. }
             | Route::Profiles { .. }
             | Route::ProviderModels
+            | Route::ProfileImport
+            | Route::ProfileDelete(_)
             | Route::ProfileCreate
             | Route::ProfileUpdate(_)
             | Route::Projects { .. }
@@ -202,6 +206,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 no_query(query).map(|()| Route::ConversationAction(conversation, action))
             }
             ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
+            ["profiles", "import"] => no_query(query).map(|()| Route::ProfileImport),
             ["provider-models"] => no_query(query).map(|()| Route::ProviderModels),
             ["profiles", profile] => {
                 let profile = profiles::profile_id(profile)?;
@@ -228,6 +233,10 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     if request.method() == Method::DELETE {
         return match segments.as_slice() {
             ["session"] => no_query(query).map(|()| Route::SessionRevoke),
+            ["profiles", id] => {
+                let id = profiles::profile_id(id)?;
+                no_query(query).map(|()| Route::ProfileDelete(id))
+            }
             _ => Err(NOT_FOUND),
         };
     }
@@ -502,6 +511,11 @@ pub(super) async fn respond(
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::provider_models(database, &body).await
         }
+        Route::ProfileImport => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::import_models(database, &body).await
+        }
+        Route::ProfileDelete(id) => profiles::delete_model(database, id).await,
         Route::ProfileCreate => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::save_profile(database, None, &body).await

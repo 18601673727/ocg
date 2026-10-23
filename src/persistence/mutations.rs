@@ -343,6 +343,19 @@ pub(crate) fn create_config(batch: &mut Batch, config: NewConfig) -> OpResult<Co
     batch.create_config(config.name, config.body)
 }
 
+pub(crate) fn import_models(
+    batch: &mut Batch,
+    connection: NewConfig,
+    models: Vec<(String, Option<u32>)>,
+    capabilities: std::collections::BTreeSet<crate::persistence::ModelCapability>,
+) -> OpResult<(Vec<ConfigId>, usize)> {
+    batch.import_models(connection, models, capabilities)
+}
+
+pub(crate) fn archive_model(batch: &mut Batch, id: ConfigId) -> OpResult<()> {
+    batch.archive_model(id)
+}
+
 /// Edits a config in place: its name and body, with the same kind. The edit
 /// counter rises by one; Jobs that froze the old values keep them.
 pub(crate) fn update_config(batch: &mut Batch, id: ConfigId, config: NewConfig) -> OpResult<()> {

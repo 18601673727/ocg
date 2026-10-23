@@ -203,6 +203,16 @@ pub(super) enum Command {
         config: NewConfig,
         reply: Reply<ConfigId>,
     },
+    ImportModels {
+        connection: NewConfig,
+        models: Vec<(String, Option<u32>)>,
+        capabilities: std::collections::BTreeSet<crate::persistence::ModelCapability>,
+        reply: Reply<(Vec<ConfigId>, usize)>,
+    },
+    ArchiveModel {
+        id: ConfigId,
+        reply: Reply<()>,
+    },
     UpdateConfig {
         id: ConfigId,
         config: NewConfig,
@@ -569,6 +579,27 @@ impl Command {
                 reply,
                 |batch| persistence::create_config(batch, config),
             ),
+            Self::ImportModels {
+                connection,
+                models,
+                capabilities,
+                reply,
+            } => run(
+                database,
+                operation,
+                commit,
+                Kind::CreateProfile,
+                reply,
+                |batch| persistence::import_models(batch, connection, models, capabilities),
+            ),
+            Self::ArchiveModel { id, reply } => run(
+                database,
+                operation,
+                commit,
+                Kind::UpdateProfile,
+                reply,
+                |batch| persistence::archive_model(batch, id),
+            ),
             Self::UpdateConfig { id, config, reply } => run(
                 database,
                 operation,
@@ -745,6 +776,25 @@ impl Command {
                 }
                 ConversationEdit::Hide | ConversationEdit::Limits(_) => 16,
             },
+            Self::ArchiveModel { .. } => 16,
+            Self::ImportModels {
+                connection, models, ..
+            } => {
+                let base = match &connection.body {
+                    ConfigBody::Connection(body) => {
+                        text_bytes(&body.endpoint).saturating_add(text_bytes(&body.credential_ref))
+                    }
+                    ConfigBody::Model(_) | ConfigBody::Agent(_) | ConfigBody::Pool(_) => 0,
+                };
+                models.iter().fold(
+                    base.saturating_add(byte_count(connection.name.len())),
+                    |bytes, (model, _)| {
+                        bytes
+                            .saturating_add(byte_count(model.len()))
+                            .saturating_add(16)
+                    },
+                )
+            }
             Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {
                 byte_count(config.name.len()).saturating_add(match &config.body {
                     ConfigBody::Agent(agent) => text_bytes(&agent.instructions)
@@ -837,6 +887,8 @@ impl Command {
             Self::SetConversation { reply, .. } => refuse(reply, error),
             Self::CreateConfig { reply, .. } => refuse(reply, error),
             Self::UpdateConfig { reply, .. } => refuse(reply, error),
+            Self::ImportModels { reply, .. } => refuse(reply, error),
+            Self::ArchiveModel { reply, .. } => refuse(reply, error),
             Self::CreateAttachment { reply, .. } => refuse(reply, error),
             Self::CleanupAttachment { reply, .. } => refuse(reply, error),
             Self::ConfirmJobStopped { reply, .. } => refuse(reply, error),

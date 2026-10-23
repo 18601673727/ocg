@@ -1006,6 +1006,7 @@ pub(super) async fn check_configuration(
     let llm = match database.config(request.llm_profile.into()).await? {
         Some(ConfigRecord {
             body: ConfigBody::Model(model),
+            archived_at: None,
             ..
         }) => model,
         _ => return Err(PROFILE_NOT_FOUND),

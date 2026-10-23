@@ -968,6 +968,28 @@ export function decodeProfiles(input: unknown) {
 
 export type ControlAgentBehavior = "chat" | "general";
 export type ControlProfilesSnapshot = ReturnType<typeof decodeProfiles>;
+
+export function decodeProviderModels(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
+  return {
+    models: listOf(envelope.models, "models", (entry, path) => {
+      const model = record(entry, path);
+      return { id: string(model.id, `${path}.id`), context_window: optionalInteger(model.context_window, `${path}.context_window`) } satisfies Wire.WireProviderModel;
+    }),
+  } satisfies Wire.WireProviderModels;
+}
+
+export function decodeImportedModels(input: unknown) {
+  const envelope = record(input, "response");
+  if (envelope.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
+  return {
+    profile_ids: listOf(envelope.profile_ids, "profile_ids", identity),
+    created: integer(envelope.created, "created"), existing: integer(envelope.existing, "existing"),
+  } satisfies Wire.WireImportedModels;
+}
+
+export type ControlProviderModel = ReturnType<typeof decodeProviderModels>["models"][number];
 export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
 export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
 

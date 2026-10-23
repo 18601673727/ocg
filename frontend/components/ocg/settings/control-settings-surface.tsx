@@ -21,6 +21,8 @@ import {
 import { cn } from "@/lib/utils";
 import { Section, describeError } from "./settings-parts";
 import { ProjectsSection } from "./projects-section";
+import { ProviderModelImport } from "./provider-model-import";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
 import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
@@ -132,6 +134,10 @@ export function SettingsSurface({
   const [llmTemperature, setLlmTemperature] = useState("");
   const [llmTopP, setLlmTopP] = useState("");
   const [llmMaxTokens, setLlmMaxTokens] = useState("");
+  const [llmContextWindow, setLlmContextWindow] = useState("");
+  const [deletingModel, setDeletingModel] = useState<ControlLlmProfile | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmError, setLlmError] = useState<string | null>(null);
   const [llmNotice, setLlmNotice] = useState<string | null>(null);
@@ -204,11 +210,13 @@ export function SettingsSurface({
     setLlmTemperature("");
     setLlmTopP("");
     setLlmMaxTokens("");
+    setLlmContextWindow("");
     setLlmError(null);
   }
 
   function startEditLlm(profile: ControlLlmProfile) {
     setEditingLlmId(profile.id);
+    setLlmContextWindow(profile.context_window === null ? "" : String(profile.context_window));
     setLlmName(profile.name);
     setLlmModel(profile.model);
     setLlmEndpoint(profile.endpoint ?? "");
@@ -268,18 +276,26 @@ export function SettingsSurface({
       return;
     }
 
+    const parsedContextWindow = llmContextWindow.trim() === "" ? null : Number(llmContextWindow.trim());
+    if (parsedContextWindow !== null && (!Number.isSafeInteger(parsedContextWindow) || parsedContextWindow < 1 || parsedContextWindow > 4294967295)) {
+      setLlmError(t("settings.llm.invalidContext")); return;
+    }
+    const priorParameters = snapshot?.llm_profiles.find((profile) => profile.id === editingLlmId)?.parameters;
     setLlmSaving(true);
     try {
       const payload = {
         kind: "llm" as const,
         name: trimmedName,
         model: trimmedModel,
+        context_window: parsedContextWindow,
         protocol: "openai_chat_completions" as const,
         endpoint: llmEndpoint.trim() ? llmEndpoint.trim() : null,
         credential_ref: llmCredentialRef.trim() ? llmCredentialRef.trim() : null,
         credential: llmSecret.trim() ? llmSecret.trim() : null,
         declared_capabilities: llmCapabilities,
         parameters: {
+          ...priorParameters,
+          max_completion_tokens: parsedMaxTokens === null ? priorParameters?.max_completion_tokens : null,
           temperature: parsedTemp,
           top_p: parsedTopP,
           max_tokens: parsedMaxTokens,
@@ -388,6 +404,30 @@ export function SettingsSurface({
 
   return (
     <PageSurface className="mx-auto w-full max-w-4xl">
+      <Dialog open={deletingModel !== null} onOpenChange={(open) => { if (!open && !deleting) setDeletingModel(null); }}>
+        <DialogContent showCloseButton={!deleting}>
+          <DialogHeader>
+            <DialogTitle>{t("settings.llm.deleteTitle")}</DialogTitle>
+            <DialogDescription>{t("settings.llm.deleteDescription", { name: deletingModel?.name ?? "" })}</DialogDescription>
+          </DialogHeader>
+          {deleteError && <p role="alert" className="text-sm text-destructive">{deleteError}</p>}
+          <DialogFooter>
+            <Button variant="outline" disabled={deleting} onClick={() => setDeletingModel(null)}>{t("common.cancel")}</Button>
+            <Button variant="destructive" disabled={deleting} onClick={() => {
+              if (!client || !deletingModel) return;
+              const id = deletingModel.id;
+              setDeleting(true); setDeleteError(null);
+              void client.deleteLlmProfile(id).then((updated) => {
+                setSnapshot(updated);
+                if (editingLlmId === id) resetLlmForm();
+                setAgentTargets((current) => current.filter((target) => target !== id));
+                setAgentDefaultModel((current) => current === id ? "" : current);
+                setDeletingModel(null); setLlmNotice(t("settings.llm.deleted"));
+              }).catch((error) => setDeleteError(describeError(error, t))).finally(() => setDeleting(false));
+            }}>{deleting ? t("settings.saving") : t("common.remove")}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <PageTitle className="text-2xl font-semibold tracking-tight">{t("settings.title")}</PageTitle>
@@ -404,6 +444,8 @@ export function SettingsSurface({
               title={t("settings.llm.title")}
               description={t("settings.llm.description")}
               action={
+                <div className="flex shrink-0 flex-wrap justify-end gap-2">
+                <ProviderModelImport client={client} snapshot={snapshot} onImported={(message) => { setLlmNotice(message); void refreshProfiles(); }} />
                 <Button
                   variant="ghost"
                   size="sm"
@@ -413,6 +455,7 @@ export function SettingsSurface({
                 >
                   {loadingProfiles ? t("settings.llm.refreshing") : t("common.refresh")}
                 </Button>
+                </div>
               }
             >
               {loadError ? (
@@ -464,7 +507,7 @@ export function SettingsSurface({
                           ) : null}
                         </div>
                       </div>
-                      <div className="shrink-0">
+                      <div className="flex shrink-0 gap-2">
                         <Button
                           type="button"
                           variant="outline"
@@ -474,6 +517,7 @@ export function SettingsSurface({
                         >
                           {editingLlmId === profile.id ? t("settings.editing") : t("common.edit")}
                         </Button>
+                        <Button type="button" variant="ghost" size="xs" disabled={llmSaving || deleting} onClick={() => { setDeletingModel(profile); setDeleteError(null); }}>{t("common.remove")}</Button>
                       </div>
                     </div>
                   ))
@@ -563,6 +607,11 @@ export function SettingsSurface({
                     ))}
                   </div>
                 </fieldset>
+
+                <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                  {t("settings.llm.contextWindow")}
+                  <Input inputMode="numeric" value={llmContextWindow} onChange={(event) => setLlmContextWindow(event.target.value)} placeholder="128000" />
+                </label>
 
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
