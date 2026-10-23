@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import type { ControlCapability, ControlProfilesSnapshot, ControlProviderModel } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
+import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { describeError } from "./settings-parts";
 
 export function ProviderModelImport({ client, snapshot, onImported }: {
@@ -36,10 +37,11 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
   const providers = snapshot?.providers ?? [];
   const [sourceId, setSourceId] = useState(providers[0]?.profile_ids[0] ?? "new");
   const [newName, setNewName] = useState("");
+  const [newProtocol, setNewProtocol] = useState<LlmProtocol>("openai_chat_completions");
   const [newEndpoint, setNewEndpoint] = useState("");
   const [newSecret, setNewSecret] = useState("");
   const [newReference] = useState(() => `OCG_IMPORT_${crypto.randomUUID().replaceAll("-", "").toUpperCase()}_API_KEY`);
-  const [newConnection, setNewConnection] = useState<{ name: string; endpoint: string; credential?: string; credential_ref?: string } | null>(null);
+  const [newConnection, setNewConnection] = useState<{ protocol: LlmProtocol; name: string; endpoint: string; credential?: string; credential_ref?: string } | null>(null);
   const provider = providers.find((entry) => entry.profile_ids.includes(sourceId));
   const [models, setModels] = useState<ControlProviderModel[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -77,7 +79,7 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
   function fetchNewModels() {
     if (!newName.trim() || !newEndpoint.trim()) { setError(t("settings.llm.newProviderRequired")); return; }
     setError(null); setModels([]); setSelected(new Set()); setLoading(true);
-    setNewConnection({ name: newName.trim(), endpoint: newEndpoint.trim(), ...(newSecret.trim() ? { credential: newSecret.trim(), credential_ref: newReference } : {}) });
+    setNewConnection({ protocol: newProtocol, name: newName.trim(), endpoint: newEndpoint.trim(), ...(newSecret.trim() ? { credential: newSecret.trim(), credential_ref: newReference } : {}) });
     setRevision((value) => value + 1);
   }
   async function save() {
@@ -111,6 +113,7 @@ function ImportContent({ client, snapshot, close, onImported, onBusyChange }: {
         <Button variant={sourceId === "new" ? "secondary" : "outline"} size="sm" aria-pressed={sourceId === "new"} disabled={saving} onClick={() => reload("new")}>{t("settings.llm.newProvider")}</Button>
       </div>
       {sourceId === "new" && <div className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2">
+        <ProtocolSelect value={newProtocol} disabled={saving} onChange={(value) => changeNewConnection(() => setNewProtocol(value))} />
         <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.provider")}<Input value={newName} disabled={saving} onChange={(event) => changeNewConnection(() => setNewName(event.target.value))} placeholder="Provider" autoComplete="off" /></label>
         <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.importEndpoint")}<Input value={newEndpoint} disabled={saving} onChange={(event) => changeNewConnection(() => setNewEndpoint(event.target.value))} placeholder="https://api.example.com/v1" spellCheck={false} autoComplete="off" /></label>
         <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">{t("settings.llm.apiKey")}<Input type="password" value={newSecret} disabled={saving} onChange={(event) => changeNewConnection(() => setNewSecret(event.target.value))} autoComplete="new-password" spellCheck={false} /></label>

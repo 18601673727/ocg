@@ -488,6 +488,24 @@ pub fn validate_project_commands(commands: &[ProjectCommand]) -> Result<(), &'st
 pub enum LlmTransport {
     /// [`crate::openai_compatible`] Chat Completions.
     OpenAiChatCompletions,
+    OpenAiResponses,
+}
+
+impl LlmTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "openai_chat_completions",
+            Self::OpenAiResponses => "openai_responses",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "openai_chat_completions" => Some(Self::OpenAiChatCompletions),
+            "openai_responses" => Some(Self::OpenAiResponses),
+            _ => None,
+        }
+    }
 }
 
 /// A capability a user declares for a model.

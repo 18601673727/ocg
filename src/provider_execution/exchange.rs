@@ -64,7 +64,10 @@ async fn exchange(
     let provider = &frozen.llm.provider;
     let endpoint = endpoint(
         provider.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT),
-        "chat/completions",
+        match config.transport {
+            crate::persistence::LlmTransport::OpenAiChatCompletions => "chat/completions",
+            crate::persistence::LlmTransport::OpenAiResponses => "responses",
+        },
     )?;
 
     let credential = resolver.resolve(provider.credential_ref.as_deref())?;
@@ -75,11 +78,17 @@ async fn exchange(
             message: "provider execution was cancelled before sending".to_owned(),
         });
     }
-    let body = request_body(
+    let chat_body = request_body(
         &frozen.llm.config.model,
         &frozen.llm.config.parameters,
         conversation,
     )?;
+    let body = match config.transport {
+        crate::persistence::LlmTransport::OpenAiChatCompletions => chat_body,
+        crate::persistence::LlmTransport::OpenAiResponses => {
+            responses::request_body(chat_body, conversation)?
+        }
+    };
     let head_timeout = config.first_delta_timeout.unwrap_or(config.timeout);
     let client = provider_client(head_timeout).await?;
     let session = endpoint
@@ -249,6 +258,7 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
     let endpoint = endpoint.trim_end_matches('/');
     let base = endpoint
         .strip_suffix("/chat/completions")
+        .or_else(|| endpoint.strip_suffix("/responses"))
         .unwrap_or(endpoint);
     let url = format!("{base}/{resource}");
     let uri = url.parse::<ntex::http::Uri>().ok();

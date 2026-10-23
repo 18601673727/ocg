@@ -124,7 +124,7 @@ export type ControlProfileWriteRequest =
       name: string;
       model: string;
       context_window?: number | null;
-      protocol?: "openai_chat_completions";
+      protocol?: "openai_chat_completions" | "openai_responses";
       endpoint?: string | null;
       credential_ref?: string | null;
       credential?: string | null;
@@ -776,7 +776,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return decodeProviderModels(answer.input);
     },
 
-    async importModels(source: string | { name: string; endpoint: string; credential?: string; credential_ref?: string }, models: ControlProviderModel[], capabilities: ControlCapability[]) {
+    async importModels(source: string | { protocol?: "openai_chat_completions" | "openai_responses"; name: string; endpoint: string; credential?: string; credential_ref?: string }, models: ControlProviderModel[], capabilities: ControlCapability[]) {
       if (typeof source === "string") identity(source, "source_profile_id");
       const connection = typeof source === "string" ? { source_profile_id: source } : { provider: source };
       const answer = await send("POST", "/api/v1/profiles/import", {

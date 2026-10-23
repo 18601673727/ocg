@@ -33,3 +33,20 @@ test("model discovery, bulk import, and deletion use authenticated signed routes
   assert.equal(calls.find((call) => call.method === "DELETE")?.path, `/api/v1/profiles/${id}`);
   client.close();
 });
+
+test("Responses provider imports preserve the explicitly selected protocol", async () => {
+  const { decodeProfiles } = await import("../components/ocg/contracts");
+  const snapshot = { api_version: 1, llm_profiles: [], agent_profiles: [], executor_protocols: [{ id, protocol: "openai_responses" }], providers: [{ protocol: "openai_responses", endpoint: "https://example.com/v1", credential_ref: null, has_credential: false, profile_ids: [id], models: ["m"] }], has_more: false, next_before: null };
+  assert.equal(decodeProfiles(snapshot).providers[0].protocol, "openai_responses");
+  assert.equal(decodeProfiles(snapshot).executor_protocols[0].protocol, "openai_responses");
+  assert.throws(() => decodeProfiles({ ...snapshot, executor_protocols: [{ id, protocol: "unknown" }] }), ContractError);
+  const source = { name: "Responses", endpoint: "https://example.com/v1", protocol: "openai_responses" as const };
+  let sent: unknown;
+  const client = createHttpCanonicalControlClient({ baseUrl: "http://localhost:7841", csrfToken: () => "test-csrf", fetch: async (_url, init) => {
+    sent = JSON.parse(String(init?.body));
+    return Response.json({ api_version: 1, profile_ids: [id], created: 1, existing: 0 });
+  } });
+  await client.importModels(source, [{ id: "m", context_window: null }], ["chat"]);
+  assert.deepEqual(sent, { provider: source, models: [{ id: "m", context_window: null }], declared_capabilities: ["chat"] });
+  client.close();
+});

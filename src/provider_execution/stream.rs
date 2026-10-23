@@ -231,6 +231,16 @@ async fn parse_stream_body(
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     let mut response = StreamedResponse::default();
+    let native = config.transport == crate::persistence::LlmTransport::OpenAiResponses;
+    let mut responses = responses::ResponseStream::default();
+    let line_limit = if native {
+        config
+            .max_output_bytes
+            .saturating_mul(6)
+            .saturating_add(MAX_SSE_LINE_BYTES)
+    } else {
+        MAX_SSE_LINE_BYTES
+    };
     let mut saw_event = false;
     let mut first_byte = None;
     let mut idle_waited = Duration::ZERO;
@@ -297,7 +307,7 @@ async fn parse_stream_body(
         first_byte.get_or_insert_with(Instant::now);
         for byte in chunk {
             buffer.push(byte);
-            if buffer.len() > MAX_SSE_LINE_BYTES {
+            if buffer.len() > line_limit {
                 return Err(
                     response.incomplete("provider SSE line exceeded its limit", status_code)
                 );
@@ -308,7 +318,7 @@ async fn parse_stream_body(
             let line = std::mem::take(&mut buffer);
             let line = line.strip_suffix(b"\n").unwrap_or(&line);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.len() > MAX_SSE_LINE_BYTES {
+            if line.len() > line_limit {
                 return Err(
                     response.incomplete("provider SSE line exceeded its limit", status_code)
                 );
@@ -332,10 +342,48 @@ async fn parse_stream_body(
             // The usage is taken before anything else of the event, so
             // neither a refused part of the event nor a failed delta write
             // loses its counters.
-            if let Some(reported) = reported_usage(&event) {
+            let reported = if native {
+                usage::reported_responses_usage(&event)
+            } else {
+                reported_usage(&event)
+            };
+            if let Some(reported) = reported {
                 response.usage = reported.usage.clone();
                 capture.record(Some(output), reported).await;
             }
+            if native && event["type"] == "response.failed" {
+                let message = event["response"]["error"]["message"]
+                    .as_str()
+                    .unwrap_or("Responses provider failed after delivery");
+                return Err(response.unknown(message, status_code));
+            }
+            if native && event["type"] == "response.incomplete" {
+                let reason = event["response"]["incomplete_details"]["reason"]
+                    .as_str()
+                    .unwrap_or("unspecified");
+                return Err(response.incomplete(
+                    format!("Responses request ended incomplete: {reason}"),
+                    status_code,
+                ));
+            }
+            let event = if native {
+                responses
+                    .event(&event, config.max_output_bytes)
+                    .map_err(|message| {
+                        if message == "Responses output exceeded its limit" {
+                            local_stop(
+                                message,
+                                status_code,
+                                response.finish_reason,
+                                response.raw_finish_reason.as_deref(),
+                            )
+                        } else {
+                            response.incomplete(message, status_code)
+                        }
+                    })?
+            } else {
+                event
+            };
             if let Some(error) = event.get("error").filter(|error| error.is_object()) {
                 let (message, provider_code) = observe::parse_provider_error(&event.to_string())
                     .unwrap_or_else(|| ("provider request failed".to_owned(), None));
@@ -402,6 +450,10 @@ async fn parse_stream_body(
                     )
                 })?;
             }
+            if native && responses.terminal {
+                response.raw_finish_reason = Some("completed".to_owned());
+                break 'stream;
+            }
         }
     }
     // A stream cut short after cancellation is the local stop, not the provider's incomplete stream.
@@ -439,6 +491,7 @@ async fn parse_stream_body(
             })?;
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
+        response_items: responses.output,
         text: response.text,
         reasoning: response.reasoning,
         tool_calls,

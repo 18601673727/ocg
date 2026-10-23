@@ -33,6 +33,8 @@ pub enum Error {
     NotConfigured(&'static str),
     #[error("{ENDPOINT_VARIABLE} must be an https:// URL")]
     NotHttps,
+    #[error("OCG_PROVIDER_PROTOCOL must be openai_chat_completions or openai_responses")]
+    InvalidProtocol,
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
     CredentialMissing,
     #[error("usage: ocg {COMMAND}")]
@@ -50,6 +52,7 @@ pub enum Error {
 pub struct Target {
     /// The name of the Pool and the Connection when they are registered.
     pub name: String,
+    pub protocol: LlmTransport,
     pub endpoint: String,
     pub model: String,
     pub credential_ref: String,
@@ -73,6 +76,7 @@ impl Target {
         if !endpoint.starts_with("https://") {
             return Err(Error::NotHttps);
         }
+        let protocol = protocol_from_environment()?;
         let model = variable(MODEL_VARIABLE)?;
         let credential_ref = variable(CREDENTIAL_REF_VARIABLE)?;
         if std::env::var_os(&credential_ref).is_none_or(|credential| credential.is_empty()) {
@@ -80,6 +84,7 @@ impl Target {
         }
         Ok(Self {
             name: name.to_owned(),
+            protocol,
             endpoint,
             model,
             credential_ref,
@@ -95,7 +100,7 @@ pub async fn targets(
     database: &DatabaseHandle,
     target: &Target,
 ) -> Result<(ExecutorId, ProfileId, ExecutionPoolId), DatabaseError> {
-    let transport = LlmTransport::OpenAiChatCompletions;
+    let transport = target.protocol;
     let pool = provision_pool(database, &target.name, transport, None).await?;
     let connection = ConnectionConfig {
         protocol: transport,
@@ -250,5 +255,13 @@ pub fn pool_config(protocol: LlmTransport, concurrency: Option<NonZeroU32>) -> E
             operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
             llm_protocols: BTreeSet::from([protocol]),
         },
+    }
+}
+
+pub(crate) fn protocol_from_environment() -> Result<LlmTransport, Error> {
+    match std::env::var("OCG_PROVIDER_PROTOCOL") {
+        Ok(value) => LlmTransport::parse(value.trim()).ok_or(Error::InvalidProtocol),
+        Err(std::env::VarError::NotPresent) => Ok(LlmTransport::OpenAiChatCompletions),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidProtocol),
     }
 }

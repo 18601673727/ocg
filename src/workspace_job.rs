@@ -163,6 +163,8 @@ pub enum Error {
     ProjectRootChanged,
     #[error("{ENDPOINT_VARIABLE} must be an https:// URL")]
     NotHttps,
+    #[error("OCG_PROVIDER_PROTOCOL must be openai_chat_completions or openai_responses")]
+    InvalidProtocol,
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
     CredentialMissing,
     #[error("usage: ocg {0} <objective>")]
@@ -198,6 +200,7 @@ pub struct Config {
     /// takes one.
     image: Option<String>,
     project: ProjectId,
+    protocol: ocg::persistence::LlmTransport,
     endpoint: String,
     model: String,
     credential_ref: String,
@@ -236,6 +239,8 @@ impl Config {
         if !endpoint.starts_with("https://") {
             return Err(Error::NotHttps);
         }
+        let protocol =
+            crate::llm_target::protocol_from_environment().map_err(|_| Error::InvalidProtocol)?;
         let model = variable(MODEL_VARIABLE)?;
         let credential_ref = variable(CREDENTIAL_REF_VARIABLE)?;
         if std::env::var_os(&credential_ref).is_none_or(|credential| credential.is_empty()) {
@@ -245,6 +250,7 @@ impl Config {
             mode,
             image,
             project,
+            protocol,
             endpoint,
             model,
             credential_ref,
@@ -429,6 +435,7 @@ async fn submit(
     let (tools, image) = prepare(database, data_directory, &config).await?;
     let target = Target {
         name: config.mode.command().to_owned(),
+        protocol: config.protocol,
         endpoint: config.endpoint,
         model: config.model,
         credential_ref: config.credential_ref,

@@ -350,3 +350,28 @@ confirmation. Successful replies are `released` or `already_released`. This rout
 is available for any origin; the CLI continues to record operator confirmation.
 
 Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 26).
+
+## OpenAI Responses providers
+
+LLM profiles and new-provider imports accept `protocol: "openai_responses"`.
+Select **OpenAI Responses** in Settings when the model requires that API (for
+example, OpenCode Go Muse Spark). Use the provider's base URL, such as
+`https://opencode.ai/inference/go/openai/v1`; OCG posts to `/responses`.
+An endpoint already ending in `/responses` is also accepted. Existing profiles
+continue to use Chat Completions unless their protocol is explicitly changed.
+For environment-based registration, set `OCG_PROVIDER_PROTOCOL=openai_responses`;
+omitting it retains `openai_chat_completions`.
+
+Responses requests stream with `store: false` and include the complete input
+history. Function calls and outputs, images, JSON response formats, reasoning
+summaries and encrypted reasoning continuation are supported. Token limits map
+to `max_output_tokens`; reasoning effort maps to `reasoning.effort`. Presence and
+frequency penalties are unsupported and cause a request-build refusal. Native
+Responses usage and output items are retained in provider history. A terminal
+`response.completed` ends reading immediately; failed, incomplete or truncated
+responses never authorize tool execution.
+
+Responses adds protocol code 2 alongside the unchanged Chat Completions code 1.
+Database format 26 is retained: existing data opens without migration. Once
+Responses configurations have been saved, use a build with Responses support;
+older builds cannot decode the added protocol code.

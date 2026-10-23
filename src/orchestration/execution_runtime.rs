@@ -424,7 +424,7 @@ enum Submission {
     Plan(ExecutionPlan, ExecutionReply),
     Provider(
         ProviderExecutionPlan,
-        Option<NewSubmission>,
+        Option<Box<NewSubmission>>,
         Option<WorkspaceTools>,
         ProviderReply,
     ),
@@ -1270,7 +1270,7 @@ impl SchedulerHandle {
         let (settled, settlement) = flume::bounded(1);
         self.submit(Submission::Provider(
             plan,
-            submission,
+            submission.map(Box::new),
             workspace_tools,
             ProviderReply { started, settled },
         ))
@@ -1625,7 +1625,13 @@ async fn dispatch_runtime(
                         }
                     }
                     Submission::Provider(mut plan, submission, workspace_tools, reply) => {
-                        match admit_provider_job(&database, &mut plan, submission).await {
+                        match admit_provider_job(
+                            &database,
+                            &mut plan,
+                            submission.map(|submission| *submission),
+                        )
+                        .await
+                        {
                             Ok((started, offered)) => {
                                 let cancellation = plan.provider_config.cancellation.clone();
                                 reply.started.send(Ok(started)).ok();
@@ -3771,6 +3777,11 @@ async fn run_provider_job_inner(
             )
             .await;
         };
+        if !result.response_items.is_empty() {
+            conversation
+                .response_items
+                .insert(conversation.messages.len(), result.response_items.clone());
+        }
         conversation.messages.push(assistant);
         if let Some(digest) = sink.response_digest.take() {
             sink.recorder.remember_response(digest);
@@ -4566,7 +4577,10 @@ async fn record_answer(
     result: &ProviderExecutionResult,
     assistant: &ChatMessage,
 ) {
-    let response = match sink.recorder.response(assistant) {
+    let response = match sink
+        .recorder
+        .response_with_items(assistant, &result.response_items)
+    {
         Ok(response) => response,
         Err(error) => {
             // ChatMessage serialization is infallible for the admitted wire types.
@@ -4932,7 +4946,10 @@ pub(crate) async fn settle_provider_error(
             "Job {job} completed its provider response but its final output flush failed; retaining the response as evidence without executing its tool calls"
         );
         let mut message = serde_json::json!(assistant_message(result));
-        if !result.reasoning.is_empty() {
+        if !result.response_items.is_empty() {
+            message = serde_json::json!({"output": result.response_items});
+        }
+        if result.response_items.is_empty() && !result.reasoning.is_empty() {
             message["reasoning_content"] = serde_json::Value::String(result.reasoning.clone());
         }
         let response = crate::persistence::MessageBody::new(&message)
@@ -5112,6 +5129,7 @@ mod failure_tests {
                     ProviderExecutionError::CompletionUnpersisted {
                         message: "flush failed".into(),
                         result: Box::new(ProviderExecutionResult {
+                            response_items: Vec::new(),
                             text: "completed text".into(),
                             reasoning: "completed reasoning".into(),
                             tool_calls: vec![CompletedToolCall {
@@ -6503,6 +6521,7 @@ mod provider_record_tests {
             handle.record_sent_request(retry).await.expect("Sent retry");
             sink.recorder.remember_sent(state);
             let result = ProviderExecutionResult {
+                response_items: Vec::new(),
                 refused: Vec::new(),
                 text: "answer".into(),
                 reasoning: "private thinking".into(),

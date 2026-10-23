@@ -7,6 +7,10 @@ use crate::persistence::{
 
 #[derive(Default)]
 pub struct RequestRecorder {
+    responses: bool,
+    input_len: usize,
+    response_groups: BTreeMap<usize, (usize, ContentDigest)>,
+    pending_response_items: usize,
     messages: Vec<ContentDigest>,
     stored: BTreeSet<ContentDigest>,
     tools: Option<Option<ContentDigest>>,
@@ -15,6 +19,8 @@ pub struct RequestRecorder {
 }
 
 pub struct SentRequestState {
+    responses: bool,
+    input_len: usize,
     messages: Vec<ContentDigest>,
     stored: Vec<ContentDigest>,
     tools: Option<ContentDigest>,
@@ -32,21 +38,60 @@ impl RequestRecorder {
         let mut bodies = Vec::new();
         let mut pending = BTreeSet::new();
         let mut digests = self.messages.clone();
+        let responses = body.get("input").is_some();
         let messages = body
-            .get("messages")
+            .get(if responses { "input" } else { "messages" })
             .and_then(Value::as_array)
             .ok_or_else(|| record_error("request has no messages"))?;
+        let input_len = messages.len();
+        let mut grouped = Vec::new();
+        let mut index = 0;
+        while index < messages.len() {
+            if responses && let Some((count, digest)) = self.response_groups.get(&index) {
+                let items = messages
+                    .get(index..index.saturating_add(*count))
+                    .ok_or_else(|| record_error("Responses input omitted a previous output"))?;
+                let value = json!({"output": items});
+                let body =
+                    MessageBody::new(&value).map_err(|error| record_error(error.to_string()))?;
+                if body.digest() != *digest {
+                    return Err(record_error("Responses input changed a previous output"));
+                }
+                grouped.push(std::borrow::Cow::Owned(value));
+                index += count;
+            } else {
+                grouped.push(std::borrow::Cow::Borrowed(&messages[index]));
+                index += 1;
+            }
+        }
+        let messages = grouped;
         if messages.len() < self.messages.len() {
             return Err(record_error("recorded messages must only be appended"));
         }
-        for (index, value) in messages.iter().enumerate().skip(self.messages.len()) {
-            let mut value = value.clone();
-            replace_images(
-                &mut value,
+        let mut user_index = 0;
+        for (index, value) in messages.iter().enumerate() {
+            let attachments = if responses {
+                if value.get("role").and_then(Value::as_str) == Some("user") {
+                    let attachments = self
+                        .image_attachments
+                        .values()
+                        .nth(user_index)
+                        .map_or(&[][..], Vec::as_slice);
+                    user_index += 1;
+                    attachments
+                } else {
+                    &[]
+                }
+            } else {
                 self.image_attachments
                     .get(&index)
-                    .map_or(&[], Vec::as_slice),
-            )?;
+                    .map_or(&[][..], Vec::as_slice)
+            };
+            if index < self.messages.len() {
+                continue;
+            }
+            let mut value = value.as_ref().clone();
+            replace_images(&mut value, attachments)?;
             let body = MessageBody::new(&value).map_err(|error| record_error(error.to_string()))?;
             digests.push(body.digest());
             if !self.stored.contains(&body.digest()) && pending.insert(body.digest()) {
@@ -67,7 +112,7 @@ impl RequestRecorder {
                     .as_object()
                     .ok_or_else(|| record_error("request is not an object"))?
                     .iter()
-                    .filter(|(key, _)| !matches!(key.as_str(), "messages" | "tools"))
+                    .filter(|(key, _)| !matches!(key.as_str(), "messages" | "input" | "tools"))
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
                 self.keep(&Value::Object(parameters), &mut bodies, &mut pending)?
@@ -82,6 +127,8 @@ impl RequestRecorder {
             .filter(|digest| !self.stored.contains(digest))
             .collect();
         let state = SentRequestState {
+            responses,
+            input_len,
             messages: digests.clone(),
             stored: pending.into_iter().collect(),
             tools,
@@ -104,6 +151,8 @@ impl RequestRecorder {
     }
 
     pub fn remember_sent(&mut self, state: SentRequestState) {
+        self.responses = state.responses;
+        self.input_len = state.input_len;
         self.messages = state.messages;
         self.stored.extend(state.stored);
         self.tools = Some(state.tools);
@@ -130,7 +179,23 @@ impl RequestRecorder {
         MessageBody::new(&value).map_err(|error| record_error(error.to_string()))
     }
 
+    pub fn response_with_items(
+        &mut self,
+        message: &ChatMessage,
+        items: &[Value],
+    ) -> Result<MessageBody, OutputSinkError> {
+        self.pending_response_items = items.len();
+        if items.is_empty() {
+            return self.response(message);
+        }
+        MessageBody::new(&json!({"output": items})).map_err(|error| record_error(error.to_string()))
+    }
+
     pub fn remember_response(&mut self, digest: ContentDigest) {
+        if self.responses && self.pending_response_items > 0 {
+            self.response_groups
+                .insert(self.input_len, (self.pending_response_items, digest));
+        }
         self.messages.push(digest);
         self.stored.insert(digest);
     }
@@ -148,13 +213,14 @@ fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(),
     };
     let mut attachments = attachments.iter();
     for part in parts {
-        if part.get("type").and_then(Value::as_str) != Some("image_url") {
-            continue;
-        }
-        let Some(url) = part
-            .get_mut("image_url")
-            .and_then(|image| image.get_mut("url"))
-        else {
+        let url = match part.get("type").and_then(Value::as_str) {
+            Some("image_url") => part
+                .get_mut("image_url")
+                .and_then(|image| image.get_mut("url")),
+            Some("input_image") => part.get_mut("image_url"),
+            _ => continue,
+        };
+        let Some(url) = url else {
             return Err(record_error("request image has no URL"));
         };
         if !url

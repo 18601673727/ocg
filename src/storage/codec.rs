@@ -413,7 +413,7 @@ pub(super) trait Code: Sized + Copy {
 codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3, OutputKind::Reasoning = 4 });
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
-codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1 });
+codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2 });
 codes!(ExecutionOperation { ExecutionOperation::LlmRequest = 1 });
 codes!(ChatFinishReason {
     ChatFinishReason::Stop = 1, ChatFinishReason::Length = 2, ChatFinishReason::ToolCalls = 3,
@@ -764,5 +764,24 @@ impl Dec<'_> {
             },
             _ => return Err(StorageError::corrupted("invalid entry")),
         })
+    }
+}
+
+#[cfg(test)]
+mod responses_protocol_tests {
+    use super::*;
+    #[test]
+    fn responses_protocol_preserves_the_existing_chat_code() {
+        assert_eq!(LlmTransport::OpenAiChatCompletions.code(), 1);
+        assert_eq!(
+            LlmTransport::from_code(1),
+            Some(LlmTransport::OpenAiChatCompletions)
+        );
+        assert_eq!(LlmTransport::OpenAiResponses.code(), 2);
+        assert_eq!(
+            LlmTransport::from_code(2),
+            Some(LlmTransport::OpenAiResponses)
+        );
+        assert_eq!(FORMAT_VERSION, 26);
     }
 }

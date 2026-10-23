@@ -97,6 +97,7 @@ impl CredentialResolver for EnvironmentCredentialResolver {
 
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionConfig {
+    pub transport: crate::persistence::LlmTransport,
     pub session_id: Option<crate::persistence::JobId>,
     pub timeout: Duration,
     pub first_delta_timeout: Option<Duration>,
@@ -107,6 +108,7 @@ pub struct ProviderExecutionConfig {
 impl ProviderExecutionConfig {
     pub(crate) fn for_profile(&self, frozen: &FrozenExecutionConfig) -> Self {
         let mut config = self.clone();
+        config.transport = frozen.llm.provider.transport;
         if frozen
             .llm
             .config
@@ -122,6 +124,7 @@ impl ProviderExecutionConfig {
 impl Default for ProviderExecutionConfig {
     fn default() -> Self {
         Self {
+            transport: crate::persistence::LlmTransport::OpenAiChatCompletions,
             session_id: None,
             timeout: DEFAULT_TIMEOUT,
             first_delta_timeout: None,
@@ -138,6 +141,7 @@ impl Default for ProviderExecutionConfig {
 /// Paths without a tool loop must require [`Self::admitted`].
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionResult {
+    pub response_items: Vec<Value>,
     pub text: String,
     /// The streamed `reasoning_content`, kept apart from the text and never
     /// published as output.

@@ -23,6 +23,7 @@ import { Section, describeError } from "./settings-parts";
 import { ProjectsSection } from "./projects-section";
 import { ProviderModelImport } from "./provider-model-import";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
 import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
@@ -126,6 +127,7 @@ export function SettingsSurface({
   const [editingLlmId, setEditingLlmId] = useState<string | null>(null);
   const [llmName, setLlmName] = useState("");
   const [llmModel, setLlmModel] = useState("");
+  const [llmProtocol, setLlmProtocol] = useState<LlmProtocol>("openai_chat_completions");
   const [llmEndpoint, setLlmEndpoint] = useState("");
   const [llmCredentialRef, setLlmCredentialRef] = useState("");
   // Write-only secret input: never populated from server responses and cleared after save.
@@ -204,6 +206,7 @@ export function SettingsSurface({
     setEditingLlmId(null);
     setLlmName("");
     setLlmModel("");
+    setLlmProtocol("openai_chat_completions");
     setLlmEndpoint("");
     setLlmCredentialRef("");
     setLlmSecret("");
@@ -220,6 +223,7 @@ export function SettingsSurface({
     setLlmContextWindow(profile.context_window === null ? "" : String(profile.context_window));
     setLlmName(profile.name);
     setLlmModel(profile.model);
+    setLlmProtocol(profile.protocol === "openai_responses" ? "openai_responses" : "openai_chat_completions");
     setLlmEndpoint(profile.endpoint ?? "");
     setLlmCredentialRef(profile.credential_ref ?? "");
     // Never populate raw credentials back into the browser.
@@ -289,7 +293,7 @@ export function SettingsSurface({
         name: trimmedName,
         model: trimmedModel,
         context_window: parsedContextWindow,
-        protocol: "openai_chat_completions" as const,
+        protocol: llmProtocol,
         endpoint: llmEndpoint.trim() ? llmEndpoint.trim() : null,
         credential_ref: llmCredentialRef.trim() ? llmCredentialRef.trim() : null,
         credential: llmSecret.trim() ? llmSecret.trim() : null,
@@ -558,6 +562,7 @@ export function SettingsSurface({
                       spellCheck={false}
                     />
                   </label>
+                  <ProtocolSelect value={llmProtocol} onChange={setLlmProtocol} disabled={llmSaving} />
                   <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
                     {t("settings.llm.endpoint")}
                     <Input

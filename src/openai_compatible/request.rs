@@ -166,6 +166,8 @@ impl ChatRequest {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatConversation {
     #[serde(skip)]
+    pub response_items: BTreeMap<usize, Vec<Value>>,
+    #[serde(skip)]
     pub dropped_turns: u32,
     #[serde(skip)]
     pub image_attachments: BTreeMap<usize, Vec<crate::persistence::AttachmentId>>,

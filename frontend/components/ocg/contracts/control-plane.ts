@@ -870,8 +870,8 @@ export function decodeProfiles(input: unknown) {
     llm_profiles: listOf(envelope.llm_profiles, "llm_profiles", (entry, path) => {
       const llm = record(entry, path);
       const protocol = string(llm.protocol, `${path}.protocol`);
-      if (protocol !== "openai_chat_completions") {
-        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      if (protocol !== "openai_chat_completions" && protocol !== "openai_responses") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions or openai_responses");
       }
       const params = record(llm.parameters, `${path}.parameters`);
       return {
@@ -937,16 +937,16 @@ export function decodeProfiles(input: unknown) {
     executor_protocols: listOf(envelope.executor_protocols, "executor_protocols", (entry, path) => {
       const executor = record(entry, path);
       const protocol = string(executor.protocol, `${path}.protocol`);
-      if (protocol !== "openai_chat_completions") {
-        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      if (protocol !== "openai_chat_completions" && protocol !== "openai_responses") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions or openai_responses");
       }
       return { id: identity(executor.id, `${path}.id`), protocol } satisfies Wire.WireProfileExecutor;
     }),
     providers: listOf(envelope.providers, "providers", (entry, path) => {
       const provider = record(entry, path);
       const protocol = string(provider.protocol, `${path}.protocol`);
-      if (protocol !== "openai_chat_completions") {
-        throw new ContractError(`${path}.protocol`, "openai_chat_completions");
+      if (protocol !== "openai_chat_completions" && protocol !== "openai_responses") {
+        throw new ContractError(`${path}.protocol`, "openai_chat_completions or openai_responses");
       }
       return {
         protocol,

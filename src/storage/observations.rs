@@ -760,13 +760,38 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
         Some(serde_json::Value::String(text)) => text.clone(),
         Some(_) => return Err(StorageError::corrupted("response content is not text")),
     };
+    let output = message.get("output").and_then(serde_json::Value::as_array);
+    let text = if let Some(output) = output {
+        let mut text = String::new();
+        for item in output {
+            if item["type"] == "message"
+                && let Some(parts) = item["content"].as_array()
+            {
+                for part in parts {
+                    let value = if part["type"] == "refusal" {
+                        part["refusal"].as_str()
+                    } else {
+                        part["text"].as_str()
+                    };
+                    if let Some(value) = value {
+                        text.push_str(value);
+                    }
+                }
+            }
+        }
+        text
+    } else {
+        text
+    };
     let decoded = DecodedMessage {
         escaped_len: text.chars().map(super::escaped_json_char_cost).sum(),
         text: Arc::from(text),
-        requests_tools: message
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|calls| !calls.is_empty()),
+        requests_tools: output
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "function_call"))
+            || message
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|calls| !calls.is_empty()),
     };
 
     let mut cache = lock_message_cache();
@@ -1021,5 +1046,23 @@ mod tests {
         decode_message(oversized, &oversized_body).expect("oversized cached");
         assert_eq!(message_parse_count(oversized), 1);
         clear_message_cache();
+    }
+}
+
+#[cfg(test)]
+mod responses_projection_tests {
+    use super::*;
+
+    #[test]
+    fn native_responses_output_projects_text_refusals_and_tools() {
+        let value = serde_json::json!({"output":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"private"}]},
+            {"type":"message","content":[{"type":"output_text","text":"visible"},{"type":"refusal","refusal":" refusal"}]},
+            {"type":"function_call","call_id":"c","name":"f","arguments":"{}"}
+        ]});
+        let body = serde_json::to_vec(&value).unwrap();
+        let decoded = decode_message(ContentDigest::of(&body), &body).unwrap();
+        assert_eq!(&*decoded.text, "visible refusal");
+        assert!(decoded.requests_tools);
     }
 }

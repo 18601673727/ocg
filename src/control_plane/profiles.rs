@@ -62,7 +62,7 @@ const INVALID_MODEL: Refusal = Refusal::new(
 const UNSUPPORTED_PROTOCOL: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "unsupported_protocol",
-    "protocol must be openai_chat_completions",
+    "protocol must be openai_chat_completions or openai_responses",
 );
 const INVALID_ENDPOINT: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -316,17 +316,18 @@ pub(super) fn map_mutation_error(error: DatabaseError) -> Refusal {
     }
 }
 
-/// Ensures at least one Pool offers OpenAI Chat Completions, so newly created
+/// Ensures at least one Pool offers the requested protocol, so newly created
 /// LLM Profiles can be selected and executed immediately.
-async fn ensure_compatible_executor(database: &DatabaseHandle) -> Result<(), Refusal> {
+async fn ensure_compatible_executor(
+    database: &DatabaseHandle,
+    protocol: LlmTransport,
+) -> Result<(), Refusal> {
     let mut before = None;
     let has_compatible = loop {
         let page = database.executors(before, PROFILE_SCAN_LIMIT).await?;
-        let found = page.iter().any(|executor| {
-            executor
-                .llm_transports
-                .contains(&LlmTransport::OpenAiChatCompletions)
-        });
+        let found = page
+            .iter()
+            .any(|executor| executor.llm_transports.contains(&protocol));
         if found || page.len() < PROFILE_SCAN_LIMIT {
             break found;
         }
@@ -336,9 +337,9 @@ async fn ensure_compatible_executor(database: &DatabaseHandle) -> Result<(), Ref
         let concurrency_limit = NonZeroU32::new(4).ok_or(INTERNAL)?;
         database
             .create_executor(NewExecutor {
-                name: "local-openai-executor".to_owned(),
+                name: format!("local-{}-executor", protocol.as_str()),
                 concurrency_limit,
-                llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+                llm_transports: BTreeSet::from([protocol]),
             })
             .await
             .map_err(map_mutation_error)?;
@@ -351,11 +352,12 @@ async fn ensure_compatible_executor(database: &DatabaseHandle) -> Result<(), Ref
 async fn resolve_or_create_connection(
     database: &DatabaseHandle,
     profile_name: &str,
+    protocol: LlmTransport,
     endpoint: Option<String>,
     credential_ref: Option<String>,
 ) -> Result<ConfigId, Refusal> {
     let wanted = ConnectionConfig {
-        protocol: LlmTransport::OpenAiChatCompletions,
+        protocol,
         endpoint,
         credential_ref,
     };
@@ -449,9 +451,7 @@ fn build_profiles_page(
                 let Some(connection) = connections.get(&model.connection_id).cloned() else {
                     return Err(INCONSISTENT_RECORD);
                 };
-                let protocol = match connection.protocol {
-                    LlmTransport::OpenAiChatCompletions => "openai_chat_completions",
-                };
+                let protocol = connection.protocol.as_str();
                 let has_credential = connection
                     .credential_ref
                     .as_deref()
@@ -541,21 +541,25 @@ fn build_profiles_page(
                 last_emitted = Some(record.id);
             }
             ConfigBody::Pool(pool) => {
-                if pool.enabled
-                    && pool.offers(
-                        ExecutionOperation::LlmRequest,
-                        Some(LlmTransport::OpenAiChatCompletions),
-                    )
-                {
-                    let executor = WireProfileExecutor {
-                        id: record.id.to_string(),
-                        protocol: "openai_chat_completions".to_owned(),
-                    };
-                    if !fits_profile_page(&executor, &mut page_bytes)? {
+                let offered: Vec<_> = [
+                    LlmTransport::OpenAiChatCompletions,
+                    LlmTransport::OpenAiResponses,
+                ]
+                .into_iter()
+                .filter(|protocol| {
+                    pool.enabled && pool.offers(ExecutionOperation::LlmRequest, Some(*protocol))
+                })
+                .map(|protocol| WireProfileExecutor {
+                    id: record.id.to_string(),
+                    protocol: protocol.as_str().to_owned(),
+                })
+                .collect();
+                if !offered.is_empty() {
+                    if !fits_profile_page(&offered, &mut page_bytes)? {
                         next_before = last_emitted;
                         break;
                     }
-                    executor_protocols.push(executor);
+                    executor_protocols.extend(offered);
                     last_emitted = Some(record.id);
                 }
             }
@@ -631,12 +635,13 @@ pub(super) async fn save_profile(
             if !valid_single_line(&model, MAX_MODEL_BYTES) {
                 return Err(INVALID_MODEL);
             }
-            if protocol
+            let keep_protocol = protocol.is_none();
+            let mut protocol = protocol
                 .as_deref()
-                .is_some_and(|proto| proto.trim() != "openai_chat_completions")
-            {
-                return Err(UNSUPPORTED_PROTOCOL);
-            }
+                .map(str::trim)
+                .map(LlmTransport::parse)
+                .unwrap_or(Some(LlmTransport::OpenAiChatCompletions))
+                .ok_or(UNSUPPORTED_PROTOCOL)?;
             let normalized_endpoint = match endpoint
                 .as_deref()
                 .map(str::trim)
@@ -708,7 +713,12 @@ pub(super) async fn save_profile(
                     .await?
                     .ok_or(INCONSISTENT_RECORD)?;
                 match existing_connection.body {
-                    ConfigBody::Connection(connection) => connection.credential_ref,
+                    ConfigBody::Connection(connection) => {
+                        if keep_protocol {
+                            protocol = connection.protocol;
+                        }
+                        connection.credential_ref
+                    }
                     _ => return Err(INCONSISTENT_RECORD),
                 }
             } else {
@@ -778,10 +788,11 @@ pub(super) async fn save_profile(
                 explicit_ref.or(prior_credential_ref)
             };
 
-            ensure_compatible_executor(database).await?;
+            ensure_compatible_executor(database, protocol).await?;
             let connection = resolve_or_create_connection(
                 database,
                 name.trim(),
+                protocol,
                 normalized_endpoint,
                 resolved_credential_ref,
             )
@@ -1000,6 +1011,7 @@ struct ImportModelsRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportProvider {
+    protocol: Option<String>,
     name: String,
     endpoint: String,
     credential_ref: Option<String>,
@@ -1114,7 +1126,12 @@ pub(super) async fn import_models(
             NewConfig {
                 name: format!("{} provider", provider.name.trim()),
                 body: ConfigBody::Connection(ConnectionConfig {
-                    protocol: LlmTransport::OpenAiChatCompletions,
+                    protocol: provider
+                        .protocol
+                        .as_deref()
+                        .map(LlmTransport::parse)
+                        .unwrap_or(Some(LlmTransport::OpenAiChatCompletions))
+                        .ok_or(UNSUPPORTED_PROTOCOL)?,
                     endpoint: Some(endpoint.to_owned()),
                     credential_ref: reference,
                 }),
@@ -1122,7 +1139,10 @@ pub(super) async fn import_models(
         }
         (None, None) | (Some(_), Some(_)) => return Err(INVALID_PROFILE_BODY),
     };
-    ensure_compatible_executor(database).await?;
+    let ConfigBody::Connection(ref connection_body) = connection.body else {
+        return Err(WRONG_PROFILE_KIND);
+    };
+    ensure_compatible_executor(database, connection_body.protocol).await?;
     let (ids, created) = database
         .import_models(connection, models.into_iter().collect(), capabilities)
         .await
@@ -2253,6 +2273,74 @@ mod approval_tests {
             body["approve"] = json!(["unknown"]);
             assert!(
                 matches!(save_profile(&db, Some(id), &serde_json::to_vec(&body).unwrap()).await, Err(refusal) if refusal.code == "invalid_approve")
+            );
+            worker.shutdown().unwrap();
+        });
+    }
+}
+
+#[cfg(test)]
+mod responses_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::test_support::{data_directory, on_system};
+
+    #[test]
+    fn responses_profiles_import_and_executor_survive_reopening_existing_format() {
+        on_system(|| async {
+            let (_root, directory) = data_directory("responses", "profiles");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let old = save_profile(
+                &db,
+                None,
+                br#"{"kind":"llm","name":"old","model":"old","declared_capabilities":["chat"]}"#,
+            )
+            .await
+            .unwrap();
+            let old_id = old.body["profile_id"].as_str().unwrap().to_owned();
+            let body = json!({"kind":"llm","name":"responses","model":"muse","protocol":"openai_responses","endpoint":"https://opencode.ai/inference/go/openai/v1/responses","declared_capabilities":["chat","tools"]});
+            let saved = save_profile(&db, None, &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            let id = saved.body["profile_id"].as_str().unwrap().to_owned();
+            let mut edit = body.clone();
+            edit.as_object_mut().unwrap().remove("protocol");
+            save_profile(
+                &db,
+                Some(profile_id(&id).unwrap()),
+                &serde_json::to_vec(&edit).unwrap(),
+            )
+            .await
+            .unwrap();
+            let import = json!({"source_profile_id":id,"models":[{"id":"second"}],"declared_capabilities":["chat"]});
+            import_models(&db, &serde_json::to_vec(&import).unwrap())
+                .await
+                .unwrap();
+            drop(db);
+            worker.shutdown().unwrap();
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let profiles = list_profiles(&db, None, 50).await.unwrap();
+            let models = profiles.body["llm_profiles"].as_array().unwrap();
+            assert_eq!(
+                models.iter().find(|m| m["id"] == id).unwrap()["protocol"],
+                "openai_responses"
+            );
+            assert_eq!(
+                models.iter().find(|m| m["id"] == old_id).unwrap()["protocol"],
+                "openai_chat_completions"
+            );
+            assert_eq!(
+                models.iter().find(|m| m["model"] == "second").unwrap()["protocol"],
+                "openai_responses"
+            );
+            assert!(
+                profiles.body["executor_protocols"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["protocol"] == "openai_responses")
             );
             worker.shutdown().unwrap();
         });
