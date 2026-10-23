@@ -79,7 +79,7 @@ export function ConversationSearch({
       open={open}
       onOpenChange={next => {
         setOpen(next);
-        // A reopened overlay starts from the unfiltered list, like the sidebar.
+        // A reopened dialog starts from the unfiltered list, like the sidebar.
         if (!next) setQuery("");
       }}
     >
@@ -87,7 +87,7 @@ export function ConversationSearch({
       <DialogContent
         initialFocus={inputRef}
         showCloseButton={false}
-        className="top-0 left-0 h-dvh w-full max-w-none translate-x-0 translate-y-0 flex flex-col gap-0 rounded-none p-0 sm:max-w-none"
+        className="flex max-h-[min(36rem,85dvh)] flex-col gap-0 p-0"
       >
         <DialogHeader className="gap-0 border-b border-border px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-3 sm:px-6">
           <div className="flex items-center gap-2">

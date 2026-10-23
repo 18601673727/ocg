@@ -228,9 +228,7 @@ export function OcgSidebar({
     );
   };
 
-  // The primary controls sit directly under the wordmark: New chat, the
-  // conversation search, and (in canonical mode) the Workbench menu that holds
-  // every destination other than Chat.
+  // New chat and the Workbench menu sit below the header controls.
   const primaryControls = (
     <>
       <div className="flex items-center gap-1 px-2 pb-2">
@@ -243,22 +241,6 @@ export function OcgSidebar({
           <Plus className="size-3.5" data-icon="inline-start" />
           {t("sidebar.newChat")}
         </Button>
-        {/*
-          The search button opens the full-screen conversation overlay. It keeps
-          its own accessible name and tooltip title rather than a Tooltip
-          wrapper, because the overlay owns the trigger's props.
-        */}
-        <ConversationSearch
-          sessions={sessions}
-          activeSessionId={activeSessionId}
-          projectName={projectName}
-          onSelect={onSelect}
-          trigger={
-            <Button variant="ghost" size="icon-sm" className="size-11 rounded-lg" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
-              <Search className="size-4" aria-hidden="true" />
-            </Button>
-          }
-        />
       </div>
 
       {hasNav && workbenchNav.length > 0 && (
@@ -379,6 +361,17 @@ export function OcgSidebar({
       <div className="flex h-full w-full flex-col">
         <div className="flex items-center gap-2 px-3 pt-3 pb-2">
           <OcgLogo className="min-w-0 flex-1" />
+          <ConversationSearch
+            sessions={sessions}
+            activeSessionId={activeSessionId}
+            projectName={projectName}
+            onSelect={onSelect}
+            trigger={
+              <Button variant="ghost" size="icon-xs" aria-label={t("sidebar.searchConversations")} title={t("sidebar.searchConversations")}>
+                <Search className="size-4" aria-hidden="true" />
+              </Button>
+            }
+          />
           <Tooltip>
             <TooltipTrigger
               render={
