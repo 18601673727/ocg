@@ -18252,6 +18252,222 @@ fn observed_models_are_complete_across_small_scan_windows() {
 }
 
 #[test]
+fn observed_models_enumerate_more_than_two_thousand_pairs_without_omission() {
+    let (_root, directory) = data_directory("observed-model-large");
+    let worker = DatabaseWorker::start(&directory).expect("start database");
+    let handle = worker.handle();
+    let first_provider = provider(&handle, "large-first");
+    let second_provider = provider(&handle, "large-second");
+    struct Pair {
+        provider: LlmProviderId,
+        model: String,
+        profile_name: String,
+        observed_at: i64,
+    }
+    let pairs: Vec<Pair> = (0..2_001)
+        .map(|index| {
+            let (provider, model, profile_name) = if index < 1_001 {
+                (
+                    first_provider,
+                    format!("first-model-{index:04}"),
+                    format!("first-profile-{index:04}"),
+                )
+            } else if index < 1_011 {
+                // The same model name under a different Provider is a
+                // distinct pair and must appear once for each Provider.
+                (
+                    second_provider,
+                    format!("first-model-{:04}", index - 1_001),
+                    format!("second-profile-{index:04}"),
+                )
+            } else {
+                (
+                    second_provider,
+                    format!("second-model-{index:04}"),
+                    format!("second-profile-{index:04}"),
+                )
+            };
+            Pair {
+                provider,
+                model,
+                profile_name,
+                observed_at: if provider == first_provider {
+                    1_000
+                } else {
+                    2_000
+                },
+            }
+        })
+        .collect();
+    let expected: BTreeSet<ObservedModel> = pairs
+        .iter()
+        .map(|pair| ObservedModel {
+            provider: pair.provider,
+            model: pair.model.clone(),
+        })
+        .collect();
+
+    // Enqueue a queue's worth at a time so the worker commits each batch in
+    // one transaction instead of one transaction per pair.
+    const BATCH: usize = 128;
+    let mut configs = Vec::with_capacity(pairs.len());
+    for chunk in pairs.chunks(BATCH) {
+        let queued: Vec<_> = chunk
+            .iter()
+            .map(|pair| {
+                admit(handle.create_config(NewConfig {
+                    name: pair.profile_name.clone(),
+                    body: ConfigBody::Model(ModelConfig {
+                        connection_id: pair.provider.into(),
+                        model: pair.model.clone(),
+                        context_window: None,
+                        parameters: LlmParameters::default(),
+                        declared_capabilities: BTreeSet::from([ModelCapability::Chat]),
+                    }),
+                }))
+            })
+            .collect();
+        for waiter in queued {
+            configs.push(waiter().expect("model profile"));
+        }
+    }
+    let base = new_job(&handle, "request", handle.genesis());
+    let mut jobs = Vec::with_capacity(pairs.len());
+    for chunk in configs.chunks(BATCH) {
+        let queued: Vec<_> = chunk
+            .iter()
+            .map(|profile| {
+                admit(handle.create_job(NewJob {
+                    configuration: llm_only((*profile).into()),
+                    ..base.clone()
+                }))
+            })
+            .collect();
+        for waiter in queued {
+            jobs.push(waiter().expect("job"));
+        }
+    }
+    for (chunk, chunk_jobs) in pairs.chunks(BATCH).zip(jobs.chunks(BATCH)) {
+        let queued: Vec<_> = chunk
+            .iter()
+            .zip(chunk_jobs)
+            .map(|(pair, job)| {
+                admit(handle.record_metrics(token_metrics(
+                    *job,
+                    pair.observed_at,
+                    None,
+                    [Some(1), None],
+                )))
+            })
+            .collect();
+        for waiter in queued {
+            waiter().expect("Metrics");
+        }
+    }
+    // The first pair spans several scan windows; its availability flag is
+    // discovered in the last one.
+    let first_job = jobs[0];
+    let first_observed_at = pairs[0].observed_at;
+    for step in 0..14 {
+        wait(handle.record_metrics(token_metrics(
+            first_job,
+            first_observed_at + step,
+            None,
+            [Some(1), None],
+        )))
+        .expect("Metrics");
+    }
+    wait(handle.record_availability_stat(NewAvailabilityStat {
+        job: first_job,
+        request: RequestNumber::FIRST,
+        observed_at: at(first_observed_at + 20),
+        observation: response(200),
+    }))
+    .expect("AvailabilityStat");
+    let filter = ObservedModelFilter {
+        observed: TimeRange {
+            from: at(0),
+            until: at(10_000),
+        },
+        provider: None,
+    };
+    let mut expected_order: Vec<ObservedModel> = expected.iter().cloned().collect();
+    expected_order.sort_by_key(|model| {
+        (
+            model.provider.get(),
+            *ContentDigest::of(model.model.as_bytes()).as_bytes(),
+        )
+    });
+
+    let mut seen = BTreeSet::new();
+    let mut order = Vec::new();
+    let mut after = None;
+    let mut pages = 0;
+    let mut saw_empty_page = false;
+    loop {
+        pages += 1;
+        assert!(pages < 1_000, "the cursor did not reach exhaustion");
+        let page = wait(handle.observed_models_scanned(filter, after.clone(), 5, 7))
+            .expect("observed models page");
+        assert!(page.choices.len() <= 5);
+        saw_empty_page |= page.choices.is_empty() && page.next.is_some();
+        for choice in page.choices {
+            assert!(
+                seen.insert(choice.model.clone()),
+                "a pair was returned twice"
+            );
+            if choice.model.provider == first_provider && choice.model.model == "first-model-0000" {
+                assert!(choice.has_metrics, "metrics were lost across pages");
+                assert!(
+                    choice.has_availability_stats,
+                    "a late availability flag was lost"
+                );
+            }
+            order.push(choice.model);
+        }
+        match page.next {
+            Some(next) => {
+                assert_ne!(after.as_ref(), Some(&next), "the cursor did not advance");
+                after = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen, expected);
+    assert_eq!(order, expected_order);
+    assert!(saw_empty_page, "no page advanced without a choice");
+
+    // The same enumeration under a time filter returns only the later half.
+    let filtered = ObservedModelFilter {
+        observed: TimeRange {
+            from: at(1_500),
+            until: at(10_000),
+        },
+        provider: None,
+    };
+    let expected_filtered: BTreeSet<_> = expected
+        .iter()
+        .filter(|model| model.provider == second_provider)
+        .cloned()
+        .collect();
+    let mut seen_filtered = BTreeSet::new();
+    let mut after = None;
+    loop {
+        let page = wait(handle.observed_models_scanned(filtered, after.clone(), 5, 7))
+            .expect("filtered observed models page");
+        for choice in page.choices {
+            assert!(seen_filtered.insert(choice.model));
+        }
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen_filtered, expected_filtered);
+    worker.shutdown().expect("shutdown");
+}
+
+#[test]
 fn usage_pages_continue_inside_a_dense_bucket_and_summary() {
     use crate::persistence::{
         USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketWidth, UsageBucketing, UsageSummaryFilter,
