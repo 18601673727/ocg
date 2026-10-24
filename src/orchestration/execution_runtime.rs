@@ -3399,6 +3399,29 @@ async fn run_decision_job(
     }
 }
 
+/// Records one shadow prediction. The returned Job is the decision, not a
+/// summary. This never calls compaction: a Prepare recommendation is kept
+/// for comparison until promotion is approved. The scheduler does not call
+/// this until that promotion; tests cover the default-off path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn shadow_predict(
+    database: &DatabaseHandle,
+    conversation: JobId,
+    agent: crate::persistence::ConfigId,
+    snapshot: crate::persistence::PredictionSnapshot,
+) -> Result<Option<JobId>, DatabaseError> {
+    let policy = database
+        .conversation_compaction_policy(conversation)
+        .await?;
+    let enabled = policy
+        .and_then(|(policy, _)| policy)
+        .is_some_and(|policy| policy.predictive.is_some());
+    if !enabled {
+        return Ok(None);
+    }
+    invoke_decision_assistance(database, conversation, agent, snapshot.request()).await
+}
+
 /// Asks an Agent's assigned Decision Profile one typed question. Assistance
 /// and later prediction both enter here; a missing or unusable assignment
 /// answers `None` and does not fail the caller.
@@ -6641,6 +6664,27 @@ mod decision_runtime_tests {
                 request(),
             ))
             .expect("missing assistance"),
+            None
+        );
+        // Prediction is off unless the conversation opts in. This records
+        // nothing and does not start a summary.
+        assert_eq!(
+            wait(shadow_predict(
+                &database,
+                conversation,
+                caller,
+                crate::persistence::PredictionSnapshot {
+                    schema_version: 1,
+                    capacity: Some(32_000),
+                    reserve: 4_096,
+                    occupancy_tokens: 1_000,
+                    recent_growth_tokens: 100,
+                    pressure: "low",
+                    settled_turns: 1,
+                    active: false,
+                },
+            ))
+            .expect("shadow"),
             None
         );
         // A generative Model is not a Decision Profile, and assigning one

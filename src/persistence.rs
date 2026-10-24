@@ -44,7 +44,8 @@ pub use execution::{
     DecisionOutcome, DecisionQuestion, DecisionRequest, DecisionResult, DecisionWork,
     DependencyCondition, DependencyState, ExecutionConfiguration, FinalResult,
     IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, MAX_DECISION_OPTIONS,
-    MAX_DECISION_REQUEST_BYTES, NewExecutor, NewJob, NewJobOutput, OutputKind, ScoreLevel,
+    MAX_DECISION_REQUEST_BYTES, NewExecutor, NewJob, NewJobOutput, OutputKind, PredictionSnapshot,
+    ScoreLevel,
 };
 pub use identity::{
     AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,

@@ -167,6 +167,52 @@ pub const DECISION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_DECISION_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_DECISION_OPTIONS: usize = 256;
 
+/// Counts a shadow prediction may see. Conversation text and workspace
+/// content are absent on purpose. The recommendation is recorded for
+/// comparison; it does not authorize summarization.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionSnapshot {
+    pub schema_version: u32,
+    pub capacity: Option<u32>,
+    pub reserve: u32,
+    pub occupancy_tokens: u32,
+    pub recent_growth_tokens: u32,
+    pub pressure: &'static str,
+    pub settled_turns: u32,
+    pub active: bool,
+}
+
+impl PredictionSnapshot {
+    /// A choice among NoNeed, Defer, Prepare and InsufficientEvidence.
+    /// The prompt names the counts and asks for no arithmetic.
+    pub fn request(&self) -> DecisionRequest {
+        DecisionRequest {
+            schema_version: DECISION_SCHEMA_VERSION,
+            state: serde_json::json!({
+                "schema_version": self.schema_version,
+                "capacity": self.capacity,
+                "reserve": self.reserve,
+                "occupancy_tokens": self.occupancy_tokens,
+                "recent_growth_tokens": self.recent_growth_tokens,
+                "pressure": self.pressure,
+                "settled_turns": self.settled_turns,
+                "active": self.active,
+            }),
+            question: DecisionQuestion::Choice {
+                prompt: "Choose one recommendation from the counts. Do not calculate further totals. NoNeed means no preparation. Defer means wait. Prepare means a later policy may summarize. InsufficientEvidence means the counts are not enough.".to_owned(),
+                options: ["no_need", "defer", "prepare", "insufficient_evidence"]
+                    .into_iter()
+                    .map(|id| ChoiceOption {
+                        id: id.to_owned(),
+                        description: id.replace('_', " "),
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChoiceOption {
