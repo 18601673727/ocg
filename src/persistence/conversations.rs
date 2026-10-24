@@ -167,6 +167,10 @@ impl CompactionPolicy {
         let Some(window) = window else {
             return Err("automatic compaction requires a known context window");
         };
+        let output_reserve = match self.mode {
+            CompactionMode::Custom { policy } => output_reserve.max(policy.reserved_output_tokens),
+            CompactionMode::Off | CompactionMode::Auto { .. } => output_reserve,
+        };
         let budget = window
             .checked_sub(output_reserve)
             .and_then(|value| value.checked_sub(safety))
@@ -188,6 +192,9 @@ impl CompactionPolicy {
             } => (3, 4, 1, 120),
             CompactionMode::Custom { policy } => {
                 policy.validate()?;
+                if policy.trigger_tokens > budget || policy.target_tokens > budget {
+                    return Err("custom compaction budgets exceed the effective model window");
+                }
                 return Ok(ResolvedCompaction {
                     mode: "custom",
                     trigger: Some(policy.trigger_tokens),
@@ -339,15 +346,21 @@ pub const SUMMARIZER_OUTPUT_RESERVE: u32 = 4096;
 #[serde(deny_unknown_fields)]
 pub struct SummarizationResult {
     pub schema_version: u32,
-    pub source: ContextSourceManifest,
+    pub source: ContentDigest,
     pub summary: String,
     /// Information loss is explicit. Original records remain recoverable.
     pub omitted_details: Vec<String>,
 }
 
 impl SummarizationResult {
+    pub fn context_text(&self) -> String {
+        format!(
+            "{}\nThis generated summary may omit assistant details. Originals remain available. Declared omissions (not guaranteed complete): {}",
+            self.summary,
+            self.omitted_details.join("; ")
+        )
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
-        self.source.validate()?;
         if self.schema_version != 1
             || self.summary.trim().is_empty()
             || self.summary.len() > 1024 * 1024
@@ -387,12 +400,25 @@ pub enum StopProof {
     Operator,
 }
 
+/// Frozen generative work with one content-addressed sealed manifest. It has
+/// no Agent tools or workspace authority. The producing Job owns the result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SummarizationWork {
+    pub frozen: FrozenExecutionConfig,
+    pub source: ContentDigest,
+    pub target_tokens: u32,
+    pub minimum_savings_tokens: u32,
+    pub policy_revision: Option<u64>,
+    pub policy_profile: Option<ConfigRef>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)] // Keep the public spec value inline, as Frozen carries its snapshot.
 pub enum TurnExecution {
     Frozen(FrozenExecutionConfig),
     Ref(JobId),
     Decision(DecisionWork),
+    Summarization(SummarizationWork),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

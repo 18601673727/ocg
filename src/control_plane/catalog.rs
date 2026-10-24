@@ -831,6 +831,8 @@ struct WireConversationEdit {
     #[serde(default)]
     hidden: Option<bool>,
     limits: Option<crate::persistence::ConversationLimits>,
+    #[serde(default, deserialize_with = "profiles::optional_value")]
+    compaction_policy: Option<Option<WireCompactionPolicy>>,
 }
 
 pub(super) async fn conversation_limits(
@@ -856,47 +858,125 @@ pub(super) async fn conversation_limits(
 pub(super) async fn conversation_context(
     database: &DatabaseHandle,
     conversation: JobId,
+    before: Option<JobId>,
+    limit: usize,
 ) -> Result<Reply, Refusal> {
-    let Some((policy, revision)) = database
-        .conversation_compaction_policy(conversation)
+    let state = database
+        .context_state(conversation, before, limit)
         .await?
-    else {
-        return Err(NOT_FOUND);
+        .ok_or(NOT_FOUND)?;
+    let wire_policy = WireCompactionPolicy::from_policy(state.policy);
+    let mode = match &wire_policy.mode {
+        WireCompactionMode::Off => "disabled",
+        WireCompactionMode::Auto { preset } => match preset {
+            WireCompactionPreset::Conservative => "conservative",
+            WireCompactionPreset::Balanced => "balanced",
+            WireCompactionPreset::Aggressive => "aggressive",
+        },
+        WireCompactionMode::Custom { .. } => "custom",
     };
-    let (mode, summarizer, predictive) = match policy {
-        None => ("inherited".to_owned(), None, false),
-        Some(policy) => {
-            let mode = match policy.mode {
-                crate::persistence::CompactionMode::Off => "disabled".to_owned(),
-                crate::persistence::CompactionMode::Auto { preset } => match preset {
-                    crate::persistence::CompactionPreset::Conservative => "conservative".to_owned(),
-                    crate::persistence::CompactionPreset::Balanced => "balanced".to_owned(),
-                    crate::persistence::CompactionPreset::Aggressive => "aggressive".to_owned(),
-                },
-                crate::persistence::CompactionMode::Custom { .. } => "custom".to_owned(),
-            };
-            (
-                mode,
-                policy
-                    .summarization_model
-                    .map(|model| crate::persistence::ProfileId::from(model).to_string()),
-                policy.predictive.is_some(),
-            )
-        }
-    };
-    let predictive_unavailable = if predictive {
-        None
-    } else {
-        Some("prediction requires an explicit conversation opt-in".to_owned())
+    let summarizer = state
+        .policy
+        .summarization_model
+        .or_else(|| state.model.as_ref().map(|model| model.model.id));
+    let boundary = |source: crate::persistence::SourceBoundary| WireContextBoundary {
+        turn: source.turn.to_string(),
+        input_through: source.input_through,
+        output_through: source.output_through,
+        fingerprint: source.content.to_string(),
     };
     Ok(Reply::ok(envelope(WireContextStatus {
         conversation: conversation.to_string(),
-        mode,
-        summarizer,
-        predictive,
-        predictive_unavailable,
-        revision,
+        mode: mode.into(),
+        summarizer: summarizer.map(|id| id.to_string()),
+        predictive: state.policy.predictive.is_some(),
+        predictive_unavailable: state.prediction_unavailable.map(str::to_owned),
+        revision: state.revision,
         uncalibrated: true,
+        policy: wire_policy,
+        policy_override: state.stored_override.map(WireCompactionPolicy::from_policy),
+        policy_source: state.policy_source.into(),
+        predictor: state.predictor.map(|id| id.to_string()),
+        predictor_model: state.predictor_model.map(|id| id.to_string()),
+        prediction_mode: if state.policy.predictive.is_some() {
+            "shadow"
+        } else {
+            "disabled"
+        }
+        .into(),
+        predictive_preparation_enabled: false,
+        foreground_model: state.model.map(|model| WireContextModel {
+            profile: model.model.id.to_string(),
+            edit_seq: model.model.edit_seq,
+            model: model.config.model,
+            capacity: model.config.context_window,
+            capacity_source: if model.config.context_window.is_some() {
+                "frozen_model_configuration"
+            } else {
+                "unknown"
+            }
+            .into(),
+            reserved_output_tokens: model
+                .config
+                .parameters
+                .max_completion_tokens
+                .or(model.config.parameters.max_tokens)
+                .unwrap_or(4096),
+        }),
+        estimated_tokens: state.estimated_tokens,
+        estimate_method: "utf8_bytes_per_three_plus_framing_and_image_allowance".into(),
+        recent_growth_tokens: state.growth,
+        last_context_use: state.last_use.map(|(turn, seq, artifact)| WireContextUse {
+            turn: turn.to_string(),
+            seq,
+            artifact: artifact.map(|id| id.to_string()),
+        }),
+        work: state
+            .work
+            .into_iter()
+            .map(|work| match work.details {
+                crate::storage::ContextWorkDetails::Summary {
+                    summarizer,
+                    automatic,
+                    source,
+                    first,
+                    through,
+                    turn_count,
+                } => WireContextWork::Summarization {
+                    job: work.job.to_string(),
+                    conversation: work.conversation.to_string(),
+                    state: work.state.into(),
+                    summarizer: summarizer.to_string(),
+                    automatic,
+                    source: WireContextSource {
+                        digest: source.to_string(),
+                        first: boundary(first),
+                        through: boundary(through),
+                        turn_count,
+                    },
+                },
+                crate::storage::ContextWorkDetails::Prediction {
+                    predictor,
+                    model,
+                    binding,
+                    forecast_tokens,
+                    result,
+                } => WireContextWork::Prediction {
+                    job: work.job.to_string(),
+                    conversation: work.conversation.to_string(),
+                    state: work.state.into(),
+                    predictor: predictor.to_string(),
+                    model: model.to_string(),
+                    activity_turn: binding.activity_turn.to_string(),
+                    policy_revision: binding.policy_revision,
+                    max_tokens: binding.max_tokens,
+                    forecast_tokens,
+                    result: result.and_then(|result| serde_json::to_value(result).ok()),
+                },
+            })
+            .collect(),
+        has_more: state.next_before.is_some(),
+        next_before: state.next_before.map(|id| id.to_string()),
     })))
 }
 
@@ -908,12 +988,17 @@ pub(super) async fn edit_conversation(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let wire: WireConversationEdit = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
-    let edit = match (wire.title, wire.hidden, wire.limits) {
-        (Some(title), None, None) if submissions::text(&title, submissions::MAX_NAME_BYTES) => {
+    let edit = match (wire.title, wire.hidden, wire.limits, wire.compaction_policy) {
+        (Some(title), None, None, None)
+            if submissions::text(&title, submissions::MAX_NAME_BYTES) =>
+        {
             ConversationEdit::Title(title)
         }
-        (None, Some(true), None) => ConversationEdit::Hide,
-        (None, None, Some(limits)) => ConversationEdit::Limits(limits),
+        (None, Some(true), None, None) => ConversationEdit::Hide,
+        (None, None, Some(limits), None) => ConversationEdit::Limits(limits),
+        (None, None, None, Some(policy)) => ConversationEdit::CompactionPolicy(
+            policy.map(WireCompactionPolicy::into_policy).transpose()?,
+        ),
         _ => return Err(INVALID_REQUEST),
     };
     database

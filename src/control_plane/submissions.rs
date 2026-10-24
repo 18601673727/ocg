@@ -1621,7 +1621,7 @@ pub(super) async fn compact(
             already,
         } => WireCompaction {
             conversation: conversation.to_string(),
-            status: if already { "already" } else { "prepared" }.to_owned(),
+            status: if already { "already" } else { "queued" }.to_owned(),
             job: Some(job.to_string()),
             system_conversation: Some(child.to_string()),
             through: Some(through.to_string()),

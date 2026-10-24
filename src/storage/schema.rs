@@ -3,7 +3,7 @@ use super::*;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const FORMAT_NAME: &[u8] = b"ocg-foundation";
-pub(crate) const FORMAT_VERSION: u32 = 29;
+pub(crate) const FORMAT_VERSION: u32 = 30;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;

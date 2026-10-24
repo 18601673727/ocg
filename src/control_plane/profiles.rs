@@ -278,6 +278,8 @@ enum WireProfileRequest {
         /// `null` clears an assignment; absent leaves the previous one.
         #[serde(default, deserialize_with = "optional_value")]
         decision_assistance: Option<Option<String>>,
+        #[serde(default, deserialize_with = "optional_value")]
+        compaction_policy: Option<Option<WireCompactionPolicy>>,
     },
     /// A Decision Model: a typed model reached over a decision protocol.
     DecisionModel {
@@ -325,7 +327,7 @@ struct WireDecisionLimitInput {
     max_output_tokens_per_question: Option<u32>,
 }
 
-fn optional_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(super) fn optional_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de>,
@@ -714,6 +716,9 @@ fn build_profiles_page(
                     decision_assistance: agent
                         .decision_assistance
                         .map(|id| ProfileId::from(id).to_string()),
+                    compaction_policy: agent
+                        .compaction_policy
+                        .map(WireCompactionPolicy::from_policy),
                     editable: true,
                     blocking_jobs: Vec::new(),
                     more_blocking_jobs: false,
@@ -1081,6 +1086,7 @@ pub(super) async fn save_profile(
             approve,
             default_model,
             decision_assistance,
+            compaction_policy,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
@@ -1238,7 +1244,11 @@ pub(super) async fn save_profile(
                     dispatch_to: parsed_dispatch,
                     tool_grant,
                     decision_assistance,
-                    compaction_policy: prior.compaction_policy,
+                    compaction_policy: match compaction_policy {
+                        None => prior.compaction_policy,
+                        Some(None) => None,
+                        Some(Some(policy)) => Some(policy.into_policy()?),
+                    },
                 }),
             }
         }
@@ -1417,6 +1427,7 @@ pub(super) async fn save_profile(
                 match database.config(model_id).await? {
                     Some(ConfigRecord {
                         body: ConfigBody::DecisionModel(_),
+                        archived_at: None,
                         ..
                     }) => parsed_models.push(model_id),
                     _ => return Err(INVALID_DECISION_MODELS),
@@ -1677,6 +1688,153 @@ mod tests {
     use crate::persistence::{ExecutionConfiguration, JobInputDraft, NewJob};
     use crate::test_support::data_directory;
 
+    #[test]
+    fn decision_profiles_and_policy_edits_round_trip_through_control_handlers() {
+        crate::test_support::on_system(|| async {
+            use crate::persistence::{ConversationEdit, ConversationSpec, Entry, Origin};
+            let (_root, directory) = data_directory("profiles", "decision-policy-api");
+            let worker = DatabaseWorker::start(&directory).unwrap();
+            let db = worker.handle();
+            let decision = save_profile(&db, None, &serde_json::to_vec(&json!({"kind":"decision_model", "name":"Decision", "model":"jev-latest", "endpoint":"https://decision.example/v1", "declared_capabilities":["choice"]})).unwrap()).await.unwrap();
+            let model = decision.body["profile_id"].as_str().unwrap().to_owned();
+            assert_eq!(decision.body["decision_profiles"][0]["id"], model);
+            assert_eq!(
+                decision.body["decision_profiles"][0]["endpoint"],
+                "https://decision.example/v1"
+            );
+            let decider = save_profile(
+                &db,
+                None,
+                &serde_json::to_vec(
+                    &json!({"kind":"decision_agent", "name":"Predictor", "models":[model]}),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            let decider = decider.body["profile_id"].as_str().unwrap().to_owned();
+            let mut cursor = None;
+            let mut seen = BTreeSet::new();
+            loop {
+                let page = list_profiles(&db, cursor, 1).await.unwrap();
+                for field in ["decision_profiles", "decision_agent_profiles"] {
+                    if let Some(rows) = page.body[field].as_array() {
+                        for row in rows {
+                            seen.insert(row["id"].as_str().unwrap().to_owned());
+                        }
+                    }
+                }
+                cursor = page.body["next_before"]
+                    .as_str()
+                    .map(|id| id.parse().unwrap());
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            assert!(seen.contains(&model) && seen.contains(&decider));
+            let generative = save_profile(&db, None, &serde_json::to_vec(&json!({"kind":"llm","name":"Generator","model":"g","context_window":32000,"declared_capabilities":["chat"]})).unwrap()).await.unwrap();
+            let generative = generative.body["profile_id"].as_str().unwrap().to_owned();
+            let policy = json!({"mode":{"kind":"auto","preset":"balanced"},"summarization_model":generative,"predictive":{"decision_agent":decider,"minimum_interval_seconds":60,"max_preparations":1,"max_prediction_tokens":4096,"max_preparation_tokens":4096}});
+            let mut body = json!({"kind":"agent", "name":"Caller", "llm_targets":[generative], "compaction_policy":policy});
+            let saved = save_profile(&db, None, &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            let agent: ProfileId = saved.body["profile_id"].as_str().unwrap().parse().unwrap();
+            body.as_object_mut().unwrap().remove("compaction_policy");
+            save_profile(&db, Some(agent), &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            let (conversation, _) = db
+                .open_conversation(
+                    None,
+                    ConversationSpec {
+                        name: Some("policy".into()),
+                        agent: Some(agent.into()),
+                        project: None,
+                        origin: Origin::User,
+                        keep_open: true,
+                    },
+                    Entry::UserMessage {
+                        text: "first".into(),
+                        attachments: vec![],
+                    },
+                    ExecutionConfiguration {
+                        agent_profile: Some(agent),
+                        llm_profile: generative.parse().unwrap(),
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            let status = super::super::catalog::conversation_context(&db, conversation, None, 1)
+                .await
+                .unwrap();
+            assert_eq!(status.body["policy_source"], "profile");
+            assert_eq!(status.body["mode"], "balanced");
+            assert_eq!(status.body["predictor"], decider);
+            assert_eq!(status.body["prediction_mode"], "shadow");
+            assert_eq!(status.body["predictive_preparation_enabled"], false);
+            assert!(status.body["estimated_tokens"].is_number());
+            assert_eq!(status.body["foreground_model"]["capacity"], 32000);
+            super::super::catalog::edit_conversation(
+                &db,
+                conversation,
+                br#"{"compaction_policy":{"mode":{"kind":"off"}}}"#,
+            )
+            .await
+            .unwrap();
+            let status = super::super::catalog::conversation_context(&db, conversation, None, 1)
+                .await
+                .unwrap();
+            assert_eq!(status.body["policy_source"], "conversation");
+            assert_eq!(status.body["mode"], "disabled");
+            assert_eq!(status.body["prediction_mode"], "disabled");
+            super::super::catalog::edit_conversation(
+                &db,
+                conversation,
+                br#"{"compaction_policy":null}"#,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                db.context_state(conversation, None, 1)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .policy_source,
+                "profile"
+            );
+            body["compaction_policy"] = serde_json::Value::Null;
+            save_profile(&db, Some(agent), &serde_json::to_vec(&body).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                db.context_state(conversation, None, 1)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .policy_source,
+                "host"
+            );
+            db.set_conversation(conversation, ConversationEdit::CompactionPolicy(None))
+                .await
+                .unwrap();
+            db.archive_model(model.parse().unwrap()).await.unwrap();
+            assert!(
+                save_profile(
+                    &db,
+                    None,
+                    &serde_json::to_vec(
+                        &json!({"kind":"decision_agent","name":"Invalid","models":[model]})
+                    )
+                    .unwrap()
+                )
+                .await
+                .is_err()
+            );
+            worker.shutdown().unwrap();
+        });
+    }
     #[test]
     fn model_import_is_atomic_and_repeated_import_preserves_edits() {
         crate::test_support::on_system(|| async {

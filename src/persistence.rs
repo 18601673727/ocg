@@ -20,7 +20,7 @@ pub use conversations::{
     NoticeBody, NoticeClass, NoticeEvent, Origin, PlanSource, PredictiveCompaction, RecordEvent,
     Recurrence, RecurrenceHalt, RecurrencePhase, ResolvedCompaction, ResponseFormat,
     SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause, StopProof, SummarizationResult,
-    TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
+    SummarizationWork, TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
 };
 mod execution;
 mod identity;
@@ -44,8 +44,8 @@ pub use execution::{
     DecisionOutcome, DecisionQuestion, DecisionRequest, DecisionResult, DecisionWork,
     DependencyCondition, DependencyState, ExecutionConfiguration, FinalResult,
     IntermediateOutputKind, JobFinalization, JobInputDraft, JobOutcome, MAX_DECISION_OPTIONS,
-    MAX_DECISION_REQUEST_BYTES, NewExecutor, NewJob, NewJobOutput, OutputKind, PredictionSnapshot,
-    ScoreLevel,
+    MAX_DECISION_REQUEST_BYTES, NewExecutor, NewJob, NewJobOutput, OutputKind, PredictionBinding,
+    PredictionSnapshot, ScoreLevel,
 };
 pub use identity::{
     AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,

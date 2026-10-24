@@ -322,12 +322,23 @@ impl DecisionRequest {
 }
 
 /// Immutable work payload carried by the existing Turn execution descriptor.
-/// Admission stays closed until an executor implements the typed decision path.
+/// Execution uses the ordinary Job lifecycle and Pool claims.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionWork {
     pub frozen: FrozenDecisionConfig,
     pub request: DecisionRequest,
+    pub prediction: Option<PredictionBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionBinding {
+    pub conversation: JobId,
+    pub activity_turn: JobId,
+    pub policy_revision: u64,
+    pub policy_profile: Option<ConfigRef>,
+    pub max_tokens: u32,
 }
 
 impl DecisionWork {
@@ -340,6 +351,16 @@ impl DecisionWork {
             || !frozen.agent.models.contains(&frozen.model_ref.id)
         {
             return Err("decision work has inconsistent frozen identities");
+        }
+        if let Some(binding) = &self.prediction
+            && (binding.max_tokens == 0
+                || binding
+                    .policy_profile
+                    .is_some_and(|profile| profile.edit_seq == 0)
+                || frozen.agent.workspace_access != crate::persistence::WorkspaceAccess::None
+                || !matches!(self.request.question, DecisionQuestion::Choice { .. }))
+        {
+            return Err("invalid prediction binding");
         }
         self.request.validate(&frozen.model.declared_capabilities)
     }

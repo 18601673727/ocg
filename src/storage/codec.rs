@@ -208,6 +208,13 @@ impl Enc {
                 }
             }
         }
+        self.opt(&work.prediction, |encoder, binding| {
+            encoder.u128(binding.conversation.get());
+            encoder.u128(binding.activity_turn.get());
+            encoder.u64(binding.policy_revision);
+            encoder.opt(&binding.policy_profile, Self::config_ref);
+            encoder.u32(binding.max_tokens);
+        });
     }
     pub(super) fn config_ref(&mut self, config: &ConfigRef) {
         self.u128(config.id.get());
@@ -551,8 +558,18 @@ impl<'a> Dec<'a> {
             }
             _ => return Err(StorageError::corrupted("invalid decision primitive")),
         };
+        let prediction = self.opt(|decoder| {
+            Ok(crate::persistence::PredictionBinding {
+                conversation: JobId::new(decoder.u128()?),
+                activity_turn: JobId::new(decoder.u128()?),
+                policy_revision: decoder.u64()?,
+                policy_profile: decoder.opt(Self::config_ref)?,
+                max_tokens: decoder.u32()?,
+            })
+        })?;
         let work = DecisionWork {
             frozen,
+            prediction,
             request: DecisionRequest {
                 schema_version,
                 state,
@@ -733,6 +750,17 @@ impl Enc {
                     TurnExecution::Frozen(frozen) => {
                         self.u8(0);
                         self.frozen_execution(frozen);
+                    }
+                    TurnExecution::Summarization(work) => {
+                        self.u8(3);
+                        self.frozen_execution(&work.frozen);
+                        self.0.extend_from_slice(work.source.as_bytes());
+                        self.u32(work.target_tokens);
+                        self.u32(work.minimum_savings_tokens);
+                        self.opt(&work.policy_revision, |encoder, revision| {
+                            encoder.u64(*revision)
+                        });
+                        self.opt(&work.policy_profile, Self::config_ref);
                     }
                     TurnExecution::Decision(work) => {
                         self.u8(2);
@@ -934,6 +962,18 @@ impl Dec<'_> {
                     0 => TurnExecution::Frozen(self.frozen_execution()?),
                     1 => TurnExecution::Ref(JobId::new(self.u128()?)),
                     2 => TurnExecution::Decision(self.decision_work()?),
+                    3 => TurnExecution::Summarization(crate::persistence::SummarizationWork {
+                        frozen: self.frozen_execution()?,
+                        source: ContentDigest::from_bytes(
+                            self.take(32)?
+                                .try_into()
+                                .map_err(|_| StorageError::corrupted("invalid source digest"))?,
+                        ),
+                        target_tokens: self.u32()?,
+                        minimum_savings_tokens: self.u32()?,
+                        policy_revision: self.opt(Self::u64)?,
+                        policy_profile: self.opt(Self::config_ref)?,
+                    }),
                     _ => return Err(StorageError::corrupted("invalid execution")),
                 },
                 plan_source: match self.u8()? {
@@ -1062,11 +1102,11 @@ mod responses_protocol_tests {
             LlmTransport::from_code(3),
             Some(LlmTransport::AnthropicMessages)
         );
-        assert_eq!(FORMAT_VERSION, 29);
+        assert_eq!(FORMAT_VERSION, 30);
     }
     #[test]
     fn older_decision_foundation_formats_are_refused_at_open() {
-        for version in [26u32, 27, 28] {
+        for version in [26u32, 27, 28, 29] {
             assert!(
                 matches!(super::super::open::format_verdict(Some(FORMAT_NAME.to_vec()), Some(version.to_le_bytes().to_vec()), 1), Err(super::super::OpenError::UnsupportedFormat { found }) if found == version)
             );

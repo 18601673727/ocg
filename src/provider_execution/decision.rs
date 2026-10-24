@@ -13,7 +13,6 @@ use crate::persistence::{
 /// base; the resource is appended the same way as for generative transports.
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-const CONFIDENCE_SEMANTICS: &str = "provider.typesafe.confidence.v1";
 
 /// One accepted structured answer and the facts of the request that produced
 /// it. The raw response is kept for provenance; normalized meaning lives in
@@ -162,7 +161,22 @@ pub(crate) async fn execute_decision(
         config.cancellation.cancelled(),
         ntex::time::timeout(
             config.timeout,
-            observe::bounded_bytes(response, MAX_RESPONSE_BYTES),
+            observe::bounded_bytes(
+                response,
+                [
+                    frozen.model.limits.max_output_tokens_per_request,
+                    frozen.model.limits.max_output_tokens_per_question,
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+                .map_or(MAX_RESPONSE_BYTES, |limit| {
+                    (limit as usize)
+                        .saturating_mul(64)
+                        .saturating_add(4096)
+                        .min(MAX_RESPONSE_BYTES)
+                }),
+            ),
         ),
     )
     .await
@@ -222,6 +236,7 @@ fn decode_decision(
             message: "decision response was not valid JSON".to_owned(),
             facts: facts(),
         })?;
+    let raw = redactor.json_value(raw);
     let (result, usage) = decode_response(frozen, input, reference, &raw).map_err(|message| {
         ProviderExecutionError::Incomplete {
             message,
@@ -234,7 +249,6 @@ fn decode_decision(
             message: message.to_owned(),
             facts: facts(),
         })?;
-    let raw = redactor.json_value(raw);
     Ok(DecisionExecution {
         result,
         raw,
@@ -248,7 +262,36 @@ pub(crate) fn request_body(
     frozen: &FrozenDecisionConfig,
     input: &DecisionRequest,
 ) -> Result<Value, ProviderExecutionError> {
-    let question = match &input.question {
+    input
+        .validate(&frozen.model.declared_capabilities)
+        .map_err(|message| ProviderExecutionError::Build {
+            message: message.into(),
+        })?;
+    if frozen.agent.workspace_access != crate::persistence::WorkspaceAccess::None {
+        return Err(ProviderExecutionError::Build {
+            message: "decision workspace materialization is unavailable".into(),
+        });
+    }
+    if !matches!(
+        input.state,
+        Value::String(_) | Value::Object(_) | Value::Array(_)
+    ) {
+        return Err(ProviderExecutionError::Build {
+            message: "decision state must be a string, object or array".into(),
+        });
+    }
+    if matches!(&input.question, DecisionQuestion::Choice { options, .. } if options.len() > 255) {
+        return Err(ProviderExecutionError::Build {
+            message: "TypeSafe Choice supports at most 255 options".into(),
+        });
+    }
+    if matches!(&input.question, DecisionQuestion::OrdinalScore { levels, .. } if levels.len() > 10)
+    {
+        return Err(ProviderExecutionError::Build {
+            message: "TypeSafe Score supports at most ten levels".into(),
+        });
+    }
+    let mut question = match &input.question {
         DecisionQuestion::Choice { prompt, options } => {
             let criteria = options
                 .iter()
@@ -273,11 +316,45 @@ pub(crate) fn request_body(
                 .collect::<Vec<_>>(),
         }),
     };
+    if let Some(instructions) = &frozen.agent.instructions {
+        question["instructions"] =
+            json!({ "profile": instructions, "question": question["instructions"] });
+    }
     let body = json!({
         "model": frozen.model.model,
         "state": input.state,
         "questions": { "decision": question },
     });
+    // Without the provider's tokenizer these are conservative UTF-8 byte
+    // upper bounds, including framing, rather than calibrated token counts.
+    let request_bound = serde_json::to_vec(&body)
+        .map_err(|_| ProviderExecutionError::Build {
+            message: "decision request could not be serialized".into(),
+        })?
+        .len()
+        .saturating_add(32);
+    let question_bound = serde_json::to_vec(&json!({ "state": input.state, "question": question }))
+        .map_err(|_| ProviderExecutionError::Build {
+            message: "decision question could not be serialized".into(),
+        })?
+        .len()
+        .saturating_add(32);
+    for (bound, limit) in [
+        (
+            request_bound,
+            frozen.model.limits.max_input_tokens_per_request,
+        ),
+        (
+            question_bound,
+            frozen.model.limits.max_input_tokens_per_question,
+        ),
+    ] {
+        if limit.is_some_and(|limit| bound > limit as usize) {
+            return Err(ProviderExecutionError::Build {
+                message: "decision input exceeds a configured token upper bound".into(),
+            });
+        }
+    }
     if serde_json::to_vec(&body)
         .map_err(|_| ProviderExecutionError::Build {
             message: "decision request could not be serialized".to_owned(),
@@ -343,6 +420,11 @@ fn decode_response(
                 .get("probabilities")
                 .and_then(Value::as_object)
                 .map(|probabilities| {
+                    if probabilities.len() != options.len() {
+                        return Err(
+                            "choice distribution must contain exactly the requested options".into(),
+                        );
+                    }
                     options
                         .iter()
                         .map(|option| {
@@ -354,7 +436,9 @@ fn decode_response(
                         })
                         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
                 })
-                .transpose()?;
+                .transpose()?
+                .ok_or_else(|| "choice answer has no distribution".to_owned())?;
+            let distribution = Some(distribution);
             if distribution.as_ref().is_some_and(|distribution| {
                 distribution.len() != options.len()
                     || probabilities_sum_to_one(distribution.values().copied()).is_err()
@@ -364,7 +448,7 @@ fn decode_response(
             DecisionAnswer::Choice {
                 selected,
                 distribution,
-                confidence: confidence(answer)?,
+                confidence: confidence(answer, "choice")?,
             }
         }
         DecisionQuestion::BinaryProbability { .. } => {
@@ -386,6 +470,9 @@ fn decode_response(
                 .get("probabilities")
                 .and_then(Value::as_object)
                 .ok_or_else(|| "score answer has no distribution".to_owned())?;
+            if probabilities.len() != levels.len() {
+                return Err("score distribution must contain exactly the requested levels".into());
+            }
             let distribution = levels
                 .iter()
                 .enumerate()
@@ -407,12 +494,34 @@ fn decode_response(
             DecisionAnswer::OrdinalScore {
                 expectation,
                 distribution: Some(distribution),
-                confidence: confidence(answer)?,
+                confidence: confidence(answer, "score")?,
             }
         }
     };
     let usage = decode_usage(raw.get("usage"));
-    let model_version = (reported_model != frozen.model.model).then(|| reported_model.clone());
+    let model_version = None;
+    for (used, limit) in [
+        (
+            usage.input_tokens,
+            frozen.model.limits.max_input_tokens_per_request,
+        ),
+        (
+            usage.input_tokens,
+            frozen.model.limits.max_input_tokens_per_question,
+        ),
+        (
+            usage.output_tokens,
+            frozen.model.limits.max_output_tokens_per_request,
+        ),
+        (
+            usage.output_tokens,
+            frozen.model.limits.max_output_tokens_per_question,
+        ),
+    ] {
+        if used.zip(limit).is_some_and(|(used, limit)| used > limit) {
+            return Err("decision usage exceeded a configured limit".into());
+        }
+    }
     Ok((
         DecisionResult {
             schema_version: crate::persistence::DECISION_SCHEMA_VERSION,
@@ -431,6 +540,7 @@ fn decode_response(
 
 fn confidence(
     answer: &serde_json::Map<String, Value>,
+    primitive: &str,
 ) -> Result<Option<DecisionConfidence>, String> {
     match answer.get("confidence") {
         None | Some(Value::Null) => Ok(None),
@@ -439,7 +549,7 @@ fn confidence(
             .map(|value| {
                 Some(DecisionConfidence {
                     value,
-                    semantics: CONFIDENCE_SEMANTICS.to_owned(),
+                    semantics: format!("provider.typesafe.{primitive}.confidence.v1"),
                 })
             })
             .ok_or_else(|| "decision confidence is not a number".to_owned()),
@@ -675,7 +785,7 @@ mod tests {
             decode_response(&frozen(), &choice_request(), reference(), &raw).expect("decoded");
         assert_eq!(usage.input_tokens, Some(120));
         assert_eq!(result.reported_model.as_deref(), Some("jev-1.13.0"));
-        assert_eq!(result.model_version.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(result.model_version, None);
         let DecisionOutcome::Answer {
             answer:
                 DecisionAnswer::Choice {
@@ -690,7 +800,7 @@ mod tests {
         assert_eq!(selected, "prepare");
         assert_eq!(
             confidence.expect("confidence").semantics,
-            CONFIDENCE_SEMANTICS
+            "provider.typesafe.choice.confidence.v1"
         );
 
         let score = DecisionRequest {
@@ -745,5 +855,89 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+    #[test]
+    fn native_limits_instructions_and_answer_space_are_enforced() {
+        let mut config = frozen();
+        config.agent.instructions = Some("Prefer deferral when evidence is missing".into());
+        let request = choice_request();
+        let body = request_body(&config, &request).unwrap();
+        assert_eq!(
+            body["questions"]["decision"]["instructions"]["profile"],
+            config.agent.instructions.as_deref().unwrap()
+        );
+        config.model.limits.max_input_tokens_per_question = Some(32);
+        assert!(request_body(&config, &request).is_err());
+        config.model.limits = Default::default();
+        let mut too_many = request;
+        if let DecisionQuestion::Choice { options, .. } = &mut too_many.question {
+            *options = (0..256)
+                .map(|id| ChoiceOption {
+                    id: format!("option{id}"),
+                    description: format!("Choice {id}"),
+                })
+                .collect();
+        }
+        assert!(request_body(&config, &too_many).is_err());
+        let score = DecisionRequest {
+            schema_version: 1,
+            state: json!("facts"),
+            question: DecisionQuestion::OrdinalScore {
+                prompt: "rank".into(),
+                levels: (0..11)
+                    .map(|value| ScoreLevel {
+                        value,
+                        description: value.to_string(),
+                    })
+                    .collect(),
+            },
+        };
+        assert!(request_body(&config, &score).is_err());
+        config.agent.workspace_access = crate::persistence::WorkspaceAccess::Full;
+        assert!(request_body(&config, &choice_request()).is_err());
+    }
+    #[test]
+    fn extra_distribution_keys_and_over_limit_usage_are_not_accepted() {
+        let raw = json!({"model":"jev", "answers":{"decision":{"type":"choice","choice":"prepare","probabilities":{"skip":0.2,"prepare":0.8,"unexpected":0.0}}},"usage":{"input_tokens":12,"output_tokens":4}});
+        assert!(decode_response(&frozen(), &choice_request(), reference(), &raw).is_err());
+        let mut valid = raw;
+        valid["answers"]["decision"]["probabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unexpected");
+        let mut config = frozen();
+        config.model.limits.max_output_tokens_per_request = Some(3);
+        assert!(decode_response(&config, &choice_request(), reference(), &valid).is_err());
+    }
+    #[test]
+    fn credential_echoes_are_redacted_before_normalization_and_persistence() {
+        let raw = json!({"model":"reported-test-secret", "answers":{"decision":{"type":"choice","choice":"prepare","probabilities":{"skip":0.2,"prepare":0.8}}},
+            "usage":{"input_tokens":12,"output_tokens":4,"provider_note":"test-secret"}});
+        let execution = decode_decision(
+            &frozen(),
+            &choice_request(),
+            reference(),
+            200,
+            serde_json::to_vec(&raw).unwrap(),
+            &Redactor::new(Some("test-secret")),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(
+            !execution
+                .result
+                .reported_model
+                .unwrap()
+                .contains("test-secret")
+        );
+        assert!(
+            !execution
+                .usage
+                .raw
+                .unwrap()
+                .to_string()
+                .contains("test-secret")
+        );
+        assert!(!execution.raw.to_string().contains("test-secret"));
     }
 }

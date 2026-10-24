@@ -48,16 +48,35 @@ export type WireConversations = { conversations: Array<WireConversation>, has_mo
 
 export type WireConversationLimits = { conversation: string, depth: number, remaining_depth: number, max_depth: number, max_auto_turns: number, max_iterations: number, };
 
+export type WireCompactionPreset = "conservative" | "balanced" | "aggressive";
+
+export type WireCustomCompaction = { trigger_tokens: number, target_tokens: number, reserved_output_tokens: number, minimum_source_tokens: number, minimum_savings_tokens: number, preserve_recent_turns: number, cooldown_seconds: number, };
+
+export type WireCompactionMode = { "kind": "off" } | { "kind": "auto", preset: WireCompactionPreset, } | { "kind": "custom", policy: WireCustomCompaction, };
+
+export type WirePredictiveCompaction = { decision_agent: string, minimum_interval_seconds: number, max_preparations: number, max_prediction_tokens: number, max_preparation_tokens: number, };
+
+export type WireCompactionPolicy = { mode: WireCompactionMode, summarization_model: string | null, predictive: WirePredictiveCompaction | null, };
+
+export type WireContextModel = { profile: string, edit_seq: number, model: string, capacity: number | null, capacity_source: string, reserved_output_tokens: number, };
+
+export type WireContextUse = { turn: string, seq: number, artifact: string | null, };
+
+export type WireContextBoundary = { turn: string, input_through: number, output_through: number, fingerprint: string, };
+
+export type WireContextSource = { digest: string, first: WireContextBoundary, through: WireContextBoundary, turn_count: number, };
+
+export type WireContextWork = { "kind": "summarization", job: string, conversation: string, state: string, summarizer: string, automatic: boolean, source: WireContextSource, } | { "kind": "prediction", job: string, conversation: string, state: string, predictor: string, model: string, activity_turn: string, policy_revision: number, max_tokens: number, forecast_tokens: number | null, result: JsonValue | null, };
+
 export type WireContextStatus = { conversation: string,
 /**
- * `disabled`, a preset name, `custom`, or `inherited` when no
- * conversation override is stored.
+ * Effective mode; `policy_source` names the winning override.
  */
 mode: string, summarizer: string | null, predictive: boolean, predictive_unavailable: string | null, revision: number,
 /**
  * Preset numbers are a proposal, not a calibrated default.
  */
-uncalibrated: boolean, };
+uncalibrated: boolean, policy: WireCompactionPolicy, policy_override: WireCompactionPolicy | null, policy_source: string, predictor: string | null, predictor_model: string | null, prediction_mode: string, predictive_preparation_enabled: boolean, foreground_model: WireContextModel | null, estimated_tokens: number | null, estimate_method: string, recent_growth_tokens: number, last_context_use: WireContextUse | null, work: Array<WireContextWork>, has_more: boolean, next_before: string | null, };
 
 export type WireRecurrence = { interval_s: number, phase: string, due_us: number | null, };
 
@@ -116,7 +135,7 @@ profile_type?: string, name: string, instructions: string | null, tool_grant: st
  * The Decision Profile this Agent may ask for typed advice. Absent
  * means none is assigned. Optional for clients that do not read it.
  */
-decision_assistance?: string, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
+decision_assistance?: string, compaction_policy?: WireCompactionPolicy, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
 
 export type WireProvider = { protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, profile_ids: Array<string>, models: Array<string>, };
 

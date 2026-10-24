@@ -220,10 +220,94 @@ contracts! {
         pub max_auto_turns: u8,
         pub max_iterations: u32,
     }
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum WireCompactionPreset { Conservative, Balanced, Aggressive }
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireCustomCompaction {
+        pub trigger_tokens: u32,
+        pub target_tokens: u32,
+        pub reserved_output_tokens: u32,
+        pub minimum_source_tokens: u32,
+        pub minimum_savings_tokens: u32,
+        pub preserve_recent_turns: u32,
+        pub cooldown_seconds: u32,
+    }
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum WireCompactionMode {
+        Off,
+        Auto { preset: WireCompactionPreset },
+        Custom { policy: WireCustomCompaction },
+    }
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WirePredictiveCompaction {
+        pub decision_agent: String,
+        pub minimum_interval_seconds: u32,
+        pub max_preparations: u32,
+        pub max_prediction_tokens: u32,
+        pub max_preparation_tokens: u32,
+    }
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireCompactionPolicy {
+        pub mode: WireCompactionMode,
+        pub summarization_model: Option<String>,
+        pub predictive: Option<WirePredictiveCompaction>,
+    }
+    struct WireContextModel {
+        pub profile: String,
+        pub edit_seq: u32,
+        pub model: String,
+        pub capacity: Option<u32>,
+        pub capacity_source: String,
+        pub reserved_output_tokens: u32,
+    }
+    struct WireContextUse {
+        pub turn: String,
+        pub seq: u32,
+        pub artifact: Option<String>,
+    }
+    struct WireContextBoundary {
+        pub turn: String,
+        pub input_through: u32,
+        pub output_through: u32,
+        pub fingerprint: String,
+    }
+    struct WireContextSource {
+        pub digest: String,
+        pub first: WireContextBoundary,
+        pub through: WireContextBoundary,
+        pub turn_count: usize,
+    }
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum WireContextWork {
+        Summarization {
+            job: String,
+            conversation: String,
+            state: String,
+            summarizer: String,
+            automatic: bool,
+            source: WireContextSource,
+        },
+        Prediction {
+            job: String,
+            conversation: String,
+            state: String,
+            predictor: String,
+            model: String,
+            activity_turn: String,
+            policy_revision: u64,
+            max_tokens: u32,
+            forecast_tokens: Option<u64>,
+            result: Option<Value>,
+        },
+    }
     struct WireContextStatus {
         pub conversation: String,
-        /// `disabled`, a preset name, `custom`, or `inherited` when no
-        /// conversation override is stored.
+        /// Effective mode; `policy_source` names the winning override.
         pub mode: String,
         pub summarizer: Option<String>,
         pub predictive: bool,
@@ -231,6 +315,21 @@ contracts! {
         pub revision: u64,
         /// Preset numbers are a proposal, not a calibrated default.
         pub uncalibrated: bool,
+        pub policy: WireCompactionPolicy,
+        pub policy_override: Option<WireCompactionPolicy>,
+        pub policy_source: String,
+        pub predictor: Option<String>,
+        pub predictor_model: Option<String>,
+        pub prediction_mode: String,
+        pub predictive_preparation_enabled: bool,
+        pub foreground_model: Option<WireContextModel>,
+        pub estimated_tokens: Option<u64>,
+        pub estimate_method: String,
+        pub recent_growth_tokens: u32,
+        pub last_context_use: Option<WireContextUse>,
+        pub work: Vec<WireContextWork>,
+        pub has_more: bool,
+        pub next_before: Option<String>,
     }
     struct WireRecurrence {
         pub interval_s: u32,
@@ -443,6 +542,9 @@ contracts! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         pub decision_assistance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub compaction_policy: Option<WireCompactionPolicy>,
         pub editable: bool,
         pub blocking_jobs: Vec<String>,
         pub more_blocking_jobs: bool,
@@ -948,5 +1050,92 @@ impl WireLlmParameters {
             presence_penalty: value.presence_penalty,
             frequency_penalty: value.frequency_penalty,
         }
+    }
+}
+
+impl WireCompactionPolicy {
+    pub(super) fn from_policy(policy: crate::persistence::CompactionPolicy) -> Self {
+        use crate::persistence::{CompactionMode, CompactionPreset};
+        Self {
+            mode: match policy.mode {
+                CompactionMode::Off => WireCompactionMode::Off,
+                CompactionMode::Auto { preset } => WireCompactionMode::Auto {
+                    preset: match preset {
+                        CompactionPreset::Conservative => WireCompactionPreset::Conservative,
+                        CompactionPreset::Balanced => WireCompactionPreset::Balanced,
+                        CompactionPreset::Aggressive => WireCompactionPreset::Aggressive,
+                    },
+                },
+                CompactionMode::Custom { policy } => WireCompactionMode::Custom {
+                    policy: WireCustomCompaction {
+                        trigger_tokens: policy.trigger_tokens,
+                        target_tokens: policy.target_tokens,
+                        reserved_output_tokens: policy.reserved_output_tokens,
+                        minimum_source_tokens: policy.minimum_source_tokens,
+                        minimum_savings_tokens: policy.minimum_savings_tokens,
+                        preserve_recent_turns: policy.preserve_recent_turns,
+                        cooldown_seconds: policy.cooldown_seconds,
+                    },
+                },
+            },
+            summarization_model: policy.summarization_model.map(|id| id.to_string()),
+            predictive: policy
+                .predictive
+                .map(|prediction| WirePredictiveCompaction {
+                    decision_agent: prediction.decision_agent.to_string(),
+                    minimum_interval_seconds: prediction.minimum_interval_seconds,
+                    max_preparations: prediction.max_preparations,
+                    max_prediction_tokens: prediction.max_prediction_tokens,
+                    max_preparation_tokens: prediction.max_preparation_tokens,
+                }),
+        }
+    }
+    pub(super) fn into_policy(
+        self,
+    ) -> Result<crate::persistence::CompactionPolicy, super::Refusal> {
+        use crate::persistence::{
+            CompactionMode, CompactionPreset, CustomPolicy, PredictiveCompaction,
+        };
+        let id = |value: String| {
+            super::profiles::profile_id(&value).map(crate::persistence::ConfigId::from)
+        };
+        let policy = crate::persistence::CompactionPolicy {
+            mode: match self.mode {
+                WireCompactionMode::Off => CompactionMode::Off,
+                WireCompactionMode::Auto { preset } => CompactionMode::Auto {
+                    preset: match preset {
+                        WireCompactionPreset::Conservative => CompactionPreset::Conservative,
+                        WireCompactionPreset::Balanced => CompactionPreset::Balanced,
+                        WireCompactionPreset::Aggressive => CompactionPreset::Aggressive,
+                    },
+                },
+                WireCompactionMode::Custom { policy } => CompactionMode::Custom {
+                    policy: CustomPolicy {
+                        trigger_tokens: policy.trigger_tokens,
+                        target_tokens: policy.target_tokens,
+                        reserved_output_tokens: policy.reserved_output_tokens,
+                        minimum_source_tokens: policy.minimum_source_tokens,
+                        minimum_savings_tokens: policy.minimum_savings_tokens,
+                        preserve_recent_turns: policy.preserve_recent_turns,
+                        cooldown_seconds: policy.cooldown_seconds,
+                    },
+                },
+            },
+            summarization_model: self.summarization_model.map(id).transpose()?,
+            predictive: self
+                .predictive
+                .map(|prediction| {
+                    Ok::<_, super::Refusal>(PredictiveCompaction {
+                        decision_agent: id(prediction.decision_agent)?,
+                        minimum_interval_seconds: prediction.minimum_interval_seconds,
+                        max_preparations: prediction.max_preparations,
+                        max_prediction_tokens: prediction.max_prediction_tokens,
+                        max_preparation_tokens: prediction.max_preparation_tokens,
+                    })
+                })
+                .transpose()?,
+        };
+        policy.validate().map_err(|_| super::INVALID_REQUEST)?;
+        Ok(policy)
     }
 }

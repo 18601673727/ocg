@@ -40,7 +40,11 @@ pub(super) enum Route {
         limit: usize,
     },
     ConversationLimits(JobId),
-    ConversationContext(JobId),
+    ConversationContext {
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    },
     ConversationNotices {
         conversation: JobId,
         after: u32,
@@ -139,7 +143,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ConversationChildren { .. }
             | Route::ConversationTurns { .. }
             | Route::ConversationLimits(_)
-            | Route::ConversationContext(_)
+            | Route::ConversationContext { .. }
             | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
             | Route::ProviderResponses { .. }
@@ -340,7 +344,13 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             })
         }
         ["conversations", conversation, "context"] => {
-            no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationContext))
+            let conversation = job_id(conversation)?;
+            let (before, limit) = catalog::page_query(query, job_id)?;
+            Ok(Route::ConversationContext {
+                conversation,
+                before,
+                limit,
+            })
         }
         ["conversations", conversation, "limits"] => {
             no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationLimits))
@@ -498,9 +508,11 @@ pub(super) async fn respond(
         Route::ConversationLimits(conversation) => {
             catalog::conversation_limits(database, conversation).await
         }
-        Route::ConversationContext(conversation) => {
-            catalog::conversation_context(database, conversation).await
-        }
+        Route::ConversationContext {
+            conversation,
+            before,
+            limit,
+        } => catalog::conversation_context(database, conversation, before, limit).await,
         Route::ConversationTurns {
             conversation,
             before,

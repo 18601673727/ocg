@@ -178,14 +178,67 @@ impl Batch {
             if let Err(message) = work.validate() {
                 return self.reject(Violation::InvalidValue("execution", message));
             }
+            if work.prediction.is_some()
+                && !self.step(|tx| {
+                    reads::prediction_current(
+                        &tx.open_table(JOBS)?,
+                        &tx.open_table(CONFIGS)?,
+                        &tx.open_table(CONVERSATIONS)?,
+                        &tx.open_table(TIPS)?,
+                        spec,
+                    )
+                })?
+            {
+                return self.reject(Violation::InvalidValue(
+                    "execution",
+                    "prediction binding is no longer current",
+                ));
+            }
             if !self
                 .open_pools()?
                 .iter()
-                .any(|pool| pool.has_room() && pool.offers(decision_requirement()))
+                .any(|pool| pool.body.enabled && pool.offers(decision_requirement()))
             {
                 return self.reject(Violation::InvalidValue(
                     "execution",
                     "no enabled Executor offers decision work",
+                ));
+            }
+        }
+        if let JobKind::Turn {
+            execution: TurnExecution::Summarization(work),
+            ..
+        } = &spec.kind
+        {
+            if work.target_tokens == 0
+                || work.frozen.agent.is_some()
+                || work.frozen.agent_ref.is_some()
+            {
+                return self.reject(Violation::InvalidValue(
+                    "execution",
+                    "summarization requires a positive target and no Agent authority",
+                ));
+            }
+            let manifest = self
+                .step(|tx| reads::load_context_manifest(&tx.open_table(MESSAGES)?, work.source))?;
+            let parent = spec
+                .parent_id
+                .map(|parent| self.require_job(parent))
+                .transpose()?;
+            if !parent.is_some_and(|parent| {
+                parent.parent_id == Some(manifest.conversation)
+                    && matches!(
+                        parent.kind,
+                        JobKind::Conversation {
+                            origin: Origin::System,
+                            ..
+                        }
+                    )
+            }) || !self.source_still_matches(&manifest)?
+            {
+                return self.reject(Violation::InvalidValue(
+                    "execution",
+                    "summarization must name a valid sealed source in its parent conversation",
                 ));
             }
         }
@@ -702,18 +755,26 @@ impl Batch {
     /// numbers are the uncalibrated proposal.
     fn prepare_if_needed(&mut self, job: JobId) -> Result<bool, BatchError> {
         let row = self.require_job(job)?;
-        if !row.kind.is_stored() {
-            return Ok(false);
+        if !self.step(|tx| {
+            reads::prediction_current(
+                &tx.open_table(JOBS)?,
+                &tx.open_table(CONFIGS)?,
+                &tx.open_table(CONVERSATIONS)?,
+                &tx.open_table(TIPS)?,
+                &row,
+            )
+        })? {
+            self.finalize(job, OutcomeKind::Cancelled, None, Some(FinalResult {
+                summary: Some("context prediction opt-in, assignment or activity changed before execution".into()),
+                code: Some("prediction_stale".into()), goal_reached: Some(false), value: None,
+            }), false)?;
+            return Ok(true);
         }
-        if row.kind.name() == Some(crate::persistence::COMPACTION_JOB_NAME) {
-            return Ok(false);
-        }
-        // A decision turn has no generative config. Policy resolution uses
-        // that config, so this check must not send decision work through it.
-        if matches!(
+        if !matches!(
             row.kind,
             JobKind::Turn {
-                execution: TurnExecution::Decision(_),
+                execution: TurnExecution::Frozen(_) | TurnExecution::Ref(_),
+                plan_source: PlanSource::Stored { .. },
                 ..
             }
         ) {
@@ -722,108 +783,158 @@ impl Batch {
         let Some(conversation) = row.parent_id else {
             return Ok(false);
         };
-        let stored = self.conversation(conversation)?.compaction_policy;
-        let (_, _, agent_id) = self.turn_execution(&row)?;
-        let agent = match agent_id {
-            Some(agent) => match self.config(agent)?.map(|record| record.body) {
-                Some(ConfigBody::Agent(agent)) => agent.compaction_policy,
-                Some(_) => None,
-                None => None,
-            },
-            None => None,
-        };
-        let policy = crate::persistence::CompactionPolicy::resolve(
-            crate::persistence::CompactionPolicy::default(),
-            agent,
-            stored,
-        );
+        self.select_context(job)?;
+        let (policy, revision, profile) = self.step(|tx| {
+            reads::effective_context_policy(
+                &tx.open_table(JOBS)?,
+                &tx.open_table(CONFIGS)?,
+                &tx.open_table(CONVERSATIONS)?,
+                conversation,
+            )
+        })?;
         if matches!(policy.mode, crate::persistence::CompactionMode::Off) {
             return Ok(false);
         }
-        let Some(summarizer) = policy.summarization_model else {
-            return Ok(false);
-        };
-        let Some(model) = self.config(summarizer)? else {
-            return Ok(false);
-        };
-        let ConfigBody::Model(model) = model.body else {
-            return Ok(false);
-        };
+        let (frozen, _, _) = self.turn_execution(&row)?;
+        let model = &frozen.llm.config;
         let output = model
             .parameters
             .max_completion_tokens
             .or(model.parameters.max_tokens)
             .unwrap_or(4096);
-        let recipe = policy
-            .recipe(model.context_window, output, 256, output)
-            .ok();
-        let Some(recipe) = recipe else {
-            return Ok(false);
-        };
-        let Some(trigger) = recipe.trigger else {
-            return Ok(false);
-        };
-        // A coarse occupancy: stored input and result bytes, three bytes a
-        // token. Cached billing tokens are not subtracted.
-        let occupancy = self.step(|tx| {
-            let mut cursor = Some(job);
-            let mut bytes = 0usize;
-            let mut seen = 0usize;
-            while let Some(turn) = cursor {
-                if seen >= 64 {
-                    break;
-                }
-                seen += 1;
-                let inputs = tx.open_table(TURN_INPUTS)?;
-                for entry in inputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
-                    bytes = bytes.saturating_add(entry?.1.value().len());
-                }
-                let row = tx
-                    .open_table(JOBS)?
-                    .get(turn.get())?
-                    .map(|bytes| JobRow::decode_at(turn.get(), bytes.value()))
-                    .transpose()?;
-                cursor = row.and_then(|row| row.kind.previous());
-            }
-            Ok(bytes.div_ceil(3))
+        let (mut occupancy, growth, _) = self.step(|tx| {
+            reads::raw_context_usage(
+                &tx.open_table(JOBS)?,
+                &tx.open_table(JOB_STATES)?,
+                &tx.open_table(TURN_INPUTS)?,
+                &tx.open_table(JOB_OUTPUTS)?,
+                job,
+            )
         })?;
-        if occupancy <= usize::try_from(trigger).unwrap_or(usize::MAX) {
+        if occupancy == usize::MAX {
             return Ok(false);
         }
-        let outstanding = self.live_children(conversation)?.into_iter().any(|child| {
-            self.job(child).ok().flatten().is_some_and(|row| {
-                row.kind.is_conversation()
-                    && self.tip(child).ok().flatten().is_some_and(|turn| {
-                        self.require_job(turn).ok().is_some_and(|turn| {
-                            turn.kind.name() == Some(crate::persistence::COMPACTION_JOB_NAME)
-                        })
-                    })
-            })
-        });
-        if outstanding {
-            return Ok(true);
+        if let Some(adopted) = self.adopt_context(job)? {
+            for boundary in &adopted.source.turns {
+                let source = self.step(|tx| {
+                    reads::source_turn(
+                        &tx.open_table(JOBS)?,
+                        &tx.open_table(JOB_STATES)?,
+                        &tx.open_table(TURN_INPUTS)?,
+                        &tx.open_table(JOB_OUTPUTS)?,
+                        &tx.open_table(TOOL_CALLS)?,
+                        &tx.open_table(APPROVALS)?,
+                        boundary.turn,
+                        Some((boundary.input_through, boundary.output_through)),
+                    )
+                })?;
+                occupancy =
+                    occupancy.saturating_sub(source.map_or(0, |turn| turn.reducible_tokens));
+            }
+            occupancy =
+                occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
         }
-        let mut bytes = [0u8; 32];
-        bytes[..16].copy_from_slice(&conversation.get().to_le_bytes());
-        bytes[16..].copy_from_slice(&job.get().to_le_bytes());
-        let key = crate::persistence::SubmissionKey::from_digest(bytes);
-        let fingerprint = crate::persistence::RequestFingerprint::from_digest(bytes);
-        // A source the summarizer cannot fit is not prepared and does not
-        // block the turn. Manual compaction still refuses that case.
-        if occupancy
-            > usize::try_from(model.context_window.unwrap_or(0).saturating_sub(output))
-                .unwrap_or(usize::MAX)
+        let safety = u32::try_from(
+            frozen
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.instructions.as_ref())
+                .map_or(0, String::len)
+                .div_ceil(3),
+        )
+        .unwrap_or(u32::MAX)
+        .saturating_add(256);
+        let Ok(recipe) = policy.recipe(model.context_window, output, safety, growth.max(output))
+        else {
+            return Ok(false);
+        };
+        if recipe
+            .trigger
+            .is_none_or(|trigger| occupancy <= trigger as usize)
         {
             return Ok(false);
         }
-        match self.request_compaction(
-            conversation,
-            summarizer,
-            crate::persistence::NewSubmission { key, fingerprint },
-        ) {
-            Ok(crate::persistence::CompactionRequest::Prepared { .. }) => Ok(true),
-            Ok(crate::persistence::CompactionRequest::Noop { .. }) => Ok(false),
-            Err(error) => Err(error),
+        let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
+        if !self.config(summarizer)?.is_some_and(|record| {
+            record.archived_at.is_none() && matches!(record.body, ConfigBody::Model(_))
+        }) {
+            return Ok(false);
+        }
+        let summarizer_row = self.require_config(summarizer)?;
+        let ConfigBody::Model(summarizer_body) = summarizer_row.body else {
+            return Ok(false);
+        };
+        let Some(connection) = self.config(summarizer_body.connection_id)? else {
+            return Ok(false);
+        };
+        let ConfigBody::Connection(connection_body) = connection.body else {
+            return Ok(false);
+        };
+        if connection.archived_at.is_some()
+            || !self.open_pools()?.iter().any(|pool| {
+                pool.body.enabled
+                    && pool.offers(requirement(
+                        Some(ExecutionOperation::LlmRequest),
+                        Some(connection_body.protocol),
+                    ))
+            })
+        {
+            return Ok(false);
+        }
+        let mut identity = [0u8; 32];
+        identity[..16].copy_from_slice(&conversation.get().to_le_bytes());
+        identity[16..].copy_from_slice(&job.get().to_le_bytes());
+        let key = crate::persistence::SubmissionKey::from_digest(identity);
+        if let Some(submission) = self.submission(key)? {
+            return Ok(self.require_job_state(submission.job)?.outcome.is_none());
+        }
+        for producer in self.context_compaction_jobs(conversation)? {
+            let producer_row = self.require_job(producer)?;
+            let JobKind::Turn {
+                execution: TurnExecution::Summarization(work),
+                ..
+            } = producer_row.kind
+            else {
+                continue;
+            };
+            if work
+                .policy_revision
+                .is_some_and(|bound| bound != revision || work.policy_profile != profile)
+            {
+                continue;
+            }
+            let state = self.require_job_state(producer)?;
+            if state.outcome.is_none() {
+                return Ok(true);
+            }
+            if state.outcome.is_some_and(|outcome| {
+                self.now
+                    .as_unix_micros()
+                    .saturating_sub(outcome.at.as_unix_micros())
+                    < i64::from(recipe.cooldown_seconds).saturating_mul(1_000_000)
+            }) {
+                return Ok(false);
+            }
+        }
+        if !self.background_room(false)? {
+            return Ok(false);
+        }
+        let submission = crate::persistence::NewSubmission {
+            key,
+            fingerprint: crate::persistence::RequestFingerprint::from_digest(identity),
+        };
+        match self.request_compaction_for(conversation, summarizer, submission, Some(recipe))? {
+            crate::persistence::CompactionRequest::Prepared { job, .. } => {
+                self.insert_turn_input(
+                    row.id,
+                    Entry::ContextPreparation {
+                        job,
+                        policy_revision: revision,
+                    },
+                )?;
+                Ok(self.require_job_state(job)?.outcome.is_none())
+            }
+            crate::persistence::CompactionRequest::Noop { .. } => Ok(false),
         }
     }
 
@@ -854,6 +965,7 @@ impl Batch {
             })?;
             // Adoption is checked in this claim. A mismatch leaves the
             // original records in the prompt; it does not refuse the claim.
+            self.select_context(job)?;
             let _adopted = self.adopt_context(job)?;
         }
         state.claim = Some(ClaimRecord {
@@ -959,6 +1071,9 @@ impl Batch {
         };
         let (pool_id, edit_seq, pool_capabilities) =
             (pool.id, pool.edit_seq, pool.body.capabilities.clone());
+        if self.prepare_if_needed(job)? {
+            return Ok(Err(ClaimRefusal::NotPending));
+        }
         self.write_claim(
             job,
             requirement_key,

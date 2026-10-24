@@ -210,8 +210,13 @@ pub(super) enum Command {
         edit: ConversationEdit,
         reply: Reply<()>,
     },
-    /// Requests one manual compaction. The key deduplicates it; the model
-    /// must be generative. A source that will not fit is refused.
+    /// Schedules optional, bounded shadow prediction after conversation activity.
+    PredictContext {
+        conversation: JobId,
+        reply: Reply<Option<JobId>>,
+    },
+    /// Requests one idempotent manual compaction using a generative model.
+    /// A source that will not fit is refused.
     RequestCompaction {
         conversation: JobId,
         model: ConfigId,
@@ -601,6 +606,12 @@ impl Command {
                 reply,
                 |batch| persistence::set_conversation(batch, root, edit),
             ),
+            Self::PredictContext {
+                conversation,
+                reply,
+            } => run(database, operation, commit, Kind::Open, reply, |batch| {
+                batch.predict_context(conversation)
+            }),
             Self::RequestCompaction {
                 conversation,
                 model,
@@ -747,10 +758,11 @@ impl Command {
             Self::CreateClaimedFixture { job, .. } => {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
-            Self::ClaimExecution { request, .. } => {
-                byte_count(request.allowed_pools.len()).saturating_mul(8)
-            }
-            Self::ClaimBatch { .. } | Self::BoundaryB { .. } => 4096,
+            Self::ClaimExecution { request, .. } => byte_count(request.allowed_pools.len())
+                .saturating_mul(8)
+                .saturating_add(4096 * 512),
+            Self::ClaimBatch { .. } => 2 * 4096 * 512,
+            Self::BoundaryB { .. } => 4096,
             Self::DecideApproval { decision, .. } => match decision {
                 persistence::ApprovalDecision::Answered { text } => byte_count(text.len()),
                 persistence::ApprovalDecision::Approved
@@ -854,7 +866,8 @@ impl Command {
             },
             // The sealed source is already stored. This records one system
             // child and a short instruction, not a second copy of the source.
-            Self::RequestCompaction { .. } => 4096,
+            Self::PredictContext { .. } => 131072,
+            Self::RequestCompaction { .. } => 4096 * 512,
             Self::ArchiveModel { .. } => 16,
             Self::ImportModels {
                 connection, models, ..
@@ -975,6 +988,7 @@ impl Command {
             Self::CreateProject { reply, .. } => refuse(reply, error),
             Self::UpdateProject { reply, .. } => refuse(reply, error),
             Self::SetConversation { reply, .. } => refuse(reply, error),
+            Self::PredictContext { reply, .. } => refuse(reply, error),
             Self::RequestCompaction { reply, .. } => refuse(reply, error),
             Self::CreateConfig { reply, .. } => refuse(reply, error),
             Self::UpdateConfig { reply, .. } => refuse(reply, error),

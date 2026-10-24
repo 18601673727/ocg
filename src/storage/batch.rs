@@ -556,8 +556,23 @@ impl Batch {
                     "predictive compaction requires a configured decision model",
                 ));
             }
+            if body.workspace_access != crate::persistence::WorkspaceAccess::None {
+                return self.reject(Violation::InvalidValue(
+                    "decision_agent",
+                    "context prediction requires Input Only access",
+                ));
+            }
+            let selected = body.default_model.or_else(|| body.models.first().copied());
             for model in body.models {
-                self.require_config_kind(model, ConfigKind::DecisionModel)?;
+                let record = self.require_config_kind(model, ConfigKind::DecisionModel)?;
+                if selected == Some(model)
+                    && !matches!(record.body, ConfigBody::DecisionModel(model) if model.declared_capabilities.contains(&crate::persistence::DecisionCapability::Choice))
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "decision_agent",
+                        "context prediction requires Choice capability",
+                    ));
+                }
             }
         }
         Ok(())

@@ -52,6 +52,7 @@ pub(super) fn turn_execution(
     };
     let execution = match execution {
         TurnExecution::Frozen(execution) => execution.clone(),
+        TurnExecution::Summarization(work) => work.frozen.clone(),
         TurnExecution::Decision(_) => {
             return Err(StorageError::corrupted(
                 "decision work cannot use the generative context reader",
@@ -1340,7 +1341,11 @@ pub(crate) fn read_profile_page(
         last = Some(ConfigId::new(id));
         if matches!(
             row.body,
-            ConfigBody::Model(_) | ConfigBody::Agent(_) | ConfigBody::Pool(_)
+            ConfigBody::Model(_)
+                | ConfigBody::Agent(_)
+                | ConfigBody::Pool(_)
+                | ConfigBody::DecisionModel(_)
+                | ConfigBody::DecisionAgent(_)
         ) && row.archived_at.is_none()
         {
             records.push(config_record(row));
@@ -1360,18 +1365,23 @@ pub(crate) fn read_profile_page(
 
     let mut connections = BTreeMap::new();
     for record in &records {
-        let ConfigBody::Model(model) = &record.body else {
-            continue;
+        let connection_id = match &record.body {
+            ConfigBody::Model(model) => model.connection_id,
+            ConfigBody::DecisionModel(model) => model.connection_id,
+            ConfigBody::Agent(_)
+            | ConfigBody::DecisionAgent(_)
+            | ConfigBody::Pool(_)
+            | ConfigBody::Connection(_) => continue,
         };
-        if connections.contains_key(&model.connection_id) {
+        if connections.contains_key(&connection_id) {
             continue;
         }
-        let Some(bytes) = configs.get(model.connection_id.get())? else {
+        let Some(bytes) = configs.get(connection_id.get())? else {
             continue;
         };
-        let row = ConfigRow::decode_at(model.connection_id.get(), bytes.value())?;
+        let row = ConfigRow::decode_at(connection_id.get(), bytes.value())?;
         if let ConfigBody::Connection(connection) = row.body {
-            connections.insert(model.connection_id, connection);
+            connections.insert(connection_id, connection);
         }
     }
     Ok(ProfilePageRecords {
@@ -2701,12 +2711,920 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
     })
 }
 
+/// One immutable source turn, rendered as data for summarization. The hash
+/// covers framing, identity, frozen configuration, inputs, results and tools.
+pub(super) struct SealedTurn {
+    pub boundary: crate::persistence::SourceBoundary,
+    pub text: String,
+    pub reducible_tokens: usize,
+    pub context_tokens: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_turn(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    states: &impl ReadableTable<u128, &'static [u8]>,
+    inputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    outputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    tools: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    approvals: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    turn: JobId,
+    bounds: Option<(u32, u32)>,
+) -> Result<Option<SealedTurn>, StorageError> {
+    let Some(job) = jobs.get(turn.get())? else {
+        return Ok(None);
+    };
+    let row = JobRow::decode_at(turn.get(), job.value())?;
+    if matches!(
+        row.kind,
+        JobKind::Turn {
+            execution: TurnExecution::Decision(_),
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+    let Some(bytes) = states.get(turn.get())? else {
+        return Ok(None);
+    };
+    let state = JobStateRow::decode_at(turn.get(), bytes.value())?;
+    if !state.locally_stopped() {
+        return Ok(None);
+    }
+    let mut canonical = b"ocg-context-source-v2".to_vec();
+    let mut frame = |bytes: &[u8]| {
+        canonical.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(bytes);
+    };
+    frame(job.value());
+    frame(format!("{:?}", state.outcome).as_bytes());
+    let mut text = format!("Turn {turn}, outcome {:?}\n", state.outcome);
+    let mut input_bytes = 0usize;
+    let mut answer_bytes = 0usize;
+    let frozen = turn_execution(jobs, &row)?.0;
+    text.push_str(&format!(
+        "Frozen model {:?}; Agent {:?}. Active instructions are supplied separately.\n",
+        frozen.llm.model, frozen.agent_ref
+    ));
+    let mut input_through = 0u32;
+    for entry in inputs.range((turn.get(), 1)..=(turn.get(), bounds.map_or(u32::MAX, |b| b.0)))? {
+        let (key, bytes) = entry?;
+        if key.value().1 != input_through.saturating_add(1) {
+            return Ok(None);
+        }
+        input_through = key.value().1;
+        frame(bytes.value());
+        let entry = TurnEntry::decode(bytes.value())?;
+        match entry.entry {
+            Entry::UserMessage { text: message, attachments } => {
+                let message = format!("User ({turn}): {message}\nAttachments: {attachments:?}\n");
+                text.push_str(&message);
+                input_bytes = input_bytes.saturating_add(message.len());
+            }
+            Entry::AgentMessage { text: message, call } => {
+                let message = format!("Agent ({call:?}): {message}\n");
+                text.push_str(&message);
+                input_bytes = input_bytes.saturating_add(message.len());
+            }
+            Entry::Decision { approval } => {
+                if let Some(bytes) = approvals.get((approval.0.get(), approval.1, approval.2))? {
+                    frame(bytes.value());
+                    text.push_str(&format!("Approval: {:?}\n", ApprovalRecord::decode(bytes.value())?));
+                } else { return Ok(None); }
+            }
+            Entry::Notice { child, event, reference } => {
+                text.push_str(&format!("Notice from {child}: {event:?}, reference {reference}\n"));
+                for output in outputs.range((reference.get(), 0)..=(reference.get(), u32::MAX))? {
+                    let (key, bytes) = output?;
+                    let output = decode_output(key.value(), bytes.value())?;
+                    if output.kind == OutputKind::Result {
+                        frame(bytes.value());
+                        text.push_str(&format!("Referenced result: {:?} {:?}\n", output.summary, output.value));
+                    }
+                }
+            }
+            Entry::RetryOf { turn: original, by } => text.push_str(&format!("Retry of {original}, requested by {by:?}; previous tool effects must not be repeated automatically.\n")),
+            Entry::Iteration { n } => text.push_str(&format!("Iteration {n}\n")),
+            Entry::ResponseFormat { .. } | Entry::ContextPreparation { .. } | Entry::ContextUse { .. } => {}
+        }
+    }
+    let mut output_through = 0u32;
+    if bounds.is_none_or(|b| b.1 > 0) {
+        for entry in
+            outputs.range((turn.get(), 0)..=(turn.get(), bounds.map_or(u32::MAX, |b| b.1)))?
+        {
+            let (key, bytes) = entry?;
+            let output = decode_output(key.value(), bytes.value())?;
+            if output.kind == OutputKind::Result {
+                output_through = key.value().1;
+                frame(bytes.value());
+                answer_bytes =
+                    answer_bytes.saturating_add(output.summary.as_ref().map_or(0, String::len));
+                text.push_str(&format!(
+                    "Result: {:?} {:?}\n",
+                    output.summary, output.value
+                ));
+            }
+        }
+    }
+    for entry in tools.range((turn.get(), 0, 0)..=(turn.get(), u32::MAX, u32::MAX))? {
+        let (key, bytes) = entry?;
+        frame(bytes.value());
+        let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
+        text.push_str(&format!(
+            "Tool {} at {:?}, arguments {:?}, outcome {:?}, reconciliation {:?}\n",
+            call.name,
+            call.call,
+            call.admission()
+                .map(|admission| admission.arguments.as_str()),
+            call.outcome,
+            call.reconciliation
+        ));
+    }
+    if input_through == 0 || bounds.is_some_and(|b| b != (input_through, output_through)) {
+        return Ok(None);
+    }
+    Ok(Some(SealedTurn {
+        boundary: crate::persistence::SourceBoundary {
+            turn,
+            input_through,
+            output_through,
+            content: ContentDigest::of(&canonical),
+        },
+        text,
+        reducible_tokens: answer_bytes.div_ceil(3),
+        context_tokens: input_bytes
+            .saturating_add(answer_bytes)
+            .saturating_add(16)
+            .div_ceil(3),
+    }))
+}
+
+pub(super) fn load_context_manifest(
+    messages: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    digest: ContentDigest,
+) -> Result<crate::persistence::ContextSourceManifest, StorageError> {
+    let bytes = messages
+        .get(digest.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("sealed source manifest missing"))?;
+    if ContentDigest::of(bytes.value()) != digest {
+        return Err(StorageError::corrupted("source manifest digest mismatch"));
+    }
+    let manifest: crate::persistence::ContextSourceManifest = serde_json::from_slice(bytes.value())
+        .map_err(|_| StorageError::corrupted("invalid source manifest"))?;
+    manifest.validate().map_err(StorageError::corrupted)?;
+    Ok(manifest)
+}
+
+pub(super) fn source_is_prefix(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    consumer: &JobRow,
+    manifest: &crate::persistence::ContextSourceManifest,
+) -> Result<bool, StorageError> {
+    if consumer.parent_id != Some(manifest.conversation) {
+        return Ok(false);
+    }
+    source_is_prefix_from(
+        jobs,
+        manifest.conversation,
+        consumer.kind.previous(),
+        manifest,
+    )
+}
+
+fn source_is_prefix_from(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    conversation: JobId,
+    mut cursor: Option<JobId>,
+    manifest: &crate::persistence::ContextSourceManifest,
+) -> Result<bool, StorageError> {
+    let mut reverse = Vec::new();
+    let mut seen = BTreeSet::new();
+    while let Some(turn) = cursor {
+        if !seen.insert(turn) || reverse.len() >= 4096 {
+            return Ok(false);
+        }
+        let Some(bytes) = jobs.get(turn.get())? else {
+            return Ok(false);
+        };
+        let row = JobRow::decode_at(turn.get(), bytes.value())?;
+        if row.parent_id != Some(conversation) {
+            return Ok(false);
+        }
+        reverse.push(turn);
+        cursor = row.kind.previous();
+    }
+    reverse.reverse();
+    Ok(reverse.len() >= manifest.turns.len()
+        && reverse
+            .iter()
+            .zip(&manifest.turns)
+            .all(|(turn, boundary)| *turn == boundary.turn))
+}
+
+pub(crate) struct AdoptedContext {
+    pub source: crate::persistence::ContextSourceManifest,
+    pub summary: String,
+}
+
+pub(super) fn effective_context_policy(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    configs: &impl ReadableTable<u128, &'static [u8]>,
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    conversation: JobId,
+) -> Result<(crate::persistence::CompactionPolicy, u64, Option<ConfigRef>), StorageError> {
+    let row = jobs
+        .get(conversation.get())?
+        .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+    let row = JobRow::decode_at(conversation.get(), row.value())?;
+    let JobKind::Conversation { agent, .. } = row.kind else {
+        return Err(StorageError::corrupted("expected conversation"));
+    };
+    let metadata = conversations
+        .get(conversation.get())?
+        .ok_or_else(|| StorageError::corrupted("conversation metadata missing"))?;
+    let metadata = ConversationRow::decode(metadata.value())?;
+    let profile = agent
+        .map(|id| {
+            configs
+                .get(id.get())?
+                .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
+    let profile_ref = profile
+        .as_ref()
+        .filter(|profile| profile.archived_at.is_none())
+        .map(|profile| ConfigRef {
+            id: profile.id,
+            edit_seq: profile.edit_seq,
+        });
+    let profile_policy = profile
+        .filter(|profile| profile.archived_at.is_none())
+        .and_then(|profile| match profile.body {
+            ConfigBody::Agent(agent) => agent.compaction_policy,
+            ConfigBody::Connection(_)
+            | ConfigBody::Model(_)
+            | ConfigBody::Pool(_)
+            | ConfigBody::DecisionModel(_)
+            | ConfigBody::DecisionAgent(_) => None,
+        });
+    Ok((
+        crate::persistence::CompactionPolicy::resolve(
+            Default::default(),
+            profile_policy,
+            metadata.compaction_policy,
+        ),
+        metadata.compaction_revision,
+        profile_ref,
+    ))
+}
+
+pub(super) fn raw_context_usage(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    states: &impl ReadableTable<u128, &'static [u8]>,
+    inputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    outputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    start: JobId,
+) -> Result<(usize, u32, u32), StorageError> {
+    let mut cursor = Some(start);
+    let mut seen = BTreeSet::new();
+    let mut total = 0usize;
+    let mut growth = 0usize;
+    let mut settled = 0u32;
+    while let Some(turn) = cursor {
+        if !seen.insert(turn) {
+            return Err(StorageError::corrupted("context ancestry cycle"));
+        }
+        if seen.len() > 4096 {
+            return Ok((usize::MAX, u32::try_from(growth).unwrap_or(u32::MAX), 4096));
+        }
+        let mut bytes = 16usize;
+        for entry in inputs.range((turn.get(), 1)..=(turn.get(), u32::MAX))? {
+            let entry = TurnEntry::decode(entry?.1.value())?;
+            match entry.entry {
+                Entry::UserMessage { text, attachments } => {
+                    bytes = bytes
+                        .saturating_add(text.len())
+                        .saturating_add(attachments.len().saturating_mul(4800));
+                }
+                Entry::AgentMessage { text, .. } => bytes = bytes.saturating_add(text.len()),
+                Entry::RetryOf { .. }
+                | Entry::Notice { .. }
+                | Entry::Decision { .. }
+                | Entry::Iteration { .. } => bytes = bytes.saturating_add(256),
+                Entry::ResponseFormat { .. }
+                | Entry::ContextPreparation { .. }
+                | Entry::ContextUse { .. } => {}
+            }
+        }
+        for output in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+            let (key, bytes_row) = output?;
+            let output = decode_output(key.value(), bytes_row.value())?;
+            if output.kind == OutputKind::Result {
+                bytes = bytes.saturating_add(output.summary.as_ref().map_or(0, String::len));
+            }
+        }
+        let tokens = bytes.div_ceil(3);
+        total = total.saturating_add(tokens);
+        let state = states
+            .get(turn.get())?
+            .ok_or_else(|| StorageError::corrupted("context turn state missing"))?;
+        if JobStateRow::decode_at(turn.get(), state.value())?.locally_stopped() {
+            settled = settled.saturating_add(1);
+            if settled <= 8 {
+                growth = growth.max(tokens);
+            }
+        }
+        let row = jobs
+            .get(turn.get())?
+            .ok_or_else(|| StorageError::corrupted("context turn missing"))?;
+        cursor = JobRow::decode_at(turn.get(), row.value())?.kind.previous();
+    }
+    Ok((total, u32::try_from(growth).unwrap_or(u32::MAX), settled))
+}
+
+pub(crate) fn read_effective_context_policy(
+    database: &Database,
+    conversation: JobId,
+) -> Result<Option<(crate::persistence::CompactionPolicy, u64, Option<ConfigRef>)>, StorageError> {
+    let rx = read(database)?;
+    if read_job_row(&rx, conversation)?.is_none_or(|row| !row.kind.is_conversation()) {
+        return Ok(None);
+    }
+    effective_context_policy(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(CONFIGS)?,
+        &rx.open_table(CONVERSATIONS)?,
+        conversation,
+    )
+    .map(Some)
+}
+
+pub(crate) struct ContextWorkState {
+    pub job: JobId,
+    pub conversation: JobId,
+    pub state: &'static str,
+    pub details: ContextWorkDetails,
+}
+pub(crate) enum ContextWorkDetails {
+    Summary {
+        summarizer: ConfigId,
+        automatic: bool,
+        source: ContentDigest,
+        first: crate::persistence::SourceBoundary,
+        through: crate::persistence::SourceBoundary,
+        turn_count: usize,
+    },
+    Prediction {
+        predictor: ConfigId,
+        model: ConfigId,
+        binding: crate::persistence::PredictionBinding,
+        forecast_tokens: Option<u64>,
+        result: Option<Box<crate::persistence::DecisionResult>>,
+    },
+}
+
+pub(crate) struct ContextState {
+    pub policy: crate::persistence::CompactionPolicy,
+    pub stored_override: Option<crate::persistence::CompactionPolicy>,
+    pub policy_source: &'static str,
+    pub revision: u64,
+    pub model: Option<FrozenLlmConfig>,
+    pub estimated_tokens: Option<u64>,
+    pub growth: u32,
+    pub predictor: Option<ConfigId>,
+    pub predictor_model: Option<ConfigId>,
+    pub prediction_unavailable: Option<&'static str>,
+    pub last_use: Option<(JobId, u32, Option<JobId>)>,
+    pub work: Vec<ContextWorkState>,
+    pub next_before: Option<JobId>,
+}
+
+pub(crate) fn read_context_state(
+    database: &Database,
+    conversation: JobId,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Option<ContextState>, StorageError> {
+    let rx = read(database)?;
+    let Some(owner) = read_job_row(&rx, conversation)? else {
+        return Ok(None);
+    };
+    if !owner.kind.is_conversation() {
+        return Ok(None);
+    }
+    let (policy, revision, profile) = effective_context_policy(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(CONFIGS)?,
+        &rx.open_table(CONVERSATIONS)?,
+        conversation,
+    )?;
+    let stored_override = read_conversation(&rx, conversation)?.compaction_policy;
+    let profile_policy = profile.map(|reference| read_config_record(&rx, reference.id)).transpose()?.flatten().is_some_and(|record| matches!(record.body, ConfigBody::Agent(agent) if agent.compaction_policy.is_some()));
+    let tip = rx
+        .open_table(TIPS)?
+        .get(conversation.get())?
+        .map(|value| JobId::new(value.value()));
+    let model = tip
+        .map(|tip| read_job_row(&rx, tip))
+        .transpose()?
+        .flatten()
+        .map(|row| turn_config(&rx, &row))
+        .transpose()?
+        .flatten()
+        .map(|frozen| frozen.llm);
+    let (raw, growth, _) = tip
+        .map(|tip| {
+            raw_context_usage(
+                &rx.open_table(JOBS)?,
+                &rx.open_table(JOB_STATES)?,
+                &rx.open_table(TURN_INPUTS)?,
+                &rx.open_table(JOB_OUTPUTS)?,
+                tip,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut tokens = raw;
+    let mut last_use = None;
+    let mut cursor = tip;
+    for _ in 0..32 {
+        let Some(turn) = cursor else {
+            break;
+        };
+        for entry in rx
+            .open_table(TURN_INPUTS)?
+            .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+            .rev()
+            .take(128)
+        {
+            let (key, bytes) = entry?;
+            if let Entry::ContextUse { artifact } = TurnEntry::decode(bytes.value())?.entry {
+                last_use = Some((turn, key.value().1, artifact));
+                break;
+            }
+        }
+        if last_use.is_some() {
+            break;
+        }
+        cursor = read_job_row(&rx, turn)?.and_then(|row| row.kind.previous());
+    }
+    if let Some(tip) = tip
+        && let Some(adopted) = adopted_context(&rx, tip)?
+    {
+        for boundary in &adopted.source.turns {
+            if let Some(turn) = source_turn(
+                &rx.open_table(JOBS)?,
+                &rx.open_table(JOB_STATES)?,
+                &rx.open_table(TURN_INPUTS)?,
+                &rx.open_table(JOB_OUTPUTS)?,
+                &rx.open_table(TOOL_CALLS)?,
+                &rx.open_table(APPROVALS)?,
+                boundary.turn,
+                Some((boundary.input_through, boundary.output_through)),
+            )? {
+                tokens = tokens.saturating_sub(turn.reducible_tokens);
+            }
+        }
+        tokens = tokens.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
+    }
+    let predictor = policy.predictive.map(|binding| binding.decision_agent);
+    let mut predictor_model = None;
+    let mut prediction_unavailable =
+        Some("prediction requires an explicitly assigned Decision Profile");
+    if let Some(predictor) = predictor {
+        prediction_unavailable = Some("assigned Decision Profile is unavailable or ineligible");
+        if let Some(record) = read_config_record(&rx, predictor)?
+            && record.archived_at.is_none()
+            && let ConfigBody::DecisionAgent(agent) = record.body
+            && agent.workspace_access == crate::persistence::WorkspaceAccess::None
+            && let Some(model) = agent
+                .default_model
+                .or_else(|| agent.models.first().copied())
+            && let Some(record) = read_config_record(&rx, model)?
+            && record.archived_at.is_none()
+            && matches!(record.body, ConfigBody::DecisionModel(model) if model.declared_capabilities.contains(&crate::persistence::DecisionCapability::Choice))
+        {
+            predictor_model = Some(model);
+            prediction_unavailable = None;
+        }
+        if predictor_model.is_some()
+            && model
+                .as_ref()
+                .is_none_or(|model| model.config.context_window.is_none())
+        {
+            prediction_unavailable = Some("foreground model capacity is unknown");
+        }
+    }
+    let limit = limit.clamp(1, 100);
+    let mut work = Vec::new();
+    let mut next_before = None;
+    let mut verify_remaining = 4096usize;
+    for (scanned, entry) in rx
+        .open_table(CHILD_CONVERSATIONS)?
+        .range((conversation.get(), 0)..(conversation.get(), before.map_or(u128::MAX, JobId::get)))?
+        .rev()
+        .enumerate()
+    {
+        let child = JobId::new(entry?.0.value().1);
+        if scanned >= limit.saturating_mul(4) || work.len() >= limit {
+            break;
+        }
+        next_before = Some(child);
+        let Some(job) = rx
+            .open_table(TIPS)?
+            .get(child.get())?
+            .map(|value| JobId::new(value.value()))
+        else {
+            continue;
+        };
+        let Some(row) = read_job_row(&rx, job)? else {
+            continue;
+        };
+        if let JobKind::Turn {
+            execution: TurnExecution::Decision(decision),
+            ..
+        } = &row.kind
+            && let Some(binding) = &decision.prediction
+        {
+            let state = read_state(&rx, job)?;
+            let current = prediction_current(
+                &rx.open_table(JOBS)?,
+                &rx.open_table(CONFIGS)?,
+                &rx.open_table(CONVERSATIONS)?,
+                &rx.open_table(TIPS)?,
+                &row,
+            )?;
+            let label = match state.outcome {
+                None if !current => "stale",
+                None if state.claim.is_some() => "predicting",
+                None => "queued",
+                Some(outcome) => match outcome.kind {
+                    OutcomeKind::Completed => "recorded",
+                    OutcomeKind::Failed => "failed",
+                    OutcomeKind::Cancelled => "cancelled",
+                    OutcomeKind::Unknown => "unknown",
+                },
+            };
+            let result = rx
+                .open_table(JOB_OUTPUTS)?
+                .range((job.get(), 0)..=(job.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+                .transpose()?
+                .and_then(|output| output.value)
+                .and_then(|value| value.get("decision").cloned())
+                .and_then(|value| serde_json::from_value(value).ok());
+            work.push(ContextWorkState {
+                job,
+                conversation: child,
+                state: label,
+                details: ContextWorkDetails::Prediction {
+                    predictor: decision.frozen.agent_ref.id,
+                    model: decision.frozen.model_ref.id,
+                    binding: binding.clone(),
+                    forecast_tokens: decision
+                        .request
+                        .state
+                        .get("deterministic_forecast_tokens")
+                        .and_then(serde_json::Value::as_u64),
+                    result,
+                },
+            });
+            continue;
+        }
+        let JobKind::Turn {
+            execution: TurnExecution::Summarization(summary_work),
+            ..
+        } = row.kind
+        else {
+            continue;
+        };
+        let manifest = load_context_manifest(&rx.open_table(MESSAGES)?, summary_work.source)?;
+        let first = manifest
+            .turns
+            .first()
+            .cloned()
+            .ok_or_else(|| StorageError::corrupted("empty context source"))?;
+        let through = manifest
+            .turns
+            .last()
+            .cloned()
+            .ok_or_else(|| StorageError::corrupted("empty context source"))?;
+        let state = read_state(&rx, job)?;
+        let label = if summary_work
+            .policy_revision
+            .is_some_and(|bound| bound != revision || summary_work.policy_profile != profile)
+        {
+            "discarded"
+        } else {
+            match state.outcome {
+                None if state.claim.is_some() => "preparing",
+                None => "queued",
+                Some(outcome) => match outcome.kind {
+                    OutcomeKind::Failed => "failed",
+                    OutcomeKind::Cancelled => "cancelled",
+                    OutcomeKind::Unknown => "unknown",
+                    OutcomeKind::Completed => {
+                        if last_use.is_some_and(|(_, _, artifact)| artifact == Some(job)) {
+                            "adopted"
+                        } else {
+                            "prepared"
+                        }
+                    }
+                },
+            }
+        };
+        let mut label = label;
+        if matches!(label, "prepared" | "adopted") {
+            let prefix_valid =
+                source_is_prefix_from(&rx.open_table(JOBS)?, conversation, tip, &manifest)?;
+            if !prefix_valid {
+                label = "incompatible";
+            } else if manifest.turns.len() > verify_remaining {
+                label = "unverified";
+            } else {
+                verify_remaining -= manifest.turns.len();
+                let output = rx
+                    .open_table(JOB_OUTPUTS)?
+                    .range((job.get(), 0)..=(job.get(), u32::MAX))?
+                    .next_back()
+                    .transpose()?
+                    .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+                    .transpose()?;
+                let summary_tokens = output
+                    .filter(|output| output.kind == OutputKind::Result)
+                    .and_then(|output| output.value)
+                    .and_then(|value| {
+                        serde_json::from_value::<crate::persistence::SummarizationResult>(value)
+                            .ok()
+                    })
+                    .filter(|result| {
+                        result.validate().is_ok() && result.source == summary_work.source
+                    })
+                    .map(|result| result.context_text().len().saturating_add(128).div_ceil(3));
+                if summary_tokens.is_none_or(|tokens| tokens > summary_work.target_tokens as usize)
+                {
+                    label = "incompatible";
+                }
+                let mut reducible = 0usize;
+                for boundary in &manifest.turns {
+                    if label == "incompatible" {
+                        break;
+                    }
+                    let source = source_turn(
+                        &rx.open_table(JOBS)?,
+                        &rx.open_table(JOB_STATES)?,
+                        &rx.open_table(TURN_INPUTS)?,
+                        &rx.open_table(JOB_OUTPUTS)?,
+                        &rx.open_table(TOOL_CALLS)?,
+                        &rx.open_table(APPROVALS)?,
+                        boundary.turn,
+                        Some((boundary.input_through, boundary.output_through)),
+                    )?;
+                    match source {
+                        Some(source) if source.boundary == *boundary => {
+                            reducible = reducible.saturating_add(source.reducible_tokens)
+                        }
+                        Some(_) | None => label = "incompatible",
+                    }
+                }
+                if summary_tokens.is_some_and(|tokens| {
+                    reducible.saturating_sub(tokens) < summary_work.minimum_savings_tokens as usize
+                }) {
+                    label = "incompatible";
+                }
+            }
+        }
+        work.push(ContextWorkState {
+            job,
+            conversation: child,
+            state: label,
+            details: ContextWorkDetails::Summary {
+                summarizer: summary_work.frozen.llm.model.id,
+                automatic: summary_work.policy_revision.is_some(),
+                source: summary_work.source,
+                first,
+                through,
+                turn_count: manifest.turns.len(),
+            },
+        });
+    }
+    if let Some(cursor) = next_before
+        && rx
+            .open_table(CHILD_CONVERSATIONS)?
+            .range((conversation.get(), 0)..(conversation.get(), cursor.get()))?
+            .next()
+            .is_none()
+    {
+        next_before = None;
+    }
+    Ok(Some(ContextState {
+        policy,
+        stored_override,
+        policy_source: if stored_override.is_some() {
+            "conversation"
+        } else if profile_policy {
+            "profile"
+        } else {
+            "host"
+        },
+        revision,
+        model,
+        estimated_tokens: (raw != usize::MAX).then_some(u64::try_from(tokens).unwrap_or(u64::MAX)),
+        growth,
+        predictor,
+        predictor_model,
+        prediction_unavailable,
+        last_use,
+        work,
+        next_before,
+    }))
+}
+
+fn read_config_record(
+    rx: &ReadTransaction,
+    id: ConfigId,
+) -> Result<Option<ConfigRecord>, StorageError> {
+    rx.open_table(CONFIGS)?
+        .get(id.get())?
+        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()).map(config_record))
+        .transpose()
+}
+
+pub(super) fn prediction_current(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    configs: &impl ReadableTable<u128, &'static [u8]>,
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    tips: &impl ReadableTable<u128, u128>,
+    row: &JobRow,
+) -> Result<bool, StorageError> {
+    let JobKind::Turn {
+        execution: TurnExecution::Decision(work),
+        ..
+    } = &row.kind
+    else {
+        return Ok(true);
+    };
+    let Some(prediction) = &work.prediction else {
+        return Ok(true);
+    };
+    let Some(parent) = row.parent_id else {
+        return Ok(false);
+    };
+    let Some(bytes) = jobs.get(parent.get())? else {
+        return Ok(false);
+    };
+    let parent = JobRow::decode_at(parent.get(), bytes.value())?;
+    if !matches!(
+        parent.kind,
+        JobKind::Conversation {
+            origin: Origin::System,
+            ..
+        }
+    ) {
+        return Ok(false);
+    }
+    let Some(conversation) = parent.parent_id else {
+        return Ok(false);
+    };
+    if prediction.conversation != conversation {
+        return Ok(false);
+    }
+    let (policy, revision, profile) =
+        effective_context_policy(jobs, configs, conversations, conversation)?;
+    let Some(binding) = policy.predictive else {
+        return Ok(false);
+    };
+    if binding.decision_agent != work.frozen.agent_ref.id
+        || prediction.policy_revision != revision
+        || prediction.policy_profile != profile
+        || prediction.max_tokens != binding.max_prediction_tokens
+    {
+        return Ok(false);
+    }
+    if tips
+        .get(conversation.get())?
+        .map(|value| JobId::new(value.value()))
+        != Some(prediction.activity_turn)
+    {
+        return Ok(false);
+    }
+    for reference in [
+        work.frozen.agent_ref,
+        work.frozen.model_ref,
+        work.frozen.connection_ref,
+    ] {
+        let Some(bytes) = configs.get(reference.id.get())? else {
+            return Ok(false);
+        };
+        let current = ConfigRow::decode_at(reference.id.get(), bytes.value())?;
+        if current.archived_at.is_some() || current.edit_seq != reference.edit_seq {
+            return Ok(false);
+        }
+    }
+    let metadata = conversations
+        .get(conversation.get())?
+        .ok_or_else(|| StorageError::corrupted("prediction owner missing"))?;
+    Ok(ConversationRow::decode(metadata.value())?.closing.is_none())
+}
+
+pub(crate) fn read_prediction_current(
+    database: &Database,
+    job: JobId,
+) -> Result<bool, StorageError> {
+    let rx = read(database)?;
+    let Some(row) = read_job_row(&rx, job)? else {
+        return Ok(false);
+    };
+    prediction_current(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(CONFIGS)?,
+        &rx.open_table(CONVERSATIONS)?,
+        &rx.open_table(TIPS)?,
+        &row,
+    )
+}
+
+pub(crate) struct SummarizationInput {
+    pub work: crate::persistence::SummarizationWork,
+    pub source: crate::persistence::ContextSourceManifest,
+    pub text: String,
+    pub source_tokens: usize,
+    pub current: bool,
+}
+
+pub(crate) fn read_summarization_input(
+    database: &Database,
+    job: JobId,
+) -> Result<Option<SummarizationInput>, StorageError> {
+    let rx = read(database)?;
+    let Some(row) = read_job_row(&rx, job)? else {
+        return Ok(None);
+    };
+    let JobKind::Turn {
+        execution: TurnExecution::Summarization(work),
+        ..
+    } = row.kind
+    else {
+        return Ok(None);
+    };
+    let source = load_context_manifest(&rx.open_table(MESSAGES)?, work.source)?;
+    let mut current = true;
+    if let Some(bound) = work.policy_revision {
+        let (policy, revision, profile) = effective_context_policy(
+            &rx.open_table(JOBS)?,
+            &rx.open_table(CONFIGS)?,
+            &rx.open_table(CONVERSATIONS)?,
+            source.conversation,
+        )?;
+        current = revision == bound
+            && profile == work.policy_profile
+            && !matches!(policy.mode, crate::persistence::CompactionMode::Off);
+    }
+    let mut text = String::new();
+    let mut reducible = 0usize;
+    for boundary in &source.turns {
+        let Some(sealed) = source_turn(
+            &rx.open_table(JOBS)?,
+            &rx.open_table(JOB_STATES)?,
+            &rx.open_table(TURN_INPUTS)?,
+            &rx.open_table(JOB_OUTPUTS)?,
+            &rx.open_table(TOOL_CALLS)?,
+            &rx.open_table(APPROVALS)?,
+            boundary.turn,
+            Some((boundary.input_through, boundary.output_through)),
+        )?
+        else {
+            current = false;
+            break;
+        };
+        if sealed.boundary != *boundary {
+            current = false;
+            break;
+        }
+        reducible = reducible.saturating_add(sealed.reducible_tokens);
+        text.push_str(&sealed.text);
+    }
+    let source_tokens = reducible;
+    Ok(Some(SummarizationInput {
+        work,
+        source,
+        text,
+        source_tokens,
+        current,
+    }))
+}
+
 /// The latest candidate whose sealed prefix is still the stored bytes.
 /// A failed check returns no summary; it does not fail the prompt read.
 fn adopted_context(
     rx: &ReadTransaction,
     turn: JobId,
-) -> Result<Option<crate::persistence::SummarizationResult>, StorageError> {
+) -> Result<Option<AdoptedContext>, StorageError> {
     let row = read_job_row(rx, turn)?.ok_or_else(|| StorageError::corrupted("turn missing"))?;
     if !row.kind.is_stored() {
         return Ok(None);
@@ -2721,6 +3639,13 @@ fn adopted_context(
         return Ok(None);
     };
     let Some(producer) = read_job_row(rx, artifact)? else {
+        return Ok(None);
+    };
+    let JobKind::Turn {
+        execution: TurnExecution::Summarization(work),
+        ..
+    } = &producer.kind
+    else {
         return Ok(None);
     };
     let Some(parent) = producer.parent_id else {
@@ -2753,48 +3678,43 @@ fn adopted_context(
         return Ok(None);
     };
     let result: crate::persistence::SummarizationResult = result;
-    if result.validate().is_err() || Some(result.source.conversation) != row.parent_id {
+    if result.source != work.source {
         return Ok(None);
     }
-    for boundary in &result.source.turns {
-        let mut input_through = 0u32;
-        let mut inputs = Vec::new();
-        for entry in rx
-            .open_table(TURN_INPUTS)?
-            .range((boundary.turn.get(), 1)..=(boundary.turn.get(), boundary.input_through))?
-        {
-            let (key, bytes) = entry?;
-            if key.value().1 != input_through.saturating_add(1) {
-                return Ok(None);
-            }
-            input_through = key.value().1;
-            inputs.extend_from_slice(bytes.value());
-        }
-        let mut output_through = 0u32;
-        let mut outputs = Vec::new();
-        if boundary.output_through > 0 {
-            for entry in rx
-                .open_table(JOB_OUTPUTS)?
-                .range((boundary.turn.get(), 0)..=(boundary.turn.get(), boundary.output_through))?
-            {
-                let (key, bytes) = entry?;
-                let record = decode_output(key.value(), bytes.value())?;
-                if record.kind == OutputKind::Result {
-                    output_through = key.value().1;
-                    outputs.extend_from_slice(bytes.value());
-                }
-            }
-        }
-        if input_through != boundary.input_through || output_through != boundary.output_through {
-            return Ok(None);
-        }
-        let mut canonical = inputs;
-        canonical.extend(outputs);
-        if ContentDigest::of(&canonical) != boundary.content {
-            return Ok(None);
-        }
+    let manifest = load_context_manifest(&rx.open_table(MESSAGES)?, result.source)?;
+    if result.validate().is_err() || !source_is_prefix(&rx.open_table(JOBS)?, &row, &manifest)? {
+        return Ok(None);
     }
-    Ok(Some(result))
+    let mut reducible = 0usize;
+    for boundary in &manifest.turns {
+        let Some(source) = source_turn(
+            &rx.open_table(JOBS)?,
+            &rx.open_table(JOB_STATES)?,
+            &rx.open_table(TURN_INPUTS)?,
+            &rx.open_table(JOB_OUTPUTS)?,
+            &rx.open_table(TOOL_CALLS)?,
+            &rx.open_table(APPROVALS)?,
+            boundary.turn,
+            Some((boundary.input_through, boundary.output_through)),
+        )?
+        else {
+            return Ok(None);
+        };
+        if source.boundary != *boundary {
+            return Ok(None);
+        }
+        reducible = reducible.saturating_add(source.reducible_tokens);
+    }
+    let tokens = result.context_text().len().saturating_add(128).div_ceil(3);
+    if tokens > work.target_tokens as usize
+        || reducible.saturating_sub(tokens) < work.minimum_savings_tokens as usize
+    {
+        return Ok(None);
+    }
+    Ok(Some(AdoptedContext {
+        source: manifest,
+        summary: result.context_text(),
+    }))
 }
 pub(crate) fn read_turn_context(
     database: &Database,
@@ -2881,8 +3801,15 @@ pub(crate) fn read_turn_context(
         None
     };
     let mut cursor = Some(turn);
-    let mut used = 0usize;
+    let mut used = context
+        .adopted_summary
+        .as_ref()
+        .map_or(0, |summary| summary.len().saturating_add(128).div_ceil(3));
+    let mut visited = BTreeSet::new();
     while let Some(id) = cursor {
+        if !visited.insert(id) {
+            return Err(StorageError::corrupted("context ancestry cycle"));
+        }
         let row = read_job_row(&rx, id)?
             .ok_or_else(|| StorageError::corrupted("previous turn missing"))?;
         let covered = id != turn && context.covered_turns.contains(&id);
@@ -2913,8 +3840,9 @@ pub(crate) fn read_turn_context(
             }
         }
         let state = read_state(&rx, id)?;
-        let answer = if iteration_context
-            .is_some_and(|(first, previous)| id == first && previous != Some(id))
+        let answer = if covered
+            || iteration_context
+                .is_some_and(|(first, previous)| id == first && previous != Some(id))
             || state
                 .outcome
                 .is_some_and(|outcome| outcome.kind == OutcomeKind::Cancelled)
@@ -2932,13 +3860,11 @@ pub(crate) fn read_turn_context(
         };
         let weight = (text.len() + answer.as_ref().map_or(0, String::len) + 16).div_ceil(3)
             + attachments.len() * 1600;
-        if !covered && used.saturating_add(weight) > budget_tokens && id != turn {
+        if used.saturating_add(weight) > budget_tokens && id != turn {
             context.omitted = true;
             break;
         }
-        if !covered {
-            used = used.saturating_add(weight);
-        }
+        used = used.saturating_add(weight);
         cursor = match iteration_context {
             Some((first, previous)) if id == turn => previous
                 .filter(|previous| *previous != turn)
@@ -2961,7 +3887,7 @@ pub(crate) fn read_turn_context(
                     .ok_or_else(|| StorageError::corrupted("turn attachment missing"))
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
-        if !covered {
+        {
             context.turns.push(ContextTurn {
                 turn: id,
                 text,

@@ -143,8 +143,9 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 29, with no migration;
-recreate data directories made by earlier versions.
+cancelled if reopened without a claim. The stored format is 30, with no migration;
+older or newer directories are refused before writing and left intact. Use a
+separate fresh directory for this build.
 
 Conversation depth is derived from parent links. Limits default to depth 3
 (root depth 0), 8 automatic notice-driven follow-up turns, and 100 scheduled
@@ -349,7 +350,7 @@ tracked, `confirm_required` asks for `{"confirm":true}`, which records user stop
 confirmation. Successful replies are `released` or `already_released`. This route
 is available for any origin; the CLI continues to record operator confirmation.
 
-Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 29).
+Conversation naming runs after the first successful Provider reply in an unnamed, open-ended user conversation whose first Job has no explicit name. A separate tool-free System Job uses a bounded excerpt and the original frozen Provider/model, with a 256-token output budget. Its JSON title result is applied only while the conversation remains unnamed; manual names win. Naming requests, outputs, usage and failures belong to that Job and never become chat turns or notices in the user conversation. One-shot API Jobs do not request titles. Naming respects conversation child limits and reuses the existing stored Job layout (format 30).
 
 
 ## OpenAI Responses providers
@@ -373,44 +374,104 @@ Responses usage and output items are retained in provider history. A terminal
 responses never authorize tool execution.
 
 Responses adds protocol code 2 alongside the unchanged Chat Completions code 1.
-Database format 29 combines indexed conversation search, Anthropic protocol
-support, Decision Profile, compaction-policy, turn-metadata and frozen Agent
-encodings. Format-26, format-27 and format-28 directories are refused without
-migration or deletion; use a separate fresh directory for this build.
+Database format 30 includes indexed conversation search, Anthropic transport,
+Decision Profiles and compaction policies. It also encodes the Decision Pool
+operation, typed summarization work and optional typed shadow-prediction binding.
+A summarization Job references a sealed manifest stored once in the existing
+content-addressed MESSAGES table; its final result references that same digest.
+Format 29 and all older formats are refused without migration or deletion.
 
-Decision Model and Decision Agent configs are backend foundation types. They
-reuse config identities, edit counters and archival. Decision agents expose
-read-only context access and have no tool grants, dispatch or approval authority.
-The shared freeze contract distinguishes generative and decision snapshots.
-Ordinary text submissions refuse decision execution until the typed runner is
-available. Native TypeSafe transport and decision Profile HTTP/UI support are
-separate implementation phases.
+Decision Models and Decision Agents reuse config identities, versions and
+archival. `POST /api/v1/profiles` accepts `kind: "decision_model"` and
+`kind: "decision_agent"`; paged Profile responses include their respective
+`decision_profiles` and `decision_agent_profiles` arrays. Decision Agents have no
+tool, dispatch or approval authority. Only Input Only (`workspace_access: "none"`)
+is currently executable; workspace readers are not implemented.
+`POST /api/v1/decisions` submits typed work through ordinary Jobs and Pools
+advertising the `decision` operation. A busy eligible Pool queues work. Optional
+Agent `decision_assistance` is a Decision Agent reference and may be unavailable
+without preventing generative work.
 
-Normalized decisions specify Choice, BinaryProbability or OrdinalScore answer
-spaces. Results validate against that request and its frozen model/config and
-provider-request identities. Provider confidence has an explicit semantic
-identifier; it is not assumed to be a calibrated probability of correctness.
-Unknown or insufficient evidence has explicit unusable/uncertain outcomes.
+The native TypeSafe System One adapter supports Choice (up to 255 options),
+BinaryProbability (Noul) and OrdinalScore (up to 10 ordered levels). It includes
+Decision Agent instructions, validates complete distributions and records the
+requested and reported model identities separately. A reported model name is
+not assumed to identify a version. Choice and Score confidence use distinct
+provider semantic identifiers; neither is a calibrated probability of correctness.
+Noul is the probability of the specified binary proposition. Invalid provider
+answers fail explicitly. Input limits use conservative UTF-8 byte upper bounds;
+response-size and reported-usage limits are checked locally. The provider API
+has no output-token-limit parameter, so these controls are not a remote spending
+guarantee. Request/response evidence and usage remain on the ordinary Job request;
+Decision metrics are not included in generative Provider/model charts.
 
-Conversation compaction policies are stored overrides with a revision counter.
-Resolution replaces the whole policy: conversation, then Agent, then host.
-The default is Off. Auto selects Conservative, Balanced or Aggressive; Custom
-stores token trigger/target/output reserve, minimum source and savings, recent
-turn preservation and cooldown. Model-budget preset resolution and automatic
-execution are supplied by the policy runtime, not this storage foundation.
-Predictive opt-in is an explicit Decision Agent binding with bounded preparation
-and token budgets, independent of generative decision assistance. Manual
-compaction requires neither that binding nor automatic mode.
+Conversation compaction is independent of database/storage compaction. Set a
+whole `compaction_policy` on an Agent Profile or through
+`POST /api/v1/conversations/{id}`. Omission preserves the stored value; `null`
+clears an override, and `{"mode":{"kind":"off"}}` explicitly disables automatic
+compaction. Precedence is conversation, then current Agent Profile, then host
+Off. Manual compaction requires no Decision Profile: send `{"model":"<profile UUID>"}`
+with an Idempotency-Key to `POST /api/v1/conversations/{id}/compact`.
+Repeated keys return the same producing Job. During execution it seals an
+older settled prefix for a later turn, without changing a running request.
 
-Compaction artifacts are typed summarization Job results; original history is
-kept. Source manifests carry ordered turn identities, inclusive input/output
-high-water marks and fixed SHA-256 content digests. Pending turns can record
-internal preparation/candidate-use entries before claim. These entries do not
-enter prompts, titles, search text or completion causes, and do not themselves
-adopt a summary. A null artifact selection explicitly restores original context;
-claim-time selection determines adoption. Source capture, compatibility checks, atomic adoption and the
-manual/automatic/predictive runners remain separate runtime phases. No context
-is reduced by this foundation alone.
+Automatic policy uses the foreground turn's frozen model window and output
+reserve. The summarizer can be assigned separately; otherwise it uses the
+foreground model. Estimates use UTF-8 bytes/3, framing and image allowances,
+not a provider tokenizer. Let B be window minus output reserve and protected
+instruction allowance, and H the larger of output reserve and the largest
+estimated growth across the last eight settled turns. The initial, explicitly **uncalibrated** presets are:
+
+| Preset | Trigger / target | Recent settled turns kept | Cooldown |
+| :--- | :--- | :--- | :--- |
+| Conservative | B-H / B-2H | 4 | 600s |
+| Balanced | B-2H / B-3H | 2 | 300s |
+| Aggressive | B-3H / B-4H | 1 | 120s |
+
+Preset minimum source is 2H; minimum savings is H. Invalid or unknown budgets
+do not schedule automatic work. Custom mode supplies explicit trigger, target,
+output reserve, minimum source/savings, recent-turn count and cooldown; reserve
+cannot reduce the frozen model's output budget. Default remains Off.
+Preparation is bounded to two outstanding summary Jobs globally and never holds
+the waiting foreground turn's Pool slot. A failed or unusable preparation does
+not repeat forever with the same submission key. Sources larger than the
+summarizer window are refused explicitly; chunking/reduction remains open.
+
+Summarization Jobs receive the sealed source as untrusted data, including final
+results, tool outcomes and provenance. Valid JSON results declare omitted details
+and must meet target/savings bounds. Before claim, adoption checks source hashes
+and contiguous ancestry, completion, current automatic-policy binding and
+compatibility with appended messages. Original user/Agent inputs, approvals,
+attachments and recent turns remain in effective context; covered assistant
+answers are replaced by a generated summary labeled with its possible loss of
+detail. Enabled compaction fails explicitly when this protected context cannot
+fit. Off retains the existing fitter behavior. All original persisted records
+remain recoverable. Preparation/use metadata is append-only and excluded from
+prompt text, titles and search. An explicit null artifact selection restores
+original context. No history is rewritten and no artifact table is added.
+
+Predictive opt-in is a separate explicit eligible Decision Agent assignment,
+independent of decision assistance. This phase records **shadow predictions**
+after foreground completion, using counts and a deterministic growth forecast,
+without conversation text. It never starts summarization or promotes a prediction
+into execution authority; BE-23 promotion remains unimplemented. Shadow work is
+limited to one outstanding prediction per conversation, at least 60 seconds
+between predictions, two globally queued/running Decision Jobs, six predictions
+per minute, bounded queue scans and the configured prediction token bound.
+Queued foreground work suppresses new shadow submissions. Stale activity, policy/Profile edits,
+archival or removal of opt-in prevents sending. Reported missing/over-budget
+usage makes a shadow answer unusable. Preparation token settings are reserved
+for the gated promotion phase, not a claim of implemented speculative work.
+
+`GET /api/v1/conversations/{id}/context?before=<child UUID>&limit=50` returns
+effective policy and its source, capacity/estimate provenance, predictor and
+summarizer identities, last context use and bounded pages of summary/prediction
+work. It distinguishes queued, preparing, prepared, adopted, incompatible,
+failed, cancelled and recorded shadow states; `next_before` can advance over an
+empty scan page. The existing conversation stop route can cancel typed summary
+or decision System children. General System/title work remains protected.
+These are backend APIs and generated wire contracts; dedicated Profile and
+compaction UI controls remain frontend work.
 
 ## Conversation full-text search
 
@@ -455,4 +516,4 @@ Presence/frequency penalties are refused. Reasoning effort enables adaptive
 thinking and maps to `output_config.effort` (`minimal` maps to `low`, `none`
 disables thinking); choose a model that supports these options. OCG does not
 infer model support from names. Anthropic uses stored protocol code 3; the
-protocol and search index are included in database format 29, without migration.
+protocol and search index are included in database format 30, without migration.

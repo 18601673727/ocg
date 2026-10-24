@@ -1316,12 +1316,57 @@ impl DatabaseHandle {
         })
         .await
     }
+    pub(crate) async fn context_state(
+        &self,
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<Option<storage::ContextState>, DatabaseError> {
+        self.read(move |database| {
+            storage::read_context_state(database, conversation, before, limit)
+        })
+        .await
+    }
+    pub(crate) async fn prediction_current(&self, job: JobId) -> Result<bool, DatabaseError> {
+        self.read(move |database| storage::read_prediction_current(database, job))
+            .await
+    }
+    pub(crate) async fn predict_context(
+        &self,
+        conversation: JobId,
+    ) -> Result<Option<JobId>, DatabaseError> {
+        self.submit(|reply| Command::PredictContext {
+            conversation,
+            reply,
+        })
+        .await
+    }
+    pub(crate) async fn effective_compaction_policy(
+        &self,
+        conversation: JobId,
+    ) -> Result<
+        Option<(
+            persistence::CompactionPolicy,
+            u64,
+            Option<persistence::ConfigRef>,
+        )>,
+        DatabaseError,
+    > {
+        self.read(move |database| storage::read_effective_context_policy(database, conversation))
+            .await
+    }
+    pub(crate) async fn summarization_input(
+        &self,
+        job: JobId,
+    ) -> Result<Option<storage::SummarizationInput>, DatabaseError> {
+        self.read(move |database| storage::read_summarization_input(database, job))
+            .await
+    }
     /// Asks `agent`'s assigned Decision Profile one typed question, as an
-    /// ordinary system child of `conversation`. Assistance and later
-    /// prediction both enter here: the Profile is a reference, never a copy,
+    /// ordinary system child of `conversation`. The Profile is a reference,
     /// and a missing or unusable assignment answers `None` without failing
     /// the caller. The returned Job is the decision turn.
-    #[allow(dead_code)] // called from tests; prediction uses the runtime wrapper
+    #[allow(dead_code)] // Optional assistance callers use the same typed Job path.
     pub(crate) async fn invoke_decision_assistance(
         &self,
         conversation: JobId,
@@ -1377,7 +1422,7 @@ impl DatabaseHandle {
             | persistence::DecisionQuestion::BinaryProbability { prompt }
             | persistence::DecisionQuestion::OrdinalScore { prompt, .. } => prompt.clone(),
         };
-        let (_, appended) = self
+        let submitted = self
             .submit_decision(
                 Some(conversation),
                 persistence::ConversationSpec {
@@ -1398,8 +1443,12 @@ impl DatabaseHandle {
                 request,
                 None,
             )
-            .await?;
-        Ok(Some(appended.turn))
+            .await;
+        match submitted {
+            Ok((_, appended)) => Ok(Some(appended.turn)),
+            Err(DatabaseError::Rejected(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Opens a system conversation with one typed decision turn and freezes
