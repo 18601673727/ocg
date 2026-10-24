@@ -3072,6 +3072,11 @@ pub(crate) enum ContextWorkDetails {
     Summary {
         summarizer: ConfigId,
         automatic: bool,
+        stage: &'static str,
+        chain: Option<JobId>,
+        prediction: Option<JobId>,
+        reserved_tokens: u32,
+        reserved_requests: u32,
         source: ContentDigest,
         first: crate::persistence::SourceBoundary,
         through: crate::persistence::SourceBoundary,
@@ -3190,7 +3195,10 @@ pub(crate) fn read_context_state(
         }
         tokens = tokens.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
     }
-    let predictor = policy.predictive.map(|binding| binding.decision_agent);
+    let predictor = policy
+        .predictive
+        .as_ref()
+        .map(|binding| binding.decision_agent);
     let mut predictor_model = None;
     let mut prediction_unavailable =
         Some("prediction requires an explicitly assigned Decision Profile");
@@ -3216,6 +3224,25 @@ pub(crate) fn read_context_state(
                 .is_none_or(|model| model.config.context_window.is_none())
         {
             prediction_unavailable = Some("foreground model capacity is unknown");
+        }
+    }
+    if let Some(binding) = &policy.predictive
+        && binding.mode == crate::persistence::PredictionMode::Prepare
+        && let Some(id) = predictor_model
+    {
+        let current = read_config_record(&rx, id)?;
+        if current.as_ref().is_none_or(|record| {
+            binding.acceptance.as_ref().is_none_or(|pin| {
+                pin.model
+                    != ConfigRef {
+                        id,
+                        edit_seq: record.edit_seq,
+                    }
+            })
+        }) {
+            prediction_unavailable = Some(
+                "prediction acceptance model version no longer matches the assigned Decision Profile",
+            );
         }
     }
     let limit = limit.clamp(1, 100);
@@ -3315,9 +3342,19 @@ pub(crate) fn read_context_state(
             .cloned()
             .ok_or_else(|| StorageError::corrupted("empty context source"))?;
         let state = read_state(&rx, job)?;
-        let label = if summary_work
-            .policy_revision
-            .is_some_and(|bound| bound != revision || summary_work.policy_profile != profile)
+        let binding = summary_root(&rx.open_table(JOBS)?, &summary_work)?;
+        let label = if context_work_stopped(&rx.open_table(NOTICES)?, child)?
+            || !preparation_current(
+                &rx.open_table(JOBS)?,
+                &rx.open_table(CONFIGS)?,
+                &rx.open_table(CONVERSATIONS)?,
+                &rx.open_table(NOTICES)?,
+                &read_job_row(&rx, job)?
+                    .ok_or_else(|| StorageError::corrupted("summary missing"))?,
+            )?
+            || binding
+                .policy_revision
+                .is_some_and(|bound| bound != revision || binding.policy_profile != profile)
         {
             "discarded"
         } else {
@@ -3328,6 +3365,7 @@ pub(crate) fn read_context_state(
                     OutcomeKind::Failed => "failed",
                     OutcomeKind::Cancelled => "cancelled",
                     OutcomeKind::Unknown => "unknown",
+                    OutcomeKind::Completed if !summary_work.is_artifact() => "part_ready",
                     OutcomeKind::Completed => {
                         if last_use.is_some_and(|(_, _, artifact)| artifact == Some(job)) {
                             "adopted"
@@ -3405,7 +3443,16 @@ pub(crate) fn read_context_state(
             state: label,
             details: ContextWorkDetails::Summary {
                 summarizer: summary_work.frozen.llm.model.id,
-                automatic: summary_work.policy_revision.is_some(),
+                automatic: binding.policy_revision.is_some(),
+                stage: match summary_work.stage {
+                    crate::persistence::SummarizationStage::Direct => "direct",
+                    crate::persistence::SummarizationStage::Chunk { .. } => "chunk",
+                    crate::persistence::SummarizationStage::Reduce => "reduce",
+                },
+                chain: summary_work.chain,
+                prediction: binding.prediction,
+                reserved_tokens: binding.reserved_tokens,
+                reserved_requests: binding.reserved_requests,
                 source: summary_work.source,
                 first,
                 through,
@@ -3424,7 +3471,7 @@ pub(crate) fn read_context_state(
     }
     Ok(Some(ContextState {
         policy,
-        stored_override,
+        stored_override: stored_override.clone(),
         policy_source: if stored_override.is_some() {
             "conversation"
         } else if profile_policy {
@@ -3549,12 +3596,363 @@ pub(crate) fn read_prediction_current(
     )
 }
 
+pub(super) fn summary_root(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    work: &crate::persistence::SummarizationWork,
+) -> Result<crate::persistence::SummarizationWork, StorageError> {
+    let Some(anchor) = work.chain else {
+        return Ok(work.clone());
+    };
+    let bytes = jobs
+        .get(anchor.get())?
+        .ok_or_else(|| StorageError::corrupted("summary chain anchor missing"))?;
+    let row = JobRow::decode_at(anchor.get(), bytes.value())?;
+    let JobKind::Turn {
+        execution: TurnExecution::Summarization(root),
+        ..
+    } = row.kind
+    else {
+        return Err(StorageError::corrupted("invalid summary chain anchor"));
+    };
+    if root.chain.is_some()
+        || root.source != work.source
+        || !matches!(
+            root.stage,
+            crate::persistence::SummarizationStage::Chunk { start: 0, .. }
+        )
+    {
+        return Err(StorageError::corrupted("inconsistent summary chain"));
+    }
+    Ok(root)
+}
+
+pub(super) fn context_work_stopped(
+    notices: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    conversation: JobId,
+) -> Result<bool, StorageError> {
+    for (scanned, entry) in notices
+        .range((conversation.get(), 0)..=(conversation.get(), u32::MAX))?
+        .rev()
+        .enumerate()
+        .take(129)
+    {
+        if scanned == 128 {
+            return Ok(true);
+        }
+        if matches!(
+            Notice::decode(entry?.1.value())?.body,
+            NoticeBody::Record {
+                event: RecordEvent::Stop,
+                ..
+            }
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Known usage only increases the reservation charge. Missing or unfinished
+/// usage never refunds a reservation, including after a restart.
+pub(super) fn preparation_charge(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    children: &impl ReadableTable<(u128, u128), ()>,
+    tips: &impl ReadableTable<u128, u128>,
+    events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    row: &JobRow,
+) -> Result<(u64, Timestamp), StorageError> {
+    let JobKind::Turn {
+        execution: TurnExecution::Summarization(work),
+        ..
+    } = &row.kind
+    else {
+        return Ok((0, row.created_at));
+    };
+    let root = summary_root(jobs, work)?;
+    if root.prediction.is_none() {
+        return Ok((0, row.created_at));
+    }
+    let anchor = work.chain.unwrap_or(row.id);
+    let Some(parent) = row.parent_id else {
+        return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+    };
+    let Some(bytes) = jobs.get(parent.get())? else {
+        return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+    };
+    let Some(owner) = JobRow::decode_at(parent.get(), bytes.value())?.parent_id else {
+        return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+    };
+    let mut total = 0u64;
+    let mut charged_at = row.created_at;
+    for (scanned, entry) in children
+        .range((owner.get(), 0)..=(owner.get(), u128::MAX))?
+        .rev()
+        .enumerate()
+        .take(257)
+    {
+        if scanned == 256 {
+            return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+        }
+        let child = entry?.0.value().1;
+        let Some(tip) = tips.get(child)?.map(|tip| tip.value()) else {
+            continue;
+        };
+        if tip < anchor.get() {
+            break;
+        }
+        let Some(bytes) = jobs.get(tip)? else {
+            return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+        };
+        let member = JobRow::decode_at(tip, bytes.value())?;
+        let JobKind::Turn {
+            execution: TurnExecution::Summarization(part),
+            ..
+        } = &member.kind
+        else {
+            continue;
+        };
+        if part.source != root.source || part.chain.unwrap_or(member.id) != anchor {
+            continue;
+        }
+        let mut evidence = Vec::new();
+        for (scanned, entry) in events
+            .range((tip, 1, 0)..=(tip, u32::MAX, u32::MAX))?
+            .enumerate()
+            .take(129)
+        {
+            if scanned == 128 {
+                return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+            }
+            let (key, bytes) = entry?;
+            let (_, request, seq) = key.value();
+            if request != 1 {
+                return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
+            }
+            evidence.push(rows::decode_request_event(
+                member.id,
+                RequestNumber::FIRST,
+                seq,
+                bytes.value(),
+            )?);
+        }
+        for event in &evidence {
+            charged_at = charged_at.max(event.recorded_at);
+        }
+        if let Some(sample) = observations::usage_sample_of(
+            member.id,
+            RequestNumber::FIRST,
+            &turn_target_of(jobs, &member)?,
+            &evidence,
+        ) {
+            total = total
+                .saturating_add(u64::from(sample.input.value().unwrap_or(0)))
+                .saturating_add(u64::from(sample.output.value().unwrap_or(0)));
+        }
+    }
+    Ok((total.max(u64::from(root.reserved_tokens)), charged_at))
+}
+
+pub(crate) fn read_preparation_current(
+    database: &Database,
+    job: JobId,
+) -> Result<bool, StorageError> {
+    let rx = read(database)?;
+    let Some(row) = read_job_row(&rx, job)? else {
+        return Ok(false);
+    };
+    if read_state(&rx, job)?.outcome.is_some() {
+        return Ok(true);
+    }
+    if !preparation_current(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(CONFIGS)?,
+        &rx.open_table(CONVERSATIONS)?,
+        &rx.open_table(NOTICES)?,
+        &row,
+    )? {
+        return Ok(false);
+    }
+    if let JobKind::Turn {
+        execution: TurnExecution::Summarization(work),
+        ..
+    } = &row.kind
+    {
+        let root = summary_root(&rx.open_table(JOBS)?, work)?;
+        if root.prediction.is_some() {
+            let jobs = rx.open_table(JOBS)?;
+            for (scanned, entry) in rx.open_table(PENDING)?.iter()?.enumerate().take(129) {
+                if scanned == 128 {
+                    return Ok(false);
+                }
+                let id = entry?.0.value();
+                let Some(bytes) = jobs.get(id)? else {
+                    return Ok(false);
+                };
+                if work_priority(&jobs, &JobRow::decode_at(id, bytes.value())?)? == 0 {
+                    return Ok(false);
+                }
+            }
+        }
+        if root.prediction.is_some()
+            && preparation_charge(
+                &rx.open_table(JOBS)?,
+                &rx.open_table(CHILD_CONVERSATIONS)?,
+                &rx.open_table(TIPS)?,
+                &rx.open_table(REQUEST_EVENTS)?,
+                &row,
+            )?
+            .0 > u64::from(root.reserved_tokens)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn preparation_current(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    configs: &impl ReadableTable<u128, &'static [u8]>,
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    notices: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    row: &JobRow,
+) -> Result<bool, StorageError> {
+    let JobKind::Turn {
+        execution: TurnExecution::Summarization(work),
+        ..
+    } = &row.kind
+    else {
+        return Ok(true);
+    };
+    let Some(parent) = row.parent_id else {
+        return Ok(false);
+    };
+    if context_work_stopped(notices, parent)? {
+        return Ok(false);
+    }
+    if let Some(anchor) = work.chain {
+        let Some(bytes) = jobs.get(anchor.get())? else {
+            return Ok(false);
+        };
+        let Some(anchor_parent) = JobRow::decode_at(anchor.get(), bytes.value())?.parent_id else {
+            return Ok(false);
+        };
+        if context_work_stopped(notices, anchor_parent)? {
+            return Ok(false);
+        }
+    }
+    let Some(bytes) = jobs.get(parent.get())? else {
+        return Ok(false);
+    };
+    let owner = JobRow::decode_at(parent.get(), bytes.value())?;
+    let Some(conversation) = owner.parent_id else {
+        return Ok(false);
+    };
+    let Some(metadata) = conversations.get(conversation.get())? else {
+        return Ok(false);
+    };
+    if ConversationRow::decode(metadata.value())?.closing.is_some() {
+        return Ok(false);
+    }
+    summary_current(jobs, configs, conversations, work, conversation)
+}
+
+pub(super) fn summary_current(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    configs: &impl ReadableTable<u128, &'static [u8]>,
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    work: &crate::persistence::SummarizationWork,
+    conversation: JobId,
+) -> Result<bool, StorageError> {
+    let root = summary_root(jobs, work)?;
+    let (policy, revision, profile) =
+        effective_context_policy(jobs, configs, conversations, conversation)?;
+    if root.policy_revision.is_some_and(|bound| {
+        bound != revision
+            || root.policy_profile != profile
+            || matches!(policy.mode, crate::persistence::CompactionMode::Off)
+    }) {
+        return Ok(false);
+    }
+    let Some(prediction) = root.prediction else {
+        return Ok(true);
+    };
+    let Some(bytes) = jobs.get(prediction.get())? else {
+        return Ok(false);
+    };
+    let row = JobRow::decode_at(prediction.get(), bytes.value())?;
+    let JobKind::Turn {
+        execution: TurnExecution::Decision(decision),
+        ..
+    } = row.kind
+    else {
+        return Ok(false);
+    };
+    let Some(binding) = policy.predictive else {
+        return Ok(false);
+    };
+    if binding.mode != crate::persistence::PredictionMode::Prepare
+        || binding.decision_agent != decision.frozen.agent_ref.id
+        || binding
+            .acceptance
+            .as_ref()
+            .is_none_or(|acceptance| acceptance.model != decision.frozen.model_ref)
+        || decision
+            .prediction
+            .as_ref()
+            .is_none_or(|binding| binding.conversation != conversation)
+    {
+        return Ok(false);
+    }
+    for reference in [
+        decision.frozen.agent_ref,
+        decision.frozen.model_ref,
+        decision.frozen.connection_ref,
+    ] {
+        let Some(bytes) = configs.get(reference.id.get())? else {
+            return Ok(false);
+        };
+        let row = ConfigRow::decode_at(reference.id.get(), bytes.value())?;
+        if row.archived_at.is_some() || row.edit_seq != reference.edit_seq {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn work_priority(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    row: &JobRow,
+) -> Result<u8, StorageError> {
+    Ok(match &row.kind {
+        JobKind::Turn {
+            execution: TurnExecution::Decision(work),
+            ..
+        } if work.prediction.is_some() => 2,
+        JobKind::Turn {
+            execution: TurnExecution::Summarization(work),
+            ..
+        } => {
+            let root = summary_root(jobs, work)?;
+            if root.prediction.is_some() {
+                2
+            } else if root.policy_revision.is_some() {
+                1
+            } else {
+                0
+            }
+        }
+        JobKind::Conversation { .. } | JobKind::Turn { .. } => 0,
+    })
+}
+
 pub(crate) struct SummarizationInput {
     pub work: crate::persistence::SummarizationWork,
     pub source: crate::persistence::ContextSourceManifest,
     pub text: String,
     pub source_tokens: usize,
     pub current: bool,
+    pub speculative: bool,
+    pub automatic: bool,
 }
 
 pub(crate) fn read_summarization_input(
@@ -3565,6 +3963,21 @@ pub(crate) fn read_summarization_input(
     let Some(row) = read_job_row(&rx, job)? else {
         return Ok(None);
     };
+    let eligible = preparation_current(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(CONFIGS)?,
+        &rx.open_table(CONVERSATIONS)?,
+        &rx.open_table(NOTICES)?,
+        &row,
+    )?;
+    let charge = preparation_charge(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(CHILD_CONVERSATIONS)?,
+        &rx.open_table(TIPS)?,
+        &rx.open_table(REQUEST_EVENTS)?,
+        &row,
+    )?;
+    let dependencies = row.kind.dependencies().to_vec();
     let JobKind::Turn {
         execution: TurnExecution::Summarization(work),
         ..
@@ -3573,18 +3986,9 @@ pub(crate) fn read_summarization_input(
         return Ok(None);
     };
     let source = load_context_manifest(&rx.open_table(MESSAGES)?, work.source)?;
-    let mut current = true;
-    if let Some(bound) = work.policy_revision {
-        let (policy, revision, profile) = effective_context_policy(
-            &rx.open_table(JOBS)?,
-            &rx.open_table(CONFIGS)?,
-            &rx.open_table(CONVERSATIONS)?,
-            source.conversation,
-        )?;
-        current = revision == bound
-            && profile == work.policy_profile
-            && !matches!(policy.mode, crate::persistence::CompactionMode::Off);
-    }
+    let root = summary_root(&rx.open_table(JOBS)?, &work)?;
+    let mut current =
+        eligible && (root.prediction.is_none() || charge.0 <= u64::from(root.reserved_tokens));
     let mut text = String::new();
     let mut reducible = 0usize;
     for boundary in &source.turns {
@@ -3609,6 +4013,126 @@ pub(crate) fn read_summarization_input(
         reducible = reducible.saturating_add(sealed.reducible_tokens);
         text.push_str(&sealed.text);
     }
+    match work.stage {
+        crate::persistence::SummarizationStage::Direct => {}
+        crate::persistence::SummarizationStage::Chunk {
+            start,
+            end,
+            content,
+        } => {
+            let range = usize::try_from(start).ok().zip(usize::try_from(end).ok());
+            match range.and_then(|(start, end)| text.get(start..end)) {
+                Some(part) if ContentDigest::of(part.as_bytes()) == content => {
+                    text = part.to_owned()
+                }
+                Some(_) | None => current = false,
+            }
+        }
+        crate::persistence::SummarizationStage::Reduce => {
+            let mut pieces = Vec::new();
+            for (child, condition) in dependencies {
+                if condition != DependencyCondition::Success {
+                    current = false;
+                    break;
+                }
+                let Some(part_job) = rx
+                    .open_table(TIPS)?
+                    .get(child.get())?
+                    .map(|value| JobId::new(value.value()))
+                else {
+                    current = false;
+                    break;
+                };
+                let Some(row) = read_job_row(&rx, part_job)? else {
+                    current = false;
+                    break;
+                };
+                let JobKind::Turn {
+                    execution: TurnExecution::Summarization(part_work),
+                    ..
+                } = row.kind
+                else {
+                    current = false;
+                    break;
+                };
+                let crate::persistence::SummarizationStage::Chunk {
+                    start,
+                    end,
+                    content,
+                } = part_work.stage
+                else {
+                    current = false;
+                    break;
+                };
+                if part_work.chain.unwrap_or(part_job) != work.chain.unwrap_or(job)
+                    || part_work.source != work.source
+                    || !read_state(&rx, part_job)?
+                        .outcome
+                        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+                {
+                    current = false;
+                    break;
+                }
+                let output = rx
+                    .open_table(JOB_OUTPUTS)?
+                    .range((part_job.get(), 0)..=(part_job.get(), u32::MAX))?
+                    .next_back()
+                    .transpose()?
+                    .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+                    .transpose()?;
+                let fragment = output
+                    .filter(|output| output.kind == OutputKind::Result)
+                    .and_then(|output| output.value)
+                    .and_then(|value| value.get("summary_part").cloned())
+                    .and_then(|value| {
+                        serde_json::from_value::<crate::persistence::SummaryFragment>(value).ok()
+                    });
+                let Some(fragment) = fragment.filter(|fragment| {
+                    fragment.validate().is_ok()
+                        && fragment
+                            .context_text()
+                            .len()
+                            .saturating_add(128)
+                            .div_ceil(3)
+                            <= part_work.target_tokens as usize
+                }) else {
+                    current = false;
+                    break;
+                };
+                if !usize::try_from(start)
+                    .ok()
+                    .zip(usize::try_from(end).ok())
+                    .and_then(|(start, end)| text.get(start..end))
+                    .is_some_and(|source| ContentDigest::of(source.as_bytes()) == content)
+                {
+                    current = false;
+                    break;
+                }
+                pieces.push((start, end, fragment));
+            }
+            pieces.sort_by_key(|piece| piece.0);
+            let mut covered = 0u64;
+            let mut reduced = String::new();
+            if pieces.is_empty() || pieces.len() > 7 {
+                current = false;
+            }
+            for (start, end, fragment) in pieces {
+                if start != covered || end <= start {
+                    current = false;
+                    break;
+                }
+                covered = end;
+                reduced.push_str(&format!(
+                    "Source bytes {start}..{end}:\n{}\n",
+                    fragment.context_text()
+                ));
+            }
+            if covered != text.len() as u64 {
+                current = false;
+            }
+            text = reduced;
+        }
+    }
     let source_tokens = reducible;
     Ok(Some(SummarizationInput {
         work,
@@ -3616,6 +4140,8 @@ pub(crate) fn read_summarization_input(
         text,
         source_tokens,
         current,
+        speculative: root.prediction.is_some(),
+        automatic: root.policy_revision.is_some(),
     }))
 }
 
@@ -3648,6 +4174,9 @@ fn adopted_context(
     else {
         return Ok(None);
     };
+    if !work.is_artifact() {
+        return Ok(None);
+    }
     let Some(parent) = producer.parent_id else {
         return Ok(None);
     };

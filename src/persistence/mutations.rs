@@ -626,8 +626,8 @@ pub(crate) fn set_conversation(
             return batch.set_conversation_limits(root, limits, super::Actor::User);
         }
         ConversationEdit::CompactionPolicy(policy) => {
-            if let Some(policy) = policy {
-                batch.check_compaction_policy(&policy)?;
+            if let Some(policy) = &policy {
+                batch.check_compaction_policy(policy)?;
             }
             if row.compaction_policy == policy {
                 return Ok(());

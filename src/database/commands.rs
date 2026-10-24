@@ -211,6 +211,10 @@ pub(super) enum Command {
         reply: Reply<()>,
     },
     /// Schedules optional, bounded shadow prediction after conversation activity.
+    PromotePrediction {
+        job: JobId,
+        reply: Reply<Option<JobId>>,
+    },
     PredictContext {
         conversation: JobId,
         reply: Reply<Option<JobId>>,
@@ -606,6 +610,11 @@ impl Command {
                 reply,
                 |batch| persistence::set_conversation(batch, root, edit),
             ),
+            Self::PromotePrediction { job, reply } => {
+                run(database, operation, commit, Kind::Open, reply, |batch| {
+                    batch.promote_prediction(job)
+                })
+            }
             Self::PredictContext {
                 conversation,
                 reply,
@@ -862,10 +871,11 @@ impl Command {
                     byte_count(title.len())
                 }
                 ConversationEdit::Hide | ConversationEdit::Limits(_) => 16,
-                ConversationEdit::CompactionPolicy(_) => 128,
+                ConversationEdit::CompactionPolicy(policy) => compaction_bytes(policy),
             },
             // The sealed source is already stored. This records one system
             // child and a short instruction, not a second copy of the source.
+            Self::PromotePrediction { .. } => 4096 * 512,
             Self::PredictContext { .. } => 131072,
             Self::RequestCompaction { .. } => 4096 * 512,
             Self::ArchiveModel { .. } => 16,
@@ -894,6 +904,7 @@ impl Command {
             Self::CreateConfig { config, .. } | Self::UpdateConfig { config, .. } => {
                 byte_count(config.name.len()).saturating_add(match &config.body {
                     ConfigBody::Agent(agent) => text_bytes(&agent.instructions)
+                        .saturating_add(compaction_bytes(&agent.compaction_policy))
                         .saturating_add(text_bytes(&agent.tool_grant))
                         .saturating_add(
                             byte_count(agent.models.len().saturating_add(agent.dispatch_to.len()))
@@ -988,6 +999,7 @@ impl Command {
             Self::CreateProject { reply, .. } => refuse(reply, error),
             Self::UpdateProject { reply, .. } => refuse(reply, error),
             Self::SetConversation { reply, .. } => refuse(reply, error),
+            Self::PromotePrediction { reply, .. } => refuse(reply, error),
             Self::PredictContext { reply, .. } => refuse(reply, error),
             Self::RequestCompaction { reply, .. } => refuse(reply, error),
             Self::CreateConfig { reply, .. } => refuse(reply, error),
@@ -1018,6 +1030,21 @@ fn search_index_bytes(text: &str) -> u64 {
     byte_count(text.chars().flat_map(char::to_lowercase).count())
         .saturating_mul(3)
         .saturating_mul(64)
+}
+
+fn compaction_bytes(policy: &Option<crate::persistence::CompactionPolicy>) -> u64 {
+    policy.as_ref().map_or(0, |policy| {
+        256u64.saturating_add(
+            policy
+                .predictive
+                .as_ref()
+                .and_then(|prediction| prediction.acceptance.as_ref())
+                .map_or(0, |pin| {
+                    byte_count(pin.reported_model.len())
+                        .saturating_add(byte_count(pin.confidence_semantics.len()))
+                }),
+        )
+    })
 }
 
 pub(super) fn command_bytes(commands: &[ProjectCommand]) -> u64 {

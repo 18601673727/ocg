@@ -865,7 +865,7 @@ pub(super) async fn conversation_context(
         .context_state(conversation, before, limit)
         .await?
         .ok_or(NOT_FOUND)?;
-    let wire_policy = WireCompactionPolicy::from_policy(state.policy);
+    let wire_policy = WireCompactionPolicy::from_policy(state.policy.clone());
     let mode = match &wire_policy.mode {
         WireCompactionMode::Off => "disabled",
         WireCompactionMode::Auto { preset } => match preset {
@@ -898,13 +898,21 @@ pub(super) async fn conversation_context(
         policy_source: state.policy_source.into(),
         predictor: state.predictor.map(|id| id.to_string()),
         predictor_model: state.predictor_model.map(|id| id.to_string()),
-        prediction_mode: if state.policy.predictive.is_some() {
-            "shadow"
-        } else {
-            "disabled"
-        }
-        .into(),
-        predictive_preparation_enabled: false,
+        prediction_mode: state
+            .policy
+            .predictive
+            .as_ref()
+            .map_or("disabled", |binding| match binding.mode {
+                crate::persistence::PredictionMode::Shadow => "shadow",
+                crate::persistence::PredictionMode::Prepare => "prepare",
+            })
+            .into(),
+        predictive_preparation_enabled: state.prediction_unavailable.is_none()
+            && state
+                .policy
+                .predictive
+                .as_ref()
+                .is_some_and(|binding| binding.mode == crate::persistence::PredictionMode::Prepare),
         foreground_model: state.model.map(|model| WireContextModel {
             profile: model.model.id.to_string(),
             edit_seq: model.model.edit_seq,
@@ -938,6 +946,11 @@ pub(super) async fn conversation_context(
                 crate::storage::ContextWorkDetails::Summary {
                     summarizer,
                     automatic,
+                    stage,
+                    chain,
+                    prediction,
+                    reserved_tokens,
+                    reserved_requests,
                     source,
                     first,
                     through,
@@ -948,6 +961,11 @@ pub(super) async fn conversation_context(
                     state: work.state.into(),
                     summarizer: summarizer.to_string(),
                     automatic,
+                    stage: stage.into(),
+                    chain: chain.map(|id| id.to_string()),
+                    prediction: prediction.map(|id| id.to_string()),
+                    reserved_tokens,
+                    reserved_requests,
                     source: WireContextSource {
                         digest: source.to_string(),
                         first: boundary(first),

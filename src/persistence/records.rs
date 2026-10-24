@@ -831,6 +831,7 @@ pub struct PoolConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // Configuration snapshots remain inline, like TurnExecution.
 pub enum ConfigBody {
     Connection(ConnectionConfig),
     Model(ModelConfig),

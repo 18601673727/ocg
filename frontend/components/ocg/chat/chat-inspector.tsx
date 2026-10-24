@@ -4,6 +4,7 @@ import { ExternalLink, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { ChatMessage, ChatSession } from "../types";
 import { runtimeStateLabel, useI18n } from "../i18n";
+import { ConversationContext } from "./conversation-context";
 import { ConversationLimitsEditor } from "./conversation-limits";
 
 export function ChatInspector({ session, messages, onClose, onOpenJob }: {
@@ -30,6 +31,7 @@ export function ChatInspector({ session, messages, onClose, onOpenJob }: {
               <div className="flex justify-between gap-4"><dt className="text-muted-foreground">{t("usage.updated")}</dt><dd className="text-right">{new Date(session.updatedAt).toLocaleString(locale)}</dd></div>
             </dl>
           </section>
+          {session.conversationId && <ConversationContext key={`context:${session.conversationId}`} conversation={session.conversationId} />}
           {session.conversationId && <ConversationLimitsEditor key={session.conversationId} conversation={session.conversationId} />}
           {turns.length > 0 ? <section className="space-y-3">
             <h3 className="text-xs font-semibold text-muted-foreground">{t("usage.execution")}</h3>

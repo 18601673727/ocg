@@ -243,12 +243,39 @@ contracts! {
     }
     #[derive(Clone, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
+    struct WirePredictionAcceptance {
+        pub model: String,
+        pub model_edit_seq: u32,
+        pub reported_model: String,
+        pub confidence_semantics: String,
+        pub minimum_probability_millionths: u32,
+        pub minimum_confidence_millionths: u32,
+    }
+    #[derive(Clone, serde::Deserialize, Default)]
+    #[serde(rename_all = "snake_case")]
+    enum WirePredictionMode {
+        #[default]
+        Shadow,
+        Prepare,
+    }
+    #[derive(Clone, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct WirePredictiveCompaction {
         pub decision_agent: String,
         pub minimum_interval_seconds: u32,
         pub max_preparations: u32,
         pub max_prediction_tokens: u32,
         pub max_preparation_tokens: u32,
+        #[serde(default)]
+        pub mode: WirePredictionMode,
+        #[serde(default)]
+        pub acceptance: Option<WirePredictionAcceptance>,
+        #[serde(default)]
+        pub max_preparations_per_hour: u32,
+        #[serde(default)]
+        pub max_tokens_per_hour: u32,
+        #[serde(default)]
+        pub max_requests_per_hour: u32,
     }
     #[derive(Clone, serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -290,6 +317,11 @@ contracts! {
             state: String,
             summarizer: String,
             automatic: bool,
+            stage: String,
+            chain: Option<String>,
+            prediction: Option<String>,
+            reserved_tokens: u32,
+            reserved_requests: u32,
             source: WireContextSource,
         },
         Prediction {
@@ -918,6 +950,7 @@ contracts! {
     /// protocol, never over a generative transport.
     struct WireDecisionProfile {
         pub id: String,
+        pub edit_seq: u32,
         pub name: String,
         pub model: String,
         pub protocol: String,
@@ -1087,6 +1120,24 @@ impl WireCompactionPolicy {
                     max_preparations: prediction.max_preparations,
                     max_prediction_tokens: prediction.max_prediction_tokens,
                     max_preparation_tokens: prediction.max_preparation_tokens,
+                    mode: match prediction.mode {
+                        crate::persistence::PredictionMode::Shadow => WirePredictionMode::Shadow,
+                        crate::persistence::PredictionMode::Prepare => WirePredictionMode::Prepare,
+                    },
+                    acceptance: prediction
+                        .acceptance
+                        .map(|acceptance| WirePredictionAcceptance {
+                            model: acceptance.model.id.to_string(),
+                            model_edit_seq: acceptance.model.edit_seq,
+                            reported_model: acceptance.reported_model,
+                            confidence_semantics: acceptance.confidence_semantics,
+                            minimum_probability_millionths: acceptance
+                                .minimum_probability_millionths,
+                            minimum_confidence_millionths: acceptance.minimum_confidence_millionths,
+                        }),
+                    max_preparations_per_hour: prediction.max_preparations_per_hour,
+                    max_tokens_per_hour: prediction.max_tokens_per_hour,
+                    max_requests_per_hour: prediction.max_requests_per_hour,
                 }),
         }
     }
@@ -1131,6 +1182,34 @@ impl WireCompactionPolicy {
                         max_preparations: prediction.max_preparations,
                         max_prediction_tokens: prediction.max_prediction_tokens,
                         max_preparation_tokens: prediction.max_preparation_tokens,
+                        mode: match prediction.mode {
+                            WirePredictionMode::Shadow => {
+                                crate::persistence::PredictionMode::Shadow
+                            }
+                            WirePredictionMode::Prepare => {
+                                crate::persistence::PredictionMode::Prepare
+                            }
+                        },
+                        acceptance: prediction
+                            .acceptance
+                            .map(|acceptance| {
+                                Ok::<_, super::Refusal>(crate::persistence::PredictionAcceptance {
+                                    model: crate::persistence::ConfigRef {
+                                        id: id(acceptance.model)?,
+                                        edit_seq: acceptance.model_edit_seq,
+                                    },
+                                    reported_model: acceptance.reported_model,
+                                    confidence_semantics: acceptance.confidence_semantics,
+                                    minimum_probability_millionths: acceptance
+                                        .minimum_probability_millionths,
+                                    minimum_confidence_millionths: acceptance
+                                        .minimum_confidence_millionths,
+                                })
+                            })
+                            .transpose()?,
+                        max_preparations_per_hour: prediction.max_preparations_per_hour,
+                        max_tokens_per_hour: prediction.max_tokens_per_hour,
+                        max_requests_per_hour: prediction.max_requests_per_hour,
                     })
                 })
                 .transpose()?,

@@ -2,8 +2,8 @@ use super::*;
 use crate::persistence::{
     ChoiceOption, CompactionMode, CompactionPolicy, CompactionPreset, CustomPolicy,
     DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
-    DecisionQuestion, DecisionRequest, DecisionWork, FrozenDecisionConfig, PredictiveCompaction,
-    ScoreLevel, WorkspaceAccess,
+    DecisionQuestion, DecisionRequest, DecisionWork, FrozenDecisionConfig, PredictionAcceptance,
+    PredictionMode, PredictiveCompaction, ScoreLevel, SummarizationStage, WorkspaceAccess,
 };
 
 // ---- explicit versioned encoding ----------------------------------------------
@@ -145,6 +145,20 @@ impl Enc {
             e.u32(p.max_preparations);
             e.u32(p.max_prediction_tokens);
             e.u32(p.max_preparation_tokens);
+            e.u8(match p.mode {
+                PredictionMode::Shadow => 0,
+                PredictionMode::Prepare => 1,
+            });
+            e.opt(&p.acceptance, |e, acceptance| {
+                e.config_ref(&acceptance.model);
+                e.str(&acceptance.reported_model);
+                e.str(&acceptance.confidence_semantics);
+                e.u32(acceptance.minimum_probability_millionths);
+                e.u32(acceptance.minimum_confidence_millionths);
+            });
+            e.u32(p.max_preparations_per_hour);
+            e.u32(p.max_tokens_per_hour);
+            e.u32(p.max_requests_per_hour);
         });
     }
     pub(super) fn decision_model(&mut self, model: &DecisionModelConfig) {
@@ -459,6 +473,23 @@ impl<'a> Dec<'a> {
                     max_preparations: d.u32()?,
                     max_prediction_tokens: d.u32()?,
                     max_preparation_tokens: d.u32()?,
+                    mode: match d.u8()? {
+                        0 => PredictionMode::Shadow,
+                        1 => PredictionMode::Prepare,
+                        _ => return Err(StorageError::corrupted("invalid prediction mode")),
+                    },
+                    acceptance: d.opt(|d| {
+                        Ok(PredictionAcceptance {
+                            model: d.config_ref()?,
+                            reported_model: d.str()?,
+                            confidence_semantics: d.str()?,
+                            minimum_probability_millionths: d.u32()?,
+                            minimum_confidence_millionths: d.u32()?,
+                        })
+                    })?,
+                    max_preparations_per_hour: d.u32()?,
+                    max_tokens_per_hour: d.u32()?,
+                    max_requests_per_hour: d.u32()?,
                 })
             })?,
         };
@@ -761,6 +792,24 @@ impl Enc {
                             encoder.u64(*revision)
                         });
                         self.opt(&work.policy_profile, Self::config_ref);
+                        match work.stage {
+                            SummarizationStage::Direct => self.u8(0),
+                            SummarizationStage::Chunk {
+                                start,
+                                end,
+                                content,
+                            } => {
+                                self.u8(1);
+                                self.u64(start);
+                                self.u64(end);
+                                self.0.extend_from_slice(content.as_bytes());
+                            }
+                            SummarizationStage::Reduce => self.u8(2),
+                        }
+                        self.ou128(work.chain.map(JobId::get));
+                        self.ou128(work.prediction.map(JobId::get));
+                        self.u32(work.reserved_tokens);
+                        self.u32(work.reserved_requests);
                     }
                     TurnExecution::Decision(work) => {
                         self.u8(2);
@@ -962,18 +1011,40 @@ impl Dec<'_> {
                     0 => TurnExecution::Frozen(self.frozen_execution()?),
                     1 => TurnExecution::Ref(JobId::new(self.u128()?)),
                     2 => TurnExecution::Decision(self.decision_work()?),
-                    3 => TurnExecution::Summarization(crate::persistence::SummarizationWork {
-                        frozen: self.frozen_execution()?,
-                        source: ContentDigest::from_bytes(
-                            self.take(32)?
-                                .try_into()
-                                .map_err(|_| StorageError::corrupted("invalid source digest"))?,
-                        ),
-                        target_tokens: self.u32()?,
-                        minimum_savings_tokens: self.u32()?,
-                        policy_revision: self.opt(Self::u64)?,
-                        policy_profile: self.opt(Self::config_ref)?,
-                    }),
+                    3 => {
+                        let work = crate::persistence::SummarizationWork {
+                            frozen: self.frozen_execution()?,
+                            source: ContentDigest::from_bytes(
+                                self.take(32)?.try_into().map_err(|_| {
+                                    StorageError::corrupted("invalid source digest")
+                                })?,
+                            ),
+                            target_tokens: self.u32()?,
+                            minimum_savings_tokens: self.u32()?,
+                            policy_revision: self.opt(Self::u64)?,
+                            policy_profile: self.opt(Self::config_ref)?,
+                            stage: match self.u8()? {
+                                0 => SummarizationStage::Direct,
+                                1 => SummarizationStage::Chunk {
+                                    start: self.u64()?,
+                                    end: self.u64()?,
+                                    content: ContentDigest::from_bytes(
+                                        self.take(32)?.try_into().map_err(|_| {
+                                            StorageError::corrupted("invalid chunk digest")
+                                        })?,
+                                    ),
+                                },
+                                2 => SummarizationStage::Reduce,
+                                _ => return Err(StorageError::corrupted("invalid summary stage")),
+                            },
+                            chain: self.ou128()?.map(JobId::new),
+                            prediction: self.ou128()?.map(JobId::new),
+                            reserved_tokens: self.u32()?,
+                            reserved_requests: self.u32()?,
+                        };
+                        work.validate_stage().map_err(StorageError::corrupted)?;
+                        TurnExecution::Summarization(work)
+                    }
                     _ => return Err(StorageError::corrupted("invalid execution")),
                 },
                 plan_source: match self.u8()? {
@@ -1102,11 +1173,11 @@ mod responses_protocol_tests {
             LlmTransport::from_code(3),
             Some(LlmTransport::AnthropicMessages)
         );
-        assert_eq!(FORMAT_VERSION, 30);
+        assert_eq!(FORMAT_VERSION, 31);
     }
     #[test]
     fn older_decision_foundation_formats_are_refused_at_open() {
-        for version in [26u32, 27, 28, 29] {
+        for version in [26u32, 27, 28, 29, 30] {
             assert!(
                 matches!(super::super::open::format_verdict(Some(FORMAT_NAME.to_vec()), Some(version.to_le_bytes().to_vec()), 1), Err(super::super::OpenError::UnsupportedFormat { found }) if found == version)
             );

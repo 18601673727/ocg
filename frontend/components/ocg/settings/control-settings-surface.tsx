@@ -24,6 +24,9 @@ import { ProjectsSection } from "./projects-section";
 import { ProviderModelImport } from "./provider-model-import";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
+import { CompactionPolicyFields } from "./compaction-policy-fields";
+import { DecisionProfilesSection } from "./decision-profiles-section";
+import type { ControlCompactionPolicy } from "../contracts";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
 import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
@@ -154,6 +157,8 @@ export function SettingsSurface({
   const [agentTargets, setAgentTargets] = useState<string[]>([]);
   const [agentDispatchTo, setAgentDispatchTo] = useState<string[] | undefined>();
   const [agentDefaultModel, setAgentDefaultModel] = useState<string | null | undefined>();
+  const [agentAssistance, setAgentAssistance] = useState<string | null>(null);
+  const [agentCompaction, setAgentCompaction] = useState<ControlCompactionPolicy | null>(null);
   const [agentSaving, setAgentSaving] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
   const [agentNotice, setAgentNotice] = useState<string | null>(null);
@@ -336,6 +341,8 @@ export function SettingsSurface({
     setAgentTargets([]);
     setAgentDispatchTo(undefined);
     setAgentDefaultModel(undefined);
+    setAgentAssistance(null);
+    setAgentCompaction(null);
     setAgentError(null);
   }
 
@@ -348,6 +355,8 @@ export function SettingsSurface({
     setAgentTargets([...agent.llm_targets]);
     setAgentDispatchTo(agent.dispatch_to);
     setAgentDefaultModel(agent.default_model);
+    setAgentAssistance(agent.decision_assistance ?? null);
+    setAgentCompaction(agent.compaction_policy ?? null);
     setAgentError(null);
     setAgentNotice(null);
   }
@@ -385,6 +394,8 @@ export function SettingsSurface({
         behavior: agentBehavior,
         tool_grant: agentToolGrant === "none" ? null : agentToolGrant,
         llm_targets: agentTargets,
+        decision_assistance: agentAssistance,
+        compaction_policy: agentCompaction,
         dispatch_to: agentDispatchTo,
         default_model: agentDefaultModel && !agentTargets.includes(agentDefaultModel) ? null : agentDefaultModel,
       };
@@ -811,6 +822,16 @@ export function SettingsSurface({
                   )}
                 </fieldset>
 
+                {snapshot && <>
+                  <label className="grid gap-1 text-xs">{t("context.assistance")}
+                    <select className="min-h-10 rounded-md border bg-background px-2" disabled={agentSaving} value={agentAssistance ?? ""} onChange={event => setAgentAssistance(event.target.value || null)}>
+                      <option value="">{t("context.noAssistance")}</option>
+                      {snapshot.decision_agent_profiles.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+                    </select>
+                  </label>
+                  <CompactionPolicyFields key={editingAgentId ?? "new-agent"} value={agentCompaction} onChange={setAgentCompaction} profiles={snapshot} disabled={agentSaving} />
+                </>}
+
                 {agentError ? (
                   <DismissibleNotice message={agentError}  className="text-sm text-destructive">
                     {agentError}
@@ -871,6 +892,7 @@ export function SettingsSurface({
               )}
             </Section>
 
+            {snapshot && <DecisionProfilesSection client={client} profiles={snapshot} onSaved={setSnapshot} />}
             <ProjectsSection client={client} />
             <PoolsSection client={client} />
           </>

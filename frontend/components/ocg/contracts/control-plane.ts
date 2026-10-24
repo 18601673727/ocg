@@ -930,6 +930,8 @@ export function decodeProfiles(input: unknown) {
           (target, targetPath) => identity(target, targetPath)),
         default_model: agent.default_model === undefined ? undefined : agent.default_model === null ? null
           : identity(agent.default_model, `${path}.default_model`),
+        decision_assistance: agent.decision_assistance === undefined ? undefined : identity(agent.decision_assistance, `${path}.decision_assistance`),
+        compaction_policy: agent.compaction_policy === undefined ? undefined : decodeCompactionPolicy(agent.compaction_policy, `${path}.compaction_policy`),
         editable: boolean(agent.editable, `${path}.editable`),
         blocking_jobs: listOf(agent.blocking_jobs, `${path}.blocking_jobs`,
           (job, jobPath) => identity(job, jobPath)),
@@ -937,6 +939,14 @@ export function decodeProfiles(input: unknown) {
         created_at_us: integer(agent.created_at_us, `${path}.created_at_us`),
         updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`),
       } satisfies ProjectedManagedAgent;
+    }),
+    decision_profiles: listOf(envelope.decision_profiles ?? [], "decision_profiles", (input, path) => {
+      const model = record(input, path);
+      return { id: identity(model.id, `${path}.id`), edit_seq: integer(model.edit_seq, `${path}.edit_seq`), name: string(model.name, `${path}.name`), model: string(model.model, `${path}.model`), protocol: string(model.protocol, `${path}.protocol`), endpoint: optionalString(model.endpoint, `${path}.endpoint`), credential_ref: optionalString(model.credential_ref, `${path}.credential_ref`), has_credential: boolean(model.has_credential, `${path}.has_credential`), declared_capabilities: listOf(model.declared_capabilities, `${path}.declared_capabilities`, string), limits: decisionLimits(model.limits, `${path}.limits`), editable: boolean(model.editable, `${path}.editable`), created_at_us: integer(model.created_at_us, `${path}.created_at_us`), updated_at_us: integer(model.updated_at_us, `${path}.updated_at_us`) } satisfies Wire.WireDecisionProfile;
+    }),
+    decision_agent_profiles: listOf(envelope.decision_agent_profiles ?? [], "decision_agent_profiles", (input, path) => {
+      const agent = record(input, path);
+      return { id: identity(agent.id, `${path}.id`), name: string(agent.name, `${path}.name`), instructions: optionalString(agent.instructions, `${path}.instructions`), models: listOf(agent.models, `${path}.models`, identity), default_model: agent.default_model === null ? null : identity(agent.default_model, `${path}.default_model`), workspace_access: string(agent.workspace_access, `${path}.workspace_access`), editable: boolean(agent.editable, `${path}.editable`), created_at_us: integer(agent.created_at_us, `${path}.created_at_us`), updated_at_us: integer(agent.updated_at_us, `${path}.updated_at_us`) } satisfies Wire.WireDecisionAgentProfile;
     }),
     executor_protocols: listOf(envelope.executor_protocols, "executor_protocols", (entry, path) => {
       const executor = record(entry, path);
@@ -1213,4 +1223,81 @@ export function decodeReleaseSlot(input: unknown) {
   if (value.api_version !== CONTROL_API_VERSION) throw new ContractError("api_version", String(CONTROL_API_VERSION));
   if (value.status !== "released" && value.status !== "already_released") throw new ContractError("status", "a released slot");
   return { status: value.status } satisfies Wire.WireReleaseSlot;
+}
+
+export type ControlCompactionPolicy = Wire.WireCompactionPolicy;
+export type ControlPredictiveCompaction = Wire.WirePredictiveCompaction;
+export type ControlDecisionLimits = Wire.WireDecisionLimits;
+
+function decisionLimits(input: unknown, path: string): Wire.WireDecisionLimits {
+  const value = record(input, path);
+  return {
+    max_input_tokens_per_request: timestamp(value.max_input_tokens_per_request, `${path}.max_input_tokens_per_request`),
+    max_output_tokens_per_request: timestamp(value.max_output_tokens_per_request, `${path}.max_output_tokens_per_request`),
+    max_input_tokens_per_question: timestamp(value.max_input_tokens_per_question, `${path}.max_input_tokens_per_question`),
+    max_output_tokens_per_question: timestamp(value.max_output_tokens_per_question, `${path}.max_output_tokens_per_question`),
+  };
+}
+
+export function decodeCompactionPolicy(input: unknown, path = "policy"): Wire.WireCompactionPolicy {
+  const value = record(input, path), mode = record(value.mode, `${path}.mode`);
+  let decodedMode: Wire.WireCompactionMode;
+  if (mode.kind === "off") decodedMode = { kind: "off" };
+  else if (mode.kind === "auto" && (mode.preset === "conservative" || mode.preset === "balanced" || mode.preset === "aggressive")) decodedMode = { kind: "auto", preset: mode.preset };
+  else if (mode.kind === "custom") {
+    const custom = record(mode.policy, `${path}.mode.policy`);
+    decodedMode = { kind: "custom", policy: {
+      trigger_tokens: integer(custom.trigger_tokens, `${path}.trigger_tokens`), target_tokens: integer(custom.target_tokens, `${path}.target_tokens`),
+      reserved_output_tokens: integer(custom.reserved_output_tokens, `${path}.reserved_output_tokens`), minimum_source_tokens: integer(custom.minimum_source_tokens, `${path}.minimum_source_tokens`),
+      minimum_savings_tokens: integer(custom.minimum_savings_tokens, `${path}.minimum_savings_tokens`), preserve_recent_turns: integer(custom.preserve_recent_turns, `${path}.preserve_recent_turns`), cooldown_seconds: integer(custom.cooldown_seconds, `${path}.cooldown_seconds`),
+    } };
+  } else throw new ContractError(`${path}.mode`, "off, an automatic preset, or custom");
+  let predictive: Wire.WirePredictiveCompaction | null = null;
+  if (value.predictive !== null) {
+    const prediction = record(value.predictive, `${path}.predictive`);
+    const mode = prediction.mode ?? "shadow";
+    if (mode !== "shadow" && mode !== "prepare") throw new ContractError(`${path}.predictive.mode`, "shadow or prepare");
+    const pin = prediction.acceptance === null || prediction.acceptance === undefined ? null : record(prediction.acceptance, `${path}.predictive.acceptance`);
+    predictive = {
+      decision_agent: identity(prediction.decision_agent, `${path}.decision_agent`), minimum_interval_seconds: integer(prediction.minimum_interval_seconds, `${path}.minimum_interval_seconds`),
+      max_preparations: integer(prediction.max_preparations, `${path}.max_preparations`), max_prediction_tokens: integer(prediction.max_prediction_tokens, `${path}.max_prediction_tokens`), max_preparation_tokens: integer(prediction.max_preparation_tokens, `${path}.max_preparation_tokens`),
+      mode, acceptance: pin ? { model: identity(pin.model, `${path}.acceptance.model`), model_edit_seq: integer(pin.model_edit_seq, `${path}.acceptance.model_edit_seq`), reported_model: string(pin.reported_model, `${path}.acceptance.reported_model`), confidence_semantics: string(pin.confidence_semantics, `${path}.acceptance.confidence_semantics`), minimum_probability_millionths: integer(pin.minimum_probability_millionths, `${path}.acceptance.minimum_probability_millionths`), minimum_confidence_millionths: integer(pin.minimum_confidence_millionths, `${path}.acceptance.minimum_confidence_millionths`) } : null,
+      max_preparations_per_hour: integer(prediction.max_preparations_per_hour ?? 0, `${path}.max_preparations_per_hour`), max_tokens_per_hour: integer(prediction.max_tokens_per_hour ?? 0, `${path}.max_tokens_per_hour`), max_requests_per_hour: integer(prediction.max_requests_per_hour ?? 0, `${path}.max_requests_per_hour`),
+    };
+  }
+  return { mode: decodedMode, summarization_model: value.summarization_model === null ? null : identity(value.summarization_model, `${path}.summarization_model`), predictive };
+}
+
+export function decodeCompaction(input: unknown, conversation: string) {
+  const value = record(input, "response");
+  if (value.api_version !== CONTROL_API_VERSION || value.conversation !== conversation) throw new ContractError("conversation", "the requested conversation");
+  return { conversation, status: string(value.status, "status"), job: value.job === null ? null : identity(value.job, "job"), system_conversation: value.system_conversation === null ? null : identity(value.system_conversation, "system_conversation"), through: value.through === null ? null : identity(value.through, "through"), subsequent: boolean(value.subsequent, "subsequent"), reason: optionalString(value.reason, "reason") } satisfies Wire.WireCompaction;
+}
+
+function contextBoundary(input: unknown, path: string): Wire.WireContextBoundary {
+  const value = record(input, path);
+  return { turn: identity(value.turn, `${path}.turn`), input_through: integer(value.input_through, `${path}.input_through`), output_through: integer(value.output_through, `${path}.output_through`), fingerprint: string(value.fingerprint, `${path}.fingerprint`) };
+}
+export function decodeContextStatus(input: unknown, conversation: string) {
+  const value = record(input, "response");
+  if (value.api_version !== CONTROL_API_VERSION || value.conversation !== conversation) throw new ContractError("conversation", "the requested conversation");
+  const model = value.foreground_model === null ? null : record(value.foreground_model, "foreground_model");
+  const use = value.last_context_use === null ? null : record(value.last_context_use, "last_context_use");
+  return {
+    conversation, mode: string(value.mode, "mode"), summarizer: optionalString(value.summarizer, "summarizer"), predictive: boolean(value.predictive, "predictive"), predictive_unavailable: optionalString(value.predictive_unavailable, "predictive_unavailable"), revision: integer(value.revision, "revision"), uncalibrated: boolean(value.uncalibrated, "uncalibrated"),
+    policy: decodeCompactionPolicy(value.policy), policy_override: value.policy_override === null ? null : decodeCompactionPolicy(value.policy_override, "policy_override"), policy_source: string(value.policy_source, "policy_source"), predictor: optionalString(value.predictor, "predictor"), predictor_model: optionalString(value.predictor_model, "predictor_model"), prediction_mode: string(value.prediction_mode, "prediction_mode"), predictive_preparation_enabled: boolean(value.predictive_preparation_enabled, "predictive_preparation_enabled"),
+    foreground_model: model ? { profile: identity(model.profile, "foreground_model.profile"), edit_seq: integer(model.edit_seq, "foreground_model.edit_seq"), model: string(model.model, "foreground_model.model"), capacity: timestamp(model.capacity, "foreground_model.capacity"), capacity_source: string(model.capacity_source, "foreground_model.capacity_source"), reserved_output_tokens: integer(model.reserved_output_tokens, "foreground_model.reserved_output_tokens") } : null,
+    estimated_tokens: timestamp(value.estimated_tokens, "estimated_tokens"), estimate_method: string(value.estimate_method, "estimate_method"), recent_growth_tokens: integer(value.recent_growth_tokens, "recent_growth_tokens"),
+    last_context_use: use ? { turn: identity(use.turn, "last_context_use.turn"), seq: integer(use.seq, "last_context_use.seq"), artifact: use.artifact === null ? null : identity(use.artifact, "last_context_use.artifact") } : null,
+    work: listOf(value.work, "work", (input, path) => {
+      const work = record(input, path), base = { job: identity(work.job, `${path}.job`), conversation: identity(work.conversation, `${path}.conversation`), state: string(work.state, `${path}.state`) };
+      if (work.kind === "summarization") {
+        const source = record(work.source, `${path}.source`);
+        return { ...base, kind: "summarization", summarizer: identity(work.summarizer, `${path}.summarizer`), automatic: boolean(work.automatic, `${path}.automatic`), stage: string(work.stage, `${path}.stage`), chain: work.chain === null ? null : identity(work.chain, `${path}.chain`), prediction: work.prediction === null ? null : identity(work.prediction, `${path}.prediction`), reserved_tokens: integer(work.reserved_tokens, `${path}.reserved_tokens`), reserved_requests: integer(work.reserved_requests, `${path}.reserved_requests`), source: { digest: string(source.digest, `${path}.source.digest`), first: contextBoundary(source.first, `${path}.source.first`), through: contextBoundary(source.through, `${path}.source.through`), turn_count: integer(source.turn_count, `${path}.source.turn_count`) } } satisfies Extract<Wire.WireContextWork, { kind: "summarization" }>;
+      }
+      if (work.kind === "prediction") return { ...base, kind: "prediction", predictor: identity(work.predictor, `${path}.predictor`), model: identity(work.model, `${path}.model`), activity_turn: identity(work.activity_turn, `${path}.activity_turn`), policy_revision: integer(work.policy_revision, `${path}.policy_revision`), max_tokens: integer(work.max_tokens, `${path}.max_tokens`), forecast_tokens: timestamp(work.forecast_tokens, `${path}.forecast_tokens`) } satisfies Omit<Extract<Wire.WireContextWork, { kind: "prediction" }>, "result">;
+      throw new ContractError(`${path}.kind`, "summarization or prediction");
+    }),
+    has_more: boolean(value.has_more, "has_more"), next_before: value.next_before === null ? null : identity(value.next_before, "next_before"),
+  } satisfies Omit<Wire.WireContextStatus, "work"> & { work: Array<Extract<Wire.WireContextWork, {kind: "summarization"}> | Omit<Extract<Wire.WireContextWork, {kind: "prediction"}>, "result">> };
 }

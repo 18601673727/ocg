@@ -54,7 +54,11 @@ export type WireCustomCompaction = { trigger_tokens: number, target_tokens: numb
 
 export type WireCompactionMode = { "kind": "off" } | { "kind": "auto", preset: WireCompactionPreset, } | { "kind": "custom", policy: WireCustomCompaction, };
 
-export type WirePredictiveCompaction = { decision_agent: string, minimum_interval_seconds: number, max_preparations: number, max_prediction_tokens: number, max_preparation_tokens: number, };
+export type WirePredictionAcceptance = { model: string, model_edit_seq: number, reported_model: string, confidence_semantics: string, minimum_probability_millionths: number, minimum_confidence_millionths: number, };
+
+export type WirePredictionMode = "shadow" | "prepare";
+
+export type WirePredictiveCompaction = { decision_agent: string, minimum_interval_seconds: number, max_preparations: number, max_prediction_tokens: number, max_preparation_tokens: number, mode: WirePredictionMode, acceptance: WirePredictionAcceptance | null, max_preparations_per_hour: number, max_tokens_per_hour: number, max_requests_per_hour: number, };
 
 export type WireCompactionPolicy = { mode: WireCompactionMode, summarization_model: string | null, predictive: WirePredictiveCompaction | null, };
 
@@ -66,7 +70,7 @@ export type WireContextBoundary = { turn: string, input_through: number, output_
 
 export type WireContextSource = { digest: string, first: WireContextBoundary, through: WireContextBoundary, turn_count: number, };
 
-export type WireContextWork = { "kind": "summarization", job: string, conversation: string, state: string, summarizer: string, automatic: boolean, source: WireContextSource, } | { "kind": "prediction", job: string, conversation: string, state: string, predictor: string, model: string, activity_turn: string, policy_revision: number, max_tokens: number, forecast_tokens: number | null, result: JsonValue | null, };
+export type WireContextWork = { "kind": "summarization", job: string, conversation: string, state: string, summarizer: string, automatic: boolean, stage: string, chain: string | null, prediction: string | null, reserved_tokens: number, reserved_requests: number, source: WireContextSource, } | { "kind": "prediction", job: string, conversation: string, state: string, predictor: string, model: string, activity_turn: string, policy_revision: number, max_tokens: number, forecast_tokens: number | null, result: JsonValue | null, };
 
 export type WireContextStatus = { conversation: string,
 /**
@@ -278,7 +282,7 @@ export type WireDecisionRequest = { schema_version: number, state: JsonValue, qu
 
 export type WireDecisionLimits = { max_input_tokens_per_request: number | null, max_output_tokens_per_request: number | null, max_input_tokens_per_question: number | null, max_output_tokens_per_question: number | null, };
 
-export type WireDecisionProfile = { id: string, name: string, model: string, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, limits: WireDecisionLimits, editable: boolean, created_at_us: number, updated_at_us: number, };
+export type WireDecisionProfile = { id: string, edit_seq: number, name: string, model: string, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, limits: WireDecisionLimits, editable: boolean, created_at_us: number, updated_at_us: number, };
 
 export type WireDecisionAgentProfile = { id: string, name: string, instructions: string | null, models: Array<string>, default_model: string | null, workspace_access: string, editable: boolean, created_at_us: number, updated_at_us: number, };
 

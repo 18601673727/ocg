@@ -5460,6 +5460,7 @@ mod requests_and_tool_loop {
             let mut sent = Vec::new();
             let settled = run_provider_job(
                 ProviderRun {
+                    speculative: false,
                     scheduler: None,
                     database: handle,
                     executor: run.executor,
@@ -10622,6 +10623,7 @@ mod requests_and_tool_loop {
                 let mut sent = Vec::new();
                 let settled = run_provider_job(
                     ProviderRun {
+                        speculative: false,
                         scheduler: None,
                         database: handle,
                         executor: run.executor,
@@ -15590,6 +15592,7 @@ mod requests_and_tool_loop {
                 let mut respond = Some(respond);
                 let settled = run_provider_job(
                     ProviderRun {
+                        speculative: false,
                         scheduler: None,
                         database: handle,
                         executor: run.executor,
@@ -16153,6 +16156,7 @@ mod requests_and_tool_loop {
                 let mut steps = Some(steps);
                 run_provider_job(
                     ProviderRun {
+                        speculative: false,
                         scheduler: None,
                         database: handle,
                         executor: run.executor,
@@ -16192,7 +16196,7 @@ mod requests_and_tool_loop {
         #[test]
         fn an_attachment_is_an_entity_of_its_own_that_outlives_restarts() {
             let (_root, directory) = data_directory("attachment-entity");
-            assert_eq!(crate::storage::FORMAT_VERSION, 30);
+            assert_eq!(crate::storage::FORMAT_VERSION, 31);
             let worker = DatabaseWorker::start(&directory).expect("a new format 16 database");
             let handle = worker.handle();
             let first = attach(&handle, png(), "image/png", "../shots/screen.png");
@@ -17862,6 +17866,7 @@ mod requests_and_tool_loop {
             let (registry, _calls) = echo_registry(ToolEffect::NonIdempotent, json!({"ok": true}));
 
             let provider_run = ProviderRun {
+                speculative: false,
                 scheduler: None,
                 database: handle.clone(),
                 executor: run.executor,

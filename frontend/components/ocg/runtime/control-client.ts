@@ -32,6 +32,7 @@ import {
   decodePoolAnswer,
   decodePools,
   decodeProfiles,
+  decodeContextStatus, decodeCompaction, type ControlCompactionPolicy, type ControlDecisionLimits,
   decodeProviderModels,
   decodeImportedModels,
   type ControlProviderModel,
@@ -72,6 +73,7 @@ export type ControlPoolUpdate =
 export type ControlConversationEdit =
   | { title: string; hidden?: never }
   | { hidden: true; title?: never }
+  | { compaction_policy: ControlCompactionPolicy | null }
   | { limits: Pick<ReturnType<typeof decodeConversationLimits>, "max_depth" | "max_auto_turns" | "max_iterations">; title?: never; hidden?: never };
 
 export type JobStreamEvent = ControlJobEvent | { type: "heartbeat"; };
@@ -149,7 +151,11 @@ export type ControlProfileWriteRequest =
       llm_targets: string[];
       dispatch_to?: string[];
       default_model?: string | null;
-    };
+      decision_assistance?: string | null;
+      compaction_policy?: ControlCompactionPolicy | null;
+    }
+  | { kind: "decision_model"; name: string; model: string; protocol: "typesafe_systemone"; endpoint: string; credential?: string; credential_ref?: string | null; clear_credential?: boolean; declared_capabilities: string[]; limits: ControlDecisionLimits }
+  | { kind: "decision_agent"; name: string; instructions?: string | null; models: string[]; default_model?: string | null; workspace_access: "none" };
 
 export type ControlSubmissionResult = {
   conversation: string | null;
@@ -514,6 +520,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           .map((executor) => executor.id).sort(),
       })),
       agent_profiles: pages.flatMap((page) => page.agent_profiles),
+      decision_profiles: pages.flatMap((page) => page.decision_profiles),
+      decision_agent_profiles: pages.flatMap((page) => page.decision_agent_profiles),
       executor_protocols: [...executors.values()],
       providers: [...providers.values()],
       has_more: false,
@@ -564,6 +572,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const result = decodeConversationEdit(answer.input, root);
       conversationListeners.forEach((listener) => listener());
       return result;
+    },
+
+    async readContextStatus(conversation: string, settings: { before?: string; signal?: AbortSignal } = {}) {
+      const suffix = settings.before ? `?before=${jobIdentity(settings.before)}` : "";
+      return decodeContextStatus((await send("GET", `/api/v1/conversations/${jobIdentity(conversation)}/context${suffix}`, {signal: settings.signal})).input, conversation);
+    },
+    async compactConversation(conversation: string, model: string, key: string) {
+      return decodeCompaction((await send("POST", `/api/v1/conversations/${jobIdentity(conversation)}/compact`, {body: { model: identity(model, "model") }, key: submissionKey(key), sign: true})).input, conversation);
     },
 
     async readConversationLimits(conversation: string, signal?: AbortSignal) {

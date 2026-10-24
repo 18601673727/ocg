@@ -377,8 +377,8 @@ impl Batch {
                 if let Some(decision) = agent.decision_assistance {
                     self.require_config_kind(decision, ConfigKind::DecisionAgent)?;
                 }
-                if let Some(policy) = agent.compaction_policy {
-                    self.check_compaction_policy(&policy)?;
+                if let Some(policy) = &agent.compaction_policy {
+                    self.check_compaction_policy(policy)?;
                 }
 
                 if agent.approve.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -544,7 +544,7 @@ impl Batch {
         if let Some(model) = policy.summarization_model {
             self.require_config_kind(model, ConfigKind::Model)?;
         }
-        if let Some(predictive) = policy.predictive {
+        if let Some(predictive) = &policy.predictive {
             let agent =
                 self.require_config_kind(predictive.decision_agent, ConfigKind::DecisionAgent)?;
             let ConfigBody::DecisionAgent(body) = agent.body else {
@@ -775,10 +775,14 @@ impl Batch {
                     ConfigBody::Agent(agent) => {
                         agent.models.contains(&id)
                             || agent.default_model == Some(id)
-                            || agent.compaction_policy.is_some_and(|policy| {
+                            || agent.compaction_policy.as_ref().is_some_and(|policy| {
                                 policy.summarization_model == Some(id)
-                                    || policy.predictive.is_some_and(|prediction| {
+                                    || policy.predictive.as_ref().is_some_and(|prediction| {
                                         emptied.contains(&prediction.decision_agent)
+                                            || prediction
+                                                .acceptance
+                                                .as_ref()
+                                                .is_some_and(|pin| pin.model.id == id)
                                     })
                             })
                     }
@@ -802,9 +806,18 @@ impl Batch {
             }
             if policy
                 .predictive
+                .as_ref()
                 .is_some_and(|prediction| emptied.contains(&prediction.decision_agent))
             {
                 policy.predictive = None;
+            } else if let Some(prediction) = &mut policy.predictive
+                && prediction
+                    .acceptance
+                    .as_ref()
+                    .is_some_and(|pin| pin.model.id == id)
+            {
+                prediction.mode = crate::persistence::PredictionMode::Shadow;
+                prediction.acceptance = None;
             }
         };
         for mut agent_row in agents {
@@ -840,7 +853,7 @@ impl Batch {
                 let (key, bytes) = entry?;
                 if let Some(mut policy) = ConversationRow::decode(bytes.value())?.compaction_policy
                 {
-                    let before = policy;
+                    let before = policy.clone();
                     clear_policy(&mut policy);
                     if policy != before {
                         changes.push((JobId::new(key.value()), policy));

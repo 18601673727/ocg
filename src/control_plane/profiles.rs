@@ -767,6 +767,7 @@ fn build_profiles_page(
                     .is_some_and(|reference| database.has_credential(reference));
                 let profile = WireDecisionProfile {
                     id: id.to_string(),
+                    edit_seq: record.edit_seq,
                     name: record.name,
                     model: model.model.clone(),
                     protocol: model.protocol.as_str().to_owned(),

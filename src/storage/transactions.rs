@@ -210,14 +210,11 @@ impl Batch {
             ..
         } = &spec.kind
         {
-            if work.target_tokens == 0
-                || work.frozen.agent.is_some()
-                || work.frozen.agent_ref.is_some()
-            {
-                return self.reject(Violation::InvalidValue(
-                    "execution",
-                    "summarization requires a positive target and no Agent authority",
-                ));
+            if let Err(reason) = work.validate_stage() {
+                return self.reject(Violation::InvalidValue("execution", reason));
+            }
+            if work.chain.is_some() {
+                self.step(|tx| reads::summary_root(&tx.open_table(JOBS)?, work))?;
             }
             let manifest = self
                 .step(|tx| reads::load_context_manifest(&tx.open_table(MESSAGES)?, work.source))?;
@@ -659,6 +656,41 @@ impl Batch {
         })
     }
 
+    fn held_background(&mut self) -> Result<(u32, u32), BatchError> {
+        self.step(|tx| {
+            let jobs = tx.open_table(JOBS)?;
+            let mut counts = (0u32, 0u32);
+            for entry in tx
+                .open_table(HELD_SLOTS)?
+                .iter()?
+                .take(usize::from(GLOBAL_EXECUTION_LIMIT) + 1)
+            {
+                let id = entry?.0.value().1;
+                let Some(bytes) = jobs.get(id)? else {
+                    return Err(StorageError::corrupted("held Job missing"));
+                };
+                match reads::work_priority(&jobs, &JobRow::decode_at(id, bytes.value())?)? {
+                    2 => counts.0 += 1,
+                    1 => counts.1 += 1,
+                    _ => {}
+                }
+            }
+            Ok(counts)
+        })
+    }
+
+    pub(super) fn has_executor_for(
+        &mut self,
+        operation: ExecutionOperation,
+        protocol: Option<LlmTransport>,
+    ) -> Result<bool, BatchError> {
+        let key = requirement(Some(operation), protocol);
+        Ok(self
+            .open_pools()?
+            .iter()
+            .any(|pool| pool.body.enabled && pool.offers(key)))
+    }
+
     fn held_slot_count(&mut self) -> Result<u32, BatchError> {
         let count = self.step(|tx| Ok(tx.open_table(HELD_SLOTS)?.len()?))?;
         Ok(u32::try_from(count).unwrap_or(u32::MAX))
@@ -668,12 +700,15 @@ impl Batch {
     /// id first, while a global slot and a compatible Pool are free.
     pub(crate) fn claim_batch(&mut self) -> Result<Vec<JobId>, BatchError> {
         self.promote()?;
+        self.cancel_stale_context_work()?;
+        self.recover_predictions()?;
         let mut free = u32::from(GLOBAL_EXECUTION_LIMIT).saturating_sub(self.held_slot_count()?);
         let mut pools: Vec<OpenPool> = self
             .open_pools()?
             .into_iter()
             .filter(OpenPool::has_room)
             .collect();
+        let (mut speculative, mut automatic) = self.held_background()?;
         let mut grants = Vec::new();
         let mut deferred = BTreeSet::new();
         while free > 0 {
@@ -686,33 +721,47 @@ impl Batch {
                         .map(|(operation, protocol)| requirement(Some(*operation), *protocol))
                 })
                 .collect();
-            let mut candidate: Option<(u16, u128)> = None;
+            let mut candidate: Option<(u8, u128, u16)> = None;
             for key in offered {
                 let first = self.step(|tx| {
                     let ready = tx.open_table(READY)?;
                     let jobs = tx.open_table(JOBS)?;
                     let mut first = None;
-                    for entry in ready.range((key, 0)..=(key, u128::MAX))? {
+                    for entry in ready.range((key, 0)..=(key, u128::MAX))?.take(256) {
                         let id = entry?.0.value().1;
                         if deferred.contains(&id) {
                             continue;
                         }
-                        if let Some(row) = jobs.get(id)?
-                            && JobRow::decode_at(id, row.value())?.kind.is_stored()
+                        let Some(bytes) = jobs.get(id)? else {
+                            return Err(StorageError::corrupted("ready Job missing"));
+                        };
+                        let row = JobRow::decode_at(id, bytes.value())?;
+                        if !row.kind.is_stored() {
+                            continue;
+                        }
+                        let priority = reads::work_priority(&jobs, &row)?;
+                        if priority == 2 && (speculative >= 1 || free < 2)
+                            || priority == 1 && automatic >= 2
                         {
-                            first = Some(id);
+                            continue;
+                        }
+                        let chosen = (priority, id, key);
+                        if first.is_none_or(|best| chosen < best) {
+                            first = Some(chosen);
+                        }
+                        if priority == 0 {
                             break;
                         }
                     }
                     Ok(first)
                 })?;
-                if let Some(job) = first
-                    && candidate.is_none_or(|(_, best)| job < best)
+                if let Some(first) = first
+                    && candidate.is_none_or(|best| first < best)
                 {
-                    candidate = Some((key, job));
+                    candidate = Some(first);
                 }
             }
-            let Some((key, job)) = candidate else {
+            let Some((priority, job, key)) = candidate else {
                 break;
             };
             // Policy is resolved before a slot is reserved. A turn that still
@@ -737,6 +786,11 @@ impl Batch {
                 (pool.id, pool.edit_seq, pool.body.capabilities.clone())
             };
             self.write_claim(JobId::new(job), key, pool, edit_seq, capabilities)?;
+            if priority == 2 {
+                speculative += 1;
+            } else if priority == 1 {
+                automatic += 1;
+            }
             grants.push(JobId::new(job));
             free -= 1;
             if !pools[index].has_room() {
@@ -897,13 +951,22 @@ impl Batch {
             else {
                 continue;
             };
-            if work
+            let binding = self.step(|tx| reads::summary_root(&tx.open_table(JOBS)?, &work))?;
+            if binding
                 .policy_revision
-                .is_some_and(|bound| bound != revision || work.policy_profile != profile)
+                .is_some_and(|bound| bound != revision || binding.policy_profile != profile)
             {
                 continue;
             }
             let state = self.require_job_state(producer)?;
+            if binding.prediction.is_some()
+                && state
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.kind != OutcomeKind::Completed)
+            {
+                continue;
+            }
             if state.outcome.is_none() {
                 return Ok(true);
             }
@@ -991,7 +1054,8 @@ impl Batch {
 
     /// Claims one named ready Job into the first of `allowed` that is
     /// enabled, offers what the Job needs and has room. The same limits as
-    /// [`Self::claim_batch`] apply; a refusal changes nothing.
+    /// [`Self::claim_batch`] apply. Context preparation may be admitted while
+    /// the foreground turn remains pending.
     pub(crate) fn claim_job(
         &mut self,
         job: JobId,
@@ -1073,6 +1137,15 @@ impl Batch {
             (pool.id, pool.edit_seq, pool.body.capabilities.clone());
         if self.prepare_if_needed(job)? {
             return Ok(Err(ClaimRefusal::NotPending));
+        }
+        let priority = self.step(|tx| reads::work_priority(&tx.open_table(JOBS)?, &row))?;
+        let (speculative, automatic) = self.held_background()?;
+        if priority == 2
+            && (speculative >= 1
+                || self.held_slot_count()?.saturating_add(1) >= u32::from(GLOBAL_EXECUTION_LIMIT))
+            || priority == 1 && automatic >= 2
+        {
+            return Ok(Err(ClaimRefusal::NoCapacity(CapacityScope::Global)));
         }
         self.write_claim(
             job,

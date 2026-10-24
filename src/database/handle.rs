@@ -1327,8 +1327,19 @@ impl DatabaseHandle {
         })
         .await
     }
+    pub(crate) async fn preparation_current(&self, job: JobId) -> Result<bool, DatabaseError> {
+        self.read(move |database| storage::read_preparation_current(database, job))
+            .await
+    }
     pub(crate) async fn prediction_current(&self, job: JobId) -> Result<bool, DatabaseError> {
         self.read(move |database| storage::read_prediction_current(database, job))
+            .await
+    }
+    pub(crate) async fn promote_prediction(
+        &self,
+        job: JobId,
+    ) -> Result<Option<JobId>, DatabaseError> {
+        self.submit(|reply| Command::PromotePrediction { job, reply })
             .await
     }
     pub(crate) async fn predict_context(

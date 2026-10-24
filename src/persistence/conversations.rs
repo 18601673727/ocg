@@ -92,7 +92,7 @@ pub enum CompactionMode {
 
 /// Presence of this binding is explicit predictive opt-in. No default or
 /// assistance assignment may manufacture it. Runtime eligibility is rechecked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredictiveCompaction {
     pub decision_agent: ConfigId,
@@ -100,9 +100,78 @@ pub struct PredictiveCompaction {
     pub max_preparations: u32,
     pub max_prediction_tokens: u32,
     pub max_preparation_tokens: u32,
+    #[serde(default)]
+    pub mode: PredictionMode,
+    #[serde(default)]
+    pub acceptance: Option<PredictionAcceptance>,
+    #[serde(default)]
+    pub max_preparations_per_hour: u32,
+    #[serde(default)]
+    pub max_tokens_per_hour: u32,
+    #[serde(default)]
+    pub max_requests_per_hour: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictionMode {
+    #[default]
+    Shadow,
+    Prepare,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PredictionAcceptance {
+    pub model: ConfigRef,
+    pub reported_model: String,
+    pub confidence_semantics: String,
+    pub minimum_probability_millionths: u32,
+    pub minimum_confidence_millionths: u32,
+}
+
+impl PredictionAcceptance {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.model.edit_seq == 0
+            || self.reported_model.trim().is_empty()
+            || self.reported_model.len() > 512
+            || self.confidence_semantics.trim().is_empty()
+            || self.confidence_semantics.len() > 256
+            || !(1..=1_000_000).contains(&self.minimum_probability_millionths)
+            || !(1..=1_000_000).contains(&self.minimum_confidence_millionths)
+        {
+            return Err(
+                "prediction acceptance requires an exact model version, explicit confidence semantics and positive thresholds at most one million",
+            );
+        }
+        Ok(())
+    }
+    pub fn accepts(&self, result: &DecisionResult) -> bool {
+        let DecisionOutcome::Answer {
+            answer:
+                DecisionAnswer::Choice {
+                    selected,
+                    distribution: Some(distribution),
+                    confidence: Some(confidence),
+                },
+        } = &result.outcome
+        else {
+            return false;
+        };
+        result.model == self.model
+            && result.reported_model.as_deref() == Some(self.reported_model.as_str())
+            && selected == "prepare"
+            && confidence.semantics == self.confidence_semantics
+            && confidence.value.is_finite()
+            && confidence.value >= f64::from(self.minimum_confidence_millionths) / 1_000_000.0
+            && distribution.get("prepare").is_some_and(|probability| {
+                probability.is_finite()
+                    && *probability >= f64::from(self.minimum_probability_millionths) / 1_000_000.0
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
@@ -143,7 +212,7 @@ impl CompactionPolicy {
     /// Resolves the selected policy against a known window. An unknown window
     /// cannot drive utilization automation. Disabled stays disabled.
     pub fn recipe(
-        self,
+        &self,
         window: Option<u32>,
         output_reserve: u32,
         safety: u32,
@@ -247,7 +316,7 @@ impl CompactionPolicy {
         if let CompactionMode::Custom { policy } = self.mode {
             policy.validate()?;
         }
-        if self.predictive.is_some_and(|p| {
+        if self.predictive.as_ref().is_some_and(|p| {
             p.minimum_interval_seconds == 0
                 || p.max_preparations != 1
                 || p.max_prediction_tokens == 0
@@ -256,6 +325,22 @@ impl CompactionPolicy {
             return Err(
                 "predictive preparation requires positive budgets and interval, with at most one preparation",
             );
+        }
+        if let Some(predictive) = &self.predictive {
+            if let Some(acceptance) = &predictive.acceptance {
+                acceptance.validate()?;
+            }
+            if predictive.mode == PredictionMode::Prepare
+                && (matches!(self.mode, CompactionMode::Off)
+                    || predictive.acceptance.is_none()
+                    || predictive.max_preparations_per_hour == 0
+                    || predictive.max_requests_per_hour == 0
+                    || predictive.max_tokens_per_hour < predictive.max_preparation_tokens)
+            {
+                return Err(
+                    "predictive preparation requires enabled automatic compaction, explicit acceptance and positive hourly budgets",
+                );
+            }
         }
         Ok(())
     }
@@ -352,27 +437,44 @@ pub struct SummarizationResult {
     pub omitted_details: Vec<String>,
 }
 
+fn summary_context_text(summary: &str, omissions: &[String]) -> String {
+    format!(
+        "{summary}\nThis generated summary may omit assistant details. Originals remain available. Declared omissions (not guaranteed complete): {}",
+        omissions.join("; ")
+    )
+}
+fn validate_summary(version: u32, summary: &str, omissions: &[String]) -> Result<(), &'static str> {
+    if version != 1
+        || summary.trim().is_empty()
+        || summary.len() > 1024 * 1024
+        || omissions.len() > 256
+        || omissions.iter().any(|detail| detail.len() > 4096)
+    {
+        return Err("invalid summarization result");
+    }
+    Ok(())
+}
 impl SummarizationResult {
     pub fn context_text(&self) -> String {
-        format!(
-            "{}\nThis generated summary may omit assistant details. Originals remain available. Declared omissions (not guaranteed complete): {}",
-            self.summary,
-            self.omitted_details.join("; ")
-        )
+        summary_context_text(&self.summary, &self.omitted_details)
     }
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 1
-            || self.summary.trim().is_empty()
-            || self.summary.len() > 1024 * 1024
-            || self.omitted_details.len() > 256
-            || self
-                .omitted_details
-                .iter()
-                .any(|detail| detail.len() > 4096)
-        {
-            return Err("invalid summarization result");
-        }
-        Ok(())
+        validate_summary(self.schema_version, &self.summary, &self.omitted_details)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryFragment {
+    pub schema_version: u32,
+    pub summary: String,
+    pub omitted_details: Vec<String>,
+}
+impl SummaryFragment {
+    pub fn context_text(&self) -> String {
+        summary_context_text(&self.summary, &self.omitted_details)
+    }
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_summary(self.schema_version, &self.summary, &self.omitted_details)
     }
 }
 
@@ -410,6 +512,72 @@ pub struct SummarizationWork {
     pub minimum_savings_tokens: u32,
     pub policy_revision: Option<u64>,
     pub policy_profile: Option<ConfigRef>,
+    pub stage: SummarizationStage,
+    pub chain: Option<JobId>,
+    pub prediction: Option<JobId>,
+    pub reserved_tokens: u32,
+    pub reserved_requests: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SummarizationStage {
+    Direct,
+    Chunk {
+        start: u64,
+        end: u64,
+        content: ContentDigest,
+    },
+    Reduce,
+}
+
+impl SummarizationWork {
+    pub fn validate_stage(&self) -> Result<(), &'static str> {
+        if self.target_tokens == 0
+            || self.frozen.agent.is_some()
+            || self.frozen.agent_ref.is_some()
+            || self.chain.is_some()
+                && (self.policy_revision.is_some()
+                    || self.policy_profile.is_some()
+                    || self.prediction.is_some()
+                    || self.reserved_tokens != 0
+                    || self.reserved_requests != 0)
+            || self.prediction.is_some()
+                && (self.policy_revision.is_none()
+                    || self.reserved_tokens == 0
+                    || self.reserved_requests == 0)
+        {
+            return Err("invalid summary authority or reservation");
+        }
+        match self.stage {
+            SummarizationStage::Direct
+                if self.chain.is_none() && self.minimum_savings_tokens > 0 =>
+            {
+                Ok(())
+            }
+            SummarizationStage::Chunk { start, end, .. }
+                if start < end
+                    && end <= 7 * 256 * 1024
+                    && (self.chain.is_some() || start == 0)
+                    && self.minimum_savings_tokens == 0 =>
+            {
+                Ok(())
+            }
+            SummarizationStage::Reduce
+                if self.chain.is_some() && self.minimum_savings_tokens > 0 =>
+            {
+                Ok(())
+            }
+            SummarizationStage::Direct
+            | SummarizationStage::Chunk { .. }
+            | SummarizationStage::Reduce => Err("invalid summary stage or source span"),
+        }
+    }
+    pub fn is_artifact(&self) -> bool {
+        matches!(
+            self.stage,
+            SummarizationStage::Direct | SummarizationStage::Reduce
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

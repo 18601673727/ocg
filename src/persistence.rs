@@ -17,10 +17,11 @@ pub use conversations::{
     Actor, Appended, COMPACTION_JOB_NAME, CompactionMode, CompactionPolicy, CompactionPreset,
     CompactionRequest, ContextSourceManifest, ConversationAction, ConversationLimits,
     ConversationSpec, CustomPolicy, Entry, EntryKind, JobKind, MAX_CONVERSATION_DEPTH, Notice,
-    NoticeBody, NoticeClass, NoticeEvent, Origin, PlanSource, PredictiveCompaction, RecordEvent,
-    Recurrence, RecurrenceHalt, RecurrencePhase, ResolvedCompaction, ResponseFormat,
-    SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause, StopProof, SummarizationResult,
-    SummarizationWork, TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
+    NoticeBody, NoticeClass, NoticeEvent, Origin, PlanSource, PredictionAcceptance, PredictionMode,
+    PredictiveCompaction, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
+    ResolvedCompaction, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause,
+    StopProof, SummarizationResult, SummarizationStage, SummarizationWork, SummaryFragment,
+    TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
 };
 mod execution;
 mod identity;

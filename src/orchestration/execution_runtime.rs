@@ -3250,8 +3250,15 @@ async fn run_started_provider_job(
     let resolver = plan.credential_resolver.as_ref();
     plan.provider_config.session_id = Some(job_record.conversation.unwrap_or(job));
     let config = &plan.provider_config;
-    run_provider_job_inner(
+    let speculative = summary_input
+        .as_ref()
+        .is_some_and(|input| input.speculative);
+    let monitoring = summary_input.as_ref().is_some_and(|input| input.automatic);
+    let monitor_database = database.clone();
+    let monitor_cancellation = config.cancellation.clone();
+    let execution = run_provider_job_inner(
         ProviderRun {
+            speculative,
             scheduler,
             database,
             executor,
@@ -3278,8 +3285,42 @@ async fn run_started_provider_job(
             )
             .await
         },
-    )
-    .await
+    );
+    if monitoring {
+        match ntex::util::select(
+            execution,
+            monitor_preparation(monitor_database, job, monitor_cancellation),
+        )
+        .await
+        {
+            ntex::util::Either::Left(result) => result,
+            ntex::util::Either::Right(never) => match never {},
+        }
+    } else {
+        execution.await
+    }
+}
+
+async fn monitor_preparation(
+    database: DatabaseHandle,
+    job: JobId,
+    cancellation: CancellationToken,
+) -> std::convert::Infallible {
+    loop {
+        ntex::time::sleep(Duration::from_millis(250)).await;
+        match database.preparation_current(job).await {
+            Ok(true) => {}
+            Ok(false) => {
+                cancellation.cancel();
+                std::future::pending::<()>().await;
+            }
+            Err(error) => {
+                log::warn!("context eligibility could not be checked for {job}: {error}");
+                cancellation.cancel();
+                std::future::pending::<()>().await;
+            }
+        }
+    }
 }
 
 /// Runs one typed decision turn: the same frozen-configuration, request
@@ -3390,7 +3431,7 @@ async fn run_decision_job(
             .map(|(input, output)| u64::from(input).saturating_add(u64::from(output)));
         if usage.is_none_or(|used| used > budget) {
             execution.result.outcome = crate::persistence::DecisionOutcome::Unusable {
-                reason: "shadow prediction usage is unavailable or exceeds its configured budget"
+                reason: "context prediction usage is unavailable or exceeds its configured budget"
                     .into(),
             };
         }
@@ -3466,6 +3507,9 @@ async fn run_decision_job(
         job,
         result: final_output,
     };
+    if let Err(error) = database.promote_prediction(job).await {
+        log::warn!("optional preparation was not scheduled for {job}: {error}");
+    }
     match gap {
         None => Ok(receipt),
         Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
@@ -3740,6 +3784,7 @@ pub async fn attachment_images(
 
 /// The Job a provider execution settles.
 pub(crate) struct ProviderRun {
+    pub(crate) speculative: bool,
     pub(crate) scheduler: Option<StopHandle>,
     pub(crate) database: DatabaseHandle,
     pub(crate) executor: ExecutorId,
@@ -3921,6 +3966,9 @@ async fn run_provider_job_inner(
             let Err(error) = &execution else {
                 break execution;
             };
+            if run.speculative {
+                break execution;
+            }
             let Some((delay, next)) =
                 retry_delay(error, retries, cancellation.is_cancelled()).zip(sink.request.next())
             else {
@@ -4983,7 +5031,20 @@ async fn complete_provider_job(
                         summary: Some("Conversation context prepared".into()),
                         code: None,
                         goal_reached: Some(true),
-                        value: serde_json::to_value(artifact).ok(),
+                        value: if matches!(
+                            input.work.stage,
+                            crate::persistence::SummarizationStage::Chunk { .. }
+                        ) {
+                            serde_json::to_value(crate::persistence::SummaryFragment {
+                                schema_version: 1,
+                                summary: artifact.summary,
+                                omitted_details: artifact.omitted_details,
+                            })
+                            .ok()
+                            .map(|fragment| serde_json::json!({"summary_part": fragment}))
+                        } else {
+                            serde_json::to_value(artifact).ok()
+                        },
                     })
                 }
             }
@@ -5848,6 +5909,7 @@ mod failure_tests {
                 };
                 run_provider_job(
                     ProviderRun {
+                        speculative: false,
                         scheduler: None,
                         database: handle,
                         executor,
@@ -7530,6 +7592,7 @@ mod approval_runtime_tests {
         let config = ProviderExecutionConfig::default();
         run_provider_job_inner(
             ProviderRun {
+                speculative: false,
                 scheduler: None,
                 database: db,
                 executor: pool,
@@ -8215,6 +8278,11 @@ mod context_runtime_correction_tests {
                         max_preparations: 1,
                         max_prediction_tokens: 4096,
                         max_preparation_tokens: 4096,
+                        mode: crate::persistence::PredictionMode::Shadow,
+                        acceptance: None,
+                        max_preparations_per_hour: 0,
+                        max_tokens_per_hour: 0,
+                        max_requests_per_hour: 0,
                     }),
                 }),
                 ..Default::default()
@@ -8366,6 +8434,11 @@ mod context_runtime_correction_tests {
                     max_preparations: 1,
                     max_prediction_tokens: 4096,
                     max_preparation_tokens: 4096,
+                    mode: crate::persistence::PredictionMode::Shadow,
+                    acceptance: None,
+                    max_preparations_per_hour: 0,
+                    max_tokens_per_hour: 0,
+                    max_requests_per_hour: 0,
                 }),
                 ..Default::default()
             })),
@@ -8389,6 +8462,568 @@ mod context_runtime_correction_tests {
                 .is_none()
         );
         assert_eq!(wait(db.predict_context(conversation)).unwrap(), None);
+        worker.shutdown().unwrap();
+    }
+    #[test]
+    fn chunk_jobs_reduce_one_manifest_before_manual_adoption() {
+        let (_root, directory) = data_directory("context-runtime-correction", "chunked-manual");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let foreground = model(&db, "chunk-foreground", 6000);
+        let summarizer = model(&db, "chunk-summary", 6000);
+        let pool = wait(db.create_executor(NewExecutor {
+            name: "one slot".into(),
+            concurrency_limit: NonZeroU32::new(1).unwrap(),
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .unwrap();
+        let (conversation, first) = wait(db.open_conversation(
+            None,
+            ConversationSpec {
+                name: Some("chunk source".into()),
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            message("Protected: retain the requested constraints"),
+            ExecutionConfiguration {
+                agent_profile: None,
+                llm_profile: foreground.into(),
+            },
+            None,
+        ))
+        .unwrap();
+        settled(
+            &db,
+            first.turn,
+            pool,
+            &"Evidence 中文 from a settled reply. ".repeat(1300),
+        );
+        let request = wait(db.request_compaction(
+            conversation,
+            summarizer,
+            NewSubmission {
+                key: SubmissionKey::from_digest([91; 32]),
+                fingerprint: RequestFingerprint::from_digest([91; 32]),
+            },
+        ))
+        .unwrap();
+        let CompactionRequest::Prepared { job, .. } = request else {
+            panic!("expected bounded tree");
+        };
+        let mut observed = std::collections::BTreeSet::new();
+        let mut part_to_discard = None;
+        for entry in wait(db.context_state(conversation, None, 20))
+            .unwrap()
+            .unwrap()
+            .work
+        {
+            let record = wait(db.job(entry.job)).unwrap().unwrap();
+            if let JobKind::Turn {
+                execution: TurnExecution::Summarization(work),
+                ..
+            } = record.kind
+            {
+                observed.insert(work.source);
+                if matches!(work.stage, SummarizationStage::Chunk { .. }) {
+                    part_to_discard = record.parent_id;
+                }
+            }
+        }
+        assert_eq!(observed.len(), 1, "all stages reference the same manifest");
+        let maps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let map_count = maps.clone();
+        provider_seam::install("https://chunk-summary.invalid/v1", move |request| {
+            let body = serde_json::to_string(request).unwrap();
+            if body.contains("Source bytes") {
+                assert!(body.contains("chunk facts"));
+                response(
+                    r#"{"summary":"All chunk facts retained.","omitted_details":["verbatim assistant wording"]}"#,
+                )
+            } else {
+                assert!(body.contains("Evidence"));
+                map_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                response(
+                    r#"{"summary":"chunk facts retained","omitted_details":["verbatim assistant wording"]}"#,
+                )
+            }
+        });
+        provider_seam::install("https://chunk-foreground.invalid/v1", |request| {
+            let body = serde_json::to_string(request).unwrap();
+            assert!(body.contains("All chunk facts retained"));
+            assert!(body.contains("Protected: retain the requested constraints"));
+            assert!(!body.contains("Evidence 中文 from a settled reply."));
+            response("continued")
+        });
+        let handle = db.clone();
+        let consuming = on_system(move || async move {
+            let runtime = ExecutionRuntime::start(handle.clone(), ClaimScope::Stored).unwrap();
+            terminal(&handle, job).await;
+            let details = handle.job_details(job).await.unwrap().unwrap();
+            assert!(
+                details
+                    .result
+                    .unwrap()
+                    .value
+                    .unwrap()
+                    .get("source")
+                    .is_some()
+            );
+            let consumer = handle
+                .append(conversation, message("continue"), None, None)
+                .await
+                .unwrap()
+                .turn;
+            terminal(&handle, consumer).await;
+            let context = handle.read_turn_context(consumer, 10000).await.unwrap();
+            assert!(context.adopted_summary.is_some());
+            assert!(context.turns[0].answer.is_none());
+            runtime.shutdown().await.unwrap();
+            consumer
+        });
+        wait(db.stop_turn(part_to_discard.expect("chunk to discard"), Actor::User)).unwrap();
+        assert!(
+            wait(db.context_state(conversation, None, 20))
+                .unwrap()
+                .unwrap()
+                .work
+                .iter()
+                .filter(|work| work.job == job)
+                .all(|work| work.state == "discarded"),
+            "discarding a completed part invalidates the final reduction"
+        );
+        assert!(
+            wait(db.read_turn_context(consuming, 100000))
+                .unwrap()
+                .adopted_summary
+                .is_some(),
+            "already claimed context keeps its adoption"
+        );
+        let later = wait(db.append(conversation, message("after discard"), None, None))
+            .unwrap()
+            .turn;
+        assert_eq!(wait(db.claim_batch()).unwrap(), vec![later]);
+        let context = wait(db.read_turn_context(later, 100000)).unwrap();
+        assert!(
+            context.adopted_summary.is_none(),
+            "discard prevents future adoption"
+        );
+        assert!(context.turns.iter().any(|turn| {
+            turn.answer
+                .as_deref()
+                .is_some_and(|answer| answer.contains("Evidence 中文"))
+        }));
+        wait(db.finalize_job(
+            later,
+            JobFinalization::Cancelled(FinalResult {
+                summary: None,
+                code: None,
+                goal_reached: None,
+                value: None,
+            }),
+        ))
+        .unwrap();
+        assert!(maps.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        worker.shutdown().unwrap();
+    }
+
+    #[test]
+    fn prepare_requires_acceptance_and_reserves_bounded_work() {
+        for (label, confidence, budget, expect_preparation) in [
+            ("accepted", 0.9, 20000, true),
+            ("recovery", 0.9, 20000, true),
+            ("optout", 0.9, 20000, true),
+            ("foreground", 0.9, 20000, true),
+            ("uncertain", 0.2, 20000, false),
+            ("budget", 0.9, 1, false),
+        ] {
+            let (_root, directory) = data_directory("predictive-preparation", label);
+            let mut worker = DatabaseWorker::start(&directory).unwrap();
+            let mut db = worker.handle();
+            let (_, decision_model, predictor) =
+                super::decision_runtime_tests::decision_fixture(&db);
+            let model_row = wait(db.config(decision_model)).unwrap().unwrap();
+            let ConfigBody::DecisionModel(native) = &model_row.body else {
+                panic!("decision model");
+            };
+            let endpoint = format!("https://predictive-{label}.invalid/v1");
+            let mut connection = wait(db.config(native.connection_id)).unwrap().unwrap();
+            if let ConfigBody::Connection(connection) = &mut connection.body {
+                connection.endpoint = Some(endpoint.clone());
+            }
+            wait(db.update_config(
+                native.connection_id,
+                NewConfig {
+                    name: connection.name,
+                    body: connection.body,
+                },
+            ))
+            .unwrap();
+            let foreground = model(&db, &format!("predictive-foreground-{label}"), 6000);
+            let summarizer = model(&db, &format!("predictive-summary-{label}"), 6000);
+            let pool = wait(db.create_executor(NewExecutor {
+                name: "foreground".into(),
+                concurrency_limit: NonZeroU32::new(1).unwrap(),
+                llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+            }))
+            .unwrap();
+            let (conversation, first) = wait(db.open_conversation(
+                None,
+                ConversationSpec {
+                    name: Some("predictive".into()),
+                    agent: None,
+                    project: None,
+                    origin: Origin::User,
+                    keep_open: true,
+                },
+                message("Protected original requirement"),
+                ExecutionConfiguration {
+                    agent_profile: None,
+                    llm_profile: foreground.into(),
+                },
+                None,
+            ))
+            .unwrap();
+            settled(&db, first.turn, pool, &"prior evidence ".repeat(100));
+            let second =
+                wait(db.append(conversation, message("keep recent requirement"), None, None))
+                    .unwrap()
+                    .turn;
+            settled(&db, second, pool, &"recent answer ".repeat(50));
+            let policy = CompactionPolicy {
+                mode: CompactionMode::Custom {
+                    policy: CustomPolicy {
+                        trigger_tokens: 900,
+                        target_tokens: 700,
+                        reserved_output_tokens: 256,
+                        minimum_source_tokens: 100,
+                        minimum_savings_tokens: 50,
+                        preserve_recent_turns: 1,
+                        cooldown_seconds: 60,
+                    },
+                },
+                summarization_model: Some(summarizer),
+                predictive: Some(PredictiveCompaction {
+                    decision_agent: predictor,
+                    minimum_interval_seconds: 60,
+                    max_preparations: 1,
+                    max_prediction_tokens: 4096,
+                    max_preparation_tokens: budget,
+                    mode: PredictionMode::Prepare,
+                    acceptance: Some(PredictionAcceptance {
+                        model: ConfigRef {
+                            id: decision_model,
+                            edit_seq: model_row.edit_seq,
+                        },
+                        reported_model: "jev-latest".into(),
+                        confidence_semantics: "provider.typesafe.choice.confidence.v1".into(),
+                        minimum_probability_millionths: 700000,
+                        minimum_confidence_millionths: 700000,
+                    }),
+                    max_preparations_per_hour: 2,
+                    max_tokens_per_hour: 100000,
+                    max_requests_per_hour: 8,
+                }),
+            };
+            wait(db.set_conversation(
+                conversation,
+                ConversationEdit::CompactionPolicy(Some(policy)),
+            ))
+            .unwrap();
+            let prediction = wait(db.predict_context(conversation)).unwrap().unwrap();
+            crate::provider_execution::scripted::install_http(
+                &format!("{endpoint}/systemone"),
+                move |_| {
+                    Ok((200,serde_json::to_vec(&json!({"model":"jev-latest","answers":{"decision":{"type":"choice","choice":"prepare","confidence":confidence,"probabilities":{"prepare":0.9,"no_need":0.1,"defer":0.0,"insufficient_evidence":0.0}}},"usage":{"input_tokens":12,"output_tokens":4}})).unwrap()))
+                },
+            );
+            let gated = matches!(label, "optout" | "foreground");
+            let (gate_sender, gate_receiver) = flume::bounded(1);
+            let summaries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = summaries.clone();
+            provider_seam::install(
+                &format!("https://predictive-summary-{label}.invalid/v1"),
+                move |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut reply = response(
+                        r#"{"summary":"Prior evidence retained.","omitted_details":["verbatim wording"]}"#,
+                    );
+                    if gated {
+                        reply.gate = Some(gate_receiver.clone());
+                    }
+                    reply
+                },
+            );
+            if label == "recovery" {
+                wait(db.set_execution_pool_enabled(pool.into(), false)).unwrap();
+            }
+            provider_seam::install(
+                &format!("https://predictive-foreground-{label}.invalid/v1"),
+                |_| response("foreground continues"),
+            );
+            let observed = summaries.clone();
+            let handle = db.clone();
+            on_system(move || async move {
+                let runtime = ExecutionRuntime::start(handle.clone(), ClaimScope::Stored).unwrap();
+                terminal(&handle, prediction).await;
+                if gated {
+                    ntex::time::timeout(Duration::from_secs(10), async {
+                        while observed.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                            ntex::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let state = handle
+                        .context_state(conversation, None, 20)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let summary = state
+                        .work
+                        .iter()
+                        .find(|work| {
+                            matches!(
+                                work.details,
+                                crate::storage::ContextWorkDetails::Summary { .. }
+                            )
+                        })
+                        .unwrap()
+                        .job;
+                    if label == "optout" {
+                        handle
+                            .set_conversation(
+                                conversation,
+                                ConversationEdit::CompactionPolicy(Some(
+                                    CompactionPolicy::default(),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        handle
+                            .append(conversation, message("foreground has priority"), None, None)
+                            .await
+                            .unwrap();
+                    }
+                    terminal(&handle, summary).await;
+                    assert_ne!(
+                        handle
+                            .job(summary)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .outcome
+                            .unwrap()
+                            .kind,
+                        OutcomeKind::Completed,
+                        "active speculation yields without a usable artifact"
+                    );
+                } else if expect_preparation && label != "recovery" {
+                    ntex::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            let state = handle
+                                .context_state(conversation, None, 20)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            if state.work.iter().any(|work| work.state == "prepared") {
+                                break;
+                            }
+                            ntex::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .expect("accepted forecast prepares without waiting for a foreground request");
+                }
+                runtime.shutdown().await.unwrap();
+            });
+            if label == "recovery" {
+                assert_eq!(summaries.load(std::sync::atomic::Ordering::SeqCst), 0);
+                worker.shutdown().unwrap();
+                worker = DatabaseWorker::start(&directory).unwrap();
+                db = worker.handle();
+                wait(db.set_execution_pool_enabled(pool.into(), true)).unwrap();
+                let handle = db.clone();
+                on_system(move || async move {
+                    let runtime =
+                        ExecutionRuntime::start(handle.clone(), ClaimScope::Stored).unwrap();
+                    ntex::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if handle
+                                .context_state(conversation, None, 20)
+                                .await
+                                .unwrap()
+                                .unwrap()
+                                .work
+                                .iter()
+                                .any(|work| work.state == "prepared")
+                            {
+                                break;
+                            }
+                            ntex::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    })
+                    .await
+                    .expect("completed prediction is promoted after restart");
+                    runtime.shutdown().await.unwrap();
+                });
+            }
+            assert_eq!(
+                summaries.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(expect_preparation)
+            );
+            let state = wait(db.context_state(conversation, None, 20))
+                .unwrap()
+                .unwrap();
+            let prepared = state
+                .work
+                .iter()
+                .filter(|work| {
+                    matches!(
+                        work.details,
+                        crate::storage::ContextWorkDetails::Summary { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(prepared.len(), usize::from(expect_preparation));
+            if let Some(prepared) = prepared.first() {
+                let record = wait(db.job(prepared.job)).unwrap().unwrap();
+                let JobKind::Turn {
+                    execution: TurnExecution::Summarization(work),
+                    ..
+                } = record.kind
+                else {
+                    panic!("summary");
+                };
+                assert_eq!(work.prediction, Some(prediction));
+                assert_eq!(work.reserved_requests, 1);
+                assert!(work.reserved_tokens <= budget);
+                assert_eq!(
+                    wait(db.promote_prediction(prediction)).unwrap(),
+                    if gated { None } else { Some(prepared.job) },
+                    "replayed promotion deduplicates while its policy/activity binding is current"
+                );
+                if label == "accepted" {
+                    wait(db.record_metrics(NewMetrics {
+                        job: prepared.job,
+                        request: RequestNumber::FIRST,
+                        observed_at: Timestamp::now(),
+                        measurements: Measurements {
+                            usage: crate::openai_compatible::NormalizedUsage {
+                                input_tokens: Some(25000),
+                                output_tokens: Some(1),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        token: Some(crate::token_usage::TokenAnnotation::eligible(
+                            crate::token_usage::UsageFinality::Final,
+                        )),
+                    }))
+                    .unwrap();
+                    assert!(
+                        !wait(db.summarization_input(prepared.job))
+                            .unwrap()
+                            .unwrap()
+                            .current,
+                        "known usage above reservation prevents further chain work"
+                    );
+                }
+            }
+            worker.shutdown().unwrap();
+            drop(gate_sender);
+        }
+    }
+    #[test]
+    fn stopping_a_chunk_chain_cancels_pending_parts_and_reports_the_active_part() {
+        let (_root, directory) = data_directory("context-runtime-correction", "cancel-chunks");
+        let worker = DatabaseWorker::start(&directory).unwrap();
+        let db = worker.handle();
+        let summarizer = model(&db, "cancel-chunks", 6000);
+        let pool = wait(db.create_executor(NewExecutor {
+            name: "one slot".into(),
+            concurrency_limit: NonZeroU32::new(1).unwrap(),
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))
+        .unwrap();
+        let (conversation, first) = wait(db.open_conversation(
+            None,
+            ConversationSpec {
+                name: Some("chunk cancellation".into()),
+                agent: None,
+                project: None,
+                origin: Origin::User,
+                keep_open: true,
+            },
+            message("protected"),
+            ExecutionConfiguration {
+                agent_profile: None,
+                llm_profile: summarizer.into(),
+            },
+            None,
+        ))
+        .unwrap();
+        settled(&db, first.turn, pool, &"evidence ".repeat(7000));
+        let CompactionRequest::Prepared {
+            job,
+            conversation: reduce,
+            ..
+        } = wait(db.request_compaction(
+            conversation,
+            summarizer,
+            NewSubmission {
+                key: SubmissionKey::from_digest([92; 32]),
+                fingerprint: RequestFingerprint::from_digest([92; 32]),
+            },
+        ))
+        .unwrap()
+        else {
+            panic!("tree");
+        };
+        let children = wait(db.context_state(conversation, None, 20))
+            .unwrap()
+            .unwrap()
+            .work;
+        assert!(children.len() > 2);
+        let running = wait(db.claim_batch()).unwrap();
+        assert_eq!(running.len(), 1);
+        assert_ne!(running[0], job);
+        let stopped = wait(db.stop_turn(reduce, Actor::User)).unwrap();
+        assert_eq!(stopped.running, running);
+        for child in children {
+            if child.job != running[0] {
+                assert_eq!(
+                    wait(db.job(child.job))
+                        .unwrap()
+                        .unwrap()
+                        .outcome
+                        .unwrap()
+                        .kind,
+                    OutcomeKind::Cancelled
+                );
+            }
+        }
+        wait(db.finalize_job(
+            running[0],
+            JobFinalization::Cancelled(FinalResult {
+                summary: None,
+                code: None,
+                goal_reached: None,
+                value: None,
+            }),
+        ))
+        .unwrap();
+        assert!(wait(db.claim_batch()).unwrap().is_empty());
+        assert_eq!(
+            wait(db.latest_output(first.turn))
+                .unwrap()
+                .unwrap()
+                .summary
+                .unwrap(),
+            "evidence ".repeat(7000)
+        );
         worker.shutdown().unwrap();
     }
 }
