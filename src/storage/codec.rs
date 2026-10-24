@@ -665,7 +665,7 @@ codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, Output
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
 codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2, LlmTransport::AnthropicMessages = 3 });
-codes!(ExecutionOperation { ExecutionOperation::LlmRequest = 1 });
+codes!(ExecutionOperation { ExecutionOperation::LlmRequest = 1, ExecutionOperation::Decision = 2 });
 codes!(ChatFinishReason {
     ChatFinishReason::Stop = 1, ChatFinishReason::Length = 2, ChatFinishReason::ToolCalls = 3,
     ChatFinishReason::ContentFilter = 4, ChatFinishReason::Error = 5, ChatFinishReason::Other = 6,

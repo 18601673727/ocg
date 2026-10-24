@@ -253,7 +253,9 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
     let mut subtree_holds = BTreeSet::new();
     for (id, row) in &jobs {
         if !row.kind.is_conversation() {
-            executions.insert(*id, reads::turn_execution(&tx.open_table(JOBS)?, row)?.0);
+            if let Some(execution) = reads::turn_config_of(&tx.open_table(JOBS)?, row)? {
+                executions.insert(*id, execution);
+            }
             continue;
         }
         if row

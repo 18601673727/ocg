@@ -15,7 +15,7 @@ use serde::Deserialize;
 
 use super::{INVALID_REQUEST, Refusal, Reply, profiles};
 use crate::database::{DatabaseError, DatabaseHandle};
-use crate::persistence::{ExecutionPool, ExecutionPoolId, Violation};
+use crate::persistence::{ExecutionOperation, ExecutionPool, ExecutionPoolId, Violation};
 use crate::storage::MAX_PAGE;
 
 const POOL_NOT_FOUND: Refusal =
@@ -29,6 +29,10 @@ struct WirePoolUpdate {
     concurrency_limit: Option<NonZeroU32>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// Whether this Pool also offers typed decision work. Absent leaves the
+    /// capability as it is.
+    #[serde(default)]
+    decision: Option<bool>,
 }
 
 pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
@@ -37,12 +41,28 @@ pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
         .ok_or(INVALID_REQUEST)
 }
 
+/// The operations a Pool offers, as the API names them.
+fn operation_str(operation: ExecutionOperation) -> &'static str {
+    match operation {
+        ExecutionOperation::LlmRequest => "llm_request",
+        ExecutionOperation::Decision => "decision",
+    }
+}
+
 fn pool_json(pool: &ExecutionPool) -> WirePool {
     WirePool {
         id: pool.id.to_string(),
         name: pool.name.clone(),
         concurrency_limit: pool.config.concurrency_limit.get(),
         enabled: pool.enabled,
+        operations: Some(
+            pool.config
+                .capabilities
+                .operations
+                .iter()
+                .map(|operation| operation_str(*operation).to_owned())
+                .collect(),
+        ),
     }
 }
 
@@ -76,8 +96,8 @@ pub(super) async fn update(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let wire: WirePoolUpdate = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
-    match (wire.concurrency_limit, wire.enabled) {
-        (Some(concurrency_limit), None) => {
+    match (wire.concurrency_limit, wire.enabled, wire.decision) {
+        (Some(concurrency_limit), None, None) => {
             let mut config = database
                 .execution_pool(id)
                 .await?
@@ -89,9 +109,31 @@ pub(super) async fn update(
                 .await
                 .map_err(refusal)?;
         }
-        (None, Some(enabled)) => {
+        (None, Some(enabled), None) => {
             database
                 .set_execution_pool_enabled(id, enabled)
+                .await
+                .map_err(refusal)?;
+        }
+        (None, None, Some(decision)) => {
+            let mut config = database
+                .execution_pool(id)
+                .await?
+                .ok_or(POOL_NOT_FOUND)?
+                .config;
+            if decision {
+                config
+                    .capabilities
+                    .operations
+                    .insert(ExecutionOperation::Decision);
+            } else {
+                config
+                    .capabilities
+                    .operations
+                    .remove(&ExecutionOperation::Decision);
+            }
+            database
+                .update_execution_pool(id, config)
                 .await
                 .map_err(refusal)?;
         }

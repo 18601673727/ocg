@@ -95,6 +95,7 @@ pub(super) enum Route {
         after_seq: Option<i64>,
     },
     Submit,
+    DecisionSubmit,
     Admission,
     DecideApproval(crate::persistence::ToolCallRef),
     ReleaseSlot(JobId),
@@ -158,6 +159,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Events { .. }
             | Route::Admission
             | Route::Submit
+            | Route::DecisionSubmit
             | Route::DecideApproval(_)
             | Route::ReleaseSlot(_)
             | Route::ConversationCards(_)
@@ -184,6 +186,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     if request.method() == Method::POST {
         return match segments.as_slice() {
             ["jobs"] => no_query(query).map(|()| Route::Submit),
+            ["decisions"] => no_query(query).map(|()| Route::DecisionSubmit),
             ["jobs", job, "release-slot"] => {
                 no_query(query).and_then(|()| job_id(job).map(Route::ReleaseSlot))
             }
@@ -581,6 +584,12 @@ pub(super) async fn respond(
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             let job = submissions::JobRequest::parse(&body)?;
             submissions::submit(shared, key, job).await
+        }
+        Route::DecisionSubmit => {
+            let key = submissions::idempotency_key(request.headers())?;
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let decision = submissions::DecisionJobRequest::parse(&body)?;
+            submissions::submit_decision(shared, key, decision).await
         }
         Route::Admission => {
             let key = submissions::idempotency_key(request.headers())?;

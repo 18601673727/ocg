@@ -27,8 +27,9 @@ use super::{
 use crate::database::{DatabaseError, DatabaseHandle};
 use crate::persistence::{
     AgentBehavior, AgentConfig, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig,
+    DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
     ExecutionOperation, LlmParameters, LlmTransport, ModelCapability, ModelConfig, NewConfig,
-    NewExecutor, ProfileId, RecordRef, Violation,
+    NewExecutor, ProfileId, RecordRef, Violation, WorkspaceAccess,
 };
 
 const MAX_PROFILE_NAME_BYTES: usize = 128;
@@ -114,6 +115,41 @@ const INVALID_BEHAVIOR: Refusal = Refusal::new(
     "invalid_behavior",
     "behavior must be chat or general",
 );
+const UNSUPPORTED_DECISION_PROTOCOL: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "unsupported_decision_protocol",
+    "decision protocol must be typesafe_systemone",
+);
+const INVALID_DECISION_CAPABILITIES: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_decision_capabilities",
+    "declared_capabilities must include at least one of choice, ordinal_score, binary_probability",
+);
+const INVALID_DECISION_LIMITS: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_decision_limits",
+    "decision limits must be between 1 and 1000000, and a per-question limit cannot exceed its per-request limit",
+);
+const INVALID_DECISION_MODELS: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_decision_models",
+    "every decision model must be an existing Decision Model Profile without duplicates",
+);
+const MISSING_DECISION_MODELS: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "missing_decision_models",
+    "a Decision Profile must select at least one Decision Model Profile",
+);
+const INVALID_WORKSPACE_ACCESS: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_workspace_access",
+    "workspace_access must be none",
+);
+const INVALID_DECISION_ASSISTANCE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_decision_assistance",
+    "decision_assistance must name an existing Decision Profile",
+);
 const INVALID_TOOL_GRANT: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_tool_grant",
@@ -152,6 +188,31 @@ fn parse_capability(value: &str) -> Option<ModelCapability> {
         "vision" => Some(ModelCapability::Vision),
         "reasoning" => Some(ModelCapability::Reasoning),
         _ => None,
+    }
+}
+
+fn decision_capability_str(capability: DecisionCapability) -> &'static str {
+    match capability {
+        DecisionCapability::Choice => "choice",
+        DecisionCapability::OrdinalScore => "ordinal_score",
+        DecisionCapability::BinaryProbability => "binary_probability",
+    }
+}
+
+fn parse_decision_capability(value: &str) -> Option<DecisionCapability> {
+    match value {
+        "choice" => Some(DecisionCapability::Choice),
+        "ordinal_score" => Some(DecisionCapability::OrdinalScore),
+        "binary_probability" => Some(DecisionCapability::BinaryProbability),
+        _ => None,
+    }
+}
+
+fn workspace_access_str(access: WorkspaceAccess) -> &'static str {
+    match access {
+        WorkspaceAccess::None => "none",
+        WorkspaceAccess::Metadata => "metadata",
+        WorkspaceAccess::Full => "full",
     }
 }
 
@@ -213,7 +274,55 @@ enum WireProfileRequest {
         approve: Option<Option<Vec<String>>>,
         #[serde(default, deserialize_with = "optional_value")]
         default_model: Option<Option<String>>,
+        /// An existing Decision Profile this Agent may ask for typed advice.
+        /// `null` clears an assignment; absent leaves the previous one.
+        #[serde(default, deserialize_with = "optional_value")]
+        decision_assistance: Option<Option<String>>,
     },
+    /// A Decision Model: a typed model reached over a decision protocol.
+    DecisionModel {
+        name: String,
+        model: String,
+        #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        credential_ref: Option<String>,
+        #[serde(default)]
+        credential: Option<String>,
+        #[serde(default)]
+        clear_credential: bool,
+        #[serde(default)]
+        declared_capabilities: Vec<String>,
+        #[serde(default)]
+        limits: WireDecisionLimitInput,
+    },
+    /// A Decision Profile: an Agent whose models are Decision Models.
+    DecisionAgent {
+        name: String,
+        #[serde(default)]
+        instructions: Option<String>,
+        #[serde(default)]
+        models: Vec<String>,
+        #[serde(default, deserialize_with = "optional_value")]
+        default_model: Option<Option<String>>,
+        #[serde(default)]
+        workspace_access: Option<String>,
+    },
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct WireDecisionLimitInput {
+    #[serde(default)]
+    max_input_tokens_per_request: Option<u32>,
+    #[serde(default)]
+    max_output_tokens_per_request: Option<u32>,
+    #[serde(default)]
+    max_input_tokens_per_question: Option<u32>,
+    #[serde(default)]
+    max_output_tokens_per_question: Option<u32>,
 }
 
 fn optional_value<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
@@ -376,6 +485,77 @@ async fn resolve_or_create_connection(
         .map_err(map_mutation_error)
 }
 
+/// The credential reference a Profile names, and the secret to write, if
+/// any. An update keeps the reference it had when none is supplied, and an
+/// explicit clear removes it.
+async fn resolve_credential(
+    database: &DatabaseHandle,
+    profile_name: &str,
+    credential_ref: Option<&str>,
+    credential: Option<&str>,
+    clear_credential: bool,
+    prior_credential_ref: Option<String>,
+) -> Result<(Option<String>, Option<(String, String)>), Refusal> {
+    let explicit_ref = credential_ref
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(reference) = explicit_ref.as_deref()
+        && !valid_credential_ref(reference)
+    {
+        return Err(INVALID_CREDENTIAL_REF);
+    }
+    let secret = credential.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(secret_value) = secret
+        && (secret_value.len() > 4096
+            || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret_value}")).is_err())
+    {
+        return Err(INVALID_CREDENTIAL);
+    }
+    if clear_credential {
+        return Ok((None, None));
+    }
+    match secret {
+        Some(secret_value) => {
+            let target_ref = match explicit_ref.or(prior_credential_ref) {
+                Some(reference) => reference,
+                None => {
+                    let base = default_credential_ref(profile_name);
+                    let existing_connections =
+                        database.all_configs(Some(ConfigKind::Connection)).await?;
+                    let is_in_use = |reference: &str| {
+                        existing_connections.iter().any(|record| {
+                            if let ConfigBody::Connection(connection) = &record.body {
+                                connection.credential_ref.as_deref() == Some(reference)
+                            } else {
+                                false
+                            }
+                        })
+                    };
+                    let mut candidate = base.clone();
+                    if is_in_use(&candidate) {
+                        let mut suffix = 2;
+                        loop {
+                            let suffixed = format!("{base}_{suffix}");
+                            if !is_in_use(&suffixed) {
+                                candidate = suffixed;
+                                break;
+                            }
+                            suffix += 1;
+                        }
+                    }
+                    candidate
+                }
+            };
+            Ok((
+                Some(target_ref.clone()),
+                Some((target_ref, secret_value.to_owned())),
+            ))
+        }
+        None => Ok((explicit_ref.or(prior_credential_ref), None)),
+    }
+}
+
 /// The default Profile page size.
 const DEFAULT_PROFILE_PAGE: usize = 50;
 /// How many configs one page examines per Profile it may return.
@@ -426,6 +606,8 @@ fn build_profiles_page(
     } = page;
     let mut llm_profiles = Vec::new();
     let mut agent_profiles = Vec::new();
+    let mut decision_profiles = Vec::new();
+    let mut decision_agent_profiles = Vec::new();
     let mut executor_protocols = Vec::new();
 
     #[derive(Ord, PartialOrd, Eq, PartialEq)]
@@ -464,6 +646,7 @@ fn build_profiles_page(
                 let id_str = id.to_string();
                 let profile = WireLlmProfile {
                     id: id_str.clone(),
+                    profile_type: Some("llm".to_owned()),
                     name: record.name,
                     model: model.model.clone(),
                     context_window: model.context_window,
@@ -501,6 +684,7 @@ fn build_profiles_page(
             ConfigBody::Agent(agent) => {
                 let profile = WireManagedAgent {
                     id: id.to_string(),
+                    profile_type: Some("agent".to_owned()),
                     name: record.name,
                     instructions: agent.instructions,
                     tool_grant: agent.tool_grant,
@@ -527,6 +711,9 @@ fn build_profiles_page(
                         .iter()
                         .map(|id| ProfileId::from(*id).to_string())
                         .collect(),
+                    decision_assistance: agent
+                        .decision_assistance
+                        .map(|id| ProfileId::from(id).to_string()),
                     editable: true,
                     blocking_jobs: Vec::new(),
                     more_blocking_jobs: false,
@@ -565,8 +752,69 @@ fn build_profiles_page(
                 }
             }
             ConfigBody::Connection(_) => {}
-            ConfigBody::DecisionModel(_) => {}
-            ConfigBody::DecisionAgent(_) => {}
+            ConfigBody::DecisionModel(model) => {
+                let Some(connection) = connections.get(&model.connection_id).cloned() else {
+                    return Err(INCONSISTENT_RECORD);
+                };
+                let has_credential = connection
+                    .credential_ref
+                    .as_deref()
+                    .is_some_and(|reference| database.has_credential(reference));
+                let profile = WireDecisionProfile {
+                    id: id.to_string(),
+                    name: record.name,
+                    model: model.model.clone(),
+                    protocol: model.protocol.as_str().to_owned(),
+                    endpoint: connection.endpoint.clone(),
+                    credential_ref: connection.credential_ref.clone(),
+                    has_credential,
+                    declared_capabilities: model
+                        .declared_capabilities
+                        .iter()
+                        .map(|capability| decision_capability_str(*capability).to_owned())
+                        .collect(),
+                    limits: WireDecisionLimits {
+                        max_input_tokens_per_request: model.limits.max_input_tokens_per_request,
+                        max_output_tokens_per_request: model.limits.max_output_tokens_per_request,
+                        max_input_tokens_per_question: model.limits.max_input_tokens_per_question,
+                        max_output_tokens_per_question: model.limits.max_output_tokens_per_question,
+                    },
+                    editable: true,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
+                };
+                if !fits_profile_page(&profile, &mut page_bytes)? {
+                    next_before = last_emitted;
+                    break;
+                }
+                decision_profiles.push(profile);
+                last_emitted = Some(record.id);
+            }
+            ConfigBody::DecisionAgent(agent) => {
+                let profile = WireDecisionAgentProfile {
+                    id: id.to_string(),
+                    name: record.name,
+                    instructions: agent.instructions,
+                    models: agent
+                        .models
+                        .iter()
+                        .map(|id| ProfileId::from(*id).to_string())
+                        .collect(),
+                    default_model: agent
+                        .default_model
+                        .map(|id| ProfileId::from(id).to_string()),
+                    workspace_access: workspace_access_str(agent.workspace_access).to_owned(),
+                    editable: true,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
+                };
+                if !fits_profile_page(&profile, &mut page_bytes)? {
+                    next_before = last_emitted;
+                    break;
+                }
+                decision_agent_profiles.push(profile);
+                last_emitted = Some(record.id);
+            }
         }
     }
     // Newest first, as Profiles have always been listed.
@@ -592,6 +840,9 @@ fn build_profiles_page(
     Ok(envelope(WireProfiles {
         llm_profiles,
         agent_profiles,
+        decision_profiles: (!decision_profiles.is_empty()).then_some(decision_profiles),
+        decision_agent_profiles: (!decision_agent_profiles.is_empty())
+            .then_some(decision_agent_profiles),
         executor_protocols,
         providers,
         has_more: next_before.is_some(),
@@ -829,6 +1080,7 @@ pub(super) async fn save_profile(
             dispatch_to,
             approve,
             default_model,
+            decision_assistance,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
@@ -958,6 +1210,23 @@ pub(super) async fn save_profile(
             if default_model.is_some_and(|id| !parsed_targets.contains(&id)) {
                 return Err(invalid_default);
             }
+            let decision_assistance = match decision_assistance {
+                None => prior.decision_assistance,
+                Some(None) => None,
+                Some(Some(raw)) => {
+                    let id = profile_id(&raw)
+                        .map(ConfigId::from)
+                        .map_err(|_| INVALID_DECISION_ASSISTANCE)?;
+                    match database.config(id).await? {
+                        Some(ConfigRecord {
+                            body: ConfigBody::DecisionAgent(_),
+                            archived_at: None,
+                            ..
+                        }) => Some(id),
+                        _ => return Err(INVALID_DECISION_ASSISTANCE),
+                    }
+                }
+            };
             NewConfig {
                 name: name.trim().to_owned(),
                 body: ConfigBody::Agent(AgentConfig {
@@ -968,8 +1237,224 @@ pub(super) async fn save_profile(
                     default_model,
                     dispatch_to: parsed_dispatch,
                     tool_grant,
-                    decision_assistance: prior.decision_assistance,
+                    decision_assistance,
                     compaction_policy: prior.compaction_policy,
+                }),
+            }
+        }
+        WireProfileRequest::DecisionModel {
+            name,
+            model,
+            protocol,
+            endpoint,
+            credential_ref,
+            credential,
+            clear_credential,
+            declared_capabilities,
+            limits,
+        } => {
+            if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
+                return Err(INVALID_PROFILE_NAME);
+            }
+            if !valid_single_line(&model, MAX_MODEL_BYTES) {
+                return Err(INVALID_MODEL);
+            }
+            let decision_protocol = protocol
+                .as_deref()
+                .map(str::trim)
+                .map(DecisionProtocol::parse)
+                .unwrap_or(Some(DecisionProtocol::TypeSafeSystemOne))
+                .ok_or(UNSUPPORTED_DECISION_PROTOCOL)?;
+            let normalized_endpoint = match endpoint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                None => None,
+                Some(url) => {
+                    if url.len() > MAX_ENDPOINT_BYTES
+                        || crate::provider_execution::model_endpoint(url).is_err()
+                        || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+                    {
+                        return Err(INVALID_ENDPOINT);
+                    }
+                    Some(url.to_owned())
+                }
+            };
+            let mut capabilities = BTreeSet::new();
+            for item in &declared_capabilities {
+                let Some(parsed) = parse_decision_capability(item.trim()) else {
+                    return Err(INVALID_DECISION_CAPABILITIES);
+                };
+                capabilities.insert(parsed);
+            }
+            if capabilities.is_empty() {
+                return Err(INVALID_DECISION_CAPABILITIES);
+            }
+            let decision_limits = DecisionLimits {
+                max_input_tokens_per_request: limits.max_input_tokens_per_request,
+                max_output_tokens_per_request: limits.max_output_tokens_per_request,
+                max_input_tokens_per_question: limits.max_input_tokens_per_question,
+                max_output_tokens_per_question: limits.max_output_tokens_per_question,
+            };
+            for value in [
+                decision_limits.max_input_tokens_per_request,
+                decision_limits.max_output_tokens_per_request,
+                decision_limits.max_input_tokens_per_question,
+                decision_limits.max_output_tokens_per_question,
+            ] {
+                if value.is_some_and(|value| value == 0 || value > 1_000_000) {
+                    return Err(INVALID_DECISION_LIMITS);
+                }
+            }
+            for (question, request) in [
+                (
+                    decision_limits.max_input_tokens_per_question,
+                    decision_limits.max_input_tokens_per_request,
+                ),
+                (
+                    decision_limits.max_output_tokens_per_question,
+                    decision_limits.max_output_tokens_per_request,
+                ),
+            ] {
+                if question
+                    .zip(request)
+                    .is_some_and(|(question, request)| question > request)
+                {
+                    return Err(INVALID_DECISION_LIMITS);
+                }
+            }
+            // The existing Profile's Connection, when it is edited, keeps its
+            // credential reference unless another one is named.
+            let prior_credential_ref = if let Some(id) = existing_id {
+                let Some(existing_record) = database.config(id.into()).await? else {
+                    return Err(PROFILE_NOT_FOUND);
+                };
+                if existing_record.archived_at.is_some() {
+                    return Err(PROFILE_NOT_FOUND);
+                }
+                let ConfigBody::DecisionModel(existing_model) = existing_record.body else {
+                    return Err(WRONG_PROFILE_KIND);
+                };
+                let existing_connection = database
+                    .config(existing_model.connection_id)
+                    .await?
+                    .ok_or(INCONSISTENT_RECORD)?;
+                match existing_connection.body {
+                    ConfigBody::Connection(connection) => connection.credential_ref,
+                    _ => return Err(INCONSISTENT_RECORD),
+                }
+            } else {
+                None
+            };
+            let (resolved_credential_ref, secret) = resolve_credential(
+                database,
+                name.trim(),
+                credential_ref.as_deref(),
+                credential.as_deref(),
+                clear_credential,
+                prior_credential_ref,
+            )
+            .await?;
+            credential_to_save = secret;
+            // The Connection carries the endpoint and the credential. Its
+            // transport records how the endpoint would be spoken generatively
+            // and is never used for decision work: the decision protocol
+            // belongs to this Profile.
+            let connection = resolve_or_create_connection(
+                database,
+                &format!("{} decision provider", name.trim()),
+                LlmTransport::OpenAiChatCompletions,
+                normalized_endpoint,
+                resolved_credential_ref,
+            )
+            .await?;
+            NewConfig {
+                name: name.trim().to_owned(),
+                body: ConfigBody::DecisionModel(DecisionModelConfig {
+                    connection_id: connection,
+                    model: model.trim().to_owned(),
+                    protocol: decision_protocol,
+                    limits: decision_limits,
+                    declared_capabilities: capabilities,
+                }),
+            }
+        }
+        WireProfileRequest::DecisionAgent {
+            name,
+            instructions,
+            models,
+            default_model,
+            workspace_access,
+        } => {
+            if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
+                return Err(INVALID_PROFILE_NAME);
+            }
+            let normalized_instructions = match instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                None => None,
+                Some(text) => {
+                    if !valid_multiline(text, MAX_INSTRUCTIONS_BYTES) {
+                        return Err(INVALID_INSTRUCTIONS);
+                    }
+                    Some(text.to_owned())
+                }
+            };
+            if models.is_empty() {
+                return Err(MISSING_DECISION_MODELS);
+            }
+            let mut parsed_models: Vec<ConfigId> = Vec::with_capacity(models.len());
+            for raw_model in &models {
+                let model_id = crate::persistence::parse_entity_id(raw_model.trim())
+                    .map(ConfigId::new)
+                    .ok_or(INVALID_DECISION_MODELS)?;
+                if parsed_models.contains(&model_id) {
+                    return Err(INVALID_DECISION_MODELS);
+                }
+                match database.config(model_id).await? {
+                    Some(ConfigRecord {
+                        body: ConfigBody::DecisionModel(_),
+                        ..
+                    }) => parsed_models.push(model_id),
+                    _ => return Err(INVALID_DECISION_MODELS),
+                }
+            }
+            parsed_models.sort();
+            let invalid_default = Refusal::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_default_decision_model",
+                "default_model must be one of models",
+            );
+            let default_model = match default_model {
+                None => None,
+                Some(value) => value
+                    .map(|raw| {
+                        profile_id(&raw)
+                            .map(ConfigId::from)
+                            .map_err(|_| invalid_default)
+                    })
+                    .transpose()?,
+            };
+            if default_model.is_some_and(|id| !parsed_models.contains(&id)) {
+                return Err(invalid_default);
+            }
+            // Workspace reads are not implemented. A Decision Profile that
+            // names metadata or full access would advertise a permission it
+            // cannot use, so only none is accepted.
+            let access = match workspace_access.as_deref().map(str::trim) {
+                None | Some("none") => WorkspaceAccess::None,
+                Some(_) => return Err(INVALID_WORKSPACE_ACCESS),
+            };
+            NewConfig {
+                name: name.trim().to_owned(),
+                body: ConfigBody::DecisionAgent(DecisionAgentConfig {
+                    instructions: normalized_instructions,
+                    models: parsed_models,
+                    default_model,
+                    workspace_access: access,
                 }),
             }
         }
@@ -1580,18 +2065,29 @@ struct ProviderModelsRequest {
     credential_ref: Option<String>,
 }
 
+/// Which protocol a discovery request names: a generative transport, or a
+/// decision protocol. The two are discovered by different routes, so the
+/// protocol decides which one is used.
+enum DiscoveryProtocol {
+    Generative(LlmTransport),
+    Decision(DecisionProtocol),
+}
+
 pub(super) async fn provider_models(
     database: &DatabaseHandle,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let request: ProviderModelsRequest =
         serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
-    let protocol = request
-        .protocol
-        .as_deref()
-        .map(LlmTransport::parse)
-        .unwrap_or(Some(LlmTransport::OpenAiChatCompletions))
-        .ok_or(UNSUPPORTED_PROTOCOL)?;
+    let protocol = match request.protocol.as_deref().map(str::trim) {
+        None => DiscoveryProtocol::Generative(LlmTransport::OpenAiChatCompletions),
+        Some(name) => match DecisionProtocol::parse(name) {
+            Some(protocol) => DiscoveryProtocol::Decision(protocol),
+            None => DiscoveryProtocol::Generative(
+                LlmTransport::parse(name).ok_or(UNSUPPORTED_PROTOCOL)?,
+            ),
+        },
+    };
     if request.endpoint.len() > MAX_ENDPOINT_BYTES
         || crate::provider_execution::model_endpoint(&request.endpoint).is_err()
     {
@@ -1625,13 +2121,25 @@ pub(super) async fn provider_models(
         return Err(INVALID_CREDENTIAL);
     }
     use crate::provider_execution::ModelListError;
-    let (code, message, status_code) = match crate::provider_execution::list_models(
-        &request.endpoint,
-        credential.as_deref(),
-        protocol,
-    )
-    .await
-    {
+    let listed = match protocol {
+        DiscoveryProtocol::Generative(protocol) => {
+            crate::provider_execution::list_models(
+                &request.endpoint,
+                credential.as_deref(),
+                protocol,
+            )
+            .await
+        }
+        DiscoveryProtocol::Decision(protocol) => {
+            debug_assert_eq!(protocol, DecisionProtocol::TypeSafeSystemOne);
+            crate::provider_execution::list_decision_models(
+                &request.endpoint,
+                credential.as_deref(),
+            )
+            .await
+        }
+    };
+    let (code, message, status_code) = match listed {
         Ok(models) => {
             return Ok(Reply::ok(envelope(WireProviderModels {
                 models: models

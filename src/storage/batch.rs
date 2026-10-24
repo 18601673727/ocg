@@ -1236,11 +1236,7 @@ impl Batch {
             recorded_at: self.now,
             payload,
         };
-        let execution = if row.kind.is_conversation() {
-            None
-        } else {
-            Some(self.turn_execution(&row)?.0)
-        };
+        let execution = self.step(|tx| reads::turn_config_of(&tx.open_table(JOBS)?, &row))?;
         let scope = derived::request_scope_key(execution.as_ref(), &event);
         self.step(|tx| {
             tx.open_table(REQUEST_EVENTS)?.insert(
@@ -1273,11 +1269,7 @@ impl Batch {
         if row.kind.is_conversation() {
             return Ok((None, Vec::new()));
         }
-        let execution = self.turn_execution(&row)?.0;
-        let target = Some(LlmTarget {
-            llm_profile: execution.llm.model.id.into(),
-            frozen: execution.llm.clone(),
-        });
+        let target = self.step(|tx| reads::turn_target_of(&tx.open_table(JOBS)?, &row))?;
         let events = self.step(|tx| {
             let table = tx.open_table(REQUEST_EVENTS)?;
             let mut events = Vec::new();
@@ -1315,17 +1307,21 @@ impl Batch {
         if row.kind.is_conversation() {
             return Ok(());
         }
-        let execution = self.turn_execution(&row)?.0;
+        let Some(target) = self.step(|tx| reads::turn_target_of(&tx.open_table(JOBS)?, &row))?
+        else {
+            return Ok(());
+        };
+        let execution = target.frozen;
         let parent = match row.parent_id {
             Some(parent) => self.job(parent)?,
             None => None,
         };
         let agent = usage_agent(&row, parent.as_ref());
-        let provider = execution.llm.provider.id.get();
-        let model_hash = *ContentDigest::of(execution.llm.config.model.as_bytes()).as_bytes();
-        let target = Some(LlmTarget {
-            llm_profile: execution.llm.model.id.into(),
-            frozen: execution.llm.clone(),
+        let provider = execution.provider.id.get();
+        let model_hash = *ContentDigest::of(execution.config.model.as_bytes()).as_bytes();
+        let target = Some(crate::persistence::LlmTarget {
+            llm_profile: execution.model.id.into(),
+            frozen: execution,
         });
         if events.is_empty() {
             return Ok(());

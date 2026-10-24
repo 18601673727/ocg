@@ -111,11 +111,7 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobRow) -> Result<JobRecord,
             .map(|outcome| outcome.at)
     };
     let subtree_settled = rx.open_table(UNSETTLED)?.get(id.get())?.is_none();
-    let execution = if row.kind.is_conversation() {
-        None
-    } else {
-        Some(turn_execution(&rx.open_table(JOBS)?, &row)?.0)
-    };
+    let execution = turn_config(rx, &row)?;
     let configuration = execution.as_ref().map(|execution| ExecutionConfiguration {
         agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
         llm_profile: execution.llm.model.id.into(),
@@ -565,12 +561,8 @@ fn active_turn(
     }
     let row = read_job_row(rx, turn)?
         .ok_or_else(|| StorageError::corrupted(format!("{turn} has no job row")))?;
-    let (execution, _, _) = turn_execution(&rx.open_table(JOBS)?, &row)?;
-    Ok(Some((
-        turn,
-        execution.llm.model.id,
-        execution.llm.config.model.clone(),
-    )))
+    let (model, name) = turn_identity(rx, &row)?;
+    Ok(Some((turn, model, name)))
 }
 
 /// How a turn stands: what its outcome says, else whether it runs, else
@@ -693,7 +685,15 @@ fn tree_node(
             )
         }
         JobKind::Turn { name, .. } => {
-            let (execution, _, agent) = turn_execution(&rx.open_table(JOBS)?, row)?;
+            let (model_id, model_name) = turn_identity(rx, row)?;
+            let agent = match &row.kind {
+                JobKind::Turn {
+                    execution: TurnExecution::Decision(work),
+                    ..
+                } => Some(work.frozen.agent_ref.id),
+                JobKind::Turn { .. } => turn_execution(&rx.open_table(JOBS)?, row)?.2,
+                _ => None,
+            };
             let title = match name {
                 Some(name) => name.clone(),
                 None => match row.kind.objective() {
@@ -717,7 +717,7 @@ fn tree_node(
                     state: turn_state(rx, row.id)?,
                     conversation: row.kind.is_stored().then_some(row.parent_id).flatten(),
                     previous: row.kind.previous(),
-                    model: (execution.llm.model.id, execution.llm.config.model.clone()),
+                    model: (model_id, model_name),
                     depends_on,
                 },
                 agent,
@@ -966,11 +966,7 @@ pub(crate) fn read_tool_evidence(
 /// The input of a Job is part of its spec, so it is read from the Job. The
 /// identity of the input is the Job's.
 fn input_of(rx: &ReadTransaction, row: JobRow) -> Result<JobInputRecord, StorageError> {
-    let execution = if row.kind.is_conversation() {
-        None
-    } else {
-        Some(turn_execution(&rx.open_table(JOBS)?, &row)?.0)
-    };
+    let execution = turn_config(rx, &row)?;
     Ok(JobInputRecord {
         id: JobInputId::new(row.id.get()),
         objective: row.kind.objective().map(str::to_owned),
@@ -999,6 +995,82 @@ pub(crate) fn read_job_input_for_job(
         .transpose()
 }
 
+/// The Profile and model identity a turn runs with, for projections that do
+/// not need its whole frozen configuration. A decision turn names its
+/// Decision Model; a generative turn its Model.
+fn turn_identity(rx: &ReadTransaction, row: &JobRow) -> Result<(ConfigId, String), StorageError> {
+    if let JobKind::Turn {
+        execution: TurnExecution::Decision(work),
+        ..
+    } = &row.kind
+    {
+        return Ok((work.frozen.model_ref.id, work.frozen.model.model.clone()));
+    }
+    let (execution, _, _) = turn_execution(&rx.open_table(JOBS)?, row)?;
+    Ok((execution.llm.model.id, execution.llm.config.model.clone()))
+}
+
+/// The frozen generative configuration of a turn. A decision turn has none:
+/// its configuration is typed decision work, not an LLM Profile.
+fn turn_config(
+    rx: &ReadTransaction,
+    row: &JobRow,
+) -> Result<Option<FrozenExecutionConfig>, StorageError> {
+    let jobs = rx.open_table(JOBS)?;
+    turn_config_of(&jobs, row)
+}
+
+/// See [`turn_config`]; it takes the table so a write batch can call it.
+pub(super) fn turn_config_of(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    row: &JobRow,
+) -> Result<Option<FrozenExecutionConfig>, StorageError> {
+    if matches!(
+        &row.kind,
+        JobKind::Turn {
+            execution: TurnExecution::Decision(_),
+            ..
+        }
+    ) || row.kind.is_conversation()
+    {
+        return Ok(None);
+    }
+    Ok(Some(turn_execution(jobs, row)?.0))
+}
+
+/// The generative accounting target of a turn. A decision turn has no LLM
+/// Profile or generative Provider, so it has none: its Token facts remain
+/// per-Job Metrics and are not aggregated into Provider/model charts.
+pub(super) fn turn_target(
+    rx: &ReadTransaction,
+    row: &JobRow,
+) -> Result<Option<crate::persistence::LlmTarget>, StorageError> {
+    let jobs = rx.open_table(JOBS)?;
+    turn_target_of(&jobs, row)
+}
+
+/// See [`turn_target`]; it takes the table so a write batch can call it.
+pub(super) fn turn_target_of(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    row: &JobRow,
+) -> Result<Option<crate::persistence::LlmTarget>, StorageError> {
+    if matches!(
+        &row.kind,
+        JobKind::Turn {
+            execution: TurnExecution::Decision(_),
+            ..
+        }
+    ) || row.kind.is_conversation()
+    {
+        return Ok(None);
+    }
+    let (execution, _, _) = turn_execution(jobs, row)?;
+    Ok(Some(crate::persistence::LlmTarget {
+        llm_profile: execution.llm.model.id.into(),
+        frozen: execution.llm,
+    }))
+}
+
 pub(crate) fn read_job_configuration(
     database: &Database,
     job: JobId,
@@ -1010,12 +1082,34 @@ pub(crate) fn read_job_configuration(
     if row.kind.is_conversation() {
         return Ok(None);
     }
-    let execution = turn_execution(&rx.open_table(JOBS)?, &row)?.0;
+    let Some(execution) = turn_config(&rx, &row)? else {
+        return Ok(None);
+    };
     Ok(Some(SubmittedConfiguration {
         agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
         llm_profile: execution.llm.model.id.into(),
         frozen: execution,
     }))
+}
+
+/// The typed work of a decision turn, read from its immutable spec. It is
+/// `None` for every other Job, so a caller must branch on execution class
+/// rather than pass a generative snapshot to the decision runtime.
+pub(crate) fn read_decision_work(
+    database: &Database,
+    job: JobId,
+) -> Result<Option<crate::persistence::DecisionWork>, StorageError> {
+    let rx = read(database)?;
+    let Some(row) = read_job_row(&rx, job)? else {
+        return Ok(None);
+    };
+    match row.kind {
+        JobKind::Turn {
+            execution: TurnExecution::Decision(work),
+            ..
+        } => Ok(Some(work)),
+        _ => Ok(None),
+    }
 }
 
 // ---- submissions -------------------------------------------------------------------
@@ -1392,6 +1486,21 @@ fn pools_offering(
     rx: &ReadTransaction,
     protocol: LlmTransport,
 ) -> Result<Vec<ExecutorId>, StorageError> {
+    pools_offering_capability(rx, ExecutionOperation::LlmRequest, Some(protocol))
+}
+
+fn pools_offering_operation(
+    rx: &ReadTransaction,
+    operation: ExecutionOperation,
+) -> Result<Vec<ExecutorId>, StorageError> {
+    pools_offering_capability(rx, operation, None)
+}
+
+fn pools_offering_capability(
+    rx: &ReadTransaction,
+    operation: ExecutionOperation,
+    protocol: Option<LlmTransport>,
+) -> Result<Vec<ExecutorId>, StorageError> {
     let mut pools = Vec::new();
     for entry in rx.open_table(CONFIGS)?.iter()? {
         let (key, bytes) = entry?;
@@ -1399,7 +1508,7 @@ fn pools_offering(
         if row.archived_at.is_none()
             && let ConfigBody::Pool(body) = &row.body
             && body.enabled
-            && body.offers(ExecutionOperation::LlmRequest, Some(protocol))
+            && body.offers(operation, protocol)
         {
             pools.push(row.id.into());
             if pools.len() >= MAX_PAGE {
@@ -1440,6 +1549,14 @@ pub(crate) fn read_compatible_executors(
     pools_offering(&rx, connection.protocol)
 }
 
+/// The Pools that offer typed decision work, oldest first.
+pub(crate) fn read_decision_executors(
+    database: &Database,
+) -> Result<Vec<ExecutorId>, StorageError> {
+    let rx = read(database)?;
+    pools_offering_operation(&rx, ExecutionOperation::Decision)
+}
+
 /// The Pools that offer what the Connection a Job froze speaks.
 pub(crate) fn read_job_compatible_executors(
     database: &Database,
@@ -1451,6 +1568,15 @@ pub(crate) fn read_job_compatible_executors(
     };
     if row.kind.is_conversation() {
         return Ok(Vec::new());
+    }
+    if matches!(
+        &row.kind,
+        JobKind::Turn {
+            execution: TurnExecution::Decision(_),
+            ..
+        }
+    ) {
+        return pools_offering_operation(&rx, ExecutionOperation::Decision);
     }
     let execution = turn_execution(&rx.open_table(JOBS)?, &row)?.0;
     pools_offering(&rx, execution.llm.provider.transport)
@@ -1944,8 +2070,10 @@ fn resolve_model_name(
         let (key, _) = entry?;
         let (_provider, _hash, _obs, job, _req, _seq) = key.value();
         if let Some(job_row) = read_job_row(rx, JobId::new(job))? {
-            let execution = turn_execution(&rx.open_table(JOBS)?, &job_row)?.0;
-            return Ok(Some(execution.llm.config.model));
+            let Some(target) = turn_target(rx, &job_row)? else {
+                continue;
+            };
+            return Ok(Some(target.frozen.config.model));
         }
     }
     Ok(None)
@@ -3004,7 +3132,6 @@ pub(crate) fn read_usage_retries(
 ) -> Result<UsageRetriesPage, StorageError> {
     let rx = read(database)?;
     let retries = rx.open_table(RETRIES)?;
-    let jobs = rx.open_table(JOBS)?;
     let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
     let mut entries = retries.range((start, std::ops::Bound::Unbounded))?;
     let mut grouped: BTreeMap<UsageGroupKey, (String, u64)> = BTreeMap::new();
@@ -3032,14 +3159,17 @@ pub(crate) fn read_usage_retries(
         if filter.agent.is_some_and(|target| agent != target) {
             continue;
         }
-        let execution = turn_execution(&jobs, &original)?.0;
+        let Some(target) = turn_target(&rx, &original)? else {
+            continue;
+        };
+        let config = target.frozen;
         let bucket = bucketing
             .start_of(at)
             .ok_or_else(|| StorageError::corrupted("retry bucket overflows"))?;
-        let model = execution.llm.config.model;
+        let model = config.config.model;
         let hash = *ContentDigest::of(model.as_bytes()).as_bytes();
         let slot = grouped
-            .entry((bucket, agent, execution.llm.provider.id.get(), hash))
+            .entry((bucket, agent, config.provider.id.get(), hash))
             .or_insert((model, 0));
         slot.1 += 1;
     }

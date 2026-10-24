@@ -26,14 +26,7 @@ pub(super) fn frozen_llm_target(
     else {
         return Ok(None);
     };
-    if row.kind.is_conversation() {
-        return Ok(None);
-    }
-    let execution = reads::turn_execution(&rx.open_table(JOBS)?, &row)?.0;
-    Ok(Some(LlmTarget {
-        llm_profile: execution.llm.model.id.into(),
-        frozen: execution.llm,
-    }))
+    reads::turn_target(rx, &row)
 }
 
 fn job_events(rx: &ReadTransaction, job: JobId) -> Result<Vec<RequestEventRecord>, StorageError> {

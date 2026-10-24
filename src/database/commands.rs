@@ -141,6 +141,17 @@ pub(super) enum Command {
         format: Option<crate::persistence::ResponseFormat>,
         reply: Reply<Appended>,
     },
+    /// Opens a system conversation with one typed decision turn. It is the
+    /// same admission boundary as `Open`; only the execution class differs.
+    SubmitDecision {
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        request: crate::persistence::DecisionRequest,
+        submission: Option<NewSubmission>,
+        reply: Reply<(JobId, Appended)>,
+    },
     StopTurn {
         conversation: JobId,
         by: Actor,
@@ -468,6 +479,17 @@ impl Command {
                 batch.require_user_conversation(conversation)?;
                 batch.append_with_format(conversation, entry, freeze, submission, false, format)
             }),
+            Self::SubmitDecision {
+                parent,
+                spec,
+                first,
+                configuration,
+                request,
+                submission,
+                reply,
+            } => run(database, operation, commit, Kind::Open, reply, |batch| {
+                batch.open_decision(parent, spec, first, configuration, request, submission)
+            }),
             Self::StopTurn {
                 conversation,
                 by,
@@ -745,6 +767,8 @@ impl Command {
             | Self::CreateSubmittedJob { job, .. } => {
                 text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective))
             }
+            Self::SubmitDecision { first, request, .. } => byte_count(format!("{first:?}").len())
+                .saturating_add(byte_count(format!("{request:?}").len())),
             Self::Open { first, format, .. }
             | Self::Append {
                 entry: first,
@@ -920,7 +944,7 @@ impl Command {
             Self::CreateJob { reply, .. }
             | Self::BenchCreateDependentTurn { reply, .. }
             | Self::CreateSubmittedJob { reply, .. } => refuse(reply, error),
-            Self::Open { reply, .. } => refuse(reply, error),
+            Self::Open { reply, .. } | Self::SubmitDecision { reply, .. } => refuse(reply, error),
             Self::Append { reply, .. } | Self::Retry { reply, .. } => refuse(reply, error),
             Self::StopTurn { reply, .. }
             | Self::Close { reply, .. }

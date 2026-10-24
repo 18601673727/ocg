@@ -69,6 +69,7 @@ const MAX_UNRESOLVED: usize = 256;
 
 const KEY_DOMAIN: &[u8] = b"ocg.control-plane.idempotency-key.v1\n";
 const REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.job-submission.v1\n";
+const DECISION_REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.decision-submission.v1\n";
 
 pub(super) const KEY_REQUIRED: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
@@ -756,7 +757,48 @@ pub(super) async fn submit(
     key: SubmissionKey,
     request: JobRequest,
 ) -> Result<Reply, Refusal> {
-    let fingerprint = request.fingerprint();
+    submit_plan(shared, key, Plan::Job(request)).await
+}
+
+/// Submits one typed decision under `key`, with the same admission
+/// guarantees as an ordinary Job submission.
+pub(super) async fn submit_decision(
+    shared: &Arc<Shared>,
+    key: SubmissionKey,
+    request: DecisionJobRequest,
+) -> Result<Reply, Refusal> {
+    submit_plan(shared, key, Plan::Decision(request)).await
+}
+
+/// What a submission asks for. Both kinds are admitted once under one key.
+enum Plan {
+    Job(JobRequest),
+    Decision(DecisionJobRequest),
+}
+
+impl Plan {
+    fn fingerprint(&self) -> RequestFingerprint {
+        match self {
+            Self::Job(request) => request.fingerprint(),
+            Self::Decision(request) => request.fingerprint(),
+        }
+    }
+}
+
+async fn submit_plan(
+    shared: &Arc<Shared>,
+    key: SubmissionKey,
+    plan: Plan,
+) -> Result<Reply, Refusal> {
+    let fingerprint = plan.fingerprint();
+    let decision = matches!(plan, Plan::Decision(_));
+    let admission_value = move |job: JobId| async move {
+        if decision {
+            admitted_decision_value(shared, key, job).await
+        } else {
+            admitted_value(shared, key, job).await
+        }
+    };
     // At most one uncertain entry is resolved before the key is claimed.
     for _ in 0..2 {
         let (outcome, owner) = match shared.submissions.claim(key, fingerprint) {
@@ -767,7 +809,7 @@ pub(super) async fn submit(
                     Reconciled::Recorded(record) if record.fingerprint == fingerprint => {
                         return Ok(Reply::new(
                             StatusCode::OK,
-                            admitted_value(shared, key, record.job).await?,
+                            admission_value(record.job).await?,
                         ));
                     }
                     Reconciled::Recorded(_) => return Err(KEY_CONFLICT),
@@ -782,7 +824,7 @@ pub(super) async fn submit(
             } => {
                 // Spawned before anything is awaited: the admission is the
                 // listener's, whatever becomes of this request.
-                ntex::rt::spawn(admit(shared.clone(), key, generation, fingerprint, request));
+                ntex::rt::spawn(admit(shared.clone(), key, generation, fingerprint, plan));
                 (outcome, true)
             }
         };
@@ -794,7 +836,7 @@ pub(super) async fn submit(
                 } else {
                     StatusCode::OK
                 },
-                admitted_value(shared, key, job).await?,
+                admission_value(job).await?,
             )),
             Ok(Ok(Outcome::Conflict)) => Err(KEY_CONFLICT),
             Ok(Ok(Outcome::Refused(refusal))) => Err(refusal),
@@ -880,7 +922,7 @@ async fn admit(
     key: SubmissionKey,
     generation: u64,
     fingerprint: RequestFingerprint,
-    request: JobRequest,
+    plan: Plan,
 ) {
     let registry = &shared.submissions;
     // Every waiter of an admission that ran is of the owner's request.
@@ -913,6 +955,26 @@ async fn admit(
             return finish(Outcome::Refused(refusal));
         }
     }
+    match plan {
+        Plan::Job(request) => {
+            admit_job(&shared, key, generation, fingerprint, request, finish).await
+        }
+        Plan::Decision(request) => {
+            admit_decision(&shared, key, generation, fingerprint, request, finish).await
+        }
+    }
+}
+
+/// The admission of an ordinary Job: its configuration is checked, then the
+/// Job is opened with its submission.
+async fn admit_job(
+    shared: &Arc<Shared>,
+    key: SubmissionKey,
+    generation: u64,
+    fingerprint: RequestFingerprint,
+    request: JobRequest,
+    finish: impl Fn(Outcome),
+) {
     let mut request = request;
     if let Err(refusal) = normalize(&shared.database, &mut request).await {
         return finish(Outcome::Refused(refusal));
@@ -978,7 +1040,9 @@ async fn admit(
             })
         }
         Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
-            registry.uncertain(key, generation, operation.epoch())
+            shared
+                .submissions
+                .uncertain(key, generation, operation.epoch())
         }
         Err(DatabaseError::Rejected(Violation::InvalidValue("vision_not_supported", _))) => {
             finish(Outcome::Refused(VISION_NOT_SUPPORTED))
@@ -990,6 +1054,314 @@ async fn admit(
             &ExecutionRuntimeError::Database(error),
         ))),
     }
+}
+
+// ---- decision submissions --------------------------------------------------------
+
+const DECISION_PROFILE_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "decision_profile_not_found",
+    "no such Decision Profile; nothing was submitted",
+);
+const DECISION_MODEL_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "decision_model_not_found",
+    "no such Decision Model Profile; nothing was submitted",
+);
+const DECISION_MODEL_NOT_TARGETED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "decision_model_not_targeted",
+    "the Decision Profile does not select that Decision Model Profile; nothing was submitted",
+);
+const DECISION_EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "executor_not_found",
+    "no such Executor; nothing was submitted",
+);
+const DECISION_EXECUTOR_INCOMPATIBLE: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "decision_executor_incompatible",
+    "the Executor does not offer decision work; nothing was submitted",
+);
+const INVALID_DECISION_REQUEST: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_decision_request",
+    "the request is not a typed decision this API accepts",
+);
+
+/// A validated decision submission: an existing Decision Profile and
+/// Decision Model Profile, an Executor that offers decision work, and one
+/// typed decision request. Nothing else can be submitted: the endpoint, the
+/// credential and the model come from the Decision Model Profile.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct DecisionJobRequest {
+    decision_agent: ProfileId,
+    decision_model: ProfileId,
+    executor: ExecutorId,
+    request: crate::persistence::DecisionRequest,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDecisionSubmission {
+    decision_agent: String,
+    decision_model: String,
+    executor: String,
+    request: WireDecisionRequestBody,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDecisionRequestBody {
+    #[serde(default)]
+    schema_version: Option<u32>,
+    state: serde_json::Value,
+    question: WireDecisionQuestionBody,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WireDecisionQuestionBody {
+    Choice {
+        prompt: String,
+        options: Vec<WireChoiceOptionBody>,
+    },
+    BinaryProbability {
+        prompt: String,
+    },
+    OrdinalScore {
+        prompt: String,
+        levels: Vec<WireScoreLevelBody>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireChoiceOptionBody {
+    id: String,
+    description: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireScoreLevelBody {
+    value: i32,
+    description: String,
+}
+
+impl DecisionJobRequest {
+    /// Parses a decision submission body strictly: one JSON object of the
+    /// known fields, none repeated, each within its bounds.
+    pub(super) fn parse(body: &[u8]) -> Result<Self, Refusal> {
+        let wire: WireDecisionSubmission =
+            serde_json::from_slice(body).map_err(|_| INVALID_DECISION_REQUEST)?;
+        let decision_agent = identity(&wire.decision_agent, "profile:")
+            .map(ProfileId::new)
+            .ok_or(INVALID_DECISION_REQUEST)?;
+        let decision_model = identity(&wire.decision_model, "profile:")
+            .map(ProfileId::new)
+            .ok_or(INVALID_DECISION_REQUEST)?;
+        let executor = identity(&wire.executor, "executor:").ok_or(INVALID_DECISION_REQUEST)?;
+        if wire
+            .name
+            .as_deref()
+            .is_some_and(|name| !text(name, MAX_NAME_BYTES))
+        {
+            return Err(INVALID_DECISION_REQUEST);
+        }
+        let request = crate::persistence::DecisionRequest {
+            schema_version: wire
+                .request
+                .schema_version
+                .unwrap_or(crate::persistence::DECISION_SCHEMA_VERSION),
+            state: wire.request.state,
+            question: match wire.request.question {
+                WireDecisionQuestionBody::Choice { prompt, options } => {
+                    crate::persistence::DecisionQuestion::Choice {
+                        prompt,
+                        options: options
+                            .into_iter()
+                            .map(|option| crate::persistence::ChoiceOption {
+                                id: option.id,
+                                description: option.description,
+                            })
+                            .collect(),
+                    }
+                }
+                WireDecisionQuestionBody::BinaryProbability { prompt } => {
+                    crate::persistence::DecisionQuestion::BinaryProbability { prompt }
+                }
+                WireDecisionQuestionBody::OrdinalScore { prompt, levels } => {
+                    crate::persistence::DecisionQuestion::OrdinalScore {
+                        prompt,
+                        levels: levels
+                            .into_iter()
+                            .map(|level| crate::persistence::ScoreLevel {
+                                value: level.value,
+                                description: level.description,
+                            })
+                            .collect(),
+                    }
+                }
+            },
+        };
+        // The structure of the request is checked here; the primitive the
+        // question needs is checked against the Decision Model Profile when
+        // the request is admitted.
+        if request.schema_version != crate::persistence::DECISION_SCHEMA_VERSION
+            || serde_json::to_vec(&request)
+                .map(|bytes| bytes.len() > crate::persistence::MAX_DECISION_REQUEST_BYTES)
+                .unwrap_or(true)
+        {
+            return Err(INVALID_DECISION_REQUEST);
+        }
+        Ok(Self {
+            decision_agent,
+            decision_model,
+            executor: ExecutorId::new(executor),
+            request,
+            name: wire.name,
+        })
+    }
+
+    /// The digest of the request as parsed, whatever its JSON spelling.
+    fn fingerprint(&self) -> RequestFingerprint {
+        let mut context = Context::new(&SHA256);
+        context.update(DECISION_REQUEST_DOMAIN);
+        context.update(&self.decision_agent.get().to_le_bytes());
+        context.update(&self.decision_model.get().to_le_bytes());
+        context.update(&self.executor.get().to_le_bytes());
+        match &self.name {
+            None => context.update(&[0]),
+            Some(name) => {
+                context.update(&[1]);
+                context.update(&(name.len() as u64).to_le_bytes());
+                context.update(name.as_bytes());
+            }
+        }
+        let request = serde_json::to_vec(&self.request).unwrap_or_default();
+        context.update(&(request.len() as u64).to_le_bytes());
+        context.update(&request);
+        RequestFingerprint::from_digest(sha256(context))
+    }
+}
+
+/// The admission of one typed decision: the Decision Profile, the Decision
+/// Model Profile and the Executor are checked, then a system conversation
+/// with one decision turn is opened with the request.
+async fn admit_decision(
+    shared: &Arc<Shared>,
+    key: SubmissionKey,
+    generation: u64,
+    fingerprint: RequestFingerprint,
+    request: DecisionJobRequest,
+    finish: impl Fn(Outcome),
+) {
+    if let Err(refusal) = check_decision_configuration(&shared.database, &request).await {
+        return finish(Outcome::Refused(refusal));
+    }
+    let submission = Some(NewSubmission { key, fingerprint });
+    let configuration = ExecutionConfiguration {
+        agent_profile: Some(request.decision_agent),
+        llm_profile: request.decision_model,
+    };
+    let first = crate::persistence::Entry::UserMessage {
+        text: match &request.request.question {
+            crate::persistence::DecisionQuestion::Choice { prompt, .. }
+            | crate::persistence::DecisionQuestion::BinaryProbability { prompt }
+            | crate::persistence::DecisionQuestion::OrdinalScore { prompt, .. } => prompt.clone(),
+        },
+        attachments: Vec::new(),
+    };
+    let admitted = shared
+        .database
+        .submit_decision(
+            None,
+            crate::persistence::ConversationSpec {
+                name: request.name.clone(),
+                agent: Some(request.decision_agent.into()),
+                project: None,
+                origin: crate::persistence::Origin::System,
+                keep_open: false,
+            },
+            first,
+            configuration,
+            request.request.clone(),
+            submission,
+        )
+        .await;
+    match admitted {
+        Ok((_, appended)) => finish(Outcome::Admitted {
+            job: appended.turn,
+            created: true,
+        }),
+        Err(DatabaseError::Rejected(Violation::SubmissionKeyUsed { job, same_request })) => {
+            finish(if same_request {
+                Outcome::Admitted {
+                    job,
+                    created: false,
+                }
+            } else {
+                Outcome::Conflict
+            })
+        }
+        Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
+            shared
+                .submissions
+                .uncertain(key, generation, operation.epoch())
+        }
+        Err(error) => finish(Outcome::Refused(not_admitted(
+            &ExecutionRuntimeError::Database(error),
+        ))),
+    }
+}
+
+/// Refuses a Decision Profile that does not exist, a Decision Model Profile
+/// that does not exist or is not selected by the Decision Profile, and an
+/// Executor that does not exist or does not offer decision work. The
+/// creation checks them again in its own transaction.
+async fn check_decision_configuration(
+    database: &DatabaseHandle,
+    request: &DecisionJobRequest,
+) -> Result<(), Refusal> {
+    let agent = match database.config(request.decision_agent.into()).await? {
+        Some(ConfigRecord {
+            body: ConfigBody::DecisionAgent(agent),
+            archived_at: None,
+            ..
+        }) => agent,
+        _ => return Err(DECISION_PROFILE_NOT_FOUND),
+    };
+    let model = match database.config(request.decision_model.into()).await? {
+        Some(ConfigRecord {
+            body: ConfigBody::DecisionModel(model),
+            archived_at: None,
+            ..
+        }) => model,
+        _ => return Err(DECISION_MODEL_NOT_FOUND),
+    };
+    if !agent.models.contains(&request.decision_model.into()) {
+        return Err(DECISION_MODEL_NOT_TARGETED);
+    }
+    // The primitive the question needs must be one the model declares.
+    request
+        .request
+        .validate(&model.declared_capabilities)
+        .map_err(|_| INVALID_DECISION_REQUEST)?;
+    if database.executor(request.executor).await?.is_none() {
+        return Err(DECISION_EXECUTOR_NOT_FOUND);
+    }
+    if !database
+        .decision_executors()
+        .await?
+        .contains(&request.executor)
+    {
+        return Err(DECISION_EXECUTOR_INCOMPATIBLE);
+    }
+    Ok(())
 }
 
 /// Refuses a Profile that is not an existing LLM Profile, an Agent Profile
@@ -1337,6 +1709,28 @@ async fn admitted_value(shared: &Shared, key: SubmissionKey, job: JobId) -> Resu
             seq: record.seq,
             joined: record.seq > 1,
             model: frozen.frozen.llm.config.model,
+            kept: turn.cancelled_at.is_some(),
+        },
+    }))
+}
+
+/// The admission of a decision Job. Its model comes from the Decision Model
+/// Profile it froze, not from a generative configuration.
+async fn admitted_decision_value(
+    shared: &Shared,
+    key: SubmissionKey,
+    job: JobId,
+) -> Result<Value, Refusal> {
+    let record = shared.database.submission(key).await?.ok_or(INTERNAL)?;
+    let turn = shared.database.job(job).await?.ok_or(INTERNAL)?;
+    let work = shared.database.decision_work(job).await?.ok_or(INTERNAL)?;
+    Ok(envelope(WireAdmissionResponse {
+        admission: WireAdmission::Admitted {
+            job: job.to_string(),
+            conversation: turn.conversation.map(|id| id.to_string()),
+            seq: record.seq,
+            joined: record.seq > 1,
+            model: work.frozen.model.model,
             kept: turn.cancelled_at.is_some(),
         },
     }))

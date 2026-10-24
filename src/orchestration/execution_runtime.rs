@@ -28,10 +28,11 @@ use crate::persistence::{
     AppendedOutput, ApproveClass, AttachmentId, AuthorizationBasis, ExecutorId, FinalResult,
     FrozenExecutionConfig, IntermediateOutputKind, JobFinalization, JobId, JobInputDraft,
     JobInputId, JobOutcome, JobRecord, MAX_STORED_TOOL_ARGUMENTS_BYTES,
-    MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, NewAvailabilityStat, NewJob,
-    NewJobOutput, NewMetrics, NewSubmission, NewToolEvidence, NotInvokedReason, ProjectCommand,
-    ProjectId, ProjectRecord, RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
-    ToolOutcome, ToolOutcomeKind, ToolPayload, UncertainCause, Violation, WithheldReason,
+    MAX_STORED_TOOL_ARGUMENTS_PER_JOB_BYTES, Measurements, MessageBody, NewAvailabilityStat,
+    NewJob, NewJobOutput, NewMetrics, NewSentRequest, NewSubmission, NewToolEvidence,
+    NotInvokedReason, ProjectCommand, ProjectId, ProjectRecord, RequestNumber, Timestamp,
+    ToolAdmission, ToolCallRef, ToolDecision, ToolOutcome, ToolOutcomeKind, ToolPayload,
+    UncertainCause, Violation, WithheldReason,
 };
 use crate::provider_execution::{
     self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
@@ -2957,6 +2958,12 @@ async fn run_started_provider_job(
         job,
     } = started;
 
+    // A decision turn carries its own frozen typed work, so it runs through
+    // the decision adapter instead of the generative conversation path.
+    if let Some(work) = database.decision_work(job).await? {
+        return run_decision_job(database, plan, executor, input, job, work).await;
+    }
+
     // Settles the Job failed before anything was sent.
     let refused = async |summary: String| -> Result<ExecutionReceipt, ExecutionRuntimeError> {
         let failed = FinalResult {
@@ -3224,10 +3231,185 @@ async fn run_started_provider_job(
     .await
 }
 
-/// A test stand-in for the Provider of a plan executed by the runtime, and a
-/// hook before a provider plan's Job is created. Both are keyed, by the
-/// Provider's endpoint and by the Job's name, so tests running at once do
-/// not see each other's.
+/// Runs one typed decision turn: the same frozen-configuration, request
+/// recording, error settlement and finalization boundaries as a generative
+/// Job, with `POST`-style structured evidence instead of streamed text.
+/// There is no tool loop, no streamed output and no retry: a structured
+/// answer is one request, and any failure settles as the generative path
+/// would.
+async fn run_decision_job(
+    database: DatabaseHandle,
+    mut plan: ProviderTask,
+    executor: ExecutorId,
+    input: JobInputId,
+    job: JobId,
+    work: crate::persistence::DecisionWork,
+) -> Result<ExecutionReceipt, ExecutionRuntimeError> {
+    let request = RequestNumber::FIRST;
+    let body = crate::provider_execution::decision_request_body(&work.frozen, &work.request)
+        .map_err(|error| ExecutionRuntimeError::Provider(error.to_string()))?;
+    let reference = crate::persistence::RequestRef { job, request };
+    let recorded = MessageBody::new(&serde_json::json!({ "decision": body.clone() }))
+        .map_err(|error| ExecutionRuntimeError::Provider(error.to_string()))?;
+    let parameters = recorded.digest();
+    let sent = NewSentRequest {
+        job,
+        request,
+        observed_at: Timestamp::now(),
+        messages: vec![parameters],
+        tools: None,
+        parameters,
+        dropped_turns: None,
+        bodies: vec![recorded],
+        required_messages: Vec::new(),
+    };
+    if let Err(error) = database.record_sent_request(sent).await {
+        let failed = FinalResult {
+            summary: Some(format!("decision request could not be recorded: {error}")),
+            code: Some(NOT_SENT.to_owned()),
+            goal_reached: Some(false),
+            value: None,
+        };
+        let result = database
+            .finalize_job(job, JobFinalization::Failed(failed))
+            .await?;
+        return Ok(ExecutionReceipt {
+            executor,
+            input,
+            job,
+            result,
+        });
+    }
+    plan.provider_config.session_id = Some(job);
+    let execution = crate::provider_execution::execute_decision(
+        &work.frozen,
+        &work.request,
+        &body,
+        plan.credential_resolver.as_ref(),
+        &plan.provider_config,
+        reference,
+    )
+    .await;
+    let execution = match execution {
+        Ok(execution) => execution,
+        Err(error) => {
+            return settle_provider_error(database, executor, input, job, request, error).await;
+        }
+    };
+    let mut gap = None;
+    let finished_ms = (execution.finished_in.as_micros() / 1_000).min(u128::from(u64::MAX)) as u64;
+    if let Err(error) = database
+        .record_metrics(NewMetrics {
+            job,
+            request,
+            observed_at: Timestamp::now(),
+            measurements: Measurements {
+                request_finished_in_ms: Some(finished_ms),
+                usage: execution.usage.clone(),
+                ..Measurements::default()
+            },
+            token: Some(TokenAnnotation::eligible(UsageFinality::Final)),
+        })
+        .await
+    {
+        gap.get_or_insert(error);
+    }
+    match MessageBody::new(&execution.raw) {
+        Ok(response) => {
+            let answer = crate::persistence::NewProviderAnswer {
+                stat: NewAvailabilityStat {
+                    job,
+                    request,
+                    observed_at: Timestamp::now(),
+                    observation: crate::persistence::AvailabilityObservation {
+                        status_code: Some(execution.status_code),
+                        finish_reason: None,
+                        raw_finish_reason: None,
+                        failure: None,
+                    },
+                },
+                measurements: Measurements {
+                    request_finished_in_ms: Some(finished_ms),
+                    ..Measurements::default()
+                },
+                response,
+            };
+            if let Err(error) = database.record_provider_answer(answer).await {
+                gap.get_or_insert(error);
+            }
+        }
+        Err(error) => {
+            log::warn!("Job {job} decision response could not be recorded: {error}");
+        }
+    }
+    let summary = decision_summary(&execution.result);
+    let settlement = JobFinalization::Completed(FinalResult {
+        summary: Some(summary),
+        code: None,
+        goal_reached: None,
+        value: serde_json::to_value(&execution.result)
+            .ok()
+            .map(|value| serde_json::json!({ "decision": value })),
+    });
+    let final_output = match database.finalize_job(job, settlement.clone()).await {
+        Ok(final_output) => final_output,
+        Err(source) => {
+            return Err(ExecutionRuntimeError::NotSettled {
+                source,
+                observations: gap.map(Box::new),
+                settlement: Box::new(settlement),
+            });
+        }
+    };
+    let receipt = ExecutionReceipt {
+        executor,
+        input,
+        job,
+        result: final_output,
+    };
+    match gap {
+        None => Ok(receipt),
+        Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
+            receipt: Box::new(receipt),
+            source,
+        }),
+    }
+}
+
+/// Asks an Agent's assigned Decision Profile one typed question. Assistance
+/// and later prediction both enter here; a missing or unusable assignment
+/// answers `None` and does not fail the caller.
+#[allow(dead_code)] // prediction calls this; tests cover the path
+pub(crate) async fn invoke_decision_assistance(
+    database: &DatabaseHandle,
+    conversation: JobId,
+    agent: crate::persistence::ConfigId,
+    request: crate::persistence::DecisionRequest,
+) -> Result<Option<JobId>, DatabaseError> {
+    database
+        .invoke_decision_assistance(conversation, agent, request)
+        .await
+}
+
+/// A bounded human-readable line for a decision result. The typed payload is
+/// the authoritative value; this only summarises it.
+fn decision_summary(result: &crate::persistence::DecisionResult) -> String {
+    use crate::persistence::{DecisionAnswer, DecisionOutcome};
+    match &result.outcome {
+        DecisionOutcome::Answer { answer } => match answer {
+            DecisionAnswer::Choice { selected, .. } => format!("selected {selected}"),
+            DecisionAnswer::BinaryProbability { true_probability } => {
+                format!("probability {true_probability:.6}")
+            }
+            DecisionAnswer::OrdinalScore { expectation, .. } => {
+                format!("expectation {expectation:.6}")
+            }
+        },
+        DecisionOutcome::Uncertain { reason } => format!("uncertain: {reason}"),
+        DecisionOutcome::Unusable { reason } => format!("unusable: {reason}"),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod provider_seam {
     use std::collections::BTreeMap;
@@ -6227,6 +6409,267 @@ mod failure_tests {
                 .is_empty()
         );
         worker.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod decision_runtime_tests {
+    use super::*;
+    use crate::database::DatabaseWorker;
+    use crate::persistence::{
+        CapabilitySet, ChoiceOption, ConfigBody, ConfigId, ConnectionConfig, DecisionAgentConfig,
+        DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
+        ExecutionOperation, ExecutionPoolConfig, NewConfig, NewExecutionPool,
+    };
+    use crate::test_support::{data_directory, on_system, wait};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+    use std::num::NonZeroU32;
+
+    const ENDPOINT: &str = "https://decision.invalid/v1";
+
+    /// A Pool that offers decision work, a Decision Model and a Decision
+    /// Profile that selects it.
+    fn decision_fixture(handle: &DatabaseHandle) -> (ExecutorId, ConfigId, ConfigId) {
+        let pool = wait(handle.create_execution_pool(NewExecutionPool {
+            name: "decision worker".into(),
+            config: ExecutionPoolConfig {
+                concurrency_limit: NonZeroU32::new(4).expect("limit"),
+                capabilities: CapabilitySet {
+                    operations: BTreeSet::from([ExecutionOperation::Decision]),
+                    llm_protocols: BTreeSet::new(),
+                },
+            },
+            enabled: true,
+        }))
+        .expect("pool");
+        let connection = wait(handle.create_config(NewConfig {
+            name: "decision provider".into(),
+            body: ConfigBody::Connection(ConnectionConfig {
+                protocol: crate::persistence::LlmTransport::OpenAiChatCompletions,
+                endpoint: Some(ENDPOINT.into()),
+                credential_ref: None,
+            }),
+        }))
+        .expect("connection");
+        let model = wait(handle.create_config(NewConfig {
+            name: "jev".into(),
+            body: ConfigBody::DecisionModel(DecisionModelConfig {
+                connection_id: connection,
+                model: "jev-latest".into(),
+                protocol: DecisionProtocol::TypeSafeSystemOne,
+                limits: DecisionLimits::default(),
+                declared_capabilities: BTreeSet::from([DecisionCapability::Choice]),
+            }),
+        }))
+        .expect("model");
+        let agent = wait(handle.create_config(NewConfig {
+            name: "decider".into(),
+            body: ConfigBody::DecisionAgent(DecisionAgentConfig {
+                models: vec![model],
+                default_model: Some(model),
+                ..Default::default()
+            }),
+        }))
+        .expect("agent");
+        (pool.into(), model, agent)
+    }
+
+    fn request() -> crate::persistence::DecisionRequest {
+        crate::persistence::DecisionRequest {
+            schema_version: crate::persistence::DECISION_SCHEMA_VERSION,
+            state: json!({"fact": "the deadline moved"}),
+            question: crate::persistence::DecisionQuestion::Choice {
+                prompt: "Which option should be taken?".into(),
+                options: vec![
+                    ChoiceOption {
+                        id: "ship".into(),
+                        description: "Ship as planned".into(),
+                    },
+                    ChoiceOption {
+                        id: "wait".into(),
+                        description: "Wait for the next review".into(),
+                    },
+                ],
+            },
+        }
+    }
+
+    #[test]
+    fn a_decision_turn_runs_its_typed_request_and_records_the_answer() {
+        let (_root, directory) = data_directory("decision-runtime", "typed-answer");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let (_pool, model, agent) = decision_fixture(&database);
+        crate::provider_execution::scripted::install_http(
+            "https://decision.invalid/v1/systemone",
+            |_| {
+                Ok((
+                    200,
+                    serde_json::to_vec(&json!({
+                        "model": "jev-latest",
+                        "answers": {
+                            "decision": {
+                                "type": "choice",
+                                "choice": "ship",
+                                "probabilities": {"ship": 0.7, "wait": 0.3}
+                            }
+                        },
+                        "usage": {"input_tokens": 12, "output_tokens": 4}
+                    }))
+                    .expect("answer"),
+                ))
+            },
+        );
+        let (_, appended) = wait(database.submit_decision(
+            None,
+            crate::persistence::ConversationSpec {
+                name: Some("decision".into()),
+                agent: Some(agent),
+                project: None,
+                origin: crate::persistence::Origin::System,
+                keep_open: false,
+            },
+            crate::persistence::Entry::UserMessage {
+                text: "Which option should be taken?".into(),
+                attachments: Vec::new(),
+            },
+            crate::persistence::ExecutionConfiguration {
+                agent_profile: Some(agent.into()),
+                llm_profile: model.into(),
+            },
+            request(),
+            None,
+        ))
+        .expect("submit");
+        let job = appended.turn;
+        on_system(move || async move {
+            let runtime =
+                ExecutionRuntime::start(database.clone(), ClaimScope::Stored).expect("runtime");
+            ntex::time::timeout(Duration::from_secs(10), async {
+                while !database
+                    .job(job)
+                    .await
+                    .expect("read")
+                    .expect("turn")
+                    .any_terminal()
+                {
+                    ntex::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .expect("finished");
+            let details = database.job_details(job).await.expect("details");
+            let details = details.expect("details");
+            let result = details.result.expect("result");
+            let value = result.value.expect("a decision result");
+            let decision = &value["decision"];
+            assert_eq!(decision["outcome"]["answer"]["selected"], "ship");
+            assert_eq!(decision["requested_model"], "jev-latest");
+            assert_eq!(decision["schema_version"], 1);
+            runtime.shutdown().await.expect("shutdown");
+        });
+        worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn assistance_uses_the_assigned_profile_and_skips_a_missing_one() {
+        let (_root, directory) = data_directory("decision-runtime", "assistance");
+        let worker = DatabaseWorker::start(&directory).expect("database");
+        let database = worker.handle();
+        let (_pool, model, decision_agent) = decision_fixture(&database);
+        let generative = crate::test_support::execution_configuration(&database);
+        let caller = wait(database.create_config(NewConfig {
+            name: "caller".into(),
+            body: ConfigBody::Agent(crate::persistence::AgentConfig {
+                models: vec![generative.llm_profile.into()],
+                default_model: Some(generative.llm_profile.into()),
+                ..Default::default()
+            }),
+        }))
+        .expect("caller");
+        let generative = crate::persistence::ExecutionConfiguration {
+            agent_profile: Some(caller.into()),
+            llm_profile: generative.llm_profile,
+        };
+        let conversation = wait(database.open_conversation(
+            None,
+            crate::persistence::ConversationSpec {
+                name: Some("caller".into()),
+                agent: Some(caller),
+                project: None,
+                origin: crate::persistence::Origin::User,
+                keep_open: true,
+            },
+            crate::persistence::Entry::UserMessage {
+                text: "Need advice".into(),
+                attachments: Vec::new(),
+            },
+            generative,
+            None,
+        ))
+        .expect("conversation")
+        .0;
+        assert_eq!(
+            wait(invoke_decision_assistance(
+                &database,
+                conversation,
+                caller,
+                request(),
+            ))
+            .expect("missing assistance"),
+            None
+        );
+        // A generative Model is not a Decision Profile, and assigning one
+        // never starts decision work.
+        let generative_model = wait(database.config(caller)).expect("read").expect("agent");
+        let ConfigBody::Agent(mut wrong) = generative_model.body.clone() else {
+            panic!("expected an Agent");
+        };
+        wrong.decision_assistance = Some(generative.llm_profile.into());
+        assert!(
+            wait(database.update_config(
+                caller,
+                NewConfig {
+                    name: "caller".into(),
+                    body: ConfigBody::Agent(wrong),
+                },
+            ))
+            .is_err(),
+            "a generative Model cannot be decision assistance"
+        );
+        let ConfigBody::Agent(mut agent) = wait(database.config(caller))
+            .expect("read")
+            .expect("agent")
+            .body
+        else {
+            panic!("expected an Agent");
+        };
+        agent.decision_assistance = Some(decision_agent);
+        wait(database.update_config(
+            caller,
+            NewConfig {
+                name: "caller".into(),
+                body: ConfigBody::Agent(agent),
+            },
+        ))
+        .expect("assign");
+        let turn = wait(database.invoke_decision_assistance(conversation, caller, request()))
+            .expect("assistance")
+            .expect("a decision turn");
+        let work = wait(database.decision_work(turn))
+            .expect("work")
+            .expect("decision work");
+        assert_eq!(work.frozen.model_ref.id, model);
+        assert_eq!(work.frozen.agent_ref.id, decision_agent);
+        let child = wait(database.job(turn))
+            .expect("turn")
+            .expect("turn")
+            .conversation
+            .expect("conversation");
+        let child = wait(database.job(child)).expect("child").expect("child");
+        assert_eq!(child.parent_id, Some(conversation));
+        worker.shutdown().expect("shutdown");
     }
 }
 

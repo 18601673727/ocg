@@ -258,6 +258,164 @@ impl Batch {
         )?;
         Ok((conversation, appended))
     }
+    /// Creates a system conversation and its one typed decision turn. The
+    /// configuration is frozen in this transaction, exactly as an ordinary
+    /// turn's is, so an archived or edited target cannot be submitted.
+    pub(crate) fn open_decision(
+        &mut self,
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        request: crate::persistence::DecisionRequest,
+        submission: Option<NewSubmission>,
+    ) -> Result<(JobId, Appended), BatchError> {
+        if let Some(parent) = parent {
+            let parent_row = self.require_job(parent)?;
+            if !parent_row.kind.is_conversation() {
+                return self.reject(Violation::InvalidValue("parent", "expected a conversation"));
+            }
+            let (limits, parent_depth) = self.conversation_limits(parent)?;
+            let mut root = parent;
+            while let Some(ancestor) = self.require_job(root)?.parent_id {
+                root = ancestor;
+            }
+            if parent_depth.saturating_add(1) > limits.max_depth
+                || self.live_children(parent)?.len() >= 16
+                || self.live_subtree(root)?.len() >= 64
+            {
+                return self.reject(Violation::InvalidValue(
+                    "children",
+                    "live conversation limit reached",
+                ));
+            }
+        }
+        if let Some(submission) = &submission
+            && let Some(record) = self.submission(submission.key)?
+        {
+            if record.fingerprint != submission.fingerprint {
+                return self.reject(Violation::SubmissionKeyUsed {
+                    job: record.job,
+                    same_request: false,
+                });
+            }
+            let turn = self.require_job(record.job)?;
+            let Some(conversation) = turn.parent_id else {
+                return self.corrupted("submission has no conversation".into());
+            };
+            return Ok((
+                conversation,
+                Appended {
+                    turn: record.job,
+                    seq: record.seq,
+                    joined: record.seq > 1,
+                },
+            ));
+        }
+        let frozen = match self.freeze_configuration(configuration)? {
+            crate::persistence::FrozenConfiguration::Decision(frozen) => frozen,
+            crate::persistence::FrozenConfiguration::Generative(_) => {
+                return self.reject(Violation::InvalidValue(
+                    "execution",
+                    "a decision Job requires a Decision Model and Decision Profile",
+                ));
+            }
+        };
+        let work = crate::persistence::DecisionWork { frozen, request };
+        if let Err(message) = work.validate() {
+            return self.reject(Violation::InvalidValue("execution", message));
+        }
+        let conversation = self.t1_submit(
+            None,
+            JobRow {
+                id: JobId::new(0),
+                created_at: self.now,
+                parent_id: parent,
+                kind: JobKind::Conversation {
+                    agent: spec.agent,
+                    project: spec.project,
+                    origin: spec.origin,
+                    keep_open: spec.keep_open,
+                },
+            },
+        )?;
+        self.insert_conversation(conversation, &ConversationRow::default())?;
+        if let Some(parent) = parent {
+            self.step(|tx| {
+                tx.open_table(CHILD_CONVERSATIONS)?
+                    .insert((parent.get(), conversation.get()), ())?;
+                tx.open_table(LIVE_CHILDREN)?
+                    .insert((parent.get(), conversation.get()), ())?;
+                Ok(())
+            })?;
+        }
+        let appended =
+            self.append_decision(conversation, first, work, submission, Vec::new(), spec.name)?;
+        Ok((conversation, appended))
+    }
+
+    fn append_decision(
+        &mut self,
+        conversation: JobId,
+        entry: Entry,
+        work: crate::persistence::DecisionWork,
+        submission: Option<NewSubmission>,
+        dependencies: Vec<(JobId, DependencyCondition)>,
+        name: Option<String>,
+    ) -> Result<Appended, BatchError> {
+        let row = self.require_job(conversation)?;
+        if !row.kind.is_conversation() {
+            return self.reject(Violation::InvalidValue(
+                "conversation_not_found",
+                "expected a conversation",
+            ));
+        }
+        if self.conversation(conversation)?.closing.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "conversation_closed",
+                "no longer accepts messages",
+            ));
+        }
+        let spec = JobRow {
+            id: JobId::new(0),
+            created_at: self.now,
+            parent_id: Some(conversation),
+            kind: JobKind::Turn {
+                name,
+                execution: TurnExecution::Decision(work),
+                plan_source: PlanSource::Stored {
+                    previous: self.tip(conversation)?,
+                    dependencies,
+                },
+            },
+        };
+        let turn = self.t1_submit(None, spec)?;
+        let seq = self.insert_turn_input(turn, entry)?;
+        if let Some(submission) = submission {
+            let record = SubmissionRecord {
+                key: submission.key,
+                fingerprint: submission.fingerprint,
+                job: turn,
+                seq,
+                recorded_at: self.now,
+            };
+            let key = record.key;
+            self.step(|tx| {
+                tx.open_table(SUBMISSIONS)?.insert(
+                    key.as_bytes().as_slice(),
+                    encode_submission(&record).as_slice(),
+                )?;
+                Ok(())
+            })?;
+            self.probe = Some(Probe::Submission(key));
+        }
+        Ok(Appended {
+            turn,
+            seq,
+            joined: false,
+        })
+    }
+
     fn check_context_job(&mut self, consumer: &JobRow, producer: JobId) -> Result<(), BatchError> {
         let source = self.require_job(producer)?;
         let Some(parent) = source.parent_id else {

@@ -391,6 +391,11 @@ contracts! {
     }
     struct WireLlmProfile {
         pub id: String,
+        /// Which kind of Profile this is: `llm`, `agent`, `decision_model` or
+        /// `decision_agent`. Optional for clients that do not read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub profile_type: Option<String>,
         pub name: String,
         pub model: String,
         pub context_window: Option<u32>,
@@ -408,6 +413,11 @@ contracts! {
     }
     struct WireManagedAgent {
         pub id: String,
+        /// Which kind of Profile this is: `llm`, `agent`, `decision_model` or
+        /// `decision_agent`. Optional for clients that do not read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub profile_type: Option<String>,
         pub name: String,
         pub instructions: Option<String>,
         pub tool_grant: Option<String>,
@@ -416,6 +426,11 @@ contracts! {
         pub default_model: Option<String>,
         pub behavior: String,
         pub llm_targets: Vec<String>,
+        /// The Decision Profile this Agent may ask for typed advice. Absent
+        /// means none is assigned. Optional for clients that do not read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub decision_assistance: Option<String>,
         pub editable: bool,
         pub blocking_jobs: Vec<String>,
         pub more_blocking_jobs: bool,
@@ -433,6 +448,16 @@ contracts! {
     struct WireProfiles {
         pub llm_profiles: Vec<WireLlmProfile>,
         pub agent_profiles: Vec<WireManagedAgent>,
+        /// The Decision Model Profiles on this page, when any. Optional for
+        /// clients that do not read them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub decision_profiles: Option<Vec<WireDecisionProfile>>,
+        /// The Decision Profiles on this page, when any. Optional for
+        /// clients that do not read them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub decision_agent_profiles: Option<Vec<WireDecisionAgentProfile>>,
         /// Enabled executor capabilities on this page. Collect all pages
         /// and join these with each Model's protocol for compatibility.
         pub executor_protocols: Vec<WireProfileExecutor>,
@@ -475,6 +500,11 @@ contracts! {
         pub name: String,
         pub concurrency_limit: u32,
         pub enabled: bool,
+        /// The operations this Pool offers: `llm_request` and `decision`.
+        /// Optional for clients that do not read it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        pub operations: Option<Vec<String>>,
     }
     struct WirePools {
         pub pools: Vec<WirePool>,
@@ -730,6 +760,73 @@ contracts! {
     }
     struct WireAdmissionResponse {
         pub admission: WireAdmission,
+    }
+    struct WireDecisionChoiceOption {
+        pub id: String,
+        pub description: String,
+    }
+    struct WireDecisionScoreLevel {
+        pub value: i32,
+        pub description: String,
+    }
+    /// The typed decision a client submits. Its variants are the wire shape
+    /// of the request, not a value this API constructs.
+    #[allow(dead_code)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum WireDecisionQuestion {
+        Choice {
+            prompt: String,
+            options: Vec<WireDecisionChoiceOption>,
+        },
+        BinaryProbability {
+            prompt: String,
+        },
+        OrdinalScore {
+            prompt: String,
+            levels: Vec<WireDecisionScoreLevel>,
+        },
+    }
+    /// The typed decision a client submits. `schema_version` is the decision
+    /// schema the request is written in; a client that omits it submits the
+    /// current one.
+    struct WireDecisionRequest {
+        pub schema_version: u32,
+        pub state: Value,
+        pub question: WireDecisionQuestion,
+    }
+    struct WireDecisionLimits {
+        pub max_input_tokens_per_request: Option<u32>,
+        pub max_output_tokens_per_request: Option<u32>,
+        pub max_input_tokens_per_question: Option<u32>,
+        pub max_output_tokens_per_question: Option<u32>,
+    }
+    /// A Decision Model Profile: a typed model reached over a decision
+    /// protocol, never over a generative transport.
+    struct WireDecisionProfile {
+        pub id: String,
+        pub name: String,
+        pub model: String,
+        pub protocol: String,
+        pub endpoint: Option<String>,
+        pub credential_ref: Option<String>,
+        pub has_credential: bool,
+        pub declared_capabilities: Vec<String>,
+        pub limits: WireDecisionLimits,
+        pub editable: bool,
+        pub created_at_us: i64,
+        pub updated_at_us: i64,
+    }
+    /// A Decision Profile: an Agent whose models are Decision Models.
+    struct WireDecisionAgentProfile {
+        pub id: String,
+        pub name: String,
+        pub instructions: Option<String>,
+        pub models: Vec<String>,
+        pub default_model: Option<String>,
+        pub workspace_access: String,
+        pub editable: bool,
+        pub created_at_us: i64,
+        pub updated_at_us: i64,
     }
     struct WireProviderRequest {
         pub job: String,

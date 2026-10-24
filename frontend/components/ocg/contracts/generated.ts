@@ -88,13 +88,38 @@ export type WireAgentProfile = { id: string, name: string, tool_grant: string | 
 
 export type WireAgentProfiles = { agent_profiles: Array<WireAgentProfile>, has_more: boolean, next_before: string | null, };
 
-export type WireLlmProfile = { id: string, name: string, model: string, context_window: number | null, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, parameters: WireLlmParameters, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
+export type WireLlmProfile = { id: string,
+/**
+ * Which kind of Profile this is: `llm`, `agent`, `decision_model` or
+ * `decision_agent`. Optional for clients that do not read it.
+ */
+profile_type?: string, name: string, model: string, context_window: number | null, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, parameters: WireLlmParameters, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
 
-export type WireManagedAgent = { id: string, name: string, instructions: string | null, tool_grant: string | null, approve: Array<string>, dispatch_to: Array<string>, default_model: string | null, behavior: string, llm_targets: Array<string>, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
+export type WireManagedAgent = { id: string,
+/**
+ * Which kind of Profile this is: `llm`, `agent`, `decision_model` or
+ * `decision_agent`. Optional for clients that do not read it.
+ */
+profile_type?: string, name: string, instructions: string | null, tool_grant: string | null, approve: Array<string>, dispatch_to: Array<string>, default_model: string | null, behavior: string, llm_targets: Array<string>,
+/**
+ * The Decision Profile this Agent may ask for typed advice. Absent
+ * means none is assigned. Optional for clients that do not read it.
+ */
+decision_assistance?: string, editable: boolean, blocking_jobs: Array<string>, more_blocking_jobs: boolean, created_at_us: number, updated_at_us: number, };
 
 export type WireProvider = { protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, profile_ids: Array<string>, models: Array<string>, };
 
 export type WireProfiles = { llm_profiles: Array<WireLlmProfile>, agent_profiles: Array<WireManagedAgent>,
+/**
+ * The Decision Model Profiles on this page, when any. Optional for
+ * clients that do not read them.
+ */
+decision_profiles?: Array<WireDecisionProfile>,
+/**
+ * The Decision Profiles on this page, when any. Optional for
+ * clients that do not read them.
+ */
+decision_agent_profiles?: Array<WireDecisionAgentProfile>,
 /**
  * Enabled executor capabilities on this page. Collect all pages
  * and join these with each Model's protocol for compatibility.
@@ -116,7 +141,12 @@ export type WireProjects = { projects: Array<WireProject>, has_more: boolean, ne
 
 export type WireProjectAnswer = { project: WireProject, };
 
-export type WirePool = { id: string, name: string, concurrency_limit: number, enabled: boolean, };
+export type WirePool = { id: string, name: string, concurrency_limit: number, enabled: boolean,
+/**
+ * The operations this Pool offers: `llm_request` and `decision`.
+ * Optional for clients that do not read it.
+ */
+operations?: Array<string>, };
 
 export type WirePools = { pools: Array<WirePool>, };
 
@@ -207,6 +237,20 @@ export type WireCards = { conversation: string, cards: Array<WireCard>, };
 export type WireAdmission = { "status": "admitted", job: string, conversation: string | null, seq: number, joined: boolean, model: string, kept: boolean, } | { "status": "pending", job: string | null, } | { "status": "uncertain", job: string | null, } | { "status": "not_found", job: string | null, };
 
 export type WireAdmissionResponse = { admission: WireAdmission, };
+
+export type WireDecisionChoiceOption = { id: string, description: string, };
+
+export type WireDecisionScoreLevel = { value: number, description: string, };
+
+export type WireDecisionQuestion = { "kind": "choice", prompt: string, options: Array<WireDecisionChoiceOption>, } | { "kind": "binary_probability", prompt: string, } | { "kind": "ordinal_score", prompt: string, levels: Array<WireDecisionScoreLevel>, };
+
+export type WireDecisionRequest = { schema_version: number, state: JsonValue, question: WireDecisionQuestion, };
+
+export type WireDecisionLimits = { max_input_tokens_per_request: number | null, max_output_tokens_per_request: number | null, max_input_tokens_per_question: number | null, max_output_tokens_per_question: number | null, };
+
+export type WireDecisionProfile = { id: string, name: string, model: string, protocol: string, endpoint: string | null, credential_ref: string | null, has_credential: boolean, declared_capabilities: Array<string>, limits: WireDecisionLimits, editable: boolean, created_at_us: number, updated_at_us: number, };
+
+export type WireDecisionAgentProfile = { id: string, name: string, instructions: string | null, models: Array<string>, default_model: string | null, workspace_access: string, editable: boolean, created_at_us: number, updated_at_us: number, };
 
 export type WireProviderRequest = { job: string, request: number, messages: Array<JsonValue>, tools: JsonValue | null, parameters: JsonValue, dropped_turns: number, response: JsonValue | null, };
 

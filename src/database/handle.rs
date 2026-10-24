@@ -826,6 +826,17 @@ impl DatabaseHandle {
             .await
     }
 
+    /// The typed work of a decision turn, or `None` for every other Job. A
+    /// caller that receives `Some` must run the decision runtime, not the
+    /// generative one.
+    pub async fn decision_work(
+        &self,
+        job: JobId,
+    ) -> Result<Option<persistence::DecisionWork>, DatabaseError> {
+        self.read(move |database| storage::read_decision_work(database, job))
+            .await
+    }
+
     /// The Executors that support the transport of an LLM Profile's Provider
     /// as configured now, oldest first, at most 1,000. This lists candidates
     /// for new work only; it neither ranks nor reserves them, and running on
@@ -836,6 +847,13 @@ impl DatabaseHandle {
     ) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(move |database| storage::read_compatible_executors(database, llm_profile))
             .await
+    }
+
+    /// The Executors that offer typed decision work, oldest first, at most
+    /// 1,000. These are the candidates for new decision Jobs; running on any
+    /// of them never changes the Decision Model or its request.
+    pub async fn decision_executors(&self) -> Result<Vec<ExecutorId>, DatabaseError> {
+        self.read(storage::read_decision_executors).await
     }
 
     /// The Executors that support the transport of the LLM configuration a
@@ -1294,6 +1312,114 @@ impl DatabaseHandle {
             configuration,
             submission,
             format,
+            reply,
+        })
+        .await
+    }
+    /// Asks `agent`'s assigned Decision Profile one typed question, as an
+    /// ordinary system child of `conversation`. Assistance and later
+    /// prediction both enter here: the Profile is a reference, never a copy,
+    /// and a missing or unusable assignment answers `None` without failing
+    /// the caller. The returned Job is the decision turn.
+    #[allow(dead_code)] // called from tests; prediction uses the runtime wrapper
+    pub(crate) async fn invoke_decision_assistance(
+        &self,
+        conversation: JobId,
+        agent: ConfigId,
+        request: persistence::DecisionRequest,
+    ) -> Result<Option<JobId>, DatabaseError> {
+        let Some(agent_record) = self.config(agent).await? else {
+            return Ok(None);
+        };
+        let persistence::ConfigBody::Agent(agent_body) = agent_record.body else {
+            return Ok(None);
+        };
+        let Some(decision_agent) = agent_body.decision_assistance else {
+            return Ok(None);
+        };
+        let Some(decision_record) = self.config(decision_agent).await? else {
+            return Ok(None);
+        };
+        if decision_record.archived_at.is_some() {
+            return Ok(None);
+        }
+        let persistence::ConfigBody::DecisionAgent(decision) = decision_record.body else {
+            return Ok(None);
+        };
+        // Advice is read-only. A Profile that claims workspace access has no
+        // reader yet, so it is not asked rather than granted one.
+        if decision.workspace_access != persistence::WorkspaceAccess::None {
+            return Ok(None);
+        }
+        let Some(model) = decision
+            .default_model
+            .or_else(|| decision.models.first().copied())
+        else {
+            return Ok(None);
+        };
+        if !decision.models.contains(&model) {
+            return Ok(None);
+        }
+        let Some(model_record) = self.config(model).await? else {
+            return Ok(None);
+        };
+        if model_record.archived_at.is_some() {
+            return Ok(None);
+        }
+        let persistence::ConfigBody::DecisionModel(model_body) = model_record.body else {
+            return Ok(None);
+        };
+        if request.validate(&model_body.declared_capabilities).is_err() {
+            return Ok(None);
+        }
+        let prompt = match &request.question {
+            persistence::DecisionQuestion::Choice { prompt, .. }
+            | persistence::DecisionQuestion::BinaryProbability { prompt }
+            | persistence::DecisionQuestion::OrdinalScore { prompt, .. } => prompt.clone(),
+        };
+        let (_, appended) = self
+            .submit_decision(
+                Some(conversation),
+                persistence::ConversationSpec {
+                    name: Some("decision assistance".into()),
+                    agent: Some(decision_agent),
+                    project: None,
+                    origin: persistence::Origin::System,
+                    keep_open: false,
+                },
+                persistence::Entry::UserMessage {
+                    text: prompt,
+                    attachments: Vec::new(),
+                },
+                persistence::ExecutionConfiguration {
+                    agent_profile: Some(decision_agent.into()),
+                    llm_profile: model.into(),
+                },
+                request,
+                None,
+            )
+            .await?;
+        Ok(Some(appended.turn))
+    }
+
+    /// Opens a system conversation with one typed decision turn and freezes
+    /// its Decision Model and Profile in the same transaction.
+    pub(crate) async fn submit_decision(
+        &self,
+        parent: Option<JobId>,
+        spec: ConversationSpec,
+        first: Entry,
+        configuration: ExecutionConfiguration,
+        request: persistence::DecisionRequest,
+        submission: Option<NewSubmission>,
+    ) -> Result<(JobId, Appended), DatabaseError> {
+        self.submit(|reply| Command::SubmitDecision {
+            parent,
+            spec,
+            first,
+            configuration,
+            request,
+            submission,
             reply,
         })
         .await

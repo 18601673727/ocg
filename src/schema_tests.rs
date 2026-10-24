@@ -12871,7 +12871,7 @@ mod requests_and_tool_loop {
             };
             assert_eq!(
                 listed(),
-                json!({"id": id, "name": "pooled", "concurrency_limit": 1, "enabled": true})
+                json!({"id": id, "name": "pooled", "concurrency_limit": 1, "enabled": true, "operations": ["llm_request"]})
             );
             let path = format!("/api/v1/pools/{id}");
             assert_eq!(

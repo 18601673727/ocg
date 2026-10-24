@@ -38,6 +38,13 @@ pub(super) fn execution_requirement(execution: &FrozenExecutionConfig) -> u16 {
         Some(execution.llm.provider.transport),
     )
 }
+
+/// What a Pool must offer to run one decision Job. The native protocol is
+/// chosen from the frozen Decision Model; a Pool that offers `Decision` can
+/// run any typed protocol its executor adapter implements.
+pub(super) fn decision_requirement() -> u16 {
+    requirement(Some(ExecutionOperation::Decision), None)
+}
 /// A Pool as the claim batch sees it.
 struct OpenPool {
     id: ConfigId,
@@ -163,17 +170,24 @@ impl Batch {
     /// All T1 refusals occur before allocating or writing any rows. Event
     /// appends can keep their source transaction and fall back to a notice.
     pub(crate) fn validate_spec(&mut self, spec: &JobRow) -> Result<(), BatchError> {
-        if matches!(
-            spec.kind,
-            JobKind::Turn {
-                execution: TurnExecution::Decision(_),
-                ..
+        if let JobKind::Turn {
+            execution: TurnExecution::Decision(work),
+            ..
+        } = &spec.kind
+        {
+            if let Err(message) = work.validate() {
+                return self.reject(Violation::InvalidValue("execution", message));
             }
-        ) {
-            return self.reject(Violation::InvalidValue(
-                "execution",
-                "decision work requires the typed decision runtime",
-            ));
+            if !self
+                .open_pools()?
+                .iter()
+                .any(|pool| pool.has_room() && pool.offers(decision_requirement()))
+            {
+                return self.reject(Violation::InvalidValue(
+                    "execution",
+                    "no enabled Executor offers decision work",
+                ));
+            }
         }
         self.check_spec_references(spec)?;
         for (dependency, _) in spec.kind.dependencies() {
@@ -294,7 +308,18 @@ impl Batch {
                     ));
                 }
                 if let Some(agent) = agent {
-                    self.require_config_kind(*agent, ConfigKind::Agent)?;
+                    // A conversation is held by an Agent Profile, or by a
+                    // Decision Profile when it carries typed decision work.
+                    let row = self.require_config(*agent)?;
+                    if row.archived_at.is_some()
+                        || !matches!(row.kind, ConfigKind::Agent | ConfigKind::DecisionAgent)
+                    {
+                        return self.reject(Violation::WrongConfigKind {
+                            config: *agent,
+                            expected: ConfigKind::Agent,
+                            found: row.kind,
+                        });
+                    }
                 }
                 if let Some(project) = project {
                     self.require_project(*project)?;
@@ -320,6 +345,31 @@ impl Batch {
                             "reference must name a Frozen owner in this conversation",
                         ));
                     }
+                }
+                if let JobKind::Turn {
+                    execution: TurnExecution::Decision(work),
+                    ..
+                } = &spec.kind
+                {
+                    // A decision turn names a Decision Model and a Decision
+                    // Profile, never a generative Model.
+                    let agent = self
+                        .require_config_kind(work.frozen.agent_ref.id, ConfigKind::DecisionAgent)?;
+                    let ConfigBody::DecisionAgent(agent) = agent.body else {
+                        return self.corrupted("mismatched decision agent".into());
+                    };
+                    if spec.kind.is_stored() && !agent.models.contains(&work.frozen.model_ref.id) {
+                        return self.reject(Violation::NotAConfiguredTarget {
+                            agent_profile: work.frozen.agent_ref.id.into(),
+                            llm_profile: work.frozen.model_ref.id.into(),
+                        });
+                    }
+                    self.require_config_kind(work.frozen.model_ref.id, ConfigKind::DecisionModel)?;
+                    self.require_config_kind(
+                        work.frozen.connection_ref.id,
+                        ConfigKind::Connection,
+                    )?;
+                    return Ok(());
                 }
                 let (execution, _, agent) = self.turn_execution(spec)?;
                 if spec.kind.is_stored() && execution.agent_ref.map(|agent| agent.id) != agent {
@@ -458,11 +508,24 @@ impl Batch {
 
     // ---- placement (8.10) ---------------------------------------------------------
 
+    /// What a Job's ready row requires. A decision turn names its typed
+    /// operation; every other turn derives its requirement from the frozen
+    /// generative transport.
+    fn execution_key(&mut self, row: &JobRow) -> Result<u16, BatchError> {
+        match &row.kind {
+            JobKind::Turn {
+                execution: TurnExecution::Decision(_),
+                ..
+            } => Ok(decision_requirement()),
+            _ => Ok(execution_requirement(&self.turn_execution(row)?.0)),
+        }
+    }
+
     /// PLACE: a pending Job with no open dependency becomes `ready`, or
     /// `delayed` until its `eligible_at`.
     pub(crate) fn place(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
-        let requirement = execution_requirement(&self.turn_execution(&row)?.0);
+        let requirement = self.execution_key(&row)?;
         if self.is_held(&row)?
             || (row.kind.is_stored()
                 && row.parent_id.is_some()
@@ -502,7 +565,7 @@ impl Batch {
         })?;
         for (eligible_at, job) in due {
             let row = self.require_job(JobId::new(job))?;
-            let requirement = execution_requirement(&self.turn_execution(&row)?.0);
+            let requirement = self.execution_key(&row)?;
             self.touched_ready_or_delayed = true;
             self.step(|tx| {
                 tx.open_table(DELAYED)?.remove((eligible_at, job))?;
@@ -688,7 +751,7 @@ impl Batch {
             return Ok(Err(ClaimRefusal::EmptyAllowedPools));
         }
         self.promote()?;
-        let requirement_key = execution_requirement(&self.turn_execution(&row)?.0);
+        let requirement_key = self.execution_key(&row)?;
         let (ready, delayed) = self.step(|tx| {
             let ready = tx
                 .open_table(READY)?
@@ -1294,7 +1357,7 @@ impl Batch {
     /// readiness table.
     pub(crate) fn cancel_pending_writes(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
-        let requirement_key = execution_requirement(&self.turn_execution(&row)?.0);
+        let requirement_key = self.execution_key(&row)?;
         self.step(|tx| {
             tx.open_table(PENDING)?.remove(job.get())?;
             tx.open_table(READY)?.remove((requirement_key, job.get()))?;
