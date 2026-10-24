@@ -48,6 +48,17 @@ export type WireConversations = { conversations: Array<WireConversation>, has_mo
 
 export type WireConversationLimits = { conversation: string, depth: number, remaining_depth: number, max_depth: number, max_auto_turns: number, max_iterations: number, };
 
+export type WireContextStatus = { conversation: string,
+/**
+ * `disabled`, a preset name, `custom`, or `inherited` when no
+ * conversation override is stored.
+ */
+mode: string, summarizer: string | null, predictive: boolean, predictive_unavailable: string | null, revision: number,
+/**
+ * Preset numbers are a proposal, not a calibrated default.
+ */
+uncalibrated: boolean, };
+
 export type WireRecurrence = { interval_s: number, phase: string, due_us: number | null, };
 
 export type WireChild = { id: string, origin?: string, title: string, agent: string | null, state: string, on_hold: WireHold | null, keep_open: boolean, recurrence: WireRecurrence | null, };
@@ -279,6 +290,8 @@ export type WireAppend = { conversation: string, turn: string, seq: number, join
 export type WireStop = { conversation: string, status: string, record_seq: number | null, };
 
 export type WireConversationEdited = { conversation: string, };
+
+export type WireCompaction = { conversation: string, status: string, job: string | null, system_conversation: string | null, through: string | null, subsequent: boolean, reason: string | null, };
 
 export type WireApprovalDecision = { approval: [string, number, number], decision: string, turn: string, seq: number, joined: boolean, };
 

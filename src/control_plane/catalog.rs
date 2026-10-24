@@ -851,6 +851,55 @@ pub(super) async fn conversation_limits(
     })))
 }
 
+/// `GET /api/v1/conversations/{id}/context`. Reports the stored override and
+/// why prediction is unavailable. It does not estimate a percentage.
+pub(super) async fn conversation_context(
+    database: &DatabaseHandle,
+    conversation: JobId,
+) -> Result<Reply, Refusal> {
+    let Some((policy, revision)) = database
+        .conversation_compaction_policy(conversation)
+        .await?
+    else {
+        return Err(NOT_FOUND);
+    };
+    let (mode, summarizer, predictive) = match policy {
+        None => ("inherited".to_owned(), None, false),
+        Some(policy) => {
+            let mode = match policy.mode {
+                crate::persistence::CompactionMode::Off => "disabled".to_owned(),
+                crate::persistence::CompactionMode::Auto { preset } => match preset {
+                    crate::persistence::CompactionPreset::Conservative => "conservative".to_owned(),
+                    crate::persistence::CompactionPreset::Balanced => "balanced".to_owned(),
+                    crate::persistence::CompactionPreset::Aggressive => "aggressive".to_owned(),
+                },
+                crate::persistence::CompactionMode::Custom { .. } => "custom".to_owned(),
+            };
+            (
+                mode,
+                policy
+                    .summarization_model
+                    .map(|model| crate::persistence::ProfileId::from(model).to_string()),
+                policy.predictive.is_some(),
+            )
+        }
+    };
+    let predictive_unavailable = if predictive {
+        None
+    } else {
+        Some("prediction requires an explicit conversation opt-in".to_owned())
+    };
+    Ok(Reply::ok(envelope(WireContextStatus {
+        conversation: conversation.to_string(),
+        mode,
+        summarizer,
+        predictive,
+        predictive_unavailable,
+        revision,
+        uncalibrated: true,
+    })))
+}
+
 /// `POST /api/v1/conversations/{job}`: renames the conversation whose root
 /// is `root`, hides it for good, or updates its limits. No Job spec changes.
 pub(super) async fn edit_conversation(

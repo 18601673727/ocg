@@ -40,6 +40,7 @@ pub(super) enum Route {
         limit: usize,
     },
     ConversationLimits(JobId),
+    ConversationContext(JobId),
     ConversationNotices {
         conversation: JobId,
         after: u32,
@@ -138,6 +139,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ConversationChildren { .. }
             | Route::ConversationTurns { .. }
             | Route::ConversationLimits(_)
+            | Route::ConversationContext(_)
             | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
             | Route::ProviderResponses { .. }
@@ -337,6 +339,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 limit,
             })
         }
+        ["conversations", conversation, "context"] => {
+            no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationContext))
+        }
         ["conversations", conversation, "limits"] => {
             no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationLimits))
         }
@@ -492,6 +497,9 @@ pub(super) async fn respond(
         } => catalog::conversation_children(database, conversation, before, limit).await,
         Route::ConversationLimits(conversation) => {
             catalog::conversation_limits(database, conversation).await
+        }
+        Route::ConversationContext(conversation) => {
+            catalog::conversation_context(database, conversation).await
         }
         Route::ConversationTurns {
             conversation,

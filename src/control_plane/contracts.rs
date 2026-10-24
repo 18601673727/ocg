@@ -220,6 +220,18 @@ contracts! {
         pub max_auto_turns: u8,
         pub max_iterations: u32,
     }
+    struct WireContextStatus {
+        pub conversation: String,
+        /// `disabled`, a preset name, `custom`, or `inherited` when no
+        /// conversation override is stored.
+        pub mode: String,
+        pub summarizer: Option<String>,
+        pub predictive: bool,
+        pub predictive_unavailable: Option<String>,
+        pub revision: u64,
+        /// Preset numbers are a proposal, not a calibrated default.
+        pub uncalibrated: bool,
+    }
     struct WireRecurrence {
         pub interval_s: u32,
         pub phase: String,
