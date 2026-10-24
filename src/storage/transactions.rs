@@ -14,7 +14,7 @@ use crate::persistence::{
     DependencyState, ExecutionConfiguration, FrozenConfiguration, FrozenDecisionConfig,
     FrozenPoolBinding, GLOBAL_EXECUTION_LIMIT, LlmConfig, OutcomeCause, OutcomeKind, OutcomeRecord,
     PoolConfig, Recorded, RequestFingerprint, SubmissionKey, SubmissionRecord, ToolCallRef,
-    ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
+    ToolDecision, ToolEvidenceRecord, ToolOutcome, TurnExecution, Violation,
 };
 
 /// The key of a Job in `ready`: what a Pool must offer to run it. The high
@@ -662,6 +662,13 @@ impl Batch {
             let Some((key, job)) = candidate else {
                 break;
             };
+            // Policy is resolved before a slot is reserved. A turn that still
+            // needs preparation stays pending; reserving its pool room first
+            // would leave that room held with no grant.
+            if self.prepare_if_needed(JobId::new(job))? {
+                deferred.insert(job);
+                continue;
+            }
             let Some(index) = pools
                 .iter()
                 .enumerate()
@@ -676,13 +683,6 @@ impl Batch {
                 pool.held += 1;
                 (pool.id, pool.edit_seq, pool.body.capabilities.clone())
             };
-            // Policy is resolved before a slot is taken. A turn that still
-            // needs preparation stays pending; claiming it would hold a slot
-            // while the summary is produced.
-            if self.prepare_if_needed(JobId::new(job))? {
-                deferred.insert(job);
-                continue;
-            }
             self.write_claim(JobId::new(job), key, pool, edit_seq, capabilities)?;
             grants.push(JobId::new(job));
             free -= 1;
@@ -708,19 +708,30 @@ impl Batch {
         if row.kind.name() == Some(crate::persistence::COMPACTION_JOB_NAME) {
             return Ok(false);
         }
+        // A decision turn has no generative config. Policy resolution uses
+        // that config, so this check must not send decision work through it.
+        if matches!(
+            row.kind,
+            JobKind::Turn {
+                execution: TurnExecution::Decision(_),
+                ..
+            }
+        ) {
+            return Ok(false);
+        }
         let Some(conversation) = row.parent_id else {
             return Ok(false);
         };
         let stored = self.conversation(conversation)?.compaction_policy;
-        let agent = self
-            .turn_execution(&row)
-            .ok()
-            .and_then(|(_, _, agent)| agent)
-            .and_then(|agent| self.config(agent).ok().flatten())
-            .and_then(|record| match record.body {
-                ConfigBody::Agent(agent) => agent.compaction_policy,
-                _ => None,
-            });
+        let (_, _, agent_id) = self.turn_execution(&row)?;
+        let agent = match agent_id {
+            Some(agent) => match self.config(agent)?.map(|record| record.body) {
+                Some(ConfigBody::Agent(agent)) => agent.compaction_policy,
+                Some(_) => None,
+                None => None,
+            },
+            None => None,
+        };
         let policy = crate::persistence::CompactionPolicy::resolve(
             crate::persistence::CompactionPolicy::default(),
             agent,
