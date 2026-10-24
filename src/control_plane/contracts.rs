@@ -904,6 +904,15 @@ contracts! {
     struct WireConversationEdited {
         pub conversation: String,
     }
+    struct WireCompaction {
+        pub conversation: String,
+        pub status: String,
+        pub job: Option<String>,
+        pub system_conversation: Option<String>,
+        pub through: Option<String>,
+        pub subsequent: bool,
+        pub reason: Option<String>,
+    }
     struct WireApprovalDecision {
         pub approval: (String, u32, u32),
         pub decision: String,

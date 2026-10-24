@@ -3028,9 +3028,18 @@ async fn run_started_provider_job(
             return refused(ExecutionRuntimeError::WorkspaceGrantUnsupported.to_string()).await;
         }
     }
-    let decider =
-        job_record.kind.is_stored() && database.has_decider(job_record.conversation).await?;
-    let dispatch = job_record.kind.is_stored()
+    // A compaction child summarizes. It never runs tools or workspace work,
+    // even when the selected model declares those capabilities.
+    let summarizing = job_record.kind.name() == Some(crate::persistence::COMPACTION_JOB_NAME);
+    if summarizing {
+        plan.tools = None;
+        plan.workspace_tools = None;
+    }
+    let decider = !summarizing
+        && job_record.kind.is_stored()
+        && database.has_decider(job_record.conversation).await?;
+    let dispatch = !summarizing
+        && job_record.kind.is_stored()
         && configuration
             .frozen
             .agent

@@ -210,6 +210,14 @@ pub(super) enum Command {
         edit: ConversationEdit,
         reply: Reply<()>,
     },
+    /// Requests one manual compaction. The key deduplicates it; the model
+    /// must be generative. A source that will not fit is refused.
+    RequestCompaction {
+        conversation: JobId,
+        model: ConfigId,
+        submission: NewSubmission,
+        reply: Reply<crate::persistence::CompactionRequest>,
+    },
     CreateConfig {
         config: NewConfig,
         reply: Reply<ConfigId>,
@@ -593,6 +601,14 @@ impl Command {
                 reply,
                 |batch| persistence::set_conversation(batch, root, edit),
             ),
+            Self::RequestCompaction {
+                conversation,
+                model,
+                submission,
+                reply,
+            } => run(database, operation, commit, Kind::Open, reply, |batch| {
+                batch.request_compaction(conversation, model, submission)
+            }),
             Self::CreateConfig { config, reply } => run(
                 database,
                 operation,
@@ -836,6 +852,9 @@ impl Command {
                 ConversationEdit::Hide | ConversationEdit::Limits(_) => 16,
                 ConversationEdit::CompactionPolicy(_) => 128,
             },
+            // The sealed source is already stored. This records one system
+            // child and a short instruction, not a second copy of the source.
+            Self::RequestCompaction { .. } => 4096,
             Self::ArchiveModel { .. } => 16,
             Self::ImportModels {
                 connection, models, ..
@@ -956,6 +975,7 @@ impl Command {
             Self::CreateProject { reply, .. } => refuse(reply, error),
             Self::UpdateProject { reply, .. } => refuse(reply, error),
             Self::SetConversation { reply, .. } => refuse(reply, error),
+            Self::RequestCompaction { reply, .. } => refuse(reply, error),
             Self::CreateConfig { reply, .. } => refuse(reply, error),
             Self::UpdateConfig { reply, .. } => refuse(reply, error),
             Self::ImportModels { reply, .. } => refuse(reply, error),

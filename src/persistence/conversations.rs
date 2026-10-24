@@ -190,6 +190,34 @@ impl ContextSourceManifest {
     }
 }
 
+/// What a manual compaction request did. A repeated key returns the same
+/// outcome. No eligible source is a no-op, not a failure; a source that
+/// cannot fit the summarizer is an explicit refusal, never a truncated job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactionRequest {
+    /// Ordinary system summarization work was created, or the same key
+    /// already created it. `subsequent` means a turn is still active, so
+    /// this artifact is for a later execution.
+    Prepared {
+        job: JobId,
+        conversation: JobId,
+        through: JobId,
+        subsequent: bool,
+        already: bool,
+    },
+    /// Nothing to summarize: no settled prefix, or the prefix is already
+    /// covered and would not shrink.
+    Noop { reason: &'static str },
+}
+
+/// The name of a manual or automatic summarization child. It is ordinary
+/// system work, not the title helper.
+pub const COMPACTION_JOB_NAME: &str = "Compact conversation context";
+
+/// Tokens reserved for the summary itself. The source must fit beside this
+/// in the summarizer's own window; it is never truncated to make room.
+pub const SUMMARIZER_OUTPUT_RESERVE: u32 = 4096;
+
 /// Stored once in the producing Job's FinalResult.value. The result's Job ID
 /// is the artifact identity; the consuming turn/input sequence is its use identity.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

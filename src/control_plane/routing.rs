@@ -101,6 +101,7 @@ pub(super) enum Route {
     ReleaseSlot(JobId),
     ConversationCards(JobId),
     ConversationAction(JobId, &'static str),
+    ConversationCompact(JobId),
     AttachmentUpload,
     Attachment(AttachmentId),
     AttachmentContent(AttachmentId),
@@ -164,6 +165,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ReleaseSlot(_)
             | Route::ConversationCards(_)
             | Route::ConversationAction(..)
+            | Route::ConversationCompact(_)
             | Route::AttachmentUpload
             | Route::Attachment(_)
             | Route::AttachmentContent(_)
@@ -199,6 +201,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                     index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
                 };
                 no_query(query).map(|()| Route::DecideApproval(approval))
+            }
+            ["conversations", conversation, "compact"] => {
+                no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationCompact))
             }
             ["conversations", conversation, action]
                 if matches!(*action, "stop" | "close" | "hold" | "unhold" | "retry") =>
@@ -604,6 +609,11 @@ pub(super) async fn respond(
             submissions::release_slot(database, job, &body).await
         }
         Route::ConversationCards(conversation) => submissions::cards(shared, conversation).await,
+        Route::ConversationCompact(conversation) => {
+            let key = submissions::idempotency_key(request.headers())?;
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            submissions::compact(shared, conversation, key, &body).await
+        }
         Route::ConversationAction(conversation, action) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             submissions::action(shared, conversation, action, &body).await

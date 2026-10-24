@@ -12,7 +12,7 @@ fn member(rest: &str, collection: &str) -> bool {
 
 fn conversation_action(rest: &str) -> bool {
     let mut segments = rest.split('/');
-    matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry"), None) if !id.is_empty())
+    matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry" | "compact"), None) if !id.is_empty())
 }
 
 fn approval_or_release(rest: &str) -> bool {

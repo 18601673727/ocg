@@ -14,12 +14,13 @@ mod availability;
 mod conversations;
 pub(crate) use conversations::parse_suggested_title;
 pub use conversations::{
-    Actor, Appended, CompactionMode, CompactionPolicy, CompactionPreset, ContextSourceManifest,
-    ConversationAction, ConversationLimits, ConversationSpec, CustomPolicy, Entry, EntryKind,
-    JobKind, MAX_CONVERSATION_DEPTH, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin,
-    PlanSource, PredictiveCompaction, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
-    ResponseFormat, SourceBoundary, StopCause, StopProof, SummarizationResult, TITLE_JOB_NAME,
-    TurnEntry, TurnExecution, title_prompt,
+    Actor, Appended, COMPACTION_JOB_NAME, CompactionMode, CompactionPolicy, CompactionPreset,
+    CompactionRequest, ContextSourceManifest, ConversationAction, ConversationLimits,
+    ConversationSpec, CustomPolicy, Entry, EntryKind, JobKind, MAX_CONVERSATION_DEPTH, Notice,
+    NoticeBody, NoticeClass, NoticeEvent, Origin, PlanSource, PredictiveCompaction, RecordEvent,
+    Recurrence, RecurrenceHalt, RecurrencePhase, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE,
+    SourceBoundary, StopCause, StopProof, SummarizationResult, TITLE_JOB_NAME, TurnEntry,
+    TurnExecution, title_prompt,
 };
 mod execution;
 mod identity;

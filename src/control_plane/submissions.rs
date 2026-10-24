@@ -51,9 +51,9 @@ use crate::orchestration::execution_runtime::{
 };
 use crate::persistence::ResponseFormat;
 use crate::persistence::{
-    AttachmentId, AttachmentOrigin, ConfigBody, ConfigRecord, ExecutionConfiguration, ExecutorId,
-    JobId, ModelCapability, NewSubmission, ProfileId, ProjectId, RequestFingerprint, SubmissionKey,
-    SubmissionRecord, Violation,
+    AttachmentId, AttachmentOrigin, ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration,
+    ExecutorId, JobId, ModelCapability, NewSubmission, ProfileId, ProjectId, RequestFingerprint,
+    SubmissionKey, SubmissionRecord, Violation,
 };
 
 /// The request header that names a submission.
@@ -1575,6 +1575,70 @@ async fn normalize(database: &DatabaseHandle, request: &mut JobRequest) -> Resul
         request.llm_profile = agent.default_model.ok_or(INVALID_BODY)?.into();
     }
     Ok(())
+}
+
+/// `POST /api/v1/conversations/{id}/compact`. The body names the generative
+/// model. A repeated idempotency key returns the same preparation. A source
+/// that will not fit is an explicit refusal, not a truncated job.
+pub(super) async fn compact(
+    shared: &Shared,
+    conversation: JobId,
+    key: SubmissionKey,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
+    let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
+    if object.len() != 1 {
+        return Err(INVALID_ROUTE_BODY);
+    }
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(INVALID_ROUTE_BODY)?;
+    let model = identity(model, "profile:").ok_or(INVALID_ROUTE_BODY)?;
+    let fingerprint = RequestFingerprint::from_digest({
+        let mut context = Context::new(&SHA256);
+        context.update(conversation.to_string().as_bytes());
+        context.update(&[0]);
+        context.update(&model.to_le_bytes());
+        sha256(context)
+    });
+    let result = shared
+        .database
+        .request_compaction(
+            conversation,
+            ConfigId::new(model),
+            NewSubmission { key, fingerprint },
+        )
+        .await
+        .map_err(action_error)?;
+    let wire = match result {
+        crate::persistence::CompactionRequest::Prepared {
+            job,
+            conversation: child,
+            through,
+            subsequent,
+            already,
+        } => WireCompaction {
+            conversation: conversation.to_string(),
+            status: if already { "already" } else { "prepared" }.to_owned(),
+            job: Some(job.to_string()),
+            system_conversation: Some(child.to_string()),
+            through: Some(through.to_string()),
+            subsequent,
+            reason: None,
+        },
+        crate::persistence::CompactionRequest::Noop { reason } => WireCompaction {
+            conversation: conversation.to_string(),
+            status: "noop".to_owned(),
+            job: None,
+            system_conversation: None,
+            through: None,
+            subsequent: false,
+            reason: Some(reason.to_owned()),
+        },
+    };
+    Ok(Reply::ok(envelope(wire)))
 }
 
 pub(super) async fn action(

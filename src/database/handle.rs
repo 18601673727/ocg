@@ -1424,6 +1424,24 @@ impl DatabaseHandle {
         })
         .await
     }
+    /// Requests one manual compaction of `conversation` through generative
+    /// `model`. The submission key returns the same Job on repeat. A source
+    /// that will not fit the model's window is refused, not truncated.
+    pub async fn request_compaction(
+        &self,
+        conversation: JobId,
+        model: ConfigId,
+        submission: NewSubmission,
+    ) -> Result<persistence::CompactionRequest, DatabaseError> {
+        self.submit(|reply| Command::RequestCompaction {
+            conversation,
+            model,
+            submission,
+            reply,
+        })
+        .await
+    }
+
     pub async fn append(
         &self,
         conversation: JobId,
