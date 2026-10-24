@@ -416,6 +416,247 @@ impl Batch {
         })
     }
 
+    /// The settled prefix a later turn may summarize. Pending and running
+    /// turns are excluded. `through` is the newest turn included; a turn
+    /// still open for input is not a source. Manual compaction is the
+    /// production caller; tests seal a prefix directly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn seal_context_source(
+        &mut self,
+        conversation: JobId,
+        through: JobId,
+    ) -> Result<Option<crate::persistence::ContextSourceManifest>, BatchError> {
+        let row = self.require_job(conversation)?;
+        if !row.kind.is_conversation() {
+            return self.reject(Violation::InvalidValue(
+                "conversation",
+                "expected a conversation",
+            ));
+        }
+        let through_row = self.require_job(through)?;
+        if through_row.parent_id != Some(conversation) || !through_row.kind.is_stored() {
+            return self.reject(Violation::InvalidValue(
+                "context_source",
+                "the source boundary is not a turn of this conversation",
+            ));
+        }
+        let mut chain = Vec::new();
+        let mut cursor = Some(through);
+        let mut seen = BTreeSet::new();
+        while let Some(turn) = cursor {
+            if !seen.insert(turn) || chain.len() >= 4096 {
+                return self.reject(Violation::InvalidValue(
+                    "context_source",
+                    "the source chain is cyclic or too long",
+                ));
+            }
+            let row = self.require_job(turn)?;
+            if row.parent_id != Some(conversation) || !row.kind.is_stored() {
+                return self.reject(Violation::InvalidValue(
+                    "context_source",
+                    "the source chain leaves this conversation",
+                ));
+            }
+            let state = self.require_job_state(turn)?;
+            if state.claim.is_none() || state.outcome.is_none() {
+                return Ok(None);
+            }
+            if self.step(|tx| {
+                rows::job_tool_evidence(&tx.open_table(TOOL_CALLS)?, turn).map(|calls| {
+                    calls
+                        .iter()
+                        .any(crate::persistence::ToolEvidenceRecord::is_unresolved)
+                })
+            })? {
+                return Ok(None);
+            }
+            chain.push(turn);
+            cursor = row.kind.previous();
+        }
+        chain.reverse();
+        let mut boundaries = Vec::with_capacity(chain.len());
+        for turn in chain {
+            let (input_through, inputs) = self.step(|tx| {
+                let table = tx.open_table(TURN_INPUTS)?;
+                let mut input_through = 0u32;
+                let mut inputs = Vec::new();
+                for entry in table.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+                    let (key, bytes) = entry?;
+                    input_through = key.value().1;
+                    inputs.extend_from_slice(bytes.value());
+                }
+                Ok((input_through, inputs))
+            })?;
+            if input_through == 0 {
+                return self.reject(Violation::InvalidValue(
+                    "context_source",
+                    "a sealed turn has no input",
+                ));
+            }
+            let (output_through, outputs) = self.step(|tx| {
+                let table = tx.open_table(JOB_OUTPUTS)?;
+                let mut output_through = 0u32;
+                let mut outputs = Vec::new();
+                for entry in table.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+                    let (key, bytes) = entry?;
+                    let record = decode_output(key.value(), bytes.value())?;
+                    if record.kind == OutputKind::Result {
+                        output_through = key.value().1;
+                        outputs.extend_from_slice(bytes.value());
+                    }
+                }
+                Ok((output_through, outputs))
+            })?;
+            let mut canonical = inputs;
+            canonical.extend(outputs);
+            boundaries.push(crate::persistence::SourceBoundary {
+                turn,
+                input_through,
+                output_through,
+                content: ContentDigest::of(&canonical),
+            });
+        }
+        let manifest = crate::persistence::ContextSourceManifest {
+            schema_version: 1,
+            conversation,
+            through_turn: through,
+            turns: boundaries,
+            base_artifact: None,
+        };
+        if let Err(message) = manifest.validate() {
+            return self.reject(Violation::InvalidValue("context_source", message));
+        }
+        Ok(Some(manifest))
+    }
+
+    /// Confirms a sealed prefix is still the same stored bytes. A later
+    /// append beyond the boundary does not change the match.
+    fn source_still_matches(
+        &mut self,
+        manifest: &crate::persistence::ContextSourceManifest,
+    ) -> Result<bool, BatchError> {
+        for boundary in &manifest.turns {
+            let (input_through, inputs) = self.step(|tx| {
+                let table = tx.open_table(TURN_INPUTS)?;
+                let mut input_through = 0u32;
+                let mut inputs = Vec::new();
+                for entry in table.range(
+                    (boundary.turn.get(), 1)..=(boundary.turn.get(), boundary.input_through),
+                )? {
+                    let (key, bytes) = entry?;
+                    if key.value().1 != input_through.saturating_add(1) {
+                        return Ok((0, Vec::new()));
+                    }
+                    input_through = key.value().1;
+                    inputs.extend_from_slice(bytes.value());
+                }
+                Ok((input_through, inputs))
+            })?;
+            let (output_through, outputs) = self.step(|tx| {
+                let table = tx.open_table(JOB_OUTPUTS)?;
+                let mut output_through = 0u32;
+                let mut outputs = Vec::new();
+                if boundary.output_through > 0 {
+                    for entry in table.range(
+                        (boundary.turn.get(), 0)..=(boundary.turn.get(), boundary.output_through),
+                    )? {
+                        let (key, bytes) = entry?;
+                        let record = decode_output(key.value(), bytes.value())?;
+                        if record.kind == OutputKind::Result {
+                            output_through = key.value().1;
+                            outputs.extend_from_slice(bytes.value());
+                        }
+                    }
+                }
+                Ok((output_through, outputs))
+            })?;
+            if input_through != boundary.input_through || output_through != boundary.output_through
+            {
+                return Ok(false);
+            }
+            let mut canonical = inputs;
+            canonical.extend(outputs);
+            if ContentDigest::of(&canonical) != boundary.content {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Adopts the consuming turn's latest candidate when its sealed prefix is
+    /// still the same bytes. An explicit original-context selection, a missing
+    /// result, or a changed prefix leaves the prompt on the original records.
+    /// The selection itself was written before claim; this only checks it.
+    /// Claim calls this so an incompatible candidate is refused as context
+    /// before the turn starts.
+    pub(crate) fn adopt_context(
+        &mut self,
+        turn: JobId,
+    ) -> Result<Option<crate::persistence::SummarizationResult>, BatchError> {
+        let row = self.require_job(turn)?;
+        if !row.kind.is_stored() {
+            return Ok(None);
+        }
+        let selected = self.step(|tx| {
+            let mut selected = None;
+            for entry in tx
+                .open_table(TURN_INPUTS)?
+                .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+            {
+                let (_, bytes) = entry?;
+                if let Entry::ContextUse { artifact } = TurnEntry::decode(bytes.value())?.entry {
+                    selected = Some(artifact);
+                }
+            }
+            Ok(selected)
+        })?;
+        let Some(Some(artifact)) = selected else {
+            return Ok(None);
+        };
+        let Some(producer) = self.job(artifact)? else {
+            return Ok(None);
+        };
+        let Some(parent) = producer.parent_id else {
+            return Ok(None);
+        };
+        let Some(owner) = self.job(parent)? else {
+            return Ok(None);
+        };
+        if owner.parent_id != row.parent_id {
+            return Ok(None);
+        }
+        let state = self.require_job_state(artifact)?;
+        if !state
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+        {
+            return Ok(None);
+        }
+        let result = self.step(|tx| {
+            tx.open_table(JOB_OUTPUTS)?
+                .range((artifact.get(), 0)..=(artifact.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+                .transpose()
+        })?;
+        let Some(result) = result
+            .filter(|output| output.kind == OutputKind::Result)
+            .and_then(|output| output.value)
+            .and_then(|value| serde_json::from_value(value).ok())
+        else {
+            return Ok(None);
+        };
+        let result: crate::persistence::SummarizationResult = result;
+        if result.validate().is_err()
+            || Some(result.source.conversation) != row.parent_id
+            || !self.source_still_matches(&result.source)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(result))
+    }
+
     fn check_context_job(&mut self, consumer: &JobRow, producer: JobId) -> Result<(), BatchError> {
         let source = self.require_job(producer)?;
         let Some(parent) = source.parent_id else {
@@ -5507,6 +5748,7 @@ mod tests {
             .join("\n");
         assert!(!text.contains("durable task facts"));
         assert!(!text.contains(&producer.to_string()));
+        assert!(context.adopted_summary.is_none());
         let metadata_matches = wait(fixture.database.search_conversations(
             vec![producer.to_string()],
             None,
@@ -5583,5 +5825,103 @@ mod tests {
             entries
         );
         worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn a_validated_summary_replaces_only_its_sealed_prefix() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("context-adoption");
+        let (conversation, first) = fixture.open();
+        fixture.finish(first, OutcomeKind::Completed);
+        let follow = wait(fixture.database.append(
+            conversation,
+            message("keep this tail"),
+            None,
+            None,
+        ))
+        .expect("follow")
+        .turn;
+        fixture.finish(follow, OutcomeKind::Completed);
+        let consumer = wait(
+            fixture
+                .database
+                .append(conversation, message("now"), None, None),
+        )
+        .expect("consumer")
+        .turn;
+        let source = wait(fixture.database.with_database(move |database| {
+            run_batch_with(database, 1, Commit::Durable, |batch| {
+                batch.seal_context_source(conversation, first)
+            })
+            .result
+            .map_err(|error| StorageError::corrupted(format!("{error:?}")))
+        }))
+        .expect("seal")
+        .expect("settled prefix");
+        assert_eq!(source.turns.len(), 1);
+        assert_eq!(source.turns[0].turn, first);
+        let (system, appended) = wait(fixture.database.open_conversation(
+            Some(conversation),
+            ConversationSpec {
+                name: Some("prepare".into()),
+                agent: None,
+                project: None,
+                origin: Origin::System,
+                keep_open: false,
+            },
+            message("summarize"),
+            fixture.configuration,
+            None,
+        ))
+        .expect("system child");
+        let producer = appended.turn;
+        let artifact = SummarizationResult {
+            schema_version: 1,
+            source,
+            summary: "the first turn settled".into(),
+            omitted_details: vec!["the original wording".into()],
+        };
+        fixture.claim(producer);
+        wait(fixture.database.finalize_job(
+            producer,
+            JobFinalization::Completed(FinalResult {
+                value: Some(serde_json::to_value(&artifact).expect("value")),
+                ..result("prepared")
+            }),
+        ))
+        .expect("finish artifact");
+        wait(fixture.database.with_database(move |database| {
+            run_batch_with(database, 1, Commit::Durable, |batch| {
+                batch.insert_turn_input(
+                    consumer,
+                    Entry::ContextUse {
+                        artifact: Some(producer),
+                    },
+                )
+            })
+            .result
+            .map_err(|error| StorageError::corrupted(format!("{error:?}")))
+        }))
+        .expect("select");
+        let context = wait(fixture.database.read_turn_context(consumer, 10000)).expect("context");
+        assert_eq!(
+            context.adopted_summary.as_deref(),
+            Some("the first turn settled")
+        );
+        assert_eq!(context.covered_turns, vec![first]);
+        let shown = context
+            .turns
+            .iter()
+            .map(|turn| turn.turn)
+            .collect::<Vec<_>>();
+        assert_eq!(shown, vec![follow, consumer]);
+        assert!(
+            context
+                .turns
+                .iter()
+                .any(|turn| turn.text.contains("keep this tail"))
+        );
+        assert!(wait(fixture.database.job(system)).expect("child").is_some());
+        fixture.worker.shutdown().expect("shutdown");
     }
 }

@@ -2576,6 +2576,11 @@ pub struct TurnContext {
     pub attention: String,
     pub tree_status: String,
     pub response_format: Option<ResponseFormat>,
+    /// A validated summary that replaces the covered prefix. The original
+    /// records remain stored; this is only the prompt view.
+    pub adopted_summary: Option<String>,
+    /// Turns the adopted summary covers. The suffix after them stays raw.
+    pub covered_turns: Vec<JobId>,
 }
 
 fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageError> {
@@ -2695,6 +2700,102 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
         | Entry::ContextUse { .. } => String::new(),
     })
 }
+
+/// The latest candidate whose sealed prefix is still the stored bytes.
+/// A failed check returns no summary; it does not fail the prompt read.
+fn adopted_context(
+    rx: &ReadTransaction,
+    turn: JobId,
+) -> Result<Option<crate::persistence::SummarizationResult>, StorageError> {
+    let row = read_job_row(rx, turn)?.ok_or_else(|| StorageError::corrupted("turn missing"))?;
+    if !row.kind.is_stored() {
+        return Ok(None);
+    }
+    let mut selected = None;
+    for (_, entry) in turn_entries(rx, turn)? {
+        if let Entry::ContextUse { artifact } = entry.entry {
+            selected = Some(artifact);
+        }
+    }
+    let Some(artifact) = selected.flatten() else {
+        return Ok(None);
+    };
+    let Some(producer) = read_job_row(rx, artifact)? else {
+        return Ok(None);
+    };
+    let Some(parent) = producer.parent_id else {
+        return Ok(None);
+    };
+    let Some(owner) = read_job_row(rx, parent)? else {
+        return Ok(None);
+    };
+    if owner.parent_id != row.parent_id {
+        return Ok(None);
+    }
+    let state = read_state(rx, artifact)?;
+    if !state
+        .outcome
+        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+    {
+        return Ok(None);
+    }
+    let result = rx
+        .open_table(JOB_OUTPUTS)?
+        .range((artifact.get(), 0)..=(artifact.get(), u32::MAX))?
+        .next_back()
+        .transpose()?
+        .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+        .transpose()?
+        .filter(|output| output.kind == OutputKind::Result)
+        .and_then(|output| output.value)
+        .and_then(|value| serde_json::from_value(value).ok());
+    let Some(result) = result else {
+        return Ok(None);
+    };
+    let result: crate::persistence::SummarizationResult = result;
+    if result.validate().is_err() || Some(result.source.conversation) != row.parent_id {
+        return Ok(None);
+    }
+    for boundary in &result.source.turns {
+        let mut input_through = 0u32;
+        let mut inputs = Vec::new();
+        for entry in rx
+            .open_table(TURN_INPUTS)?
+            .range((boundary.turn.get(), 1)..=(boundary.turn.get(), boundary.input_through))?
+        {
+            let (key, bytes) = entry?;
+            if key.value().1 != input_through.saturating_add(1) {
+                return Ok(None);
+            }
+            input_through = key.value().1;
+            inputs.extend_from_slice(bytes.value());
+        }
+        let mut output_through = 0u32;
+        let mut outputs = Vec::new();
+        if boundary.output_through > 0 {
+            for entry in rx
+                .open_table(JOB_OUTPUTS)?
+                .range((boundary.turn.get(), 0)..=(boundary.turn.get(), boundary.output_through))?
+            {
+                let (key, bytes) = entry?;
+                let record = decode_output(key.value(), bytes.value())?;
+                if record.kind == OutputKind::Result {
+                    output_through = key.value().1;
+                    outputs.extend_from_slice(bytes.value());
+                }
+            }
+        }
+        if input_through != boundary.input_through || output_through != boundary.output_through {
+            return Ok(None);
+        }
+        let mut canonical = inputs;
+        canonical.extend(outputs);
+        if ContentDigest::of(&canonical) != boundary.content {
+            return Ok(None);
+        }
+    }
+    Ok(Some(result))
+}
 pub(crate) fn read_turn_context(
     database: &Database,
     turn: JobId,
@@ -2708,7 +2809,18 @@ pub(crate) fn read_turn_context(
         attention: String::new(),
         tree_status: String::new(),
         response_format: None,
+        adopted_summary: None,
+        covered_turns: Vec::new(),
     };
+    if let Some(adopted) = adopted_context(&rx, turn)? {
+        context.adopted_summary = Some(adopted.summary);
+        context.covered_turns = adopted
+            .source
+            .turns
+            .into_iter()
+            .map(|source| source.turn)
+            .collect();
+    }
     let own_entries = turn_entries(&rx, turn)?;
     context.response_format = own_entries
         .iter()
@@ -2773,6 +2885,7 @@ pub(crate) fn read_turn_context(
     while let Some(id) = cursor {
         let row = read_job_row(&rx, id)?
             .ok_or_else(|| StorageError::corrupted("previous turn missing"))?;
+        let covered = id != turn && context.covered_turns.contains(&id);
         let mut text = String::new();
         let mut attachments = Vec::new();
         for (_, entry) in turn_entries(&rx, id)?.into_iter().filter(|_| {
@@ -2819,11 +2932,13 @@ pub(crate) fn read_turn_context(
         };
         let weight = (text.len() + answer.as_ref().map_or(0, String::len) + 16).div_ceil(3)
             + attachments.len() * 1600;
-        if used.saturating_add(weight) > budget_tokens && id != turn {
+        if !covered && used.saturating_add(weight) > budget_tokens && id != turn {
             context.omitted = true;
             break;
         }
-        used = used.saturating_add(weight);
+        if !covered {
+            used = used.saturating_add(weight);
+        }
         cursor = match iteration_context {
             Some((first, previous)) if id == turn => previous
                 .filter(|previous| *previous != turn)
@@ -2846,13 +2961,15 @@ pub(crate) fn read_turn_context(
                     .ok_or_else(|| StorageError::corrupted("turn attachment missing"))
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
-        context.turns.push(ContextTurn {
-            turn: id,
-            text,
-            attachments,
-            attachment_bytes,
-            answer,
-        });
+        if !covered {
+            context.turns.push(ContextTurn {
+                turn: id,
+                text,
+                attachments,
+                attachment_bytes,
+                answer,
+            });
+        }
     }
     context.turns.reverse();
     if let Some(conversation) = row.parent_id.filter(|_| row.kind.is_stored()) {

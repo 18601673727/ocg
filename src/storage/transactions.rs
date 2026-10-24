@@ -710,6 +710,9 @@ impl Batch {
                     .insert(conversation.get(), notice_seq)?;
                 Ok(())
             })?;
+            // Adoption is checked in this claim. A mismatch leaves the
+            // original records in the prompt; it does not refuse the claim.
+            let _adopted = self.adopt_context(job)?;
         }
         state.claim = Some(ClaimRecord {
             started_at: self.now,

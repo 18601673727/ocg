@@ -3137,6 +3137,20 @@ async fn run_started_provider_job(
             prior_attachments.push(attachments);
             prior_turns.push((Some(text), images, answer));
         }
+        // A validated summary stands in for the covered prefix. The raw
+        // suffix above is unchanged, and the original records stay stored.
+        if let Some(summary) = context.adopted_summary {
+            prior_turns.insert(
+                0,
+                (
+                    Some(format!(
+                        "Earlier conversation, summarized; original records remain available:\n{summary}"
+                    )),
+                    Vec::new(),
+                    None,
+                ),
+            );
+        }
     }
     let images = match attachment_images(&database, &current_attachments).await {
         Ok(images) => images,
