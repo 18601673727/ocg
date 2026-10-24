@@ -292,6 +292,8 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
         .strip_suffix("/chat/completions")
         .or_else(|| endpoint.strip_suffix("/responses"))
         .or_else(|| endpoint.strip_suffix("/messages"))
+        .or_else(|| endpoint.strip_suffix("/systemone"))
+        .or_else(|| endpoint.strip_suffix("/models"))
         .unwrap_or(endpoint);
     let url = format!("{base}/{resource}");
     let uri = url.parse::<ntex::http::Uri>().ok();

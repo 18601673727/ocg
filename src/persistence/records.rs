@@ -613,6 +613,17 @@ pub enum DecisionProtocol {
 }
 
 impl DecisionProtocol {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeSafeSystemOne => "typesafe_systemone",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "typesafe_systemone" => Some(Self::TypeSafeSystemOne),
+            _ => None,
+        }
+    }
     pub fn code(self) -> u8 {
         match self {
             Self::TypeSafeSystemOne => 1,
@@ -1048,6 +1059,9 @@ pub struct MetricsRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExecutionOperation {
     LlmRequest,
+    /// One typed decision request over a Decision Model's native protocol.
+    /// Pools offering it are candidates for ordinary decision Jobs.
+    Decision,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1074,7 +1088,12 @@ impl ExecutionPoolConfig {
     pub fn body(&self, enabled: bool) -> PoolConfig {
         let mut capabilities = BTreeSet::new();
         for operation in &self.capabilities.operations {
-            if self.capabilities.llm_protocols.is_empty() {
+            // Decision work names no LLM transport, so its Pool offers it
+            // without one whether or not the same Pool serves generative
+            // work over transports.
+            if *operation == ExecutionOperation::Decision
+                || self.capabilities.llm_protocols.is_empty()
+            {
                 capabilities.insert((*operation, None));
             }
             for protocol in &self.capabilities.llm_protocols {

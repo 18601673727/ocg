@@ -37,6 +37,15 @@ pub(super) async fn announce_at(
     }
 }
 
+pub(super) async fn bounded_bytes(response: ClientResponse, limit: usize) -> Option<Vec<u8>> {
+    response
+        .body()
+        .limit(limit)
+        .await
+        .ok()
+        .map(|body| body.to_vec())
+}
+
 pub(super) async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> {
     response
         .body()
@@ -102,6 +111,11 @@ impl Redactor {
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
+    }
+
+    pub(crate) fn json_value(&self, mut value: Value) -> Value {
+        self.json(&mut value);
+        value
     }
 
     pub(crate) fn body(&self, body: &str) -> String {
@@ -220,7 +234,7 @@ fn retryable_status(status_code: u16) -> bool {
     matches!(status_code, 408 | 409 | 425 | 429 | 500..=599)
 }
 
-fn provider_failure(
+pub(super) fn provider_failure(
     status_code: u16,
     request_id: Option<String>,
     response_body: Option<String>,

@@ -35,6 +35,7 @@ const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 mod anthropic;
 mod cancellation;
 mod conversation;
+mod decision;
 mod exchange;
 mod models;
 mod observe;
@@ -49,6 +50,9 @@ mod usage;
 pub use cancellation::CancellationToken;
 pub use conversation::{execute_chat, objective_conversation, objective_conversation_with_images};
 pub(crate) use conversation::{ground_project, request_body};
+pub(crate) use decision::{
+    execute_decision, list_models as list_decision_models, request_body as decision_request_body,
+};
 #[cfg(test)]
 use exchange::authorization;
 use exchange::incomplete_tool_calls;
@@ -61,7 +65,7 @@ pub(crate) use observe::{announce, rejected_failure};
 pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecutionError> {
     exchange::endpoint(endpoint, "models")
 }
-pub(crate) use models::{ModelListError, list_models};
+pub(crate) use models::{ModelListError, ProviderModel, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
 pub(crate) use proxy::{
     initialize as initialize_proxy, log_configuration as log_proxy_configuration,
