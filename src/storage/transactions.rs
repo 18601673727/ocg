@@ -1187,19 +1187,6 @@ impl Batch {
                 crate::persistence::ConversationEdit::SuggestedTitle(title),
             )?;
         }
-        let mut appended = None;
-        if let Some(result) = result
-            && kind != OutcomeKind::Unknown
-        {
-            appended = Some(self.append_output(
-                job,
-                OutputKind::Result,
-                result.summary,
-                result.code,
-                result.goal_reached,
-                result.value,
-            )?);
-        }
         if kind == OutcomeKind::Unknown && self.no_live_process(job)? {
             state.stop_confirmed_at = Some(self.now);
             state.stop_confirmed_by = Some(StopProof::Proof);
@@ -1239,6 +1226,19 @@ impl Batch {
             })?;
         }
         self.put_job_state(job, &state)?;
+        let mut appended = None;
+        if let Some(result) = result
+            && kind != OutcomeKind::Unknown
+        {
+            appended = Some(self.append_output(
+                job,
+                OutputKind::Result,
+                result.summary,
+                result.code,
+                result.goal_reached,
+                result.value,
+            )?);
+        }
         self.index_answer(&row, kind, appended.is_some())?;
         if kind == OutcomeKind::Completed {
             self.schedule_title_job(&row)?;

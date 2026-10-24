@@ -42,6 +42,13 @@ pub(super) fn index_search_text(
     seq: u32,
     text: &str,
 ) -> Result<(), StorageError> {
+    let jobs = tx.open_table(JOBS)?;
+    let row = jobs
+        .get(conversation.get())?
+        .ok_or_else(|| StorageError::corrupted("search conversation missing"))?;
+    if !searchable_conversation(&JobRow::decode_at(conversation.get(), row.value())?) {
+        return Ok(());
+    }
     let mut table = tx.open_table(CONVERSATION_SEARCH)?;
     for gram in search_grams(text) {
         table.insert((conversation.get(), gram, turn.get(), source, seq), ())?;
@@ -49,7 +56,12 @@ pub(super) fn index_search_text(
     Ok(())
 }
 
-pub(super) fn search_output_text(output: &JobOutputRecord) -> Option<&str> {
+pub(super) fn searchable_conversation(row: &JobRow) -> bool {
+    row.parent_id.is_none()
+        && matches!(&row.kind, JobKind::Conversation { origin, .. } if *origin != Origin::System)
+}
+
+pub(super) fn search_output_text(output: &JobOutputRecord, completed: bool) -> Option<&str> {
     if output.kind != OutputKind::Result {
         return None;
     }
@@ -58,7 +70,76 @@ pub(super) fn search_output_text(output: &JobOutputRecord) -> Option<&str> {
         .as_ref()
         .and_then(|value| value.get("text"))
         .and_then(serde_json::Value::as_str)
-        .or(output.summary.as_deref())
+        .or(output.summary.as_deref().filter(|_| completed))
+}
+
+fn visit_search_keys(
+    tx: &WriteTransaction,
+    auth: &Authoritative,
+    mut visit: impl FnMut(schema::ConversationSearchKey) -> Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let conversation_for = |turn: u128| {
+        auth.jobs
+            .get(&turn)
+            .and_then(|row| row.parent_id)
+            .filter(|id| {
+                auth.jobs
+                    .get(&id.get())
+                    .is_some_and(searchable_conversation)
+            })
+    };
+    for entry in tx.open_table(TURN_INPUTS)?.iter()? {
+        let (key, bytes) = entry?;
+        let (turn, seq) = key.value();
+        if let Some(conversation) = conversation_for(turn)
+            && let Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } =
+                TurnEntry::decode(bytes.value())?.entry
+        {
+            for gram in search_grams(&text) {
+                visit((conversation.get(), gram, turn, 0, seq))?;
+            }
+        }
+    }
+    for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
+        let (key, bytes) = entry?;
+        let (turn, seq) = key.value();
+        let completed = auth
+            .states
+            .get(&turn)
+            .and_then(|state| state.outcome.as_ref())
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+        if let Some(conversation) = conversation_for(turn) {
+            let output = decode_output(key.value(), bytes.value())?;
+            if let Some(text) = search_output_text(&output, completed) {
+                for gram in search_grams(text) {
+                    visit((conversation.get(), gram, turn, 1, seq))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_search(tx: &WriteTransaction, auth: &Authoritative) -> Result<bool, StorageError> {
+    let table = tx.open_table(CONVERSATION_SEARCH)?;
+    let mut count = 0u64;
+    let mut missing = false;
+    visit_search_keys(tx, auth, |key| {
+        count = count.saturating_add(1);
+        missing |= table.get(key)?.is_none();
+        Ok(())
+    })?;
+    let differs = missing || table.len()? != count;
+    drop(table);
+    if differs {
+        tx.delete_table(CONVERSATION_SEARCH)?;
+        let mut table = tx.open_table(CONVERSATION_SEARCH)?;
+        visit_search_keys(tx, auth, |key| {
+            table.insert(key, ())?;
+            Ok(())
+        })?;
+    }
+    Ok(differs)
 }
 
 /// What every derived table must hold, given the authoritative rows.
@@ -103,7 +184,6 @@ struct Authoritative {
     user_entry_at: BTreeMap<u128, i64>,
     retries: BTreeMap<(u128, u128), bool>,
     request_scopes_differ: bool,
-    search: BTreeMap<schema::ConversationSearchKey, ()>,
 }
 
 fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageError> {
@@ -126,22 +206,11 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         conversations.insert(key.value(), ConversationRow::decode(bytes.value())?);
     }
     let mut result_turns = BTreeSet::new();
-    let mut search = BTreeMap::new();
     for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
         let (key, bytes) = entry?;
         let output = decode_output(key.value(), bytes.value())?;
         if output.kind == OutputKind::Result {
             result_turns.insert(key.value().0);
-            if let Some(conversation) = jobs.get(&key.value().0).and_then(|row| row.parent_id)
-                && let Some(text) = search_output_text(&output)
-            {
-                for gram in search_grams(text) {
-                    search.insert(
-                        (conversation.get(), gram, key.value().0, 1, key.value().1),
-                        (),
-                    );
-                }
-            }
         }
     }
     let mut attachment_refs = BTreeMap::new();
@@ -151,13 +220,6 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         let (key, bytes) = entry?;
         let (turn, _) = key.value();
         let input = TurnEntry::decode(bytes.value())?;
-        if let Some(conversation) = jobs.get(&turn).and_then(|row| row.parent_id)
-            && let Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } = &input.entry
-        {
-            for gram in search_grams(text) {
-                search.insert((conversation.get(), gram, turn, 0, key.value().1), ());
-            }
-        }
         match &input.entry {
             Entry::UserMessage { attachments, .. } => {
                 for attachment in attachments {
@@ -311,7 +373,6 @@ fn read_authoritative(tx: &WriteTransaction) -> Result<Authoritative, StorageErr
         user_entry_at,
         retries,
         request_scopes_differ,
-        search,
     })
 }
 
@@ -739,11 +800,7 @@ pub(super) fn rebuild(
     note("successor", sync!(tx, SUCCESSORS, derived.successors), true);
     note("tip", sync!(tx, TIPS, derived.tips), true);
     note("recent", sync!(tx, RECENT, derived.recent), true);
-    note(
-        "conversation_search",
-        sync!(tx, CONVERSATION_SEARCH, auth.search),
-        true,
-    );
+    note("conversation_search", sync_search(tx, &auth)?, true);
     note(
         "child_conversation",
         sync!(tx, CHILD_CONVERSATIONS, derived.child_conversations),

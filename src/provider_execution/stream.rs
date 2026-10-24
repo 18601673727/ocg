@@ -235,7 +235,7 @@ async fn parse_stream_body(
     let mut responses = responses::ResponseStream::default();
     let anthropic = config.transport == crate::persistence::LlmTransport::AnthropicMessages;
     let mut messages = anthropic::MessageStream::default();
-    let line_limit = if native {
+    let line_limit = if native || anthropic {
         config
             .max_output_bytes
             .saturating_mul(6)

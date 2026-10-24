@@ -35,3 +35,18 @@ test("conversation search bounds UTF-8 bytes before sending and forwards cancell
   assert.equal(calls, 1);
   client.close();
 });
+
+
+test("server search retains older unloaded conversations and deduplicates cursor pages", async () => {
+  const { appendSearchResults, conversationSearchMatches } = await import("../components/ocg/sidebar/conversation-search-results");
+  const conversation = (root: string, title: string) => ({ root_job: root, tip_job: `${root}-tip`, title, agent: null, state: "open" as const, on_hold: null, project: null, tip_settlement_state: "completed", tip_created_at_us: 1 });
+  const first = conversation("older-1", "First match");
+  const second = conversation("older-2", "Second match");
+  const results = appendSearchResults([first], [first, second]);
+  const matches = conversationSearchMatches([{ id: "local", conversationId: "older-1", title: "Old title", workType: "research", updatedAt: "" }], results);
+  assert.deepEqual(matches, [
+    { id: "local", title: "First match", conversation: "older-1" },
+    { id: "older-2", title: "Second match", conversation: "older-2" },
+  ]);
+  assert.deepEqual(conversationSearchMatches([], [second]), [{ id: "older-2", title: "Second match", conversation: "older-2" }]);
+});

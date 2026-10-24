@@ -1636,6 +1636,118 @@ mod tests {
     }
 
     #[test]
+    fn search_excludes_failure_diagnostics_and_non_root_sources() {
+        let fixture = Fixture::new("search-eligibility");
+        let (root, first) = fixture.open();
+        fixture.finish(first, OutcomeKind::Failed);
+        assert!(
+            wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["failed".into()], None, 10)
+            )
+            .unwrap()
+            .conversations
+            .is_empty()
+        );
+        let (cancelled, cancelled_turn) = fixture.open();
+        fixture.finish(cancelled_turn, OutcomeKind::Cancelled);
+        assert!(
+            wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["cancelled".into()], None, 10)
+            )
+            .unwrap()
+            .conversations
+            .is_empty()
+        );
+        let (partial, partial_turn) = fixture.open();
+        fixture.claim(partial_turn);
+        wait(fixture.database.finalize_job(
+            partial_turn,
+            crate::persistence::JobFinalization::Failed(FinalResult {
+                summary: Some("diagnostic-only".into()),
+                code: None,
+                goal_reached: None,
+                value: Some(serde_json::json!({"text":"saved partial answer"})),
+            }),
+        ))
+        .unwrap();
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["partial answer".into()], None, 10)
+            )
+            .unwrap()
+            .conversations[0]
+                .root_job,
+            partial
+        );
+        assert!(
+            wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["diagnostic-only".into()], None, 10)
+            )
+            .unwrap()
+            .conversations
+            .is_empty()
+        );
+        assert_ne!(cancelled, partial);
+        let (child, child_turn) = fixture.child(root, false);
+        fixture.finish(child_turn, OutcomeKind::Completed);
+        wait(fixture.database.with_database(move |database| {
+            let tx = database.begin_write()?;
+            assert!(
+                tx.open_table(CONVERSATION_SEARCH)?
+                    .range(
+                        (child.get(), 0, 0, 0, 0)
+                            ..=(child.get(), u128::MAX, u128::MAX, u8::MAX, u32::MAX)
+                    )?
+                    .next()
+                    .is_none()
+            );
+            // Simulate old postings for a diagnostic and a non-queryable child.
+            derived::index_search_text(&tx, root, first, 1, 1, "failed")?;
+            tx.open_table(CONVERSATION_SEARCH)?.insert(
+                (
+                    child.get(),
+                    derived::search_gram(&['x']),
+                    child_turn.get(),
+                    0,
+                    1,
+                ),
+                (),
+            )?;
+            tx.commit()?;
+            Ok(())
+        }))
+        .unwrap();
+        assert!(
+            wait(
+                fixture
+                    .database
+                    .search_conversations(vec!["failed".into()], None, 10)
+            )
+            .unwrap()
+            .conversations
+            .is_empty()
+        );
+        wait(fixture.database.with_database(|database| {
+            assert!(derived::inconsistencies(database)?.contains(&"conversation_search"));
+            let tx = database.begin_write()?;
+            derived::rebuild(&tx, open::promotion_clock())?;
+            tx.commit()?;
+            assert!(derived::inconsistencies(database)?.is_empty());
+            Ok(())
+        }))
+        .unwrap();
+        fixture.worker.shutdown().unwrap();
+    }
+
+    #[test]
     fn full_text_search_pages_without_skipping_lookahead_and_rebuilds_its_index() {
         let fixture = Fixture::new("full-text-pages");
         let mut roots = Vec::new();
@@ -4868,6 +4980,159 @@ mod tests {
         .expect("archived refusal");
         assert_eq!(snapshot.model.model, "decision-v1");
         fixture.worker.shutdown().expect("shutdown");
+    }
+
+    #[test]
+    fn archive_models_clears_live_policy_bindings_without_mutating_frozen_work() {
+        use crate::persistence::*;
+        let fixture = Fixture::new("archive-policy-bindings");
+        let (decision_model, decision_agent) = decision_configs(&fixture);
+        let backup_body = wait(fixture.database.config(decision_model))
+            .unwrap()
+            .unwrap()
+            .body;
+        let backup = wait(fixture.database.create_config(NewConfig {
+            name: "backup decision model".into(),
+            body: backup_body,
+        }))
+        .unwrap();
+        let mut agent = wait(fixture.database.config(decision_agent))
+            .unwrap()
+            .unwrap();
+        if let ConfigBody::DecisionAgent(body) = &mut agent.body {
+            body.models.push(backup);
+        }
+        wait(fixture.database.update_config(
+            decision_agent,
+            NewConfig {
+                name: agent.name,
+                body: agent.body,
+            },
+        ))
+        .unwrap();
+        let generative = ConfigId::from(fixture.configuration.llm_profile);
+        let ConfigBody::Model(model_body) = wait(fixture.database.config(generative))
+            .unwrap()
+            .unwrap()
+            .body
+        else {
+            panic!("model");
+        };
+        let summarizer = wait(fixture.database.create_config(NewConfig {
+            name: "summarizer".into(),
+            body: ConfigBody::Model(model_body),
+        }))
+        .unwrap();
+        let policy = CompactionPolicy {
+            mode: CompactionMode::Auto {
+                preset: CompactionPreset::Balanced,
+            },
+            summarization_model: Some(summarizer),
+            predictive: Some(PredictiveCompaction {
+                decision_agent,
+                minimum_interval_seconds: 120,
+                max_preparations: 1,
+                max_prediction_tokens: 1000,
+                max_preparation_tokens: 12000,
+            }),
+        };
+        let profile = wait(fixture.database.create_config(NewConfig {
+            name: "assisted".into(),
+            body: ConfigBody::Agent(AgentConfig {
+                models: vec![generative],
+                decision_assistance: Some(decision_agent),
+                compaction_policy: Some(policy),
+                ..Default::default()
+            }),
+        }))
+        .unwrap();
+        let (conversation, turn) = fixture.open_as(profile.into());
+        wait(fixture.database.set_conversation(
+            conversation,
+            ConversationEdit::CompactionPolicy(Some(policy)),
+        ))
+        .unwrap();
+        let frozen = wait(fixture.database.with_database(move |database| {
+            let rx = database.begin_read()?;
+            JobRow::decode_at(
+                turn.get(),
+                rx.open_table(JOBS)?.get(turn.get())?.unwrap().value(),
+            )
+        }))
+        .unwrap();
+        wait(fixture.database.archive_model(summarizer)).unwrap();
+        let (stored_policy, revision) = wait(
+            fixture
+                .database
+                .conversation_compaction_policy(conversation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert_eq!(stored_policy.unwrap().summarization_model, None);
+        assert!(stored_policy.unwrap().predictive.is_some());
+        wait(fixture.database.archive_model(decision_model)).unwrap();
+        let (policy_with_backup, revision) = wait(
+            fixture
+                .database
+                .conversation_compaction_policy(conversation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revision, 2);
+        assert!(policy_with_backup.unwrap().predictive.is_some());
+        wait(fixture.database.archive_model(backup)).unwrap();
+        let (stored_policy, revision) = wait(
+            fixture
+                .database
+                .conversation_compaction_policy(conversation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(revision, 3);
+        let policy_after = stored_policy.unwrap();
+        assert_eq!(policy_after.mode, policy.mode);
+        assert!(policy_after.summarization_model.is_none() && policy_after.predictive.is_none());
+        let current = wait(fixture.database.config(profile)).unwrap().unwrap();
+        let ConfigBody::Agent(body) = &current.body else {
+            panic!("agent");
+        };
+        assert_eq!(body.compaction_policy, Some(policy_after));
+        assert_eq!(body.decision_assistance, Some(decision_agent));
+        wait(fixture.database.update_config(
+            profile,
+            NewConfig {
+                name: "still editable".into(),
+                body: current.body,
+            },
+        ))
+        .unwrap();
+        wait(fixture.database.with_database(move |database| {
+            let rx = database.begin_read()?;
+            assert_eq!(
+                JobRow::decode_at(
+                    turn.get(),
+                    rx.open_table(JOBS)?.get(turn.get())?.unwrap().value()
+                )?,
+                frozen
+            );
+            Ok(())
+        }))
+        .unwrap();
+        wait(fixture.database.archive_model(decision_model)).unwrap();
+        assert_eq!(
+            wait(
+                fixture
+                    .database
+                    .conversation_compaction_policy(conversation)
+            )
+            .unwrap()
+            .unwrap()
+            .1,
+            3
+        );
+        wait(fixture.database.archive_model(generative)).unwrap();
+        fixture.worker.shutdown().unwrap();
     }
 
     #[test]

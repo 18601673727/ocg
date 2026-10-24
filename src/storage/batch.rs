@@ -736,6 +736,21 @@ impl Batch {
         if row.archived_at.is_some() {
             return Ok(());
         }
+        let emptied = self.step(|tx| {
+            let mut emptied = BTreeSet::new();
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, value) = entry?;
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
+                if row.archived_at.is_none()
+                    && let ConfigBody::DecisionAgent(agent) = row.body
+                    && agent.models.contains(&id)
+                    && agent.models.iter().all(|model| *model == id)
+                {
+                    emptied.insert(row.id);
+                }
+            }
+            Ok(emptied)
+        })?;
         let agents = self.step(|tx| {
             let mut agents = Vec::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
@@ -743,7 +758,14 @@ impl Batch {
                 let row = ConfigRow::decode_at(key.value(), value.value())?;
                 let references_model = match &row.body {
                     ConfigBody::Agent(agent) => {
-                        agent.models.contains(&id) || agent.default_model == Some(id)
+                        agent.models.contains(&id)
+                            || agent.default_model == Some(id)
+                            || agent.compaction_policy.is_some_and(|policy| {
+                                policy.summarization_model == Some(id)
+                                    || policy.predictive.is_some_and(|prediction| {
+                                        emptied.contains(&prediction.decision_agent)
+                                    })
+                            })
                     }
                     ConfigBody::DecisionAgent(agent) => {
                         agent.models.contains(&id) || agent.default_model == Some(id)
@@ -759,20 +781,65 @@ impl Batch {
             }
             Ok(agents)
         })?;
+        let clear_policy = |policy: &mut crate::persistence::CompactionPolicy| {
+            if policy.summarization_model == Some(id) {
+                policy.summarization_model = None;
+            }
+            if policy
+                .predictive
+                .is_some_and(|prediction| emptied.contains(&prediction.decision_agent))
+            {
+                policy.predictive = None;
+            }
+        };
         for mut agent_row in agents {
-            if let ConfigBody::Agent(agent) = &mut agent_row.body {
-                agent.models.retain(|model| *model != id);
-                if agent.default_model == Some(id) {
-                    agent.default_model = None;
+            let before = agent_row.body.clone();
+            match &mut agent_row.body {
+                ConfigBody::Agent(agent) => {
+                    agent.models.retain(|model| *model != id);
+                    if agent.default_model == Some(id) {
+                        agent.default_model = None;
+                    }
+                    if let Some(policy) = &mut agent.compaction_policy {
+                        clear_policy(policy);
+                    }
+                }
+                ConfigBody::DecisionAgent(agent) => {
+                    agent.models.retain(|model| *model != id);
+                    if agent.default_model == Some(id) {
+                        agent.default_model = None;
+                    }
+                }
+                ConfigBody::Connection(_)
+                | ConfigBody::Model(_)
+                | ConfigBody::DecisionModel(_)
+                | ConfigBody::Pool(_) => {}
+            }
+            if agent_row.body != before {
+                self.update_config(agent_row.id, agent_row.name, agent_row.body)?;
+            }
+        }
+        let conversations = self.step(|tx| {
+            let mut changes = Vec::new();
+            for entry in tx.open_table(CONVERSATIONS)?.iter()? {
+                let (key, bytes) = entry?;
+                if let Some(mut policy) = ConversationRow::decode(bytes.value())?.compaction_policy
+                {
+                    let before = policy;
+                    clear_policy(&mut policy);
+                    if policy != before {
+                        changes.push((JobId::new(key.value()), policy));
+                    }
                 }
             }
-            if let ConfigBody::DecisionAgent(agent) = &mut agent_row.body {
-                agent.models.retain(|model| *model != id);
-                if agent.default_model == Some(id) {
-                    agent.default_model = None;
-                }
-            }
-            self.update_config(agent_row.id, agent_row.name, agent_row.body)?;
+            Ok(changes)
+        })?;
+        for (conversation, policy) in conversations {
+            crate::persistence::set_conversation(
+                self,
+                conversation,
+                crate::persistence::ConversationEdit::CompactionPolicy(Some(policy)),
+            )?;
         }
         row.archived_at = Some(self.now);
         row.updated_at = self.now;
@@ -891,9 +958,21 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(JOB_OUTPUTS)?
                 .insert((job.get(), seq), encode_output(&record).as_slice())?;
-            if let Some(text) = derived::search_output_text(&record)
-                && let Some(row) = tx.open_table(JOBS)?.get(job.get())?
-                && let Some(conversation) = JobRow::decode_at(job.get(), row.value())?.parent_id
+            let completed = tx
+                .open_table(JOB_STATES)?
+                .get(job.get())?
+                .map(|bytes| JobStateRow::decode_at(job.get(), bytes.value()))
+                .transpose()?
+                .and_then(|state| state.outcome)
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+            let conversation = tx
+                .open_table(JOBS)?
+                .get(job.get())?
+                .map(|bytes| JobRow::decode_at(job.get(), bytes.value()))
+                .transpose()?
+                .and_then(|row| row.parent_id);
+            if let Some(text) = derived::search_output_text(&record, completed)
+                && let Some(conversation) = conversation
             {
                 derived::index_search_text(tx, conversation, job, 1, seq, text)?;
             }

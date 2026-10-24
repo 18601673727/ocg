@@ -700,7 +700,8 @@ impl Command {
     }
 
     /// The space this command's transaction is allowed to need: twice its
-    /// variable-length payload plus [`TRANSACTION_ALLOWANCE_BYTES`]. Saturates
+    /// variable-length payload and search-index allowance, plus
+    /// [`TRANSACTION_ALLOWANCE_BYTES`]. Saturates
     /// rather than wraps, so an absurd payload fails the space check.
     pub(super) fn expected_write_bytes(&self) -> u64 {
         let payload = match self {
@@ -719,7 +720,23 @@ impl Command {
                 | persistence::ApprovalDecision::Voided => 64,
             },
             Self::ApplyJobTool { tool, .. } => {
-                byte_count(format!("{tool:?}").len()).saturating_add(4096)
+                use crate::orchestration::job_tools::JobToolCall;
+                let search = match tool {
+                    JobToolCall::JobAssign { objective, .. }
+                    | JobToolCall::JobDispatch { objective, .. } => search_index_bytes(objective),
+                    JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
+                    JobToolCall::JobLimits { .. }
+                    | JobToolCall::JobAgents { .. }
+                    | JobToolCall::JobWorkers { .. }
+                    | JobToolCall::JobStop { .. }
+                    | JobToolCall::JobClose { .. }
+                    | JobToolCall::JobHold { .. }
+                    | JobToolCall::JobUnhold { .. }
+                    | JobToolCall::JobRetry { .. } => 0,
+                };
+                byte_count(format!("{tool:?}").len())
+                    .saturating_add(4096)
+                    .saturating_add(search)
             }
             Self::CreateExecutionPool { pool, .. } => byte_count(pool.name.len()),
             Self::SetExecutionPoolEnabled { .. } | Self::UpdateExecutionPool { .. } => 64,
@@ -733,11 +750,22 @@ impl Command {
                 entry: first,
                 format,
                 ..
-            } => byte_count(format!("{first:?}").len()).saturating_add(
-                format.as_ref().map_or(0, |format| {
+            } => byte_count(format!("{first:?}").len())
+                .saturating_add(match first {
+                    Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. } => {
+                        search_index_bytes(text)
+                    }
+                    Entry::Notice { .. }
+                    | Entry::Decision { .. }
+                    | Entry::RetryOf { .. }
+                    | Entry::Iteration { .. }
+                    | Entry::ContextPreparation { .. }
+                    | Entry::ContextUse { .. }
+                    | Entry::ResponseFormat { .. } => 0,
+                })
+                .saturating_add(format.as_ref().map_or(0, |format| {
                     byte_count(storage::encode_response_format(format).len())
-                }),
-            ),
+                })),
             Self::StopTurn { .. }
             | Self::Close { .. }
             | Self::Hold { .. }
@@ -753,7 +781,14 @@ impl Command {
                 JobFinalization::Completed(result)
                 | JobFinalization::Failed(result)
                 | JobFinalization::Cancelled(result) => {
+                    let text = result
+                        .value
+                        .as_ref()
+                        .and_then(|value| value.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                        .or(result.summary.as_deref());
                     output_bytes(&result.summary, &result.code, &result.value)
+                        .saturating_add(text.map_or(0, search_index_bytes))
                 }
                 JobFinalization::Unknown => 0,
             },
@@ -919,6 +954,14 @@ pub(super) fn refuse<T>(reply: Reply<T>, error: impl Fn() -> DatabaseError) {
     reply.send(Err(error())).ok();
 }
 
+// At most three gram keys per lowercased scalar; each 53-byte key has
+// an additional allowance for its index entry. The command doubles this too.
+fn search_index_bytes(text: &str) -> u64 {
+    byte_count(text.chars().flat_map(char::to_lowercase).count())
+        .saturating_mul(3)
+        .saturating_mul(64)
+}
+
 pub(super) fn command_bytes(commands: &[ProjectCommand]) -> u64 {
     commands.iter().fold(0, |total, command| {
         command.argv.iter().fold(
@@ -985,6 +1028,58 @@ pub(super) fn output_bytes(
 #[cfg(test)]
 mod decision_budget_tests {
     use super::*;
+    #[test]
+    fn message_and_result_estimates_cover_search_posting_amplification() {
+        let text = (0x1000..0x3000)
+            .filter_map(char::from_u32)
+            .collect::<String>();
+        let keys = text.chars().count() * 3 - 3;
+        let postings = u64::try_from(keys * 53).unwrap();
+        let (reply, _) = flume::bounded(1);
+        let command = Command::Append {
+            conversation: JobId::new(1),
+            entry: Entry::UserMessage {
+                text: text.clone(),
+                attachments: vec![],
+            },
+            freeze: None,
+            submission: None,
+            format: None,
+            reply,
+        };
+        assert!(command.expected_write_bytes() >= TRANSACTION_ALLOWANCE_BYTES + 2 * postings);
+        let (reply, _) = flume::bounded(1);
+        let command = Command::FinalizeJob {
+            job: JobId::new(2),
+            cause: None,
+            ignore_stop_cause: false,
+            finalization: JobFinalization::Completed(crate::persistence::FinalResult {
+                summary: Some(text.clone()),
+                code: None,
+                goal_reached: None,
+                value: None,
+            }),
+            reply,
+        };
+        assert!(command.expected_write_bytes() >= TRANSACTION_ALLOWANCE_BYTES + 2 * postings);
+        let (reply, _) = flume::bounded(1);
+        let command = Command::ApplyJobTool {
+            call: ToolCallRef {
+                job: JobId::new(2),
+                request: RequestNumber::FIRST,
+                index: 0,
+            },
+            tool: crate::orchestration::job_tools::JobToolCall::JobMessage {
+                conversation: JobId::new(1).to_string(),
+                text,
+            },
+            max_result_bytes: 1000,
+            reply,
+        };
+        assert!(command.expected_write_bytes() >= TRANSACTION_ALLOWANCE_BYTES + 2 * postings);
+        assert_eq!(search_index_bytes("İ"), 2 * 3 * 64);
+    }
+
     #[test]
     fn decision_payload_estimate_counts_uuid_targets_and_variable_text() {
         use crate::persistence::{DecisionAgentConfig, WorkspaceAccess};

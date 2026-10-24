@@ -7,7 +7,7 @@
  * query shows the sidebar's own list, while a non-empty query asks the
  * control server's conversation search (titles plus user/agent
  * messages and assistant replies, terms combined by AND) through the same account's control
- * client and keeps only the sessions the sidebar already renders.
+ * client, including matches not yet loaded in the sidebar.
  * Selecting a result goes through the same session-selection callback the
  * sidebar list uses, so navigation, URL state and attention handling stay
  * identical. The server reads only this account's database, so one
@@ -38,6 +38,7 @@ import {
 import type { ChatSession } from "../types";
 import { useI18n } from "../i18n";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import { appendSearchResults, conversationSearchMatches, type SearchConversation, type SearchMatch } from "./conversation-search-results";
 
 export type ConversationSearchProps = {
   /** Element used to open the overlay; receives the dialog's trigger props. */
@@ -47,84 +48,67 @@ export type ConversationSearchProps = {
   activeSessionId: string;
   /** The same selection callback the sidebar list uses. */
   onSelect: (id: string) => void;
+  onOpenConversation?: (conversation: string) => void;
   /** This account's control client for full-text search; omitting it keeps title filtering. */
   control?: HttpCanonicalControlClient;
 };
-
-function sessionKeys(session: ChatSession): string[] {
-  const keys = [session.id];
-  if (session.conversationId && session.conversationId !== session.id) keys.push(session.conversationId);
-  return keys;
-}
 
 export function ConversationSearch({
   trigger,
   sessions,
   activeSessionId,
   onSelect,
+  onOpenConversation,
   control,
 }: ConversationSearchProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [serverKeys, setServerKeys] = useState<ReadonlySet<string> | null>(null);
+  const [serverResults, setServerResults] = useState<readonly SearchConversation[] | null>(null);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
-  const [page, setPage] = useState(0);
+  const [before, setBefore] = useState<string | undefined>();
+  const [attempt, setAttempt] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const needle = query.trim();
-  const cursorRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!open || !control || !needle) return;
     let cancelled = false;
     const controller = new AbortController();
-    const before = page === 0 ? undefined : cursorRef.current ?? undefined;
     const timer = setTimeout(() => {
       setLoading(true);
       setFailed(false);
       void control.searchConversations({ query: needle, before, limit: 50, signal: controller.signal })
         .then(answer => {
           if (cancelled) return;
-          setServerKeys(previous => {
-            const keys = new Set(page === 0 ? [] : previous ?? []);
-            for (const conversation of answer.conversations) {
-              keys.add(conversation.root_job);
-              keys.add(conversation.tip_job);
-            }
-            return keys;
-          });
-          cursorRef.current = answer.has_more ? answer.next_before : null;
-          setNextBefore(cursorRef.current);
+          setServerResults(previous => appendSearchResults(before ? previous ?? [] : [], answer.conversations));
+          setNextBefore(answer.has_more ? answer.next_before : null);
         })
         .catch(() => { if (!cancelled) setFailed(true); })
         .finally(() => { if (!cancelled) setLoading(false); });
-    }, page === 0 ? 200 : 0);
+    }, before === undefined ? 200 : 0);
     return () => { cancelled = true; clearTimeout(timer); controller.abort(); };
-  }, [open, control, needle, page]);
+  }, [open, control, needle, before, attempt]);
 
   // An untitled session is shown as "New chat", so it is matched under that
   // name too rather than only against its empty title. Same rule as the list.
   const untitledLabel = t("sidebar.newChat");
-  const matches = useMemo(() => {
+  const matches = useMemo<readonly SearchMatch[]>(() => {
     if (!needle) return sessions;
-    if (serverKeys) {
-      // The server already matched titles and messages across projects;
-      // keep the sidebar's own order, including hidden-session handling
-      // upstream. The keys come from this account's control client only.
-      return sessions.filter(session => sessionKeys(session).some(key => serverKeys.has(key)));
-    }
+    if (serverResults) return conversationSearchMatches(sessions, serverResults);
     const lowered = needle.toLowerCase();
     return sessions.filter(session =>
       (session.title || untitledLabel).toLowerCase().includes(lowered),
     );
-  }, [sessions, needle, serverKeys, untitledLabel]);
+  }, [sessions, needle, serverResults, untitledLabel]);
 
   const close = () => setOpen(false);
-  const select = (id: string) => {
+  const select = (match: SearchMatch) => {
     close();
-    onSelect(id);
+    if (match.conversation && onOpenConversation) onOpenConversation(match.conversation);
+    else onSelect(match.id);
   };
 
   return (
@@ -135,12 +119,11 @@ export function ConversationSearch({
         // A reopened dialog starts from the unfiltered list, like the sidebar.
         if (!next) {
           setQuery("");
-          setServerKeys(null);
+          setServerResults(null);
           setNextBefore(null);
           setLoading(false);
           setFailed(false);
-          setPage(0);
-          cursorRef.current = null;
+          setBefore(undefined);
         }
       }}
     >
@@ -182,19 +165,18 @@ export function ConversationSearch({
                 setQuery(event.target.value);
                 if (event.target.value.trim() === needle) return;
                 // A new needle invalidates the previous server result.
-                setServerKeys(null);
+                setServerResults(null);
                 setNextBefore(null);
                 setFailed(false);
                 setLoading(Boolean(control && event.target.value.trim()));
-                setPage(0);
-                cursorRef.current = null;
+                setBefore(undefined);
               }}
               onKeyDown={event => {
                 // Enter takes the first match; Escape belongs to the dialog.
                 if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
                 event.preventDefault();
                 const first = matches[0];
-                if (first) select(first.id);
+                if (first) select(first);
               }}
               className="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
@@ -203,7 +185,7 @@ export function ConversationSearch({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6">
           {loading && <p role="status" className="px-2 py-2 text-sm text-muted-foreground">{t("common.loading")}</p>}
-          {failed && <div role="alert" className="px-2 py-2 text-sm text-destructive"><p>{t("sidebar.searchFailed")}</p><Button variant="outline" size="sm" onClick={() => { setLoading(true); setPage(value => value + 1); }}>{t("common.retry")}</Button></div>}
+          {failed && <div role="alert" className="px-2 py-2 text-sm text-destructive"><p>{t("sidebar.searchFailed")}</p><Button variant="outline" size="sm" disabled={loading} onClick={() => { setLoading(true); setAttempt(value => value + 1); }}>{t("common.retry")}</Button></div>}
           <ul aria-busy={loading} role="listbox" aria-label={t("nav.chatSessions")} className="flex flex-col gap-px pb-2">
             {matches.map(session => {
               const active = session.id === activeSessionId;
@@ -213,7 +195,7 @@ export function ConversationSearch({
                     type="button"
                     role="option"
                     aria-selected={active}
-                    onClick={() => select(session.id)}
+                    onClick={() => select(session)}
                     className={cn(
                       "flex w-full min-w-0 items-center gap-2 rounded-md border border-transparent px-2 py-2 text-left",
                       TYPOGRAPHY_SCALE.body_sm,
@@ -240,7 +222,7 @@ export function ConversationSearch({
               </li>
             )}
           </ul>
-          {nextBefore && <Button variant="outline" size="sm" disabled={loading} onClick={() => { setLoading(true); setPage(value => value + 1); }}>{t("sidebar.searchMore")}</Button>}
+          {nextBefore && <Button variant="outline" size="sm" disabled={loading || failed} onClick={() => { setLoading(true); setBefore(nextBefore ?? undefined); }}>{t("sidebar.searchMore")}</Button>}
         </div>
       </DialogContent>
     </Dialog>

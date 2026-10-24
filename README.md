@@ -143,7 +143,7 @@ them after restart using their frozen configuration and their Project's current
 commands. A running turn abandoned by a crash becomes Unknown; when its stop
 cannot be proven, its quarantined slot stalls the conversation until the stop
 is confirmed. CLI process turns belong to their admitting process and are
-cancelled if reopened without a claim. The stored format is 27, with no migration;
+cancelled if reopened without a claim. The stored format is 29, with no migration;
 recreate data directories made by earlier versions.
 
 Conversation depth is derived from parent links. Limits default to depth 3

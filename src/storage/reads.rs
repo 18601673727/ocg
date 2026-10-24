@@ -1863,9 +1863,17 @@ fn conversation_matches(
                         .get((turn, seq))?
                         .ok_or_else(|| StorageError::corrupted("search output missing"))?;
                     let output = decode_output((turn, seq), bytes.value())?;
-                    derived::search_output_text(&output)
-                        .ok_or_else(|| StorageError::corrupted("search output is not text"))?
-                        .to_owned()
+                    let completed = rx
+                        .open_table(JOB_STATES)?
+                        .get(turn)?
+                        .map(|bytes| JobStateRow::decode_at(turn, bytes.value()))
+                        .transpose()?
+                        .and_then(|state| state.outcome)
+                        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+                    let Some(text) = derived::search_output_text(&output, completed) else {
+                        continue;
+                    };
+                    text.to_owned()
                 }
                 _ => return Err(StorageError::corrupted("invalid search source")),
             };

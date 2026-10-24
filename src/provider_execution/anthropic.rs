@@ -533,6 +533,46 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_large_signed_events_obey_the_configured_output_budget() {
+        let signature = "s".repeat(70000);
+        let text = "\0".repeat(12000);
+        let mut events = vec![
+            start(),
+            block(
+                0,
+                json!({"type":"thinking","thinking":"why","signature":""}),
+            ),
+            delta(0, json!({"type":"signature_delta","signature":signature})),
+            stop(0),
+            block(1, json!({"type":"text","text":text})),
+            stop(1),
+        ];
+        events.extend(finish("end_turn"));
+        let result = parse(events.clone(), &ChatConversation::default()).unwrap();
+        assert_eq!(result.text, text);
+        assert_eq!(
+            result.response_items[0]["content"][0]["signature"],
+            signature
+        );
+        let config = ProviderExecutionConfig {
+            transport: LlmTransport::AnthropicMessages,
+            max_output_bytes: 65536,
+            ..Default::default()
+        };
+        let error = crate::test_support::wait(stream::read_response(
+            payload(steps(events), config.cancellation.clone()),
+            200,
+            Instant::now(),
+            None,
+            &config,
+            None,
+            &ChatConversation::default(),
+        ))
+        .unwrap_err();
+        assert!(matches!(error, ProviderExecutionError::Stopped { .. }));
+    }
+
+    #[test]
     fn anthropic_stream_preserves_signed_thinking_text_and_cache_usage() {
         let mut events = vec![
             start(),
@@ -764,6 +804,7 @@ mod http_tests {
                     vec![
                         json!({"type":"thinking","thinking":"why","signature":"signed"}),
                         json!({"type":"tool_use","id":"call","name":"f","input":{}}),
+                        json!({"type":"tool_use","id":"call-2","name":"f","input":{}}),
                     ]
                 } else {
                     assert_eq!(body["messages"][1]["content"][0]["signature"], "signed");
@@ -771,6 +812,11 @@ mod http_tests {
                     assert_eq!(
                         body["messages"][2]["content"][0],
                         json!({"type":"tool_result","tool_use_id":"call","content":"done"})
+                    );
+                    assert_eq!(body["messages"][1]["content"][2]["id"], "call-2");
+                    assert_eq!(
+                        body["messages"][3]["content"][0],
+                        json!({"type":"tool_result","tool_use_id":"call-2","content":"also done"})
                     );
                     vec![json!({"type":"text","text":"finished"})]
                 };
@@ -830,7 +876,7 @@ mod http_tests {
             .unwrap()
             .admitted()
             .unwrap();
-            assert_eq!(result.tool_calls.len(), 1);
+            assert_eq!(result.tool_calls.len(), 2);
             assert_eq!(result.request_id.as_deref(), Some("anthropic-request"));
             conversation.response_items.insert(2, result.response_items);
             conversation.messages.push(ChatMessage::assistant(
@@ -844,6 +890,9 @@ mod http_tests {
             conversation
                 .messages
                 .push(ChatMessage::tool("call", "done"));
+            conversation
+                .messages
+                .push(ChatMessage::tool("call-2", "also done"));
             let result = execute_conversation(
                 &frozen,
                 &conversation,
