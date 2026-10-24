@@ -120,7 +120,122 @@ impl Default for CompactionPolicy {
     }
 }
 
+/// One resolved automatic recipe. The numbers are the uncalibrated proposal
+/// in the workstream notes: they are not approved production defaults.
+/// `Disabled` is explicit and does not trigger preparation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResolvedCompaction {
+    pub mode: &'static str,
+    /// Trigger when estimated occupancy exceeds this. `None` is Disabled.
+    pub trigger: Option<u32>,
+    pub target: u32,
+    pub headroom: u32,
+    pub minimum_source: u32,
+    pub minimum_savings: u32,
+    pub preserve_recent_turns: u32,
+    pub cooldown_seconds: u32,
+    pub summarization_model: Option<ConfigId>,
+    /// These values are a proposal, not a calibrated or approved default.
+    pub uncalibrated: bool,
+}
+
 impl CompactionPolicy {
+    /// Resolves the selected policy against a known window. An unknown window
+    /// cannot drive utilization automation. Disabled stays disabled.
+    pub fn recipe(
+        self,
+        window: Option<u32>,
+        output_reserve: u32,
+        safety: u32,
+        headroom: u32,
+    ) -> Result<ResolvedCompaction, &'static str> {
+        let disabled = ResolvedCompaction {
+            mode: "disabled",
+            trigger: None,
+            target: 0,
+            headroom,
+            minimum_source: 0,
+            minimum_savings: 0,
+            preserve_recent_turns: 0,
+            cooldown_seconds: 0,
+            summarization_model: self.summarization_model,
+            uncalibrated: true,
+        };
+        if matches!(self.mode, CompactionMode::Off) {
+            return Ok(disabled);
+        }
+        let Some(window) = window else {
+            return Err("automatic compaction requires a known context window");
+        };
+        let budget = window
+            .checked_sub(output_reserve)
+            .and_then(|value| value.checked_sub(safety))
+            .ok_or("context window cannot hold the output reserve and safety allowance")?;
+        let headroom = headroom.max(output_reserve);
+        let (trigger_gap, target_gap, preserve, cooldown) = match self.mode {
+            CompactionMode::Off => return Ok(disabled),
+            // Uncalibrated proposal: Conservative B-H / B-2H / four turns / 10 minutes.
+            CompactionMode::Auto {
+                preset: CompactionPreset::Conservative,
+            } => (1, 2, 4, 600),
+            // Uncalibrated proposal: Balanced B-2H / B-3H / two turns / 5 minutes.
+            CompactionMode::Auto {
+                preset: CompactionPreset::Balanced,
+            } => (2, 3, 2, 300),
+            // Uncalibrated proposal: Aggressive B-3H / B-4H / one turn / 2 minutes.
+            CompactionMode::Auto {
+                preset: CompactionPreset::Aggressive,
+            } => (3, 4, 1, 120),
+            CompactionMode::Custom { policy } => {
+                policy.validate()?;
+                return Ok(ResolvedCompaction {
+                    mode: "custom",
+                    trigger: Some(policy.trigger_tokens),
+                    target: policy.target_tokens,
+                    headroom,
+                    minimum_source: policy.minimum_source_tokens,
+                    minimum_savings: policy.minimum_savings_tokens,
+                    preserve_recent_turns: policy.preserve_recent_turns,
+                    cooldown_seconds: policy.cooldown_seconds,
+                    summarization_model: self.summarization_model,
+                    uncalibrated: true,
+                });
+            }
+        };
+        let trigger = budget
+            .checked_sub(headroom.saturating_mul(trigger_gap))
+            .ok_or("preset trigger does not fit the known window")?;
+        let target = budget
+            .checked_sub(headroom.saturating_mul(target_gap))
+            .ok_or("preset target does not fit the known window")?;
+        if target >= trigger {
+            return Err("preset target is not below its trigger");
+        }
+        Ok(ResolvedCompaction {
+            mode: match self.mode {
+                CompactionMode::Auto {
+                    preset: CompactionPreset::Conservative,
+                } => "conservative",
+                CompactionMode::Auto {
+                    preset: CompactionPreset::Balanced,
+                } => "balanced",
+                CompactionMode::Auto {
+                    preset: CompactionPreset::Aggressive,
+                } => "aggressive",
+                CompactionMode::Off | CompactionMode::Custom { .. } => "disabled",
+            },
+            trigger: Some(trigger),
+            target,
+            headroom,
+            minimum_source: headroom.saturating_mul(2),
+            minimum_savings: headroom,
+            preserve_recent_turns: preserve,
+            cooldown_seconds: cooldown,
+            summarization_model: self.summarization_model,
+            uncalibrated: true,
+        })
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         if let CompactionMode::Custom { policy } = self.mode {
             policy.validate()?;
@@ -628,5 +743,41 @@ mod title_tests {
         let prompt = title_prompt(&"你".repeat(10000));
         assert!(prompt.len() < 9000);
         assert!(prompt.contains("Excerpt: \""));
+    }
+
+    #[test]
+    fn presets_are_uncalibrated_and_disabled_does_not_trigger() {
+        let host = CompactionPolicy {
+            mode: CompactionMode::Auto {
+                preset: CompactionPreset::Aggressive,
+            },
+            summarization_model: None,
+            predictive: None,
+        };
+        let disabled = CompactionPolicy::default();
+        let selected = CompactionPolicy::resolve(host, None, Some(disabled));
+        let recipe = selected
+            .recipe(Some(32_000), 4_096, 256, 4_096)
+            .expect("recipe");
+        assert_eq!(recipe.mode, "disabled");
+        assert!(recipe.trigger.is_none());
+        assert!(recipe.uncalibrated);
+        let balanced = CompactionPolicy {
+            mode: CompactionMode::Auto {
+                preset: CompactionPreset::Balanced,
+            },
+            ..CompactionPolicy::default()
+        };
+        let recipe = balanced
+            .recipe(Some(32_000), 4_096, 256, 4_096)
+            .expect("balanced");
+        assert_eq!(recipe.mode, "balanced");
+        assert!(recipe.uncalibrated);
+        assert!(
+            recipe
+                .trigger
+                .is_some_and(|trigger| trigger > recipe.target)
+        );
+        assert!(balanced.recipe(None, 4_096, 256, 4_096).is_err());
     }
 }

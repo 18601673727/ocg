@@ -622,6 +622,7 @@ impl Batch {
             .filter(OpenPool::has_room)
             .collect();
         let mut grants = Vec::new();
+        let mut deferred = BTreeSet::new();
         while free > 0 {
             let offered: BTreeSet<u16> = pools
                 .iter()
@@ -640,6 +641,9 @@ impl Batch {
                     let mut first = None;
                     for entry in ready.range((key, 0)..=(key, u128::MAX))? {
                         let id = entry?.0.value().1;
+                        if deferred.contains(&id) {
+                            continue;
+                        }
                         if let Some(row) = jobs.get(id)?
                             && JobRow::decode_at(id, row.value())?.kind.is_stored()
                         {
@@ -672,6 +676,13 @@ impl Batch {
                 pool.held += 1;
                 (pool.id, pool.edit_seq, pool.body.capabilities.clone())
             };
+            // Policy is resolved before a slot is taken. A turn that still
+            // needs preparation stays pending; claiming it would hold a slot
+            // while the summary is produced.
+            if self.prepare_if_needed(JobId::new(job))? {
+                deferred.insert(job);
+                continue;
+            }
             self.write_claim(JobId::new(job), key, pool, edit_seq, capabilities)?;
             grants.push(JobId::new(job));
             free -= 1;
@@ -683,6 +694,126 @@ impl Batch {
             self.probe = Some(Probe::Claim(*first));
         }
         Ok(grants)
+    }
+
+    /// Prepares when the resolved policy says the turn is over its trigger,
+    /// and reports that the turn should stay pending. Disabled, an unknown
+    /// window, and a missing summarizer do not block the turn. The preset
+    /// numbers are the uncalibrated proposal.
+    fn prepare_if_needed(&mut self, job: JobId) -> Result<bool, BatchError> {
+        let row = self.require_job(job)?;
+        if !row.kind.is_stored() {
+            return Ok(false);
+        }
+        if row.kind.name() == Some(crate::persistence::COMPACTION_JOB_NAME) {
+            return Ok(false);
+        }
+        let Some(conversation) = row.parent_id else {
+            return Ok(false);
+        };
+        let stored = self.conversation(conversation)?.compaction_policy;
+        let agent = self
+            .turn_execution(&row)
+            .ok()
+            .and_then(|(_, _, agent)| agent)
+            .and_then(|agent| self.config(agent).ok().flatten())
+            .and_then(|record| match record.body {
+                ConfigBody::Agent(agent) => agent.compaction_policy,
+                _ => None,
+            });
+        let policy = crate::persistence::CompactionPolicy::resolve(
+            crate::persistence::CompactionPolicy::default(),
+            agent,
+            stored,
+        );
+        if matches!(policy.mode, crate::persistence::CompactionMode::Off) {
+            return Ok(false);
+        }
+        let Some(summarizer) = policy.summarization_model else {
+            return Ok(false);
+        };
+        let Some(model) = self.config(summarizer)? else {
+            return Ok(false);
+        };
+        let ConfigBody::Model(model) = model.body else {
+            return Ok(false);
+        };
+        let output = model
+            .parameters
+            .max_completion_tokens
+            .or(model.parameters.max_tokens)
+            .unwrap_or(4096);
+        let recipe = policy
+            .recipe(model.context_window, output, 256, output)
+            .ok();
+        let Some(recipe) = recipe else {
+            return Ok(false);
+        };
+        let Some(trigger) = recipe.trigger else {
+            return Ok(false);
+        };
+        // A coarse occupancy: stored input and result bytes, three bytes a
+        // token. Cached billing tokens are not subtracted.
+        let occupancy = self.step(|tx| {
+            let mut cursor = Some(job);
+            let mut bytes = 0usize;
+            let mut seen = 0usize;
+            while let Some(turn) = cursor {
+                if seen >= 64 {
+                    break;
+                }
+                seen += 1;
+                let inputs = tx.open_table(TURN_INPUTS)?;
+                for entry in inputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+                    bytes = bytes.saturating_add(entry?.1.value().len());
+                }
+                let row = tx
+                    .open_table(JOBS)?
+                    .get(turn.get())?
+                    .map(|bytes| JobRow::decode_at(turn.get(), bytes.value()))
+                    .transpose()?;
+                cursor = row.and_then(|row| row.kind.previous());
+            }
+            Ok(bytes.div_ceil(3))
+        })?;
+        if occupancy <= usize::try_from(trigger).unwrap_or(usize::MAX) {
+            return Ok(false);
+        }
+        let outstanding = self.live_children(conversation)?.into_iter().any(|child| {
+            self.job(child).ok().flatten().is_some_and(|row| {
+                row.kind.is_conversation()
+                    && self.tip(child).ok().flatten().is_some_and(|turn| {
+                        self.require_job(turn).ok().is_some_and(|turn| {
+                            turn.kind.name() == Some(crate::persistence::COMPACTION_JOB_NAME)
+                        })
+                    })
+            })
+        });
+        if outstanding {
+            return Ok(true);
+        }
+        let mut bytes = [0u8; 32];
+        bytes[..16].copy_from_slice(&conversation.get().to_le_bytes());
+        bytes[16..].copy_from_slice(&job.get().to_le_bytes());
+        let key = crate::persistence::SubmissionKey::from_digest(bytes);
+        let fingerprint = crate::persistence::RequestFingerprint::from_digest(bytes);
+        // A source the summarizer cannot fit is not prepared and does not
+        // block the turn. Manual compaction still refuses that case.
+        if occupancy
+            > usize::try_from(model.context_window.unwrap_or(0).saturating_sub(output))
+                .unwrap_or(usize::MAX)
+        {
+            return Ok(false);
+        }
+        match self.request_compaction(
+            conversation,
+            summarizer,
+            crate::persistence::NewSubmission { key, fingerprint },
+        ) {
+            Ok(crate::persistence::CompactionRequest::Prepared { .. }) => Ok(true),
+            Ok(crate::persistence::CompactionRequest::Noop { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Writes the claim of `job` into `pool`: the claim itself, the Job's

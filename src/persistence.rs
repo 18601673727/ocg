@@ -18,9 +18,9 @@ pub use conversations::{
     CompactionRequest, ContextSourceManifest, ConversationAction, ConversationLimits,
     ConversationSpec, CustomPolicy, Entry, EntryKind, JobKind, MAX_CONVERSATION_DEPTH, Notice,
     NoticeBody, NoticeClass, NoticeEvent, Origin, PlanSource, PredictiveCompaction, RecordEvent,
-    Recurrence, RecurrenceHalt, RecurrencePhase, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE,
-    SourceBoundary, StopCause, StopProof, SummarizationResult, TITLE_JOB_NAME, TurnEntry,
-    TurnExecution, title_prompt,
+    Recurrence, RecurrenceHalt, RecurrencePhase, ResolvedCompaction, ResponseFormat,
+    SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause, StopProof, SummarizationResult,
+    TITLE_JOB_NAME, TurnEntry, TurnExecution, title_prompt,
 };
 mod execution;
 mod identity;
