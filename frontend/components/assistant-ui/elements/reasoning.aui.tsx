@@ -58,20 +58,6 @@ const ReasoningImpl: ReasoningMessagePartComponent = (props) => (
   <MarkdownText text={props.text} status={props.status} inMuted />
 );
 
-export const useLatestReasoningIndex = () =>
-  useAuiState((s) => {
-    for (let messageIndex = s.thread.messages.length - 1; messageIndex >= 0; messageIndex--) {
-      const message = s.thread.messages[messageIndex];
-      if (message.role !== "assistant") continue;
-      for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex--) {
-        if (message.parts[partIndex].type === "reasoning") {
-          return message.id === s.message.id ? partIndex : -1;
-        }
-      }
-    }
-    return -1;
-  });
-
 const ReasoningGroupImpl: ReasoningGroupComponent = ({ children, startIndex, endIndex }) => {
   const unsettled = useAuiState((s) => s.message.status?.type === "running");
   const duration = useAuiState((s) => {

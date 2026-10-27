@@ -30,9 +30,9 @@ use crate::service::ai::providers::openai_compatible::{
     ToolCallRefusal, ToolWire,
 };
 use crate::service::ai::providers::{
-    self, CancellationToken, CredentialResolver, EnvironmentCredentialResolver, OutputSinkError,
-    ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
-    ProviderObservation, ProviderOutputSink,
+    self, CancellationToken, CredentialResolver, OutputSinkError, ProviderExecutionConfig,
+    ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
+    ProviderOutputSink,
 };
 use crate::system::scheduler::{StartedJob, StopHandle};
 
@@ -221,23 +221,6 @@ impl std::fmt::Display for ToolLoopStop {
             Self::ContextWindow => {
                 formatter.write_str("the conversation exceeds the model's context window")
             }
-        }
-    }
-}
-
-impl ProviderExecutionPlan {
-    pub fn environment_credentials(
-        executor_id: ExecutorId,
-        input: JobInputDraft,
-        job: Job,
-    ) -> Self {
-        Self {
-            executor_id,
-            input,
-            job,
-            credential_resolver: Arc::new(EnvironmentCredentialResolver),
-            provider_config: ProviderExecutionConfig::default(),
-            tools: None,
         }
     }
 }

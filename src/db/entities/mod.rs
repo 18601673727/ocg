@@ -47,6 +47,7 @@ pub use job_context::{
     StopProof, SummarizationResult, SummarizationStage, SummarizationWork, SummaryFragment,
     TITLE_JOB_NAME, title_prompt,
 };
+pub(in crate::db) use job_context::{effective_entries, summary_chunks};
 pub use jobs::*;
 pub use metrics::*;
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
@@ -57,8 +58,7 @@ pub use scheduling::*;
 pub use statistics::{
     AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,
     AvailabilityStat, AvailabilityStatRecord, MixedRequests, ObservationCursor, ObservationFilter,
-    ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelCursor, ObservedModelFilter,
-    ObservedModelPage, RejectionCause, TimeRange, ToolStatRecord, UnavailableCause,
+    ObservationPage, RejectionCause, TimeRange, ToolStatRecord, UnavailableCause,
 };
 pub(crate) use usage::{JobUsage, TokenEvidence, TokenObservation};
 pub use usage::{

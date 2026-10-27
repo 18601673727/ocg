@@ -368,16 +368,6 @@ impl TokenRequestSample {
             .filter_map(TokenEvidence::sample)
             .collect())
     }
-
-    /// The input plus output of one Job: the sum of its requests' own
-    /// totals, known only when every one of them is. No counter is taken
-    /// from one request for another, and none is a maximum across them.
-    #[must_use]
-    pub fn job_total(samples: &[Self]) -> Option<u64> {
-        samples
-            .iter()
-            .try_fold(0_u64, |sum, sample| sum.checked_add(sample.total?))
-    }
 }
 
 /// The width of one usage summary bucket: one hour. A summary rounds its
@@ -519,4 +509,28 @@ pub(crate) struct JobUsage {
     pub(in crate::db) cache_write_tokens: u64,
     pub(in crate::db) reasoning_tokens: u64,
     pub(in crate::db) truncated: bool,
+}
+
+impl JobUsage {
+    pub(in crate::db) fn add_sample(&mut self, sample: &TokenRequestSample) {
+        self.requests = self.requests.saturating_add(1);
+        self.complete_requests = self
+            .complete_requests
+            .saturating_add(u64::from(sample.usage == TokenUsageState::Complete));
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(u64::from(sample.input.value().unwrap_or(0)));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(u64::from(sample.output.value().unwrap_or(0)));
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(u64::from(sample.cache_read.value().unwrap_or(0)));
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(u64::from(sample.cache_write.value().unwrap_or(0)));
+        self.reasoning_tokens = self
+            .reasoning_tokens
+            .saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
+    }
 }

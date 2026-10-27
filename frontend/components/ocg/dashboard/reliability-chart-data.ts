@@ -1,13 +1,8 @@
-import type {
-  decodeAvailability,
-  decodeUsage,
-  decodeUsageBuckets,
-  decodeUsageRetries,
-} from "../contracts";
+import type * as Api from "@/components/ocg/contracts/api";
 
-type BucketRow = ReturnType<typeof decodeUsageBuckets>["rows"][number];
-type RetryRow = ReturnType<typeof decodeUsageRetries>["retry_rows"][number];
-type UsageObservation = ReturnType<typeof decodeUsage>["observations"][number];
+type BucketRow = Api.Envelope<Api.UsageBuckets>["rows"][number];
+type RetryRow = Api.UsageRetries["retry_rows"][number];
+type UsageObservation = Api.Usage["observations"][number];
 
 export type ReliabilityBucket = {
   bucketUs: number;
@@ -56,7 +51,7 @@ export function summarizeReliability(
   fromUs: number,
   untilUs: number,
   widthUs: number,
-  availability: readonly ReturnType<typeof decodeAvailability>["observations"][number][],
+  availability: readonly Api.Availability["observations"][number][],
 ): ReliabilitySummary {
   const buckets: ReliabilityBucket[] = [];
   if (widthUs > 0) {

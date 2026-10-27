@@ -3,6 +3,13 @@ use crate::db::{Batch, BatchError};
 use std::collections::BTreeSet;
 
 impl Batch {
+    pub(crate) fn root_group(&mut self, mut root: JobId) -> Result<JobId, BatchError> {
+        while let Some(parent) = self.require_job(root)?.parent_id {
+            root = parent;
+        }
+        Ok(root)
+    }
+
     pub(crate) fn live_subtree(&mut self, root: JobId) -> Result<Vec<JobId>, BatchError> {
         let mut result = vec![root];
         let mut i = 0;

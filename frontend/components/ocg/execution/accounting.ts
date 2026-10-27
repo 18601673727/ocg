@@ -19,7 +19,3 @@ export type JobAccounting = {
   ceiling: BudgetCeiling | null;
   consumption: UsageCost | null;
 };
-
-export function emptyAccounting(): JobAccounting {
-  return { ceiling: null, consumption: null };
-}

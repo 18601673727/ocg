@@ -327,62 +327,6 @@ pub struct ObservationPage<T> {
     pub next: Option<ObservationCursor>,
 }
 
-/// Selects historical (Provider, model) choices: the frozen targets of LLM
-/// Metrics and AvailabilityStats observed within `observed`, which is
-/// compared with the producer's observation time like
-/// [`ObservationFilter::observed`]. A configured model nothing observed has
-/// no choice here.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservedModelFilter {
-    pub observed: TimeRange,
-    pub provider: Option<LlmProviderId>,
-}
-
-/// A Provider and an exact, case-sensitive model name that observations
-/// were recorded against, as their Jobs froze them. Choices are ordered by
-/// Provider ID and then by the model name's SHA-256 digest, the order of the
-/// request-scope index, so a bounded scan and its continuation agree; the
-/// order is stable but not alphabetical.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObservedModel {
-    pub provider: LlmProviderId,
-    pub model: String,
-}
-
-/// Which records within the time range a choice comes from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservedModelChoice {
-    pub model: ObservedModel,
-    pub has_metrics: bool,
-    pub has_availability_stats: bool,
-}
-
-/// A position in the observed-model enumeration. `model` names the pair being
-/// read and the flags already seen in it, and the remaining fields are the
-/// last request-scope row examined, which the next page continues after.
-/// `complete` says the pair was fully read and its choice returned; otherwise
-/// the pair continues on the next page.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservedModelCursor {
-    pub model: ObservedModel,
-    pub has_metrics: bool,
-    pub has_availability_stats: bool,
-    pub complete: bool,
-    pub observed_at: Timestamp,
-    pub job: JobId,
-    pub request: RequestNumber,
-    pub seq: u32,
-}
-
-/// One page of choices. `next` is `None` once no later pair exists; a page
-/// may be empty while `next` is set, when the scan window held no pair with a
-/// record within the time range.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ObservedModelPage {
-    pub choices: Vec<ObservedModelChoice>,
-    pub next: Option<ObservedModelCursor>,
-}
-
 /// Aggregated statistics of one tool's admissions and execution outcomes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolStatRecord {

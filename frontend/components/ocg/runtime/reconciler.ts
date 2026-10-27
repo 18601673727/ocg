@@ -31,13 +31,8 @@ import type {
   RuntimeResumeCursor,
   RuntimeStreamId,
 } from "./runtime-envelope";
-import { validateRuntimeEnvelope } from "./runtime-envelope";
 import type { RuntimeSnapshotEnvelope, RuntimeSnapshotScope } from "./runtime-snapshot";
-import {
-  emptyRuntimeSnapshot,
-  sameSnapshotScope,
-  validateRuntimeSnapshotEnvelope,
-} from "./runtime-snapshot";
+import { emptyRuntimeSnapshot, sameSnapshotScope } from "./runtime-snapshot";
 import {
   boundDiagnostics,
   compareGeneration,
@@ -124,22 +119,6 @@ export function isDegradedSyncStatus(status: RuntimeSyncStatus | null | undefine
   );
 }
 
-/** Preserve a diagnostic without allowing an invalid payload to reach the reducer. */
-export function recordRuntimeDiagnostic(
-  state: RuntimeState,
-  diagnostic: RuntimeDiagnostic,
-  status?: RuntimeSyncStatus,
-): RuntimeState {
-  return {
-    snapshot: state.snapshot,
-    sync: {
-      ...state.sync,
-      ...(status !== undefined ? { status } : {}),
-      diagnostics: boundDiagnostics([...state.sync.diagnostics, diagnostic]),
-    },
-  };
-}
-
 /* -------------------------------------------------------------------------- */
 /* Helpers                                                                    */
 /* -------------------------------------------------------------------------- */
@@ -151,21 +130,6 @@ function withDiagnostics(state: RuntimeState, diagnostics: RuntimeDiagnostic[]):
     sync: {
       ...state.sync,
       diagnostics: boundDiagnostics([...state.sync.diagnostics, ...diagnostics]),
-    },
-  };
-}
-
-function setSyncStatus(
-  state: RuntimeState,
-  status: RuntimeSyncStatus,
-  diagnostic: RuntimeDiagnostic,
-): RuntimeState {
-  return {
-    snapshot: state.snapshot,
-    sync: {
-      ...state.sync,
-      status,
-      diagnostics: boundDiagnostics([...state.sync.diagnostics, diagnostic]),
     },
   };
 }
@@ -251,11 +215,6 @@ export function reconcileSnapshot(
   state: RuntimeState,
   envelope: RuntimeSnapshotEnvelope,
 ): RuntimeState {
-  const validation = validateRuntimeSnapshotEnvelope(envelope);
-  if (!validation.ok) {
-    return setSyncStatus(state, "error", validation.diagnostic);
-  }
-  envelope = validation.envelope;
   if (envelope.snapshot.logs !== undefined && envelope.snapshot.logs.length > 0) {
     const normalizedLogs = envelope.snapshot.logs.map(normalizeLogEntry);
     const logsChanged = normalizedLogs.some(
@@ -367,28 +326,6 @@ function installValidatedSnapshot(
 /* -------------------------------------------------------------------------- */
 
 export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope): RuntimeState {
-  const validation = validateRuntimeEnvelope(envelope);
-  if (!validation.ok) {
-    return setSyncStatus(state, "error", {
-      ...validation.diagnostic,
-      eventId:
-        typeof envelope === "object" &&
-        envelope !== null &&
-        "eventId" in envelope &&
-        typeof envelope.eventId === "string"
-          ? envelope.eventId
-          : undefined,
-      sequence:
-        typeof envelope === "object" &&
-        envelope !== null &&
-        "sequence" in envelope &&
-        typeof envelope.sequence === "number"
-          ? envelope.sequence
-          : undefined,
-    });
-  }
-  envelope = validation.envelope;
-
   const sync = state.sync;
   if (
     sync.status === "uninitialized" ||

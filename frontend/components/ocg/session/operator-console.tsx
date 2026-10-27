@@ -1,5 +1,7 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -8,7 +10,6 @@ import {
   createHttpCanonicalControlClient,
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/control-client";
-import { decodeHealth } from "@/components/ocg/contracts";
 import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
 import { SessionActions } from "../login/access-boundary";
@@ -17,7 +18,7 @@ import { useI18n } from "../i18n";
 
 type Phase = "checking" | "out" | "in" | "unreachable";
 
-type Health = ReturnType<typeof decodeHealth>;
+type Health = Api.Health;
 
 /** The local operator console: one browser session on this machine. */
 export function OperatorConsole() {

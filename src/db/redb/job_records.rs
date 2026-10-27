@@ -5,36 +5,6 @@ use crate::db::entities::{
 };
 use ::redb::ReadableTableMetadata;
 
-fn summary_chunks(
-    text: &str,
-    capacity: usize,
-) -> Option<Vec<crate::db::entities::SummarizationStage>> {
-    if capacity == 0 {
-        return None;
-    }
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    while start < text.len() {
-        if ranges.len() == 7 {
-            return None;
-        }
-        let mut end = start.saturating_add(capacity).min(text.len());
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            return None;
-        }
-        ranges.push(crate::db::entities::SummarizationStage::Chunk {
-            start: start as u64,
-            end: end as u64,
-            content: crate::db::entities::ContentDigest::of(&text.as_bytes()[start..end]),
-        });
-        start = end;
-    }
-    (!ranges.is_empty()).then_some(ranges)
-}
-
 impl Batch {
     pub(crate) fn job_execution(
         &mut self,
@@ -166,10 +136,7 @@ impl Batch {
             }
         }
         let (limits, depth) = self.group_limits(conversation)?;
-        let mut root = conversation;
-        while let Some(parent) = self.require_job(root)?.parent_id {
-            root = parent;
-        }
+        let root = self.root_group(conversation)?;
         if self.job_control(conversation)?.closing.is_some()
             || self.require_job_state(conversation)?.outcome.is_some()
             || depth.saturating_add(1) > limits.max_depth
@@ -229,7 +196,8 @@ impl Batch {
         let stages = if source_tokens <= budget as usize {
             vec![crate::db::entities::SummarizationStage::Direct]
         } else {
-            let Some(stages) = summary_chunks(&source_text, chunk_capacity) else {
+            let Some(stages) = crate::db::entities::summary_chunks(&source_text, chunk_capacity)
+            else {
                 refuse!(
                     "source_exceeds_summarizer",
                     "source cannot fit a bounded compaction tree; no source is truncated"
@@ -616,48 +584,10 @@ impl Batch {
         commands: Option<crate::db::entities::CommandAssessment>,
         assignment: Option<crate::db::entities::DecisionAssignment>,
     ) -> Result<(JobId, Appended), BatchError> {
-        if let Some(submission) = &submission
-            && let Some(record) = self.submission(submission.key)?
-        {
-            if record.fingerprint != submission.fingerprint {
-                return self.reject(Violation::SubmissionKeyUsed {
-                    job: record.job,
-                    same_request: false,
-                });
-            }
-            let turn = self.require_job(record.job)?;
-            let Some(conversation) = turn.parent_id else {
-                return self.corrupted("submission has no conversation".into());
-            };
-            return Ok((
-                conversation,
-                Appended {
-                    turn: record.job,
-                    seq: record.seq,
-                    joined: record.seq > 1,
-                },
-            ));
+        if let Some(existing) = self.existing_group_submission(submission.as_ref())? {
+            return Ok(existing);
         }
-        if let Some(parent) = parent {
-            let parent_row = self.require_job(parent)?;
-            if !parent_row.kind.is_group() {
-                return self.reject(Violation::InvalidValue("parent", "expected a conversation"));
-            }
-            let (limits, parent_depth) = self.group_limits(parent)?;
-            let mut root = parent;
-            while let Some(ancestor) = self.require_job(root)?.parent_id {
-                root = ancestor;
-            }
-            if parent_depth.saturating_add(1) > limits.max_depth
-                || self.live_children(parent)?.len() >= 16
-                || self.live_subtree(root)?.len() >= 64
-            {
-                return self.reject(Violation::InvalidValue(
-                    "children",
-                    "live conversation limit reached",
-                ));
-            }
-        }
+        self.validate_group_parent(parent)?;
         let work = crate::db::entities::DecisionWork {
             assignment,
             frozen,
@@ -668,31 +598,7 @@ impl Batch {
         if let Err(message) = work.validate() {
             return self.reject(Violation::InvalidValue("execution", message));
         }
-        let conversation = self.t1_submit(
-            None,
-            JobSpec {
-                allocation: None,
-                id: JobId::new(0),
-                created_at: self.now,
-                parent_id: parent,
-                kind: JobKind::Group {
-                    agent: spec.agent,
-                    project: spec.project,
-                    origin: spec.origin,
-                    keep_open: spec.keep_open,
-                },
-            },
-        )?;
-        self.put_job_control(conversation, &JobControl::default())?;
-        if let Some(parent) = parent {
-            self.step(|tx| {
-                tx.open_table(CHILD_GROUPS)?
-                    .insert((parent.get(), conversation.get()), ())?;
-                tx.open_table(LIVE_CHILDREN)?
-                    .insert((parent.get(), conversation.get()), ())?;
-                Ok(())
-            })?;
-        }
+        let conversation = self.insert_group(parent, &spec)?;
         let appended =
             self.append_decision(conversation, first, work, submission, Vec::new(), spec.name)?;
         Ok((conversation, appended))
@@ -744,15 +650,7 @@ impl Batch {
                 seq,
                 recorded_at: self.now,
             };
-            let key = record.key;
-            self.step(|tx| {
-                tx.open_table(SUBMISSIONS)?.insert(
-                    key.as_bytes().as_slice(),
-                    encode_submission(&record).as_slice(),
-                )?;
-                Ok(())
-            })?;
-            self.probe = Some(Probe::Submission(key));
+            self.record_submission(&record)?;
         }
         Ok(Appended {
             turn,
@@ -1569,10 +1467,7 @@ impl Batch {
         {
             return Ok(None);
         }
-        let mut root = conversation;
-        while let Some(parent) = self.require_job(root)?.parent_id {
-            root = parent;
-        }
+        let root = self.root_group(conversation)?;
         if self.live_subtree(root)?.len() >= 64 || self.job_control(conversation)?.closing.is_some()
         {
             return Ok(None);

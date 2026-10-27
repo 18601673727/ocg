@@ -41,9 +41,9 @@ use crate::db::entities::{
     ExecutionPoolRecord, ExecutorId, ExecutorRecord, FinalResult, FrozenExecutionConfig,
     FrozenLlmConfig, JobId, JobInputId, JobOutputId, JobOutputRecord, JobRecord, LlmConfig,
     LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsId,
-    ModelCapability, OutputKind, PendingJobKey, PendingJobsPage, ProfileId, ProjectId,
-    ProjectRecord, ProviderSnapshot, RecordRef, RequestEligibility, RequestNumber, SubmissionKey,
-    SubmissionRecord, Timestamp, ToolEffect, ToolEvidenceRecord, UncertainCause, WithheldReason,
+    ModelCapability, OutputKind, ProfileId, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
+    RequestEligibility, RequestNumber, SubmissionKey, SubmissionRecord, Timestamp, ToolEffect,
+    ToolEvidenceRecord, UncertainCause, WithheldReason,
 };
 use crate::service::ai::providers::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
@@ -92,7 +92,7 @@ pub(crate) fn escaped_json_char_cost(character: char) -> usize {
 
 pub(crate) use observations::{
     ProviderResponsesPage, read_availability_stats, read_job_availability, read_job_metrics,
-    read_metrics, read_observed_models, read_provider_request, read_provider_responses,
+    read_metrics, read_provider_request, read_provider_responses,
 };
 use reader::read;
 use recovery::allocate;
@@ -105,13 +105,12 @@ pub(crate) use reader::{
 pub(crate) use reader::{
     ContextState, ContextWorkDetails, JobDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
     UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, queue_counts,
-    read_attachment, read_attachment_inputs, read_attachments, read_children,
-    read_compatible_executors, read_config, read_configs, read_context_state,
-    read_conversation_search, read_conversations, read_decision_executors, read_decision_work,
-    read_effective_context_policy, read_execution_pool, read_execution_pools, read_executor,
-    read_executors, read_job, read_job_compatible_executors, read_job_configuration,
-    read_job_details, read_job_input, read_job_input_for_job, read_job_search, read_job_tree,
-    read_jobs, read_latest_output, read_occupancy, read_outputs, read_pending_jobs,
+    read_attachment, read_attachments, read_children, read_compatible_executors, read_config,
+    read_configs, read_context_state, read_conversation_search, read_conversations,
+    read_decision_executors, read_decision_work, read_effective_context_policy,
+    read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,
+    read_job_configuration, read_job_details, read_job_input, read_job_input_for_job,
+    read_job_search, read_job_tree, read_jobs, read_latest_output, read_occupancy, read_outputs,
     read_pool_binding, read_prediction_current, read_preparation_current, read_profile_page,
     read_project, read_projects, read_retries, read_submission, read_summarization_input,
     read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_buckets,
@@ -119,8 +118,8 @@ pub(crate) use reader::{
 };
 pub(crate) use reader::{ProfilePageRecords, read_turn_compaction};
 pub(crate) use reader::{
-    TurnContext, read_compaction_policy, read_conversation_limits, read_conversation_turns,
-    read_notices, read_turn_context, read_turn_entries, read_turn_execution,
+    TurnContext, read_conversation_limits, read_conversation_turns, read_notices,
+    read_turn_context, read_turn_entries, read_turn_execution,
 };
 
 pub(crate) use crate::db::entities::{JobControl, JobSpec, JobState};
@@ -131,9 +130,7 @@ use rows::{
     encode_tool_evidence, job_tool_evidence, tool_call_key, tool_call_ref,
 };
 use schema::*;
-pub(crate) use schema::{
-    CACHE_BYTES, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_OBSERVED_MODEL_SCAN, MAX_PAGE,
-};
+pub(crate) use schema::{CACHE_BYTES, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE};
 
 // ---- storage errors -------------------------------------------------------------
 

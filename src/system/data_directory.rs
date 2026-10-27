@@ -86,10 +86,6 @@ impl DataDirectory {
         &self.root
     }
 
-    pub fn key_path(&self) -> PathBuf {
-        self.root.join("ocg.key")
-    }
-
     pub fn attachments_path(&self) -> PathBuf {
         self.root.join("ocg_attachments")
     }

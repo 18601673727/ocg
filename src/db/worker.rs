@@ -277,7 +277,6 @@ impl DatabaseWorker {
                     attachments,
                     reclaimed_at_open: reclamation.details,
                     reclamation_omitted_at_open: reclamation.omitted,
-                    space_check: SharedRequest::new(),
                     recovery: SharedRequest::new(),
                     probes: std::sync::Mutex::new(std::collections::HashMap::new()),
                     credentials_path,
@@ -547,12 +546,6 @@ impl WriteWorker {
                 }
                 send_reply(&reply, active);
             }
-            Control::CheckSpace => {
-                self.check_all_paths();
-                self.shared
-                    .space_check
-                    .complete(Some(self.shared.protection.status()));
-            }
             Control::Recover => {
                 let result = self.recover();
                 self.shared.recovery.complete(result);
@@ -561,119 +554,7 @@ impl WriteWorker {
                 let result = self.compact_storage();
                 send_reply(&reply, result);
             }
-            Control::ReadPolicy(reply) => {
-                let result = self.shared.admission().check_policy(false).and_then(|()| {
-                    SystemPolicy::read_saved(&self.policy_path())
-                        .map_err(PolicyOperationError::Read)
-                });
-                send_reply(&reply, result);
-            }
-            Control::SavePolicy {
-                expected,
-                candidate,
-                started,
-                reply,
-            } => {
-                let result = self.save_policy(expected, candidate, &started);
-                send_reply(&reply, result);
-            }
         }
-    }
-
-    pub(super) fn policy_path(&self) -> PathBuf {
-        SystemPolicy::path(&self.shared.data_directory)
-    }
-
-    pub(super) fn policy_save_admission(&self) -> Result<(), PolicyOperationError> {
-        self.shared.admission().check_policy(true)
-    }
-
-    pub(super) fn save_policy(
-        &mut self,
-        expected: SystemPolicy,
-        candidate: SystemPolicy,
-        started: &AtomicBool,
-    ) -> Result<PolicySaveResult, PolicyOperationError> {
-        self.policy_save_admission()?;
-        let path = self.policy_path();
-        let current = SystemPolicy::read_saved(&path).map_err(PolicyOperationError::NotSaved)?;
-        if current != expected {
-            return Err(PolicyOperationError::Conflict {
-                expected: Box::new(expected),
-                actual: Box::new(current),
-            });
-        }
-        candidate
-            .validate(&path)
-            .map_err(PolicyOperationError::NotSaved)?;
-        self.policy_save_admission()?;
-        if current == candidate {
-            return Ok(PolicySaveResult::Unchanged);
-        }
-        let result = self.replace_policy(&path, candidate, started);
-        if let Err(
-            PolicyOperationError::NotSaved(SystemPolicyError::Io { source, .. })
-            | PolicyOperationError::OutcomeUncertain(SystemPolicyError::Io { source, .. }),
-        ) = &result
-            && source.kind() == std::io::ErrorKind::StorageFull
-        {
-            self.activate(vec![ProtectionReason::FilesystemWriteFailed {
-                area: ProtectedArea::Database,
-                path,
-                kind: source.kind(),
-                os_error: source.raw_os_error(),
-                detail: source.to_string(),
-            }]);
-        }
-        result
-    }
-
-    pub(super) fn replace_policy(
-        &mut self,
-        path: &std::path::Path,
-        candidate: SystemPolicy,
-        started: &AtomicBool,
-    ) -> Result<PolicySaveResult, PolicyOperationError> {
-        let fail = |operation: String, source| {
-            PolicyOperationError::NotSaved(policy::io_error(path, operation, source))
-        };
-        let policy_directory = self.shared.data_directory.root();
-        let directory_file = policy::open_directory(policy_directory).map_err(|source| {
-            fail(
-                "open policy directory for durable replacement".into(),
-                source,
-            )
-        })?;
-        let bytes = candidate.to_conf().into_bytes();
-        let expected_write_bytes =
-            byte_count(bytes.len()).saturating_add(TRANSACTION_ALLOWANCE_BYTES);
-        match monitor::check_space(
-            ProtectedArea::Database,
-            policy_directory,
-            expected_write_bytes,
-            self.config.disk_lock_threshold_bytes,
-        ) {
-            Ok(_) => {}
-            Err(ProtectionReason::InsufficientSpace(shortage))
-                if shortage.available_bytes >= shortage.threshold_bytes =>
-            {
-                return Err(PolicyOperationError::InsufficientSpace(shortage));
-            }
-            Err(reason) => {
-                return Err(PolicyOperationError::DiskProtected(
-                    self.activate(vec![reason]),
-                ));
-            }
-        }
-        self.policy_save_admission()?;
-        policy::replace_saved(
-            path,
-            policy_directory,
-            &bytes,
-            directory_file,
-            started,
-            || self.policy_save_admission(),
-        )
     }
 
     /// Refuses a command whose allowance the database filesystem cannot
@@ -1293,7 +1174,6 @@ impl WriteWorker {
                     .refuse(|| DatabaseError::NeverExecuted { operation });
             }
         }
-        self.shared.space_check.complete(None);
         self.shared
             .recovery
             .complete(Err(RecoveryError::ShuttingDown));

@@ -1,99 +1,54 @@
 /** Import frontend view models and checked Control Plane projections here. */
 
 export type {
-  AuthenticationMode,
-  AuthenticationSession,
-  ChatSendRequest,
   ChatImage,
   ChatImageUploadRequest,
-  ChatConversationView,
-  ChatConversationsResponse,
-  ChatMessageView,
-  ChatMessagesResponse,
-  ApiErrorBody,
-  ApiErrorEnvelope,
   CanonicalApiVersion,
-  CanonicalConfigurationEnvelope,
-  CanonicalConfigurationResponse,
-  CanonicalDashboardResponse,
-  CanonicalEventsEnvelope,
-  CanonicalJobConfigEnvelope,
-  CanonicalJobConfigResponse,
-  CanonicalJobEvent,
   CanonicalJobRelations,
-  CanonicalJobSpawnRequest,
-  CanonicalJobSpawnResponse,
   ChildPolicy,
   JobOrigin,
-  JobSpec,
   CanonicalJobOperations,
-  CanonicalJobOperationRequest,
-  CanonicalJobOperationResponse,
   Failure,
   FailureClass,
-  CanonicalJobSnapshot,
-  CanonicalJobSummary,
-  CanonicalProjectResponse,
-  CanonicalProjectsResponse,
-  GlobalConfiguration,
-  JobLaunchRequest,
-  JobLaunchResponse,
   JsonValue,
-  Model,
-  ModelMetadata,
-  SetupModelSelection,
-  SetupRefreshRequest,
-  Origin,
-  Profile,
   ProfileApiVersion,
-  ProfileBootstrapRequest,
-  ProfileReplaceRequest,
-  ProfileView,
-  ProjectConfiguration,
-  ProjectConfigurationView,
-  ProjectRecord,
-  Provider,
-  ProviderProtocol,
   RecursiveLimits,
 } from "./view-models";
 
 export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./view-models";
 
-export { ContractError, decode } from "./decode";
-export { decodeJobDetails } from "./control-plane";
-export type { DecodeResult, Decoder } from "./decode";
+export { ContractError } from "./decode";
 
-export { decodeExecutionState } from "./canonical-decode";
 export type {
   CanonicalAttempt,
   CanonicalCall,
   CanonicalDispatchIntent,
   CanonicalEffectKind,
   CanonicalExecutor,
-  CanonicalExecutionState,
   CanonicalWatchdogAction,
-  CanonicalJob,
   CanonicalJobState,
-} from "./canonical-decode";
+} from "./view-models";
 
 export type {
-  UsageQuantity,
-  UsageTokenTotals,
   UsageCurrencyCost,
   UsageCost,
-  ContextCostTotals,
-  UsageTotals,
-  UsageBreakdown,
-  UsageConversationRow,
-  ProjectUsageResponse,
-  ConversationUsageResponse,
-  JobUsageResponse,
   UsageCompleteness,
-  UsageWindow,
   UsageCostSource,
 } from "./view-models";
 
-export * from "./control-plane";
+export type {
+  ControlToolOutcomeKind,
+  ControlToolCall,
+  ControlAgentCapability,
+  ControlTreeState,
+  ControlTreeNode,
+  ControlApproval,
+} from "./control-shared";
+export { POOL_OPERATIONS, TREE_MAX_DEPTH } from "./control-shared";
+export * from "./control-jobs";
+export * from "./control-conversation";
+export * from "./control-catalog";
+export * from "./control-settings";
 export { CONTROL_API_VERSION } from "./generated";
 
 export type ChatModelSelection = import("./view-models").ChatModelSelection & {

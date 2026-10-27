@@ -309,6 +309,32 @@ fn valid_multiline(text: &str, max_bytes: usize) -> bool {
             .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
 }
 
+fn normalize_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Refusal> {
+    match endpoint.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some(url) => {
+            if url.len() > MAX_ENDPOINT_BYTES
+                || crate::service::ai::providers::model_endpoint(url).is_err()
+                || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+            {
+                return Err(INVALID_ENDPOINT);
+            }
+            Ok(Some(url.to_owned()))
+        }
+    }
+}
+
+fn normalize_instructions(instructions: Option<&str>) -> Result<Option<String>, Refusal> {
+    match instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(None),
+        Some(text) if valid_multiline(text, MAX_INSTRUCTIONS_BYTES) => Ok(Some(text.to_owned())),
+        Some(_) => Err(INVALID_INSTRUCTIONS),
+    }
+}
+
 fn valid_credential_ref(reference: &str) -> bool {
     !reference.is_empty()
         && reference.len() <= MAX_CREDENTIAL_REF_BYTES
@@ -454,6 +480,39 @@ async fn resolve_or_create_connection(
         })
         .await
         .map_err(map_mutation_error)
+}
+
+async fn previous_model_connection(
+    database: &DatabaseHandle,
+    existing_id: Option<ProfileId>,
+    kind: ConfigKind,
+) -> Result<Option<(ConfigBody, ConnectionConfig)>, Refusal> {
+    let Some(id) = existing_id else {
+        return Ok(None);
+    };
+    let record = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
+    if record.archived_at.is_some() {
+        return Err(PROFILE_NOT_FOUND);
+    }
+    if record.body.kind() != kind {
+        return Err(WRONG_PROFILE_KIND);
+    }
+    let connection_id = match &record.body {
+        ConfigBody::Model(model) => model.connection_id,
+        ConfigBody::DecisionModel(model) => model.connection_id,
+        ConfigBody::Connection(_)
+        | ConfigBody::Agent(_)
+        | ConfigBody::DecisionAgent(_)
+        | ConfigBody::Pool(_) => return Err(WRONG_PROFILE_KIND),
+    };
+    let connection = database
+        .config(connection_id)
+        .await?
+        .ok_or(INCONSISTENT_RECORD)?;
+    let ConfigBody::Connection(connection) = connection.body else {
+        return Err(INCONSISTENT_RECORD);
+    };
+    Ok(Some((record.body, connection)))
 }
 
 /// The credential reference a Profile names, and the secret to write, if
@@ -862,22 +921,7 @@ pub(crate) async fn save_profile(
                 .map(LlmTransport::parse)
                 .unwrap_or(Some(LlmTransport::OpenAiChatCompletions))
                 .ok_or(UNSUPPORTED_PROTOCOL)?;
-            let normalized_endpoint = match endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                None => None,
-                Some(url) => {
-                    if url.len() > MAX_ENDPOINT_BYTES
-                        || crate::service::ai::providers::model_endpoint(url).is_err()
-                        || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
-                    {
-                        return Err(INVALID_ENDPOINT);
-                    }
-                    Some(url.to_owned())
-                }
-            };
+            let normalized_endpoint = normalize_endpoint(endpoint.as_deref())?;
 
             let mut capabilities = BTreeSet::new();
             for item in &declared_capabilities {
@@ -920,72 +964,33 @@ pub(crate) async fn save_profile(
             // Connection so we can preserve its credential_ref when none is
             // supplied.
             let mut reasoning_efforts = None;
-            let prior_credential_ref = if let Some(id) = existing_id {
-                let Some(existing_record) = database.config(id.into()).await? else {
-                    return Err(PROFILE_NOT_FOUND);
-                };
-                if existing_record.archived_at.is_some() {
-                    return Err(PROFILE_NOT_FOUND);
-                }
-                let ConfigBody::Model(existing_model) = existing_record.body else {
+            let previous =
+                previous_model_connection(database, existing_id, ConfigKind::Model).await?;
+            let prior_credential_ref = if let Some((body, connection)) = previous {
+                let ConfigBody::Model(existing_model) = body else {
                     return Err(WRONG_PROFILE_KIND);
                 };
                 if existing_model.model == model.trim() {
                     reasoning_efforts = existing_model.reasoning_efforts;
                 }
-                let existing_connection = database
-                    .config(existing_model.connection_id)
-                    .await?
-                    .ok_or(INCONSISTENT_RECORD)?;
-                match existing_connection.body {
-                    ConfigBody::Connection(connection) => {
-                        if keep_protocol {
-                            protocol = connection.protocol;
-                        }
-                        connection.credential_ref
-                    }
-                    _ => return Err(INCONSISTENT_RECORD),
+                if keep_protocol {
+                    protocol = connection.protocol;
                 }
+                connection.credential_ref
             } else {
                 None
             };
 
-            let explicit_ref = credential_ref
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            if let Some(ref reference) = explicit_ref
-                && !valid_credential_ref(reference)
-            {
-                return Err(INVALID_CREDENTIAL_REF);
-            }
-
-            let secret = credential
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-
-            if let Some(secret_value) = secret
-                && (secret_value.len() > 4096
-                    || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret_value}"))
-                        .is_err())
-            {
-                return Err(INVALID_CREDENTIAL);
-            }
-
-            let resolved_credential_ref = if clear_credential {
-                None
-            } else if let Some(secret_value) = secret {
-                let target_ref = match explicit_ref.or(prior_credential_ref) {
-                    Some(reference) => reference,
-                    None => unused_credential_ref(database, name.trim()).await?,
-                };
-                credential_to_save = Some((target_ref.clone(), secret_value.to_owned()));
-                Some(target_ref)
-            } else {
-                explicit_ref.or(prior_credential_ref)
-            };
+            let (resolved_credential_ref, secret) = resolve_credential(
+                database,
+                name.trim(),
+                credential_ref.as_deref(),
+                credential.as_deref(),
+                clear_credential,
+                prior_credential_ref,
+            )
+            .await?;
+            credential_to_save = secret;
 
             ensure_compatible_executor(database, protocol).await?;
             let connection = resolve_or_create_connection(
@@ -1041,19 +1046,7 @@ pub(crate) async fn save_profile(
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
             }
-            let normalized_instructions = match instructions
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                None => None,
-                Some(text) => {
-                    if !valid_multiline(text, MAX_INSTRUCTIONS_BYTES) {
-                        return Err(INVALID_INSTRUCTIONS);
-                    }
-                    Some(text.to_owned())
-                }
-            };
+            let normalized_instructions = normalize_instructions(instructions.as_deref())?;
             let mut selected_capabilities = BTreeSet::new();
             for capability in capabilities {
                 selected_capabilities
@@ -1133,22 +1126,7 @@ pub(crate) async fn save_profile(
                 .map(DecisionProtocol::parse)
                 .unwrap_or(Some(DecisionProtocol::TypeSafeSystemOne))
                 .ok_or(UNSUPPORTED_DECISION_PROTOCOL)?;
-            let normalized_endpoint = match endpoint
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                None => None,
-                Some(url) => {
-                    if url.len() > MAX_ENDPOINT_BYTES
-                        || crate::service::ai::providers::model_endpoint(url).is_err()
-                        || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
-                    {
-                        return Err(INVALID_ENDPOINT);
-                    }
-                    Some(url.to_owned())
-                }
-            };
+            let normalized_endpoint = normalize_endpoint(endpoint.as_deref())?;
             let mut capabilities = BTreeSet::new();
             for item in &declared_capabilities {
                 let Some(parsed) = parse_decision_capability(item.trim()) else {
@@ -1194,28 +1172,10 @@ pub(crate) async fn save_profile(
             }
             // The existing Profile's Connection, when it is edited, keeps its
             // credential reference unless another one is named.
-            let prior_credential_ref = if let Some(id) = existing_id {
-                let Some(existing_record) = database.config(id.into()).await? else {
-                    return Err(PROFILE_NOT_FOUND);
-                };
-                if existing_record.archived_at.is_some() {
-                    return Err(PROFILE_NOT_FOUND);
-                }
-                let ConfigBody::DecisionModel(existing_model) = existing_record.body else {
-                    return Err(WRONG_PROFILE_KIND);
-                };
-
-                let existing_connection = database
-                    .config(existing_model.connection_id)
+            let prior_credential_ref =
+                previous_model_connection(database, existing_id, ConfigKind::DecisionModel)
                     .await?
-                    .ok_or(INCONSISTENT_RECORD)?;
-                match existing_connection.body {
-                    ConfigBody::Connection(connection) => connection.credential_ref,
-                    _ => return Err(INCONSISTENT_RECORD),
-                }
-            } else {
-                None
-            };
+                    .and_then(|(_, connection)| connection.credential_ref);
             let (resolved_credential_ref, secret) = resolve_credential(
                 database,
                 name.trim(),
@@ -1258,19 +1218,7 @@ pub(crate) async fn save_profile(
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
             }
-            let normalized_instructions = match instructions
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                None => None,
-                Some(text) => {
-                    if !valid_multiline(text, MAX_INSTRUCTIONS_BYTES) {
-                        return Err(INVALID_INSTRUCTIONS);
-                    }
-                    Some(text.to_owned())
-                }
-            };
+            let normalized_instructions = normalize_instructions(instructions.as_deref())?;
             if models.is_empty() {
                 return Err(MISSING_DECISION_MODELS);
             }

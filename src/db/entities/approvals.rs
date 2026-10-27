@@ -316,18 +316,4 @@ impl ToolEvidenceRecord {
                 .as_ref()
                 .is_some_and(|outcome| outcome.fact.is_definite())
     }
-
-    /// Whether the call's effect is known to have happened.
-    pub fn is_applied(&self) -> bool {
-        let completed = self.outcome.as_ref().is_some_and(|outcome| {
-            matches!(
-                outcome.fact,
-                ToolOutcome::Completed { .. } | ToolOutcome::CompletedWithheld { .. }
-            )
-        });
-        let reconciled = self.reconciliation.as_ref().is_some_and(|reconciliation| {
-            reconciliation.fact.conclusion == EffectConclusion::Applied
-        });
-        self.admission().is_some() && (completed || reconciled)
-    }
 }

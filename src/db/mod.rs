@@ -27,11 +27,10 @@ use crate::db::entities::{
     ConfigKind, ConfigRecord, ContentDigest, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId,
     ExecutionPoolRecord, Executor, ExecutorId, Job, JobEdit, JobFinalization, JobId, JobInputId,
     JobOutput, JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord, ObservationCursor,
-    ObservationFilter, ObservationPage, ObservedModelCursor, ObservedModelFilter,
-    ObservedModelPage, OperationId, OperationKind, Project, ProjectCommand, ProjectId,
-    ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, SentRequest, Submission,
-    SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord, ToolOutcome,
-    ToolReconciliation, Violation,
+    ObservationFilter, ObservationPage, OperationId, OperationKind, Project, ProjectCommand,
+    ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, SentRequest,
+    Submission, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
+    ToolOutcome, ToolReconciliation, Violation,
 };
 use crate::db::entities::{ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding};
 use crate::db::mutations::PublishedAttachment;
@@ -44,9 +43,7 @@ use crate::system::monitor::{
     ProtectionCell, ProtectionLock, ProtectionReason, ProtectionWatch, RecoveryError,
     RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
 };
-use crate::system::policy::{
-    self, PolicyOperationError, PolicySaveResult, SystemPolicy, SystemPolicyError,
-};
+use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 /// The most queued commands one group commit covers. Commands that queue up
@@ -83,8 +80,6 @@ pub const READ_WORKERS: usize = 2;
 pub const READ_QUEUE_CAPACITY: usize = 64;
 /// The most index entries one observation query reads, matching or not.
 pub const MAX_OBSERVATION_SCAN: usize = redb::MAX_OBSERVATION_SCAN;
-/// The most distinct (Provider, model) pairs one choice query examines.
-pub const MAX_OBSERVED_MODEL_SCAN: usize = redb::MAX_OBSERVED_MODEL_SCAN;
 /// At most one space check and one recovery are pending at a time; later
 /// requests join them.
 const CONTROL_QUEUE_CAPACITY: usize = 2;
@@ -102,7 +97,7 @@ mod shared;
 
 mod worker;
 
-use commands::{Command, Control, Envelope, Message, Reply, byte_count};
+use commands::{Command, Control, Envelope, Message, Reply};
 use errors::operation_status;
 pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,

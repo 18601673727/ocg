@@ -1,6 +1,6 @@
-import type { decodeUsageBuckets } from "../contracts";
+import type * as Api from "@/components/ocg/contracts/api";
 
-type UsageRow = ReturnType<typeof decodeUsageBuckets>["rows"][number];
+type UsageRow = Api.Envelope<Api.UsageBuckets>["rows"][number];
 export type ModelKey = string | null;
 export type UsageBar = { bucketUs: number; total: number; totals: Map<ModelKey, number> };
 export type RankedUsage = {

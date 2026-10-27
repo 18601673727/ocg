@@ -282,10 +282,3 @@ export type BootstrapState = {
   activeProfileId?: string;
   ready: boolean;
 };
-
-export type StageGate = {
-  stage: OnboardingStageId;
-  canAdvance: boolean;
-  /** Stable codes explaining why advancement is blocked. */
-  blockers: string[];
-};

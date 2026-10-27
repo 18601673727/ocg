@@ -186,16 +186,6 @@ pub struct SubmissionRecord {
     pub recorded_at: Timestamp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum RequestPayloadKind {
-    Measurement = 1,
-    Availability = 2,
-    Token = 3,
-    Sent = 4,
-    Received = 5,
-    ApprovedCalls = 6,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestPayload {
     ApprovedCalls,
@@ -233,5 +223,3 @@ pub struct RequestEventRecord {
     pub recorded_at: Timestamp,
     pub payload: RequestPayload,
 }
-
-pub type ToolCallRecord = super::approvals::ToolEvidenceRecord;

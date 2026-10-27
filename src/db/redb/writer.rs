@@ -132,20 +132,7 @@ pub(crate) fn run_batch_with<T>(
         Err(BatchError(failure)) => return finish_abort(batch.tx, failure),
         Ok(value) => value,
     };
-    let (wake, freed, probe) = (
-        batch.touched_ready_or_delayed || batch.changed_pool,
-        batch.freed_capacity,
-        batch.probe,
-    );
-    commit_transaction(
-        batch.tx,
-        value,
-        wake,
-        freed,
-        probe,
-        batch.catalog_changed,
-        commit,
-    )
+    commit_batch(batch, value, commit)
 }
 
 /// Like [`run_batch_with`], and a body that returns `None` ends the batch
@@ -181,17 +168,16 @@ pub(crate) fn run_batch_declinable<T>(
         }
         Ok(Some(value)) => value,
     };
-    let (wake, freed, probe) = (
+    commit_batch(batch, Some(value), commit)
+}
+
+fn commit_batch<T>(batch: Batch, value: T, commit: Commit) -> BatchOutcome<T> {
+    commit_transaction(
+        batch.tx,
+        value,
         batch.touched_ready_or_delayed || batch.changed_pool,
         batch.freed_capacity,
         batch.probe,
-    );
-    commit_transaction(
-        batch.tx,
-        Some(value),
-        wake,
-        freed,
-        probe,
         batch.catalog_changed,
         commit,
     )
@@ -717,6 +703,14 @@ impl Batch {
         Ok(())
     }
 
+    fn put_config(&mut self, row: &ConfigRow) -> Result<(), BatchError> {
+        self.step(|tx| {
+            tx.open_table(CONFIGS)?
+                .insert(row.id.get(), row.encode().as_slice())?;
+            Ok(())
+        })
+    }
+
     /// Inserts a new config with edit counter 1.
     pub(crate) fn create_config(
         &mut self,
@@ -738,11 +732,7 @@ impl Batch {
         if row.kind == ConfigKind::Pool {
             self.changed_pool = true;
         }
-        self.step(|tx| {
-            tx.open_table(CONFIGS)?
-                .insert(id.get(), row.encode().as_slice())?;
-            Ok(())
-        })?;
+        self.put_config(&row)?;
         if row.kind == ConfigKind::DecisionModel {
             self.provision_decision_executor(id)?;
         }
@@ -781,11 +771,7 @@ impl Batch {
             body,
             ..existing
         };
-        self.step(|tx| {
-            tx.open_table(CONFIGS)?
-                .insert(id.get(), row.encode().as_slice())?;
-            Ok(())
-        })?;
+        self.put_config(&row)?;
         if row.kind == ConfigKind::DecisionModel {
             self.provision_decision_executor(id)?;
         }
@@ -1104,11 +1090,7 @@ impl Batch {
         row.archived_at = Some(self.now);
         row.updated_at = self.now;
         row.edit_seq += 1;
-        self.step(|tx| {
-            tx.open_table(CONFIGS)?
-                .insert(id.get(), row.encode().as_slice())?;
-            Ok(())
-        })
+        self.put_config(&row)
     }
 
     // ---- jobs --------------------------------------------------------------------------

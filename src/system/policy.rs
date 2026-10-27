@@ -6,9 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::db::redb;
 use crate::system::data_directory::DataDirectory;
 use crate::system::logger::{LoggerConfig, LoggerConfigError};
-use crate::system::monitor::{
-    self, FilesystemConfig, FilesystemConfigError, ProtectionLock, ProtectionReason, SpaceShortage,
-};
+use crate::system::monitor::{self, FilesystemConfig, FilesystemConfigError, ProtectionReason};
 
 pub const SYSTEM_POLICY_FILE_NAME: &str = "ocg.conf";
 pub const SYSTEM_POLICY_FORMAT_VERSION: u32 = 2;
@@ -70,56 +68,6 @@ pub enum SystemPolicyError {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicySaveResult {
-    SavedForRestart,
-    Unchanged,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicySaveFailureOutcome {
-    NotSaved,
-    Uncertain,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum PolicyOperationError {
-    #[error("the worker is shutting down; the policy operation was refused")]
-    ShuttingDown,
-    #[error("the worker stopped before the policy operation ran")]
-    WorkerStopped,
-    #[error("the control queue is full; the policy operation was not accepted")]
-    QueueFull,
-    #[error("disk protection is active; the policy save was refused: {0}")]
-    DiskProtected(ProtectionLock),
-    #[error("the policy save allowance would cross the active lock threshold: {0:?}")]
-    InsufficientSpace(SpaceShortage),
-    #[error("the saved system policy differs from the expected previous policy")]
-    Conflict {
-        expected: Box<SystemPolicy>,
-        actual: Box<SystemPolicy>,
-    },
-    #[error("failed to read saved system policy: {0}")]
-    Read(#[source] SystemPolicyError),
-    #[error("system policy was not saved: {0}")]
-    NotSaved(#[source] SystemPolicyError),
-    #[error("system policy replacement is visible but durability is uncertain: {0}")]
-    OutcomeUncertain(#[source] SystemPolicyError),
-    #[error("the worker stopped during the policy save; its outcome is uncertain")]
-    SaveInterrupted,
-}
-
-impl PolicyOperationError {
-    pub fn save_failure_outcome(&self) -> PolicySaveFailureOutcome {
-        match self {
-            Self::OutcomeUncertain(_) | Self::SaveInterrupted => {
-                PolicySaveFailureOutcome::Uncertain
-            }
-            _ => PolicySaveFailureOutcome::NotSaved,
-        }
-    }
-}
-
 impl SystemPolicy {
     pub fn path(data_directory: &DataDirectory) -> PathBuf {
         data_directory.root().join(SYSTEM_POLICY_FILE_NAME)
@@ -160,13 +108,6 @@ impl SystemPolicy {
         if initialize {
             policy.publish(data_directory, &path)?;
         }
-        Ok(policy)
-    }
-
-    pub(crate) fn read_saved(path: &Path) -> Result<Self, SystemPolicyError> {
-        let bytes = fs::read(path).map_err(|source| io_error(path, "read saved policy", source))?;
-        let policy = Self::parse(&bytes, path)?;
-        policy.validate(path)?;
         Ok(policy)
     }
 
@@ -304,79 +245,6 @@ pub(crate) fn open_directory(path: &Path) -> io::Result<Option<File>> {
 #[cfg(not(unix))]
 pub(crate) fn open_directory(_path: &Path) -> io::Result<Option<File>> {
     Ok(None)
-}
-
-pub(crate) fn replace_saved(
-    path: &Path,
-    policy_directory: &Path,
-    bytes: &[u8],
-    directory_file: Option<File>,
-    started: &std::sync::atomic::AtomicBool,
-    before_publish: impl FnOnce() -> Result<(), PolicyOperationError>,
-) -> Result<PolicySaveResult, PolicyOperationError> {
-    let fail = |operation: String, source| {
-        PolicyOperationError::NotSaved(io_error(path, operation, source))
-    };
-    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
-    let temporary = policy_directory.join(format!(
-        ".ocg-conf-edit-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = crate::system::data_directory::private_file(&mut std::fs::OpenOptions::new())
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .map_err(|source| {
-            fail(
-                format!("create temporary file {}", temporary.display()),
-                source,
-            )
-        })?;
-    let result = (|| {
-        file.write_all(bytes)
-            .and_then(|()| file.flush())
-            .and_then(|()| file.sync_all())
-            .map_err(|source| {
-                fail(
-                    format!("write and persist temporary file {}", temporary.display()),
-                    source,
-                )
-            })?;
-        before_publish()?;
-        started.store(true, Ordering::SeqCst);
-        std::fs::rename(&temporary, path).map_err(|source| {
-            fail(
-                format!("replace policy from {}", temporary.display()),
-                source,
-            )
-        })?;
-        if let Some(directory_file) = directory_file {
-            directory_file.sync_all().map_err(|source| {
-                PolicyOperationError::OutcomeUncertain(io_error(
-                    path,
-                    "confirm replacement directory durability",
-                    source,
-                ))
-            })?;
-        }
-        Ok(PolicySaveResult::SavedForRestart)
-    })();
-    drop(file);
-    if result.is_err()
-        && let Err(source) = std::fs::remove_file(&temporary)
-        && source.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!(
-            "{}",
-            io_error(
-                path,
-                format!("clean up temporary file {}", temporary.display()),
-                source
-            )
-        );
-    }
-    result
 }
 
 impl SystemPolicy {

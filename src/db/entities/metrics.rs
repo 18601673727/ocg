@@ -84,3 +84,96 @@ pub struct MetricsRecord {
     /// time is not monotonic. It is never used in place of `observed_at`.
     pub recorded_at: Timestamp,
 }
+
+/// The Metrics records of one Job's events. A Token event that directly
+/// follows the Measurement event written with it, in the same transaction,
+/// is that record's annotation; any other Token event is a record of its
+/// own, without measurements.
+fn metrics_of(
+    job: JobId,
+    target: &Option<LlmTarget>,
+    events: &[RequestEventRecord],
+) -> Vec<MetricsRecord> {
+    let mut records: Vec<MetricsRecord> = Vec::new();
+    let mut last_measurement: Option<(RequestNumber, u32, Timestamp, Timestamp)> = None;
+    for event in events {
+        match &event.payload {
+            RequestPayload::Measurement { measurements } => {
+                last_measurement = Some((
+                    event.request,
+                    event.seq,
+                    event.observed_at,
+                    event.recorded_at,
+                ));
+                records.push(MetricsRecord {
+                    id: MetricsId::new(event.id.get()),
+                    job,
+                    request: event.request,
+                    target: target.clone(),
+                    observed_at: event.observed_at,
+                    measurements: measurements.clone(),
+                    token: None,
+                    recorded_at: event.recorded_at,
+                });
+            }
+            RequestPayload::Token {
+                eligibility,
+                finality,
+            } => {
+                let annotation = TokenAnnotation {
+                    eligibility: *eligibility,
+                    finality: *finality,
+                };
+                let pairs =
+                    last_measurement.is_some_and(|(request, seq, observed_at, recorded_at)| {
+                        request == event.request
+                            && seq + 1 == event.seq
+                            && observed_at == event.observed_at
+                            && recorded_at == event.recorded_at
+                    });
+                match records.last_mut() {
+                    Some(record) if pairs => record.token = Some(annotation),
+                    _ => records.push(MetricsRecord {
+                        id: MetricsId::new(event.id.get()),
+                        job,
+                        request: event.request,
+                        target: target.clone(),
+                        observed_at: event.observed_at,
+                        measurements: Measurements::default(),
+                        token: Some(annotation),
+                        recorded_at: event.recorded_at,
+                    }),
+                }
+                last_measurement = None;
+            }
+            RequestPayload::Availability { .. }
+            | RequestPayload::Sent { .. }
+            | RequestPayload::Received { .. }
+            | RequestPayload::ApprovedCalls => last_measurement = None,
+        }
+    }
+    records
+}
+
+/// Reduces one request's events to its Token sample. An evidence error drops
+/// only this request, and is logged once with the Job, the request and the
+/// error; no sample is then returned. Both the mutation and the rebuild path
+/// use this rule, so they cannot disagree about a request.
+pub(in crate::db) fn usage_sample_of(
+    job: JobId,
+    request: RequestNumber,
+    target: &Option<LlmTarget>,
+    events: &[RequestEventRecord],
+) -> Option<TokenRequestSample> {
+    let records = metrics_of(job, target, events);
+    match TokenRequestSample::from_metrics(&records) {
+        Ok(sample) => sample,
+        Err(error) => {
+            log::warn!(
+                "dropping Token usage of {job} request {}: {error}",
+                request.get()
+            );
+            None
+        }
+    }
+}

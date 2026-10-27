@@ -186,16 +186,6 @@ pub struct LoggerStatus {
     pub stopped: bool,
 }
 
-impl LoggerStatus {
-    pub fn dropped_records(&self) -> u64 {
-        self.dropped_queue_full
-            .saturating_add(self.dropped_oversized)
-            .saturating_add(self.dropped_protected)
-            .saturating_add(self.dropped_failed)
-            .saturating_add(self.dropped_closed)
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("logger status is being updated; retry the nonblocking snapshot")]
 pub struct LoggerStatusBusy;

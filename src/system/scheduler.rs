@@ -338,26 +338,6 @@ impl SchedulerHandle {
         self.admit(plan, None, None).await
     }
 
-    /// Like [`Self::admit_provider`], and records `submission` with the
-    /// plan's Job, in its T1 transaction, so the
-    /// Job exists only with its submission, and the submission only with its
-    /// Job. A key already recorded refuses the plan before its Job is
-    /// created, as [`AdmissionError::NotAdmitted`] with
-    /// [`DatabaseError::Rejected`] of [`Violation::SubmissionKeyUsed`],
-    /// which names the Job the key created.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::admit_provider`].
-    #[allow(clippy::result_large_err)]
-    pub async fn admit_submitted_provider(
-        &self,
-        plan: ProviderExecutionPlan,
-        submission: Submission,
-    ) -> Result<AdmittedJob, AdmissionError> {
-        self.admit(plan, Some(submission), None).await
-    }
-
     #[allow(clippy::result_large_err)]
     async fn admit(
         &self,
@@ -441,11 +421,6 @@ impl AdmittedJob {
     /// Pool actually selected by the claim batch.
     pub fn executor(&self) -> ExecutorId {
         self.started.executor
-    }
-
-    /// A handle that requests the stop of this Job and of nothing else.
-    pub fn stop_handle(&self) -> JobStop {
-        self.stop.clone()
     }
 
     /// Requests the stop of this Job's execution, see [`JobStop::request`].

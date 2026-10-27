@@ -152,8 +152,6 @@ export type AttentionItem = {
   resolution: AttentionResolution | null;
 };
 
-export type AttentionTab = "overview" | "approvals" | "blocked" | "resolved";
-
 const UNRESOLVED: readonly AttentionLifecycle[] = ["pending", "acknowledged"];
 
 export function isUnresolved(item: AttentionItem): boolean {

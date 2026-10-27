@@ -1,51 +1,20 @@
+import type { ControlProjects, ControlPools, ControlChildren } from "../contracts";
+import type * as Api from "@/components/ocg/contracts/api";
 import {
+  projectJob,
+  projectContextStatus,
   ContractError,
   TREE_MAX_DEPTH,
-  decodeAdmission,
-  decodeAgentProfiles,
-  decodeAttachment,
-  decodeControlError,
-  decodeConversationEdit,
-  decodeConversationLimits,
-  decodeConversations,
-  decodeChildren,
-  decodeCards,
-  decodeApprovalDecision,
-  decodeReleaseSlot,
+  projectAdmission,
+  projectAgentProfiles,
   type ControlApproval,
-  decodeHealth,
-  decodeJobs,
-  decodeUsage,
-  decodeUsageBuckets,
-  decodeUsageRetries,
-  decodeAvailability,
-  decodeLogs,
-  decodeJob,
-  decodeJobDetails,
-  decodeConversationTurns,
-  decodeJobInput,
-  decodeJobEvent,
-  decodeJobTools,
-  decodeJobTree,
-  decodeOutputsPage,
-  decodeProviderResponses,
-  decodePoolAnswer,
-  decodePools,
-  decodeProfiles,
-  decodeActiveSystemSettings,
-  decodeGlobalCompactionSettings,
+  projectJobDetails,
+  projectConversation,
+  projectJobEvent,
+  projectProfiles,
   type ControlGlobalCompactionSettings,
-  decodeContextStatus,
-  decodeCompaction,
   type ControlDecisionLimits,
-  decodeProviderModels,
-  decodeImportedModels,
   type ControlProviderModel,
-  decodeProjectAnswer,
-  decodeProjects,
-  decodeSession,
-  decodeStop,
-  decodeRetry,
   type ControlAttachment,
   type ControlOutput,
   type ControlCapability,
@@ -85,10 +54,7 @@ export type ControlConversationEdit =
   | { title: string; hidden?: never }
   | { hidden: true; title?: never }
   | {
-      limits: Pick<
-        ReturnType<typeof decodeConversationLimits>,
-        "max_depth" | "max_auto_turns" | "max_iterations"
-      >;
+      limits: Pick<Api.ConversationLimits, "max_depth" | "max_auto_turns" | "max_iterations">;
       title?: never;
       hidden?: never;
     };
@@ -454,7 +420,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     if (!response.ok) {
       let code = "http_error";
       try {
-        code = decodeControlError(await response.json()).code;
+        code = ((await response.json()) as Api.ErrorResponse).error.code;
       } catch {
         /* An unrecognized body still retains its HTTP status. */
       }
@@ -505,7 +471,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           } catch {
             throw new ContractError("data", "a complete JSON event");
           }
-          const event = decodeJobEvent(frame.event, input, jobId, frame.id);
+          const event = projectJobEvent(frame.event, input);
           if (event.type === "output") {
             const acknowledged = event.output.seq;
             const previous = cursor.sequence ?? 0;
@@ -565,7 +531,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           if (!response.ok) {
             let code = "http_error";
             try {
-              code = decodeControlError(await response.json()).code;
+              code = ((await response.json()) as Api.ErrorResponse).error.code;
             } catch {
               /* Retain the HTTP status. */
             }
@@ -608,19 +574,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                 if ("comment" in frame) continue;
                 const data = JSON.parse(frame.data);
                 if (frame.event === "stream_error") {
-                  const error = decodeControlError(data);
+                  const error = (data as Api.ErrorResponse).error;
                   throw new ControlTransportError(error.code, 503, retryable(503, error.code));
                 }
-                if (
-                  frame.event !== "snapshot" ||
-                  !data ||
-                  typeof data !== "object" ||
-                  typeof data.topic !== "string" ||
-                  (data.key !== null && typeof data.key !== "string") ||
-                  typeof data.first !== "boolean" ||
-                  typeof data.last !== "boolean"
-                )
-                  throw new ContractError("snapshot", "a subscription snapshot");
+                if (frame.event !== "snapshot") continue;
                 receive(data as Snapshot);
                 delay = 250;
               }
@@ -650,9 +607,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     return () => controller.abort();
   }
 
-  type Conversations = ReturnType<typeof decodeConversations>;
-  type Projects = ReturnType<typeof decodeProjects>;
-  type Children = ReturnType<typeof decodeChildren>;
+  type Conversations = Api.Conversations;
+  type Projects = ControlProjects;
+  type Children = ControlChildren;
   type Observer<T> = { receive: (value: T) => void; error: (error: unknown) => void };
   const catalogObservers = new Set<Observer<void>>();
   let stopCatalog: (() => void) | undefined;
@@ -684,7 +641,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         `/api/v1/sidebar/events${query ? `?${query}` : ""}`,
         (snapshot) => {
           if (snapshot.topic === "conversations") {
-            const page = decodeConversations(snapshot.value);
+            const page = snapshot.value as Api.Conversations;
             conversations = snapshot.first
               ? page.conversations
               : [...conversations, ...page.conversations];
@@ -693,14 +650,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
               sidebarObservers.forEach((observer) => observer.receive(latestConversations!));
             }
           } else if (snapshot.topic === "projects") {
-            const page = decodeProjects(snapshot.value);
+            const page = snapshot.value as ControlProjects;
             projects = snapshot.first ? page.projects : [...projects, ...page.projects];
             if (snapshot.last) {
               latestProjects = { ...page, projects };
               projectObservers.forEach((observer) => observer.receive(latestProjects!));
             }
           } else if (snapshot.topic === "children" && snapshot.key) {
-            const page = decodeChildren(snapshot.value, snapshot.key);
+            const page = snapshot.value as ControlChildren;
             const items = snapshot.first
               ? page.children
               : [...(children.get(snapshot.key) ?? []), ...page.children];
@@ -764,7 +721,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       let code = "http_error";
       let detail = "";
       try {
-        const decoded = decodeControlError(await response.json());
+        const decoded = ((await response.json()) as Api.ErrorResponse).error;
         code = decoded.code;
         detail = decoded.message;
       } catch {
@@ -807,7 +764,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     const answer = await send("GET", `/api/v1/jobs/${job}/tools${suffix}`, {
       signal: settings.signal,
     });
-    return decodeJobTools(answer.input, job);
+    return answer.input as Api.Tools;
   };
 
   async function readProjectPage(
@@ -822,25 +779,25 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       query.push(`limit=${settings.limit}`);
     }
     const suffix = query.length ? `?${query.join("&")}` : "";
-    return decodeProjects(
-      (await send("GET", `/api/v1/projects${suffix}`, { signal: settings.signal })).input,
-    );
+    return (await send("GET", `/api/v1/projects${suffix}`, { signal: settings.signal }))
+      .input as ControlProjects;
   }
 
   async function readProfilePage(settings: { before?: string; signal?: AbortSignal } = {}) {
     const suffix =
       settings.before === undefined ? "" : `?before=${identity(settings.before, "before")}`;
-    return decodeProfiles(
-      (await send("GET", `/api/v1/profiles${suffix}`, { signal: settings.signal })).input,
+    return projectProfiles(
+      (await send("GET", `/api/v1/profiles${suffix}`, { signal: settings.signal }))
+        .input as Api.Profiles,
     );
   }
 
   async function readAllProfiles(signal?: AbortSignal) {
-    const pages: Array<ReturnType<typeof decodeProfiles>> = [];
-    const providers = new Map<string, ReturnType<typeof decodeProfiles>["providers"][number]>();
+    const pages: Array<ReturnType<typeof projectProfiles>> = [];
+    const providers = new Map<string, ReturnType<typeof projectProfiles>["providers"][number]>();
     const executors = new Map<
       string,
-      ReturnType<typeof decodeProfiles>["executor_protocols"][number]
+      ReturnType<typeof projectProfiles>["executor_protocols"][number]
     >();
     let before: string | undefined;
     for (;;) {
@@ -940,15 +897,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
     subscribeLogs(
       file: string | undefined,
-      receive: (value: ReturnType<typeof decodeLogs>) => void,
+      receive: (value: Api.Logs) => void,
       error: (error: unknown) => void,
     ) {
       const query = file ? `?file=${encodeURIComponent(file)}` : "";
       return subscribeSnapshots(
         `/api/v1/logs/events${query}`,
         (snapshot) => {
-          if (snapshot.topic !== "logs") throw new ContractError("snapshot.topic", "logs");
-          receive(decodeLogs(snapshot.value));
+          receive(snapshot.value as Api.Logs);
         },
         error,
       );
@@ -959,8 +915,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (!stopCatalog && !closed) {
         stopCatalog = subscribeSnapshots(
           "/api/v1/catalog/events",
-          (snapshot) => {
-            if (snapshot.topic !== "catalog") throw new ContractError("snapshot.topic", "catalog");
+          () => {
             catalogReady = true;
             catalogError = undefined;
             catalogObservers.forEach((item) => item.receive());
@@ -991,8 +946,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     subscribeObservationChanges(
       receive: (value: {
         ready: boolean;
-        usage: ReturnType<typeof decodeUsage>["observations"];
-        availability: ReturnType<typeof decodeAvailability>["observations"];
+        usage: Api.Usage["observations"];
+        availability: Api.Availability["observations"];
       }) => void,
       reset: () => void,
       error: (error: unknown) => void,
@@ -1006,28 +961,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           () =>
             `/api/v1/observation-changes/events${cursor ? `?since=${encodeURIComponent(cursor)}` : ""}`,
           (snapshot) => {
-            if (
-              snapshot.topic !== "observation_changes" ||
-              !snapshot.key ||
-              !/^[0-9a-f-]{36}\.\d+$/.test(snapshot.key) ||
-              !snapshot.value ||
-              typeof snapshot.value !== "object" ||
-              Array.isArray(snapshot.value)
-            )
-              throw new ContractError("snapshot", "an observation change snapshot");
-            const value = snapshot.value as Record<string, unknown>;
-            const usage = decodeUsage({
-              ...value,
-              observations: value.usage,
-              next_after: null,
-            }).observations;
-            const availability = decodeAvailability({
-              ...value,
-              observations: value.availability,
-              next_after: null,
-            }).observations;
+            const value = snapshot.value as {
+              usage: Api.Usage["observations"];
+              availability: Api.Availability["observations"];
+            };
+            const { usage, availability } = value;
             receive({ ready: snapshot.first, usage, availability });
-            cursor = snapshot.key;
+            cursor = snapshot.key ?? undefined;
           },
           (cause) => {
             if (
@@ -1066,10 +1006,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     ) {
       const query = [`limit=${settings.limit ?? 50}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
-      return decodeConversations(
-        (await send("GET", `/api/v1/conversations?${query.join("&")}`, { signal: settings.signal }))
-          .input,
-      );
+      return (
+        await send("GET", `/api/v1/conversations?${query.join("&")}`, { signal: settings.signal })
+      ).input as Api.Conversations;
     },
 
     /**
@@ -1090,13 +1029,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const query = [`query=${encodeURIComponent(trimmed)}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       query.push(`limit=${settings.limit ?? 50}`);
-      return decodeConversations(
-        (
-          await send("GET", `/api/v1/conversations/search?${query.join("&")}`, {
-            signal: settings.signal,
-          })
-        ).input,
-      );
+      return (
+        await send("GET", `/api/v1/conversations/search?${query.join("&")}`, {
+          signal: settings.signal,
+        })
+      ).input as Api.Conversations;
     },
 
     /** Renames a conversation or hides it for good. */
@@ -1107,7 +1044,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const result = decodeConversationEdit(answer.input, root);
+      const result = (answer.input as Api.ConversationEdited).conversation;
       conversationListeners.forEach((listener) => listener());
       return result;
     },
@@ -1117,34 +1054,28 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
     ) {
       const suffix = `?limit=${settings.limit ?? 50}${settings.before ? `&before=${jobIdentity(settings.before)}` : ""}`;
-      return decodeContextStatus(
+      return projectContextStatus(
         (
           await send("GET", `/api/v1/conversations/${jobIdentity(conversation)}/context${suffix}`, {
             signal: settings.signal,
           })
-        ).input,
-        conversation,
+        ).input as Api.ContextStatus,
       );
     },
     async compactConversation(conversation: string, model: string, key: string) {
-      return decodeCompaction(
-        (
-          await send("POST", `/api/v1/conversations/${jobIdentity(conversation)}/compact`, {
-            body: { model: identity(model, "model") },
-            key: submissionKey(key),
-            sign: true,
-          })
-        ).input,
-        conversation,
-      );
+      return (
+        await send("POST", `/api/v1/conversations/${jobIdentity(conversation)}/compact`, {
+          body: { model: identity(model, "model") },
+          key: submissionKey(key),
+          sign: true,
+        })
+      ).input as Api.Compaction;
     },
 
     async readConversationLimits(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
-      return decodeConversationLimits(
-        (await send("GET", `/api/v1/conversations/${conversation}/limits`, { signal })).input,
-        conversation,
-      );
+      return (await send("GET", `/api/v1/conversations/${conversation}/limits`, { signal }))
+        .input as Api.ConversationLimits;
     },
 
     async readJobs(
@@ -1153,20 +1084,17 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const query = [`limit=${settings.limit ?? 50}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       if (settings.query?.trim()) query.push(`query=${encodeURIComponent(settings.query.trim())}`);
-      return decodeJobs(
-        (await send("GET", `/api/v1/job-history?${query.join("&")}`, { signal: settings.signal }))
-          .input,
-      );
+      return (
+        await send("GET", `/api/v1/job-history?${query.join("&")}`, { signal: settings.signal })
+      ).input as Api.Jobs;
     },
 
     async readUsage(settings: ObservationSettings = {}) {
-      return decodeUsage(
-        (
-          await send("GET", `/api/v1/usage${observationQuery(settings)}`, {
-            signal: settings.signal,
-          })
-        ).input,
-      );
+      return (
+        await send("GET", `/api/v1/usage${observationQuery(settings)}`, {
+          signal: settings.signal,
+        })
+      ).input as Api.Usage;
     },
 
     async readUsageBuckets({
@@ -1190,9 +1118,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         throw new ContractError("tz_offset_minutes", "a signed safe integer");
       }
       const query = `from_us=${sequence(fromUs)}&until_us=${sequence(untilUs)}&bucket=${bucket}&tz_offset_minutes=${tzOffsetMinutes}${scope ? `&scope=${scope}` : ""}${after ? `&after=${encodeURIComponent(after)}` : ""}`;
-      return decodeUsageBuckets(
-        (await send("GET", `/api/v1/usage/summary?${query}`, { signal })).input,
-      );
+      return (await send("GET", `/api/v1/usage/summary?${query}`, { signal }))
+        .input as Api.Envelope<Api.UsageBuckets>;
     },
 
     async readUsageRetries({
@@ -1213,19 +1140,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (!Number.isSafeInteger(tzOffsetMinutes))
         throw new ContractError("tz_offset_minutes", "a signed safe integer");
       const query = `from_us=${sequence(fromUs)}&until_us=${sequence(untilUs)}&bucket=${bucket}&tz_offset_minutes=${tzOffsetMinutes}&limit=100${after ? `&after=${encodeURIComponent(after)}` : ""}`;
-      return decodeUsageRetries(
-        (await send("GET", `/api/v1/usage/retries?${query}`, { signal })).input,
-      );
+      return (await send("GET", `/api/v1/usage/retries?${query}`, { signal }))
+        .input as Api.UsageRetries;
     },
 
     async readAvailability(settings: ObservationSettings = {}) {
-      return decodeAvailability(
-        (
-          await send("GET", `/api/v1/availability${observationQuery(settings)}`, {
-            signal: settings.signal,
-          })
-        ).input,
-      );
+      return (
+        await send("GET", `/api/v1/availability${observationQuery(settings)}`, {
+          signal: settings.signal,
+        })
+      ).input as Api.Availability;
     },
 
     async readLogs(
@@ -1238,34 +1162,36 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         query.push(`file=${settings.file}`);
       }
       if (settings.before !== undefined) query.push(`before=${sequence(settings.before)}`);
-      return decodeLogs(
-        (await send("GET", `/api/v1/logs?${query.join("&")}`, { signal: settings.signal })).input,
-      );
+      return (await send("GET", `/api/v1/logs?${query.join("&")}`, { signal: settings.signal }))
+        .input as Api.Logs;
     },
 
     /** What the host establishes about itself and its database, now. */
     async readHealth(signal?: AbortSignal) {
-      return decodeHealth((await send("GET", "/api/v1/health", { signal })).input);
+      return (await send("GET", "/api/v1/health", { signal })).input as Api.Health;
     },
 
     /** The Job's persisted lifecycle record. */
     async readJob(job: string, signal?: AbortSignal) {
       jobIdentity(job);
-      return decodeJob((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
+      return projectJob(
+        (await send("GET", `/api/v1/jobs/${job}`, { signal })).input as Api.JobDetails,
+      );
     },
 
     async readJobDetails(job: string, signal?: AbortSignal) {
       jobIdentity(job);
-      return decodeJobDetails((await send("GET", `/api/v1/jobs/${job}`, { signal })).input);
+      return projectJobDetails(
+        (await send("GET", `/api/v1/jobs/${job}`, { signal })).input as Api.JobDetails,
+      );
     },
 
     /** The Job's frozen input: its objective as text, never inferred from its identity. */
     async readJobInput(job: string, signal?: AbortSignal) {
       jobIdentity(job);
-      return decodeJobInput(
-        (await send("GET", `/api/v1/jobs/${job}/input`, { signal })).input,
-        job,
-      );
+      const answer = (await send("GET", `/api/v1/jobs/${job}/input`, { signal }))
+        .input as Api.JobInput;
+      return { ...answer.input, job: answer.job };
     },
 
     /** The bounded conversation ending at `job`, reconstructed from persisted Job `previous` links. */
@@ -1281,18 +1207,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const answer = await send("GET", `/api/v1/conversations/${conversation}/turns${query}`, {
         signal,
       });
-      return decodeConversationTurns(answer.input, conversation);
+      return projectConversation(answer.input as Api.Turns);
     },
 
     async readChildren(conversation: string, before?: string, limit = 20, signal?: AbortSignal) {
       jobIdentity(conversation);
       if (before) jobIdentity(before);
       const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
-      return decodeChildren(
-        (await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal }))
-          .input,
-        conversation,
-      );
+      return (
+        await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal })
+      ).input as ControlChildren;
     },
     /** The tree of the work below a Job: its ancestors, and the nodes below it. */
     async readJobTree(
@@ -1313,14 +1237,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const answer = await send("GET", `/api/v1/jobs/${job}/tree?${query.join("&")}`, {
         signal: settings.signal,
       });
-      return decodeJobTree(answer.input, job);
+      return answer.input as import("../contracts").ControlJobTree;
     },
     async readCards(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
-      return decodeCards(
-        (await send("GET", `/api/v1/conversations/${conversation}/cards`, { signal })).input,
-        conversation,
-      );
+      return (await send("GET", `/api/v1/conversations/${conversation}/cards`, { signal }))
+        .input as Api.Cards;
     },
     async decideApproval(
       approval: ControlApproval,
@@ -1331,60 +1253,49 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       sequence(approval[1]);
       sequence(approval[2]);
       const [turn, request, index] = approval;
-      const result = decodeApprovalDecision(
-        (
-          await send("POST", `/api/v1/approvals/${turn}/${request}/${index}`, {
-            body: decision,
-            sign: true,
-            signal,
-          })
-        ).input,
-        approval,
-      );
+      const result = (
+        await send("POST", `/api/v1/approvals/${turn}/${request}/${index}`, {
+          body: decision,
+          sign: true,
+          signal,
+        })
+      ).input as Api.ApprovalDecision;
       conversationListeners.forEach((listener) => listener());
       return result;
     },
     async releaseSlot(turn: string, confirm = false, signal?: AbortSignal) {
       jobIdentity(turn);
-      const result = decodeReleaseSlot(
-        (
-          await send("POST", `/api/v1/jobs/${turn}/release-slot`, {
-            body: confirm ? { confirm: true } : {},
-            sign: true,
-            signal,
-          })
-        ).input,
-      );
+      const result = (
+        await send("POST", `/api/v1/jobs/${turn}/release-slot`, {
+          body: confirm ? { confirm: true } : {},
+          sign: true,
+          signal,
+        })
+      ).input as Api.ReleaseSlot;
       conversationListeners.forEach((listener) => listener());
       return result;
     },
     async holdConversation(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
-      const result = decodeStop(
-        (
-          await send("POST", `/api/v1/conversations/${conversation}/hold`, {
-            body: {},
-            sign: true,
-            signal,
-          })
-        ).input,
-        conversation,
-      );
+      const result = (
+        await send("POST", `/api/v1/conversations/${conversation}/hold`, {
+          body: {},
+          sign: true,
+          signal,
+        })
+      ).input as Api.Stop;
       conversationListeners.forEach((listener) => listener());
       return result;
     },
     async unholdConversation(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
-      const result = decodeStop(
-        (
-          await send("POST", `/api/v1/conversations/${conversation}/unhold`, {
-            body: {},
-            sign: true,
-            signal,
-          })
-        ).input,
-        conversation,
-      );
+      const result = (
+        await send("POST", `/api/v1/conversations/${conversation}/unhold`, {
+          body: {},
+          sign: true,
+          signal,
+        })
+      ).input as Api.Stop;
       conversationListeners.forEach((listener) => listener());
       return result;
     },
@@ -1399,17 +1310,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       jobIdentity(conversation);
       jobIdentity(amendment.turn);
       sequence(amendment.message);
-      const result = decodeRetry(
-        (
-          await send("POST", `/api/v1/conversations/${conversation}/queue`, {
-            body: amendment,
-            sign: true,
-            signal,
-          })
-        ).input,
-      );
-      if (result.conversation !== conversation)
-        throw new ContractError("conversation", `matching ${conversation}`);
+      const result = (
+        await send("POST", `/api/v1/conversations/${conversation}/queue`, {
+          body: amendment,
+          sign: true,
+          signal,
+        })
+      ).input as Api.Envelope<Api.Append>;
       return result;
     },
     async retryConversation(conversation: string, turn: string, signal?: AbortSignal) {
@@ -1420,9 +1327,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const result = decodeRetry(answer.input);
-      if (result.conversation !== conversation)
-        throw new ContractError("conversation", `matching ${conversation}`);
+      const result = answer.input as Api.Envelope<Api.Append>;
       conversationListeners.forEach((listener) => listener());
       return result;
     },
@@ -1441,8 +1346,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         query.push(`limit=${settings.limit}`);
       }
       const suffix = query.length ? `?${query.join("&")}` : "";
-      return decodeAgentProfiles(
-        (await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal })).input,
+      return projectAgentProfiles(
+        (await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal }))
+          .input as Api.AgentProfiles,
       );
     },
 
@@ -1470,7 +1376,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeProjectAnswer(answer.input);
+      return (answer.input as Api.ProjectAnswer).project as ControlProject;
     },
 
     /** Updates an existing Project. */
@@ -1481,7 +1387,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeProjectAnswer(answer.input);
+      return (answer.input as Api.ProjectAnswer).project as ControlProject;
     },
 
     async configureProjectDecision(
@@ -1492,7 +1398,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       signal?: AbortSignal,
     ) {
       identity(projectId, "project");
-      return decodeProjectAnswer(
+      return (
         (
           await send("POST", `/api/v1/projects/${projectId}/decision`, {
             body: {
@@ -1503,14 +1409,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             sign: true,
             signal,
           })
-        ).input,
-      );
+        ).input as Api.ProjectAnswer
+      ).project as ControlProject;
     },
 
     /** Every Pool. */
     async readPools(signal?: AbortSignal) {
       const answer = await send("GET", "/api/v1/pools", { signal });
-      return decodePools(answer.input);
+      return answer.input as ControlPools;
     },
 
     /** Updates a Pool's concurrency limit or enabled state. */
@@ -1530,7 +1436,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodePoolAnswer(answer.input);
+      return (answer.input as Api.PoolAnswer).pool as ControlPools["pools"][number];
     },
 
     /** Every Profile (LLM Profiles, Agent Profiles) and the merged Provider projection. */
@@ -1552,7 +1458,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const result = decodeProviderModels(answer.input);
+      const result = answer.input as Api.ProviderModels;
       profileListeners.forEach((listener) => listener());
       return result;
     },
@@ -1577,19 +1483,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         body: { ...connection, models, declared_capabilities: capabilities },
         sign: true,
       });
-      const result = decodeImportedModels(answer.input);
+      const result = answer.input as Api.ImportedModels;
       profileListeners.forEach((listener) => listener());
       return result;
     },
 
     async readActiveSystemSettings(signal?: AbortSignal) {
       const answer = await send("GET", "/api/v1/settings/system", { signal });
-      return decodeActiveSystemSettings(answer.input);
+      return answer.input as Api.ActiveSystemSettings;
     },
 
     async readGlobalCompactionSettings(signal?: AbortSignal) {
       const answer = await send("GET", "/api/v1/settings/compaction", { signal });
-      return decodeGlobalCompactionSettings(answer.input);
+      return answer.input as Api.GlobalCompactionSettings;
     },
 
     async saveGlobalCompactionSettings(settings: ControlGlobalCompactionSettings) {
@@ -1597,13 +1503,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         body: settings,
         sign: true,
       });
-      return decodeGlobalCompactionSettings(answer.input);
+      return answer.input as Api.GlobalCompactionSettings;
     },
 
     async deleteLlmProfile(profileId: string) {
       identity(profileId, "profile");
       const answer = await send("DELETE", `/api/v1/profiles/${profileId}`, { sign: true });
-      decodeProfiles(answer.input);
+      projectProfiles(answer.input as Api.Profiles);
       profileListeners.forEach((listener) => listener());
       return readAllProfiles();
     },
@@ -1615,7 +1521,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const saved = decodeProfiles(answer.input).profile_id;
+      const saved = projectProfiles(answer.input as Api.Profiles).profile_id;
       const snapshot = await readAllProfiles(signal);
       profileListeners.forEach((listener) => listener());
       return { ...snapshot, profile_id: saved };
@@ -1633,7 +1539,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const saved = decodeProfiles(answer.input).profile_id;
+      const saved = projectProfiles(answer.input as Api.Profiles).profile_id;
       const snapshot = await readAllProfiles(signal);
       profileListeners.forEach((listener) => listener());
       return { ...snapshot, profile_id: saved };
@@ -1657,15 +1563,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const answer = await send("GET", `/api/v1/jobs/${job}/outputs${suffix}`, {
         signal: settings.signal,
       });
-      return decodeOutputsPage(answer.input, job);
+      return answer.input as Api.Outputs;
     },
 
     async readLatestOutput(job: string, signal?: AbortSignal): Promise<ControlOutput | null> {
       jobIdentity(job);
       const answer = await send("GET", `/api/v1/jobs/${job}/outputs/latest`, { signal });
-      const page = decodeOutputsPage(answer.input, job);
-      if (page.outputs.length > 1 || page.has_more)
-        throw new ContractError("outputs", "the latest output only");
+      const page = answer.input as Api.Outputs;
       return page.outputs[0] ?? null;
     },
 
@@ -1687,7 +1591,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (sequence(request) === 0 || request > 0xffffffff || sequence(index) > 0xffffffff)
         throw new ContractError("tool", "a positive request and unsigned index");
       const answer = await send("GET", `/api/v1/jobs/${job}/tools/${request}/${index}`, { signal });
-      const page = decodeJobTools(answer.input, job);
+      const page = answer.input as Api.Tools;
       const tool = page.tools[0];
       if (
         page.tools.length !== 1 ||
@@ -1702,19 +1606,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
 
     async readAllJobOutputs(job: string, signal?: AbortSignal) {
-      const outputs: ReturnType<typeof decodeOutputsPage>["outputs"] = [];
+      const outputs: Api.Outputs["outputs"] = [];
       let after = 0;
       for (;;) {
-        const page = decodeOutputsPage(
-          (
-            await send(
-              "GET",
-              `/api/v1/jobs/${jobIdentity(job)}/outputs?limit=100&after_seq=${after}`,
-              { signal },
-            )
-          ).input,
-          job,
-        );
+        const page = (
+          await send(
+            "GET",
+            `/api/v1/jobs/${jobIdentity(job)}/outputs?limit=100&after_seq=${after}`,
+            { signal },
+          )
+        ).input as Api.Outputs;
         if (page.outputs.some((output) => output.seq <= after))
           throw new ContractError("outputs.seq", "a sequence after the cursor");
         outputs.push(...page.outputs);
@@ -1740,10 +1641,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       let partialBytes = 0;
       for (let pageCount = 0; pageCount < 50; pageCount++) {
         const query = `?limit=100${cursor === undefined ? "" : `&after=${sequence(cursor)}`}${offset ? `&text_offset=${offset}` : ""}`;
-        const page = decodeProviderResponses(
-          (await send("GET", `/api/v1/jobs/${job}/responses${query}`, { signal })).input,
-          job,
-        );
+        const page = (await send("GET", `/api/v1/jobs/${job}/responses${query}`, { signal }))
+          .input as Api.ProviderResponses;
         for (const chunk of page.responses) {
           if (chunk.text_offset === 0) {
             if (partial || chunk.request <= (cursor ?? 0))
@@ -1824,7 +1723,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      const admission = decodeAdmission(answer.input);
+      const admission = projectAdmission(answer.input as Api.AdmissionResponse);
       if (admission.status !== "admitted" && admission.status !== "pending") {
         throw new ContractError("admission.status", "admitted or pending from a submission");
       }
@@ -1855,14 +1754,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeAttachment(answer.input);
+      return (answer.input as { attachment: ControlAttachment }).attachment;
     },
 
     /** Reads metadata of an image Attachment. */
     async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
       identity(attachmentId, "attachment");
       const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, { signal });
-      return decodeAttachment(answer.input);
+      return (answer.input as { attachment: ControlAttachment }).attachment;
     },
 
     /** URL to fetch the raw image content of an Attachment. */
@@ -1875,7 +1774,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     async readAdmission(key: string, signal?: AbortSignal) {
       submissionKey(key);
       const answer = await send("GET", "/api/v1/admissions", { key, signal });
-      return decodeAdmission(answer.input);
+      return projectAdmission(answer.input as Api.AdmissionResponse);
     },
 
     /** Requests the stop of one Job this listener admitted. */
@@ -1886,7 +1785,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeStop(answer.input, conversation);
+      return answer.input as Api.Stop;
     },
     async closeConversation(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
@@ -1895,7 +1794,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return decodeStop(answer.input, conversation);
+      return answer.input as Api.Stop;
     },
 
     /** Signs the browser in under this run's pairing code. */
@@ -1904,7 +1803,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         body: { pairing_code: pairingCode },
         signal,
       });
-      const session = decodeSession(answer.input);
+      const session = (answer.input as Api.SessionResponse).session;
       if (!session.authenticated) throw new ContractError("session", "a signed-in session");
       return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
     },
@@ -1912,7 +1811,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     /** The session this browser holds, if it is still authorized. */
     async readSession(signal?: AbortSignal) {
       const answer = await send("GET", "/api/v1/session", { signal });
-      const session = decodeSession(answer.input);
+      const session = (answer.input as Api.SessionResponse).session;
       if (!session.authenticated) throw new ContractError("session", "a signed-in session");
       return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
     },

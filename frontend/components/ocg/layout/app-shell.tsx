@@ -1,5 +1,7 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
@@ -10,7 +12,6 @@ import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import type { decodeHealth } from "../contracts";
 import type { ComposerIntent } from "../composer/domain";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
@@ -68,7 +69,7 @@ const SettingsSurface = dynamic(
 
 export type { WorkspaceView } from "./view-domain";
 
-type Health = ReturnType<typeof decodeHealth>;
+type Health = Api.Health;
 function currentLocation() {
   const url = new URL(window.location.href);
   const settingsSection = parseSettingsPath(url.pathname);

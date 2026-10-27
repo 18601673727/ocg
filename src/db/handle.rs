@@ -265,55 +265,6 @@ impl DatabaseHandle {
         self.shared.active_policy
     }
 
-    pub async fn read_saved_system_policy(&self) -> Result<SystemPolicy, PolicyOperationError> {
-        let (reply, response) = flume::bounded(1);
-        self.request_policy(Control::ReadPolicy(reply), false)?;
-        response
-            .recv_async()
-            .await
-            .unwrap_or(Err(PolicyOperationError::WorkerStopped))
-    }
-
-    pub async fn save_system_policy(
-        &self,
-        candidate: SystemPolicy,
-        expected_previous: SystemPolicy,
-    ) -> Result<PolicySaveResult, PolicyOperationError> {
-        let (reply, response) = flume::bounded(1);
-        let started = Arc::new(AtomicBool::new(false));
-        self.request_policy(
-            Control::SavePolicy {
-                expected: expected_previous,
-                candidate,
-                started: started.clone(),
-                reply,
-            },
-            true,
-        )?;
-        response.recv_async().await.unwrap_or_else(|_| {
-            Err(if started.load(Ordering::SeqCst) {
-                PolicyOperationError::SaveInterrupted
-            } else {
-                PolicyOperationError::WorkerStopped
-            })
-        })
-    }
-
-    fn request_policy(&self, control: Control, saving: bool) -> Result<(), PolicyOperationError> {
-        let admission = self
-            .shared
-            .admission
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        admission.check_policy(saving)?;
-        self.control_sender
-            .try_send(control)
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => PolicyOperationError::QueueFull,
-                flume::TrySendError::Disconnected(_) => PolicyOperationError::WorkerStopped,
-            })
-    }
-
     async fn submit<T>(
         &self,
         command: impl FnOnce(Reply<T>) -> Command,
@@ -461,24 +412,6 @@ impl DatabaseHandle {
         self.shared.protection.watch()
     }
 
-    /// Checks every protected filesystem now, on the write worker, and
-    /// returns the status after the check. Concurrent requests share one
-    /// check.
-    pub async fn check_disk_space(&self) -> Result<DiskProtectionStatus, DatabaseError> {
-        let response = self.shared.space_check.join(|| {
-            self.request(Control::CheckSpace)
-                .map_err(|error| match error {
-                    RecoveryError::ControlQueueFull => DatabaseError::ControlQueueFull,
-                    _ => DatabaseError::ShuttingDown,
-                })
-        })?;
-        match response.recv_async().await {
-            Ok(Some(status)) => Ok(status),
-            Ok(None) => Err(DatabaseError::ShuttingDown),
-            Err(_) => Err(DatabaseError::WorkerPanicked),
-        }
-    }
-
     /// Compacts the database file when the policy says it is worth it: the
     /// file is large, a large share of it is free, and no attempt was made
     /// recently. Otherwise reports why it did not. Nothing calls this
@@ -602,14 +535,6 @@ impl DatabaseHandle {
         })
         .await
     }
-    /// The stored override and opt-in revision; preset resolution is model-specific.
-    pub async fn conversation_compaction_policy(
-        &self,
-        conversation: JobId,
-    ) -> Result<Option<(Option<crate::db::entities::CompactionPolicy>, u64)>, DatabaseError> {
-        self.read(move |database| redb::read_compaction_policy(database, conversation))
-            .await
-    }
 
     pub async fn group_limits(
         &self,
@@ -696,19 +621,6 @@ impl DatabaseHandle {
         limit: usize,
     ) -> Result<redb::ConversationsPage, DatabaseError> {
         self.read(move |database| redb::read_conversation_search(database, &terms, before, limit))
-            .await
-    }
-
-    /// The Jobs that are submitted but neither started nor settled, oldest
-    /// first by Job ID, strictly after `after` when given.
-    /// At most `limit`, and never more than 1,000, index entries are
-    /// examined per call, see [`entities::PendingJobsPage`].
-    pub async fn pending_jobs(
-        &self,
-        after: Option<JobId>,
-        limit: usize,
-    ) -> Result<entities::PendingJobsPage, DatabaseError> {
-        self.read(move |database| redb::read_pending_jobs(database, after, limit))
             .await
     }
 
@@ -835,17 +747,6 @@ impl DatabaseHandle {
     /// of them never changes the Decision Model or its request.
     pub async fn decision_executors(&self) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(redb::read_decision_executors).await
-    }
-
-    /// The Executors that support the transport of the LLM configuration a
-    /// submitted Job froze, oldest first, at most 1,000; empty for an
-    /// unconfigured Job.
-    pub async fn job_compatible_executors(
-        &self,
-        job: JobId,
-    ) -> Result<Vec<ExecutorId>, DatabaseError> {
-        self.read(move |database| redb::read_job_compatible_executors(database, job))
-            .await
     }
 
     /// The Jobs that explicitly retry `original`, oldest first.
@@ -984,38 +885,6 @@ impl DatabaseHandle {
     ) -> Result<ObservationPage<AvailabilityStatRecord>, DatabaseError> {
         self.read(move |database| {
             redb::read_availability_stats(database, &filter, after, limit, MAX_OBSERVATION_SCAN)
-        })
-        .await
-    }
-
-    /// One page of the distinct (Provider, model) pairs that LLM Metrics or
-    /// AvailabilityStats observed within `filter`'s time range were recorded
-    /// against, as their Jobs froze them. Choices follow the request-scope
-    /// index order: Provider ID, then the model name's SHA-256 digest. Pass
-    /// the returned `next` back as `after` to continue; a page can be empty
-    /// while `next` is set, and a pair's flags accumulate across the pages
-    /// that read it. At most `limit` choices (clamped to 1..=1,000) and
-    /// [`MAX_OBSERVED_MODEL_SCAN`] examined rows per call.
-    ///
-    /// Each call reads one snapshot; separate calls do not share one. Records
-    /// are never removed, so a pair a page returned never stops being a
-    /// choice, and pages never repeat a pair. A pair first recorded, or first
-    /// observed within the range, after a later page has passed its position
-    /// is not revisited.
-    pub async fn observed_models(
-        &self,
-        filter: ObservedModelFilter,
-        after: Option<ObservedModelCursor>,
-        limit: usize,
-    ) -> Result<ObservedModelPage, DatabaseError> {
-        self.read(move |database| {
-            redb::read_observed_models(
-                database,
-                &filter,
-                after.as_ref(),
-                limit,
-                MAX_OBSERVED_MODEL_SCAN,
-            )
         })
         .await
     }
@@ -1676,18 +1545,6 @@ impl DatabaseHandle {
         limit: usize,
     ) -> Result<Vec<AttachmentRecord>, DatabaseError> {
         self.read(move |database| redb::read_attachments(database, before, limit))
-            .await
-    }
-
-    /// The inputs that carry an Attachment, oldest first; see
-    /// [`DatabaseHandle::input_jobs`] for the Jobs of each.
-    pub async fn attachment_inputs(
-        &self,
-        attachment: AttachmentId,
-        after: Option<JobInputId>,
-        limit: usize,
-    ) -> Result<redb::CursorPage<JobInputId, JobInputId>, DatabaseError> {
-        self.read(move |database| redb::read_attachment_inputs(database, attachment, after, limit))
             .await
     }
 

@@ -27,18 +27,6 @@ pub(super) enum Admission {
 }
 
 impl Admission {
-    pub(super) fn check_policy(&self, saving: bool) -> Result<(), PolicyOperationError> {
-        match self {
-            Self::Open => Ok(()),
-            Self::Protected(lock) if saving => {
-                Err(PolicyOperationError::DiskProtected(lock.clone()))
-            }
-            Self::Protected(_) => Ok(()),
-            Self::ShuttingDown => Err(PolicyOperationError::ShuttingDown),
-            Self::WorkerStopped => Err(PolicyOperationError::WorkerStopped),
-        }
-    }
-
     pub(super) fn check_read(&self) -> Result<(), DatabaseError> {
         match self {
             Self::Open => Ok(()),
@@ -145,7 +133,6 @@ pub(super) struct Shared {
     pub(super) reclaimed_at_open: Vec<(ContentDigest, Result<Reclamation, StoreError>)>,
     pub(super) reclamation_omitted_at_open: u64,
     /// `None` answers a check that the stopping worker will never run.
-    pub(super) space_check: SharedRequest<Option<DiskProtectionStatus>>,
     pub(super) recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
     /// The natural keys of the commands whose commit had an unknown outcome,
     /// by operation, so [`DatabaseHandle::reconcile_operation`] can read them.
@@ -321,7 +308,6 @@ impl Drop for ReleaseOnPanic {
                         .refuse(|| DatabaseError::NeverExecuted { operation });
                 }
             }
-            self.shared.space_check.abandon();
             self.shared.recovery.abandon();
             for control in self.control.drain() {
                 control.refuse_policy(true);

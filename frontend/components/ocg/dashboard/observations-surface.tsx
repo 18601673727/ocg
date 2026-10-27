@@ -1,9 +1,10 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import type { decodeAvailability, decodeHealth, decodeUsage } from "../contracts";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { UsageChart } from "./usage-chart";
@@ -18,8 +19,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-type Usage = ReturnType<typeof decodeUsage>["observations"][number];
-type Availability = ReturnType<typeof decodeAvailability>["observations"][number];
+type Usage = Api.Usage["observations"][number];
+type Availability = Api.Availability["observations"][number];
 const cell = "px-3 py-3 align-top text-left";
 const select = "rounded-md border border-input bg-background px-3 py-2 text-sm";
 const number = (value: number | null) => (value === null ? "—" : value.toLocaleString());
@@ -32,7 +33,7 @@ export function ObservationsSurface({
 }: {
   client: HttpCanonicalControlClient;
   kind: "usage" | "health";
-  health: ReturnType<typeof decodeHealth> | null;
+  health: Api.Health | null;
   onJob: (job: string) => void;
 }) {
   const [days, setDays] = useState(1);

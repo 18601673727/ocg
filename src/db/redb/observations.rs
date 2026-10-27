@@ -9,9 +9,7 @@ use super::rows::decode_request_event;
 use super::*;
 use crate::db::entities::{
     AvailabilityObservation, AvailabilityStatRecord, MetricsRecord, ObservationCursor,
-    ObservationFilter, ObservationPage, ObservedModel, ObservedModelChoice, ObservedModelCursor,
-    ObservedModelFilter, ObservedModelPage, RequestEventRecord, RequestPayload, TokenAnnotation,
-    TokenRequestSample,
+    ObservationFilter, ObservationPage, RequestEventRecord, RequestPayload, TokenAnnotation,
 };
 
 pub(super) fn frozen_llm_target(
@@ -138,98 +136,7 @@ pub(super) fn metric_record(
     }))
 }
 
-/// The Metrics records of one Job's events. A Token event that directly
-/// follows the Measurement event written with it, in the same transaction,
-/// is that record's annotation; any other Token event is a record of its
-/// own, without measurements.
-pub(super) fn metrics_of(
-    job: JobId,
-    target: &Option<LlmTarget>,
-    events: &[RequestEventRecord],
-) -> Vec<MetricsRecord> {
-    let mut records: Vec<MetricsRecord> = Vec::new();
-    let mut last_measurement: Option<(RequestNumber, u32, Timestamp, Timestamp)> = None;
-    for event in events {
-        match &event.payload {
-            RequestPayload::Measurement { measurements } => {
-                last_measurement = Some((
-                    event.request,
-                    event.seq,
-                    event.observed_at,
-                    event.recorded_at,
-                ));
-                records.push(MetricsRecord {
-                    id: MetricsId::new(event.id.get()),
-                    job,
-                    request: event.request,
-                    target: target.clone(),
-                    observed_at: event.observed_at,
-                    measurements: measurements.clone(),
-                    token: None,
-                    recorded_at: event.recorded_at,
-                });
-            }
-            RequestPayload::Token {
-                eligibility,
-                finality,
-            } => {
-                let annotation = TokenAnnotation {
-                    eligibility: *eligibility,
-                    finality: *finality,
-                };
-                let pairs =
-                    last_measurement.is_some_and(|(request, seq, observed_at, recorded_at)| {
-                        request == event.request
-                            && seq + 1 == event.seq
-                            && observed_at == event.observed_at
-                            && recorded_at == event.recorded_at
-                    });
-                match records.last_mut() {
-                    Some(record) if pairs => record.token = Some(annotation),
-                    _ => records.push(MetricsRecord {
-                        id: MetricsId::new(event.id.get()),
-                        job,
-                        request: event.request,
-                        target: target.clone(),
-                        observed_at: event.observed_at,
-                        measurements: Measurements::default(),
-                        token: Some(annotation),
-                        recorded_at: event.recorded_at,
-                    }),
-                }
-                last_measurement = None;
-            }
-            RequestPayload::Availability { .. }
-            | RequestPayload::Sent { .. }
-            | RequestPayload::Received { .. }
-            | RequestPayload::ApprovedCalls => last_measurement = None,
-        }
-    }
-    records
-}
-
-/// Reduces one request's events to its Token sample. An evidence error drops
-/// only this request, and is logged once with the Job, the request and the
-/// error; no sample is then returned. Both the mutation and the rebuild path
-/// use this rule, so they cannot disagree about a request.
-pub(super) fn usage_sample_of(
-    job: JobId,
-    request: RequestNumber,
-    target: &Option<LlmTarget>,
-    events: &[RequestEventRecord],
-) -> Option<TokenRequestSample> {
-    let records = metrics_of(job, target, events);
-    match TokenRequestSample::from_metrics(&records) {
-        Ok(sample) => sample,
-        Err(error) => {
-            log::warn!(
-                "dropping Token usage of {job} request {}: {error}",
-                request.get()
-            );
-            None
-        }
-    }
-}
+pub(super) use crate::db::entities::usage_sample_of;
 
 fn availability_of(
     job: JobId,
@@ -328,12 +235,6 @@ pub(crate) fn read_job_availability(
 }
 
 // ---- queries over the scope index ---------------------------------------------------
-
-type ScopeKey = (u128, [u8; 32], i64, u128, u32, u32);
-
-fn model_hash(model: &str) -> [u8; 32] {
-    *ContentDigest::of(model.as_bytes()).as_bytes()
-}
 
 fn cursor_key(cursor: &ObservationCursor) -> RequestTimelineKey {
     (
@@ -435,14 +336,6 @@ fn event_at_parts(
     )?))
 }
 
-fn event_at(
-    rx: &ReadTransaction,
-    key: ScopeKey,
-) -> Result<Option<RequestEventRecord>, StorageError> {
-    let (_, _, _, job, request, seq) = key;
-    event_at_parts(rx, job, request, seq)
-}
-
 fn event_at_timeline(
     rx: &ReadTransaction,
     key: RequestTimelineKey,
@@ -451,50 +344,19 @@ fn event_at_timeline(
     event_at_parts(rx, job, request, seq)
 }
 
-pub(crate) fn read_metrics(
+fn read_observation_page<T>(
     database: &Database,
     filter: &ObservationFilter,
     cursor: Option<ObservationCursor>,
     limit: usize,
     max_scan: usize,
-) -> Result<ObservationPage<MetricsRecord>, StorageError> {
-    let rx = read(database)?;
-    let limit = limit.clamp(1, MAX_PAGE);
-    let mut cache = HashMap::new();
-    let mut records = Vec::new();
-    let stopped = walk_timeline(&rx, filter, cursor.as_ref(), max_scan, |key| {
-        let job = JobId::new(key.1);
-        if target_matches(&rx, filter, job, &mut cache)?.is_none() {
-            return Ok(true);
-        }
-        let Some(event) = event_at_timeline(&rx, key)? else {
-            return Ok(true);
-        };
-        if !matches!(
-            event.payload,
-            RequestPayload::Measurement { .. } | RequestPayload::Token { .. }
-        ) {
-            return Ok(true);
-        }
-        let target = cache.get(&job).cloned().flatten();
-        if let Some(record) = metric_record(&rx.open_table(REQUEST_EVENTS)?, &target, &event)? {
-            records.push(record);
-        }
-        Ok(records.len() < limit)
-    })?;
-    Ok(ObservationPage {
-        records,
-        next: stopped.map(key_cursor),
-    })
-}
-
-pub(crate) fn read_availability_stats(
-    database: &Database,
-    filter: &ObservationFilter,
-    cursor: Option<ObservationCursor>,
-    limit: usize,
-    max_scan: usize,
-) -> Result<ObservationPage<AvailabilityStatRecord>, StorageError> {
+    mut project: impl FnMut(
+        &ReadTransaction,
+        JobId,
+        LlmTarget,
+        RequestEventRecord,
+    ) -> Result<Option<T>, StorageError>,
+) -> Result<ObservationPage<T>, StorageError> {
     let rx = read(database)?;
     let limit = limit.clamp(1, MAX_PAGE);
     let mut cache = HashMap::new();
@@ -505,7 +367,7 @@ pub(crate) fn read_availability_stats(
             return Ok(true);
         };
         if let Some(event) = event_at_timeline(&rx, key)?
-            && let Some(record) = availability_of(job, &target, event)
+            && let Some(record) = project(&rx, job, target, event)?
         {
             records.push(record);
         }
@@ -517,210 +379,46 @@ pub(crate) fn read_availability_stats(
     })
 }
 
-pub(crate) fn read_observed_models(
+pub(crate) fn read_metrics(
     database: &Database,
-    filter: &ObservedModelFilter,
-    after: Option<&ObservedModelCursor>,
+    filter: &ObservationFilter,
+    cursor: Option<ObservationCursor>,
     limit: usize,
-    scan_limit: usize,
-) -> Result<ObservedModelPage, StorageError> {
-    let rx = read(database)?;
-    let limit = limit.clamp(1, MAX_PAGE);
-    let table = rx.open_table(REQUEST_SCOPES)?;
-    let from = filter.observed.from.as_unix_micros();
-    let until = filter.observed.until.as_unix_micros();
-    if from >= until || scan_limit == 0 {
-        return Ok(ObservedModelPage {
-            choices: Vec::new(),
-            next: None,
-        });
-    }
-    let min_provider = filter.provider.map_or(0, |provider| provider.get());
-    let max_provider = filter.provider.map_or(u128::MAX, |provider| provider.get());
-    let high = (
-        max_provider,
-        [0xff; 32],
-        i64::MAX,
-        u128::MAX,
-        u32::MAX,
-        u32::MAX,
-    );
-    let group_end = |provider, hash| (provider, hash, i64::MAX, u128::MAX, u32::MAX, u32::MAX);
-    let group_high = |provider, hash| {
-        (
-            provider,
-            hash,
-            until.saturating_sub(1),
-            u128::MAX,
-            u32::MAX,
-            u32::MAX,
-        )
-    };
-
-    let mut choices = Vec::new();
-    let jobs = rx.open_table(JOBS)?;
-    let mut generative = HashMap::new();
-    let mut examined = 0usize;
-    let mut flags = (false, false);
-    let (mut current, mut start, mut bound) = match after {
-        Some(cursor) => {
-            let provider = cursor.model.provider.get();
-            let hash = model_hash(&cursor.model.model);
-            let key = (
-                provider,
-                hash,
-                cursor.observed_at.as_unix_micros(),
-                cursor.job.get(),
-                cursor.request.get(),
-                cursor.seq,
-            );
-            if cursor.complete {
-                // The pair's choice was returned; continue after its whole group.
-                (None, None, Bound::Excluded(group_end(provider, hash)))
-            } else {
-                // Continue the pair with the flags already seen in it.
-                flags = (cursor.has_metrics, cursor.has_availability_stats);
-                (
-                    Some((provider, hash, cursor.model.clone(), key)),
-                    Some(Bound::Excluded(key)),
-                    Bound::Excluded(key),
-                )
+    max_scan: usize,
+) -> Result<ObservationPage<MetricsRecord>, StorageError> {
+    read_observation_page(
+        database,
+        filter,
+        cursor,
+        limit,
+        max_scan,
+        |rx, _, target, event| {
+            if !matches!(
+                event.payload,
+                RequestPayload::Measurement { .. } | RequestPayload::Token { .. }
+            ) {
+                return Ok(None);
             }
-        }
-        None => (
-            None,
-            None,
-            Bound::Included((min_provider, [0; 32], from, 0, 0, 0)),
-        ),
-    };
-
-    loop {
-        let (provider, hash, model, discovered) = match current.take() {
-            Some(current) => current,
-            None => {
-                let mut range = table.range((bound, Bound::Included(high)))?;
-                let Some(entry) = range.next() else {
-                    break;
-                };
-                let key = entry?.0.value();
-                if key.0 > max_provider {
-                    break;
-                }
-                let (provider, hash) = (key.0, key.1);
-                let row = jobs
-                    .get(key.3)?
-                    .map(|bytes| JobSpec::decode_at(key.3, bytes.value()))
-                    .transpose()?
-                    .ok_or_else(|| StorageError::corrupted("observed request has no Job"))?;
-                let identity = reader::turn_usage_identity_of(&jobs, &row)?.ok_or_else(|| {
-                    StorageError::corrupted("observed request has no frozen model")
-                })?;
-                flags = (false, false);
-                (
-                    provider,
-                    hash,
-                    ObservedModel {
-                        provider: LlmProviderId::new(provider),
-                        model: identity.model,
-                    },
-                    key,
-                )
-            }
-        };
-        let low = start
-            .take()
-            .unwrap_or(Bound::Included((provider, hash, from, 0, 0, 0)));
-        let mut last = None;
-        let mut saw_event = flags.0 || flags.1;
-        let mut complete = true;
-        for entry in table.range((low, Bound::Included(group_high(provider, hash))))? {
-            if examined >= scan_limit {
-                complete = false;
-                break;
-            }
-            let key = entry?.0.value();
-            let job = JobId::new(key.3);
-            let eligible = match generative.get(&job) {
-                Some(eligible) => *eligible,
-                None => {
-                    let eligible = frozen_llm_target(&rx, job)?.is_some();
-                    generative.insert(job, eligible);
-                    eligible
-                }
-            };
-            if eligible && let Some(event) = event_at(&rx, key)? {
-                match event.payload {
-                    RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => {
-                        flags.0 = true;
-                    }
-                    RequestPayload::Availability { .. } => flags.1 = true,
-                    RequestPayload::Sent { .. }
-                    | RequestPayload::Received { .. }
-                    | RequestPayload::ApprovedCalls => {}
-                }
-                saw_event = true;
-            }
-            examined += 1;
-            last = Some(key);
-        }
-        if !complete {
-            let Some(last) = last else {
-                bound = Bound::Excluded(group_end(provider, hash));
-                continue;
-            };
-            return Ok(ObservedModelPage {
-                choices,
-                next: Some(observed_cursor(model, flags, false, last)),
-            });
-        }
-        bound = Bound::Excluded(group_end(provider, hash));
-        if !saw_event {
-            examined += 1;
-            if examined >= scan_limit {
-                return Ok(ObservedModelPage {
-                    choices,
-                    next: Some(observed_cursor(model, flags, true, discovered)),
-                });
-            }
-            continue;
-        }
-        choices.push(ObservedModelChoice {
-            model: model.clone(),
-            has_metrics: flags.0,
-            has_availability_stats: flags.1,
-        });
-        if choices.len() >= limit || examined >= scan_limit {
-            let Some(last) = last else {
-                continue;
-            };
-            return Ok(ObservedModelPage {
-                choices,
-                next: Some(observed_cursor(model, flags, true, last)),
-            });
-        }
-    }
-    Ok(ObservedModelPage {
-        choices,
-        next: None,
-    })
+            metric_record(&rx.open_table(REQUEST_EVENTS)?, &Some(target), &event)
+        },
+    )
 }
 
-fn observed_cursor(
-    model: ObservedModel,
-    flags: (bool, bool),
-    complete: bool,
-    (_, _, observed_at, job, request, seq): ScopeKey,
-) -> ObservedModelCursor {
-    ObservedModelCursor {
-        model,
-        has_metrics: flags.0,
-        has_availability_stats: flags.1,
-        complete,
-        observed_at: Timestamp::from_unix_micros(observed_at),
-        job: JobId::new(job),
-        request: RequestNumber::new(request).unwrap_or(RequestNumber::FIRST),
-        seq,
-    }
+pub(crate) fn read_availability_stats(
+    database: &Database,
+    filter: &ObservationFilter,
+    cursor: Option<ObservationCursor>,
+    limit: usize,
+    max_scan: usize,
+) -> Result<ObservationPage<AvailabilityStatRecord>, StorageError> {
+    read_observation_page(
+        database,
+        filter,
+        cursor,
+        limit,
+        max_scan,
+        |_, job, target, event| Ok(availability_of(job, &target, event)),
+    )
 }
 
 pub(crate) struct ProviderResponse {

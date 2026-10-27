@@ -2,7 +2,6 @@ import type {
   AgentCapability,
   JobUsage,
   JobActivity,
-  JobPlanStepView,
   JobPlanView,
   JsonValue,
   ProjectRecord,
@@ -16,7 +15,7 @@ export type {
   JobActivity,
   JsonValue,
 } from "./generated";
-export type TaskStep = JobPlanStepView;
+
 export type TaskPlan = JobPlanView;
 
 export type Envelope<T> = { api_version: number } & T;
@@ -372,24 +371,6 @@ export type Input = {
 
 export type JobInput = { job: string; input: Input };
 
-export type Entry =
-  | { kind: "context_preparation"; job: string; policy_revision: string }
-  | { kind: "context_use"; artifact: string | null }
-  | { kind: "user_message"; text: string; attachments: Array<string> }
-  | { kind: "user_message_edit"; message: number; text: string; attachments: Array<string> }
-  | { kind: "user_message_withdraw"; message: number }
-  | { kind: "agent_message"; text: string; call: string }
-  | { kind: "notice"; child: string; event: string; reference: string }
-  | { kind: "decision"; approval: [string, number, number] }
-  | { kind: "retry_of"; turn: string; by: Actor }
-  | { kind: "iteration"; n: number }
-  | ({ kind: "response_format" } & (
-      | { type: "json_object" }
-      | { type: "json_schema"; name: string }
-    ));
-
-export type ResponseFormat = { type: "json_object" } | { type: "json_schema"; name: string };
-
 export type TurnEntry = { seq: number; at_us: number } & (
   | { kind: "context_preparation"; job: string; policy_revision: string }
   | { kind: "context_use"; artifact: string | null }
@@ -580,18 +561,7 @@ export type Pool = {
   operations?: Array<string>;
 };
 
-export type Pools = { pools: Array<Pool> };
-
 export type PoolAnswer = { pool: Pool };
-
-export type Observation = {
-  id: string;
-  job: string;
-  request: number;
-  observed_at_us: number;
-  model: string | null;
-  provider: string | null;
-};
 
 export type UsageObservation = {
   llm_profile: string | null;
@@ -631,19 +601,6 @@ export type Availability = {
   next_after: string | null;
 };
 
-export type UsageRow = {
-  agent: string | null;
-  provider: string;
-  model: string | null;
-  requests: number;
-  complete_requests: number;
-  input_tokens: number;
-  output_tokens: number;
-  cache_read_tokens: number;
-  cache_write_tokens: number;
-  reasoning_tokens: number;
-};
-
 export type UsageBucket = {
   bucket_us: number;
   agent: string | null;
@@ -679,17 +636,6 @@ export type UsageRetries = {
   next_after: string | null;
 };
 
-export type UsageSummary = {
-  from_us: number;
-  until_us: number;
-  complete: boolean;
-  /**
-   * The opaque source-row continuation; `None` exactly when complete.
-   */
-  resume_after: string | null;
-  rows: Array<UsageRow>;
-};
-
 export type UsageBuckets = {
   from_us: number;
   until_us: number;
@@ -702,19 +648,6 @@ export type UsageBuckets = {
   bucket: string;
   tz_offset_minutes: number;
 };
-
-export type ToolStatsRow = {
-  name: string;
-  admitted: number;
-  refused_arguments: number;
-  completed: number;
-  failed: number;
-  open: number;
-  duration_us_mean: number | null;
-  duration_us_max: number;
-};
-
-export type ToolStats = { tools: Array<ToolStatsRow> };
 
 export type Logs = {
   files: Array<string>;
@@ -775,8 +708,6 @@ export type Attachment = {
   created_at_us: number;
   available: boolean;
 };
-
-export type AttachmentAnswer = { attachment: Attachment };
 
 export type JobDetails = {
   job: Job;
@@ -850,21 +781,6 @@ export type Admission =
 
 export type AdmissionResponse = { admission: Admission };
 
-export type DecisionChoiceOption = { id: string; description: string };
-
-export type DecisionScoreLevel = { value: number; description: string };
-
-export type DecisionQuestion =
-  | { kind: "choice"; prompt: string; options: Array<DecisionChoiceOption> }
-  | { kind: "binary_probability"; prompt: string }
-  | { kind: "ordinal_score"; prompt: string; levels: Array<DecisionScoreLevel> };
-
-export type DecisionRequest = {
-  schema_version: number;
-  state: JsonValue;
-  question: DecisionQuestion;
-};
-
 export type DecisionLimits = {
   max_input_tokens_per_request: number | null;
   max_output_tokens_per_request: number | null;
@@ -899,16 +815,6 @@ export type DecisionAgentProfile = {
   updated_at_us: number;
 };
 
-export type ProviderRequest = {
-  job: string;
-  request: number;
-  messages: Array<JsonValue>;
-  tools: JsonValue | null;
-  parameters: JsonValue;
-  dropped_turns: number;
-  response: JsonValue | null;
-};
-
 export type ProviderModel = {
   id: string;
   reasoning_efforts: string[] | null;
@@ -918,22 +824,6 @@ export type ProviderModel = {
 export type ImportedModels = { profile_ids: Array<string>; created: number; existing: number };
 
 export type ProviderModels = { models: Array<ProviderModel> };
-
-export type ProviderError = { code: string; message: string; status_code?: number };
-
-export type ProviderErrorResponse = { error: ProviderError };
-
-export type GroupError = { code: string; message: string; group: number };
-
-export type GroupErrorResponse = { error: GroupError };
-
-export type NoticeBody =
-  | { child: string; event: string; reference: string }
-  | { event: string; by: Actor; at_us: number };
-
-export type Notice = { seq: number; class: string; body: NoticeBody };
-
-export type Notices = { conversation: string; notices: Array<Notice>; has_more: boolean };
 
 export type Append = { conversation: string; turn: string; seq: number; joined: boolean };
 

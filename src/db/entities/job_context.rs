@@ -856,3 +856,88 @@ pub enum JobEdit {
     /// Hides it from the conversation list, for good.
     Hide,
 }
+
+pub(in crate::db) fn effective_entries(
+    entries: Vec<(u32, JobInputEntry)>,
+) -> Result<Vec<(u32, JobInputEntry)>, &'static str> {
+    let mut visible: std::collections::BTreeMap<u32, JobInputEntry> =
+        std::collections::BTreeMap::new();
+    for (seq, entry) in entries {
+        match entry.entry {
+            Entry::UserMessageEdit {
+                message,
+                text,
+                attachments,
+            } => {
+                if message >= seq {
+                    return Err("queued edit does not name an earlier input");
+                }
+                let Some(original) = visible.get_mut(&message) else {
+                    return Err("queued edit names an absent input");
+                };
+                if !matches!(original.entry, Entry::UserMessage { .. }) {
+                    return Err("queued edit does not name a user message");
+                }
+                original.entry = Entry::UserMessage { text, attachments };
+            }
+            Entry::UserMessageWithdraw { message } => {
+                if message >= seq
+                    || !visible
+                        .get(&message)
+                        .is_some_and(|original| matches!(original.entry, Entry::UserMessage { .. }))
+                {
+                    return Err("queued withdrawal does not name an earlier user message");
+                }
+                visible.remove(&message);
+            }
+            other @ (Entry::UserMessage { .. }
+            | Entry::AgentMessage { .. }
+            | Entry::Notice { .. }
+            | Entry::Decision { .. }
+            | Entry::RetryOf { .. }
+            | Entry::Iteration { .. }
+            | Entry::ResponseFormat { .. }
+            | Entry::ContextPreparation { .. }
+            | Entry::ContextUse { .. }) => {
+                visible.insert(
+                    seq,
+                    JobInputEntry {
+                        entry: other,
+                        at: entry.at,
+                    },
+                );
+            }
+        }
+    }
+    Ok(visible.into_iter().collect())
+}
+
+pub(in crate::db) fn summary_chunks(
+    text: &str,
+    capacity: usize,
+) -> Option<Vec<crate::db::entities::SummarizationStage>> {
+    if capacity == 0 {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        if ranges.len() == 7 {
+            return None;
+        }
+        let mut end = start.saturating_add(capacity).min(text.len());
+        while end > start && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            return None;
+        }
+        ranges.push(crate::db::entities::SummarizationStage::Chunk {
+            start: start as u64,
+            end: end as u64,
+            content: crate::db::entities::ContentDigest::of(&text.as_bytes()[start..end]),
+        });
+        start = end;
+    }
+    (!ranges.is_empty()).then_some(ranges)
+}

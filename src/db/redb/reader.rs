@@ -3,6 +3,7 @@ use std::ops::Bound;
 use ::redb::ReadableTableMetadata;
 
 use super::*;
+use crate::db::derived::ActivityProjection;
 use crate::db::entities::{
     ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig, DependencyState,
     ExecutionConfiguration, ExecutionOperation, ExecutionPoolConfig, FrozenPoolBinding,
@@ -332,17 +333,6 @@ pub(crate) struct JobDetails {
     pub task_plan: Option<JobPlanView>,
 }
 
-fn job_plan_state(job: &JobRecord) -> JobActivityPhase {
-    match job.outcome.as_ref().map(|outcome| outcome.kind) {
-        Some(OutcomeKind::Completed) => JobActivityPhase::Completed,
-        Some(OutcomeKind::Failed) => JobActivityPhase::Failed,
-        Some(OutcomeKind::Cancelled) => JobActivityPhase::Cancelled,
-        Some(OutcomeKind::Unknown) => JobActivityPhase::Unknown,
-        None if job.started_at.is_some() => JobActivityPhase::RunningTools,
-        None => JobActivityPhase::Queued,
-    }
-}
-
 fn job_plan_view(rx: &ReadTransaction, row: &JobSpec) -> Result<Option<JobPlanView>, StorageError> {
     let Some((owner, receipt)) = job_plan_snapshot(rx, row)? else {
         return Ok(None);
@@ -353,7 +343,7 @@ fn job_plan_view(rx: &ReadTransaction, row: &JobSpec) -> Result<Option<JobPlanVi
     };
     let synthesis = job_record(rx, synthesis)?;
     let state = if synthesis.outcome.is_some() {
-        job_plan_state(&synthesis)
+        JobActivityPhase::for_plan(&synthesis)
     } else if synthesis.started_at.is_some() {
         JobActivityPhase::Synthesizing
     } else {
@@ -387,7 +377,7 @@ fn job_plan_view(rx: &ReadTransaction, row: &JobSpec) -> Result<Option<JobPlanVi
                 .unwrap_or_else(|| "Task phase".into()),
             agent,
             model,
-            state: job_plan_state(&job),
+            state: JobActivityPhase::for_plan(&job),
             depends_on: original
                 .kind
                 .dependencies()
@@ -406,18 +396,6 @@ fn job_plan_view(rx: &ReadTransaction, row: &JobSpec) -> Result<Option<JobPlanVi
 
 /// Cuts `message` to its first 2048 bytes at a character boundary, ending
 /// with "…" when cut, so the Job route stays bounded.
-fn cut_unknown_reason(message: &str) -> String {
-    const LIMIT: usize = 2048;
-    if message.len() <= LIMIT {
-        return message.to_owned();
-    }
-    let mut boundary = LIMIT;
-    while !message.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    format!("{}…", &message[..boundary])
-}
-
 pub(crate) fn read_job_details(
     database: &Database,
     id: JobId,
@@ -442,38 +420,14 @@ pub(crate) fn read_job_details(
     let result = latest_output
         .clone()
         .filter(|output| output.kind == OutputKind::Result);
-    let mut activity = JobActivity {
-        phase: JobActivityPhase::Starting,
-        request: None,
-        request_started_at_us: None,
-        last_activity_at_us: job.updated_at.as_unix_micros().max(
-            latest_output
-                .as_ref()
-                .map_or(0, |o| o.created_at.as_unix_micros()),
-        ),
-        last_output_at_us: latest_output
-            .as_ref()
-            .map(|o| o.created_at.as_unix_micros()),
-        last_output_seq: latest_output.as_ref().map_or(0, |o| o.seq),
-        provider_status: None,
-        tool: None,
-    };
-    let mut received = false;
-    let mut rate_limited = false;
-    let (usage, unknown_reason) = if conversation {
-        (None, None)
+    let mut activity = ActivityProjection::new(&job, latest_output.as_ref());
+    let usage = if conversation {
+        None
     } else {
         let target = observations::frozen_llm_target(&rx, id)?;
         let mut usage = JobUsage::default();
         let mut events = Vec::new();
         let mut scanned = 0;
-        // The Job's latest request, named by the first event decoded in
-        // reverse; only its first Availability counts, so a retried attempt
-        // never reports an earlier attempt's failure.
-        let want_unknown = job.unknown_at.is_some();
-        let mut latest_request: Option<RequestNumber> = None;
-        let mut unknown_reason: Option<String> = None;
-        let mut unknown_done = !want_unknown;
         for entry in rx
             .open_table(REQUEST_EVENTS)?
             .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
@@ -490,77 +444,19 @@ pub(crate) fn read_job_details(
                 .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
             scanned += 1;
             let event = super::rows::decode_request_event(id, request, seq, bytes.value())?;
-            let latest = *activity.request.get_or_insert(event.request.get());
-            if event.request.get() == latest {
-                activity.last_activity_at_us = activity
-                    .last_activity_at_us
-                    .max(event.recorded_at.as_unix_micros());
-                match &event.payload {
-                    crate::db::entities::RequestPayload::Sent { .. } => {
-                        activity.request_started_at_us = Some(event.recorded_at.as_unix_micros())
-                    }
-                    crate::db::entities::RequestPayload::Received { .. } => received = true,
-                    crate::db::entities::RequestPayload::Availability {
-                        status_code,
-                        failure,
-                        ..
-                    } => {
-                        if activity.provider_status.is_none() {
-                            activity.provider_status = *status_code;
-                            rate_limited = *status_code == Some(429)
-                                && failure.as_ref().is_some_and(|f| f.retryable);
-                        }
-                    }
-                    crate::db::entities::RequestPayload::ApprovedCalls
-                    | crate::db::entities::RequestPayload::Measurement { .. }
-                    | crate::db::entities::RequestPayload::Token { .. } => {}
-                }
-            }
-            if !unknown_done {
-                let latest = *latest_request.get_or_insert(event.request);
-                if event.request != latest {
-                    unknown_done = true;
-                } else if let crate::db::entities::RequestPayload::Availability {
-                    failure, ..
-                } = &event.payload
-                {
-                    if let Some(failure) = failure {
-                        unknown_reason = Some(cut_unknown_reason(&failure.message));
-                    }
-                    unknown_done = true;
-                }
-            }
+            activity.request_event(&event);
             let seq = event.seq;
             events.push(event);
             if seq == 1 {
                 events.reverse();
                 if let Some(sample) = observations::usage_sample_of(id, request, &target, &events) {
-                    usage.requests = usage.requests.saturating_add(1);
-                    usage.complete_requests = usage.complete_requests.saturating_add(u64::from(
-                        sample.usage == crate::db::entities::TokenUsageState::Complete,
-                    ));
-                    usage.input_tokens = usage
-                        .input_tokens
-                        .saturating_add(u64::from(sample.input.value().unwrap_or(0)));
-                    usage.output_tokens = usage
-                        .output_tokens
-                        .saturating_add(u64::from(sample.output.value().unwrap_or(0)));
-                    usage.cache_read_tokens = usage
-                        .cache_read_tokens
-                        .saturating_add(u64::from(sample.cache_read.value().unwrap_or(0)));
-                    usage.cache_write_tokens = usage
-                        .cache_write_tokens
-                        .saturating_add(u64::from(sample.cache_write.value().unwrap_or(0)));
-                    usage.reasoning_tokens = usage
-                        .reasoning_tokens
-                        .saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
+                    usage.add_sample(&sample);
                 }
                 events.clear();
             }
         }
-        ((scanned != 0).then_some(usage), unknown_reason)
+        (scanned != 0).then_some(usage)
     };
-    let mut waiting_user = false;
     for entry in rx
         .open_table(TOOL_CALLS)?
         .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
@@ -569,50 +465,29 @@ pub(crate) fn read_job_details(
     {
         let (key, bytes) = entry?;
         let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
-        activity.last_activity_at_us = activity
-            .last_activity_at_us
-            .max(call.decision.at.as_unix_micros());
-        if let Some(outcome) = &call.outcome {
-            activity.last_activity_at_us = activity
-                .last_activity_at_us
-                .max(outcome.at.as_unix_micros());
-        }
-        match call.decision.fact {
+        let awaiting_user = match &call.decision.fact {
             crate::db::entities::ToolDecision::AwaitingAnswer(_)
             | crate::db::entities::ToolDecision::AwaitingApproval(_) => {
                 if let Some(conversation) = job.group {
-                    waiting_user |= rx
-                        .open_table(OPEN_APPROVALS)?
+                    rx.open_table(OPEN_APPROVALS)?
                         .get((
                             conversation.get(),
                             call.call.job.get(),
                             call.call.request.get(),
                             call.call.index,
                         ))?
-                        .is_some();
+                        .is_some()
+                } else {
+                    false
                 }
             }
-            crate::db::entities::ToolDecision::Admitted(_) if call.outcome.is_none() => {
-                activity.tool = Some(call.name)
-            }
             crate::db::entities::ToolDecision::Admitted(_)
-            | crate::db::entities::ToolDecision::Refused(_) => {}
-        }
+            | crate::db::entities::ToolDecision::Refused(_) => false,
+        };
+        activity.tool_call(call, awaiting_user);
     }
-    activity.phase = match job.outcome.as_ref().map(|outcome| outcome.kind) {
-        Some(OutcomeKind::Completed) if waiting_user => JobActivityPhase::WaitingForUser,
-        Some(OutcomeKind::Completed) => JobActivityPhase::Completed,
-        Some(OutcomeKind::Failed) => JobActivityPhase::Failed,
-        Some(OutcomeKind::Cancelled) => JobActivityPhase::Cancelled,
-        Some(OutcomeKind::Unknown) => JobActivityPhase::Unknown,
-        None if job.started_at.is_none() => JobActivityPhase::Queued,
-        None if activity.tool.is_some() => JobActivityPhase::RunningTools,
-        None if rate_limited => JobActivityPhase::RateLimited,
-        None if activity.request_started_at_us.is_some() && !received => {
-            JobActivityPhase::WaitingForProvider
-        }
-        None => JobActivityPhase::Starting,
-    };
+    let (activity, unknown_reason) = activity.finish(&job);
+
     Ok(Some(JobDetails {
         job,
         result,
@@ -685,35 +560,6 @@ pub(crate) fn read_job_search(
         records,
         next_before: last.filter(|_| has_more),
         has_more,
-    })
-}
-
-pub(crate) fn read_pending_jobs(
-    database: &Database,
-    after: Option<JobId>,
-    limit: usize,
-) -> Result<PendingJobsPage, StorageError> {
-    let rx = read(database)?;
-    let index = rx.open_table(PENDING)?;
-    let start = after.map_or(Bound::Unbounded, |job| Bound::Excluded(job.get()));
-    let limit = limit.min(MAX_PAGE);
-    let mut entries = index.range((start, Bound::Unbounded))?;
-    let mut visited = Vec::new();
-    let mut exhausted = false;
-    while visited.len() < limit {
-        let Some(entry) = entries.next() else {
-            exhausted = true;
-            break;
-        };
-        visited.push(PendingJobKey {
-            job: JobId::new(entry?.0.value()),
-        });
-    }
-    let last_visited = visited.last().map(|key| key.job);
-    Ok(PendingJobsPage {
-        visited,
-        last_visited,
-        exhausted,
     })
 }
 
@@ -1616,32 +1462,6 @@ pub(crate) fn content_available(
         .is_some_and(|value| value.value().1 > 0))
 }
 
-/// The Jobs that carry an Attachment, whose inputs name it.
-pub(crate) fn read_attachment_inputs(
-    database: &Database,
-    attachment: AttachmentId,
-    after: Option<JobInputId>,
-    limit: usize,
-) -> Result<CursorPage<JobInputId, JobInputId>, StorageError> {
-    let rx = read(database)?;
-    let table = rx.open_table(ATTACHMENT_REFS)?;
-    let limit = limit.clamp(1, MAX_PAGE);
-    let mut records = Vec::new();
-    let mut more = false;
-    for entry in table.range((
-        std::ops::Bound::Excluded((attachment.get(), after.map_or(0, JobInputId::get))),
-        std::ops::Bound::Included((attachment.get(), u128::MAX)),
-    ))? {
-        if records.len() == limit {
-            more = true;
-            break;
-        }
-        records.push(JobInputId::new(entry?.0.value().1));
-    }
-    let next = records.last().copied().filter(|_| more);
-    Ok(CursorPage { records, next })
-}
-
 // ---- projects ----------------------------------------------------------------------
 
 pub(crate) fn read_project(
@@ -1833,17 +1653,46 @@ fn pool_view(row: ConfigRow) -> Option<ExecutionPoolRecord> {
     })
 }
 
+fn read_pool_view<T>(
+    database: &Database,
+    id: u128,
+    view: impl FnOnce(ConfigRow) -> Option<T>,
+) -> Result<Option<T>, StorageError> {
+    let rx = read(database)?;
+    Ok(rx
+        .open_table(CONFIGS)?
+        .get(id)?
+        .map(|bytes| ConfigRow::decode_at(id, bytes.value()))
+        .transpose()?
+        .and_then(view))
+}
+
+fn read_pool_views<T>(
+    database: &Database,
+    before: u128,
+    limit: usize,
+    view: impl Fn(ConfigRow) -> Option<T>,
+) -> Result<Vec<T>, StorageError> {
+    let rx = read(database)?;
+    let configs = rx.open_table(CONFIGS)?;
+    let mut records = Vec::new();
+    for entry in configs.range(..before)?.rev() {
+        let (key, bytes) = entry?;
+        if let Some(record) = view(ConfigRow::decode_at(key.value(), bytes.value())?) {
+            records.push(record);
+            if records.len() >= limit.min(MAX_PAGE) {
+                break;
+            }
+        }
+    }
+    Ok(records)
+}
+
 pub(crate) fn read_execution_pool(
     database: &Database,
     id: ExecutionPoolId,
 ) -> Result<Option<ExecutionPoolRecord>, StorageError> {
-    let rx = read(database)?;
-    Ok(rx
-        .open_table(CONFIGS)?
-        .get(id.get())?
-        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
-        .transpose()?
-        .and_then(pool_view))
+    read_pool_view(database, id.get(), pool_view)
 }
 
 pub(crate) fn read_execution_pools(
@@ -1851,20 +1700,12 @@ pub(crate) fn read_execution_pools(
     before: Option<ExecutionPoolId>,
     limit: usize,
 ) -> Result<Vec<ExecutionPoolRecord>, StorageError> {
-    let rx = read(database)?;
-    let configs = rx.open_table(CONFIGS)?;
-    let end = before.map_or(u128::MAX, ExecutionPoolId::get);
-    let mut pools = Vec::new();
-    for entry in configs.range(..end)?.rev() {
-        let (key, bytes) = entry?;
-        if let Some(pool) = pool_view(ConfigRow::decode_at(key.value(), bytes.value())?) {
-            pools.push(pool);
-            if pools.len() >= limit.min(MAX_PAGE) {
-                break;
-            }
-        }
-    }
-    Ok(pools)
+    read_pool_views(
+        database,
+        before.map_or(u128::MAX, ExecutionPoolId::get),
+        limit,
+        pool_view,
+    )
 }
 
 fn executor_view(row: ConfigRow) -> Option<ExecutorRecord> {
@@ -1885,13 +1726,7 @@ pub(crate) fn read_executor(
     database: &Database,
     id: ExecutorId,
 ) -> Result<Option<ExecutorRecord>, StorageError> {
-    let rx = read(database)?;
-    Ok(rx
-        .open_table(CONFIGS)?
-        .get(id.get())?
-        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
-        .transpose()?
-        .and_then(executor_view))
+    read_pool_view(database, id.get(), executor_view)
 }
 
 pub(crate) fn read_executors(
@@ -1899,20 +1734,12 @@ pub(crate) fn read_executors(
     before: Option<ExecutorId>,
     limit: usize,
 ) -> Result<Vec<ExecutorRecord>, StorageError> {
-    let rx = read(database)?;
-    let configs = rx.open_table(CONFIGS)?;
-    let end = before.map_or(u128::MAX, ExecutorId::get);
-    let mut records = Vec::new();
-    for entry in configs.range(..end)?.rev() {
-        let (key, bytes) = entry?;
-        if let Some(record) = executor_view(ConfigRow::decode_at(key.value(), bytes.value())?) {
-            records.push(record);
-            if records.len() >= limit.min(MAX_PAGE) {
-                break;
-            }
-        }
-    }
-    Ok(records)
+    read_pool_views(
+        database,
+        before.map_or(u128::MAX, ExecutorId::get),
+        limit,
+        executor_view,
+    )
 }
 
 /// The enabled Pools that offer an LLM request over `protocol`, oldest first.
@@ -1989,36 +1816,6 @@ pub(crate) fn read_decision_executors(
 ) -> Result<Vec<ExecutorId>, StorageError> {
     let rx = read(database)?;
     pools_offering_operation(&rx, ExecutionOperation::Decision)
-}
-
-/// The Pools that offer what the Connection a Job froze speaks.
-pub(crate) fn read_job_compatible_executors(
-    database: &Database,
-    job: JobId,
-) -> Result<Vec<ExecutorId>, StorageError> {
-    let rx = read(database)?;
-    let Some(row) = read_job_row(&rx, job)? else {
-        return Ok(Vec::new());
-    };
-    if row.kind.is_group() {
-        return Ok(Vec::new());
-    }
-    if let JobKind::Execution {
-        execution: JobExecution::Decision(work),
-        ..
-    } = &row.kind
-    {
-        return match &work.frozen {
-            crate::db::entities::FrozenDecisionConfig::Native(_) => {
-                pools_offering_operation(&rx, ExecutionOperation::Decision)
-            }
-            crate::db::entities::FrozenDecisionConfig::Generative(frozen, _) => {
-                pools_offering(&rx, frozen.llm.provider.transport)
-            }
-        };
-    }
-    let execution = job_execution(&rx.open_table(JOBS)?, &row)?.0;
-    pools_offering(&rx, execution.llm.provider.transport)
 }
 
 // ---- claims and held slots ------------------------------------------------------------
@@ -3040,62 +2837,9 @@ pub(super) fn job_entries_of(
 pub(super) fn effective_entries(
     entries: Vec<(u32, JobInputEntry)>,
 ) -> Result<Vec<(u32, JobInputEntry)>, StorageError> {
-    let mut visible: BTreeMap<u32, JobInputEntry> = BTreeMap::new();
-    for (seq, entry) in entries {
-        match entry.entry {
-            Entry::UserMessageEdit {
-                message,
-                text,
-                attachments,
-            } => {
-                if message >= seq {
-                    return Err(StorageError::corrupted(
-                        "queued edit does not name an earlier input",
-                    ));
-                }
-                let Some(original) = visible.get_mut(&message) else {
-                    return Err(StorageError::corrupted("queued edit names an absent input"));
-                };
-                if !matches!(original.entry, Entry::UserMessage { .. }) {
-                    return Err(StorageError::corrupted(
-                        "queued edit does not name a user message",
-                    ));
-                }
-                original.entry = Entry::UserMessage { text, attachments };
-            }
-            Entry::UserMessageWithdraw { message } => {
-                if message >= seq
-                    || !visible
-                        .get(&message)
-                        .is_some_and(|original| matches!(original.entry, Entry::UserMessage { .. }))
-                {
-                    return Err(StorageError::corrupted(
-                        "queued withdrawal does not name an earlier user message",
-                    ));
-                }
-                visible.remove(&message);
-            }
-            other @ (Entry::UserMessage { .. }
-            | Entry::AgentMessage { .. }
-            | Entry::Notice { .. }
-            | Entry::Decision { .. }
-            | Entry::RetryOf { .. }
-            | Entry::Iteration { .. }
-            | Entry::ResponseFormat { .. }
-            | Entry::ContextPreparation { .. }
-            | Entry::ContextUse { .. }) => {
-                visible.insert(
-                    seq,
-                    JobInputEntry {
-                        entry: other,
-                        at: entry.at,
-                    },
-                );
-            }
-        }
-    }
-    Ok(visible.into_iter().collect())
+    crate::db::entities::effective_entries(entries).map_err(StorageError::corrupted)
 }
+
 pub(crate) fn read_notices(
     database: &Database,
     conversation: JobId,
@@ -3154,21 +2898,6 @@ pub(crate) fn read_conversation_turns(
         result.push(job_record(&rx, row)?);
     }
     Ok(result)
-}
-
-pub(crate) fn read_compaction_policy(
-    database: &Database,
-    conversation: JobId,
-) -> Result<Option<(Option<crate::db::entities::CompactionPolicy>, u64)>, StorageError> {
-    let rx = read(database)?;
-    let Some(job) = read_job_row(&rx, conversation)? else {
-        return Ok(None);
-    };
-    if !job.kind.is_group() {
-        return Ok(None);
-    }
-    let row = read_job_control(&rx, conversation)?;
-    Ok(Some((row.compaction_policy, row.compaction_revision)))
 }
 
 pub(crate) fn read_conversation_limits(

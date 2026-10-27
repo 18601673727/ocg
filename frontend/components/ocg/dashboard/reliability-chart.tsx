@@ -1,13 +1,9 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
-import type {
-  decodeAvailability,
-  decodeUsage,
-  decodeUsageBuckets,
-  decodeUsageRetries,
-} from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { summarizeReliability, type ReliabilitySummary } from "./reliability-chart-data";
@@ -142,8 +138,8 @@ function ReliabilityChartData({
         let lastUntil = from;
         let bucketAfter: string | undefined;
         let bucketsPartial = false;
-        const rows: ReturnType<typeof decodeUsageBuckets>["rows"] = [];
-        const retryRows: ReturnType<typeof decodeUsageRetries>["retry_rows"] = [];
+        const rows: Api.Envelope<Api.UsageBuckets>["rows"] = [];
+        const retryRows: Api.UsageRetries["retry_rows"] = [];
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
           const page = await client.readUsageBuckets({
             fromUs: from,
@@ -181,7 +177,7 @@ function ReliabilityChartData({
           if (page.next_after === retryAfter) throw new Error("Retry cursor did not advance.");
           retryAfter = page.next_after;
         }
-        const availability: ReturnType<typeof decodeAvailability>["observations"] = [];
+        const availability: Api.Availability["observations"] = [];
         let availabilityPartial = false;
         let availabilityAfter: string | undefined;
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
@@ -200,7 +196,7 @@ function ReliabilityChartData({
             throw new Error("Availability cursor did not advance.");
           availabilityAfter = page.next_after;
         }
-        const observations: ReturnType<typeof decodeUsage>["observations"] = [];
+        const observations: Api.Usage["observations"] = [];
         let observationsPartial = false;
         let after: string | undefined;
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {

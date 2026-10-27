@@ -1,9 +1,10 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import type { decodeLogs } from "../contracts";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { LoadMore } from "../primitives/load-more";
@@ -18,7 +19,7 @@ import {
 export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {
   const { t } = useI18n();
   const [file, setFile] = useState("");
-  const [snapshot, setSnapshot] = useState<ReturnType<typeof decodeLogs> | null>(null);
+  const [snapshot, setSnapshot] = useState<Api.Logs | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -26,13 +27,10 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
 
   useEffect(() => {
     const controller = new AbortController();
-    let current: ReturnType<typeof decodeLogs> | null = null;
+    let current: Api.Logs | null = null;
     let busy = false;
-    let queued: ReturnType<typeof decodeLogs> | null = null;
-    const merge = (
-      entries: ReturnType<typeof decodeLogs>["entries"],
-      page: ReturnType<typeof decodeLogs>,
-    ) => {
+    let queued: Api.Logs | null = null;
+    const merge = (entries: Api.Logs["entries"], page: Api.Logs) => {
       const merged = new Map(entries.map((entry) => [entry.offset, entry]));
       page.entries.forEach((entry) => merged.set(entry.offset, entry));
       return [...merged.values()].sort((a, b) => a.offset - b.offset);
@@ -43,7 +41,7 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
         setLoading(false);
       }
     };
-    const receive = async (answer: ReturnType<typeof decodeLogs>) => {
+    const receive = async (answer: Api.Logs) => {
       if (busy) {
         queued = answer;
         return;

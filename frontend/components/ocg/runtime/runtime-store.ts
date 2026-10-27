@@ -7,9 +7,7 @@
  */
 
 import type { AnyRuntimeEnvelope } from "./runtime-envelope";
-import { validateRuntimeEnvelope } from "./runtime-envelope";
 import type { RuntimeSnapshotEnvelope } from "./runtime-snapshot";
-import { validateRuntimeSnapshotEnvelope } from "./runtime-snapshot";
 import type { RuntimeState } from "./reconciler";
 import {
   createUninitializedRuntimeState,
@@ -17,29 +15,13 @@ import {
   markReconnecting,
   reconcileEvent,
   reconcileSnapshot,
-  recordRuntimeDiagnostic,
 } from "./reconciler";
 import type { RuntimeSnapshot } from "./runtime-types";
-import type { ProjectId } from "../project/domain";
-import {
-  applyCanonicalSnapshot,
-  applyCanonicalEvents,
-  applyCanonicalCommandAck,
-  createCanonicalState,
-  selectCanonical,
-} from "./canonical-store";
-import type {
-  CanonicalBackendEvent,
-  CanonicalCommandAck,
-  CanonicalSelectors,
-  CanonicalState,
-} from "./canonical-store";
 
 export type RuntimeStoreListener = () => void;
 
 export class RuntimeStore {
   private state: RuntimeState;
-  private canonical: CanonicalState = createCanonicalState();
   private readonly listeners = new Set<RuntimeStoreListener>();
 
   constructor(initialState: RuntimeState) {
@@ -79,29 +61,6 @@ export class RuntimeStore {
     return this.state;
   }
 
-  applyUnknown(input: unknown): RuntimeState {
-    const validation = validateRuntimeEnvelope(input);
-    if (!validation.ok) {
-      const degraded =
-        validation.diagnostic.code === "schema-invalid" ||
-        validation.diagnostic.code === "protocol-incompatible";
-      this.commit(
-        recordRuntimeDiagnostic(this.state, validation.diagnostic, degraded ? "error" : undefined),
-      );
-      return this.state;
-    }
-    return this.applyEnvelope(validation.envelope);
-  }
-
-  installUnknownSnapshot(input: unknown): RuntimeState {
-    const validation = validateRuntimeSnapshotEnvelope(input);
-    if (!validation.ok) {
-      this.commit(recordRuntimeDiagnostic(this.state, validation.diagnostic, "error"));
-      return this.state;
-    }
-    return this.installSnapshot(validation.envelope);
-  }
-
   applyMany(envelopes: readonly AnyRuntimeEnvelope[]): RuntimeState {
     let next = this.state;
     for (const envelope of envelopes) next = reconcileEvent(next, envelope);
@@ -123,47 +82,6 @@ export class RuntimeStore {
   markReconnecting(): RuntimeState {
     this.commit(markReconnecting(this.state));
     return this.state;
-  }
-
-  getCanonical(): CanonicalState {
-    return this.canonical;
-  }
-
-  applyCanonicalSnapshot(input: {
-    payload: unknown;
-    projectId: ProjectId;
-    generation?: number;
-  }): CanonicalState {
-    this.canonical = applyCanonicalSnapshot(this.canonical, {
-      payload: input.payload,
-      projectId: input.projectId,
-      generation: input.generation ?? this.canonical.generation,
-    });
-    this.notify();
-    return this.canonical;
-  }
-
-  applyCanonicalEvents(
-    events: readonly CanonicalBackendEvent[],
-    options: { projectId: ProjectId; generation?: number },
-  ): CanonicalState {
-    this.canonical = applyCanonicalEvents(this.canonical, events, options);
-    this.notify();
-    return this.canonical;
-  }
-
-  applyCanonicalCommandAck(ack: CanonicalCommandAck): CanonicalState {
-    this.canonical = applyCanonicalCommandAck(this.canonical, ack);
-    this.notify();
-    return this.canonical;
-  }
-
-  selectCanonical(): CanonicalSelectors {
-    return selectCanonical(this.canonical);
-  }
-
-  private notify(): void {
-    for (const listener of [...this.listeners]) listener();
   }
 
   private commit(next: RuntimeState): boolean {

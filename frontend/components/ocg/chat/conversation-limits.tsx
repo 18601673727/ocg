@@ -1,8 +1,9 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { useEffect, useState, type FormEvent } from "react";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import type { decodeConversationLimits } from "../contracts/control-plane";
 import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { Button } from "@/components/ui/button";
@@ -11,7 +12,7 @@ import { Input } from "@/components/ui/input";
 export function ConversationLimitsEditor({ conversation }: { conversation: string }) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
-  const [limits, setLimits] = useState<ReturnType<typeof decodeConversationLimits> | null>(null);
+  const [limits, setLimits] = useState<Api.ConversationLimits | null>(null);
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   useEffect(() => {

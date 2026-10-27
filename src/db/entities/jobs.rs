@@ -690,29 +690,6 @@ pub struct ClaimRecord {
     pub notice_seq: u32,
 }
 
-/// A position in the order of Jobs that have been submitted but have not
-/// started or reached an outcome: Job ID alone. IDs are allocated in the
-/// single write transaction, so this order follows commits independently
-/// of the worker's wall clock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PendingJobKey {
-    pub job: JobId,
-}
-
-/// A bounded run of the pending Jobs in key order, read in one short
-/// transaction. `visited` holds every index entry the read examined and each
-/// references an existing Job that was pending in that transaction. Nothing
-/// is filtered here, and a page never examines more entries than its limit.
-/// `exhausted` is set only when the read went past the last entry; a page
-/// that used its whole limit says nothing about what follows it, and the
-/// next page starts strictly after `last_visited`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PendingJobsPage {
-    pub visited: Vec<PendingJobKey>,
-    pub last_visited: Option<JobId>,
-    pub exhausted: bool,
-}
-
 /// A Job's input as its spec holds it: the objective, limits, Attachments and
 /// frozen configuration. Its identity is the Job's.
 #[derive(Clone, Debug, PartialEq)]

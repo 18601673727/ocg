@@ -1,8 +1,9 @@
 "use client";
 
+import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
-import type { decodeUsageBuckets } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { summarize, type RankedUsage } from "./usage-chart-data";
@@ -129,7 +130,7 @@ function UsageChartData({
         let lastUntil = from;
         let after: string | undefined;
         let partial = false;
-        const rows: ReturnType<typeof decodeUsageBuckets>["rows"] = [];
+        const rows: Api.Envelope<Api.UsageBuckets>["rows"] = [];
         for (let pageNumber = 0; pageNumber < 10; pageNumber++) {
           const page = await client.readUsageBuckets({
             fromUs: from,

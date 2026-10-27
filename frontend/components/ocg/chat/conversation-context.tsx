@@ -1,14 +1,12 @@
 "use client";
 
+import type { ControlContextStatus } from "../contracts";
+
 import Link from "next/link";
 
 import { useEffect, useRef, useState } from "react";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import type {
-  ControlDecisionAnswer,
-  ControlProfilesSnapshot,
-  decodeContextStatus,
-} from "../contracts";
+import type { ControlDecisionAnswer, ControlProfilesSnapshot } from "../contracts";
 import { describeError } from "../settings/settings-parts";
 import { useI18n } from "../i18n";
 import { Button } from "@/components/ui/button";
@@ -29,7 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 
-type Status = ReturnType<typeof decodeContextStatus>;
+type Status = ControlContextStatus;
 
 function formatShare(value: number): string {
   return Number.isInteger(value)

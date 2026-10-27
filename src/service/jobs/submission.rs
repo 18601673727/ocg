@@ -46,6 +46,86 @@ impl Batch {
         )
     }
 
+    pub(crate) fn validate_group_parent(
+        &mut self,
+        parent: Option<JobId>,
+    ) -> Result<(), BatchError> {
+        if let Some(parent) = parent {
+            let parent_row = self.require_job(parent)?;
+            if !parent_row.kind.is_group() {
+                return self.reject(Violation::InvalidValue("parent", "expected a conversation"));
+            }
+            let (limits, parent_depth) = self.group_limits(parent)?;
+            let root = self.root_group(parent)?;
+            if parent_depth.saturating_add(1) > limits.max_depth
+                || self.live_children(parent)?.len() >= 16
+                || self.live_subtree(root)?.len() >= 64
+            {
+                return self.reject(Violation::InvalidValue(
+                    "children",
+                    "live conversation limit reached",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn existing_group_submission(
+        &mut self,
+        submission: Option<&Submission>,
+    ) -> Result<Option<(JobId, Appended)>, BatchError> {
+        if let Some(submission) = submission
+            && let Some(record) = self.submission(submission.key)?
+        {
+            if record.fingerprint != submission.fingerprint {
+                return self.reject(Violation::SubmissionKeyUsed {
+                    job: record.job,
+                    same_request: false,
+                });
+            }
+            let turn = self.require_job(record.job)?;
+            let Some(conversation) = turn.parent_id else {
+                return self.corrupted("submission has no conversation".into());
+            };
+            return Ok(Some((
+                conversation,
+                Appended {
+                    turn: record.job,
+                    seq: record.seq,
+                    joined: record.seq > 1,
+                },
+            )));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn insert_group(
+        &mut self,
+        parent: Option<JobId>,
+        spec: &JobGroup,
+    ) -> Result<JobId, BatchError> {
+        let conversation = self.t1_submit(
+            None,
+            JobSpec {
+                allocation: None,
+                id: JobId::new(0),
+                created_at: self.now(),
+                parent_id: parent,
+                kind: JobKind::Group {
+                    agent: spec.agent,
+                    project: spec.project,
+                    origin: spec.origin.clone(),
+                    keep_open: spec.keep_open,
+                },
+            },
+        )?;
+        self.put_job_control(conversation, &JobControl::default())?;
+        if let Some(parent) = parent {
+            self.link_job_group(parent, conversation)?;
+        }
+        Ok(conversation)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_group_with_execution(
         &mut self,
@@ -59,67 +139,11 @@ impl Batch {
         execution: Option<JobExecution>,
         allocation: Option<crate::db::entities::JobAllocation>,
     ) -> Result<(JobId, Appended), BatchError> {
-        if let Some(parent) = parent {
-            let parent_row = self.require_job(parent)?;
-            if !parent_row.kind.is_group() {
-                return self.reject(Violation::InvalidValue("parent", "expected a conversation"));
-            }
-            let (limits, parent_depth) = self.group_limits(parent)?;
-            let mut root = parent;
-            while let Some(ancestor) = self.require_job(root)?.parent_id {
-                root = ancestor;
-            }
-            if parent_depth.saturating_add(1) > limits.max_depth
-                || self.live_children(parent)?.len() >= 16
-                || self.live_subtree(root)?.len() >= 64
-            {
-                return self.reject(Violation::InvalidValue(
-                    "children",
-                    "live conversation limit reached",
-                ));
-            }
+        self.validate_group_parent(parent)?;
+        if let Some(existing) = self.existing_group_submission(submission.as_ref())? {
+            return Ok(existing);
         }
-        if let Some(submission) = &submission
-            && let Some(record) = self.submission(submission.key)?
-        {
-            if record.fingerprint != submission.fingerprint {
-                return self.reject(Violation::SubmissionKeyUsed {
-                    job: record.job,
-                    same_request: false,
-                });
-            }
-            let turn = self.require_job(record.job)?;
-            let Some(conversation) = turn.parent_id else {
-                return self.corrupted("submission has no conversation".into());
-            };
-            return Ok((
-                conversation,
-                Appended {
-                    turn: record.job,
-                    seq: record.seq,
-                    joined: record.seq > 1,
-                },
-            ));
-        }
-        let conversation = self.t1_submit(
-            None,
-            JobSpec {
-                allocation: None,
-                id: JobId::new(0),
-                created_at: self.now(),
-                parent_id: parent,
-                kind: JobKind::Group {
-                    agent: spec.agent,
-                    project: spec.project,
-                    origin: spec.origin,
-                    keep_open: spec.keep_open,
-                },
-            },
-        )?;
-        self.put_job_control(conversation, &JobControl::default())?;
-        if let Some(parent) = parent {
-            self.link_job_group(parent, conversation)?;
-        }
+        let conversation = self.insert_group(parent, &spec)?;
         let appended = self.append_named(
             conversation,
             first,

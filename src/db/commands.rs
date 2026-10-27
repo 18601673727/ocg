@@ -15,32 +15,13 @@ pub(super) enum Control {
         reason: ProtectionReason,
         reply: flume::Sender<bool>,
     },
-    CheckSpace,
     Recover,
     CompactStorage(flume::Sender<Result<CompactionOutcome, MaintenanceError>>),
-    ReadPolicy(flume::Sender<Result<SystemPolicy, PolicyOperationError>>),
-    SavePolicy {
-        expected: SystemPolicy,
-        candidate: SystemPolicy,
-        started: Arc<AtomicBool>,
-        reply: flume::Sender<Result<PolicySaveResult, PolicyOperationError>>,
-    },
 }
 
 impl Control {
     pub(super) fn refuse_policy(self, stopped: bool) {
-        let error = if stopped {
-            PolicyOperationError::WorkerStopped
-        } else {
-            PolicyOperationError::ShuttingDown
-        };
         match self {
-            Self::ReadPolicy(reply) => {
-                reply.send(Err(error)).ok();
-            }
-            Self::SavePolicy { reply, .. } => {
-                reply.send(Err(error)).ok();
-            }
             Self::CompactStorage(reply) => {
                 reply
                     .send(Err(if stopped {
@@ -50,7 +31,7 @@ impl Control {
                     }))
                     .ok();
             }
-            Self::CheckSpace | Self::Recover => {}
+            Self::Recover => {}
             Self::FilesystemFailure { reply, .. } => {
                 reply.send(false).ok();
             }

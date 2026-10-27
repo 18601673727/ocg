@@ -51,18 +51,6 @@ pub(crate) fn ground_project(
     ))
 }
 
-pub async fn execute_chat(
-    frozen: &FrozenExecutionConfig,
-    objective: Option<&str>,
-    resolver: &dyn CredentialResolver,
-    config: &ProviderExecutionConfig,
-) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    let conversation = objective_conversation(frozen, objective);
-    execute_conversation(frozen, &conversation, resolver, config, None)
-        .await?
-        .admitted()
-}
-
 /// The conversation a Job's objective is sent as: the frozen Agent
 /// instructions, when there are any, then the objective. It offers no tools.
 #[must_use]
@@ -395,19 +383,6 @@ async fn exchange(
     )
     .await
     .map_err(|error| redactor.error(error))
-}
-
-pub async fn execute_chat_with_sink(
-    frozen: &FrozenExecutionConfig,
-    objective: Option<&str>,
-    resolver: &dyn CredentialResolver,
-    config: &ProviderExecutionConfig,
-    sink: &mut dyn ProviderOutputSink,
-) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    let conversation = objective_conversation(frozen, objective);
-    execute_conversation(frozen, &conversation, resolver, config, Some(sink))
-        .await?
-        .admitted()
 }
 
 const MAX_NATIVE_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
