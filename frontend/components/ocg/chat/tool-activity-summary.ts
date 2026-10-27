@@ -1,0 +1,95 @@
+import type { TranslateFn } from "../i18n";
+
+export type ToolActivity = {
+  name: string;
+  arguments?: string | null;
+  result?: unknown;
+  durationMs?: number;
+  truncated?: boolean;
+};
+
+const categories = ["read", "search", "code", "edit", "command", "agent", "other"] as const;
+type Category = (typeof categories)[number];
+
+export function toolCategory(name: string): Category {
+  switch (name) {
+    case "workspace_read_file":
+    case "workspace_list_directory":
+      return "read";
+    case "workspace_search":
+    case "workspace_fts_search":
+      return "search";
+    case "workspace_code":
+      return "code";
+    case "workspace_write_file":
+    case "workspace_update_file":
+    case "workspace_create_file":
+      return "edit";
+    case "workspace_run_command":
+      return "command";
+    case "ask_user":
+      return "agent";
+    default:
+      return name.startsWith("job_") ? "agent" : "other";
+  }
+}
+
+export function toolActivitySummary(tools: readonly ToolActivity[]) {
+  const counts = new Map<Category, number>();
+  let bytes = 0;
+  let durationMs = 0;
+  let timed = 0;
+  const encoder = new TextEncoder();
+  for (const tool of tools) {
+    const category = toolCategory(tool.name);
+    counts.set(category, (counts.get(category) ?? 0) + 1);
+    const result =
+      typeof tool.result === "string"
+        ? tool.result
+        : tool.result === undefined
+          ? ""
+          : JSON.stringify(tool.result);
+    bytes += encoder.encode(tool.arguments ?? "").length + encoder.encode(result).length;
+    if (
+      typeof tool.durationMs === "number" &&
+      Number.isFinite(tool.durationMs) &&
+      tool.durationMs >= 0
+    ) {
+      durationMs += tool.durationMs;
+      timed++;
+    }
+  }
+  return {
+    categories: categories.flatMap((category) =>
+      counts.has(category) ? [{ category, count: counts.get(category)! }] : [],
+    ),
+    tokens: Math.ceil(bytes / 3),
+    truncated: tools.some((tool) => tool.truncated),
+    durationMs: timed ? durationMs : null,
+    durationPartial: timed < tools.length,
+  };
+}
+
+export function toolActivityLabels(tools: readonly ToolActivity[], t: TranslateFn, locale: string) {
+  const summary = toolActivitySummary(tools);
+  const format = new Intl.NumberFormat(locale, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+  return {
+    categories: summary.categories
+      .map(({ category, count }) =>
+        t(`chat.tools.${category}.${count === 1 ? "one" : "other"}`, { count }),
+      )
+      .join(" · "),
+    tokens: t("chat.tools.tokens", {
+      count: `≈${new Intl.NumberFormat(locale).format(summary.tokens)}${summary.truncated ? "+" : ""}`,
+    }),
+    duration:
+      summary.durationMs === null
+        ? t("chat.tools.durationUnknown")
+        : t("chat.tools.duration", {
+            seconds: `${summary.durationPartial ? "≥" : ""}${format.format(summary.durationMs / 1000)}`,
+          }),
+  };
+}

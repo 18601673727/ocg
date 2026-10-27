@@ -1,0 +1,76 @@
+[package]
+name = "ocg"
+version = "0.5.2"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+default-run = "ocg"
+
+[features]
+benchmarks = []
+
+[[bin]]
+name = "ocg-rs-ts"
+path = "src/generate_typescript.rs"
+
+[[bin]]
+name = "ocg"
+path = "src/main.rs"
+
+[lib]
+name = "ocg"
+path = "src/ocg.rs"
+
+[[bench]]
+name = "backend"
+path = "benchmark/backend.rs"
+harness = false
+required-features = ["benchmarks"]
+
+[[bench]]
+name = "database_writes"
+path = "benchmark/database_writes.rs"
+harness = false
+required-features = ["benchmarks"]
+
+[dependencies]
+uuid = { version = "=1.28.0", default-features = false, features = ["std", "v7"] }
+ts-rs = { version = "=12.0.1", default-features = false, features = ["serde-compat", "serde-json-impl"] }
+redb = { version = "=4.3.0", default-features = false, features = ["std"] }
+petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
+flume = "0.11"
+ntex = { version = "3.12", default-features = false, features = ["rustls"] }
+aws-lc-rs = "1"
+webpki-roots = "=1.0.9"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
+serde_json = "1"
+# Image content parts: canonical base64 data URLs; the version the tree
+# already builds.
+base64 = "0.22"
+# Tool-call argument admission; no remote or file schema resolution.
+jsonschema = { version = "=0.58.6", default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+log = { version = "=0.4.34", default-features = false, features = ["std"] }
+time = { version = "=0.3.55", default-features = false, features = ["std"] }
+regex = "1.13.1"
+memchr = "2"
+
+[target.'cfg(unix)'.dependencies]
+# Opens Workspace files component by component without following links; the
+# same rustix that fs4 already builds. `process` waits for, and kills the
+# process group of, a Workspace command.
+rustix = { version = "1", features = ["fs", "process"] }
+# The effective user's home directory from the account database
+# (`getpwuid_r`), never from `HOME`, for Workspace authorization; the nix the
+# tree already builds, with only its safe account lookup.
+nix = { version = "0.31", default-features = false, features = ["user"] }
+# Embedded code intelligence for workspace_index_query: syntax-only structural
+# analysis (outline, syntax errors) for Rust, TypeScript/TSX, Python.
+tree-sitter = "=0.27.1"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-python = "=0.25.0"
+libc = "0.2"

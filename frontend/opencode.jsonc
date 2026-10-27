@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "provider": {
+      "name": "Provider",
+      "env": ["PROVIDER_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://api.example.com/v1",
+        "apiKey": "{env:PROVIDER_API_KEY}"
+      },
+      "models": {
+        "example-model": { "name": "example-model" }
+      }
+    }
+  }
+}

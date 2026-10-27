@@ -1,0 +1,532 @@
+//! Runtime disk protection.
+//!
+//! Storage admission locks when a protected filesystem runs short of space,
+//! when its space cannot be measured, or when storage itself fails. The lock
+//! is held in memory only: operating it never writes Jobs, JobSteps, Events
+//! or any other record. It clears only through an explicit recovery, never
+//! merely because space has become sufficient again.
+
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use crate::db::entities::{OperationId, Timestamp};
+use crate::db::{OperationStatus, StorageError};
+use crate::system::data_directory::DataDirectory;
+
+pub const DEFAULT_DISK_LOCK_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_RESUME_THRESHOLD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const DEFAULT_DISK_CHECK_INTERVAL_MS: u64 = 120 * 60 * 1000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupConfig {
+    pub max_log_files_per_run: u32,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            max_log_files_per_run: 1000,
+        }
+    }
+}
+
+/// The disk-protection settings of the system policy's filesystem
+/// configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemConfig {
+    /// A write is refused when it would leave less than this many bytes
+    /// available on a protected filesystem.
+    pub disk_lock_threshold_bytes: u64,
+    /// Recovery requires at least this many bytes available on every
+    /// protected filesystem.
+    pub disk_resume_threshold_bytes: u64,
+    /// How often every protected filesystem is checked.
+    pub disk_check_interval_ms: u64,
+    #[serde(default)]
+    pub cleanup_config: CleanupConfig,
+}
+
+impl Default for FilesystemConfig {
+    fn default() -> Self {
+        Self {
+            disk_lock_threshold_bytes: DEFAULT_DISK_LOCK_THRESHOLD_BYTES,
+            disk_resume_threshold_bytes: DEFAULT_DISK_RESUME_THRESHOLD_BYTES,
+            disk_check_interval_ms: DEFAULT_DISK_CHECK_INTERVAL_MS,
+            cleanup_config: CleanupConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FilesystemConfigError {
+    #[error("disk_lock_threshold_bytes must be greater than zero")]
+    LockThresholdZero,
+    #[error(
+        "disk_resume_threshold_bytes ({resume}) must be greater than disk_lock_threshold_bytes ({lock})"
+    )]
+    ResumeNotAboveLock { lock: u64, resume: u64 },
+    #[error("disk_check_interval_ms must be greater than zero")]
+    CheckIntervalZero,
+    #[error("cleanup_config.max_log_files_per_run must be greater than zero")]
+    CleanupLimitZero,
+}
+
+impl FilesystemConfig {
+    pub fn validate(&self) -> Result<(), FilesystemConfigError> {
+        if self.disk_lock_threshold_bytes == 0 {
+            return Err(FilesystemConfigError::LockThresholdZero);
+        }
+        if self.disk_resume_threshold_bytes <= self.disk_lock_threshold_bytes {
+            return Err(FilesystemConfigError::ResumeNotAboveLock {
+                lock: self.disk_lock_threshold_bytes,
+                resume: self.disk_resume_threshold_bytes,
+            });
+        }
+        if self.disk_check_interval_ms == 0 {
+            return Err(FilesystemConfigError::CheckIntervalZero);
+        }
+        if self.cleanup_config.max_log_files_per_run == 0 {
+            return Err(FilesystemConfigError::CleanupLimitZero);
+        }
+        Ok(())
+    }
+
+    pub fn check_interval(&self) -> Duration {
+        Duration::from_millis(self.disk_check_interval_ms)
+    }
+}
+
+/// A directory of the data layout whose filesystem is protected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProtectedArea {
+    Database,
+    Attachments,
+    Logs,
+}
+
+pub(crate) fn protected_paths(data_directory: &DataDirectory) -> [(ProtectedArea, PathBuf); 3] {
+    [
+        (
+            ProtectedArea::Database,
+            data_directory.database_path().to_path_buf(),
+        ),
+        (
+            ProtectedArea::Attachments,
+            data_directory.attachments_path(),
+        ),
+        (ProtectedArea::Logs, data_directory.logs_path()),
+    ]
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceShortage {
+    pub area: ProtectedArea,
+    pub path: PathBuf,
+    /// Space available to the current user when it was measured.
+    pub available_bytes: u64,
+    /// The allowance of the refused write; zero for a check without a write.
+    pub expected_write_bytes: u64,
+    /// The threshold that was not met: the lock threshold, or the resume
+    /// threshold during recovery.
+    pub threshold_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceQueryFailure {
+    pub area: ProtectedArea,
+    pub path: PathBuf,
+    pub kind: io::ErrorKind,
+    pub os_error: Option<i32>,
+    pub detail: String,
+}
+
+/// Why storage admission is locked.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProtectionReason {
+    #[error(
+        "{} has {} bytes available; {} more bytes would leave less than {}",
+        .0.path.display(), .0.available_bytes, .0.expected_write_bytes, .0.threshold_bytes
+    )]
+    InsufficientSpace(SpaceShortage),
+    #[error("the available space of {} could not be measured: {}", .0.path.display(), .0.detail)]
+    SpaceQueryFailed(SpaceQueryFailure),
+    #[error("filesystem write to {} failed: {detail}", path.display())]
+    FilesystemWriteFailed {
+        area: ProtectedArea,
+        path: PathBuf,
+        kind: io::ErrorKind,
+        os_error: Option<i32>,
+        detail: String,
+    },
+    #[error("storage failed and the database must be reopened: {0}")]
+    StorageUnavailable(StorageError),
+}
+
+impl ProtectionReason {
+    /// A newer reason replaces an older one about the same subject.
+    fn same_subject(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::InsufficientSpace(a), Self::InsufficientSpace(b)) => a.area == b.area,
+            (Self::SpaceQueryFailed(a), Self::SpaceQueryFailed(b)) => a.area == b.area,
+            (
+                Self::FilesystemWriteFailed { area: a, .. },
+                Self::FilesystemWriteFailed { area: b, .. },
+            ) => a == b,
+            (Self::StorageUnavailable(_), Self::StorageUnavailable(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// An active lock with every reason found while it has been held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProtectionLock {
+    pub reasons: Vec<ProtectionReason>,
+    pub locked_at: Timestamp,
+}
+
+impl ProtectionLock {
+    /// The storage failure that released the database, if any.
+    pub fn storage_failure(&self) -> Option<&StorageError> {
+        self.reasons.iter().find_map(|reason| match reason {
+            ProtectionReason::StorageUnavailable(error) => Some(error),
+            _ => None,
+        })
+    }
+}
+
+impl std::fmt::Display for ProtectionLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, reason) in self.reasons.iter().enumerate() {
+            if index > 0 {
+                f.write_str("; ")?;
+            }
+            write!(f, "{reason}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiskProtectionStatus {
+    /// Present while mutations are refused.
+    pub lock: Option<ProtectionLock>,
+    pub recovering: bool,
+    /// Full checks of every protected filesystem, periodic or requested.
+    pub completed_checks: u64,
+    pub last_checked_at: Option<Timestamp>,
+    pub recovery_attempts: u64,
+    /// Increases on every change, so a watcher can tell how many changes
+    /// coalesced into one notification.
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceMeasurement {
+    pub area: ProtectedArea,
+    pub path: PathBuf,
+    pub available_bytes: u64,
+}
+
+/// A successful recovery. Recovering an unlocked database is a no-op that
+/// returns an empty report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// The epoch of the reopened database, when the failed one was replaced.
+    pub reopened_epoch: Option<u64>,
+    /// Every operation whose outcome had been unknown, as its marker proves
+    /// it now. None of them is retried.
+    pub reconciled: Vec<(OperationId, OperationStatus)>,
+    pub available: Vec<SpaceMeasurement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReopenFailure {
+    #[error("{0}")]
+    Storage(StorageError),
+}
+
+/// Why a recovery attempt left the lock in place.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RecoveryError {
+    #[error("the control queue is full; recovery was not accepted")]
+    ControlQueueFull,
+    #[error("a protected filesystem does not have the resume threshold available")]
+    Space(Vec<ProtectionReason>),
+    #[error("reopening the database failed: {0}")]
+    Reopen(ReopenFailure),
+    #[error("reconciling {operation} failed: {error}")]
+    Reconcile {
+        operation: OperationId,
+        error: StorageError,
+    },
+    #[error("the database is shutting down")]
+    ShuttingDown,
+    #[error("the database worker stopped")]
+    WorkerStopped,
+}
+
+fn measure(area: ProtectedArea, path: &Path) -> Result<u64, SpaceQueryFailure> {
+    fs4::available_space(path).map_err(|error| SpaceQueryFailure {
+        area,
+        path: path.to_path_buf(),
+        kind: error.kind(),
+        os_error: error.raw_os_error(),
+        detail: error.to_string(),
+    })
+}
+
+/// Whether `available_bytes` minus `expected_write_bytes` still reaches
+/// `threshold_bytes`; a write larger than the available space never does.
+pub(crate) fn leaves_threshold(
+    available_bytes: u64,
+    expected_write_bytes: u64,
+    threshold_bytes: u64,
+) -> bool {
+    available_bytes
+        .checked_sub(expected_write_bytes)
+        .is_some_and(|remaining| remaining >= threshold_bytes)
+}
+
+/// Measures the filesystem holding `path` and refuses a write of
+/// `expected_write_bytes` that would leave less than `threshold_bytes`
+/// available. A failed measurement refuses too, for its own reason. Returns
+/// the measured space.
+pub(crate) fn check_space(
+    area: ProtectedArea,
+    path: &Path,
+    expected_write_bytes: u64,
+    threshold_bytes: u64,
+) -> Result<u64, ProtectionReason> {
+    let available_bytes = measure(area, path).map_err(ProtectionReason::SpaceQueryFailed)?;
+    if leaves_threshold(available_bytes, expected_write_bytes, threshold_bytes) {
+        Ok(available_bytes)
+    } else {
+        Err(ProtectionReason::InsufficientSpace(SpaceShortage {
+            area,
+            path: path.to_path_buf(),
+            available_bytes,
+            expected_write_bytes,
+            threshold_bytes,
+        }))
+    }
+}
+
+/// The published protection status and its watchers. Its locks are only
+/// ever held to copy or change the status, never across a database
+/// operation, so reading it does not wait for storage.
+pub(crate) struct ProtectionCell {
+    blocked: AtomicBool,
+    lock_epoch: AtomicU64,
+    status: Mutex<DiskProtectionStatus>,
+    /// `None` once the database worker has stopped, so watchers see the end.
+    watchers: Mutex<Option<Vec<flume::Sender<()>>>>,
+}
+
+impl ProtectionCell {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            blocked: AtomicBool::new(false),
+            lock_epoch: AtomicU64::new(0),
+            status: Mutex::new(DiskProtectionStatus::default()),
+            watchers: Mutex::new(Some(Vec::new())),
+        })
+    }
+
+    pub(crate) fn status(&self) -> DiskProtectionStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn logging_state(&self) -> (bool, u64) {
+        let epoch = self.lock_epoch.load(Ordering::SeqCst);
+        (self.blocked.load(Ordering::SeqCst), epoch)
+    }
+
+    pub(crate) fn update<T>(&self, change: impl FnOnce(&mut DiskProtectionStatus) -> T) -> T {
+        let value = {
+            let mut status = self.status.lock().unwrap_or_else(PoisonError::into_inner);
+            let value = change(&mut status);
+            self.blocked.store(status.lock.is_some(), Ordering::SeqCst);
+            status.generation += 1;
+            value
+        };
+        let mut watchers = self.watchers.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(watchers) = watchers.as_mut() {
+            // A full channel already holds an unread notification.
+            watchers.retain(|watcher| {
+                !matches!(
+                    watcher.try_send(()),
+                    Err(flume::TrySendError::Disconnected(()))
+                )
+            });
+        }
+        value
+    }
+
+    /// Locks with `reasons`, or adds them to the held lock, replacing older
+    /// reasons about the same subject. Returns the resulting lock.
+    pub(crate) fn lock(&self, reasons: Vec<ProtectionReason>) -> ProtectionLock {
+        self.blocked.store(true, Ordering::SeqCst);
+        self.lock_epoch.fetch_add(1, Ordering::SeqCst);
+        self.update(|status| {
+            let lock = status.lock.get_or_insert_with(|| ProtectionLock {
+                reasons: Vec::new(),
+                locked_at: Timestamp::now(),
+            });
+            for reason in reasons {
+                match lock
+                    .reasons
+                    .iter_mut()
+                    .find(|held| held.same_subject(&reason))
+                {
+                    Some(held) => *held = reason,
+                    None => lock.reasons.push(reason),
+                }
+            }
+            lock.clone()
+        })
+    }
+
+    pub(crate) fn watch(self: &Arc<Self>) -> ProtectionWatch {
+        let (sender, receiver) = flume::bounded(1);
+        if let Some(watchers) = self
+            .watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            watchers.push(sender);
+        }
+        ProtectionWatch {
+            receiver,
+            cell: self.clone(),
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// Notifies of protection status changes. Changes made while nobody is
+/// waiting coalesce into one notification; compare
+/// [`DiskProtectionStatus::generation`] to count them.
+pub struct ProtectionWatch {
+    receiver: flume::Receiver<()>,
+    cell: Arc<ProtectionCell>,
+}
+
+impl ProtectionWatch {
+    pub(crate) fn notifications(&self) -> &flume::Receiver<()> {
+        &self.receiver
+    }
+    pub fn status(&self) -> DiskProtectionStatus {
+        self.cell.status()
+    }
+
+    /// Waits for the next change and returns the status after it, or `None`
+    /// once the database worker has stopped. Needs no particular async
+    /// runtime.
+    pub async fn changed(&self) -> Option<DiskProtectionStatus> {
+        self.receiver
+            .recv_async()
+            .await
+            .ok()
+            .map(|()| self.cell.status())
+    }
+}
+
+/// A request that callers share while it is pending: the first caller
+/// starts it, later callers wait for the same result.
+pub(crate) struct SharedRequest<T> {
+    waiters: Mutex<Option<Vec<flume::Sender<T>>>>,
+}
+
+impl<T: Clone> SharedRequest<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            waiters: Mutex::new(None),
+        }
+    }
+
+    /// Joins the pending request, or starts one with `start` when none is
+    /// pending. `start` runs under this request's lock, so a completion
+    /// cannot slip between starting and registering.
+    pub(crate) fn join<E>(
+        &self,
+        start: impl FnOnce() -> Result<(), E>,
+    ) -> Result<flume::Receiver<T>, E> {
+        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        let (sender, receiver) = flume::bounded(1);
+        match waiters.as_mut() {
+            Some(waiters) => waiters.push(sender),
+            None => {
+                start()?;
+                *waiters = Some(vec![sender]);
+            }
+        }
+        Ok(receiver)
+    }
+
+    pub(crate) fn complete(&self, result: T) {
+        let waiters = self
+            .waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        for waiter in waiters.into_iter().flatten() {
+            waiter.send(result.clone()).ok();
+        }
+    }
+
+    /// Drops every waiter unanswered, which they observe as a stopped worker.
+    pub(crate) fn abandon(&self) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+}
+
+/// Writes every change between locked and unlocked storage to standard
+/// error, which needs neither the database nor the file log. Ends when the
+/// database worker stops.
+pub(crate) async fn report_protection(watch: ProtectionWatch) {
+    let mut lock = watch.status().lock;
+    if let Some(notice) = protection_notice(None, lock.as_ref()) {
+        eprintln!("{notice}");
+    }
+    while let Some(status) = watch.changed().await {
+        if let Some(notice) = protection_notice(lock.as_ref(), status.lock.as_ref()) {
+            eprintln!("{notice}");
+        }
+        lock = status.lock;
+    }
+}
+
+/// What changed between two protection states, if admission changed.
+fn protection_notice(
+    before: Option<&ProtectionLock>,
+    after: Option<&ProtectionLock>,
+) -> Option<String> {
+    match (before, after) {
+        (None, Some(lock)) => Some(format!(
+            "OCG storage protection is active; commands are refused and the file log is paused: {lock}"
+        )),
+        (Some(_), None) => {
+            Some("OCG storage protection was lifted; commands are accepted again".to_owned())
+        }
+        _ => None,
+    }
+}

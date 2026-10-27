@@ -1,0 +1,190 @@
+export type WorkType = "research" | "coding" | "design" | "devops";
+
+export type ChatSession = {
+  id: string;
+  title: string;
+  workType: WorkType;
+  updatedAt: string;
+  projectId?: string;
+  sessionId?: string;
+  agentProfile?: string;
+  conversationId?: string;
+  jobState?: string;
+  hasChildren?: boolean;
+};
+
+/**
+ * Who authored a message.
+ *
+ * `call` mirrors the canonical `Actor` kind of the same name: a Call is the
+ * managed action the substrate ran, and its output can be a message of its own.
+ */
+export type MessageRole = "user" | "assistant" | "call" | "tool";
+
+export type MessageStatus =
+  | "pending"
+  | "streaming"
+  | "completed"
+  | "cancelled"
+  | "unknown"
+  | "failed";
+
+/** One managed Call shown inline in the conversation. */
+export type CallActivity = {
+  id: string;
+  /** The canonical effect identity, when the substrate named one. */
+  name: string;
+  status: string;
+  durationMs: number;
+  summary: string;
+  detail: string;
+  /** The Executor the substrate attributed this Call to. */
+  executorId?: string;
+};
+
+export type ChatMessage = {
+  agentInstruction?: boolean;
+  compaction?: import("./contracts").ControlConversationTurn["compaction"];
+  withdrawn?: boolean;
+  queued?: boolean;
+  queueHistory?: { content: string; at: string }[];
+  activity?: import("./contracts").ControlJobActivity;
+  taskPlan?: import("./contracts").ControlTaskPlan | null;
+  toolCalls?: import("./contracts").ControlToolCall[];
+  images?: import("./contracts").ChatImage[];
+  id: string;
+  commandId?: string;
+  /** Canonical Job owning this assistant turn, when backed by OCG. */
+  jobId?: string;
+  optimistic?: boolean;
+  role: MessageRole;
+  content: string;
+  /** Extended thinking content from models that support reasoning. */
+  reasoning?: string;
+  reasoningDurationMs?: number;
+  intermediate?: boolean;
+  failureReason?: string;
+  failureAt?: number;
+  failureCode?: "project-missing" | "configuration-required" | "stream-closed";
+  createdAt: string;
+  status: MessageStatus;
+  call?: CallActivity;
+  /** Temporary read-only compatibility field for the legacy fixture renderer. */
+  tool?: ToolActivity;
+};
+
+/** Status an observability participant (a provider invocation) can report. */
+export type WorkerStatus =
+  | "queued"
+  | "starting"
+  | "active"
+  | "waiting"
+  | "idle"
+  | "completed"
+  | "failed"
+  | "cancelled";
+export type ToolActivityStatus =
+  | "pending"
+  | "running"
+  | "success"
+  | "failure"
+  | "retrying"
+  | "waiting-approval";
+export type ToolActivity = {
+  id: string;
+  name: string;
+  status: string;
+  durationMs: number;
+  summary: string;
+  detail: string;
+  retryCount?: number;
+};
+
+export type RuntimeConnectionState = "connected" | "connecting" | "disconnected" | "failed";
+
+/** The same states, as data, so a validator can check membership. */
+export const RUNTIME_CONNECTION_STATES: readonly RuntimeConnectionState[] = [
+  "connected",
+  "connecting",
+  "disconnected",
+  "failed",
+];
+
+export type RuntimeStatus = {
+  state: RuntimeConnectionState;
+  sessionId?: string;
+  detailCode?: "provider-ready" | "configuration-required";
+  detail?: string;
+};
+
+export type SendMessageInput = {
+  images?: import("./contracts").ChatImage[];
+  selection?: import("./contracts").ChatModelSelection;
+  mode?: "queue" | "steer";
+  content: string;
+  /** Explicit owning Project from real UI state (the active project at send time). */
+  projectId?: string;
+};
+
+export type QueuedChatMessage = { id: string; input: SendMessageInput };
+
+export type OcgRuntimeEvent =
+  | { type: "conversation.session-deleted"; sessionId: string }
+  | {
+      type: "conversation.message-image";
+      sessionId: string;
+      messageId: string;
+      image: import("./contracts").ChatImage;
+    }
+  | {
+      type: "conversation.queue-updated";
+      sessionId: string;
+      queue: QueuedChatMessage[];
+      paused: boolean;
+    }
+  | { type: "conversation.history-loaded"; sessionId: string; messages: ChatMessage[] }
+  | { type: "runtime.status-changed"; status: RuntimeStatus }
+  | { type: "conversation.session-created"; session: ChatSession }
+  | { type: "conversation.session-updated"; session: ChatSession }
+  | { type: "conversation.message-started"; sessionId: string; message: ChatMessage }
+  | { type: "conversation.message-delta"; sessionId: string; messageId: string; delta: string }
+  | {
+      type: "conversation.message-reasoning-delta";
+      sessionId: string;
+      messageId: string;
+      delta: string;
+    }
+  | {
+      type: "conversation.message-round-committed";
+      sessionId: string;
+      messageId: string;
+      committedContentLength: number;
+      committedImageCount: number;
+      committedReasoningLength: number;
+    }
+  | { type: "conversation.message-completed"; sessionId: string; message: ChatMessage }
+  | { type: "activity.updated"; sessionId: string; messageId: string; activity: CallActivity }
+  | {
+      type: "job.execution-updated";
+      sessionId?: string;
+      execution: import("./execution/domain").JobExecution;
+      accounting: import("./execution/accounting").JobAccounting | null;
+    }
+  | {
+      type: "job.launch-updated";
+      sessionId: string;
+      result: import("./runtime/runtime-types").JobLaunchResult;
+    }
+  | {
+      type: "observability.updated";
+      sessionId: string;
+      observability: import("./runtime/observability").RuntimeObservability;
+    }
+  | { type: "attention.updated"; item: import("./attention/domain").AttentionItem }
+  | { type: "ledger.entry-added"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
+  | { type: "ledger.entry-updated"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
+  | { type: "log.appended"; entry: import("./logs/domain").LogEntry }
+  | { type: "bootstrap.updated"; bootstrap: import("./bootstrap/types").BootstrapState }
+  | { type: "warning"; message: string }
+  | { type: "error"; message: string }
+  | { type: "cancelled"; sessionId: string; messageId?: string };
