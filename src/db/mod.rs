@@ -30,7 +30,7 @@ use crate::db::entities::{
     ObservationFilter, ObservationPage, OperationId, OperationKind, Project, ProjectCommand,
     ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, SentRequest,
     Submission, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
-    ToolOutcome, ToolReconciliation, Violation,
+    ToolOutcome, Violation,
 };
 use crate::db::entities::{ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding};
 use crate::db::mutations::PublishedAttachment;

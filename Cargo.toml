@@ -38,7 +38,6 @@ required-features = ["benchmarks"]
 uuid = { version = "=1.28.0", default-features = false, features = ["std", "v7"] }
 ts-rs = { version = "=12.0.1", default-features = false, features = ["serde-compat", "serde-json-impl"] }
 redb = { version = "=4.3.0", default-features = false, features = ["std"] }
-petgraph = { version = "=0.8.3", default-features = false, features = ["std"] }
 flume = "0.11"
 ntex = { version = "3.12", default-features = false, features = ["rustls"] }
 aws-lc-rs = "1"

@@ -294,15 +294,6 @@ pub(super) enum Command {
         outcome: Box<ToolOutcome>,
         reply: Reply<()>,
     },
-    #[expect(
-        dead_code,
-        reason = "OCG has no trusted reconciler outside its tests yet"
-    )]
-    ReconcileToolEffect {
-        call: ToolCallRef,
-        reconciliation: Box<ToolReconciliation>,
-        reply: Reply<()>,
-    },
 }
 
 impl Command {
@@ -825,18 +816,6 @@ impl Command {
                 reply,
                 |batch| mutations::record_tool_outcome(batch, call, *outcome),
             ),
-            Self::ReconcileToolEffect {
-                call,
-                reconciliation,
-                reply,
-            } => run(
-                database,
-                operation,
-                commit,
-                Kind::ReconcileToolEffect,
-                reply,
-                |batch| mutations::reconcile_tool_effect(batch, call, *reconciliation),
-            ),
         }
     }
 
@@ -1110,11 +1089,6 @@ impl Command {
                 ToolOutcome::Uncertain { message, .. } => text_bytes(message),
                 ToolOutcome::CompletedWithheld { .. } | ToolOutcome::NotInvoked { .. } => 0,
             },
-            Self::ReconcileToolEffect { reconciliation, .. } => {
-                byte_count(reconciliation.reconciler.len())
-                    .saturating_add(byte_count(reconciliation.evidence.len()))
-                    .saturating_add(byte_count(reconciliation.explanation.len()))
-            }
         };
         payload
             .saturating_mul(2)
@@ -1170,8 +1144,7 @@ impl Command {
             Self::RecordSentRequest { reply, .. }
             | Self::RecordProviderAnswer { reply, .. }
             | Self::RecordToolDecision { reply, .. }
-            | Self::RecordToolOutcome { reply, .. }
-            | Self::ReconcileToolEffect { reply, .. } => refuse(reply, error),
+            | Self::RecordToolOutcome { reply, .. } => refuse(reply, error),
         }
     }
 }

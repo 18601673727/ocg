@@ -29,7 +29,6 @@ pub use approvals::{
     ToolOutcome, ToolOutcomeKind, ToolPayload, ToolReconciliation, UncertainCause, WithheldReason,
     is_handler_version,
 };
-pub(in crate::db) use approvals::{MAX_RECONCILER_BYTES, MAX_RECONCILIATION_TEXT_BYTES};
 pub use attachments::*;
 pub use identity::{
     AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,

@@ -12,9 +12,6 @@ import {
   projectConversation,
   projectJobEvent,
   projectProfiles,
-  type ControlGlobalCompactionSettings,
-  type ControlDecisionLimits,
-  type ControlProviderModel,
   type ControlAttachment,
   type ControlOutput,
   type ControlCapability,
@@ -145,7 +142,7 @@ export type ControlProfileWriteRequest =
       credential_ref?: string | null;
       clear_credential?: boolean;
       declared_capabilities: string[];
-      limits: ControlDecisionLimits;
+      limits: Api.DecisionLimits;
     }
   | {
       kind: "decision_agent";
@@ -1473,7 +1470,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             credential?: string;
             credential_ref?: string;
           },
-      models: ControlProviderModel[],
+      models: Api.ProviderModel[],
       capabilities: ControlCapability[],
     ) {
       if (typeof source === "string") identity(source, "source_profile_id");
@@ -1498,7 +1495,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.input as Api.GlobalCompactionSettings;
     },
 
-    async saveGlobalCompactionSettings(settings: ControlGlobalCompactionSettings) {
+    async saveGlobalCompactionSettings(settings: Api.GlobalCompactionSettings) {
       const answer = await send("POST", "/api/v1/settings/compaction", {
         body: settings,
         sign: true,

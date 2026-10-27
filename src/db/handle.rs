@@ -1786,28 +1786,6 @@ impl DatabaseHandle {
         self.record_tool_outcome(call, outcome).await
     }
 
-    /// Records, once, a verified conclusion about an admitted call whose
-    /// outcome is uncertain, once its Job is settled. Only trusted OCG code
-    /// that verified the conclusion against the external system may call
-    /// it; OCG has no such reconciler yet, so it is not part of the public
-    /// API.
-    #[expect(
-        dead_code,
-        reason = "OCG has no trusted reconciler outside its tests yet"
-    )]
-    pub(crate) async fn reconcile_tool_effect(
-        &self,
-        call: ToolCallRef,
-        reconciliation: ToolReconciliation,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::ReconcileToolEffect {
-            call,
-            reconciliation: Box::new(reconciliation),
-            reply,
-        })
-        .await
-    }
-
     /// A Job's tool evidence in call order, after the call named by its
     /// request and index when given; at most 1,000 per call.
     pub async fn tool_evidence(

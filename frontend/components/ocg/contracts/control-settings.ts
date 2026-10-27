@@ -1,10 +1,5 @@
 import type * as Api from "./api";
 
-export type ControlCompactionPolicy = Api.CompactionPolicy;
-export type ControlPredictiveCompaction = Api.PredictiveCompaction;
-export type ControlDecisionLimits = Api.DecisionLimits;
-export type ControlGlobalCompactionSettings = Api.GlobalCompactionSettings;
-
 type Confidence = { value: number; semantics: string };
 export type ControlDecisionAnswer =
   | {

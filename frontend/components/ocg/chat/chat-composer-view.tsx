@@ -5,7 +5,7 @@ import type { ComponentPropsWithRef, ComponentPropsWithoutRef, ReactNode } from 
 import { ArrowUp, Command, ListPlus, Loader2, Paperclip, Sparkles, Square } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { SELECTED_ROW, STATUS_TEXT } from "@/components/ocg/primitives";
+import { SELECTED_ROW, TEXT_TONE } from "@/components/ocg/primitives";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
 
@@ -169,7 +169,7 @@ export function ChatComposerInput({
       {error && !errorInHeader && (
         <DismissibleNotice
           message={error}
-          className={`border-t border-border px-3 py-1.5 text-xs ${STATUS_TEXT["error"]}`}
+          className={`border-t border-border px-3 py-1.5 text-xs ${TEXT_TONE.red}`}
         >
           {error}
         </DismissibleNotice>

@@ -385,7 +385,6 @@ function AppShellContent({
             activeView={location.view}
             titleVisible={location.view === "chat" || !pageTitleInView}
             onOpenMobileSidebar={() => setMobile(true)}
-            syncStatus={runtime.sync?.status}
             backButton={
               location.view === "chat" && ancestors.length > 1 ? (
                 <Button

@@ -1,12 +1,7 @@
 "use client";
 
 import { forwardRef, memo, useCallback, useRef } from "react";
-import {
-  useScrollLock,
-  useAuiState,
-  type ReasoningMessagePartComponent,
-  type ReasoningGroupComponent,
-} from "@assistant-ui/react";
+import { useScrollLock, type ReasoningMessagePartComponent } from "@assistant-ui/react";
 import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import {
   ANIMATION_DURATION,
@@ -58,40 +53,6 @@ const ReasoningImpl: ReasoningMessagePartComponent = (props) => (
   <MarkdownText text={props.text} status={props.status} inMuted />
 );
 
-const ReasoningGroupImpl: ReasoningGroupComponent = ({ children, startIndex, endIndex }) => {
-  const unsettled = useAuiState((s) => s.message.status?.type === "running");
-  const duration = useAuiState((s) => {
-    const value = s.message.metadata.custom.reasoningDurationMs;
-    return typeof value === "number" ? value / 1000 : undefined;
-  });
-  const text = useAuiState((s) =>
-    s.message.parts
-      .slice(startIndex, endIndex + 1)
-      .map((part) => (part.type === "reasoning" ? part.text : ""))
-      .join(""),
-  );
-  const isReasoningStreaming = useAuiState((s) => {
-    if (s.message.status?.type !== "running") return false;
-    for (let index = startIndex; index <= endIndex; index++) {
-      if (s.message.parts[index]?.status.type === "running") return true;
-    }
-    return false;
-  });
-
-  return (
-    <ReasoningRoot streaming={isReasoningStreaming}>
-      <ReasoningTrigger
-        active={unsettled}
-        duration={duration}
-        tokens={estimateReasoningTokens(text)}
-      />
-      <ReasoningContent streaming={isReasoningStreaming} aria-busy={isReasoningStreaming}>
-        <ReasoningText>{children}</ReasoningText>
-      </ReasoningContent>
-    </ReasoningRoot>
-  );
-};
-
 const Reasoning = Object.assign(memo(ReasoningImpl), {
   Root: ReasoningRoot,
   Trigger: ReasoningTrigger,
@@ -107,20 +68,9 @@ Reasoning.Content = ReasoningContent;
 Reasoning.Text = ReasoningText;
 Reasoning.Fade = ReasoningFade;
 
-/**
- * @deprecated This wrapper targets the legacy `components.ReasoningGroup`
- * prop on `<MessagePrimitive.Parts>`. Use `<MessagePrimitive.GroupedParts>`
- * with a `groupBy` returning `"group-reasoning"` and compose `ReasoningRoot`
- * / `ReasoningTrigger` / `ReasoningContent` / `ReasoningText` directly.
- * See `thread.aui.tsx` for an example.
- */
-const ReasoningGroup = memo(ReasoningGroupImpl);
-ReasoningGroup.displayName = "ReasoningGroup";
-
 export {
   estimateReasoningTokens,
   Reasoning,
-  ReasoningGroup,
   ReasoningRoot,
   ReasoningTrigger,
   ReasoningContent,

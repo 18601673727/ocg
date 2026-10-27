@@ -1,10 +1,10 @@
 "use client";
 
+import type { ControlProfilesSnapshot } from "../contracts";
 import type {
-  ControlCompactionPolicy,
-  ControlProfilesSnapshot,
-  ControlPredictiveCompaction,
-} from "../contracts";
+  CompactionPolicy as ControlCompactionPolicy,
+  PredictiveCompaction as ControlPredictiveCompaction,
+} from "../contracts/api";
 import { useI18n, type I18nKey } from "../i18n";
 import { Input } from "@/components/ui/input";
 import {

@@ -16,11 +16,11 @@ import { PageSurface, Pill, SELECTED_OPTION } from "@/components/ocg/primitives"
 import type {
   ControlAgentCapability,
   ControlCapability,
-  ControlDecisionLimits,
   ControlLlmProfile,
   ControlManagedAgentProfile,
   ControlProfilesSnapshot,
 } from "@/components/ocg/contracts";
+import type { DecisionLimits as ControlDecisionLimits } from "@/components/ocg/contracts/api";
 import {
   ControlTransportError,
   type ControlProfileWriteRequest,

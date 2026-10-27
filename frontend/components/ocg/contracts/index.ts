@@ -3,29 +3,19 @@
 export type {
   ChatImage,
   ChatImageUploadRequest,
-  CanonicalApiVersion,
-  CanonicalJobRelations,
   ChildPolicy,
   JobOrigin,
-  CanonicalJobOperations,
   Failure,
   FailureClass,
   JsonValue,
-  ProfileApiVersion,
   RecursiveLimits,
 } from "./view-models";
-
-export { CANONICAL_API_VERSION, PROFILE_API_VERSION } from "./view-models";
 
 export { ContractError } from "./decode";
 
 export type {
   CanonicalAttempt,
-  CanonicalCall,
-  CanonicalDispatchIntent,
   CanonicalEffectKind,
-  CanonicalExecutor,
-  CanonicalWatchdogAction,
   CanonicalJobState,
 } from "./view-models";
 

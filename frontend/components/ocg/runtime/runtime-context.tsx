@@ -16,36 +16,24 @@ import type {
   JobLaunchResult,
   OcgRuntimeClient,
   RuntimeAuthority,
+  RuntimeSnapshot,
 } from "./runtime-types";
 import type { JobLaunchCommand } from "../job/draft-domain";
 import type { ChatSession, SendMessageInput } from "../types";
-import type { RuntimeSnapshot } from "./runtime-types";
-import type { RuntimeDiagnostic } from "./runtime-envelope";
-import type { RuntimeSyncState } from "./reconciler";
-import type { OnboardingStageId } from "../bootstrap/types";
-
+import type { RuntimeDiagnostic } from "./reconciler";
 import type { HttpCanonicalControlClient } from "./control-client";
 
 type RuntimeContextValue = {
   control: HttpCanonicalControlClient | null;
   client: OcgRuntimeClient;
-  /** Which runtime answers Chat. Derived from the control endpoint, not a fixture name. */
   authority: RuntimeAuthority;
   snapshot: RuntimeSnapshot;
-  /** Canonical synchronization metadata for the runtime store, when available. */
-  sync: RuntimeSyncState | null;
-  /** Bounded, display-safe diagnostics observed by the reconciler. */
   diagnostics: readonly RuntimeDiagnostic[];
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
   deleteSession: (sessionId: string) => Promise<void>;
   sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
   retryMessage: (sessionId: string, messageId: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
-  requestAccessHandoff: () => Promise<void>;
-  setOnboardingStage: (stage: OnboardingStageId) => Promise<void>;
-  completeOnboarding: () => Promise<void>;
-  retryBootstrap: () => Promise<void>;
-  setActiveProfile: (profileId: string) => Promise<void>;
   launchJob: (command: JobLaunchCommand) => Promise<JobLaunchResult>;
 };
 
@@ -54,8 +42,6 @@ const RuntimeContext = createContext<RuntimeContextValue | null>(null);
 const subscribeHydration = () => () => {};
 const browserHydrated = () => true;
 const serverHydrated = () => false;
-
-const EMPTY_DIAGNOSTICS: readonly RuntimeDiagnostic[] = [];
 
 export function OcgRuntimeProvider({
   children,
@@ -90,14 +76,11 @@ export function OcgRuntimeProvider({
   );
   const getSnapshot = useCallback(() => client.getSnapshot(), [client]);
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  const getSyncState = useCallback(() => client.getSyncState?.() ?? null, [client]);
-  const sync = useSyncExternalStore(subscribe, getSyncState, getSyncState);
-  const diagnostics = sync?.diagnostics ?? EMPTY_DIAGNOSTICS;
+  const getDiagnostics = useCallback(() => client.getDiagnostics(), [client]);
+  const diagnostics = useSyncExternalStore(subscribe, getDiagnostics, getDiagnostics);
 
   const createSession = useCallback(
-    async (input: CreateSessionInput) => {
-      return client.createSession(input);
-    },
+    async (input: CreateSessionInput) => client.createSession(input),
     [client],
   );
   const sendMessage = useCallback(
@@ -122,27 +105,6 @@ export function OcgRuntimeProvider({
   const retryMessage = useCallback(
     async (sessionId: string, messageId: string) => {
       await client.retryMessage(sessionId, messageId);
-    },
-    [client],
-  );
-  const requestAccessHandoff = useCallback(async () => {
-    await client.requestAccessHandoff?.();
-  }, [client]);
-  const setOnboardingStage = useCallback(
-    async (stage: OnboardingStageId) => {
-      await client.setOnboardingStage?.(stage);
-    },
-    [client],
-  );
-  const completeOnboarding = useCallback(async () => {
-    await client.completeOnboarding?.();
-  }, [client]);
-  const retryBootstrap = useCallback(async () => {
-    await client.retryBootstrap?.();
-  }, [client]);
-  const setActiveProfile = useCallback(
-    async (profileId: string) => {
-      await client.setActiveProfile?.(profileId);
     },
     [client],
   );
@@ -171,18 +133,12 @@ export function OcgRuntimeProvider({
         controlClient ?? (client instanceof CanonicalOcgRuntimeClient ? client.control : null),
       authority,
       snapshot,
-      sync,
       diagnostics,
       createSession,
       deleteSession,
       sendMessage,
       retryMessage,
       cancel,
-      requestAccessHandoff,
-      setOnboardingStage,
-      completeOnboarding,
-      retryBootstrap,
-      setActiveProfile,
       launchJob,
     }),
     [
@@ -190,19 +146,13 @@ export function OcgRuntimeProvider({
       cancel,
       client,
       controlClient,
-      completeOnboarding,
       createSession,
       deleteSession,
       diagnostics,
       launchJob,
-      requestAccessHandoff,
-      retryBootstrap,
       retryMessage,
       sendMessage,
-      setActiveProfile,
-      setOnboardingStage,
       snapshot,
-      sync,
     ],
   );
   if (!hydrated) return null;

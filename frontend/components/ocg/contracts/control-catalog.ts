@@ -42,7 +42,6 @@ export type ControlProfilesSnapshot = Omit<
   decision_profiles: Api.DecisionProfile[];
   decision_agent_profiles: Api.DecisionAgentProfile[];
 };
-export type ControlProviderModel = Api.ProviderModel;
 export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
 export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
 

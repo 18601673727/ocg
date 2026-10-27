@@ -1,480 +1,38 @@
-/**
- * Pure runtime reconciler.
- *
- * `reconcileSnapshot` installs an authoritative baseline; `reconcileEvent`
- * applies one validated envelope to that baseline. Both are total, pure, and
- * identity-preserving when nothing changed, so they can back a single external
- * store shared by React and tests.
- *
- * Rules enforced here:
- * - protocol/schema validation happens before any mutation;
- * - a snapshot of an older generation or an older cursor is stale;
- * - duplicate event IDs are idempotent and sequence gaps require a resync;
- * - lower/older sequences can never roll state backwards;
- * - known session events whose Project scope does not match fixture ownership
- *   are consumed without mutating the snapshot;
- * - entity-missing/malformed payloads yield diagnostics, not corruption.
- */
-
-import type { ChatMessage } from "../types";
-import type { ProjectId } from "../project/domain";
-import type { JobLaunchResult, RuntimeSnapshot } from "./runtime-types";
+import type { ChatMessage, OcgRuntimeEvent } from "../types";
+import type { RuntimeSnapshot } from "./runtime-types";
 import { boundActivities, boundTimeline } from "./observability";
-import { normalizeLogEntry } from "../logs/domain";
-import type {
-  AnyRuntimeEnvelope,
-  RuntimeCursor,
-  RuntimeDiagnostic,
-  RuntimeDiagnosticCode,
-  RuntimeEventId,
-  RuntimeGeneration,
-  RuntimeResumeCursor,
-  RuntimeStreamId,
-} from "./runtime-envelope";
-import type { RuntimeSnapshotEnvelope, RuntimeSnapshotScope } from "./runtime-snapshot";
-import { emptyRuntimeSnapshot, sameSnapshotScope } from "./runtime-snapshot";
-import {
-  boundDiagnostics,
-  compareGeneration,
-  compareSequence,
-  isSeen,
-  rememberId,
-} from "./event-gate";
 
-export type RuntimeSyncStatus =
-  | "uninitialized"
-  | "loading-snapshot"
-  | "live"
-  | "reconnecting"
-  | "stale"
-  | "error";
+export type RuntimeDiagnosticCode =
+  | "unknown-session"
+  | "unknown-entity"
+  | "command-rejected"
+  | "command-failed"
+  | "runtime-warning"
+  | "runtime-error";
 
-export type RuntimeSyncState = {
-  authority?: "canonical";
-  status: RuntimeSyncStatus;
-  scope: RuntimeSnapshotScope | null;
-  cursor: RuntimeCursor | null;
-  streamId: RuntimeStreamId | null;
-  generation: RuntimeGeneration | null;
-  lastEventId: RuntimeEventId | null;
-  snapshotRevision?: string;
-  resumeCursor?: RuntimeResumeCursor;
-  lastSuccessfulSyncAt?: string;
-  /** True after a gap or an unknown generation; a snapshot is required. */
-  resyncRequired: boolean;
-  diagnostics: RuntimeDiagnostic[];
-  seenEventIds: string[];
-  seenDeltaKeys: string[];
-  /** Latest command acknowledgement by stable command identity. */
-  commandResults: Record<string, JobLaunchResult>;
-  /** Runtime ownership learned from scoped snapshots/events for dynamic sessions. */
-  sessionProjects: Record<string, ProjectId>;
+export type RuntimeDiagnostic = {
+  code: RuntimeDiagnosticCode;
+  severity: "info" | "warning" | "error";
+  message: string;
+  sessionId?: string;
 };
 
 export type RuntimeState = {
   snapshot: RuntimeSnapshot;
-  sync: RuntimeSyncState;
+  diagnostics: RuntimeDiagnostic[];
 };
 
-export function createUninitializedRuntimeState(): RuntimeState {
-  return {
-    snapshot: emptyRuntimeSnapshot(),
-    sync: {
-      status: "uninitialized",
-      scope: null,
-      cursor: null,
-      streamId: null,
-      generation: null,
-      lastEventId: null,
-      resyncRequired: false,
-      diagnostics: [],
-      seenEventIds: [],
-      seenDeltaKeys: [],
-      commandResults: {},
-      sessionProjects: {},
-    },
-  };
-}
+type ApplyResult = { snapshot: RuntimeSnapshot; diagnostics: RuntimeDiagnostic[] };
 
-export function markLoadingSnapshot(state: RuntimeState): RuntimeState {
-  if (state.sync.status === "loading-snapshot") return state;
-  return { snapshot: state.snapshot, sync: { ...state.sync, status: "loading-snapshot" } };
-}
+const MAX_DIAGNOSTICS = 50;
 
-export function markReconnecting(state: RuntimeState): RuntimeState {
-  if (state.sync.status === "reconnecting") return state;
-  return {
-    snapshot: state.snapshot,
-    sync: { ...state.sync, status: "reconnecting", resyncRequired: true },
-  };
-}
-
-/** A degraded status is anything other than a healthy uninitialized/live sync. */
-export function isDegradedSyncStatus(status: RuntimeSyncStatus | null | undefined): boolean {
-  return (
-    status === "stale" ||
-    status === "error" ||
-    status === "reconnecting" ||
-    status === "loading-snapshot"
-  );
-}
-
-/* -------------------------------------------------------------------------- */
-/* Helpers                                                                    */
-/* -------------------------------------------------------------------------- */
-
-function withDiagnostics(state: RuntimeState, diagnostics: RuntimeDiagnostic[]): RuntimeState {
-  if (diagnostics.length === 0) return state;
-  return {
-    snapshot: state.snapshot,
-    sync: {
-      ...state.sync,
-      diagnostics: boundDiagnostics([...state.sync.diagnostics, ...diagnostics]),
-    },
-  };
-}
-
-function requireResync(
-  state: RuntimeState,
-  diagnostic: RuntimeDiagnostic,
-  options: { resumable?: boolean } = {},
-): RuntimeState {
-  if (state.sync.resyncRequired && state.sync.status === "stale") {
-    return withDiagnostics(state, [diagnostic]);
-  }
-  void options;
-  return {
-    snapshot: state.snapshot,
-    sync: {
-      ...state.sync,
-      status: "stale",
-      resyncRequired: true,
-      diagnostics: boundDiagnostics([...state.sync.diagnostics, diagnostic]),
-    },
-  };
-}
-
-/** Consume one in-sequence envelope without mutating the snapshot. */
-function consumeEnvelope(
-  state: RuntimeState,
-  envelope: AnyRuntimeEnvelope,
-  diagnostics: RuntimeDiagnostic[],
-  deltaKey?: string,
-): RuntimeState {
-  const sync = state.sync;
-  return {
-    snapshot: state.snapshot,
-    sync: {
-      ...sync,
-      cursor: { streamId: envelope.streamId, sequence: envelope.sequence },
-      lastEventId: envelope.eventId,
-      lastSuccessfulSyncAt: envelope.occurredAt,
-      seenEventIds: rememberId(sync.seenEventIds, envelope.eventId),
-      seenDeltaKeys:
-        deltaKey !== undefined ? rememberId(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
-      diagnostics: boundDiagnostics([...sync.diagnostics, ...diagnostics]),
-    },
-  };
-}
-
-function deltaDedupKey(envelope: AnyRuntimeEnvelope): string | undefined {
-  if (envelope.type !== "conversation.message-delta") return undefined;
-  const { turnId, deltaSequence } = envelope.payload;
-  if (turnId === undefined || deltaSequence === undefined) return undefined;
-  return `${envelope.streamId}\u0000${turnId}\u0000${deltaSequence}`;
-}
-
-/** True when a known entity's Project scope contradicts the envelope scope. */
-function hasScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEnvelope): boolean {
-  if (envelope.projectId === null) return false;
-  if (!envelope.sessionId) return false;
-  const owner = sync.sessionProjects[envelope.sessionId] ?? null;
-  return owner !== null && owner !== envelope.projectId;
-}
-
-function hasPayloadScopeViolation(sync: RuntimeSyncState, envelope: AnyRuntimeEnvelope): boolean {
-  if (envelope.projectId === null) return false;
-  if (hasScopeViolation(sync, envelope)) return true;
-  if (envelope.type === "job.execution-updated") {
-    return envelope.payload.execution.projectId !== envelope.projectId;
-  }
-  if (envelope.type === "attention.updated") {
-    return (
-      envelope.payload.item.projectId !== undefined &&
-      envelope.payload.item.projectId !== envelope.projectId
-    );
-  }
-  return false;
-}
-
-/* -------------------------------------------------------------------------- */
-/* Snapshot reconciliation                                                    */
-/* -------------------------------------------------------------------------- */
-
-export function reconcileSnapshot(
-  state: RuntimeState,
-  envelope: RuntimeSnapshotEnvelope,
-): RuntimeState {
-  if (envelope.snapshot.logs !== undefined && envelope.snapshot.logs.length > 0) {
-    const normalizedLogs = envelope.snapshot.logs.map(normalizeLogEntry);
-    const logsChanged = normalizedLogs.some(
-      (entry, index) => JSON.stringify(entry) !== JSON.stringify(envelope.snapshot.logs![index]),
-    );
-    if (!logsChanged) return installValidatedSnapshot(state, envelope);
-    envelope = {
-      ...envelope,
-      snapshot: {
-        ...envelope.snapshot,
-        logs: normalizedLogs,
-      },
-    };
-  }
-
-  return installValidatedSnapshot(state, envelope);
-}
-
-function installValidatedSnapshot(
-  state: RuntimeState,
-  envelope: RuntimeSnapshotEnvelope,
-): RuntimeState {
-  const sync = state.sync;
-  const hasBaseline =
-    sync.scope !== null &&
-    sync.streamId !== null &&
-    sync.generation !== null &&
-    sync.cursor !== null;
-
-  if (hasBaseline) {
-    if (envelope.generation < sync.generation!) {
-      return withDiagnostics(state, [
-        {
-          code: "generation-stale",
-          severity: "warning",
-          message: `Ignored snapshot from stale generation ${envelope.generation} (current ${sync.generation}).`,
-        },
-      ]);
-    }
-    if (envelope.generation === sync.generation!) {
-      if (!sameSnapshotScope(envelope.scope, sync.scope!)) {
-        return withDiagnostics(state, [
-          {
-            code: "snapshot-scope-mismatch",
-            severity: "warning",
-            message: "Ignored snapshot whose Project scope does not match the installed baseline.",
-          },
-        ]);
-      }
-      if (envelope.streamId !== sync.streamId!) {
-        return withDiagnostics(state, [
-          {
-            code: "stream-mismatch",
-            severity: "warning",
-            message: `Ignored snapshot from stream "${envelope.streamId}" (current "${sync.streamId}").`,
-          },
-        ]);
-      }
-      if (envelope.cursor.sequence < sync.cursor!.sequence) {
-        return withDiagnostics(state, [
-          {
-            code: "snapshot-stale",
-            severity: "warning",
-            message: `Ignored stale snapshot at sequence ${envelope.cursor.sequence} (current ${sync.cursor!.sequence}).`,
-          },
-        ]);
-      }
-    }
-  }
-
-  const nextSync: RuntimeSyncState = {
-    authority: envelope.snapshot.authority,
-    status: "live",
-    scope: envelope.scope,
-    cursor: envelope.cursor,
-    streamId: envelope.streamId,
-    generation: envelope.generation,
-    lastEventId: null,
-    ...(envelope.snapshotRevision !== undefined
-      ? { snapshotRevision: envelope.snapshotRevision }
-      : {}),
-    ...(envelope.resumeCursor !== undefined ? { resumeCursor: envelope.resumeCursor } : {}),
-    ...(envelope.occurredAt !== undefined
-      ? { lastSuccessfulSyncAt: envelope.occurredAt }
-      : sync.lastSuccessfulSyncAt !== undefined
-        ? { lastSuccessfulSyncAt: sync.lastSuccessfulSyncAt }
-        : {}),
-    resyncRequired: false,
-    diagnostics: sync.diagnostics,
-    seenEventIds: [],
-    seenDeltaKeys: [],
-    commandResults: {},
-    sessionProjects: Object.fromEntries(
-      envelope.snapshot.sessions.flatMap((session) => {
-        const owner =
-          envelope.scope.kind === "project"
-            ? envelope.scope.projectId
-            : (session.projectId ?? null);
-        return owner ? [[session.id, owner] as const] : [];
-      }),
-    ),
-  };
-
-  return { snapshot: envelope.snapshot, sync: nextSync };
-}
-
-/* -------------------------------------------------------------------------- */
-/* Event reconciliation                                                       */
-/* -------------------------------------------------------------------------- */
-
-export function reconcileEvent(state: RuntimeState, envelope: AnyRuntimeEnvelope): RuntimeState {
-  const sync = state.sync;
-  if (
-    sync.status === "uninitialized" ||
-    sync.cursor === null ||
-    sync.streamId === null ||
-    sync.generation === null
-  ) {
-    return requireResync(state, {
-      code: "no-snapshot",
-      severity: "warning",
-      message: "Runtime event arrived before an authoritative snapshot was installed.",
-      eventId: envelope.eventId,
-      sequence: envelope.sequence,
-    });
-  }
-
-  const generation = compareGeneration(envelope.generation, sync.generation);
-  if (generation === "stale") {
-    return withDiagnostics(state, [
-      {
-        code: "generation-stale",
-        severity: "warning",
-        message: `Ignored late event from old generation ${envelope.generation} (current ${sync.generation}).`,
-        eventId: envelope.eventId,
-        sequence: envelope.sequence,
-      },
-    ]);
-  }
-
-  if (generation === "unknown") {
-    return requireResync(state, {
-      code: "generation-unknown",
-      severity: "warning",
-      message: `Event generation ${envelope.generation} is newer than the installed baseline; snapshot required.`,
-      eventId: envelope.eventId,
-      sequence: envelope.sequence,
-    });
-  }
-
-  if (envelope.streamId !== sync.streamId) {
-    return requireResync(state, {
-      code: "stream-mismatch",
-      severity: "warning",
-      message: `Event from stream "${envelope.streamId}" does not match "${sync.streamId}".`,
-      eventId: envelope.eventId,
-      sequence: envelope.sequence,
-    });
-  }
-
-  // Duplicate event identity is a pure idempotent no-op.
-  if (isSeen(sync.seenEventIds, envelope.eventId)) {
-    return state;
-  }
-
-  const sequence = compareSequence(envelope.sequence, sync.cursor.sequence);
-  if (sequence === "stale") {
-    return withDiagnostics(state, [
-      {
-        code: "sequence-stale",
-        severity: "warning",
-        message: `Ignored stale sequence ${envelope.sequence} (cursor ${sync.cursor.sequence}).`,
-        eventId: envelope.eventId,
-        sequence: envelope.sequence,
-      },
-    ]);
-  }
-
-  if (sequence === "gap") {
-    return requireResync(state, {
-      code: "sequence-gap",
-      severity: "warning",
-      message: `Sequence gap: expected ${sync.cursor.sequence + 1}, received ${envelope.sequence}.`,
-      eventId: envelope.eventId,
-      sequence: envelope.sequence,
-    });
-  }
-
-  // A command acknowledgement is scoped to the command's requested Project,
-  // even when the command is rejected because that Project does not own the
-  // referenced session. It must remain observable rather than being mistaken
-  // for a spoofed domain update.
-  if (envelope.type !== "job.launch-updated" && hasPayloadScopeViolation(sync, envelope)) {
-    return consumeEnvelope(state, envelope, [
-      {
-        code: "project-scope-mismatch",
-        severity: "warning",
-        message:
-          envelope.type === "job.execution-updated"
-            ? `Ignored Job "${envelope.payload.execution.jobId}" whose Project does not match the event scope.`
-            : `Ignored event for session "${envelope.sessionId}" scoped to Project "${envelope.projectId}".`,
-        eventId: envelope.eventId,
-        sequence: envelope.sequence,
-        sessionId: envelope.sessionId,
-      },
-    ]);
-  }
-
-  const deltaKey = deltaDedupKey(envelope);
-  if (deltaKey !== undefined && sync.seenDeltaKeys.includes(deltaKey)) {
-    return consumeEnvelope(
-      state,
-      envelope,
-      [
-        {
-          code: "duplicate-delta",
-          severity: "info",
-          message: "Ignored duplicate message delta for an already-applied turn/delta sequence.",
-          eventId: envelope.eventId,
-          sequence: envelope.sequence,
-        },
-      ],
-      deltaKey,
-    );
-  }
-
-  const applied = applyEnvelopeToSnapshot(state.snapshot, envelope);
-  const diagnostics = boundDiagnostics([...sync.diagnostics, ...applied.diagnostics]);
+export function reconcileRuntimeEvent(state: RuntimeState, event: OcgRuntimeEvent): RuntimeState {
+  const applied = applyRuntimeEventToSnapshot(state.snapshot, event);
   return {
     snapshot: applied.snapshot,
-    sync: {
-      ...sync,
-      status: "live",
-      resyncRequired: false,
-      cursor: { streamId: envelope.streamId, sequence: envelope.sequence },
-      lastEventId: envelope.eventId,
-      lastSuccessfulSyncAt: envelope.occurredAt,
-      seenEventIds: rememberId(sync.seenEventIds, envelope.eventId),
-      seenDeltaKeys:
-        deltaKey !== undefined ? rememberId(sync.seenDeltaKeys, deltaKey) : sync.seenDeltaKeys,
-      commandResults:
-        envelope.type === "job.launch-updated"
-          ? { ...sync.commandResults, [envelope.payload.result.commandId]: envelope.payload.result }
-          : sync.commandResults,
-      sessionProjects:
-        envelope.sessionId &&
-        envelope.projectId !== null &&
-        !sync.sessionProjects[envelope.sessionId]
-          ? { ...sync.sessionProjects, [envelope.sessionId]: envelope.projectId }
-          : sync.sessionProjects,
-      diagnostics,
-    },
+    diagnostics: [...state.diagnostics, ...applied.diagnostics].slice(-MAX_DIAGNOSTICS),
   };
 }
-
-/* -------------------------------------------------------------------------- */
-/* Total reducer for the current event union                                  */
-/* -------------------------------------------------------------------------- */
-
-type ApplyResult = { snapshot: RuntimeSnapshot; diagnostics: RuntimeDiagnostic[] };
 
 function diag(
   code: RuntimeDiagnosticCode,
@@ -503,12 +61,13 @@ function setMessages(
   };
 }
 
-export function applyEnvelopeToSnapshot(
+function applyRuntimeEventToSnapshot(
   snapshot: RuntimeSnapshot,
-  envelope: AnyRuntimeEnvelope,
+  event: OcgRuntimeEvent,
 ): ApplyResult {
-  const sessionId = envelope.sessionId;
-  switch (envelope.type) {
+  const sessionId =
+    "sessionId" in event && typeof event.sessionId === "string" ? event.sessionId : undefined;
+  switch (event.type) {
     case "conversation.session-deleted": {
       if (!sessionExists(snapshot, sessionId)) return { snapshot, diagnostics: [] };
       const withoutSession = <T>(entries: Record<string, T>) =>
@@ -536,7 +95,10 @@ export function applyEnvelopeToSnapshot(
       return {
         snapshot: {
           ...snapshot,
-          chatQueues: { ...snapshot.chatQueues, [sessionId]: envelope.payload },
+          chatQueues: {
+            ...snapshot.chatQueues,
+            [sessionId]: { queue: event.queue, paused: event.paused },
+          },
         },
         diagnostics: [],
       };
@@ -549,7 +111,7 @@ export function applyEnvelopeToSnapshot(
         };
       }
       const current = snapshot.messagesBySession[sessionId] ?? [];
-      const incoming = envelope.payload.messages;
+      const incoming = event.messages;
       const matches = (left: ChatMessage, right: ChatMessage) =>
         left.id === right.id ||
         (left.commandId !== undefined &&
@@ -572,10 +134,10 @@ export function applyEnvelopeToSnapshot(
       return { snapshot: setMessages(snapshot, sessionId, messages), diagnostics: [] };
     }
     case "runtime.status-changed":
-      return { snapshot: { ...snapshot, status: envelope.payload.status }, diagnostics: [] };
+      return { snapshot: { ...snapshot, status: event.status }, diagnostics: [] };
 
     case "conversation.session-created": {
-      const session = envelope.payload.session;
+      const session = event.session;
       const exists = snapshot.sessions.some((item) => item.id === session.id);
       if (exists) {
         return {
@@ -612,7 +174,7 @@ export function applyEnvelopeToSnapshot(
     }
 
     case "conversation.session-updated": {
-      const session = envelope.payload.session;
+      const session = event.session;
       if (!snapshot.sessions.some((item) => item.id === session.id)) {
         return {
           snapshot,
@@ -643,7 +205,7 @@ export function applyEnvelopeToSnapshot(
           ],
         };
       }
-      const message = envelope.payload.message;
+      const message = event.message;
       const messages = snapshot.messagesBySession[sessionId] ?? [];
       const next = messages.some((item) => item.id === message.id)
         ? messages.map((item) => (item.id === message.id ? message : item))
@@ -658,14 +220,14 @@ export function applyEnvelopeToSnapshot(
           diagnostics: [diag("unknown-session", "Image for unknown session.", { sessionId })],
         };
       const messages = snapshot.messagesBySession[sessionId] ?? [];
-      const current = messages.find((message) => message.id === envelope.payload.messageId);
+      const current = messages.find((message) => message.id === event.messageId);
       if (
         !current ||
         current.role !== "assistant" ||
         (current.status !== "streaming" && current.status !== "pending")
       )
         return { snapshot, diagnostics: [] };
-      const image = envelope.payload.image;
+      const image = event.image;
       if (current.images?.some((existing) => existing.id === image.id))
         return { snapshot, diagnostics: [] };
       return {
@@ -694,14 +256,14 @@ export function applyEnvelopeToSnapshot(
         };
       }
       const messages = snapshot.messagesBySession[sessionId] ?? [];
-      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
+      const index = messages.findIndex((item) => item.id === event.messageId);
       if (index < 0) {
         return {
           snapshot,
           diagnostics: [
             diag(
               "unknown-entity",
-              `Delta for unknown message "${envelope.payload.messageId}".`,
+              `Delta for unknown message "${event.messageId}".`,
               { sessionId },
               "info",
             ),
@@ -727,7 +289,7 @@ export function applyEnvelopeToSnapshot(
         };
       }
       const next = [...messages];
-      next[index] = { ...current, content: current.content + envelope.payload.delta };
+      next[index] = { ...current, content: current.content + event.delta };
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
@@ -743,14 +305,14 @@ export function applyEnvelopeToSnapshot(
         };
       }
       const messages = snapshot.messagesBySession[sessionId] ?? [];
-      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
+      const index = messages.findIndex((item) => item.id === event.messageId);
       if (index < 0) {
         return {
           snapshot,
           diagnostics: [
             diag(
               "unknown-entity",
-              `Reasoning delta for unknown message "${envelope.payload.messageId}".`,
+              `Reasoning delta for unknown message "${event.messageId}".`,
               { sessionId },
               "info",
             ),
@@ -776,7 +338,7 @@ export function applyEnvelopeToSnapshot(
         };
       }
       const next = [...messages];
-      next[index] = { ...current, reasoning: (current.reasoning ?? "") + envelope.payload.delta };
+      next[index] = { ...current, reasoning: (current.reasoning ?? "") + event.delta };
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
@@ -792,14 +354,14 @@ export function applyEnvelopeToSnapshot(
         };
       }
       const messages = snapshot.messagesBySession[sessionId] ?? [];
-      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
+      const index = messages.findIndex((item) => item.id === event.messageId);
       if (index < 0) {
         return {
           snapshot,
           diagnostics: [
             diag(
               "unknown-entity",
-              `Round boundary for unknown message "${envelope.payload.messageId}".`,
+              `Round boundary for unknown message "${event.messageId}".`,
               { sessionId },
               "info",
             ),
@@ -827,17 +389,11 @@ export function applyEnvelopeToSnapshot(
       // Only this round's provisional tail is dropped. The message identity, the
       // rounds already committed ahead of the boundary, and the turn itself all
       // survive, so a replacement attempt continues the same assistant message.
-      const content = current.content.slice(
-        0,
-        Math.max(0, envelope.payload.committedContentLength),
-      );
-      const images = (current.images ?? []).slice(
-        0,
-        Math.max(0, envelope.payload.committedImageCount),
-      );
+      const content = current.content.slice(0, Math.max(0, event.committedContentLength));
+      const images = (current.images ?? []).slice(0, Math.max(0, event.committedImageCount));
       const reasoning = (current.reasoning ?? "").slice(
         0,
-        Math.max(0, envelope.payload.committedReasoningLength),
+        Math.max(0, event.committedReasoningLength),
       );
       if (
         content === current.content &&
@@ -869,7 +425,7 @@ export function applyEnvelopeToSnapshot(
           ],
         };
       }
-      const message = envelope.payload.message;
+      const message = event.message;
       const messages = snapshot.messagesBySession[sessionId] ?? [];
       const exists = messages.some((item) => item.id === message.id);
       const next = exists
@@ -901,18 +457,18 @@ export function applyEnvelopeToSnapshot(
           ],
         };
       }
-      if (envelope.payload.messageId === undefined) {
+      if (event.messageId === undefined) {
         return { snapshot, diagnostics: [] };
       }
       const messages = snapshot.messagesBySession[sessionId] ?? [];
-      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
+      const index = messages.findIndex((item) => item.id === event.messageId);
       if (index < 0) {
         return {
           snapshot,
           diagnostics: [
             diag(
               "unknown-entity",
-              `Cancellation for unknown message "${envelope.payload.messageId}".`,
+              `Cancellation for unknown message "${event.messageId}".`,
               { sessionId },
               "info",
             ),
@@ -942,37 +498,6 @@ export function applyEnvelopeToSnapshot(
       return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
     }
 
-    case "activity.updated": {
-      if (!sessionExists(snapshot, sessionId)) {
-        return {
-          snapshot,
-          diagnostics: [
-            diag("unknown-session", `Activity update for unknown session "${sessionId ?? ""}".`, {
-              sessionId,
-            }),
-          ],
-        };
-      }
-      const messages = snapshot.messagesBySession[sessionId] ?? [];
-      const index = messages.findIndex((item) => item.id === envelope.payload.messageId);
-      if (index < 0) {
-        return {
-          snapshot,
-          diagnostics: [
-            diag(
-              "unknown-entity",
-              `Activity for unknown message "${envelope.payload.messageId}".`,
-              { sessionId },
-              "info",
-            ),
-          ],
-        };
-      }
-      const next = [...messages];
-      next[index] = { ...messages[index], tool: envelope.payload.activity };
-      return { snapshot: setMessages(snapshot, sessionId, next), diagnostics: [] };
-    }
-
     case "observability.updated": {
       if (!sessionExists(snapshot, sessionId)) {
         return {
@@ -986,7 +511,7 @@ export function applyEnvelopeToSnapshot(
           ],
         };
       }
-      const observability = envelope.payload.observability;
+      const observability = event.observability;
       return {
         snapshot: {
           ...snapshot,
@@ -1004,109 +529,44 @@ export function applyEnvelopeToSnapshot(
     }
 
     case "job.execution-updated": {
-      const execution = envelope.payload.execution;
-      const projectId = execution.projectId;
-      const projectExecutions = snapshot.executionsByProject?.[projectId] ?? {};
-      const executionsByProject = {
-        ...snapshot.executionsByProject,
-        [projectId]: { ...projectExecutions, [execution.jobId]: execution },
-      };
-      const hasChatSession = sessionExists(snapshot, sessionId);
+      if (!sessionExists(snapshot, sessionId)) return { snapshot, diagnostics: [] };
       return {
         snapshot: {
           ...snapshot,
-          executionsByProject,
-          ...(hasChatSession
-            ? {
-                executionBySession: { ...snapshot.executionBySession, [sessionId!]: execution },
-                accountingBySession: {
-                  ...snapshot.accountingBySession,
-                  [sessionId!]: envelope.payload.accounting,
-                },
-              }
-            : {}),
+          executionBySession: {
+            ...snapshot.executionBySession,
+            [sessionId]: event.execution,
+          },
+          accountingBySession: {
+            ...snapshot.accountingBySession,
+            [sessionId]: event.accounting,
+          },
         },
         diagnostics: [],
       };
     }
 
-    case "bootstrap.updated":
-      return { snapshot: { ...snapshot, bootstrap: envelope.payload.bootstrap }, diagnostics: [] };
-
     case "job.launch-updated": {
-      const result = envelope.payload.result;
+      const result = event.result;
       if (result.outcome === "accepted") return { snapshot, diagnostics: [] };
       const code: RuntimeDiagnosticCode =
         result.outcome === "rejected" ? "command-rejected" : "command-failed";
       return {
         snapshot,
-        diagnostics: [diag(code, result.message, { sessionId: envelope.sessionId }, "warning")],
+        diagnostics: [diag(code, result.message, { sessionId }, "warning")],
       };
-    }
-
-    case "attention.updated": {
-      const item = envelope.payload.item;
-      const items = snapshot.attentionItems ?? [];
-      const next = items.some((current) => current.id === item.id)
-        ? items.map((current) => (current.id === item.id ? item : current))
-        : [...items, item];
-      return { snapshot: { ...snapshot, attentionItems: next }, diagnostics: [] };
-    }
-
-    case "ledger.entry-added":
-    case "ledger.entry-updated": {
-      const entry = envelope.payload.entry;
-      const ledger = snapshot.resourceLedger ?? { generatedAt: entry.timestamp, entries: [] };
-      const index = ledger.entries.findIndex((current) => current.id === entry.id);
-      if (envelope.type === "ledger.entry-added" && index >= 0) {
-        return {
-          snapshot,
-          diagnostics: [
-            diag(
-              "duplicate-event",
-              `Ledger entry "${entry.id}" already exists; add ignored.`,
-              {},
-              "info",
-            ),
-          ],
-        };
-      }
-      const entries =
-        index >= 0
-          ? ledger.entries.map((current) => (current.id === entry.id ? entry : current))
-          : [...ledger.entries, entry];
-      return { snapshot: { ...snapshot, resourceLedger: { ...ledger, entries } }, diagnostics: [] };
-    }
-
-    case "log.appended": {
-      const entry = normalizeLogEntry(envelope.payload.entry);
-      const logs = snapshot.logs ?? [];
-      if (logs.some((current) => current.id === entry.id)) {
-        return {
-          snapshot,
-          diagnostics: [
-            diag(
-              "duplicate-event",
-              `Log entry "${entry.id}" already exists; append ignored.`,
-              {},
-              "info",
-            ),
-          ],
-        };
-      }
-      return { snapshot: { ...snapshot, logs: [...logs, entry] }, diagnostics: [] };
     }
 
     case "warning":
       return {
         snapshot,
-        diagnostics: [diag("runtime-warning", envelope.payload.message, { sessionId }, "warning")],
+        diagnostics: [diag("runtime-warning", event.message, { sessionId }, "warning")],
       };
 
     case "error":
       return {
         snapshot,
-        diagnostics: [diag("runtime-error", envelope.payload.message, { sessionId }, "error")],
+        diagnostics: [diag("runtime-error", event.message, { sessionId }, "error")],
       };
   }
 }

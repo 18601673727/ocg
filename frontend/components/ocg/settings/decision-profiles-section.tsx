@@ -2,7 +2,8 @@
 
 import { useState, type FormEvent } from "react";
 import Link from "next/link";
-import type { ControlDecisionLimits, ControlProfilesSnapshot } from "../contracts";
+import type { ControlProfilesSnapshot } from "../contracts";
+import type { DecisionLimits as ControlDecisionLimits } from "../contracts/api";
 import type {
   HttpCanonicalControlClient,
   ControlProfileWriteRequest,

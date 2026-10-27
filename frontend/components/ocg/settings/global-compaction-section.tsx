@@ -3,7 +3,8 @@
 import Link from "next/link";
 
 import { useEffect, useState } from "react";
-import type { ControlGlobalCompactionSettings, ControlProfilesSnapshot } from "../contracts";
+import type { ControlProfilesSnapshot } from "../contracts";
+import type { GlobalCompactionSettings as ControlGlobalCompactionSettings } from "../contracts/api";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { Section, describeError } from "./settings-parts";

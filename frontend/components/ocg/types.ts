@@ -13,12 +13,6 @@ export type ChatSession = {
   hasChildren?: boolean;
 };
 
-/**
- * Who authored a message.
- *
- * `call` mirrors the canonical `Actor` kind of the same name: a Call is the
- * managed action the substrate ran, and its output can be a message of its own.
- */
 export type MessageRole = "user" | "assistant" | "call" | "tool";
 
 export type MessageStatus =
@@ -28,19 +22,6 @@ export type MessageStatus =
   | "cancelled"
   | "unknown"
   | "failed";
-
-/** One managed Call shown inline in the conversation. */
-export type CallActivity = {
-  id: string;
-  /** The canonical effect identity, when the substrate named one. */
-  name: string;
-  status: string;
-  durationMs: number;
-  summary: string;
-  detail: string;
-  /** The Executor the substrate attributed this Call to. */
-  executorId?: string;
-};
 
 export type ChatMessage = {
   agentInstruction?: boolean;
@@ -54,12 +35,10 @@ export type ChatMessage = {
   images?: import("./contracts").ChatImage[];
   id: string;
   commandId?: string;
-  /** Canonical Job owning this assistant turn, when backed by OCG. */
   jobId?: string;
   optimistic?: boolean;
   role: MessageRole;
   content: string;
-  /** Extended thinking content from models that support reasoning. */
   reasoning?: string;
   reasoningDurationMs?: number;
   intermediate?: boolean;
@@ -68,12 +47,8 @@ export type ChatMessage = {
   failureCode?: "project-missing" | "configuration-required" | "stream-closed";
   createdAt: string;
   status: MessageStatus;
-  call?: CallActivity;
-  /** Temporary read-only compatibility field for the legacy fixture renderer. */
-  tool?: ToolActivity;
 };
 
-/** Status an observability participant (a provider invocation) can report. */
 export type WorkerStatus =
   | "queued"
   | "starting"
@@ -83,32 +58,8 @@ export type WorkerStatus =
   | "completed"
   | "failed"
   | "cancelled";
-export type ToolActivityStatus =
-  | "pending"
-  | "running"
-  | "success"
-  | "failure"
-  | "retrying"
-  | "waiting-approval";
-export type ToolActivity = {
-  id: string;
-  name: string;
-  status: string;
-  durationMs: number;
-  summary: string;
-  detail: string;
-  retryCount?: number;
-};
 
 export type RuntimeConnectionState = "connected" | "connecting" | "disconnected" | "failed";
-
-/** The same states, as data, so a validator can check membership. */
-export const RUNTIME_CONNECTION_STATES: readonly RuntimeConnectionState[] = [
-  "connected",
-  "connecting",
-  "disconnected",
-  "failed",
-];
 
 export type RuntimeStatus = {
   state: RuntimeConnectionState;
@@ -122,7 +73,6 @@ export type SendMessageInput = {
   selection?: import("./contracts").ChatModelSelection;
   mode?: "queue" | "steer";
   content: string;
-  /** Explicit owning Project from real UI state (the active project at send time). */
   projectId?: string;
 };
 
@@ -163,7 +113,6 @@ export type OcgRuntimeEvent =
       committedReasoningLength: number;
     }
   | { type: "conversation.message-completed"; sessionId: string; message: ChatMessage }
-  | { type: "activity.updated"; sessionId: string; messageId: string; activity: CallActivity }
   | {
       type: "job.execution-updated";
       sessionId?: string;
@@ -180,11 +129,6 @@ export type OcgRuntimeEvent =
       sessionId: string;
       observability: import("./runtime/observability").RuntimeObservability;
     }
-  | { type: "attention.updated"; item: import("./attention/domain").AttentionItem }
-  | { type: "ledger.entry-added"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
-  | { type: "ledger.entry-updated"; entry: import("./resource-ledger/types").ResourceLedgerEntry }
-  | { type: "log.appended"; entry: import("./logs/domain").LogEntry }
-  | { type: "bootstrap.updated"; bootstrap: import("./bootstrap/types").BootstrapState }
   | { type: "warning"; message: string }
   | { type: "error"; message: string }
   | { type: "cancelled"; sessionId: string; messageId?: string };

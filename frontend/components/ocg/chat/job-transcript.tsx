@@ -5,7 +5,7 @@ import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import { STATUS_TEXT } from "@/components/ocg/primitives";
+import { TEXT_TONE } from "@/components/ocg/primitives";
 import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/contracts";
 import type { TranscriptTurn } from "./job-transcript-model";
 import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
@@ -105,7 +105,7 @@ function TurnRow({
           className={cn(
             "text-base leading-7 text-foreground/90",
             isUser && "rounded-md border border-border bg-muted/30 px-3 py-2",
-            turn.status === "failed" && STATUS_TEXT["error"],
+            turn.status === "failed" && TEXT_TONE.red,
             turn.status === "cancelled" && "text-muted-foreground italic",
           )}
         >

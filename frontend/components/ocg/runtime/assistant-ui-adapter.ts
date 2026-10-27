@@ -69,7 +69,6 @@ function metadataFor(message: ChatMessage, context: MessageContext): OcgMetadata
     failureReason: message.failureReason,
     failureAt: message.failureAt,
     failureCode: message.failureCode,
-    call: message.call ?? message.tool,
     canRetry: message.id === context.retryId,
   };
 }
@@ -155,19 +154,13 @@ function userImagePart(
 }
 
 function toolPart(message: ChatMessage): ToolCallMessagePart {
-  const activity = message.call ?? message.tool;
-  const name = activity?.name ?? "unknown";
-  const summary = activity?.summary ?? "";
-  const detail = activity?.detail ?? "";
-  const args = { summary, detail };
+  const args = { summary: "", detail: "" };
   return {
     type: "tool-call",
-    toolCallId: activity?.id ?? message.id,
-    toolName: name,
+    toolCallId: message.id,
+    toolName: "unknown",
     args,
     argsText: JSON.stringify(args),
-    ...(detail ? { result: detail } : {}),
-    ...(activity?.status === "failed" || activity?.status === "failure" ? { isError: true } : {}),
   };
 }
 
@@ -183,7 +176,7 @@ function assistantParts(
     parts.push(reasoning);
   }
   if (message.content) parts.push(textPart(message.content));
-  if (message.role === "call" || message.role === "tool" || message.call || message.tool) {
+  if (message.role === "call" || message.role === "tool") {
     parts.push(toolPart(message));
   }
   for (const call of message.toolCalls ?? []) {

@@ -6,8 +6,6 @@ use super::*;
 pub const MAX_STORED_TOOL_ARGUMENTS_BYTES: usize = 64 * 1024;
 /// The longest handler version a tool may declare.
 pub const MAX_HANDLER_VERSION_BYTES: usize = 64;
-pub(in crate::db) const MAX_RECONCILER_BYTES: usize = 256;
-pub(in crate::db) const MAX_RECONCILIATION_TEXT_BYTES: usize = 4 * 1024;
 
 /// Whether `version` can identify a handler's behavior: 1 to
 /// [`MAX_HANDLER_VERSION_BYTES`] ASCII letters, digits or `.`, `-`, `_`, `+`.

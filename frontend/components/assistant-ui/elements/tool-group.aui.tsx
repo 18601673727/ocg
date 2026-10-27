@@ -1,14 +1,6 @@
 "use client";
 
-import {
-  memo,
-  useCallback,
-  useRef,
-  useState,
-  type FC,
-  type PropsWithChildren,
-  type ReactNode,
-} from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
 import { ChevronDownIcon } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
@@ -192,33 +184,4 @@ function ToolGroupContent({
   );
 }
 
-const ToolGroupImpl: FC<PropsWithChildren<{ startIndex: number; endIndex: number }>> = ({
-  children,
-  startIndex,
-  endIndex,
-}) => {
-  const toolCount = endIndex - startIndex + 1;
-
-  return (
-    <ToolGroupRoot>
-      <ToolGroupTrigger count={toolCount} />
-      <ToolGroupContent>{children}</ToolGroupContent>
-    </ToolGroupRoot>
-  );
-};
-
-/**
- * @deprecated This wrapper targets the legacy `components.ToolGroup` prop
- * on `<MessagePrimitive.Parts>`. Use `<MessagePrimitive.GroupedParts>` with
- * a `groupBy` returning `"group-tool"` and compose `ToolGroupRoot` /
- * `ToolGroupTrigger` / `ToolGroupContent` directly. See `thread.tsx`.
- */
-const ToolGroup = Object.assign(memo(ToolGroupImpl), {
-  Root: ToolGroupRoot,
-  Trigger: ToolGroupTrigger,
-  Content: ToolGroupContent,
-});
-
-ToolGroup.displayName = "ToolGroup";
-
-export { ToolGroup, ToolGroupRoot, ToolGroupTrigger, ToolGroupContent, toolGroupVariants };
+export { ToolGroupRoot, ToolGroupTrigger, ToolGroupContent, toolGroupVariants };

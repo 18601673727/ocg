@@ -1,5 +1,4 @@
 use crate::db::entities::*;
-use crate::db::entities::{MAX_RECONCILER_BYTES, MAX_RECONCILIATION_TEXT_BYTES};
 use crate::db::redb::{Batch, BatchError, JobSpec};
 use crate::service::ai::providers::openai_compatible::{
     MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES, NormalizedUsage, is_function_name,
@@ -280,54 +279,6 @@ pub(crate) fn record_tool_outcome(
     outcome: ToolOutcome,
 ) -> OpResult<()> {
     batch.tool_outcome(call, outcome)
-}
-
-/// Records a verified conclusion about an admitted call whose outcome is
-/// uncertain, once, keeping the admission and the uncertain outcome as
-/// they are. The Job must be locally stopped, so nothing still executes for
-/// it; a descendant that still runs executes its own calls, not this Job's.
-/// The reconciler, its evidence and its explanation must each be given.
-pub(crate) fn reconcile_tool_effect(
-    batch: &mut Batch,
-    call: ToolCallRef,
-    reconciliation: ToolReconciliation,
-) -> OpResult<()> {
-    if !batch.require_job_state(call.job)?.locally_stopped() {
-        return batch.reject(Violation::ToolEffectStillExecuting(call.job));
-    }
-    let Some(mut record) = batch.tool_evidence(call)? else {
-        return batch.reject(Violation::ToolCallNotFound(call));
-    };
-    if record.admission().is_none() {
-        return batch.reject(Violation::ToolCallNotAdmitted(call));
-    }
-    if record.reconciliation.is_some() {
-        return batch.reject(Violation::ToolEffectAlreadyReconciled(call));
-    }
-    if !record.is_unresolved() {
-        return batch.reject(Violation::ToolEffectAlreadyResolved(call));
-    }
-    if reconciliation.reconciler.is_empty()
-        || reconciliation.reconciler.len() > MAX_RECONCILER_BYTES
-    {
-        return batch.reject(Violation::InvalidValue(
-            "reconciler",
-            "must be 1 to 256 bytes",
-        ));
-    }
-    for (field, text) in [
-        ("evidence", &reconciliation.evidence),
-        ("explanation", &reconciliation.explanation),
-    ] {
-        if text.is_empty() || text.len() > MAX_RECONCILIATION_TEXT_BYTES {
-            return batch.reject(Violation::InvalidValue(field, "must be 1 to 4096 bytes"));
-        }
-    }
-    record.reconciliation = Some(Recorded {
-        fact: reconciliation,
-        at: batch.now(),
-    });
-    batch.put_tool_evidence(&record)
 }
 
 /// Whether `text` is one JSON object.
