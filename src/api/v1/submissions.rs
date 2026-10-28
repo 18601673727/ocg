@@ -342,7 +342,12 @@ impl JobRequest {
             }
             attachments.push(attachment);
         }
-        if !text(&wire.objective, MAX_OBJECTIVE_BYTES)
+        if (wire.objective.trim().is_empty() && attachments.is_empty())
+            || wire.objective.len() > MAX_OBJECTIVE_BYTES
+            || wire
+                .objective
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
             || wire
                 .name
                 .as_deref()

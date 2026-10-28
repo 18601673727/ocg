@@ -280,9 +280,18 @@ function ImportContent({
             >
               {t("settings.llm.clearSelection")}
             </Button>
-            <span className="ml-auto tabular-nums">
-              {selected.size} / {importable.length}
-            </span>
+            <Button
+              className="ml-auto"
+              disabled={saving || loading || !selected.size}
+              onClick={() => void save()}
+            >
+              {saving
+                ? t("settings.llm.importing")
+                : t("settings.llm.importSelected", {
+                    selected: selected.size,
+                    total: importable.length,
+                  })}
+            </Button>
           </div>
           <div
             aria-busy={loading}
@@ -346,16 +355,6 @@ function ImportContent({
           {result}
         </p>
       )}
-      <div className="flex justify-end">
-        <Button disabled={saving || loading || !selected.size} onClick={() => void save()}>
-          {saving
-            ? t("settings.llm.importing")
-            : t("settings.llm.importSelected", {
-                selected: selected.size,
-                total: importable.length,
-              })}
-        </Button>
-      </div>
     </div>
   );
 }

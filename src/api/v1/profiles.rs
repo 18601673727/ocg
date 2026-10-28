@@ -560,6 +560,70 @@ async fn resolve_credential(
     }
 }
 
+async fn validate_decision_model(
+    database: &DatabaseHandle,
+    protocol: DecisionProtocol,
+    endpoint: Option<&str>,
+    model: &str,
+    credential_ref: Option<&str>,
+    credential: Option<&str>,
+) -> Result<(), Refusal> {
+    let resolved_credential;
+    let credential = match credential {
+        Some(secret) => Some(secret),
+        None => {
+            resolved_credential = database
+                .credential_resolver()
+                .resolve(credential_ref)
+                .map_err(|error| INVALID_CREDENTIAL_REF.with_reason(error.to_string()))?;
+            resolved_credential.as_deref()
+        }
+    };
+    use crate::service::ai::providers::ModelListError;
+    let listed = match protocol {
+        DecisionProtocol::TypeSafeSystemOne => {
+            crate::service::ai::decisive_model::list_models(
+                endpoint.unwrap_or(crate::service::ai::decisive_model::DEFAULT_ENDPOINT),
+                credential,
+            )
+            .await
+        }
+    }
+    .map_err(|error| {
+        let (code, message) = match error {
+            ModelListError::Unreachable => (
+                "provider_unreachable",
+                "could not connect to the provider".to_owned(),
+            ),
+            ModelListError::NotListed => (
+                "models_not_listed",
+                "the provider does not list models".to_owned(),
+            ),
+            ModelListError::Rejected { message, .. } => {
+                ("provider_rejected", bounded_provider_message(message))
+            }
+        };
+        Refusal::new(
+            StatusCode::BAD_GATEWAY,
+            code,
+            "decision model validation failed",
+        )
+        .with_reason(message)
+    })?;
+    if listed.iter().any(|listed| listed.id == model) {
+        Ok(())
+    } else {
+        Err(Refusal::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "decision_model_unavailable",
+            "the provider does not list the configured decision model",
+        )
+        .with_reason(format!(
+            "the provider does not list decision model `{model}`"
+        )))
+    }
+}
+
 /// The default Profile page size.
 const DEFAULT_PROFILE_PAGE: usize = 50;
 /// How many configs one page examines per Profile it may return.
@@ -1183,6 +1247,15 @@ pub(crate) async fn save_profile(
                 credential.as_deref(),
                 clear_credential,
                 prior_credential_ref,
+            )
+            .await?;
+            validate_decision_model(
+                database,
+                decision_protocol,
+                normalized_endpoint.as_deref(),
+                model.trim(),
+                resolved_credential_ref.as_deref(),
+                secret.as_ref().map(|(_, secret)| secret.as_str()),
             )
             .await?;
             credential_to_save = secret;

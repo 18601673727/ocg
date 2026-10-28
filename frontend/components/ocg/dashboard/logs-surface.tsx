@@ -19,6 +19,11 @@ import {
 export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {
   const { t } = useI18n();
   const [file, setFile] = useState("");
+  const [timeZone, setTimeZone] = useState(() =>
+    typeof window === "undefined"
+      ? "UTC"
+      : Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+  );
   const [snapshot, setSnapshot] = useState<Api.Logs | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -134,6 +139,32 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
     };
   }, [client, file, t]);
   const loadMore = useCallback(() => loadMoreRef.current(), []);
+  const formatEntry = (line: string) => {
+    const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (\w+) (.*)$/.exec(line);
+    if (!match) return null;
+    const date = new Date(match[1]);
+    if (Number.isNaN(date.getTime())) return null;
+    return {
+      time: new Intl.DateTimeFormat(undefined, {
+        timeZone,
+        dateStyle: "medium",
+        timeStyle: "medium",
+      }).format(date),
+      level: match[2],
+      message: match[3],
+    };
+  };
+  const timeZones = [
+    "UTC",
+    timeZone,
+    "America/Los_Angeles",
+    "America/New_York",
+    "Europe/London",
+    "Europe/Berlin",
+    "Asia/Shanghai",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+  ].filter((value, index, values) => values.indexOf(value) === index);
 
   return (
     <ContentContainer>
@@ -141,6 +172,31 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
         title={t("logs.title")}
         actions={
           <>
+            <label className="sr-only" htmlFor="runtime-log-time-zone">
+              {t("logs.timeZone")}
+            </label>
+            <Select
+              value={timeZone}
+              items={timeZones.map((zone) => ({ value: zone, label: zone }))}
+              onValueChange={(next) => {
+                if (next !== null) setTimeZone(next);
+              }}
+            >
+              <SelectTrigger
+                id="runtime-log-time-zone"
+                aria-label={t("logs.timeZone")}
+                className="min-w-0 rounded-md border-input bg-background px-3 py-2 font-mono text-xs"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {timeZones.map((zone) => (
+                  <SelectItem key={zone} value={zone}>
+                    {zone}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <label className="sr-only" htmlFor="runtime-log-file">
               {t("logs.runtimeLogFile")}
             </label>
@@ -198,11 +254,35 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
             </span>
           </div>
           {snapshot.entries.length ? (
-            <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-6">
-              {[...snapshot.entries].reverse().map((entry) => (
-                <div key={entry.offset}>{entry.line}</div>
-              ))}
-            </pre>
+            <ol className="divide-y divide-border/70">
+              {[...snapshot.entries].reverse().map((entry) => {
+                const parsed = formatEntry(entry.line);
+                return (
+                  <li
+                    key={entry.offset}
+                    className="grid grid-cols-[minmax(8rem,auto)_auto_minmax(0,1fr)] items-start gap-x-3 gap-y-1 py-2.5 font-mono text-xs first:pt-1"
+                  >
+                    {parsed ? (
+                      <>
+                        <time className="whitespace-nowrap text-muted-foreground">
+                          {parsed.time}
+                        </time>
+                        <span className="rounded-sm bg-muted px-1.5 py-0.5 text-foreground">
+                          {parsed.level}
+                        </span>
+                        <span className="min-w-0 break-words text-foreground">
+                          {parsed.message}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="col-span-3 min-w-0 whitespace-pre-wrap break-words text-foreground">
+                        {entry.line}
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
           ) : (
             <p className="text-sm text-muted-foreground">{t("logs.noRecords")}</p>
           )}
