@@ -162,9 +162,14 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>)
         .map_err(StorageError::from)?
         .map(|table| table.name().to_owned())
         .collect();
-    let indexes_missing = ["job_observation", "content_reference", "content_reclaim"]
-        .iter()
-        .any(|name| !existing.iter().any(|table| table == name));
+    let indexes_missing = [
+        "job_observation",
+        "content_reference",
+        "content_reclaim",
+        "request_timeline",
+    ]
+    .iter()
+    .any(|name| !existing.iter().any(|table| table == name));
     let existing_tables = existing.len();
     let now = Timestamp::now();
     init_promotion_clock(now.as_unix_micros());

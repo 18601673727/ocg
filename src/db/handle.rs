@@ -589,7 +589,7 @@ impl DatabaseHandle {
     }
 
     /// Newest Jobs whose identity, name or objective contains every term,
-    /// with a bounded scan and cursor pagination.
+    /// with cursor pagination.
     pub(crate) async fn search_jobs(
         &self,
         terms: Vec<String>,
@@ -611,9 +611,8 @@ impl DatabaseHandle {
     }
 
     /// Conversations by immutable ID, newest first, whose title or message and result text holds
-    /// every term. `terms` are already lowercased query terms. The scan is
-    /// bounded inside storage; `before` and `limit` page like
-    /// [`Self::conversations`].
+    /// every term. `terms` are already lowercased query terms. `before` and
+    /// `limit` page like [`Self::conversations`].
     pub async fn search_conversations(
         &self,
         terms: Vec<String>,

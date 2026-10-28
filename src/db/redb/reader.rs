@@ -529,7 +529,6 @@ pub(crate) fn read_job_search(
     before: Option<JobId>,
     limit: usize,
 ) -> Result<JobSearchPage, StorageError> {
-    const MAX_SCAN: usize = 1000;
     let rx = read(database)?;
     let jobs = rx.open_table(JOBS)?;
     let end = before.map_or(u128::MAX, JobId::get);
@@ -537,8 +536,8 @@ pub(crate) fn read_job_search(
     let mut records = Vec::new();
     let mut last = None;
     let mut has_more = false;
-    for (scanned, entry) in jobs.range(..end)?.rev().enumerate() {
-        if records.len() == limit || scanned == MAX_SCAN {
+    for entry in jobs.range(..end)?.rev() {
+        if records.len() == limit {
             has_more = true;
             break;
         }
@@ -2135,8 +2134,6 @@ pub(crate) fn read_conversations(
     conversation_page(database, before, limit, &[])
 }
 
-pub(crate) const MAX_CONVERSATION_SEARCH_SCAN: usize = 1000;
-
 pub(crate) fn read_conversation_search(
     database: &Database,
     terms: &[String],
@@ -2158,12 +2155,8 @@ fn conversation_page(
     let mut conversations = Vec::new();
     let mut last = None;
     let mut has_more = false;
-    for (scanned, item) in groups
-        .range(..before.map_or(u128::MAX, JobId::get))?
-        .rev()
-        .enumerate()
-    {
-        if conversations.len() == limit || scanned == MAX_CONVERSATION_SEARCH_SCAN {
+    for item in groups.range(..before.map_or(u128::MAX, JobId::get))?.rev() {
+        if conversations.len() == limit {
             has_more = true;
             break;
         }

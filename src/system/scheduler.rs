@@ -596,6 +596,7 @@ async fn dispatch_runtime(
     let mut running = BTreeMap::new();
     let catalog_changes = database.subscribe_catalog();
     let mut reconcile = true;
+    let mut retry_at = Instant::now() + RECONCILE;
     let mut unconfirmed_stopped = BTreeSet::new();
     enum Incoming {
         Message(Result<SchedulerMessage, flume::RecvError>),
@@ -616,25 +617,36 @@ async fn dispatch_runtime(
             if std::mem::take(&mut reconcile) {
                 return Incoming::Message(Ok(SchedulerMessage::Reconcile));
             }
+            let activity = async {
+                match select(
+                    receiver.recv_async(),
+                    select(
+                        wakes.recv_async(),
+                        select(admissions.recv_async(), catalog_changes.changed()),
+                    ),
+                )
+                .await
+                {
+                    Either::Left(message) => Incoming::Message(message),
+                    Either::Right(Either::Left(Ok(()))) => Incoming::Wake,
+                    Either::Right(Either::Left(Err(_))) => Incoming::Closed,
+                    Either::Right(Either::Right(Either::Left(submission))) => {
+                        Incoming::Message(submission.map(SchedulerMessage::Schedule))
+                    }
+                    Either::Right(Either::Right(Either::Right(Ok(())))) => {
+                        Incoming::Message(Ok(SchedulerMessage::Reconcile))
+                    }
+                    Either::Right(Either::Right(Either::Right(Err(_)))) => Incoming::Closed,
+                }
+            };
             match select(
-                receiver.recv_async(),
-                select(
-                    wakes.recv_async(),
-                    select(admissions.recv_async(), catalog_changes.changed()),
-                ),
+                activity,
+                ntex::time::sleep(retry_at.saturating_duration_since(Instant::now())),
             )
             .await
             {
-                Either::Left(message) => Incoming::Message(message),
-                Either::Right(Either::Left(Ok(()))) => Incoming::Wake,
-                Either::Right(Either::Left(Err(_))) => Incoming::Closed,
-                Either::Right(Either::Right(Either::Left(submission))) => {
-                    Incoming::Message(submission.map(SchedulerMessage::Schedule))
-                }
-                Either::Right(Either::Right(Either::Right(Ok(())))) => {
-                    Incoming::Message(Ok(SchedulerMessage::Reconcile))
-                }
-                Either::Right(Either::Right(Either::Right(Err(_)))) => Incoming::Closed,
+                Either::Left(incoming) => incoming,
+                Either::Right(()) => Incoming::Message(Ok(SchedulerMessage::Reconcile)),
             }
         };
         let message = match select(shutdown.cancelled(), incoming).await {
@@ -747,6 +759,7 @@ async fn dispatch_runtime(
                 }
             }
             SchedulerMessage::Reconcile => {
+                retry_at = Instant::now() + RECONCILE;
                 retry_unsettled(&database).await;
                 match ntex::rt::spawn_blocking(blocking::retry_unproven_groups).await {
                     Ok(recovered) => unconfirmed_stopped.extend(recovered),
