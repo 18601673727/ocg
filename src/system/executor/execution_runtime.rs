@@ -2596,6 +2596,10 @@ async fn capture_file_snapshots(
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static LINKS: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\]\(\s*<?([^\s)>]+)"));
+    static LINES: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$"));
     if ACTIVE
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < 4).then_some(count + 1)
@@ -2613,10 +2617,10 @@ async fn capture_file_snapshots(
     let slot = Slot;
     let work = super::blocking::run(super::blocking::Kind::File, move || {
         let _slot = slot;
-        let Ok(links) = regex::Regex::new(r"\]\(\s*<?([^\s)>]+)") else {
+        let Ok(links) = LINKS.as_ref() else {
             return Vec::new();
         };
-        let Ok(lines) = regex::Regex::new(r"(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$") else {
+        let Ok(lines) = LINES.as_ref() else {
             return Vec::new();
         };
         let stamp = super::workspace_read::mutation_stamp();

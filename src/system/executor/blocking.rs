@@ -364,43 +364,82 @@ pub(crate) enum FinishError {
     Wait(std::io::Error),
 }
 
+type CancelQueued = Box<dyn FnOnce() + Send>;
+
 #[derive(Clone)]
 pub(crate) struct StopSignal {
     stopped: Arc<AtomicBool>,
+    queued: Arc<Mutex<Option<CancelQueued>>>,
 }
 
 impl StopSignal {
     pub(crate) fn new() -> Self {
         Self {
             stopped: Arc::new(AtomicBool::new(false)),
+            queued: Arc::new(Mutex::new(None)),
         }
     }
 
     pub(crate) fn request(&self) {
-        if let Some(governor) = GOVERNOR.get() {
-            // The same lock as the permit wait closes the check/wait race.
-            let counts = governor
-                .counts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            self.stopped.store(true, Ordering::Release);
-            let waiters = counts
-                .waiters
-                .iter()
-                .map(|(_, waker)| waker.clone())
-                .collect::<Vec<_>>();
-            drop(counts);
-            governor.changed.notify_all();
-            for waker in waiters {
-                waker.wake();
-            }
+        let governor = GOVERNOR.get_or_init(|| Arc::new(Governor::default()));
+        let counts = governor
+            .counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.stopped.store(true, Ordering::Release);
+        let waiters = counts
+            .waiters
+            .iter()
+            .map(|(_, waker)| waker.clone())
+            .collect::<Vec<_>>();
+        drop(counts);
+        governor.changed.notify_all();
+        for waker in waiters {
+            waker.wake();
+        }
+        let cancel = self
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(cancel) = cancel {
+            cancel();
+        }
+    }
+
+    fn cancel_queued(&self, cancel: impl FnOnce() + Send + 'static) {
+        let mut queued = self.queued.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.requested() {
+            drop(queued);
+            cancel();
         } else {
-            self.stopped.store(true, Ordering::Release);
+            *queued = Some(Box::new(cancel));
         }
     }
 
     pub(crate) fn requested(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+}
+
+// Cancellation and worker startup compete to take the payload. Once the
+// worker takes it, its resources remain held until the work actually ends.
+struct Queued<T>(Arc<Mutex<Option<T>>>);
+
+impl<T> Queued<T> {
+    fn new(value: T) -> Self {
+        Self(Arc::new(Mutex::new(Some(value))))
+    }
+
+    fn handle(&self) -> Arc<Mutex<Option<T>>> {
+        self.0.clone()
+    }
+}
+
+impl<T> Drop for Queued<T> {
+    fn drop(&mut self) {
+        let value = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        drop(value);
     }
 }
 
@@ -569,12 +608,19 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let permit = Permit::acquire_async(kind, None).await?;
+    let queued = Queued::new((permit, work));
+    let pending = queued.handle();
     ntex::rt::spawn_blocking(move || {
+        let (permit, work) = pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
         let _permit = permit;
-        work()
+        Some(work())
     })
     .await
-    .map_err(|_| "the blocking task ended without a result")
+    .map_err(|_| "the blocking task ended without a result")?
+    .ok_or("the blocking task was discarded before it started")
 }
 
 /// A Job's tracked work: its stop signal and a channel that disconnects
@@ -610,13 +656,25 @@ impl WorkerTracker {
             }
         }
         let permit = Permit::acquire_async(kind, Some(&stop)).await?;
+        let queued = Queued::new((permit, alive, work));
+        let cancel = queued.handle();
+        stop.cancel_queued(move || {
+            let value = cancel.lock().unwrap_or_else(PoisonError::into_inner).take();
+            drop(value);
+        });
+        let pending = queued.handle();
         ntex::rt::spawn_blocking(move || {
+            let (permit, alive, work) = pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()?;
             let _alive = alive;
             let _permit = permit;
-            work(&stop)
+            Some(work(&stop))
         })
         .await
-        .map_err(|_| "the blocking task ended without a result")
+        .map_err(|_| "the blocking task ended without a result")?
+        .ok_or("the blocking task was discarded before it started")
     }
 
     /// Requests a stop of the tracked work of `job` and waits until it has
