@@ -38,6 +38,7 @@ import type { ChatSession, QueuedChatMessage, RuntimeStatus } from "../types";
 import type { ChatModelSelection } from "../contracts";
 import type { JobExecution } from "../execution/domain";
 import type { ComposerIntent } from "../composer/domain";
+import { ContextTranscript } from "./context-transcript";
 
 type QueueState = { queue: QueuedChatMessage[]; paused: boolean };
 
@@ -63,6 +64,7 @@ type ChatComposerContextValue = {
   session: ChatSession;
   busy: boolean;
   queueing: boolean;
+  steerAfterCompletion: boolean;
   queueState?: QueueState;
   selection?: ChatModelSelection;
   setSelection: (selection: ChatModelSelection) => void;
@@ -103,6 +105,7 @@ const ChatComposerSlot: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
         projectId={value.session.projectId}
         busy={value.busy}
         queueing={value.queueing}
+        steerAfterCompletion={value.steerAfterCompletion}
         selection={value.selection}
         onSelectionChange={value.setSelection}
         onPreference={value.onPreference}
@@ -346,10 +349,15 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       (message.status === "streaming" || message.status === "pending"),
   );
   const busy = messageStreaming || liveExecution !== null;
+  const lastAssistant = messages.findLast(
+    (message) => message.role === "assistant" && !message.intermediate,
+  );
+  const steerAfterCompletion = !messageStreaming && lastAssistant?.status === "completed";
   const queueing =
-    liveExecution?.state === "running" ||
-    liveExecution?.state === "cancelling" ||
-    messages.some((message) => message.role === "assistant" && message.status === "streaming");
+    !steerAfterCompletion &&
+    (liveExecution?.state === "running" ||
+      liveExecution?.state === "cancelling" ||
+      messages.some((message) => message.role === "assistant" && message.status === "streaming"));
   const active = activeExecutionTarget(liveExecution);
   const activity = useMemo(() => {
     if (!liveExecution) return undefined;
@@ -367,6 +375,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       session,
       busy,
       queueing,
+      steerAfterCompletion,
       queueState,
       selection,
       setSelection,
@@ -387,6 +396,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       session,
       busy,
       queueing,
+      steerAfterCompletion,
       queueState,
       selection,
       draft,
@@ -411,6 +421,10 @@ export const ChatScreen: FC<ChatScreenProps> = ({
             autoFocus
             afterMessages={
               <>
+                <ContextTranscript
+                  key={`context:${session.id}`}
+                  conversation={session.conversationId}
+                />
                 {planMessage && <TaskStatus key={planMessage.jobId} plan={planMessage.taskPlan} />}
                 <ConversationArtifacts key={`artifacts:${session.id}`} sessionId={session.id} />
                 <ConversationCardStrip

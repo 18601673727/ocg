@@ -10,6 +10,7 @@ pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
             ProviderFact::NotDelivered
         }
         ProviderExecutionError::Unknown { .. }
+        | ProviderExecutionError::StreamFailure { .. }
         | ProviderExecutionError::Rejected { .. }
         | ProviderExecutionError::Incomplete { .. }
         | ProviderExecutionError::Interrupted { .. }
@@ -167,6 +168,15 @@ impl Redactor {
                 facts: facts.map(|facts| self.facts(facts)),
                 finished,
             },
+            ProviderExecutionError::StreamFailure {
+                failure,
+                facts,
+                finished,
+            } => ProviderExecutionError::StreamFailure {
+                failure: Box::new(self.failure(*failure)),
+                facts: self.facts(facts),
+                finished,
+            },
             ProviderExecutionError::Rejected { failure } => ProviderExecutionError::Rejected {
                 failure: self.failure(failure),
             },
@@ -264,11 +274,20 @@ pub(crate) fn parse_provider_error(body: &str) -> Option<(String, Option<String>
         .or_else(|| value.get("detail").and_then(Value::as_str))
         .or_else(|| value.get("error").map(|_| "provider request failed"))?
         .to_owned();
-    let code = error.get("code").and_then(|code| match code {
-        Value::String(code) => Some(code.clone()),
-        Value::Number(code) => Some(code.to_string()),
-        _ => None,
-    });
+    let code = error
+        .get("code")
+        .and_then(|code| match code {
+            Value::String(code) => Some(code.clone()),
+            Value::Number(code) => Some(code.to_string()),
+            _ => None,
+        })
+        .or_else(|| {
+            error
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|kind| *kind != "error")
+                .map(str::to_owned)
+        });
     Some((message, code))
 }
 
@@ -361,6 +380,27 @@ pub fn error_observations(
             raw_finish_reason: None,
             failure: Some(failure.clone()),
         }],
+        ProviderExecutionError::StreamFailure {
+            failure: detail,
+            facts,
+            finished,
+        } => {
+            let mut detail = detail.as_ref().clone();
+            detail.message = error.to_string();
+            if *finished {
+                vec![
+                    observed(facts, None),
+                    AvailabilityObservation {
+                        status_code: None,
+                        finish_reason: None,
+                        raw_finish_reason: None,
+                        failure: Some(detail),
+                    },
+                ]
+            } else {
+                vec![observed(facts, Some(detail))]
+            }
+        }
         ProviderExecutionError::Unknown { facts: None, .. } => vec![failure_only()],
         ProviderExecutionError::Unknown {
             facts: Some(facts),

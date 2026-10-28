@@ -4,7 +4,13 @@ import { useState } from "react";
 import { useI18n } from "../i18n";
 
 export type ChartBar = { key: string; label: string; values: number[]; tooltip: string };
-export type ChartSeries = { key: string; label: string; color: string; share: number };
+export type ChartSeries = {
+  key: string;
+  label: string;
+  color: string;
+  share: number;
+  legendValue?: string;
+};
 
 export function StackedBarChart({
   bars,
@@ -138,7 +144,7 @@ export function StackedBarChart({
             />
             <span className="min-w-0 flex-1 break-words">{entry.label}</span>
             <span className="shrink-0 tabular-nums text-muted-foreground">
-              {percent.format(entry.share)}
+              {entry.legendValue ?? percent.format(entry.share)}
             </span>
           </li>
         ))}

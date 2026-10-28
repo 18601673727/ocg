@@ -21,7 +21,7 @@ use crate::db::entities::{
     ToolOutcome, ToolOutcomeKind, ToolPayload, UncertainCause, UsageFinality, Violation,
     WithheldReason,
 };
-use crate::db::{DatabaseError, DatabaseHandle};
+use crate::db::{DatabaseError, DatabaseHandle, OperationStatus, ProviderSettlementEvidence};
 use crate::service::ai::compact::{
     ContextLimits, ContextNotices, estimate_request_tokens, fit_with_notices,
 };
@@ -305,6 +305,8 @@ pub enum ExecutionRuntimeError {
         stop: Box<ToolLoopStop>,
         source: DatabaseError,
     },
+    #[error("the provider failure and job outcome could not be recorded: {source}")]
+    ProviderSettlementNotRecorded { source: DatabaseError },
     /// The Job's outcome could not be recorded. The runtime retries the same
     /// settlement once. If that also fails, open reconcile records
     /// Unknown/Abandoned at the next start of the database; see
@@ -499,6 +501,7 @@ pub(in crate::system) async fn finalize_claim_error(
     if matches!(
         error,
         ExecutionRuntimeError::ObservationsNotRecorded { .. }
+            | ExecutionRuntimeError::ProviderSettlementNotRecorded { .. }
             | ExecutionRuntimeError::ResponseNotRecorded { .. }
             | ExecutionRuntimeError::CompletionRefused { .. }
             | ExecutionRuntimeError::ToolLoopStopped { .. }
@@ -530,12 +533,13 @@ pub(in crate::system) async fn finalize_claim_error(
 /// Finalizations that failed, kept until the database accepts them: a pure
 /// low-space lock never reopens the database, so open reconcile would not
 /// settle them.
-type RetainedFinalization = (
-    DatabaseHandle,
-    JobId,
-    JobFinalization,
-    Option<crate::db::entities::ProviderAnswer>,
-);
+struct RetainedFinalization {
+    database: DatabaseHandle,
+    job: JobId,
+    outcome: JobFinalization,
+    evidence: Option<ProviderSettlementEvidence>,
+    uncertain: Option<crate::db::entities::OperationId>,
+}
 static UNSETTLED: Mutex<Vec<RetainedFinalization>> = Mutex::new(Vec::new());
 
 pub(in crate::system) fn retain_unsettled(
@@ -543,24 +547,25 @@ pub(in crate::system) fn retain_unsettled(
     job: JobId,
     outcome: JobFinalization,
 ) {
-    retain_finalization(database, job, outcome, None);
+    retain_finalization(RetainedFinalization {
+        database,
+        job,
+        outcome,
+        evidence: None,
+        uncertain: None,
+    });
 }
 
-fn retain_finalization(
-    database: DatabaseHandle,
-    job: JobId,
-    outcome: JobFinalization,
-    answer: Option<crate::db::entities::ProviderAnswer>,
-) {
+fn retain_finalization(retained: RetainedFinalization) {
     let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(existing) = unsettled.iter().position(|(existing, retained, _, _)| {
-        existing.same_database(&database) && *retained == job
+    if let Some(existing) = unsettled.iter().position(|entry| {
+        entry.database.same_database(&retained.database) && entry.job == retained.job
     }) {
-        if answer.is_some() {
-            unsettled[existing].3 = answer;
+        if retained.evidence.is_some() {
+            unsettled[existing] = retained;
         }
     } else {
-        unsettled.push((database, job, outcome, answer));
+        unsettled.push(retained);
     }
 }
 
@@ -572,37 +577,62 @@ pub(in crate::system) async fn retry_unsettled(owner: &DatabaseHandle) {
         let mut unsettled = UNSETTLED.lock().unwrap_or_else(PoisonError::into_inner);
         let (mine, others) = std::mem::take(&mut *unsettled)
             .into_iter()
-            .partition(|(database, _, _, _)| database.same_database(owner));
+            .partition(|entry| entry.database.same_database(owner));
         *unsettled = others;
         mine
     };
-    for (database, job, outcome, answer) in retained {
-        if let Some(answer) = answer
-            && let Err(error) = persist_completion(&database, &answer).await
-        {
-            log::warn!("Job {job} completion evidence remains unpersisted: {error}");
-            retain_finalization(database, job, outcome, Some(answer));
-            continue;
-        }
-        match database.finalize_job(job, outcome.clone()).await {
-            Ok(_) | Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {}
-            Err(DatabaseError::ShuttingDown | DatabaseError::StorageUnavailable(_)) => {}
-            Err(DatabaseError::Rejected(violation)) => {
-                if matches!(outcome, JobFinalization::Completed(_)) {
-                    let failed = JobFinalization::Failed(FinalResult {
-                        summary: Some(violation.to_string()),
-                        code: Some(COMPLETION_REFUSED.to_owned()),
-                        goal_reached: Some(false),
-                        value: None,
-                    });
-                    retain_unsettled(database.without_stop_cause(), job, failed);
-                } else {
-                    log::error!("Job {job} could not be finalized: {violation}");
+    for mut entry in retained {
+        if let Some(operation) = entry.uncertain {
+            match entry.database.reconcile_operation(operation).await {
+                Ok(OperationStatus::Committed) => continue,
+                Ok(OperationStatus::NotCommitted) => entry.uncertain = None,
+                Ok(OperationStatus::NotCommittedYet | OperationStatus::Unresolvable) | Err(_) => {
+                    retain_finalization(entry);
+                    continue;
                 }
             }
+        }
+        let result = entry
+            .database
+            .finalize_job_with_provider_evidence(
+                entry.job,
+                entry.outcome.clone(),
+                entry.evidence.clone(),
+            )
+            .await;
+        match result {
+            Ok(_) => {}
+            Err(DatabaseError::Rejected(Violation::JobAlreadyFinalized(_))) => {
+                if entry.evidence.is_some() {
+                    log::error!(
+                        "Job {} was finalized independently; provider evidence could not be recorded",
+                        entry.job
+                    );
+                }
+            }
+            Err(DatabaseError::Rejected(violation))
+                if matches!(entry.outcome, JobFinalization::Completed(_)) =>
+            {
+                let failed = JobFinalization::Failed(FinalResult {
+                    summary: Some(violation.to_string()),
+                    code: Some(COMPLETION_REFUSED.to_owned()),
+                    goal_reached: Some(false),
+                    value: None,
+                });
+                retain_unsettled(entry.database.without_stop_cause(), entry.job, failed);
+            }
+            Err(DatabaseError::Rejected(violation)) => {
+                log::error!("Job {} could not be finalized: {violation}", entry.job);
+            }
             Err(failure) => {
-                log::warn!("Job {job} finalization is still unsettled: {failure}");
-                retain_unsettled(database, job, outcome);
+                log::warn!(
+                    "Job {} finalization is still unsettled: {failure}",
+                    entry.job
+                );
+                if let DatabaseError::OutcomeUnknown { operation, .. } = failure {
+                    entry.uncertain = Some(operation);
+                }
+                retain_finalization(entry);
             }
         }
     }
@@ -2974,31 +3004,6 @@ impl ProviderOutputSink for DatabaseOutputSink {
     }
 }
 
-async fn persist_completion(
-    database: &DatabaseHandle,
-    answer: &crate::db::entities::ProviderAnswer,
-) -> Result<(), DatabaseError> {
-    if let Some(response) = database
-        .provider_request(answer.stat.job, answer.stat.request)
-        .await?
-        .and_then(|record| record.response)
-    {
-        let body = crate::db::entities::MessageBody::new(&response).map_err(|_| {
-            DatabaseError::Read(crate::db::redb::StorageError::corrupted(
-                "invalid completed response",
-            ))
-        })?;
-        if body.digest() == answer.response.digest() {
-            return Ok(());
-        }
-        return Err(DatabaseError::Rejected(Violation::InvalidValue(
-            "response",
-            "a different completed response is already recorded",
-        )));
-    }
-    database.record_provider_answer(answer.clone()).await
-}
-
 /// Settles a failed provider execution. Its Job outcome follows the error
 /// alone; its availability observations record only the facts the error
 /// carries, see [`providers::error_observations`]. Each is
@@ -3028,6 +3033,7 @@ pub(crate) async fn settle_provider_error(
         ProviderExecutionError::NotDelivered { .. } => Some((NOT_DELIVERED, None)),
         ProviderExecutionError::Build { .. } => Some((BUILD_FAILED, None)),
         ProviderExecutionError::Unknown { .. }
+        | ProviderExecutionError::StreamFailure { .. }
         | ProviderExecutionError::Incomplete { .. }
         | ProviderExecutionError::Interrupted { .. }
         | ProviderExecutionError::Stopped { .. }
@@ -3044,8 +3050,7 @@ pub(crate) async fn settle_provider_error(
         }),
     };
     let observed_at = Timestamp::now();
-    let mut gap = None;
-    if let ProviderExecutionError::CompletionUnpersisted { result, .. } = &error {
+    let evidence = if let ProviderExecutionError::CompletionUnpersisted { result, .. } = &error {
         log::warn!(
             "Job {job} completed its provider response but its final output flush failed; retaining the response as evidence without executing its tool calls"
         );
@@ -3058,7 +3063,7 @@ pub(crate) async fn settle_provider_error(
         }
         let response = crate::db::entities::MessageBody::new(&message)
             .map_err(|error| ExecutionRuntimeError::Provider(error.to_string()))?;
-        let answer = crate::db::entities::ProviderAnswer {
+        ProviderSettlementEvidence::Answer(Box::new(crate::db::entities::ProviderAnswer {
             stat: AvailabilityStat {
                 job,
                 request,
@@ -3067,49 +3072,44 @@ pub(crate) async fn settle_provider_error(
             },
             measurements: providers::metrics(result),
             response,
-        };
-        if let Err(source) = persist_completion(&database, &answer).await {
-            log::warn!(
-                "Job {job} completion evidence remains unpersisted and is retained for retry: {source}"
-            );
-            retain_finalization(database.clone(), job, settlement.clone(), Some(answer));
-            gap = Some(source);
-        }
+        }))
     } else {
-        for observation in providers::error_observations(&error) {
-            let recorded = database
-                .record_availability_stat(AvailabilityStat {
+        ProviderSettlementEvidence::Observations(
+            providers::error_observations(&error)
+                .into_iter()
+                .map(|observation| AvailabilityStat {
                     job,
                     request,
                     observed_at,
                     observation,
                 })
-                .await;
-            if let Err(error) = recorded {
-                gap.get_or_insert(error);
-            }
-        }
-    }
-    let result = match database.finalize_job(job, settlement.clone()).await {
+                .collect(),
+        )
+    };
+    let result = match database
+        .finalize_job_with_provider_evidence(job, settlement.clone(), Some(evidence.clone()))
+        .await
+    {
         Ok(result) => result,
         Err(source) => {
-            return Err(ExecutionRuntimeError::NotSettled {
-                source,
-                settlement: Box::new(settlement),
+            let uncertain = match &source {
+                DatabaseError::OutcomeUnknown { operation, .. } => Some(*operation),
+                _ => None,
+            };
+            retain_finalization(RetainedFinalization {
+                database,
+                job,
+                outcome: settlement,
+                evidence: Some(evidence),
+                uncertain,
             });
+            return Err(ExecutionRuntimeError::ProviderSettlementNotRecorded { source });
         }
     };
-    let receipt = ExecutionReceipt {
+    Ok(ExecutionReceipt {
         executor,
         input,
         job,
         result,
-    };
-    match gap {
-        Some(source) => Err(ExecutionRuntimeError::ObservationsNotRecorded {
-            receipt: Box::new(receipt),
-            source,
-        }),
-        None => Ok(receipt),
-    }
+    })
 }

@@ -190,6 +190,12 @@ pub enum ProviderExecutionError {
         /// unchecked. Its facts then stand apart from the later failure.
         finished: bool,
     },
+    #[error("provider response failed after possible delivery: {failure}")]
+    StreamFailure {
+        failure: Box<ProviderFailure>,
+        facts: ResponseFacts,
+        finished: bool,
+    },
     #[error("provider rejected the request: {failure}")]
     Rejected { failure: ProviderFailure },
     /// The response broke the protocol, or what it sent was refused, such

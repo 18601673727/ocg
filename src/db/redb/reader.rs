@@ -1905,6 +1905,28 @@ pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool,
             .map(|bytes| decode_tool_evidence(call, bytes.value()))
             .transpose()?
             .is_some_and(|record| record.outcome.is_some()),
+        Probe::ProviderAvailability(job, id, digest) => {
+            let index = rx.open_table(JOB_OBSERVATIONS)?;
+            let events = rx.open_table(REQUEST_EVENTS)?;
+            if let Some(key) = index.get((job.get(), 2, id.get()))? {
+                let (request, seq) = key.value();
+                events
+                    .get((job.get(), request, seq))?
+                    .is_some_and(|bytes| ContentDigest::of(bytes.value()) == digest)
+            } else {
+                false
+            }
+        }
+        Probe::ProviderOutcome(job) => rx
+            .open_table(JOB_STATES)?
+            .get(job.get())?
+            .map(|bytes| JobState::decode_at(job.get(), bytes.value()))
+            .transpose()?
+            .is_some_and(|state| {
+                state.outcome.is_some_and(|outcome| {
+                    outcome.cause != Some(crate::db::entities::OutcomeCause::Abandoned)
+                })
+            }),
         Probe::Outcome(job) => rx
             .open_table(JOB_STATES)?
             .get(job.get())?

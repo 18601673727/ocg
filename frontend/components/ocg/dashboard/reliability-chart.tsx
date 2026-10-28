@@ -290,6 +290,7 @@ function ReliabilityPlot({ data }: { data: ChartData }) {
   });
   const dateLabel = (us: number) => date.format(new Date((us + data.offset * 60_000_000) / 1000));
   const errorShare = data.totalRequests > 0 ? data.totalErrors / data.totalRequests : null;
+  const cacheCount = (count: number) => (count > 0 ? number.format(count) : "—");
   const stats: [string, string][] = [
     [t("observations.requests"), number.format(data.totalRequests)],
     [
@@ -299,8 +300,8 @@ function ReliabilityPlot({ data }: { data: ChartData }) {
         : `${number.format(data.totalErrors)} (${percent.format(errorShare)})`,
     ],
     [t("observations.reliabilityRetries"), number.format(data.totalRetries)],
-    [t("observations.reliabilityCacheReads"), number.format(data.totalCacheReads)],
-    [t("observations.reliabilityCacheWrites"), number.format(data.totalCacheWrites)],
+    [t("observations.reliabilityCacheReads"), cacheCount(data.totalCacheReads)],
+    [t("observations.reliabilityCacheWrites"), cacheCount(data.totalCacheWrites)],
     [
       t("observations.reliabilityAvgTtfb"),
       data.ttfbAvgMs === null ? "—" : `${ms.format(data.ttfbAvgMs)} ms`,
@@ -366,33 +367,32 @@ function ReliabilityPlot({ data }: { data: ChartData }) {
       </div>
       <div>
         <h4 className="mb-3 text-sm font-medium">{t("observations.tokens")}</h4>
+        <p className="mb-3 text-xs text-muted-foreground">
+          {t("observations.reliabilityCacheNote")}
+        </p>
         <StackedBarChart
           metricLabel={t("observations.tokens")}
           integerTicks
           ariaLabel={t("observations.reliabilityCacheAria", {
             from: dateLabel(data.fromUs),
             until: dateLabel(data.untilUs - 1),
-            reads: number.format(data.totalCacheReads),
-            writes: number.format(data.totalCacheWrites),
+            reads: cacheCount(data.totalCacheReads),
+            writes: cacheCount(data.totalCacheWrites),
           })}
           series={[
             {
               key: "hits",
               label: t("observations.reliabilityCacheReads"),
               color: cacheReadsColor,
-              share:
-                data.totalCacheReads + data.totalCacheWrites
-                  ? data.totalCacheReads / (data.totalCacheReads + data.totalCacheWrites)
-                  : 0,
+              share: 0,
+              legendValue: cacheCount(data.totalCacheReads),
             },
             {
               key: "miss",
               label: t("observations.reliabilityCacheWrites"),
               color: cacheWritesColor,
-              share:
-                data.totalCacheReads + data.totalCacheWrites
-                  ? data.totalCacheWrites / (data.totalCacheReads + data.totalCacheWrites)
-                  : 0,
+              share: 0,
+              legendValue: cacheCount(data.totalCacheWrites),
             },
           ]}
           bars={data.buckets.map((bar) => ({
@@ -401,8 +401,8 @@ function ReliabilityPlot({ data }: { data: ChartData }) {
             values: [bar.cacheReads, bar.cacheWrites],
             tooltip: [
               dateLabel(bar.bucketUs),
-              `${t("observations.reliabilityCacheReads")}: ${number.format(bar.cacheReads)}`,
-              `${t("observations.reliabilityCacheWrites")}: ${number.format(bar.cacheWrites)}`,
+              `${t("observations.reliabilityCacheReads")}: ${cacheCount(bar.cacheReads)}`,
+              `${t("observations.reliabilityCacheWrites")}: ${cacheCount(bar.cacheWrites)}`,
             ].join("\n"),
           }))}
         />

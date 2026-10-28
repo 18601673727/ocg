@@ -197,7 +197,11 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                 </p>
                 <p>{t("context.preparedMode", { mode: status.prediction_mode })}</p>
                 {status.predictive_unavailable && status.predictive && (
-                  <p>{status.predictive_unavailable}</p>
+                  <p>
+                    {status.predictive_unavailable === "foreground model capacity is unknown"
+                      ? t("context.capacityUnavailable")
+                      : status.predictive_unavailable}
+                  </p>
                 )}
               </div>
             )}

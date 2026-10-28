@@ -309,15 +309,17 @@ export function ObservationsSurface({
           <p className="py-4 text-sm text-muted-foreground">{t("observations.empty")}</p>
         ) : null}
         {items.length > 0 ? (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="border-b border-border text-xs text-muted-foreground">
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table
+              className={kind === "usage" ? "w-full min-w-[1200px] text-sm" : "w-full text-sm"}
+            >
+              <thead className="border-b border-border bg-muted/40 text-xs text-muted-foreground">
                 <tr>
-                  <th className={cell}>{t("observations.observed")}</th>
-                  <th className={cell}>{t("observations.jobRequest")}</th>
-                  <th className={cell}>{t("observations.providerModel")}</th>
+                  <th className={`${cell} whitespace-nowrap`}>{t("observations.observed")}</th>
+                  <th className={`${cell} whitespace-nowrap`}>{t("observations.jobRequest")}</th>
+                  <th className={`${cell} whitespace-nowrap`}>{t("observations.providerModel")}</th>
                   {(kind === "usage" ? usageColumns : providerColumns).map((label) => (
-                    <th className={cell} key={label}>
+                    <th className={`${cell} whitespace-nowrap`} key={label}>
                       {label}
                     </th>
                   ))}
@@ -325,13 +327,14 @@ export function ObservationsSurface({
               </thead>
               <tbody className="divide-y divide-border">
                 {newestFirst.map((row) => (
-                  <tr key={`${row.job}:${row.id}`}>
+                  <tr key={`${row.job}:${row.id}`} className="transition-colors hover:bg-muted/30">
                     <td className={`${cell} whitespace-nowrap`}>
                       {new Date(row.observed_at_us / 1000).toLocaleString()}
                     </td>
                     <td className={cell}>
                       <button
-                        className="font-mono underline underline-offset-4"
+                        className="block max-w-48 truncate text-left font-mono underline decoration-muted-foreground underline-offset-4 hover:decoration-foreground focus-visible:outline-2 focus-visible:outline-offset-2"
+                        title={row.job}
                         onClick={() => onJob(row.job)}
                       >
                         {row.job}
@@ -340,7 +343,7 @@ export function ObservationsSurface({
                         {t("observations.requestNumber", { request: row.request })}
                       </p>
                     </td>
-                    <td className={`${cell} max-w-64 break-words`}>
+                    <td className={`${cell} min-w-36 max-w-64 break-words`}>
                       {row.provider ?? t("observations.unknownProvider")}
                       <p className="text-xs text-muted-foreground">
                         {row.model ?? t("observations.unknownModel")}
@@ -348,19 +351,27 @@ export function ObservationsSurface({
                     </td>
                     {"input_tokens" in row ? (
                       <>
-                        <td className={cell}>
-                          {row.finality ?? t("observations.unannotated")}
-                          <p className="text-xs text-muted-foreground">
+                        <td className={`${cell} min-w-32`}>
+                          <span className="inline-flex rounded-md bg-muted px-2 py-0.5 text-xs font-medium">
+                            {row.finality ?? t("observations.unannotated")}
+                          </span>
+                          <p className="mt-1 text-xs text-muted-foreground">
                             {row.eligibility ?? t("observations.deliveryUnknown")}
                           </p>
                         </td>
-                        <td className={cell}>{number(row.input_tokens)}</td>
-                        <td className={cell}>{number(row.output_tokens)}</td>
-                        <td className={cell}>
+                        <td className={`${cell} whitespace-nowrap tabular-nums`}>
+                          {number(row.input_tokens)}
+                        </td>
+                        <td className={`${cell} whitespace-nowrap tabular-nums`}>
+                          {number(row.output_tokens)}
+                        </td>
+                        <td className={`${cell} whitespace-nowrap tabular-nums`}>
                           {number(row.cache_read_tokens)} / {number(row.cache_write_tokens)}
                         </td>
-                        <td className={cell}>{number(row.reasoning_tokens)}</td>
-                        <td className={cell}>
+                        <td className={`${cell} whitespace-nowrap tabular-nums`}>
+                          {number(row.reasoning_tokens)}
+                        </td>
+                        <td className={`${cell} whitespace-nowrap tabular-nums`}>
                           {number(row.ttfb_ms)} / {number(row.finished_in_ms)}
                         </td>
                       </>

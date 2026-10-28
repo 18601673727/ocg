@@ -135,10 +135,27 @@ export function jobTranscript(
       ...base,
       content: visibleAnswer(progress),
       status: state,
-      detail: result?.summary ?? null,
+      detail: providerFailureDetail(result),
     };
   }
   return [...user, ...providerMessages(answer, progress, responses, visibleAnswer, outputs)];
+}
+
+function providerFailureDetail(result: ControlOutput | null): string | null {
+  const message = result?.summary ?? null;
+  if (
+    result?.code !== "provider_rejected" ||
+    !result.value ||
+    typeof result.value !== "object" ||
+    Array.isArray(result.value)
+  )
+    return message;
+  const value = result.value as Record<string, unknown>;
+  const details = [
+    typeof value.provider_code === "string" ? `Provider code: ${value.provider_code}` : null,
+    typeof value.request_id === "string" ? `Request ID: ${value.request_id}` : null,
+  ].filter((detail): detail is string => Boolean(detail));
+  return [message, ...details].filter(Boolean).join("\n") || null;
 }
 
 function approvalAnswer(text: string, tools: readonly ControlToolCall[]): string {

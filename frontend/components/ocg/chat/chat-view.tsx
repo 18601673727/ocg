@@ -42,6 +42,7 @@ export function ChatComposer({
   runtimeStatus,
   busy,
   queueing,
+  steerAfterCompletion,
   selection,
   onSelectionChange,
   onPreference,
@@ -56,6 +57,7 @@ export function ChatComposer({
   projectId?: string;
   busy: boolean;
   queueing: boolean;
+  steerAfterCompletion: boolean;
   selection?: ChatModelSelection;
   onSelectionChange: (selection: ChatModelSelection) => void;
   onPreference: (selection: ChatModelSelection) => void;
@@ -186,8 +188,15 @@ export function ChatComposer({
   };
 
   const submit = async (mode?: "queue" | "steer") => {
-    if (actionLock.current || !images.ready || (mode === "steer" && steerBlocked)) return;
+    if (
+      actionLock.current ||
+      !images.ready ||
+      (mode === "steer" && steerBlocked) ||
+      (!mode && steerAfterCompletion && steerBlocked && !steerGate?.kind)
+    )
+      return;
     const intent = parseComposerIntent(draft);
+    const effectiveMode = mode ?? (steerAfterCompletion && !steerBlocked ? "steer" : undefined);
     if (intent.kind === "unknown-command") {
       setDismissedFor(draft);
       setCommandError({ raw: draft, message: intent.reason });
@@ -204,7 +213,9 @@ export function ChatComposer({
     setCommandError(null);
     try {
       await onIntent(
-        intent.kind === "chat" ? { ...intent, selection, mode, images: images.images } : intent,
+        intent.kind === "chat"
+          ? { ...intent, selection, mode: effectiveMode, images: images.images }
+          : intent,
       );
       onDraftChange("");
       images.clear();
@@ -406,6 +417,7 @@ export function ChatComposer({
               !canSend ||
               submitting ||
               cancelling ||
+              (steerAfterCompletion && steerBlocked && !steerGate?.kind) ||
               (!chatReady && parseComposerIntent(draft).kind === "chat"),
             steerDisabled: !canSend || !chatReady || submitting || cancelling || steerBlocked,
             steerTitle: steerBlocked

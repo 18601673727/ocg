@@ -47,6 +47,8 @@ pub(crate) enum Probe {
     ToolOutcome(ToolCallRef),
     /// `job_state[job]` has an outcome.
     Outcome(JobId),
+    ProviderOutcome(JobId),
+    ProviderAvailability(JobId, AvailabilityStatId, ContentDigest),
 }
 
 pub(crate) struct BatchOutcome<T> {
@@ -847,7 +849,18 @@ impl Batch {
                 ));
             }
             let id = match known.get(&model) {
-                Some(id) => *id,
+                Some(id) => {
+                    let id = *id;
+                    let row = self.require_config(id)?;
+                    if let ConfigBody::Model(mut body) = row.body
+                        && body.context_window.is_none()
+                        && context_window.is_some()
+                    {
+                        body.context_window = context_window;
+                        self.update_config(id, row.name, ConfigBody::Model(body))?;
+                    }
+                    id
+                }
                 None => {
                     let name: String = model
                         .chars()
@@ -915,8 +928,15 @@ impl Batch {
             let efforts = models
                 .get(&body.model)
                 .and_then(|model| model.reasoning_efforts.clone());
-            if body.reasoning_efforts != efforts {
+            let context_window = body.context_window.or_else(|| {
+                models
+                    .get(&body.model)
+                    .and_then(|model| model.context_window)
+                    .filter(|value| *value > 0)
+            });
+            if body.reasoning_efforts != efforts || body.context_window != context_window {
                 body.reasoning_efforts = efforts;
+                body.context_window = context_window;
                 self.update_config(row.id, row.name, ConfigBody::Model(body))?;
             }
         }
@@ -1460,6 +1480,34 @@ impl Batch {
                 .is_some();
             Ok(observed)
         })
+    }
+
+    pub(crate) fn provider_settlement_probe(
+        &mut self,
+        job: JobId,
+        availability: Option<AvailabilityStatId>,
+    ) -> Result<(), BatchError> {
+        self.probe = Some(match availability {
+            Some(id) => {
+                let digest = self.step(|tx| {
+                    let index = tx.open_table(JOB_OBSERVATIONS)?;
+                    let key = index
+                        .get((job.get(), 2, id.get()))?
+                        .ok_or_else(|| {
+                            StorageError::corrupted("missing provider settlement observation")
+                        })?
+                        .value();
+                    let events = tx.open_table(REQUEST_EVENTS)?;
+                    let bytes = events.get((job.get(), key.0, key.1))?.ok_or_else(|| {
+                        StorageError::corrupted("missing provider settlement event")
+                    })?;
+                    Ok(ContentDigest::of(bytes.value()))
+                })?;
+                Probe::ProviderAvailability(job, id, digest)
+            }
+            None => Probe::ProviderOutcome(job),
+        });
+        Ok(())
     }
 
     /// The eligibility the request's Token events already state, if any.

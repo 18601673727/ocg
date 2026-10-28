@@ -170,8 +170,13 @@ fn parse_models(
             "max_input_tokens",
         ]
         .iter()
-        .find_map(|key| entry.get(key).and_then(Value::as_u64))
-        .and_then(|value| u32::try_from(value).ok());
+        .find_map(|key| {
+            entry
+                .get(key)
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+        });
         let efforts = [
             entry.get("reasoning_efforts"),
             entry.get("supported_reasoning_efforts"),

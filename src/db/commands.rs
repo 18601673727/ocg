@@ -177,6 +177,7 @@ pub(super) enum Command {
         cause: Option<crate::db::entities::OutcomeCause>,
         ignore_stop_cause: bool,
         finalization: JobFinalization,
+        evidence: Option<ProviderSettlementEvidence>,
         reply: Reply<Option<AppendedOutput>>,
     },
     CreateExecutor {
@@ -551,15 +552,77 @@ impl Command {
                 finalization,
                 cause,
                 ignore_stop_cause,
+                evidence,
                 reply,
-            } => run(
-                database,
-                operation,
-                commit,
-                Kind::FinalizeJob,
-                reply,
-                |batch| mutations::finalize_job(batch, job, finalization, cause, ignore_stop_cause),
-            ),
+            } => {
+                let mut changes = Vec::new();
+                let mut result = run(
+                    database,
+                    operation,
+                    commit,
+                    Kind::FinalizeJob,
+                    reply,
+                    |batch| {
+                        let provider_settlement = evidence.is_some();
+                        let abandoned = provider_settlement
+                            && batch
+                                .require_job_state(job)?
+                                .outcome
+                                .is_some_and(|outcome| {
+                                    outcome.cause == Some(entities::OutcomeCause::Abandoned)
+                                });
+                        let output = if abandoned {
+                            None
+                        } else {
+                            mutations::finalize_job(
+                                batch,
+                                job,
+                                finalization,
+                                cause,
+                                ignore_stop_cause,
+                            )?
+                        };
+                        let mut probe = None;
+                        match evidence {
+                            None => {}
+                            Some(ProviderSettlementEvidence::Observations(observations)) => {
+                                for stat in observations {
+                                    if stat.job != job {
+                                        return batch.reject(Violation::InvalidValue(
+                                            "job",
+                                            "observation belongs to a different job",
+                                        ));
+                                    }
+                                    let id = mutations::record_availability_stat(batch, stat)?;
+                                    changes.push(ObservationChange::Availability(job, id));
+                                    probe = Some(id);
+                                }
+                            }
+                            Some(ProviderSettlementEvidence::Answer(answer)) => {
+                                if answer.stat.job != job {
+                                    return batch.reject(Violation::InvalidValue(
+                                        "job",
+                                        "answer belongs to a different job",
+                                    ));
+                                }
+                                let (metrics, availability) =
+                                    mutations::record_provider_answer(batch, *answer)?;
+                                changes.push(ObservationChange::Metrics(job, metrics));
+                                changes.push(ObservationChange::Availability(job, availability));
+                                probe = Some(availability);
+                            }
+                        }
+                        if provider_settlement {
+                            batch.provider_settlement_probe(job, probe)?;
+                        }
+                        Ok(output)
+                    },
+                );
+                if result.committed {
+                    result.observations = changes;
+                }
+                result
+            }
             Self::CreateExecutor { executor, reply } => run(
                 database,
                 operation,
@@ -956,22 +1019,49 @@ impl Command {
             Self::AppendJobOutput { output, .. } => {
                 output_bytes(&output.summary, &output.code, &output.value)
             }
-            Self::FinalizeJob { finalization, .. } => match finalization {
-                JobFinalization::Completed(result)
-                | JobFinalization::Failed(result)
-                | JobFinalization::Cancelled(result) => {
-                    let text = result
-                        .value
-                        .as_ref()
-                        .and_then(|value| value.get("text"))
-                        .and_then(serde_json::Value::as_str)
-                        .or(result.summary.as_deref());
-                    output_bytes(&result.summary, &result.code, &result.value)
-                        .saturating_add(64 * 1024)
-                        .saturating_add(text.map_or(0, search_index_bytes))
-                }
-                JobFinalization::Unknown => 0,
-            },
+            Self::FinalizeJob {
+                finalization,
+                evidence,
+                ..
+            } => {
+                let evidence_bytes = match evidence {
+                    None => 0,
+                    Some(ProviderSettlementEvidence::Answer(answer)) => {
+                        byte_count(answer.response.byte_length())
+                            .saturating_add(json_bytes(&answer.measurements.usage.raw))
+                    }
+                    Some(ProviderSettlementEvidence::Observations(stats)) => {
+                        stats.iter().fold(0u64, |bytes, stat| {
+                            let observation = &stat.observation;
+                            let failure = observation.failure.as_ref().map_or(0, |failure| {
+                                byte_count(failure.message.len())
+                                    .saturating_add(text_bytes(&failure.provider_code))
+                                    .saturating_add(text_bytes(&failure.response_body))
+                                    .saturating_add(text_bytes(&failure.request_id))
+                            });
+                            bytes
+                                .saturating_add(failure)
+                                .saturating_add(text_bytes(&observation.raw_finish_reason))
+                        })
+                    }
+                };
+                evidence_bytes.saturating_add(match finalization {
+                    JobFinalization::Completed(result)
+                    | JobFinalization::Failed(result)
+                    | JobFinalization::Cancelled(result) => {
+                        let text = result
+                            .value
+                            .as_ref()
+                            .and_then(|value| value.get("text"))
+                            .and_then(serde_json::Value::as_str)
+                            .or(result.summary.as_deref());
+                        output_bytes(&result.summary, &result.code, &result.value)
+                            .saturating_add(64 * 1024)
+                            .saturating_add(text.map_or(0, search_index_bytes))
+                    }
+                    JobFinalization::Unknown => 0,
+                })
+            }
             Self::CreateExecutor { executor, .. } => byte_count(executor.name.len()),
             Self::CreateProject { project, .. } => byte_count(project.name.len())
                 .saturating_add(text_bytes(&project.description))

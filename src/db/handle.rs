@@ -1393,6 +1393,16 @@ impl DatabaseHandle {
         job: JobId,
         finalization: JobFinalization,
     ) -> Result<Option<AppendedOutput>, DatabaseError> {
+        self.finalize_job_with_provider_evidence(job, finalization, None)
+            .await
+    }
+
+    pub(crate) async fn finalize_job_with_provider_evidence(
+        &self,
+        job: JobId,
+        finalization: JobFinalization,
+        evidence: Option<ProviderSettlementEvidence>,
+    ) -> Result<Option<AppendedOutput>, DatabaseError> {
         let cause = self
             .stop_cause
             .as_ref()
@@ -1408,6 +1418,7 @@ impl DatabaseHandle {
             finalization,
             cause,
             ignore_stop_cause: self.ignore_stop_cause,
+            evidence,
             reply,
         })
         .await

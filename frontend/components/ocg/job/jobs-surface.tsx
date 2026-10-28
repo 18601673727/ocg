@@ -5,6 +5,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { SettlementState } from "../contracts/api";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { JobWatch } from "./job-watch";
@@ -29,7 +37,10 @@ export function JobsSurface({
 }) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
+  const [status, setStatus] = useState<SettlementState | "all">("all");
   const [records, setRecords] = useState<Awaited<ReturnType<typeof client.readJobs>>["jobs"]>([]);
+  const visibleRecords =
+    status === "all" ? records : records.filter((record) => record.settlement.state === status);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
@@ -158,19 +169,39 @@ export function JobsSurface({
       <ContentHeader
         title={t("jobs.title")}
         actions={
-          <Input
-            aria-label={t("jobs.search")}
-            placeholder={t("jobs.search")}
-            className="w-64"
-            value={query}
-            onChange={(event) => {
-              setRecords([]);
-              setReady(false);
-              setHasMore(false);
-              setLoadingMore(false);
-              setQuery(event.target.value);
-            }}
-          />
+          <div className="flex items-center gap-2">
+            <Select
+              value={status}
+              onValueChange={(value) => {
+                if (value !== null) setStatus(value as SettlementState | "all");
+              }}
+            >
+              <SelectTrigger aria-label={t("jobs.statusFilter")} className="w-40">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">{t("jobs.statusAll")}</SelectItem>
+                <SelectItem value="unsettled">{t("job.state.unsettled")}</SelectItem>
+                <SelectItem value="completed">{t("job.activity.completed")}</SelectItem>
+                <SelectItem value="failed">{t("job.activity.failed")}</SelectItem>
+                <SelectItem value="cancelled">{t("job.activity.cancelled")}</SelectItem>
+                <SelectItem value="unknown">{t("job.activity.unknown")}</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input
+              aria-label={t("jobs.search")}
+              placeholder={t("jobs.search")}
+              className="w-64"
+              value={query}
+              onChange={(event) => {
+                setRecords([]);
+                setReady(false);
+                setHasMore(false);
+                setLoadingMore(false);
+                setQuery(event.target.value);
+              }}
+            />
+          </div>
         }
       />
       <section className="rounded-lg border border-border bg-card p-5">
@@ -181,54 +212,85 @@ export function JobsSurface({
           </DismissibleNotice>
         ) : null}
         {!ready ? <p role="status">{t("jobs.loading")}</p> : null}
-        {ready && records.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("jobs.empty")}</p>
+        {ready && visibleRecords.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            {t(status === "all" ? "jobs.empty" : "jobs.statusEmpty")}
+          </p>
         ) : null}
-        <ul className="divide-y divide-border">
-          {records.map((record) => (
-            <li
-              key={record.id}
-              className={cn(
-                "flex flex-wrap items-center justify-between gap-3 rounded px-2 py-3 text-sm",
-                job === record.id ? cn(SELECTED_ROW, "font-medium") : "hover:bg-muted",
-              )}
-            >
-              <button
-                type="button"
-                onClick={() => select(record.id)}
-                aria-current={job === record.id ? "true" : undefined}
-                className="flex min-w-0 flex-1 flex-wrap items-center justify-between gap-3 text-left focus-visible:outline-2 focus-visible:outline-ring"
-              >
-                <span className="min-w-0">
-                  <span className="font-mono">{record.id}</span>
-                  <span className="ml-3 break-words">
-                    {record.kind === "turn" && record.conversation !== null && record.title
-                      ? record.title
-                      : (record.name ?? t("jobs.unnamed"))}
-                  </span>
-                </span>
-                <span className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-                  <span>{record.settlement.state}</span>
-                  <time>{new Date(record.created_at_us / 1000).toLocaleString()}</time>
-                </span>
-              </button>
-              {record.kind === "turn" && record.conversation !== null && onOpenChat ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="xs"
-                  className="shrink-0"
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    onOpenChat(record.id);
-                  }}
-                >
-                  {t("jobs.openInChat")}
-                </Button>
-              ) : null}
-            </li>
-          ))}
-        </ul>
+        {status !== "all" && hasMore ? (
+          <p className="mb-3 text-xs text-muted-foreground">{t("jobs.filterNote")}</p>
+        ) : null}
+        {visibleRecords.length > 0 ? (
+          <div className="overflow-x-auto rounded-lg border border-border">
+            <table className="w-full text-sm">
+              <thead className="border-b border-border bg-muted/40 text-xs text-muted-foreground">
+                <tr>
+                  <th scope="col" className="px-3 py-2 text-left">
+                    {t("jobs.columnJob")}
+                  </th>
+                  <th scope="col" className="px-3 py-2 text-left">
+                    {t("jobs.columnStatus")}
+                  </th>
+                  <th scope="col" className="whitespace-nowrap px-3 py-2 text-left">
+                    {t("jobs.columnCreated")}
+                  </th>
+                  <th scope="col" className="px-3 py-2 text-left">
+                    {t("jobs.columnActions")}
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {visibleRecords.map((record) => (
+                  <tr
+                    key={record.id}
+                    className={cn(job === record.id ? SELECTED_ROW : "hover:bg-muted/30")}
+                  >
+                    <td className="px-3 py-3">
+                      <button
+                        type="button"
+                        onClick={() => select(record.id)}
+                        aria-current={job === record.id ? "true" : undefined}
+                        className="text-left focus-visible:outline-2 focus-visible:outline-ring"
+                      >
+                        <span className="block font-medium break-words">
+                          {record.kind === "turn" && record.conversation !== null && record.title
+                            ? record.title
+                            : (record.name ?? t("jobs.unnamed"))}
+                        </span>
+                        <span className="block font-mono text-xs text-muted-foreground">
+                          {record.id}
+                        </span>
+                      </button>
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-3">
+                      {record.settlement.state === "unsettled"
+                        ? t("job.state.unsettled")
+                        : t(`job.activity.${record.settlement.state}`)}
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-3 text-muted-foreground">
+                      <time dateTime={new Date(record.created_at_us / 1000).toISOString()}>
+                        {new Date(record.created_at_us / 1000).toLocaleString()}
+                      </time>
+                    </td>
+                    <td className="px-3 py-3">
+                      {record.kind === "turn" && record.conversation !== null && onOpenChat ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          className="shrink-0"
+                          onClick={() => onOpenChat(record.id)}
+                        >
+                          {t("jobs.openInChat")}
+                        </Button>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
         {hasMore && <LoadMore loading={loadingMore} onLoad={loadMore} auto={!error} />}
       </section>
       <Dialog

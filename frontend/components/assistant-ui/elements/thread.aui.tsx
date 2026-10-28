@@ -28,7 +28,6 @@ import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-ic
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
-import { useConversationError } from "@/components/ocg/chat/conversation-errors";
 import { ToolActivityLabel } from "@/components/ocg/chat/tool-activity-label";
 import type { ToolActivity } from "@/components/ocg/chat/tool-activity-summary";
 import {
@@ -38,7 +37,6 @@ import {
   type AssistantState,
   BranchPickerPrimitive,
   ComposerPrimitive,
-  ErrorPrimitive,
   groupPartByType,
   MessagePrimitive,
   SuggestionPrimitive,
@@ -591,16 +589,6 @@ const ComposerAction: FC = () => {
   );
 };
 
-const MessageError: FC = () => {
-  return (
-    <MessagePrimitive.Error>
-      <ErrorPrimitive.Root className="aui-message-error-root border-destructive bg-destructive/10 text-destructive dark:bg-destructive/5 mt-2 rounded-md border p-3 text-sm dark:text-red-200">
-        <ErrorPrimitive.Message className="aui-message-error-message line-clamp-2" />
-      </ErrorPrimitive.Root>
-    </MessagePrimitive.Error>
-  );
-};
-
 const AssistantMessage: FC = () => {
   const {
     ToolFallback: ToolFallbackComponent = ToolFallback,
@@ -627,18 +615,8 @@ const AssistantMessage: FC = () => {
     const value = s.message.metadata.custom.failureReason;
     return typeof value === "string" ? value : null;
   });
-  const messageId = useAuiState((s) => s.message.id);
-  const failureAt = useAuiState((s) => {
-    const value = s.message.metadata.custom.failureAt;
-    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-  });
   const failed = useAuiState(
     (s) => s.message.status?.type === "incomplete" && s.message.status.reason === "error",
-  );
-  const errorInHeader = useConversationError(
-    failureReason ?? (failed ? t("chat.failed") : null),
-    messageId,
-    failureAt,
   );
   const ACTION_BAR_PT = "pt-1.5";
   // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
@@ -792,7 +770,9 @@ const AssistantMessage: FC = () => {
                 );
               }
               case "text":
-                return <SmoothMarkdownText text={part.text} streaming={part.status.type === "running"} />;
+                return (
+                  <SmoothMarkdownText text={part.text} streaming={part.status.type === "running"} />
+                );
               case "reasoning":
                 return <Reasoning {...part} />;
               case "tool-call":
@@ -819,10 +799,9 @@ const AssistantMessage: FC = () => {
           }}
         </MessagePrimitive.GroupedParts>
         {MessageFooter && <MessageFooter />}
-        {!errorInHeader && <MessageError />}
-        {failureReason && !errorInHeader && (
+        {(failureReason || failed) && (
           <p role="alert" className="text-destructive mt-2 text-sm whitespace-pre-wrap">
-            {failureReason}
+            {failureReason ?? t("chat.failed")}
           </p>
         )}
       </div>

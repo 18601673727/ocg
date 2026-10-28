@@ -412,7 +412,54 @@ pub(crate) async fn read_response(
         sink,
         &mut capture,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        if !conversation.carries_images() {
+            return error;
+        }
+        fn redact_image_error(error: ProviderExecutionError) -> ProviderExecutionError {
+            match error {
+                ProviderExecutionError::StreamFailure {
+                    mut failure,
+                    facts,
+                    finished,
+                } => {
+                    failure.message =
+                        "provider failed while processing an image request".to_owned();
+                    failure.provider_code = None;
+                    failure.request_id = None;
+                    failure.response_body = None;
+                    ProviderExecutionError::StreamFailure {
+                        failure,
+                        facts,
+                        finished,
+                    }
+                }
+                ProviderExecutionError::Rejected { failure } => ProviderExecutionError::Rejected {
+                    failure: ProviderFailure {
+                        message: "provider rejected image request".to_owned(),
+                        status_code: failure.status_code,
+                        retryable: failure.retryable,
+                        ..ProviderFailure::default()
+                    },
+                },
+                ProviderExecutionError::OutputPersistence { message, stream } => {
+                    ProviderExecutionError::OutputPersistence {
+                        message,
+                        stream: Box::new(redact_image_error(*stream)),
+                    }
+                }
+                other @ (ProviderExecutionError::Build { .. }
+                | ProviderExecutionError::NotDelivered { .. }
+                | ProviderExecutionError::Unknown { .. }
+                | ProviderExecutionError::Incomplete { .. }
+                | ProviderExecutionError::Interrupted { .. }
+                | ProviderExecutionError::Stopped { .. }
+                | ProviderExecutionError::CompletionUnpersisted { .. }) => other,
+            }
+        }
+        redact_image_error(error)
+    })?;
     let assembled = std::mem::take(&mut result.refused);
     let refused = conversation
         .admit_tool_calls(&result.tool_calls, assembled)
@@ -757,10 +804,21 @@ async fn parse_stream_body(
                 capture.record(Some(output), reported).await;
             }
             if native && event["type"] == "response.failed" {
-                let message = event["response"]["error"]["message"]
-                    .as_str()
-                    .unwrap_or("Responses provider failed after delivery");
-                return Err(response.unknown(message, status_code));
+                let (message, provider_code) =
+                    observe::parse_provider_error(&event["response"]["error"].to_string())
+                        .unwrap_or_else(|| {
+                            ("Responses provider failed after delivery".to_owned(), None)
+                        });
+                return Err(ProviderExecutionError::StreamFailure {
+                    failure: Box::new(ProviderFailure {
+                        message,
+                        provider_code,
+                        request_id: request_id.clone(),
+                        ..ProviderFailure::default()
+                    }),
+                    facts: response.facts(status_code),
+                    finished: response.finish_reason.is_some() && response.tool_calls.is_empty(),
+                });
             }
             if native && event["type"] == "response.incomplete" {
                 let reason = event["response"]["incomplete_details"]["reason"]
@@ -807,7 +865,17 @@ async fn parse_stream_body(
                             ..ProviderFailure::default()
                         },
                     },
-                    None => response.unknown(message, status_code),
+                    None => ProviderExecutionError::StreamFailure {
+                        failure: Box::new(ProviderFailure {
+                            message,
+                            provider_code,
+                            request_id: request_id.clone(),
+                            ..ProviderFailure::default()
+                        }),
+                        facts: response.facts(status_code),
+                        finished: response.finish_reason.is_some()
+                            && response.tool_calls.is_empty(),
+                    },
                 });
             }
             if native && responses.terminal {

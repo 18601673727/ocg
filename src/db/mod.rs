@@ -45,6 +45,12 @@ use crate::system::monitor::{
 };
 use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
+#[derive(Clone)]
+pub(crate) enum ProviderSettlementEvidence {
+    Observations(Vec<AvailabilityStat>),
+    Answer(Box<ProviderAnswer>),
+}
+
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 /// The most queued commands one group commit covers. Commands that queue up
 /// while the worker is busy form a group without any waiting, so a lone
