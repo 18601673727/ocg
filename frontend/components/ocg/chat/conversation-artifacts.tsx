@@ -14,7 +14,6 @@ import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
 import { artifactTitle, isArtifactCall, managedArtifactImages } from "./artifact-model";
 import { ArtifactPreview, type Artifact } from "./artifact-preview";
-import { FileChanges } from "./file-changes";
 
 export function ConversationArtifacts({ sessionId }: { sessionId: string }) {
   const { snapshot } = useOcgRuntime();
@@ -39,22 +38,12 @@ export function ConversationArtifacts({ sessionId }: { sessionId: string }) {
     }
     return [...found.values()].reverse();
   }, [snapshot.messagesBySession, sessionId]);
-  const changes = useMemo(
-    () =>
-      artifacts.flatMap((artifact) =>
-        "call" in artifact && artifact.call.name === "workspace_write_file"
-          ? [{ job: artifact.job, call: artifact.call }]
-          : [],
-      ),
-    [artifacts],
-  );
   const remaining = artifacts.filter(
     (artifact) => !("call" in artifact) || artifact.call.name !== "workspace_write_file",
   );
-  if (!artifacts.length) return null;
+  if (!remaining.length) return null;
   return (
     <>
-      <FileChanges changes={changes} />
       {remaining.length > 0 && (
         <section
           className="my-3 rounded-lg border border-border p-3"

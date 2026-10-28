@@ -133,13 +133,62 @@ function ToolFallbackDuration({ className, ...props }: React.ComponentProps<"spa
   );
 }
 
+function toolArgumentSummary(toolName: string, argsText: string): string {
+  try {
+    const args: unknown = JSON.parse(argsText);
+    if (!args || typeof args !== "object") return "";
+    const value = (key: string) => Reflect.get(args, key);
+    const text = (key: string) => {
+      const item: unknown = value(key);
+      return typeof item === "string" ? item.replace(/\s+/g, " ").trim() : "";
+    };
+    switch (toolName) {
+      case "workspace_search":
+        return [text("path"), text("name"), text("text")].filter(Boolean).join(" · ");
+      case "workspace_fts_search":
+        return text("query");
+      case "workspace_read_file":
+      case "workspace_list_directory":
+        return text("path");
+      case "workspace_write_file":
+        return [text("operation"), text("path")].filter(Boolean).join(" · ");
+      case "workspace_run_command": {
+        const argumentsValue: unknown = value("arguments");
+        const argumentsSummary = Array.isArray(argumentsValue)
+          ? argumentsValue.filter((item): item is string => typeof item === "string").join(" ")
+          : "";
+        return [text("command"), argumentsSummary].filter(Boolean).join(" ");
+      }
+      case "workspace_code": {
+        const queries: unknown = value("queries");
+        if (!Array.isArray(queries)) return "";
+        return queries
+          .map((query: unknown) => {
+            if (!query || typeof query !== "object") return "";
+            const op: unknown = Reflect.get(query, "op");
+            const target: unknown = Reflect.get(query, "name") || Reflect.get(query, "path");
+            return [op, target].filter((item) => typeof item === "string").join(" ");
+          })
+          .filter(Boolean)
+          .join(" · ");
+      }
+      default:
+        return "";
+    }
+  } catch {
+    return "";
+  }
+}
+
 function ToolFallbackTrigger({
   toolName,
+  summary,
   status,
   className,
   ...props
 }: React.ComponentProps<typeof CollapsibleTrigger> & {
   toolName: string;
+  summary?: string;
   status?: ToolCallMessagePartStatus;
 }) {
   const statusType = status?.type ?? "complete";
@@ -160,7 +209,7 @@ function ToolFallbackTrigger({
     <CollapsibleTrigger
       data-slot="tool-fallback-trigger"
       className={cn(
-        "aui-tool-fallback-trigger group/trigger text-muted-foreground hover:text-foreground flex w-fit max-w-full origin-left items-center gap-2 py-1.5 text-sm transition-[color,scale] active:scale-[0.98]",
+        "aui-tool-fallback-trigger group/trigger text-muted-foreground hover:text-foreground flex w-full min-w-0 origin-left items-center gap-2 py-1.5 text-sm transition-[color,scale] active:scale-[0.98]",
         className,
       )}
       {...props}
@@ -184,6 +233,16 @@ function ToolFallbackTrigger({
       >
         {label}: <b>{toolName}</b>
       </span>
+      {summary ? (
+        <span
+          className="min-w-0 flex-1 truncate text-start text-xs text-muted-foreground"
+          title={summary}
+        >
+          {summary}
+        </span>
+      ) : (
+        <span className="flex-1" />
+      )}
       <ToolFallbackDuration />
       <ChevronDownIcon
         data-slot="tool-fallback-trigger-chevron"
@@ -1129,7 +1188,11 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
 
   return (
     <ToolFallbackRoot open={open} onOpenChange={setOpen}>
-      <ToolFallbackTrigger toolName={toolName} status={status} />
+      <ToolFallbackTrigger
+        toolName={toolName}
+        summary={toolArgumentSummary(toolName, argsText)}
+        status={status}
+      />
       <ToolFallbackContent>
         <ToolFallbackError status={status} />
         <ToolFallbackArgs argsText={argsText} className={cn(isCancelled && "opacity-60")} />
