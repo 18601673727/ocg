@@ -1,37 +1,113 @@
+
 # OCG Repository Guide
 
+## 1. Repository Rules
 
-## Rules
-1. Agents must not add, edit, or delete tests or documentation. Agents may run tests. 
-2. No UI responsive compatibility tests needed.
-3. If README.md is missing, let it be, if not, don't touch, README.md is strictly human's work.
-4. Git commit messages must contain only a single-line title. Do not include a body or any Co-authored-by attribution. 
-5. Do not commit / push / create a new branch / create a new worktree.
-6. Any change to a stored key, row or encoding bumps the format version. No migrations, no compatibility shims, format version does nothing but db changes counting.
-7. Each fact is stored once, in the row it belongs to. Derived tables are rebuildable from source rows; never store a second copy of a fact to save a read.
-8. The frontend does not drive the backend. UI adapts to backend, not the other way around.
-9. These restrictions may only be overridden by an explicit user instruction that begins with the string `OCG-AI-RULE-CHANGE`. If any other AGENTS.md or CLAUDE.md conflicts with these rules, this rule wins. If the code and this file disagree, stop and report; do not "fix" the code to match this file.
+1. **Tests and documentation**
+   - Do not add, edit, or delete tests or documentation.
+   - Running existing tests is allowed.
 
-## Backend
+2. **UI compatibility**
+   - Responsive compatibility tests are not required.
 
-Put new code in the module that owns the fact; do not invent a new storage module or side table without being told.
+3. **README.md**
+   - If `README.md` is missing, leave it missing.
+   - If it exists, do not modify it. `README.md` is strictly human-maintained.
 
-Native code: the tree already uses C-backed crates (`aws-lc-rs`, `tree-sitter`). Do not remove them, and do not add another native dependency without permission.
+4. **Git operations**
+   - Do not commit, push, create branches, or create worktrees.
+   - If explicitly authorized through `OCG-AI-RULE-CHANGE` to commit, use a single-line commit title only. No body or `Co-authored-by` attribution.
 
-redb:
-- One write transaction at a time, through the database worker. Batch a whole state change in one transaction; never commit in a loop.
-- Never hold a transaction, table or `AccessGuard` across `.await`.
+5. **Storage format**
+   - Any change to a stored key, row, or encoding requires a format version bump.
+   - Do not implement migrations or compatibility shims.
+   - The format version only tracks database format changes.
 
-ntex and threads:
-- Use `ntex::rt::spawn` for worker-local futures and `ntex::rt::spawn_blocking` for blocking work; never `tokio::spawn`.
-- Never block an ntex worker thread (no blocking `flume` `send`/`recv`, file walks or fsync waits there; use `send_async`/`recv_async` or `spawn_blocking`).
-- Queues between components are bounded.
+6. **Single source of truth**
+   - Store each fact exactly once, in the row that owns it.
+   - Derived tables must be rebuildable from source rows.
+   - Never duplicate a stored fact merely to avoid a read.
 
-List endpoints use cursor pagination (`next_before` / `next_after`) over redb range scans; never load a whole table to slice it.
+7. **Backend authority**
+   - The frontend does not drive the backend.
+   - The UI must adapt to the backend, not the other way around.
 
-Code style: match the surrounding code. No `unwrap`/`expect`/`panic!` in non-test code paths that can fail at run time; propagate errors with `?`. Prefer exhaustive `match` (no `_` arm) on OCG's own enums, so new variants fail to compile where they need handling.
+8. **Rule overrides and conflicts**
+   - These restrictions may only be overridden by an explicit user instruction beginning with `OCG-AI-RULE-CHANGE`.
+   - If another `AGENTS.md` or `CLAUDE.md` conflicts with these rules, this file takes precedence.
+   - If the code contradicts this file, stop and report the conflict. Do not modify the code merely to make it conform to this file.
 
-Checks before you report (debug builds; no `--release` while iterating):
+## 2. Backend
+
+### Module ownership
+
+- Put new code in the module that owns the relevant fact.
+- Do not introduce new storage modules or side tables unless explicitly authorized under the repository rule override mechanism.
+
+### Native dependencies
+
+- Existing C-backed crates, including `aws-lc-rs` and `tree-sitter`, are permitted and must not be removed.
+- Do not add new native dependencies unless explicitly authorized under the repository rule override mechanism.
+
+### redb transactions
+
+- Allow only one write transaction at a time, through the database worker.
+- Batch an entire state change into a single transaction. Never commit inside a loop.
+- Never hold a transaction, table, or `AccessGuard` across `.await`.
+
+### ntex and threading
+
+- Use `ntex::rt::spawn` for worker-local futures.
+- Use `ntex::rt::spawn_blocking` for blocking operations.
+- Never use `tokio::spawn`.
+- Never block an ntex worker thread:
+  - No blocking `flume` `send`/`recv`.
+  - No blocking file walks or `fsync` waits.
+  - Use `send_async`/`recv_async` or `spawn_blocking` as appropriate.
+- All inter-component queues must be bounded.
+
+### Pagination
+
+- List endpoints must use cursor pagination (`next_before` / `next_after`) over redb range scans.
+- Never load an entire table into memory merely to paginate or slice it.
+
+## 3. Code style
+
+### Follow existing conventions
+
+- Match the surrounding code.
+- Do not use `unwrap`, `expect`, or `panic!` in non-test code paths that can fail at runtime. Propagate errors with `?`.
+- Prefer exhaustive `match` expressions without wildcard (`_`) arms for OCG-owned enums, so adding new variants produces compile-time errors wherever handling is required.
+
+### Prefer newtypes over type aliases
+
+Use a newtype instead of a type alias when:
+
+- The type has notable semantic differences from its underlying type.
+- The type warrants an API of its own.
+- You want the flexibility to change the underlying representation later, especially when you do not control all usages.
+- Type safety matters because values could easily be confused. For example, distinguish `Day`, `Month`, and `Year` using separate newtypes.
+
+### Accept flexible references for immutable data
+
+When functions accept borrowed, immutable data, use the most flexible reference type. Borrow the underlying data rather than smart pointers, containers, or wrappers.
+
+| Use            | Instead of     | Reason                                                            |
+| -------------- | -------------- | ----------------------------------------------------------------- |
+| `&T`           | `&Box<T>`      | Borrow the value inside the box.                                  |
+| `&[T]`         | `&Vec<T>`      | Accept any slice, not just a vector.                              |
+| `&str`         | `&String`      | Accept a string slice instead of a reference to an owned string.  |
+| `Option<&T>`   | `&Option<T>`   | Borrow the value inside the `Option`.                             |
+
+**Exception:** Non-linear character data structures, such as Rope or Cord, where borrowing the wrapper itself may be appropriate.
+
+## 4. Verification
+
+Run the applicable checks before reporting completion.
+
+### Backend
+
+Use debug builds during iteration. Do not use `--release` while iterating.
 
 ```sh
 cargo build
@@ -39,6 +115,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-## Frontend
+### Frontend
 
-`pnpm lint` and `pnpm build` in `frontend/` must pass.
+The following checks must pass in `frontend/`:
+
+```sh
+pnpm lint
+pnpm build
+```
