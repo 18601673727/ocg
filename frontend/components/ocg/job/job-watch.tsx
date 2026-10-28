@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { TaskStatus } from "./task-status";
 import { reconcileJob, taskPlanActive } from "../runtime/job-status";
 import { JobTranscript } from "@/components/ocg/chat/job-transcript";
-import { jobTranscript } from "@/components/ocg/chat/job-transcript-model";
+import { jobTranscript, outputText } from "@/components/ocg/chat/job-transcript-model";
 import {
   JOB_WATCH_RESIDENT_OUTPUTS,
   JOB_WATCH_WINDOW_STEP,
@@ -42,6 +42,44 @@ type Settlement = {
 
 function formatMicros(micros: number | null): string {
   return micros === null ? "—" : new Date(micros / 1000).toLocaleString();
+}
+
+function OutputContent({ output }: { output: ControlOutput }) {
+  const { t } = useI18n();
+  const [open, setOpen] = useState(false);
+  const body = outputText(output);
+  const value = output.value;
+  let structured = value;
+  if (body !== null && value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const fields = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "text"));
+    structured = Object.keys(fields).length > 0 ? fields : null;
+  }
+
+  return (
+    <>
+      {output.summary && output.summary !== body ? (
+        <p className="whitespace-pre-wrap break-words text-sm">{output.summary}</p>
+      ) : null}
+      {body ? <p className="whitespace-pre-wrap break-words text-sm">{body}</p> : null}
+      {output.code ? (
+        <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
+          {output.code}
+        </pre>
+      ) : null}
+      {structured !== null && structured !== undefined ? (
+        <details onToggle={(event) => setOpen(event.currentTarget.open)}>
+          <summary className="cursor-pointer text-xs text-muted-foreground">
+            {t("job.structuredData")}
+          </summary>
+          {open && (
+            <pre className="ocg-subtle-scrollbar mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 font-mono text-xs">
+              {JSON.stringify(structured, null, 2)}
+            </pre>
+          )}
+        </details>
+      ) : null}
+    </>
+  );
 }
 
 function failureText(t: TranslateFn, failure: { code: string; scope: "read" | "stream" }): string {
@@ -643,17 +681,7 @@ function JobWatchBody({
                     </span>
                   )}
                 </div>
-                {output.summary ? <p className="text-sm">{output.summary}</p> : null}
-                {output.code ? (
-                  <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
-                    {output.code}
-                  </pre>
-                ) : null}
-                {output.value === null || output.value === undefined ? null : (
-                  <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
-                    {JSON.stringify(output.value, null, 2)}
-                  </pre>
-                )}
+                <OutputContent output={output} />
               </li>
             ))}
           </ol>
@@ -685,20 +713,19 @@ function JobWatchBody({
     <section
       className={
         bare
-          ? "flex flex-col gap-4 text-card-foreground"
-          : "flex flex-col gap-4 rounded-lg border border-border bg-card p-5 text-card-foreground"
+          ? "flex flex-col text-card-foreground lg:h-full lg:min-h-0"
+          : "flex flex-col rounded-lg border border-border bg-card p-5 text-card-foreground"
       }
     >
-      <header className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 flex-col gap-1">
-          <h2 className="break-all font-heading text-lg">{job?.name ?? jobId}</h2>
-          <p className="break-all text-xs text-muted-foreground">
-            <code className="font-mono">{jobId}</code>
-            {job ? ` · ${job.execution_mode}` : ""}
-            {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
+      <header
+        className={
+          bare
+            ? "sticky top-0 z-10 flex min-h-16 shrink-0 flex-wrap items-center gap-3 border-b border-border bg-popover px-5 py-3 lg:static"
+            : "flex flex-wrap items-center gap-3"
+        }
+      >
+        <h2 className="min-w-0 flex-1 break-all font-heading text-lg">{job?.name ?? jobId}</h2>
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
           <span
             className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${TONE[badge] ?? TONE.unsettled}`}
           >
@@ -717,39 +744,52 @@ function JobWatchBody({
           </Button>
         </div>
       </header>
-      <TaskStatus plan={details?.task_plan} />
-      {statusFailure && (
-        <p className="text-sm text-destructive">{t("job.activity.statusFailed")}</p>
-      )}
-      {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
-      {failure ? (
-        <DismissibleNotice message={failureText(t, failure)} className="text-sm text-destructive">
-          <p>{failureText(t, failure)}</p>
-          <Button variant="outline" size="sm" onClick={onRetry}>
-            {t("common.retry")}
-          </Button>
-        </DismissibleNotice>
-      ) : null}
-      {presentation === "chat" ? (
-        <>
-          {answer}
-          <details className="flex flex-col gap-3">
-            <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-              {t("job.record")}
-            </summary>
-            <div className="mt-3 flex flex-col gap-4">
-              {recordFacts}
-              {storedOutputs}
-            </div>
-          </details>
-        </>
-      ) : (
-        <>
-          {recordFacts}
-          {answer}
-          {storedOutputs}
-        </>
-      )}
+      <div
+        className={
+          bare
+            ? "ocg-subtle-scrollbar flex min-h-0 flex-col gap-4 p-5 lg:flex-1 lg:overflow-auto"
+            : "mt-4 flex flex-col gap-4"
+        }
+      >
+        <p className="break-all text-xs text-muted-foreground">
+          <code className="font-mono">{jobId}</code>
+          {job ? ` · ${job.execution_mode}` : ""}
+          {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
+        </p>
+        <TaskStatus plan={details?.task_plan} />
+        {statusFailure && (
+          <p className="text-sm text-destructive">{t("job.activity.statusFailed")}</p>
+        )}
+        {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
+        {failure ? (
+          <DismissibleNotice message={failureText(t, failure)} className="text-sm text-destructive">
+            <p>{failureText(t, failure)}</p>
+            <Button variant="outline" size="sm" onClick={onRetry}>
+              {t("common.retry")}
+            </Button>
+          </DismissibleNotice>
+        ) : null}
+        {presentation === "chat" ? (
+          <>
+            {answer}
+            <details className="flex flex-col gap-3">
+              <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+                {t("job.record")}
+              </summary>
+              <div className="mt-3 flex flex-col gap-4">
+                {recordFacts}
+                {storedOutputs}
+              </div>
+            </details>
+          </>
+        ) : (
+          <>
+            {recordFacts}
+            {answer}
+            {storedOutputs}
+          </>
+        )}
+      </div>
     </section>
   );
 }

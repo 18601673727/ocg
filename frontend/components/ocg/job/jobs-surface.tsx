@@ -13,10 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { SettlementState } from "../contracts/api";
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import { JobWatch } from "./job-watch";
-import { JobTree } from "./job-tree";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { SELECTED_ROW } from "../primitives/selection";
@@ -46,11 +43,6 @@ export function JobsSurface({
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const loadMoreRef = useRef<() => void>(() => {});
-  // Picking a Job below the tree watches that Job without moving the tree's
-  // root; every other change of `job` (list, form, URL) moves the root too.
-  const [treeSelection, setTreeSelection] = useState<{ job: string; root: string } | null>(null);
-  if (treeSelection !== null && treeSelection.job !== job) setTreeSelection(null);
-  const treeRoot = treeSelection?.job === job ? treeSelection.root : job;
   useEffect(() => {
     if (!active) return;
     const controller = new AbortController();
@@ -158,7 +150,6 @@ export function JobsSurface({
   }, []);
   const select = useCallback(
     (next: string) => {
-      setTreeSelection(null);
       onJob(next);
     },
     [onJob],
@@ -293,45 +284,6 @@ export function JobsSurface({
         ) : null}
         {hasMore && <LoadMore loading={loadingMore} onLoad={loadMore} auto={!error} />}
       </section>
-      <Dialog
-        open={job !== null}
-        onOpenChange={(open) => {
-          if (!open) onJob(null);
-        }}
-      >
-        <DialogContent
-          className="flex h-[calc(100dvh-2rem)] max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none"
-          closeButtonClassName="top-2"
-        >
-          <div className="border-b border-border px-6 py-4 pr-14">
-            <DialogTitle>{t("jobs.detailsTitle")}</DialogTitle>
-            <DialogDescription className="sr-only">{t("jobs.tree.description")}</DialogDescription>
-          </div>
-          {job && treeRoot ? (
-            <div className="grid min-h-0 flex-1 grid-cols-1 overflow-auto lg:grid-cols-[minmax(18rem,0.8fr)_minmax(0,1.6fr)] lg:overflow-hidden">
-              <section className="ocg-subtle-scrollbar min-w-0 border-b border-border p-5 lg:overflow-auto lg:border-r lg:border-b-0">
-                <h2 className="mb-2 font-heading text-lg">{t("jobs.tree.title")}</h2>
-                <p className="mb-4 text-sm text-muted-foreground">{t("jobs.tree.description")}</p>
-                <JobTree
-                  key={treeRoot}
-                  client={client}
-                  root={treeRoot}
-                  selected={job}
-                  onSelect={(next) => {
-                    if (next !== job) setTreeSelection({ job: next, root: treeRoot });
-                    onJob(next);
-                  }}
-                  onReroot={(next) => select(next)}
-                  onOpenChat={onOpenChat}
-                />
-              </section>
-              <div className="ocg-subtle-scrollbar min-w-0 p-5 lg:overflow-auto">
-                <JobWatch key={job} client={client} jobId={job} bare />
-              </div>
-            </div>
-          ) : null}
-        </DialogContent>
-      </Dialog>
     </ContentContainer>
   );
 }

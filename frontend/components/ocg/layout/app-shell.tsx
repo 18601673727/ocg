@@ -16,6 +16,8 @@ import type { ComposerIntent } from "../composer/domain";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
 import { PageTitleVisibilityContext } from "./page-title";
+import { JobDetailsContext } from "../job/job-details-context";
+import { JobDetailsDialog } from "../job/job-details-dialog";
 import {
   ConversationErrorsProvider,
   ConversationErrorScope,
@@ -118,6 +120,9 @@ function AppShellContent({
   const runtime = useOcgRuntime();
   const { t } = useI18n();
   const [location, setLocation] = useState(currentLocation);
+  const [detailJob, setDetailJob] = useState(() =>
+    location.view === "jobs" ? location.job : null,
+  );
   const [sessionId, setSessionId] = useState("");
   const [ancestors, setAncestors] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState(false);
@@ -161,14 +166,14 @@ function AppShellContent({
   }, []);
 
   useEffect(() => {
-    if (!inspectorOpen || location.view !== "chat") return;
+    if (!inspectorOpen || location.view !== "chat" || detailJob !== null) return;
     document.getElementById("chat-inspector-close")?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") closeInspector();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [inspectorOpen, location.view, closeInspector]);
+  }, [inspectorOpen, location.view, detailJob, closeInspector]);
 
   useEffect(() => {
     const pop = () => {
@@ -177,6 +182,7 @@ function AppShellContent({
         void runtime.deleteSession(sessionId).catch((cause) => report?.(sessionId, cause));
       }
       setLocation(next);
+      setDetailJob(next.view === "jobs" ? next.job : null);
       if (next.view !== "settings") setSessionId("");
     };
     window.addEventListener("popstate", pop);
@@ -277,6 +283,20 @@ function AppShellContent({
     go("chat", job, undefined, true);
   }
 
+  function closeJobDetails() {
+    setDetailJob(null);
+    if (location.view === "jobs" && location.job) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("job");
+      window.history.replaceState(
+        window.history.state,
+        "",
+        `${url.pathname}${url.search}${url.hash}`,
+      );
+      setLocation({ ...location, job: null });
+    }
+  }
+
   const newChat = useCallback(async () => {
     const session = await runtime.createSession({ workType: "research" });
     setSessionId(session.id);
@@ -368,164 +388,179 @@ function AppShellContent({
   );
 
   return (
-    <ConversationErrorScope value={location.view === "chat" ? conversationKey : null}>
-      <div className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
-        <aside
-          className={cn(
-            "hidden shrink-0 border-r border-sidebar-border bg-sidebar md:flex",
-            collapsed ? "w-16" : "w-72",
+    <JobDetailsContext.Provider value={setDetailJob}>
+      <ConversationErrorScope value={location.view === "chat" ? conversationKey : null}>
+        <div data-ocg-app-shell className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
+          <aside
+            className={cn(
+              "hidden shrink-0 border-r border-sidebar-border bg-sidebar md:flex",
+              collapsed ? "w-16" : "w-72",
+            )}
+          >
+            {sidebar}
+          </aside>
+          {mobile && (
+            <div className="fixed inset-0 z-50 flex md:hidden">
+              <button
+                type="button"
+                aria-label={t("app.closeNavigation")}
+                className="absolute inset-0 bg-black/40"
+                onClick={() => setMobile(false)}
+              />
+              <aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">
+                {sidebar}
+              </aside>
+            </div>
           )}
-        >
-          {sidebar}
-        </aside>
-        {mobile && (
-          <div className="fixed inset-0 z-50 flex md:hidden">
-            <button
-              type="button"
-              aria-label={t("app.closeNavigation")}
-              className="absolute inset-0 bg-black/40"
-              onClick={() => setMobile(false)}
+          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+            <OcgTopbar
+              session={location.view === "chat" ? session : undefined}
+              activeView={location.view}
+              titleVisible={location.view === "chat" || !pageTitleInView}
+              onOpenMobileSidebar={() => setMobile(true)}
+              backButton={
+                location.view === "chat" && ancestors.length > 1 ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-11 shrink-0 rounded-full bg-muted/80 backdrop-blur-sm"
+                    aria-label={t("chat.child.back")}
+                    title={t("chat.child.back")}
+                    onClick={() => {
+                      window.history.pushState(null, "", conversationPath(ancestors.slice(0, -1)));
+                      setSessionId("");
+                      setLocation(currentLocation());
+                    }}
+                  >
+                    <ArrowLeft className="size-4" />
+                  </Button>
+                ) : undefined
+              }
+              inspectorToggle={
+                location.view === "chat" && inspectorAvailable && !inspectorOpen ? (
+                  <Button
+                    id="chat-inspector-toggle"
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-11 shrink-0 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted"
+                    aria-label={t("topbar.expandInspector")}
+                    title={t("topbar.expandInspector")}
+                    aria-expanded={false}
+                    aria-controls="chat-inspector"
+                    onClick={() => setInspectorOpen(true)}
+                  >
+                    <PanelRight className="size-4" />
+                  </Button>
+                ) : undefined
+              }
             />
-            <aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">
-              {sidebar}
-            </aside>
+            {signOutError && (
+              <DismissibleNotice message={signOutError} className="px-5 text-sm text-destructive">
+                {signOutError}
+              </DismissibleNotice>
+            )}
+            <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
+              <main
+                key={location.view}
+                className={cn(
+                  "flex min-h-0 flex-1 flex-col",
+                  location.view === "chat"
+                    ? "overflow-hidden"
+                    : "ocg-subtle-scrollbar overflow-y-auto overscroll-contain",
+                )}
+              >
+                {location.view === "chat" ? (
+                  <>
+                    {opening ? (
+                      <p role="status" className="m-auto text-sm text-muted-foreground">
+                        {t("app.loadingConversation")}
+                      </p>
+                    ) : session ? (
+                      <div className="flex min-h-0 flex-1 flex-col">
+                        <ChatScreen
+                          key={session.id}
+                          onOpenConversation={(job) => void openNestedConversation(job)}
+                          session={session}
+                          execution={null}
+                          runtimeStatus={runtime.snapshot.status}
+                          onComposerIntent={intent}
+                          onCancel={() => runtime.cancel(session.id)}
+                        />
+                      </div>
+                    ) : (
+                      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
+                        <h1 className="text-2xl font-medium">{t("chat.newThread")}</h1>
+                        <button
+                          type="button"
+                          className="rounded-md border border-border px-4 py-2 text-sm"
+                          onClick={() => void newChat()}
+                        >
+                          {t("sidebar.newChat")}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                ) : null}
+                {location.view === "jobs" && (
+                  <JobsSurface
+                    client={client}
+                    active
+                    job={detailJob}
+                    onJob={setDetailJob}
+                    onOpenChat={(job) => {
+                      setSessionId("");
+                      go("chat", job);
+                    }}
+                  />
+                )}
+                {(location.view === "usage" || location.view === "health") && (
+                  <ObservationsSurface
+                    key={location.view}
+                    client={client}
+                    kind={location.view}
+                    health={health}
+                    onJob={setDetailJob}
+                  />
+                )}
+                {location.view === "logs" && <LogsSurface client={client} />}
+                {location.view === "settings" && (
+                  <SettingsSurface
+                    client={client}
+                    sessionExpiresAtUs={sessionExpiresAtUs}
+                    signingOut={signingOut}
+                    onSignOut={onSignOut}
+                    section={location.settingsSection}
+                    onNavigate={goSettings}
+                  />
+                )}
+              </main>
+            </PageTitleVisibilityContext.Provider>
           </div>
-        )}
-        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-          <OcgTopbar
-            session={location.view === "chat" ? session : undefined}
-            activeView={location.view}
-            titleVisible={location.view === "chat" || !pageTitleInView}
-            onOpenMobileSidebar={() => setMobile(true)}
-            backButton={
-              location.view === "chat" && ancestors.length > 1 ? (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="size-11 shrink-0 rounded-full bg-muted/80 backdrop-blur-sm"
-                  aria-label={t("chat.child.back")}
-                  title={t("chat.child.back")}
-                  onClick={() => {
-                    window.history.pushState(null, "", conversationPath(ancestors.slice(0, -1)));
-                    setSessionId("");
-                    setLocation(currentLocation());
-                  }}
-                >
-                  <ArrowLeft className="size-4" />
-                </Button>
-              ) : undefined
-            }
-            inspectorToggle={
-              location.view === "chat" && inspectorAvailable && !inspectorOpen ? (
-                <Button
-                  id="chat-inspector-toggle"
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="size-11 shrink-0 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted"
-                  aria-label={t("topbar.expandInspector")}
-                  title={t("topbar.expandInspector")}
-                  aria-expanded={false}
-                  aria-controls="chat-inspector"
-                  onClick={() => setInspectorOpen(true)}
-                >
-                  <PanelRight className="size-4" />
-                </Button>
-              ) : undefined
-            }
-          />
-          {signOutError && (
-            <DismissibleNotice message={signOutError} className="px-5 text-sm text-destructive">
-              {signOutError}
-            </DismissibleNotice>
+          {location.view === "chat" && inspectorAvailable && inspectorOpen && (
+            <ChatInspector
+              session={session}
+              messages={session ? (runtime.snapshot.messagesBySession[session.id] ?? []) : []}
+              onClose={closeInspector}
+              onOpenJob={setDetailJob}
+            />
           )}
-          <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
-            <main
-              key={location.view}
-              className={cn(
-                "flex min-h-0 flex-1 flex-col",
-                location.view === "chat"
-                  ? "overflow-hidden"
-                  : "ocg-subtle-scrollbar overflow-y-auto overscroll-contain",
-              )}
-            >
-              {location.view === "chat" ? (
-                <>
-                  {opening ? (
-                    <p role="status" className="m-auto text-sm text-muted-foreground">
-                      {t("app.loadingConversation")}
-                    </p>
-                  ) : session ? (
-                    <div className="flex min-h-0 flex-1 flex-col">
-                      <ChatScreen
-                        key={session.id}
-                        onOpenConversation={(job) => void openNestedConversation(job)}
-                        session={session}
-                        execution={null}
-                        runtimeStatus={runtime.snapshot.status}
-                        onComposerIntent={intent}
-                        onCancel={() => runtime.cancel(session.id)}
-                      />
-                    </div>
-                  ) : (
-                    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
-                      <h1 className="text-2xl font-medium">{t("chat.newThread")}</h1>
-                      <button
-                        type="button"
-                        className="rounded-md border border-border px-4 py-2 text-sm"
-                        onClick={() => void newChat()}
-                      >
-                        {t("sidebar.newChat")}
-                      </button>
-                    </div>
-                  )}
-                </>
-              ) : null}
-              {location.view === "jobs" && (
-                <JobsSurface
-                  client={client}
-                  active
-                  job={location.job}
-                  onJob={(job) => go("jobs", job)}
-                  onOpenChat={(job) => {
-                    setSessionId("");
-                    go("chat", job);
-                  }}
-                />
-              )}
-              {(location.view === "usage" || location.view === "health") && (
-                <ObservationsSurface
-                  key={location.view}
-                  client={client}
-                  kind={location.view}
-                  health={health}
-                  onJob={(job) => go("jobs", job)}
-                />
-              )}
-              {location.view === "logs" && <LogsSurface client={client} />}
-              {location.view === "settings" && (
-                <SettingsSurface
-                  client={client}
-                  sessionExpiresAtUs={sessionExpiresAtUs}
-                  signingOut={signingOut}
-                  onSignOut={onSignOut}
-                  section={location.settingsSection}
-                  onNavigate={goSettings}
-                />
-              )}
-            </main>
-          </PageTitleVisibilityContext.Provider>
         </div>
-        {location.view === "chat" && inspectorAvailable && inspectorOpen && (
-          <ChatInspector
-            session={session}
-            messages={session ? (runtime.snapshot.messagesBySession[session.id] ?? []) : []}
-            onClose={closeInspector}
-            onOpenJob={(job) => go("jobs", job)}
-          />
-        )}
-      </div>
-    </ConversationErrorScope>
+        <JobDetailsDialog
+          client={client}
+          job={detailJob}
+          onJob={(job) => {
+            if (job === null) closeJobDetails();
+            else setDetailJob(job);
+          }}
+          onOpenChat={(job) => {
+            setDetailJob(null);
+            setSessionId("");
+            go("chat", job);
+          }}
+        />
+      </ConversationErrorScope>
+    </JobDetailsContext.Provider>
   );
 }

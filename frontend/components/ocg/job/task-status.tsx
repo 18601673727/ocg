@@ -3,9 +3,11 @@
 import Link from "next/link";
 import type { ControlTaskPlan } from "../contracts";
 import { useI18n } from "../i18n";
+import { useOpenJobDetails } from "./job-details-context";
 
 export function TaskStatus({ plan }: { plan?: ControlTaskPlan | null }) {
   const { t } = useI18n();
+  const openJobDetails = useOpenJobDetails();
   if (!plan) return null;
   const phase = plan.state;
   return (
@@ -20,7 +22,24 @@ export function TaskStatus({ plan }: { plan?: ControlTaskPlan | null }) {
       <ol className="list-decimal space-y-2 pl-5">
         {plan.steps.map((step) => (
           <li key={step.conversation}>
-            <Link className="underline underline-offset-2" href={`/jobs?job=${step.turn}`}>
+            <Link
+              className="underline underline-offset-2"
+              href={`/jobs?job=${step.turn}`}
+              onClick={(event) => {
+                if (
+                  !openJobDetails ||
+                  event.defaultPrevented ||
+                  event.button !== 0 ||
+                  event.metaKey ||
+                  event.ctrlKey ||
+                  event.shiftKey ||
+                  event.altKey
+                )
+                  return;
+                event.preventDefault();
+                openJobDetails(step.turn);
+              }}
+            >
               {step.title}
             </Link>{" "}
             · {t(`job.activity.${step.state}`)}

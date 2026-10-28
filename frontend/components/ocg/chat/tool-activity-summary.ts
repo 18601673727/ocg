@@ -8,6 +8,20 @@ export type ToolActivity = {
   truncated?: boolean;
 };
 
+export function jobPlanTitles(args: unknown): string {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return "";
+  const steps: unknown = Reflect.get(args, "steps");
+  if (!Array.isArray(steps)) return "";
+  return steps
+    .map((step: unknown) => {
+      if (!step || typeof step !== "object" || Array.isArray(step)) return "";
+      const title: unknown = Reflect.get(step, "title");
+      return typeof title === "string" ? title.replace(/\s+/g, " ").trim() : "";
+    })
+    .filter(Boolean)
+    .join(" · ");
+}
+
 const categories = ["read", "search", "code", "edit", "command", "agent", "other"] as const;
 type Category = (typeof categories)[number];
 

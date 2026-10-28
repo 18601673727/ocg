@@ -1,8 +1,18 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import { useState } from "react";
 import type { ComponentPropsWithRef, ComponentPropsWithoutRef, ReactNode } from "react";
-import { ArrowUp, Command, ListPlus, Loader2, Paperclip, Sparkles, Square } from "lucide-react";
+import {
+  ArrowUp,
+  Command,
+  Eye,
+  ListPlus,
+  Loader2,
+  Paperclip,
+  Sparkles,
+  Square,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { SELECTED_ROW, TEXT_TONE } from "@/components/ocg/primitives";
@@ -98,22 +108,12 @@ export function ChatComposerInput({
   };
 }) {
   const { t } = useI18n();
+  const [preview, setPreview] = useState(false);
   const activeSuggestion = suggestions?.items[suggestions.activeIndex];
   const errorInHeader = useConversationError(error);
   return (
     <>
       <div className="relative">
-        {textarea.value && (
-          <div
-            className="pointer-events-none absolute inset-0 z-0 max-h-[min(10rem,25dvh)] overflow-hidden px-3 pt-2.5 pb-1 text-base leading-6 sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
-            aria-hidden="true"
-          >
-            <MarkdownBody
-              content={textarea.value}
-              className="text-inherit leading-6 [&_blockquote]:my-0 [&_li]:leading-6 [&_ol]:mb-0 [&_ol]:space-y-0 [&_p]:mb-0 [&_ul]:mb-0 [&_ul]:space-y-0"
-            />
-          </div>
-        )}
         {suggestions && (
           <ul
             id="composer-suggestions"
@@ -174,9 +174,19 @@ export function ChatComposerInput({
             activeSuggestion ? `composer-suggestion-${activeSuggestion.id}` : undefined
           }
           aria-invalid={Boolean(error)}
-          className="relative z-10 max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base leading-6 text-transparent caret-foreground outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
+          className="relative z-10 max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base leading-6 text-foreground outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
         />
       </div>
+      {preview && (
+        <div
+          id="composer-preview"
+          role="region"
+          aria-label={t("chat.markdownPreview")}
+          className="max-h-[min(10rem,25dvh)] overflow-auto border-t border-border px-3 py-2"
+        >
+          <MarkdownBody content={textarea.value} />
+        </div>
+      )}
       {error && !errorInHeader && (
         <DismissibleNotice
           message={error}
@@ -197,6 +207,19 @@ export function ChatComposerInput({
           onClick={actions.onAttach}
         >
           <Paperclip className="size-4" />
+        </Button>
+        <Button
+          type="button"
+          variant={preview ? "selected" : "ghost"}
+          size="icon-xs"
+          className="size-11 rounded-md sm:size-9"
+          aria-label={t("chat.markdownPreview")}
+          aria-pressed={preview}
+          aria-controls={preview ? "composer-preview" : undefined}
+          title={t("chat.markdownPreview")}
+          onClick={() => setPreview((current) => !current)}
+        >
+          <Eye className="size-4" />
         </Button>
         {selectors}
         <span id="composer-hint" className="sr-only">

@@ -196,7 +196,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; afterMessages?: Rea
 
   return (
     <ThreadPrimitive.Root
-      className="aui-root aui-thread-root bg-background @container flex h-full flex-col"
+      className="aui-root aui-thread-root bg-background @container flex h-full min-h-0 flex-col"
       style={{
         ["--thread-max-width" as string]: "56rem",
         ["--composer-bg" as string]: "color-mix(in oklab, var(--color-muted) 30%, transparent)",
@@ -209,7 +209,7 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; afterMessages?: Rea
         autoScroll
         scrollToBottomOnRunStart={false}
         data-slot="aui_thread-viewport"
-        className="ocg-subtle-scrollbar relative flex flex-1 flex-col overflow-x-auto overflow-y-auto"
+        className="ocg-subtle-scrollbar relative flex min-h-0 flex-1 flex-col overflow-x-auto overflow-y-auto overscroll-contain"
       >
         <div
           className={cn(

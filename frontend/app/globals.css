@@ -227,6 +227,9 @@
   html {
     @apply font-sans;
   }
+  html:has([data-ocg-app-shell]) {
+    overflow: hidden;
+  }
 }
 
 @custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));

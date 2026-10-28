@@ -10,6 +10,7 @@ import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/c
 import type { TranscriptTurn } from "./job-transcript-model";
 import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 import { ToolActivityLabel } from "./tool-activity-label";
+import { jobPlanTitles } from "./tool-activity-summary";
 import {
   ReasoningRoot,
   ReasoningTrigger,
@@ -159,10 +160,11 @@ function TurnRow({
   );
 }
 
-function argumentSummary(raw: string | null): string {
+function argumentSummary(name: string, raw: string | null): string {
   if (!raw) return "";
   try {
     const parsed = JSON.parse(raw);
+    if (name === "job_plan") return jobPlanTitles(parsed);
     if (typeof parsed === "object" && parsed !== null) {
       if (typeof parsed.path === "string") return parsed.path;
       if (typeof parsed.preset === "string") return parsed.preset;
@@ -250,7 +252,7 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
       <div className="flex flex-col gap-2 p-3 pt-0">
         {open &&
           tools.map((tool) => {
-            const summary = argumentSummary(tool.arguments);
+            const summary = argumentSummary(tool.name, tool.arguments);
             const outcome = outcomeLabel(tool.outcome_kind, tool.decision, isLive);
             const isCompleted = outcome === "completed";
             const isRunning = outcome === "running";
@@ -267,7 +269,9 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
                   <div className="flex min-w-0 items-center gap-2 font-mono">
                     <span className="font-semibold text-foreground">{tool.name}</span>
                     {summary ? (
-                      <span className="truncate text-[11px] text-muted-foreground">{summary}</span>
+                      <span className="truncate text-[11px] text-muted-foreground" title={summary}>
+                        {summary}
+                      </span>
                     ) : null}
                   </div>
                   <span

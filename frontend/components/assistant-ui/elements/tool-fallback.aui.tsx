@@ -32,6 +32,7 @@ import {
   type ToolCallMessagePartComponent,
 } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
+import { jobPlanTitles } from "@/components/ocg/chat/tool-activity-summary";
 import {
   CollapsibleRoot as Collapsible,
   CollapsibleContent,
@@ -143,6 +144,8 @@ function toolArgumentSummary(toolName: string, argsText: string): string {
       return typeof item === "string" ? item.replace(/\s+/g, " ").trim() : "";
     };
     switch (toolName) {
+      case "job_plan":
+        return jobPlanTitles(args);
       case "workspace_search":
         return [text("path"), text("name"), text("text")].filter(Boolean).join(" · ");
       case "workspace_fts_search":

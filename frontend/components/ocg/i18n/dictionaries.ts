@@ -1479,6 +1479,7 @@ export const en = {
   "logs.session": "Session",
   "logs.invocation": "Invocation",
   "logs.structuredFields": "Structured fields",
+  "job.structuredData": "Structured data",
   "logs.fieldsLabel": "Structured fields",
   "logs.sensitiveRemoved": "Sensitive structured fields redacted",
   "logs.noFields": "No structured fields.",
@@ -1521,6 +1522,7 @@ export const en = {
 
   // -- chat ------------------------------------------------------------------------
   "chat.messagePlaceholder": "Type a message, Enter to send, Shift+Enter for a new line...",
+  "chat.markdownPreview": "Markdown preview",
   "chat.messageLabel": "Message OCG",
   "chat.send": "Send message",
   "chat.streaming": "streaming…",
@@ -3422,6 +3424,7 @@ export const zh: Dictionary = {
   "logs.session": "会话",
   "logs.invocation": "调用",
   "logs.structuredFields": "结构化字段",
+  "job.structuredData": "结构化数据",
   "logs.fieldsLabel": "结构化字段",
   "logs.sensitiveRemoved": "敏感结构化字段已脱敏",
   "logs.noFields": "暂无结构化字段。",
@@ -3462,6 +3465,7 @@ export const zh: Dictionary = {
   "ledger.window.last7d": "最近 7 天",
 
   "chat.messagePlaceholder": "输入消息，回车发送，Shift+回车换行...",
+  "chat.markdownPreview": "Markdown 预览",
   "chat.messageLabel": "给 OCG 发消息",
   "chat.send": "发送消息",
   "chat.streaming": "生成中…",
