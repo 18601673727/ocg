@@ -121,7 +121,7 @@ impl JobState {
             e.u32(c.notice_seq);
         });
         e.opt(&self.outcome, |e, o| {
-            e.u8(o.kind as u8);
+            e.u8(o.kind.code());
             e.ts(o.at);
             e.opt(&o.cause, |e, cause| match cause {
                 OutcomeCause::Code(c) => {
@@ -144,7 +144,7 @@ impl JobState {
             });
         });
         e.ots(self.stop_confirmed_at);
-        e.opt(&self.stop_confirmed_by, |e, proof| e.u8(*proof as u8));
+        e.opt(&self.stop_confirmed_by, |e, proof| e.u8(proof.code()));
         e.0
     }
 
@@ -178,17 +178,9 @@ impl JobState {
             })
         })?;
         let outcome = d.opt(|d| {
-            let kind = match d.u8()? {
-                1 => OutcomeKind::Completed,
-                2 => OutcomeKind::Failed,
-                3 => OutcomeKind::Cancelled,
-                4 => OutcomeKind::Unknown,
-                code => {
-                    return Err(StorageError::corrupted(format!(
-                        "invalid outcome kind {code}"
-                    )));
-                }
-            };
+            let kind = d.code_with(OutcomeKind::from_code, |code| {
+                StorageError::corrupted(format!("invalid outcome kind {code}"))
+            })?;
             let at = d.ts()?;
             let cause = d.opt(|d| match d.u8()? {
                 1 => Ok(OutcomeCause::Code(d.u8()?)),
@@ -205,13 +197,8 @@ impl JobState {
         })?;
         let stop_confirmed_at = d.ots()?;
         let stop_confirmed_by = d.opt(|d| {
-            Ok(match d.u8()? {
-                0 => StopProof::Proof,
-                1 => StopProof::Reboot,
-                2 => StopProof::Settled,
-                3 => StopProof::User,
-                4 => StopProof::Operator,
-                _ => return Err(StorageError::corrupted("invalid stop proof")),
+            d.code_with(StopProof::from_code, |_| {
+                StorageError::corrupted("invalid stop proof")
             })
         })?;
         d.end()?;
@@ -248,7 +235,7 @@ impl ConfigRow {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_CONFIG);
         e.u128(self.id.get());
-        e.u8(self.kind as u8);
+        e.u8(self.kind.code());
         e.str(&self.name);
         e.u32(self.edit_seq);
         e.ts(self.created_at);
@@ -315,26 +302,16 @@ impl ConfigRow {
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_CONFIG)?;
         let id = ConfigId::new(d.u128()?);
-        let kind = match d.u8()? {
-            1 => ConfigKind::Connection,
-            2 => ConfigKind::Model,
-            3 => ConfigKind::Agent,
-            4 => ConfigKind::Pool,
-            5 => ConfigKind::DecisionModel,
-            6 => ConfigKind::DecisionAgent,
-            code => {
-                return Err(StorageError::corrupted(format!(
-                    "invalid config kind {code}"
-                )));
-            }
-        };
+        let kind = d.code_with(ConfigKind::from_code, |code| {
+            StorageError::corrupted(format!("invalid config kind {code}"))
+        })?;
         let name = d.str()?;
         let edit_seq = d.u32()?;
         let created_at = d.ts()?;
         let updated_at = d.ts()?;
         let archived_at = d.ots()?;
         let body_tag = d.u8()?;
-        if body_tag != (kind as u8) {
+        if body_tag != kind.code() {
             return Err(StorageError::corrupted(format!(
                 "config body tag {body_tag} mismatch with kind {kind:?}"
             )));
@@ -538,15 +515,8 @@ pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
         for argument in &command.argv {
             e.str(argument);
         }
-        e.u8(match command.owner {
-            CommandOwner::User => 0,
-            CommandOwner::Decision => 1,
-        });
-        e.u8(match command.status {
-            CommandStatus::Allowed => 0,
-            CommandStatus::Review => 1,
-            CommandStatus::Blocked => 2,
-        });
+        e.u8(command.owner.code());
+        e.u8(command.status.code());
         e.opt(&command.proposal, |e, job| e.u128(job.get()));
     }
     e.opt(&p.decision, |e, policy| {
@@ -576,17 +546,12 @@ pub(super) fn decode_project(key: u128, bytes: &[u8]) -> DecodeResult<ProjectRec
         for _ in 0..argument_count {
             argv.push(d.str()?);
         }
-        let owner = match d.u8()? {
-            0 => CommandOwner::User,
-            1 => CommandOwner::Decision,
-            _ => return Err(StorageError::corrupted("invalid command owner")),
-        };
-        let status = match d.u8()? {
-            0 => CommandStatus::Allowed,
-            1 => CommandStatus::Review,
-            2 => CommandStatus::Blocked,
-            _ => return Err(StorageError::corrupted("invalid command status")),
-        };
+        let owner = d.code_with(CommandOwner::from_code, |_| {
+            StorageError::corrupted("invalid command owner")
+        })?;
+        let status = d.code_with(CommandStatus::from_code, |_| {
+            StorageError::corrupted("invalid command status")
+        })?;
         let proposal = d.opt(|d| Ok(JobId::new(d.u128()?)))?;
         commands.push(ProjectCommand {
             name,
@@ -913,14 +878,8 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
             finality,
         } => {
             e.u8(3);
-            e.u8(match eligibility {
-                RequestEligibility::Eligible => 1,
-                RequestEligibility::Excluded => 2,
-            });
-            e.u8(match finality {
-                UsageFinality::Cumulative => 1,
-                UsageFinality::Final => 2,
-            });
+            e.u8(eligibility.code());
+            e.u8(finality.code());
         }
     }
     e.0
@@ -985,24 +944,12 @@ pub(super) fn decode_request_event(
             }
         }
         3 => {
-            let eligibility = match d.u8()? {
-                1 => RequestEligibility::Eligible,
-                2 => RequestEligibility::Excluded,
-                code => {
-                    return Err(StorageError::corrupted(format!(
-                        "invalid token eligibility {code}"
-                    )));
-                }
-            };
-            let finality = match d.u8()? {
-                1 => UsageFinality::Cumulative,
-                2 => UsageFinality::Final,
-                code => {
-                    return Err(StorageError::corrupted(format!(
-                        "invalid token finality {code}"
-                    )));
-                }
-            };
+            let eligibility = d.code_with(RequestEligibility::from_code, |code| {
+                StorageError::corrupted(format!("invalid token eligibility {code}"))
+            })?;
+            let finality = d.code_with(UsageFinality::from_code, |code| {
+                StorageError::corrupted(format!("invalid token finality {code}"))
+            })?;
             RequestPayload::Token {
                 eligibility,
                 finality,
@@ -1046,7 +993,7 @@ impl JobInputEntry {
 impl Notice {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_NOTICE);
-        e.u8(self.class as u8);
+        e.u8(self.class.code());
         match &self.body {
             NoticeBody::Event {
                 child,
@@ -1060,7 +1007,7 @@ impl Notice {
             }
             NoticeBody::Record { event, by, at } => {
                 e.u8(1);
-                e.u8(*event as u8);
+                e.u8(event.code());
                 e.actor(by);
                 e.ts(*at);
             }
@@ -1069,12 +1016,9 @@ impl Notice {
     }
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_NOTICE)?;
-        let class = match d.u8()? {
-            0 => NoticeClass::Attention,
-            1 => NoticeClass::Progress,
-            2 => NoticeClass::Record,
-            _ => return Err(StorageError::corrupted("invalid notice class")),
-        };
+        let class = d.code_with(NoticeClass::from_code, |_| {
+            StorageError::corrupted("invalid notice class")
+        })?;
         let body = match d.u8()? {
             0 => NoticeBody::Event {
                 child: JobId::new(d.u128()?),
@@ -1082,12 +1026,9 @@ impl Notice {
                 reference: JobId::new(d.u128()?),
             },
             1 => NoticeBody::Record {
-                event: match d.u8()? {
-                    0 => RecordEvent::Hold,
-                    1 => RecordEvent::Unhold,
-                    2 => RecordEvent::Stop,
-                    _ => return Err(StorageError::corrupted("invalid record event")),
-                },
+                event: d.code_with(RecordEvent::from_code, |_| {
+                    StorageError::corrupted("invalid record event")
+                })?,
                 by: d.actor()?,
                 at: d.ts()?,
             },

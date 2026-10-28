@@ -461,12 +461,9 @@ fn rebuild_jobs(tx: &WriteTransaction, clock: i64) -> Result<(), StorageError> {
                             } => transactions::decision_requirement(),
                             JobKind::Execution { .. } => {
                                 let execution =
-                                    reader::turn_config_of(&tx.open_table(JOBS)?, &row)?
-                                        .ok_or_else(|| {
-                                            StorageError::corrupted(
-                                                "ready job has no configuration",
-                                            )
-                                        })?;
+                                    reader::turn_config(tx, &row)?.ok_or_else(|| {
+                                        StorageError::corrupted("ready job has no configuration")
+                                    })?;
                                 transactions::execution_requirement(&execution)
                             }
                             JobKind::Group { .. } => {

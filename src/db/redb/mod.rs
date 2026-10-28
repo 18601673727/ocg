@@ -24,8 +24,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ::redb::{
-    CommitError, Database, Durability, ReadTransaction, ReadableDatabase, ReadableTable,
-    TableDefinition, WriteTransaction,
+    CommitError, Database, Durability, Key, ReadOnlyTable, ReadTransaction, ReadableDatabase,
+    ReadableTable, Table, TableDefinition, TableError, Value, WriteTransaction,
 };
 
 use crate::db::entities::{
@@ -183,6 +183,36 @@ impl From<::redb::Error> for StorageError {
             os_error,
             detail: error.to_string(),
         }
+    }
+}
+
+/// The table-opening half of both transaction kinds, so a reader that opens
+/// only tables it owns works on a read and a write transaction alike.
+pub(super) trait TxRead {
+    type Table<'t, K: Key + 'static, V: Value + 'static>: ReadableTable<K, V>
+    where
+        Self: 't;
+    fn table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Self::Table<'_, K, V>, TableError>;
+}
+impl TxRead for ReadTransaction {
+    type Table<'t, K: Key + 'static, V: Value + 'static> = ReadOnlyTable<K, V>;
+    fn table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Self::Table<'_, K, V>, TableError> {
+        self.open_table(definition)
+    }
+}
+impl TxRead for WriteTransaction {
+    type Table<'t, K: Key + 'static, V: Value + 'static> = Table<'t, K, V>;
+    fn table<K: Key + 'static, V: Value + 'static>(
+        &self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<Self::Table<'_, K, V>, TableError> {
+        self.open_table(definition)
     }
 }
 

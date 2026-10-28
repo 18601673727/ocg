@@ -109,18 +109,14 @@ impl Batch {
         for (dependency, condition) in spec.kind.waits_on() {
             if !self.is_subtree_settled(dependency)? {
                 open_dependencies += 1;
-                self.step(|tx| {
-                    tx.open_table(DEPENDENCY_WAITERS)?
-                        .insert((dependency.get(), job.get()), condition.code())?;
-                    Ok(())
-                })?;
+                self.insert(
+                    DEPENDENCY_WAITERS,
+                    (dependency.get(), job.get()),
+                    condition.code(),
+                )?;
             }
         }
-        self.step(|tx| {
-            tx.open_table(UNSETTLED)?
-                .insert(job.get(), (open_dependencies, 0))?;
-            Ok(())
-        })?;
+        self.insert(UNSETTLED, job.get(), (open_dependencies, 0))?;
         if let Some(parent) = spec.parent_id {
             self.adjust_open_children(parent, 1)?;
         }
@@ -144,11 +140,7 @@ impl Batch {
         if spec.kind.is_persistent()
             && let Some(conversation) = spec.parent_id
         {
-            self.step(|tx| {
-                tx.open_table(GROUP_HEADS)?
-                    .insert(conversation.get(), job.get())?;
-                Ok(())
-            })?;
+            self.insert(GROUP_HEADS, conversation.get(), job.get())?;
         }
         if let Some((key, fingerprint)) = submission {
             let record = SubmissionRecord {
@@ -158,13 +150,11 @@ impl Batch {
                 seq: 0,
                 recorded_at: self.now,
             };
-            self.step(|tx| {
-                tx.open_table(SUBMISSIONS)?.insert(
-                    key.as_bytes().as_slice(),
-                    encode_submission(&record).as_slice(),
-                )?;
-                Ok(())
-            })?;
+            self.insert(
+                SUBMISSIONS,
+                key.as_bytes().as_slice(),
+                encode_submission(&record).as_slice(),
+            )?;
             self.probe = Some(Probe::Submission(key));
         }
         Ok(job)
@@ -776,7 +766,7 @@ impl Batch {
             return Ok(false);
         }
         if let Some(adopted) = self.adopt_context(job)? {
-            let reducible = self.step(|tx| reader::source_reducible_write(tx, &adopted.source))?;
+            let reducible = self.step(|tx| reader::source_reducible(tx, &adopted.source))?;
             occupancy = occupancy.saturating_sub(reducible);
             occupancy =
                 occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
@@ -1270,11 +1260,7 @@ impl Batch {
             if let Some(closing) = self.job_control(conversation)?.closing {
                 self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
             } else {
-                self.step(|tx| {
-                    tx.open_table(OPEN_APPROVALS)?
-                        .insert(approvals::open_key(conversation, call), 0)?;
-                    Ok(())
-                })?;
+                self.insert(OPEN_APPROVALS, approvals::open_key(conversation, call), 0)?;
                 self.notify(conversation, NoticeEvent::Requested, call.job)?;
             }
         }
@@ -1331,11 +1317,7 @@ impl Batch {
             at: self.now,
         });
         self.put_tool_evidence(&record)?;
-        self.step(|tx| {
-            tx.open_table(TOOL_STATS)?
-                .insert(record.name.as_str(), updated_stats)?;
-            Ok(())
-        })?;
+        self.insert(TOOL_STATS, record.name.as_str(), updated_stats)?;
         self.probe = Some(Probe::ToolOutcome(call));
         Ok(())
     }
@@ -1459,16 +1441,9 @@ impl Batch {
             let epoch = claim.epoch;
             if kind != OutcomeKind::Unknown || state.stop_confirmed_at.is_some() {
                 self.freed_capacity = true;
-                self.step(|tx| {
-                    tx.open_table(HELD_SLOTS)?.remove((pool, job.get()))?;
-                    Ok(())
-                })?;
+                self.remove(HELD_SLOTS, (pool, job.get()))?;
             } else {
-                self.step(|tx| {
-                    tx.open_table(HELD_SLOTS)?
-                        .insert((pool, job.get()), (epoch, true))?;
-                    Ok(())
-                })?;
+                self.insert(HELD_SLOTS, (pool, job.get()), (epoch, true))?;
             }
         } else {
             self.cancel_pending_writes(job)?;
@@ -1539,19 +1514,13 @@ impl Batch {
         if let Some(claim) = &state.claim {
             let pool = claim.pool_id.get();
             self.freed_capacity = true;
-            self.step(|tx| {
-                tx.open_table(HELD_SLOTS)?.remove((pool, job.get()))?;
-                Ok(())
-            })?;
+            self.remove(HELD_SLOTS, (pool, job.get()))?;
         }
         let row = self.require_job(job)?;
         if row.kind.is_persistent()
             && let Some(conversation) = row.parent_id
         {
-            self.step(|tx| {
-                tx.open_table(ACTIVE_JOBS)?.remove(conversation.get())?;
-                Ok(())
-            })?;
+            self.remove(ACTIVE_JOBS, conversation.get())?;
         }
         self.put_job_state(job, &state)?;
         self.settle(job)?;
@@ -1612,10 +1581,7 @@ impl Batch {
                 }
                 continue;
             }
-            self.step(|tx| {
-                tx.open_table(UNSETTLED)?.remove(job.get())?;
-                Ok(())
-            })?;
+            self.remove(UNSETTLED, job.get())?;
             let completed = state
                 .outcome
                 .as_ref()
@@ -1630,11 +1596,7 @@ impl Batch {
                 Ok(waiters)
             })?;
             for (waiter, condition) in waiters {
-                self.step(|tx| {
-                    tx.open_table(DEPENDENCY_WAITERS)?
-                        .remove((job.get(), waiter))?;
-                    Ok(())
-                })?;
+                self.remove(DEPENDENCY_WAITERS, (job.get(), waiter))?;
                 let waiter = JobId::new(waiter);
                 let condition = DependencyCondition::from_code(condition)
                     .ok_or_else(|| StorageError::corrupted("invalid dependency condition"));
@@ -1668,11 +1630,7 @@ impl Batch {
             }
             if let Some(parent) = row.parent_id {
                 if row.kind.is_group() {
-                    self.step(|tx| {
-                        tx.open_table(LIVE_CHILDREN)?
-                            .remove((parent.get(), job.get()))?;
-                        Ok(())
-                    })?;
+                    self.remove(LIVE_CHILDREN, (parent.get(), job.get()))?;
                     self.auto_close_check(parent)?;
                 }
                 self.adjust_open_children(parent, -1)?;

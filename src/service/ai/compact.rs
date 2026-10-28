@@ -173,6 +173,9 @@ fn system_messages(
             &command_names,
         ));
     }
+    messages.push(ChatMessage::system(
+        super::generative_model::CHART_INSTRUCTIONS,
+    ));
 
     let mut agent_conv = super::generative_model::objective_conversation(frozen, None);
     agent_conv.messages.pop();

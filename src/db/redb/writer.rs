@@ -315,6 +315,58 @@ impl Batch {
         }
     }
 
+    /// Inserts `value` under `key` in `table`.
+    pub(super) fn insert<'k, 'v, K, V>(
+        &mut self,
+        table: TableDefinition<K, V>,
+        key: K::SelfType<'k>,
+        value: V::SelfType<'v>,
+    ) -> Result<(), BatchError>
+    where
+        K: Key + 'static,
+        V: Value + 'static,
+    {
+        self.step(|tx| {
+            tx.open_table(table)?.insert(&key, &value)?;
+            Ok(())
+        })
+    }
+
+    /// Reads `key` from `table` and decodes it.
+    pub(super) fn get<K, V, T>(
+        &mut self,
+        table: TableDefinition<K, V>,
+        key: K::SelfType<'_>,
+        decode: impl FnOnce(V::SelfType<'_>) -> DecodeResult<T>,
+    ) -> Result<Option<T>, BatchError>
+    where
+        K: Key + 'static,
+        V: Value + 'static,
+    {
+        self.step(|tx| {
+            tx.open_table(table)?
+                .get(&key)?
+                .map(|bytes| decode(bytes.value()))
+                .transpose()
+        })
+    }
+
+    /// Removes `key` from `table`.
+    pub(super) fn remove<K, V>(
+        &mut self,
+        table: TableDefinition<K, V>,
+        key: K::SelfType<'_>,
+    ) -> Result<(), BatchError>
+    where
+        K: Key + 'static,
+        V: Value + 'static,
+    {
+        self.step(|tx| {
+            tx.open_table(table)?.remove(&key)?;
+            Ok(())
+        })
+    }
+
     pub(super) fn decoded<T>(&mut self, decoded: DecodeResult<T>) -> Result<T, BatchError> {
         match decoded {
             Ok(value) => Ok(value),
@@ -439,13 +491,9 @@ impl Batch {
     }
 
     pub(crate) fn config(&mut self, id: ConfigId) -> Result<Option<ConfigRow>, BatchError> {
-        let row = self.step(|tx| {
-            tx.open_table(CONFIGS)?
-                .get(id.get())?
-                .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
-                .transpose()
-        })?;
-        Ok(row)
+        self.get(CONFIGS, id.get(), |bytes| {
+            ConfigRow::decode_at(id.get(), bytes)
+        })
     }
 
     pub(crate) fn config_record(
@@ -706,11 +754,7 @@ impl Batch {
     }
 
     fn put_config(&mut self, row: &ConfigRow) -> Result<(), BatchError> {
-        self.step(|tx| {
-            tx.open_table(CONFIGS)?
-                .insert(row.id.get(), row.encode().as_slice())?;
-            Ok(())
-        })
+        self.insert(CONFIGS, row.id.get(), row.encode().as_slice())
     }
 
     /// Inserts a new config with edit counter 1.
@@ -1116,12 +1160,7 @@ impl Batch {
     // ---- jobs --------------------------------------------------------------------------
 
     pub(crate) fn job(&mut self, id: JobId) -> Result<Option<JobSpec>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(JOBS)?
-                .get(id.get())?
-                .map(|bytes| JobSpec::decode_at(id.get(), bytes.value()))
-                .transpose()
-        })
+        self.get(JOBS, id.get(), |bytes| JobSpec::decode_at(id.get(), bytes))
     }
 
     pub(crate) fn require_job(&mut self, id: JobId) -> Result<JobSpec, BatchError> {
@@ -1132,11 +1171,8 @@ impl Batch {
     }
 
     pub(crate) fn job_state(&mut self, id: JobId) -> Result<Option<JobState>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(JOB_STATES)?
-                .get(id.get())?
-                .map(|bytes| JobState::decode_at(id.get(), bytes.value()))
-                .transpose()
+        self.get(JOB_STATES, id.get(), |bytes| {
+            JobState::decode_at(id.get(), bytes)
         })
     }
 
@@ -1178,11 +1214,7 @@ impl Batch {
 
     pub(crate) fn put_job_state(&mut self, job: JobId, state: &JobState) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.step(|tx| {
-            tx.open_table(JOB_STATES)?
-                .insert(job.get(), state.encode().as_slice())?;
-            Ok(())
-        })
+        self.insert(JOB_STATES, job.get(), state.encode().as_slice())
     }
 
     /// SubtreeSettled is the absence of an `unsettled` row (I20).
@@ -1277,11 +1309,8 @@ impl Batch {
         &mut self,
         key: SubmissionKey,
     ) -> Result<Option<SubmissionRecord>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(SUBMISSIONS)?
-                .get(key.as_bytes().as_slice())?
-                .map(|bytes| decode_submission(key.as_bytes(), bytes.value()))
-                .transpose()
+        self.get(SUBMISSIONS, key.as_bytes().as_slice(), |bytes| {
+            decode_submission(key.as_bytes(), bytes)
         })
     }
 
@@ -1289,11 +1318,8 @@ impl Batch {
         &mut self,
         id: AttachmentId,
     ) -> Result<AttachmentRecord, BatchError> {
-        let record = self.step(|tx| {
-            tx.open_table(ATTACHMENTS)?
-                .get(id.get())?
-                .map(|bytes| decode_attachment(id.get(), bytes.value()))
-                .transpose()
+        let record = self.get(ATTACHMENTS, id.get(), |bytes| {
+            decode_attachment(id.get(), bytes)
         })?;
         match record {
             Some(record) => Ok(record),
@@ -1329,23 +1355,14 @@ impl Batch {
 
     pub(crate) fn insert_project(&mut self, record: &ProjectRecord) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.step(|tx| {
-            tx.open_table(PROJECTS)?
-                .insert(record.id.get(), encode_project(record).as_slice())?;
-            Ok(())
-        })
+        self.insert(PROJECTS, record.id.get(), encode_project(record).as_slice())
     }
 
     pub(crate) fn require_project_record(
         &mut self,
         id: ProjectId,
     ) -> Result<ProjectRecord, BatchError> {
-        let record = self.step(|tx| {
-            tx.open_table(PROJECTS)?
-                .get(id.get())?
-                .map(|bytes| decode_project(id.get(), bytes.value()))
-                .transpose()
-        })?;
+        let record = self.get(PROJECTS, id.get(), |bytes| decode_project(id.get(), bytes))?;
         match record {
             Some(record) => Ok(record),
             None => self.reject(Violation::NotFound(RecordRef::Project(id))),
@@ -1382,11 +1399,7 @@ impl Batch {
         row: &JobControl,
     ) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.step(|tx| {
-            tx.open_table(JOB_CONTROLS)?
-                .insert(root.get(), row.encode().as_slice())?;
-            Ok(())
-        })
+        self.insert(JOB_CONTROLS, root.get(), row.encode().as_slice())
     }
 
     // ---- tool calls ------------------------------------------------------------------------
@@ -1402,11 +1415,8 @@ impl Batch {
         &mut self,
         call: ToolCallRef,
     ) -> Result<Option<ToolEvidenceRecord>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(TOOL_CALLS)?
-                .get(tool_call_key(call))?
-                .map(|bytes| decode_tool_evidence(call, bytes.value()))
-                .transpose()
+        self.get(TOOL_CALLS, tool_call_key(call), |bytes| {
+            decode_tool_evidence(call, bytes)
         })
     }
 
@@ -1415,13 +1425,11 @@ impl Batch {
         record: &ToolEvidenceRecord,
     ) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.step(|tx| {
-            tx.open_table(TOOL_CALLS)?.insert(
-                tool_call_key(record.call),
-                encode_tool_evidence(record).as_slice(),
-            )?;
-            Ok(())
-        })
+        self.insert(
+            TOOL_CALLS,
+            tool_call_key(record.call),
+            encode_tool_evidence(record).as_slice(),
+        )
     }
 
     pub(crate) fn put_message(
@@ -1606,7 +1614,7 @@ impl Batch {
         if row.kind.is_group() {
             return Ok((None, Vec::new()));
         }
-        let target = self.step(|tx| reader::turn_target_of(&tx.open_table(JOBS)?, &row))?;
+        let target = self.step(|tx| reader::turn_target(tx, &row))?;
         let events = self.step(|tx| {
             let table = tx.open_table(REQUEST_EVENTS)?;
             let mut events = Vec::new();
@@ -1649,7 +1657,7 @@ impl Batch {
         else {
             return Ok(());
         };
-        let target = self.step(|tx| reader::turn_target_of(&tx.open_table(JOBS)?, &row))?;
+        let target = self.step(|tx| reader::turn_target(tx, &row))?;
         let parent = match row.parent_id {
             Some(parent) => self.job(parent)?,
             None => None,
@@ -1865,13 +1873,11 @@ impl Batch {
         &mut self,
         record: &SubmissionRecord,
     ) -> Result<(), BatchError> {
-        self.step(|tx| {
-            tx.open_table(SUBMISSIONS)?.insert(
-                record.key.as_bytes().as_slice(),
-                encode_submission(record).as_slice(),
-            )?;
-            Ok(())
-        })?;
+        self.insert(
+            SUBMISSIONS,
+            record.key.as_bytes().as_slice(),
+            encode_submission(record).as_slice(),
+        )?;
         self.probe = Some(Probe::Submission(record.key));
         Ok(())
     }
@@ -1912,12 +1918,7 @@ impl Batch {
         job: JobId,
         seq: u32,
     ) -> Result<Option<Notice>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(NOTICES)?
-                .get((job.get(), seq))?
-                .map(|bytes| Notice::decode(bytes.value()))
-                .transpose()
-        })
+        self.get(NOTICES, (job.get(), seq), Notice::decode)
     }
     pub(crate) fn open_job_dependencies(&mut self, job: JobId) -> Result<u32, BatchError> {
         self.step(|tx| {

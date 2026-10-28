@@ -1277,19 +1277,11 @@ fn turn_identity(rx: &ReadTransaction, row: &JobSpec) -> Result<(ConfigId, Strin
 
 /// The frozen generative configuration of a turn. A decision turn has none:
 /// its configuration is typed decision work, not an LLM Profile.
-fn turn_config(
-    rx: &ReadTransaction,
+pub(super) fn turn_config(
+    tx: &impl TxRead,
     row: &JobSpec,
 ) -> Result<Option<FrozenExecutionConfig>, StorageError> {
-    let jobs = rx.open_table(JOBS)?;
-    turn_config_of(&jobs, row)
-}
-
-/// See [`turn_config`]; it takes the table so a write batch can call it.
-pub(super) fn turn_config_of(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    row: &JobSpec,
-) -> Result<Option<FrozenExecutionConfig>, StorageError> {
+    let jobs = tx.table(JOBS)?;
     if matches!(
         &row.kind,
         JobKind::Execution {
@@ -1300,7 +1292,7 @@ pub(super) fn turn_config_of(
     {
         return Ok(None);
     }
-    Ok(Some(job_execution(jobs, row)?.0))
+    Ok(Some(job_execution(&jobs, row)?.0))
 }
 
 #[derive(Clone)]
@@ -1338,10 +1330,10 @@ pub(super) fn turn_usage_identity_of(
 /// The generative accounting target of a turn. A decision turn has no LLM
 /// Profile or generative Provider, so it has none.
 pub(super) fn turn_target(
-    rx: &ReadTransaction,
+    tx: &impl TxRead,
     row: &JobSpec,
 ) -> Result<Option<crate::db::entities::LlmTarget>, StorageError> {
-    let jobs = rx.open_table(JOBS)?;
+    let jobs = tx.table(JOBS)?;
     turn_target_of(&jobs, row)
 }
 
@@ -3096,43 +3088,35 @@ pub(super) struct SealedTurn {
     pub context_tokens: usize,
 }
 
-macro_rules! source_reducible_tokens {
-    ($name:ident, $transaction:ty) => {
-        pub(super) fn $name(
-            tx: &$transaction,
-            manifest: &crate::db::entities::ContextSourceManifest,
-        ) -> Result<usize, StorageError> {
-            if manifest.turns.is_empty() {
-                return Ok(0);
-            }
-            let jobs = tx.open_table(JOBS)?;
-            let states = tx.open_table(JOB_STATES)?;
-            let inputs = tx.open_table(JOB_INPUTS)?;
-            let outputs = tx.open_table(JOB_OUTPUTS)?;
-            let tools = tx.open_table(TOOL_CALLS)?;
-            let approvals = tx.open_table(APPROVALS)?;
-            let mut reducible = 0usize;
-            for boundary in &manifest.turns {
-                let source = source_turn(
-                    &jobs,
-                    &states,
-                    &inputs,
-                    &outputs,
-                    &tools,
-                    &approvals,
-                    boundary.turn,
-                    Some((boundary.input_through, boundary.output_through)),
-                )?;
-                reducible =
-                    reducible.saturating_add(source.map_or(0, |turn| turn.reducible_tokens));
-            }
-            Ok(reducible)
-        }
-    };
+pub(super) fn source_reducible(
+    tx: &impl TxRead,
+    manifest: &crate::db::entities::ContextSourceManifest,
+) -> Result<usize, StorageError> {
+    if manifest.turns.is_empty() {
+        return Ok(0);
+    }
+    let jobs = tx.table(JOBS)?;
+    let states = tx.table(JOB_STATES)?;
+    let inputs = tx.table(JOB_INPUTS)?;
+    let outputs = tx.table(JOB_OUTPUTS)?;
+    let tools = tx.table(TOOL_CALLS)?;
+    let approvals = tx.table(APPROVALS)?;
+    let mut reducible = 0usize;
+    for boundary in &manifest.turns {
+        let source = source_turn(
+            &jobs,
+            &states,
+            &inputs,
+            &outputs,
+            &tools,
+            &approvals,
+            boundary.turn,
+            Some((boundary.input_through, boundary.output_through)),
+        )?;
+        reducible = reducible.saturating_add(source.map_or(0, |turn| turn.reducible_tokens));
+    }
+    Ok(reducible)
 }
-
-source_reducible_tokens!(source_reducible_read, ReadTransaction);
-source_reducible_tokens!(source_reducible_write, WriteTransaction);
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn source_turn(
@@ -3625,7 +3609,7 @@ pub(crate) fn read_context_state(
     if let Some(tip) = tip
         && let Some(adopted) = adopted_context(&rx, tip)?
     {
-        tokens = tokens.saturating_sub(source_reducible_read(&rx, &adopted.source)?);
+        tokens = tokens.saturating_sub(source_reducible(&rx, &adopted.source)?);
         tokens = tokens.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
     }
     let settings = global_compaction_settings(&rx.open_table(META)?)?;

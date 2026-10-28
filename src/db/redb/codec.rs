@@ -1,10 +1,11 @@
 use super::*;
 use crate::db::entities::{
-    ChoiceOption, CommandAssessment, CompactionMode, CompactionPolicy, CompactionPreset,
-    CustomPolicy, DecisionAgentConfig, DecisionAssignment, DecisionCapability, DecisionLimits,
-    DecisionModelConfig, DecisionProtocol, DecisionQuestion, DecisionRequest, DecisionWork,
-    FrozenDecisionAgent, FrozenDecisionConfig, NativeDecisionConfig, PredictionAcceptance,
-    PredictionMode, PredictiveCompaction, ScoreLevel, SummarizationStage,
+    ChoiceOption, CommandAssessment, CommandOwner, CommandStatus, CompactionMode, CompactionPolicy,
+    CompactionPreset, ConfigKind, CustomPolicy, DecisionAgentConfig, DecisionAssignment,
+    DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol, DecisionQuestion,
+    DecisionRequest, DecisionWork, FrozenDecisionAgent, FrozenDecisionConfig, NativeDecisionConfig,
+    PredictionAcceptance, PredictionMode, PredictiveCompaction, RequestEligibility, ScoreLevel,
+    SummarizationStage, UsageFinality,
 };
 
 // ---- explicit versioned encoding ----------------------------------------------
@@ -111,11 +112,7 @@ impl Enc {
             CompactionMode::Off => self.u8(0),
             CompactionMode::Auto { preset } => {
                 self.u8(1);
-                self.u8(match preset {
-                    CompactionPreset::Conservative => 0,
-                    CompactionPreset::Balanced => 1,
-                    CompactionPreset::Aggressive => 2,
-                });
+                self.u8(preset.code());
             }
             CompactionMode::Custom { policy } => {
                 self.u8(2);
@@ -413,8 +410,17 @@ impl<'a> Dec<'a> {
         })
     }
     pub(super) fn code<T>(&mut self, decode: impl FnOnce(u8) -> Option<T>) -> DecodeResult<T> {
+        self.code_with(decode, |code| {
+            StorageError::corrupted(format!("invalid enum code {code}"))
+        })
+    }
+    pub(super) fn code_with<T>(
+        &mut self,
+        decode: impl FnOnce(u8) -> Option<T>,
+        error: impl FnOnce(u8) -> StorageError,
+    ) -> DecodeResult<T> {
         let code = self.u8()?;
-        decode(code).ok_or_else(|| StorageError::corrupted(format!("invalid enum code {code}")))
+        decode(code).ok_or_else(|| error(code))
     }
     pub(super) fn agent_config(&mut self) -> DecodeResult<AgentConfig> {
         let instructions = self.ostr()?;
@@ -443,12 +449,9 @@ impl<'a> Dec<'a> {
         let mode = match self.u8()? {
             0 => CompactionMode::Off,
             1 => CompactionMode::Auto {
-                preset: match self.u8()? {
-                    0 => CompactionPreset::Conservative,
-                    1 => CompactionPreset::Balanced,
-                    2 => CompactionPreset::Aggressive,
-                    _ => return Err(StorageError::corrupted("invalid compaction preset")),
-                },
+                preset: self.code_with(CompactionPreset::from_code, |_| {
+                    StorageError::corrupted("invalid compaction preset")
+                })?,
             },
             2 => CompactionMode::Custom {
                 policy: CustomPolicy {
@@ -764,6 +767,25 @@ codes!(UncertainCause { UncertainCause::TimedOut = 1, UncertainCause::Cancelled 
 codes!(EffectConclusion { EffectConclusion::Applied = 1, EffectConclusion::NotApplied = 2 });
 codes!(AttachmentOrigin { AttachmentOrigin::UserProvided = 1, AttachmentOrigin::ModelProduced = 2 });
 codes!(CleanupKind { CleanupKind::Manual = 1, CleanupKind::Automatic = 2 });
+codes!(OutcomeKind { OutcomeKind::Completed = 1, OutcomeKind::Failed = 2, OutcomeKind::Cancelled = 3, OutcomeKind::Unknown = 4 });
+codes!(StopProof { StopProof::Proof = 0, StopProof::Reboot = 1, StopProof::Settled = 2, StopProof::User = 3, StopProof::Operator = 4 });
+codes!(ConfigKind {
+    ConfigKind::Connection = 1, ConfigKind::Model = 2, ConfigKind::Agent = 3,
+    ConfigKind::Pool = 4, ConfigKind::DecisionModel = 5, ConfigKind::DecisionAgent = 6,
+});
+codes!(CommandOwner { CommandOwner::User = 0, CommandOwner::Decision = 1 });
+codes!(CommandStatus { CommandStatus::Allowed = 0, CommandStatus::Review = 1, CommandStatus::Blocked = 2 });
+codes!(RequestEligibility { RequestEligibility::Eligible = 1, RequestEligibility::Excluded = 2 });
+codes!(UsageFinality { UsageFinality::Cumulative = 1, UsageFinality::Final = 2 });
+codes!(NoticeClass { NoticeClass::Attention = 0, NoticeClass::Progress = 1, NoticeClass::Record = 2 });
+codes!(RecordEvent { RecordEvent::Hold = 0, RecordEvent::Unhold = 1, RecordEvent::Stop = 2 });
+codes!(RecurrenceHalt {
+    RecurrenceHalt::Closed = 0, RecurrenceHalt::ConfigUnavailable = 1,
+    RecurrenceHalt::Refused = 2, RecurrenceHalt::LimitReached = 3,
+});
+codes!(CompactionPreset {
+    CompactionPreset::Conservative = 0, CompactionPreset::Balanced = 1, CompactionPreset::Aggressive = 2,
+});
 
 impl Enc {
     pub(super) fn call_ref(&mut self, call: &crate::db::entities::ToolCallRef) {
@@ -894,7 +916,7 @@ impl Enc {
             NoticeEvent::StoppedAbove => self.u8(2),
             NoticeEvent::TurnEnded { kind } => {
                 self.u8(3);
-                self.u8(*kind as u8);
+                self.u8(kind.code());
             }
             NoticeEvent::Requested => self.u8(4),
             NoticeEvent::Stalled => self.u8(5),
@@ -1137,13 +1159,9 @@ impl Dec<'_> {
             1 => NoticeEvent::ClosedAbove,
             2 => NoticeEvent::StoppedAbove,
             3 => NoticeEvent::TurnEnded {
-                kind: match self.u8()? {
-                    1 => OutcomeKind::Completed,
-                    2 => OutcomeKind::Failed,
-                    3 => OutcomeKind::Cancelled,
-                    4 => OutcomeKind::Unknown,
-                    _ => return Err(StorageError::corrupted("invalid outcome")),
-                },
+                kind: self.code_with(OutcomeKind::from_code, |_| {
+                    StorageError::corrupted("invalid outcome")
+                })?,
             },
             4 => NoticeEvent::Requested,
             5 => NoticeEvent::Stalled,

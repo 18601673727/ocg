@@ -653,11 +653,7 @@ impl Batch {
         })?;
         for call in calls {
             self.put_approval(call, ApprovalDecision::Voided, by.clone())?;
-            self.step(|tx| {
-                tx.open_table(OPEN_APPROVALS)?
-                    .remove(open_key(conversation, call))?;
-                Ok(())
-            })?;
+            self.remove(OPEN_APPROVALS, open_key(conversation, call))?;
         }
         Ok(())
     }

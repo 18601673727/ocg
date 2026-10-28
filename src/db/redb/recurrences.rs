@@ -13,12 +13,7 @@ impl Recurrence {
             }
             RecurrencePhase::Halted { reason } => {
                 e.u8(2);
-                e.u8(match reason {
-                    RecurrenceHalt::Closed => 0,
-                    RecurrenceHalt::ConfigUnavailable => 1,
-                    RecurrenceHalt::Refused => 2,
-                    RecurrenceHalt::LimitReached => 3,
-                });
+                e.u8(reason.code());
             }
         }
         e.u64(self.n);
@@ -33,13 +28,9 @@ impl Recurrence {
             0 => RecurrencePhase::Active,
             1 => RecurrencePhase::WaitingDue { due: d.i64()? },
             2 => RecurrencePhase::Halted {
-                reason: match d.u8()? {
-                    0 => RecurrenceHalt::Closed,
-                    1 => RecurrenceHalt::ConfigUnavailable,
-                    2 => RecurrenceHalt::Refused,
-                    3 => RecurrenceHalt::LimitReached,
-                    _ => return Err(StorageError::corrupted("invalid recurrence halt")),
-                },
+                reason: d.code_with(RecurrenceHalt::from_code, |_| {
+                    StorageError::corrupted("invalid recurrence halt")
+                })?,
             },
             _ => return Err(StorageError::corrupted("invalid recurrence phase")),
         };
@@ -59,12 +50,7 @@ impl Batch {
         &mut self,
         conversation: JobId,
     ) -> Result<Option<Recurrence>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(RECURRENCES)?
-                .get(conversation.get())?
-                .map(|bytes| Recurrence::decode(bytes.value()))
-                .transpose()
-        })
+        self.get(RECURRENCES, conversation.get(), Recurrence::decode)
     }
     pub(crate) fn put_recurrence(
         &mut self,
