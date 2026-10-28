@@ -485,8 +485,11 @@ function ChildConversationCard({
   const [detail, setDetail] = useState<Awaited<
     ReturnType<HttpCanonicalControlClient["readJobDetails"]>
   > | null>(null);
+  const [model, setModel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [modelError, setModelError] = useState<string | null>(null);
   useConversationError(error, child.id);
+  useConversationError(modelError, child.id);
   const phase = child.recurrence?.phase;
   const due = child.recurrence?.due_us;
   useEffect(() => {
@@ -505,6 +508,22 @@ function ChildConversationCard({
       });
     return () => controller.abort();
   }, [control, child.id, child.state, phase, due]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void control
+      .readConversationTurns(child.id, undefined, 1, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) {
+          setModel(result.turns[0]?.input.configuration?.model ?? null);
+          setModelError(null);
+        }
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted)
+          setModelError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => controller.abort();
+  }, [control, child.id, child.state, child.job_state, phase, due]);
   const state = detail?.settlement.state;
   const status =
     state && state !== "unsettled" ? t(`state.${state}`) : t(`chat.child.${child.state}`);
@@ -532,7 +551,8 @@ function ChildConversationCard({
           {title}
         </span>
         <span className="block text-muted-foreground">
-          {agentName || t("chat.agent")} · {status}
+          {agentName || t("chat.agent")}
+          {model ? ` · ${model}` : ""} · {status}
           {child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}
         </span>
         <span className="line-clamp-3 text-muted-foreground">

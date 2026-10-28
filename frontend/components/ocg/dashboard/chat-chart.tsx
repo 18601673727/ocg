@@ -80,6 +80,8 @@ function CartesianChart({ definition }: { definition: ChatChartDefinition }) {
       hasBars ? Math.max(0, maximum) : maximum === minimum ? minimum + 1 : maximum,
     ];
   };
+  const hasRightAxis =
+    definition.type === "combo" && definition.series.some((series) => series.axis === "right");
   const [leftMinimum, leftMaximum] = domain("left");
   const [rightMinimum, rightMaximum] = domain("right");
   const axisScale = (series: ChatChartSeries, value: number) => {
@@ -132,14 +134,16 @@ function CartesianChart({ definition }: { definition: ChatChartDefinition }) {
                   >
                     {compact(leftValue, locale)}
                   </text>
-                  <text
-                    x={left + plotWidth + 12}
-                    y={y + 4}
-                    fill="var(--muted-foreground)"
-                    className="text-[11px]"
-                  >
-                    {compact(rightValue, locale)}
-                  </text>
+                  {hasRightAxis && (
+                    <text
+                      x={left + plotWidth + 12}
+                      y={y + 4}
+                      fill="var(--muted-foreground)"
+                      className="text-[11px]"
+                    >
+                      {compact(rightValue, locale)}
+                    </text>
+                  )}
                 </g>
               );
             })}

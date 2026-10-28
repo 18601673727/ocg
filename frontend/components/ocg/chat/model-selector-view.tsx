@@ -30,6 +30,7 @@ export type ModelSelectorViewProps = {
   project: SelectorField & { disabled: boolean; placeholder: string };
   provider: SelectorField;
   model: SelectorField;
+  executor: SelectorField;
   effort: SelectorField;
 };
 
@@ -41,6 +42,7 @@ export function ModelSelectorView({
   project,
   provider,
   model,
+  executor,
   effort,
   providerLabel,
   defaultEffort,
@@ -188,6 +190,30 @@ export function ModelSelectorView({
                       </SelectContent>
                     </Select>
                   </div>
+                  {executor.options.length > 1 && (
+                    <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+                      {t("chat.executor")}
+                      <Select
+                        value={executor.value}
+                        items={executor.options}
+                        disabled={disabled}
+                        onValueChange={(next) => {
+                          if (next !== null) executor.onChange(next);
+                        }}
+                      >
+                        <SelectTrigger aria-label={t("chat.executor")} className={selectClass}>
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {executor.options.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </label>
+                  )}
                   <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
                     {t("chat.effort")}
                     <Select
