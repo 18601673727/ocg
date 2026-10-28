@@ -11,7 +11,8 @@ pub enum IntermediateOutputKind {
     Summarization,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ts_rs::TS)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputKind {
     Progress,
     Evaluation,

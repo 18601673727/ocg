@@ -104,42 +104,68 @@ pub(super) fn projects_query(query: &str) -> Result<(Option<ProjectId>, usize), 
     catalog::page_query(query, project_id)
 }
 
-fn project_json(record: &ProjectRecord) -> serde_json::Value {
-    serde_json::json!({
-        "id": record.id.to_string(),
-        "name": record.name.clone(),
-        "description": record.description.clone(),
-        "root": record.root.clone(),
-        "commands": record
-                    .commands
-                    .iter()
-                    .map(|command| serde_json::json!({
-                        "name": command.name.clone(),
-                        "argv": command.argv.clone(),
-                        "owner": match command.owner {
-                            crate::db::entities::CommandOwner::User => "user",
-                            crate::db::entities::CommandOwner::Decision => "decision",
-                        }
-                        .to_owned(),
-                        "status": match command.status {
-                            crate::db::entities::CommandStatus::Allowed => "allowed",
-                            crate::db::entities::CommandStatus::Review => "review",
-                            crate::db::entities::CommandStatus::Blocked => "blocked",
-                        }
-                        .to_owned(),
-                        "proposal_job": command.proposal.map(|job| job.to_string()),
-                    }))
-                    .collect::<Vec<_>>(),
-        "decision": record.decision.as_ref().map(|policy| {
-                    serde_json::json!({
-                        "enabled": policy.enabled,
-                        "decision_profile": policy.decision_profile.map(|id| id.to_string()),
-                        "minimum_confidence": f64::from(policy.minimum_confidence_millis) / 1000.0,
-                    })
-                }),
-        "created_at_us": record.created_at.as_unix_micros(),
-        "updated_at_us": record.updated_at.as_unix_micros(),
-    })
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ProjectCommand")]
+pub(crate) struct ProjectCommandView {
+    name: String,
+    argv: Vec<String>,
+    owner: crate::db::entities::CommandOwner,
+    status: crate::db::entities::CommandStatus,
+    proposal_job: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Project")]
+pub(crate) struct ProjectView {
+    id: String,
+    name: String,
+    description: Option<String>,
+    root: String,
+    commands: Vec<ProjectCommandView>,
+    decision: Option<ProjectDecisionInput>,
+    created_at_us: i64,
+    updated_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Projects")]
+pub(crate) struct ProjectsView {
+    projects: Vec<ProjectView>,
+    has_more: bool,
+    next_before: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ProjectAnswer")]
+pub(crate) struct ProjectAnswerView {
+    project: ProjectView,
+}
+
+fn project_json(record: &ProjectRecord) -> ProjectView {
+    ProjectView {
+        id: record.id.to_string(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        root: record.root.clone(),
+        commands: record
+            .commands
+            .iter()
+            .map(|command| ProjectCommandView {
+                name: command.name.clone(),
+                argv: command.argv.clone(),
+                owner: command.owner,
+                status: command.status,
+                proposal_job: command.proposal.map(|job| job.to_string()),
+            })
+            .collect(),
+        decision: record.decision.as_ref().map(|policy| ProjectDecisionInput {
+            enabled: policy.enabled,
+            decision_profile: policy.decision_profile.map(|id| id.to_string()),
+            minimum_confidence: f64::from(policy.minimum_confidence_millis) / 1000.0,
+        }),
+        created_at_us: record.created_at.as_unix_micros(),
+        updated_at_us: record.updated_at.as_unix_micros(),
+    }
 }
 
 pub(super) async fn list(
@@ -150,12 +176,12 @@ pub(super) async fn list(
     let mut records = database.projects(before, limit + 1).await?;
     let has_more = records.len() > limit;
     records.truncate(limit);
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "projects": records.iter().map(project_json).collect::<Vec<_>>(),
-        "has_more": has_more,
-        "next_before": has_more
-        .then(|| records.last().map(|record| record.id.to_string()))
-        .flatten(),
+    Ok(Reply::ok(envelope(serde_json::json!(ProjectsView {
+        projects: records.iter().map(project_json).collect(),
+        has_more,
+        next_before: has_more
+            .then(|| records.last().map(|record| record.id.to_string()))
+            .flatten(),
     }))))
 }
 
@@ -242,8 +268,8 @@ pub(super) async fn create(shared: &Shared, body: &[u8]) -> Result<Reply, Refusa
     let record = shared.database.project(id).await?.ok_or(INTERNAL)?;
     Ok(Reply::new(
         StatusCode::CREATED,
-        envelope(serde_json::json!({
-            "project": project_json(&record),
+        envelope(serde_json::json!(ProjectAnswerView {
+            project: project_json(&record)
         })),
     ))
 }
@@ -268,14 +294,15 @@ pub(super) async fn update(
         .await
         .map_err(refusal)?;
     let record = database.project(id).await?.ok_or(PROJECT_NOT_FOUND)?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "project": project_json(&record),
+    Ok(Reply::ok(envelope(serde_json::json!(ProjectAnswerView {
+        project: project_json(&record)
     }))))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, serde::Serialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
-struct ProjectDecisionInput {
+#[ts(rename = "ProjectDecisionConfig")]
+pub(crate) struct ProjectDecisionInput {
     enabled: bool,
     decision_profile: Option<String>,
     minimum_confidence: f64,
@@ -320,7 +347,7 @@ pub(super) async fn configure_decision(
         .configure_project_decision(id, record.updated_at, assignment)
         .await
         .map_err(refusal)?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "project": project_json(&record),
+    Ok(Reply::ok(envelope(serde_json::json!(ProjectAnswerView {
+        project: project_json(&record)
     }))))
 }

@@ -539,14 +539,16 @@ pub(super) async fn respond(
         Route::Logs(query) => dashboard::logs(shared, query).await,
         Route::Job(job) => {
             let details = database.job_details(job).await?.ok_or(JOB_NOT_FOUND)?;
-            Ok(Reply::ok(envelope(serde_json::json!({
-                "job": jobs::job_view(&details.job)?,
-                "result": details.result.as_ref().map(outputs::output_view),
-                "usage": details.usage,
-                "activity": details.activity,
-                "task_plan": details.task_plan,
-                "unknown_reason": details.unknown_reason,
-            }))))
+            Ok(Reply::ok(envelope(serde_json::json!(
+                jobs::JobDetailsView {
+                    job: jobs::job_view(&details.job)?,
+                    result: details.result.as_ref().map(outputs::output_view),
+                    usage: details.usage,
+                    activity: details.activity,
+                    task_plan: details.task_plan,
+                    unknown_reason: details.unknown_reason,
+                }
+            ))))
         }
         Route::JobInput(job) => catalog::job_input(database, job).await,
         Route::ConversationChildren {
@@ -610,12 +612,14 @@ pub(super) async fn respond(
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::import_models(database, &body).await
         }
-        Route::ActiveSystemSettings => Ok(Reply::ok(envelope(serde_json::json!({
-            "path": crate::system::policy::SystemPolicy::path(&database.data_directory())
-            .display()
-            .to_string(),
-            "content": database.active_system_policy().to_conf(),
-        })))),
+        Route::ActiveSystemSettings => Ok(Reply::ok(envelope(serde_json::json!(
+            super::system::ActiveSystemSettingsView {
+                path: crate::system::policy::SystemPolicy::path(&database.data_directory())
+                    .display()
+                    .to_string(),
+                content: database.active_system_policy().to_conf(),
+            }
+        )))),
         Route::GlobalCompactionSettings => {
             profiles::global_compaction_settings(database, None).await
         }

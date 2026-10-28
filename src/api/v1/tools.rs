@@ -3,6 +3,34 @@ use super::*;
 
 pub(super) const MAX_EXPOSED_TOOL_STRING_BYTES: usize = 2 * 1024;
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ToolCall")]
+pub(crate) struct ToolCallView {
+    tool_call_id: String,
+    request: u32,
+    index: u32,
+    name: String,
+    decision: String,
+    outcome_kind: Option<ToolOutcomeKind>,
+    arguments: Option<String>,
+    arguments_cut: bool,
+    result: Option<String>,
+    result_cut: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    duration_ms: Option<u64>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Tools")]
+pub(crate) struct ToolsView {
+    job: String,
+    after: Option<String>,
+    tools: Vec<ToolCallView>,
+    next_after: Option<String>,
+    has_more: bool,
+}
+
 pub(super) fn cut_tool_string(text: &str) -> (&str, bool) {
     if text.len() <= MAX_EXPOSED_TOOL_STRING_BYTES {
         (text, false)
@@ -49,11 +77,11 @@ pub(super) fn tools_query(query: &str) -> Result<(Option<(RequestNumber, u32)>, 
     Ok((after, limit.unwrap_or(50)))
 }
 
-fn tool_view(record: &ToolEvidenceRecord) -> serde_json::Value {
+fn tool_view(record: &ToolEvidenceRecord) -> ToolCallView {
     tool_view_with_limit(record, MAX_EXPOSED_TOOL_STRING_BYTES)
 }
 
-fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> serde_json::Value {
+fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> ToolCallView {
     let cut = |text: &str| {
         if limit == MAX_EXPOSED_TOOL_STRING_BYTES {
             let (text, cut) = cut_tool_string(text);
@@ -104,38 +132,25 @@ fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> serde_json
         }
         None => (None, false),
     };
-    let outcome_kind = record.outcome.as_ref().map(|o| match o.fact.kind() {
-        ToolOutcomeKind::Completed => serde_json::json!("completed"),
-        ToolOutcomeKind::CompletedWithheld => serde_json::json!("completed_withheld"),
-        ToolOutcomeKind::NotApplied => serde_json::json!("not_applied"),
-        ToolOutcomeKind::NotInvoked => serde_json::json!("not_invoked"),
-        ToolOutcomeKind::Uncertain => serde_json::json!("uncertain"),
-    });
-
-    {
-        let mut object = serde_json::json!({
-            "tool_call_id": record.tool_call_id.clone(),
-            "request": record.call.request.get(),
-            "index": record.call.index,
-            "name": record.name.clone(),
-            "decision": decision.to_owned(),
-            "outcome_kind": outcome_kind,
-            "arguments": arguments,
-            "arguments_cut": arguments_cut,
-            "result": result,
-            "result_cut": result_cut,
-        });
-        if let Some(value) = record.outcome.as_ref().and_then(|outcome| {
+    ToolCallView {
+        tool_call_id: record.tool_call_id.clone(),
+        request: record.call.request.get(),
+        index: record.call.index,
+        name: record.name.clone(),
+        decision: decision.to_owned(),
+        outcome_kind: record.outcome.as_ref().map(|outcome| outcome.fact.kind()),
+        arguments,
+        arguments_cut,
+        result,
+        result_cut,
+        duration_ms: record.outcome.as_ref().and_then(|outcome| {
             outcome
                 .at
                 .as_unix_micros()
                 .checked_sub(record.decision.at.as_unix_micros())
                 .and_then(|micros| u64::try_from(micros).ok())
                 .map(|micros| micros / 1000)
-        }) {
-            object["duration_ms"] = serde_json::json!(value);
-        }
-        object
+        }),
     }
 }
 
@@ -159,12 +174,12 @@ pub(super) async fn tool(
         .ok_or(NOT_FOUND)?;
     dashboard::bounded(
         shared,
-        envelope(serde_json::json!({
-            "job": job.to_string(),
-            "after": serde_json::Value::Null,
-            "tools": vec![tool_view_with_limit(record, usize::MAX)],
-            "next_after": serde_json::Value::Null,
-            "has_more": false,
+        envelope(serde_json::json!(ToolsView {
+            job: job.to_string(),
+            after: None,
+            tools: vec![tool_view_with_limit(record, usize::MAX)],
+            next_after: None,
+            has_more: false,
         })),
     )
 }
@@ -181,16 +196,15 @@ pub(super) async fn tools(
     }
     let records = database.tool_evidence(job, after, limit + 1).await?;
     let after_cursor = after.map(|(req, idx)| format!("{}:{}", req.get(), idx));
-    let envelope =
-        |page: Vec<serde_json::Value>, next: Option<(RequestNumber, u32)>, more: bool| {
-            envelope(serde_json::json!({
-                "job": job.to_string(),
-                "after": after_cursor.clone(),
-                "tools": page,
-                "next_after": next.map(|(req, idx)| format!("{}:{}", req.get(), idx)),
-                "has_more": more,
-            }))
-        };
+    let envelope = |page: Vec<ToolCallView>, next: Option<(RequestNumber, u32)>, more: bool| {
+        envelope(serde_json::json!(ToolsView {
+            job: job.to_string(),
+            after: after_cursor.clone(),
+            tools: page,
+            next_after: next.map(|(req, idx)| format!("{}:{}", req.get(), idx)),
+            has_more: more,
+        }))
+    };
     let mut size = envelope(Vec::new(), None, true).to_string().len();
     let mut page = Vec::new();
     let mut next = None;

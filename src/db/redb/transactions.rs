@@ -776,22 +776,8 @@ impl Batch {
             return Ok(false);
         }
         if let Some(adopted) = self.adopt_context(job)? {
-            for boundary in &adopted.source.turns {
-                let source = self.step(|tx| {
-                    reader::source_turn(
-                        &tx.open_table(JOBS)?,
-                        &tx.open_table(JOB_STATES)?,
-                        &tx.open_table(JOB_INPUTS)?,
-                        &tx.open_table(JOB_OUTPUTS)?,
-                        &tx.open_table(TOOL_CALLS)?,
-                        &tx.open_table(APPROVALS)?,
-                        boundary.turn,
-                        Some((boundary.input_through, boundary.output_through)),
-                    )
-                })?;
-                occupancy =
-                    occupancy.saturating_sub(source.map_or(0, |turn| turn.reducible_tokens));
-            }
+            let reducible = self.step(|tx| reader::source_reducible_write(tx, &adopted.source))?;
+            occupancy = occupancy.saturating_sub(reducible);
             occupancy =
                 occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
         }

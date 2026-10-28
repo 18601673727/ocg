@@ -45,6 +45,7 @@ type QueueState = { queue: QueuedChatMessage[]; paused: boolean };
 export interface ChatScreenProps {
   session: ChatSession;
   onOpenConversation: (conversation: string) => void;
+  backButton?: ReactNode;
   execution: JobExecution | null;
   runtimeStatus: RuntimeStatus;
   onComposerIntent: (intent: ComposerIntent) => Promise<void> | void;
@@ -319,6 +320,7 @@ const THREAD_COMPONENTS = {
 export const ChatScreen: FC<ChatScreenProps> = ({
   session,
   onOpenConversation,
+  backButton,
   execution,
   runtimeStatus,
   onComposerIntent,
@@ -418,6 +420,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
         <div className="flex h-full min-h-0 w-full flex-col">
           <Thread
             components={THREAD_COMPONENTS}
+            footerAction={backButton}
             autoFocus
             afterMessages={
               <>

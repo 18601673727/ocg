@@ -1,3 +1,7 @@
+use super::commands::{
+    byte_count, command_bytes, compaction_bytes, config_bytes, entry_bytes, json_bytes,
+    output_bytes, search_index_bytes, text_bytes,
+};
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -627,8 +631,57 @@ impl DatabaseHandle {
         &self,
         request: ClaimRequest,
     ) -> Result<Result<ClaimGrant, ClaimRefusal>, DatabaseError> {
-        self.submit(|reply| Command::ClaimExecution { request, reply })
-            .await
+        self.submit(|reply| {
+            Command::custom(
+                (request,),
+                reply,
+                |(request,)| {
+                    byte_count(request.allowed_pools.len())
+                        .saturating_mul(8)
+                        .saturating_add(4096 * 512)
+                },
+                |(request,), reply, database, operation, commit| {
+                    use OperationKind as Kind;
+                    {
+                        let mut refusal = ClaimRefusal::RecipeInvalid;
+                        let outcome = redb::run_batch_declinable(
+                            database,
+                            operation.epoch,
+                            commit,
+                            |batch| match mutations::claim_execution(batch, request)? {
+                                Ok(grant) => Ok(Some(grant)),
+                                Err(reason) => {
+                                    refusal = reason;
+                                    Ok(None)
+                                }
+                            },
+                        );
+                        let declined = matches!(outcome.result, Ok(None));
+                        let outcome = redb::BatchOutcome {
+                            result: outcome.result.map(|grant| match grant {
+                                Some(grant) => Ok(grant),
+                                None => Err(refusal),
+                            }),
+                            storage_failure: outcome.storage_failure,
+                            durable_commit_us: outcome.durable_commit_us,
+                            scheduling_wake: outcome.scheduling_wake,
+                            capacity_freed: outcome.capacity_freed,
+                            catalog_changed: outcome.catalog_changed,
+                            probe: outcome.probe,
+                        };
+                        settle(
+                            operation,
+                            commit,
+                            Kind::ClaimExecution,
+                            reply,
+                            outcome,
+                            declined,
+                        )
+                    }
+                },
+            )
+        })
+        .await
     }
 
     /// CLAIM_BATCH (section 8.3): one write transaction that promotes the due
@@ -637,7 +690,17 @@ impl DatabaseHandle {
     /// claimed once this returns; execution starts only after the commit.
     pub async fn claim_batch(&self) -> Result<Vec<JobId>, DatabaseError> {
         let started = Instant::now();
-        let jobs = self.submit(|reply| Command::ClaimBatch { reply }).await?;
+        let jobs = self
+            .submit(|reply| {
+                Command::new(
+                    (),
+                    reply,
+                    |()| 2 * 4096 * 512,
+                    OperationKind::ClaimExecution,
+                    |(), batch| batch.claim_batch(),
+                )
+            })
+            .await?;
         if !jobs.is_empty() {
             let duration_us = started.elapsed().as_micros() as u64;
             self.shared.claims.fetch_add(1, Ordering::Relaxed);
@@ -929,13 +992,30 @@ impl DatabaseHandle {
     /// predecessor in `previous`. The Job is pending; the claim batch grants
     /// it when a compatible Pool has room.
     pub async fn create_job(&self, job: Job) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateJob { job, reply }).await
+        self.submit(|reply| {
+            Command::new(
+                (job,),
+                reply,
+                |(job,)| text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective)),
+                OperationKind::CreateJobWithInput,
+                |(job,), batch| mutations::create_job(batch, job),
+            )
+        })
+        .await
     }
 
     #[doc(hidden)]
     pub async fn bench_create_dependent_turn(&self, job: Job) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::BenchCreateDependentTurn { job, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (job,),
+                reply,
+                |(job,)| text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective)),
+                OperationKind::CreateJobWithInput,
+                |(job,), batch| mutations::bench_create_dependent_turn(batch, job),
+            )
+        })
+        .await
     }
 
     pub async fn create_submitted_job(
@@ -943,10 +1023,14 @@ impl DatabaseHandle {
         job: Job,
         submission: Submission,
     ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| Command::CreateSubmittedJob {
-            job,
-            submission,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (job, submission),
+                reply,
+                |(job, _)| text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective)),
+                OperationKind::CreateJobWithInput,
+                |(job, submission), batch| mutations::create_submitted_job(batch, job, submission),
+            )
         })
         .await
     }
@@ -1006,8 +1090,16 @@ impl DatabaseHandle {
     /// Creates a Connection, Model, Agent or Pool config. Its references must
     /// name configs of the kinds its body requires.
     pub async fn create_config(&self, config: Config) -> Result<ConfigId, DatabaseError> {
-        self.submit(|reply| Command::CreateConfig { config, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (config,),
+                reply,
+                |(config,)| config_bytes(config),
+                OperationKind::CreateProfile,
+                |(config,), batch| mutations::create_config(batch, config),
+            )
+        })
+        .await
     }
 
     pub async fn refresh_model_metadata(
@@ -1015,10 +1107,23 @@ impl DatabaseHandle {
         connection: crate::db::entities::ConnectionConfig,
         models: Vec<crate::db::entities::DiscoveredModel>,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::RefreshModelMetadata {
-            connection,
-            models,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (connection, models),
+                reply,
+                |(connection, models)| {
+                    text_bytes(&connection.endpoint)
+                        .saturating_add(text_bytes(&connection.credential_ref))
+                        .saturating_add(
+                            models
+                                .iter()
+                                .map(|model| byte_count(model.id.len()).saturating_add(512))
+                                .sum::<u64>(),
+                        )
+                },
+                OperationKind::UpdateProfile,
+                |(connection, models), batch| batch.refresh_model_metadata(connection, models),
+            )
         })
         .await
     }
@@ -1030,11 +1135,35 @@ impl DatabaseHandle {
         models: Vec<crate::db::entities::DiscoveredModel>,
         capabilities: std::collections::BTreeSet<crate::db::entities::ModelCapability>,
     ) -> Result<(Vec<ConfigId>, usize), DatabaseError> {
-        self.submit(|reply| Command::ImportModels {
-            connection,
-            models,
-            capabilities,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (connection, models, capabilities),
+                reply,
+                |(connection, models, _)| {
+                    let base = match &connection.body {
+                        ConfigBody::Connection(body) => text_bytes(&body.endpoint)
+                            .saturating_add(text_bytes(&body.credential_ref)),
+                        ConfigBody::Model(_)
+                        | ConfigBody::Agent(_)
+                        | ConfigBody::Pool(_)
+                        | ConfigBody::DecisionModel(_)
+                        | ConfigBody::DecisionAgent(_) => 0,
+                    };
+                    models.iter().fold(
+                        base.saturating_add(byte_count(connection.name.len())),
+                        |bytes, model| {
+                            bytes
+                                .saturating_add(byte_count(model.id.len()))
+                                .saturating_add(512)
+                                .saturating_add(16)
+                        },
+                    )
+                },
+                OperationKind::CreateProfile,
+                |(connection, models, capabilities), batch| {
+                    mutations::import_models(batch, connection, models, capabilities)
+                },
+            )
         })
         .await
     }
@@ -1050,21 +1179,45 @@ impl DatabaseHandle {
         &self,
         settings: crate::db::entities::GlobalCompactionSettings,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::SetGlobalCompactionSettings { settings, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (settings,),
+                reply,
+                |(settings,)| compaction_bytes(&Some(settings.policy.clone())).saturating_add(64),
+                OperationKind::UpdateProfile,
+                |(settings,), batch| batch.set_global_compaction_settings(settings),
+            )
+        })
+        .await
     }
 
     pub async fn archive_model(&self, id: ConfigId) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::ArchiveModel { id, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (id,),
+                reply,
+                |(_,)| 16,
+                OperationKind::UpdateProfile,
+                |(id,), batch| mutations::archive_model(batch, id),
+            )
+        })
+        .await
     }
 
     /// Edits a config in place: a new name and body of the same kind. Every
     /// edit is allowed and raises the edit counter; Jobs that froze the old
     /// values keep them.
     pub async fn update_config(&self, id: ConfigId, config: Config) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::UpdateConfig { id, config, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (id, config),
+                reply,
+                |(_, config)| config_bytes(config),
+                OperationKind::UpdateProfile,
+                |(id, config), batch| mutations::update_config(batch, id, config),
+            )
+        })
+        .await
     }
 
     pub async fn decide_approval(
@@ -1072,10 +1225,19 @@ impl DatabaseHandle {
         approval: ToolCallRef,
         decision: entities::ApprovalDecision,
     ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| Command::DecideApproval {
-            approval,
-            decision,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (approval, decision),
+                reply,
+                |(_, decision)| match decision {
+                    entities::ApprovalDecision::Answered { text } => byte_count(text.len()),
+                    entities::ApprovalDecision::Approved
+                    | entities::ApprovalDecision::Rejected
+                    | entities::ApprovalDecision::Voided => 64,
+                },
+                OperationKind::DecideApproval,
+                |(approval, decision), batch| batch.decide(approval, decision),
+            )
         })
         .await
     }
@@ -1113,12 +1275,70 @@ impl DatabaseHandle {
         call: ToolCallRef,
         tool: entities::JobToolCall,
     ) -> Result<serde_json::Value, DatabaseError> {
-        self.submit(|reply| Command::ApplyJobTool { call, tool, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (call, tool),
+                reply,
+                |(_, tool)| {
+                    use entities::JobToolCall;
+                    let search = match tool {
+                        JobToolCall::JobPlan { steps, .. } => steps
+                            .iter()
+                            .map(|step| {
+                                search_index_bytes(&step.objective).saturating_add(64 * 1024)
+                            })
+                            .sum(),
+                        JobToolCall::JobAssign { objective, .. }
+                        | JobToolCall::JobDispatch { objective, .. } => {
+                            search_index_bytes(objective)
+                        }
+                        JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
+                        JobToolCall::JobLimits { .. }
+                        | JobToolCall::JobAgents { .. }
+                        | JobToolCall::JobWorkers { .. }
+                        | JobToolCall::JobStop { .. }
+                        | JobToolCall::JobClose { .. }
+                        | JobToolCall::JobHold { .. }
+                        | JobToolCall::JobUnhold { .. }
+                        | JobToolCall::JobRetry { .. } => 0,
+                    };
+                    byte_count(format!("{tool:?}").len())
+                        .saturating_add(4096)
+                        .saturating_add(search)
+                        .saturating_add(match tool {
+                            JobToolCall::JobAssign { objective, .. }
+                            | JobToolCall::JobDispatch { objective, .. }
+                                if objective.len() <= 64 * 1024 =>
+                            {
+                                byte_count(objective.len())
+                                    .saturating_mul(6)
+                                    .saturating_add(64 * 1024)
+                            }
+                            JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
+                                byte_count(text.len())
+                                    .saturating_mul(6)
+                                    .saturating_add(64 * 1024)
+                            }
+                            _ => 0,
+                        })
+                },
+                OperationKind::ApplyJobTool,
+                |(call, tool), batch| batch.apply_job_tool(call, tool),
+            )
+        })
+        .await
     }
     pub async fn boundary_b(&self, clock: i64) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::BoundaryB { clock, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (clock,),
+                reply,
+                |(_,)| 4096,
+                OperationKind::BoundaryB,
+                |(clock,), batch| batch.boundary_b(clock),
+            )
+        })
+        .await
     }
     pub(crate) async fn recurrence_due(&self, clock: i64) -> Result<bool, DatabaseError> {
         self.read(move |database| redb::recurrence_due(database, clock))
@@ -1144,14 +1364,24 @@ impl DatabaseHandle {
         submission: Option<Submission>,
         format: Option<crate::db::entities::ResponseFormat>,
     ) -> Result<(JobId, Appended), DatabaseError> {
-        self.submit(|reply| Command::Open {
-            parent,
-            spec,
-            first,
-            configuration,
-            submission,
-            format,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (parent, spec, first, configuration, submission, format),
+                reply,
+                |(_, _, first, _, _, format)| entry_bytes(first, format),
+                OperationKind::Open,
+                |(parent, spec, first, configuration, submission, format), batch| {
+                    batch.open_group_with_format(
+                        parent,
+                        spec,
+                        first,
+                        configuration,
+                        submission,
+                        Vec::new(),
+                        format,
+                    )
+                },
+            )
         })
         .await
     }
@@ -1176,16 +1406,29 @@ impl DatabaseHandle {
         &self,
         job: JobId,
     ) -> Result<Option<JobId>, DatabaseError> {
-        self.submit(|reply| Command::PromotePrediction { job, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (job,),
+                reply,
+                |(_,)| 4096 * 512,
+                OperationKind::Open,
+                |(job,), batch| batch.promote_prediction(job),
+            )
+        })
+        .await
     }
     pub(crate) async fn predict_context(
         &self,
         conversation: JobId,
     ) -> Result<Option<JobId>, DatabaseError> {
-        self.submit(|reply| Command::PredictContext {
-            conversation,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation,),
+                reply,
+                |(_,)| 131072,
+                OperationKind::Open,
+                |(conversation,), batch| batch.predict_context(conversation),
+            )
         })
         .await
     }
@@ -1215,14 +1458,19 @@ impl DatabaseHandle {
         request: entities::DecisionRequest,
         submission: Option<Submission>,
     ) -> Result<(JobId, Appended), DatabaseError> {
-        self.submit(|reply| Command::SubmitDecision {
-            parent,
-            spec,
-            first,
-            configuration,
-            request,
-            submission,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (parent, spec, first, configuration, request, submission),
+                reply,
+                |(_, _, first, _, request, _)| {
+                    byte_count(format!("{first:?}").len())
+                        .saturating_add(byte_count(format!("{request:?}").len()))
+                },
+                OperationKind::Open,
+                |(parent, spec, first, configuration, request, submission), batch| {
+                    batch.open_decision(parent, spec, first, configuration, request, submission)
+                },
+            )
         })
         .await
     }
@@ -1235,11 +1483,16 @@ impl DatabaseHandle {
         model: ConfigId,
         submission: Submission,
     ) -> Result<entities::CompactionRequest, DatabaseError> {
-        self.submit(|reply| Command::RequestCompaction {
-            conversation,
-            model,
-            submission,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, model, submission),
+                reply,
+                |(_, _, _)| 4096 * 512,
+                OperationKind::Open,
+                |(conversation, model, submission), batch| {
+                    batch.request_compaction(conversation, model, submission)
+                },
+            )
         })
         .await
     }
@@ -1262,13 +1515,17 @@ impl DatabaseHandle {
         submission: Option<Submission>,
         format: Option<crate::db::entities::ResponseFormat>,
     ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| Command::Append {
-            conversation,
-            entry,
-            freeze,
-            submission,
-            format,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, entry, freeze, submission, format),
+                reply,
+                |(_, first, _, _, format)| entry_bytes(first, format),
+                OperationKind::Append,
+                |(conversation, entry, freeze, submission, format), batch| {
+                    batch.require_agent_group(conversation)?;
+                    batch.append_with_format(conversation, entry, freeze, submission, false, format)
+                },
+            )
         })
         .await
     }
@@ -1278,11 +1535,40 @@ impl DatabaseHandle {
         turn: JobId,
         entry: Entry,
     ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| Command::AmendQueuedInput {
-            conversation,
-            turn,
-            entry,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, turn, entry),
+                reply,
+                |(_, _, entry)| {
+                    byte_count(format!("{entry:?}").len())
+                        .saturating_add(match entry {
+                            Entry::UserMessageEdit {
+                                text, attachments, ..
+                            } => search_index_bytes(text).saturating_add(
+                                (attachments.len() as u64).saturating_mul(
+                                    3 * 64
+                                        * (crate::db::entities::MAX_ATTACHMENT_NAME_BYTES as u64
+                                            + 1),
+                                ),
+                            ),
+                            Entry::UserMessage { .. }
+                            | Entry::UserMessageWithdraw { .. }
+                            | Entry::AgentMessage { .. }
+                            | Entry::Notice { .. }
+                            | Entry::Decision { .. }
+                            | Entry::RetryOf { .. }
+                            | Entry::Iteration { .. }
+                            | Entry::ContextPreparation { .. }
+                            | Entry::ContextUse { .. }
+                            | Entry::ResponseFormat { .. } => 0,
+                        })
+                        .saturating_add(4096)
+                },
+                OperationKind::Append,
+                |(conversation, turn, entry), batch| {
+                    batch.amend_queued_input(conversation, turn, entry)
+                },
+            )
         })
         .await
     }
@@ -1295,14 +1581,23 @@ impl DatabaseHandle {
         format: Option<crate::db::entities::ResponseFormat>,
         automatic: bool,
     ) -> Result<(Appended, Vec<(JobId, crate::db::entities::StopCause)>), DatabaseError> {
-        self.submit(|reply| Command::Steer {
-            conversation,
-            entry,
-            freeze,
-            submission,
-            format,
-            automatic,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, entry, freeze, submission, format, automatic),
+                reply,
+                |(_, first, _, _, format, _)| entry_bytes(first, format),
+                OperationKind::Append,
+                |(conversation, entry, freeze, submission, format, automatic), batch| {
+                    batch.steer_with_format(
+                        conversation,
+                        entry,
+                        freeze,
+                        submission,
+                        format,
+                        automatic,
+                    )
+                },
+            )
         })
         .await
     }
@@ -1311,34 +1606,50 @@ impl DatabaseHandle {
         conversation: JobId,
         by: Actor,
     ) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| Command::StopTurn {
-            conversation,
-            by,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, by),
+                reply,
+                |(_, _)| 4096,
+                OperationKind::StopTurn,
+                |(conversation, by), batch| batch.stop_turn(conversation, by),
+            )
         })
         .await
     }
     pub async fn close(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| Command::Close {
-            conversation,
-            by,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, by),
+                reply,
+                |(_, _)| 4096,
+                OperationKind::Close,
+                |(conversation, by), batch| batch.close(conversation, by),
+            )
         })
         .await
     }
     pub async fn hold(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| Command::Hold {
-            conversation,
-            by,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, by),
+                reply,
+                |(_, _)| 4096,
+                OperationKind::Hold,
+                |(conversation, by), batch| batch.hold(conversation, by, false),
+            )
         })
         .await
     }
     pub async fn unhold(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| Command::Unhold {
-            conversation,
-            by,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, by),
+                reply,
+                |(_, _)| 4096,
+                OperationKind::Unhold,
+                |(conversation, by), batch| batch.hold(conversation, by, true),
+            )
         })
         .await
     }
@@ -1348,11 +1659,14 @@ impl DatabaseHandle {
         turn: JobId,
         by: Actor,
     ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| Command::Retry {
-            conversation,
-            turn,
-            by,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (conversation, turn, by),
+                reply,
+                |(_, _, _)| 4096,
+                OperationKind::Retry,
+                |(conversation, turn, by), batch| batch.retry(conversation, turn, by),
+            )
         })
         .await
     }
@@ -1362,8 +1676,31 @@ impl DatabaseHandle {
         job: JobId,
         output: JobOutput,
     ) -> Result<AppendedOutput, DatabaseError> {
-        self.submit(|reply| Command::AppendJobOutput { job, output, reply })
-            .await
+        self.submit(|reply| {
+            Command::custom(
+                (job, output),
+                reply,
+                |(_, output)| output_bytes(&output.summary, &output.code, &output.value),
+                |(job, output), reply, database, operation, commit| {
+                    use OperationKind as Kind;
+                    {
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            Kind::AppendJobOutput,
+                            reply,
+                            |batch| mutations::append_job_output(batch, job, output),
+                        );
+                        if result.committed {
+                            result.output_changed = Some(job);
+                        }
+                        result
+                    }
+                },
+            )
+        })
+        .await
     }
 
     pub(crate) fn with_stop_cause(
@@ -1413,33 +1750,180 @@ impl DatabaseHandle {
                 }
                 crate::db::entities::StopCause::Closed => crate::db::entities::OutcomeCause::Closed,
             });
-        self.submit(|reply| Command::FinalizeJob {
-            job,
-            finalization,
-            cause,
-            ignore_stop_cause: self.ignore_stop_cause,
-            evidence,
-            reply,
+        self.submit(|reply| {
+            Command::custom(
+                (job, cause, self.ignore_stop_cause, finalization, evidence),
+                reply,
+                |(_, _, _, finalization, evidence)| {
+                    let evidence_bytes = match evidence {
+                        None => 0,
+                        Some(ProviderSettlementEvidence::Answer(answer)) => {
+                            byte_count(answer.response.byte_length())
+                                .saturating_add(json_bytes(&answer.measurements.usage.raw))
+                        }
+                        Some(ProviderSettlementEvidence::Observations(stats)) => {
+                            stats.iter().fold(0u64, |bytes, stat| {
+                                let observation = &stat.observation;
+                                let failure = observation.failure.as_ref().map_or(0, |failure| {
+                                    byte_count(failure.message.len())
+                                        .saturating_add(text_bytes(&failure.provider_code))
+                                        .saturating_add(text_bytes(&failure.response_body))
+                                        .saturating_add(text_bytes(&failure.request_id))
+                                });
+                                bytes
+                                    .saturating_add(failure)
+                                    .saturating_add(text_bytes(&observation.raw_finish_reason))
+                            })
+                        }
+                    };
+                    evidence_bytes.saturating_add(match finalization {
+                        JobFinalization::Completed(result)
+                        | JobFinalization::Failed(result)
+                        | JobFinalization::Cancelled(result) => {
+                            let text = result
+                                .value
+                                .as_ref()
+                                .and_then(|value| value.get("text"))
+                                .and_then(serde_json::Value::as_str)
+                                .or(result.summary.as_deref());
+                            output_bytes(&result.summary, &result.code, &result.value)
+                                .saturating_add(64 * 1024)
+                                .saturating_add(text.map_or(0, search_index_bytes))
+                        }
+                        JobFinalization::Unknown => 0,
+                    })
+                },
+                |(job, cause, ignore_stop_cause, finalization, evidence),
+                 reply,
+                 database,
+                 operation,
+                 commit| {
+                    use OperationKind as Kind;
+                    {
+                        let mut changes = Vec::new();
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            Kind::FinalizeJob,
+                            reply,
+                            |batch| {
+                                let provider_settlement = evidence.is_some();
+                                let abandoned = provider_settlement
+                                    && batch.require_job_state(job)?.outcome.is_some_and(
+                                        |outcome| {
+                                            outcome.cause == Some(entities::OutcomeCause::Abandoned)
+                                        },
+                                    );
+                                let output = if abandoned {
+                                    None
+                                } else {
+                                    mutations::finalize_job(
+                                        batch,
+                                        job,
+                                        finalization,
+                                        cause,
+                                        ignore_stop_cause,
+                                    )?
+                                };
+                                let mut probe = None;
+                                match evidence {
+                                    None => {}
+                                    Some(ProviderSettlementEvidence::Observations(
+                                        observations,
+                                    )) => {
+                                        for stat in observations {
+                                            if stat.job != job {
+                                                return batch.reject(Violation::InvalidValue(
+                                                    "job",
+                                                    "observation belongs to a different job",
+                                                ));
+                                            }
+                                            let id =
+                                                mutations::record_availability_stat(batch, stat)?;
+                                            changes.push(ObservationChange::Availability(job, id));
+                                            probe = Some(id);
+                                        }
+                                    }
+                                    Some(ProviderSettlementEvidence::Answer(answer)) => {
+                                        if answer.stat.job != job {
+                                            return batch.reject(Violation::InvalidValue(
+                                                "job",
+                                                "answer belongs to a different job",
+                                            ));
+                                        }
+                                        let (metrics, availability) =
+                                            mutations::record_provider_answer(batch, *answer)?;
+                                        changes.push(ObservationChange::Metrics(job, metrics));
+                                        changes.push(ObservationChange::Availability(
+                                            job,
+                                            availability,
+                                        ));
+                                        probe = Some(availability);
+                                    }
+                                }
+                                if provider_settlement {
+                                    batch.provider_settlement_probe(job, probe)?;
+                                }
+                                Ok(output)
+                            },
+                        );
+                        if result.committed {
+                            result.observations = changes;
+                        }
+                        result
+                    }
+                },
+            )
         })
         .await
     }
 
     pub async fn create_executor(&self, executor: Executor) -> Result<ExecutorId, DatabaseError> {
-        self.submit(|reply| Command::CreateExecutor { executor, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (executor,),
+                reply,
+                |(executor,)| byte_count(executor.name.len()),
+                OperationKind::CreateExecutor,
+                |(executor,), batch| mutations::create_executor(batch, executor),
+            )
+        })
+        .await
     }
 
     pub async fn create_project(&self, project: Project) -> Result<ProjectId, DatabaseError> {
-        self.submit(|reply| Command::CreateProject { project, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (project,),
+                reply,
+                |(project,)| {
+                    byte_count(project.name.len())
+                        .saturating_add(text_bytes(&project.description))
+                        .saturating_add(byte_count(project.root.len()))
+                        .saturating_add(command_bytes(&project.commands))
+                },
+                OperationKind::CreateProject,
+                |(project,), batch| mutations::create_project(batch, project),
+            )
+        })
+        .await
     }
 
     pub(crate) async fn assess_command_grant(
         &self,
         call: ToolCallRef,
     ) -> Result<Option<JobId>, DatabaseError> {
-        self.submit(|reply| Command::AssessCommandGrant { call, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (call,),
+                reply,
+                |(_,)| 128 * 1024,
+                OperationKind::UpdateProject,
+                |(call,), batch| batch.assess_command_grant(call),
+            )
+        })
+        .await
     }
 
     pub(crate) async fn configure_project_decision(
@@ -1448,11 +1932,16 @@ impl DatabaseHandle {
         expected: crate::db::entities::Timestamp,
         assignment: Option<entities::ProjectDecisionConfig>,
     ) -> Result<entities::ProjectRecord, DatabaseError> {
-        self.submit(|reply| Command::ConfigureProjectDecision {
-            id,
-            expected,
-            assignment,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (id, expected, assignment),
+                reply,
+                |(_, _, _)| 32 * 1024,
+                OperationKind::UpdateProject,
+                |(id, expected, assignment), batch| {
+                    mutations::configure_project_decision(batch, id, expected, assignment)
+                },
+            )
         })
         .await
     }
@@ -1466,20 +1955,42 @@ impl DatabaseHandle {
         description: Option<String>,
         commands: Vec<ProjectCommand>,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::UpdateProject {
-            id,
-            name,
-            description,
-            commands,
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (id, name, description, commands),
+                reply,
+                |(_, name, description, commands)| {
+                    byte_count(name.len())
+                        .saturating_add(text_bytes(description))
+                        .saturating_add(command_bytes(commands))
+                },
+                OperationKind::UpdateProject,
+                |(id, name, description, commands), batch| {
+                    mutations::update_project(batch, id, name, description, commands)
+                },
+            )
         })
         .await
     }
 
     /// Renames or hides the conversation whose root Job is `root`.
     pub async fn set_conversation(&self, root: JobId, edit: JobEdit) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::SetConversation { root, edit, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (root, edit),
+                reply,
+                |(_, edit)| match edit {
+                    JobEdit::Title(title) | JobEdit::SuggestedTitle(title) => {
+                        byte_count(title.len())
+                    }
+                    JobEdit::Hide | JobEdit::Limits(_) => 16,
+                    JobEdit::CompactionPolicy(policy) => compaction_bytes(policy),
+                },
+                OperationKind::SetConversation,
+                |(root, edit), batch| mutations::set_conversation(batch, root, edit),
+            )
+        })
+        .await
     }
 
     /// Stores `attachment` as a new user-provided Attachment. Its content is
@@ -1519,9 +2030,17 @@ impl DatabaseHandle {
             origin: AttachmentOrigin::UserProvided,
         };
         let created = self
-            .submit(|reply| Command::CreateAttachment {
-                attachment: Box::new(published),
-                reply,
+            .submit(|reply| {
+                Command::new(
+                    (Box::new(published),),
+                    reply,
+                    |(attachment,)| {
+                        byte_count(attachment.mime.len())
+                            .saturating_add(text_bytes(&attachment.display_name))
+                    },
+                    OperationKind::CreateAttachment,
+                    |(attachment,), batch| mutations::create_attachment(batch, *attachment),
+                )
             })
             .await;
         // Committed, and durable, so every later read sees the record that
@@ -1624,7 +2143,15 @@ impl DatabaseHandle {
         let (record, recorded) = if record.is_available() {
             let kind = CleanupKind::Manual;
             match self
-                .submit(|reply| Command::CleanupAttachment { id, kind, reply })
+                .submit(|reply| {
+                    Command::new(
+                        (id, kind),
+                        reply,
+                        |(_, _)| 0,
+                        OperationKind::CleanupAttachment,
+                        |(id, kind), batch| mutations::cleanup_attachment(batch, id, kind),
+                    )
+                })
                 .await
             {
                 Ok(record) => (record, true),
@@ -1676,23 +2203,69 @@ impl DatabaseHandle {
         job: JobId,
         proof: StopProof,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::ConfirmJobStopped { job, proof, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (job, proof),
+                reply,
+                |(_, _)| 0,
+                OperationKind::ConfirmJobStopped,
+                |(job, proof), batch| mutations::confirm_job_stopped(batch, job, proof),
+            )
+        })
+        .await
     }
 
     /// Appends measurements for a Job. Their LLM is the one the Job froze.
     pub async fn record_metrics(&self, metrics: Metrics) -> Result<MetricsId, DatabaseError> {
-        self.submit(|reply| Command::RecordMetrics {
-            metrics: Box::new(metrics),
-            reply,
+        self.submit(|reply| {
+            Command::custom(
+                (Box::new(metrics),),
+                reply,
+                |(metrics,)| json_bytes(&metrics.measurements.usage.raw),
+                |(metrics,), reply, database, operation, commit| {
+                    use OperationKind as Kind;
+                    {
+                        let job = metrics.job;
+                        let id = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            Kind::RecordMetrics,
+                            reply,
+                            |batch| {
+                                let value = mutations::record_metrics(batch, *metrics)?;
+                                id.set(Some(value));
+                                Ok(value)
+                            },
+                        );
+                        if let Some(id) = id.get() {
+                            result
+                                .observations
+                                .push(ObservationChange::Metrics(job, id));
+                        }
+                        result
+                    }
+                },
+            )
         })
         .await
     }
 
     pub async fn record_sent_request(&self, sent: SentRequest) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::RecordSentRequest {
-            sent: Box::new(sent),
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (Box::new(sent),),
+                reply,
+                |(sent,)| {
+                    sent.bodies.iter().fold(
+                        byte_count(sent.messages.len()).saturating_mul(32),
+                        |bytes, body| bytes.saturating_add(byte_count(body.byte_length())),
+                    )
+                },
+                OperationKind::RecordSentRequest,
+                |(sent,), batch| mutations::record_sent_request(batch, *sent),
+            )
         })
         .await
     }
@@ -1701,9 +2274,43 @@ impl DatabaseHandle {
         &self,
         answer: ProviderAnswer,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::RecordProviderAnswer {
-            answer: Box::new(answer),
-            reply,
+        self.submit(|reply| {
+            Command::custom(
+                (Box::new(answer),),
+                reply,
+                |(answer,)| {
+                    byte_count(answer.response.byte_length())
+                        .saturating_add(json_bytes(&answer.measurements.usage.raw))
+                },
+                |(answer,), reply, database, operation, commit| {
+                    use OperationKind as Kind;
+                    {
+                        let job = answer.stat.job;
+                        let ids = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            Kind::RecordProviderAnswer,
+                            reply,
+                            |batch| {
+                                let value = mutations::record_provider_answer(batch, *answer)?;
+                                ids.set(Some(value));
+                                Ok(())
+                            },
+                        );
+                        if let Some((metrics, availability)) = ids.get() {
+                            result
+                                .observations
+                                .push(ObservationChange::Metrics(job, metrics));
+                            result
+                                .observations
+                                .push(ObservationChange::Availability(job, availability));
+                        }
+                        result
+                    }
+                },
+            )
         })
         .await
     }
@@ -1736,9 +2343,46 @@ impl DatabaseHandle {
         &self,
         stat: AvailabilityStat,
     ) -> Result<AvailabilityStatId, DatabaseError> {
-        self.submit(|reply| Command::RecordAvailabilityStat {
-            stat: Box::new(stat),
-            reply,
+        self.submit(|reply| {
+            Command::custom(
+                (Box::new(stat),),
+                reply,
+                |(stat,)| {
+                    let observation = &stat.observation;
+                    let failure = observation.failure.as_ref().map_or(0, |failure| {
+                        byte_count(failure.message.len())
+                            .saturating_add(text_bytes(&failure.provider_code))
+                            .saturating_add(text_bytes(&failure.response_body))
+                            .saturating_add(text_bytes(&failure.request_id))
+                    });
+                    failure.saturating_add(text_bytes(&observation.raw_finish_reason))
+                },
+                |(stat,), reply, database, operation, commit| {
+                    use OperationKind as Kind;
+                    {
+                        let job = stat.job;
+                        let id = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            Kind::RecordAvailabilityStat,
+                            reply,
+                            |batch| {
+                                let value = mutations::record_availability_stat(batch, *stat)?;
+                                id.set(Some(value));
+                                Ok(value)
+                            },
+                        );
+                        if let Some(id) = id.get() {
+                            result
+                                .observations
+                                .push(ObservationChange::Availability(job, id));
+                        }
+                        result
+                    }
+                },
+            )
         })
         .await
     }
@@ -1752,9 +2396,24 @@ impl DatabaseHandle {
         &self,
         evidence: ToolEvidence,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::RecordToolDecision {
-            evidence: Box::new(evidence),
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (Box::new(evidence),),
+                reply,
+                |(evidence,)| {
+                    let identity = byte_count(evidence.tool_call_id.len())
+                        .saturating_add(byte_count(evidence.name.len()));
+                    match evidence.decision.stored_admission() {
+                        None => identity,
+                        Some(admission) => identity
+                            .saturating_add(byte_count(admission.handler_version.len()))
+                            .saturating_add(byte_count(admission.parameters.len()))
+                            .saturating_add(byte_count(admission.arguments.len())),
+                    }
+                },
+                OperationKind::RecordToolDecision,
+                |(evidence,), batch| mutations::record_tool_decision(batch, *evidence),
+            )
         })
         .await
     }
@@ -1767,10 +2426,19 @@ impl DatabaseHandle {
         call: ToolCallRef,
         outcome: ToolOutcome,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::RecordToolOutcome {
-            call,
-            outcome: Box::new(outcome),
-            reply,
+        self.submit(|reply| {
+            Command::new(
+                (call, Box::new(outcome)),
+                reply,
+                |(_, outcome)| match outcome.as_ref() {
+                    ToolOutcome::Completed { result } => byte_count(result.len()),
+                    ToolOutcome::NotApplied { message } => byte_count(message.len()),
+                    ToolOutcome::Uncertain { message, .. } => text_bytes(message),
+                    ToolOutcome::CompletedWithheld { .. } | ToolOutcome::NotInvoked { .. } => 0,
+                },
+                OperationKind::RecordToolOutcome,
+                |(call, outcome), batch| mutations::record_tool_outcome(batch, call, *outcome),
+            )
         })
         .await
     }
@@ -1814,8 +2482,16 @@ impl DatabaseHandle {
         &self,
         pool: ExecutionPool,
     ) -> Result<ExecutionPoolId, DatabaseError> {
-        self.submit(|reply| Command::CreateExecutionPool { pool, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (pool,),
+                reply,
+                |(pool,)| byte_count(pool.name.len()),
+                OperationKind::CreateExecutionPool,
+                |(pool,), batch| mutations::create_execution_pool(batch, pool),
+            )
+        })
+        .await
     }
 
     pub async fn set_execution_pool_enabled(
@@ -1823,8 +2499,16 @@ impl DatabaseHandle {
         id: ExecutionPoolId,
         enabled: bool,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::SetExecutionPoolEnabled { id, enabled, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (id, enabled),
+                reply,
+                |(_, _)| 64,
+                OperationKind::SetExecutionPoolEnabled,
+                |(id, enabled), batch| mutations::set_execution_pool_enabled(batch, id, enabled),
+            )
+        })
+        .await
     }
 
     /// Replaces a Pool's capabilities and concurrency limit.
@@ -1833,8 +2517,16 @@ impl DatabaseHandle {
         id: ExecutionPoolId,
         config: ExecutionPoolConfig,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| Command::UpdateExecutionPool { id, config, reply })
-            .await
+        self.submit(|reply| {
+            Command::new(
+                (id, config),
+                reply,
+                |(_, _)| 64,
+                OperationKind::SetExecutionPoolProfile,
+                |(id, config), batch| mutations::update_execution_pool(batch, id, config),
+            )
+        })
+        .await
     }
 
     pub async fn execution_pool(

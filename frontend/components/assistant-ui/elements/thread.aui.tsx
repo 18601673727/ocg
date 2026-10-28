@@ -24,7 +24,10 @@ import {
   ToolGroupRoot,
   ToolGroupTrigger,
 } from "@/components/assistant-ui/elements/tool-group.aui";
-import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import {
+  FloatingIconButton,
+  TooltipIconButton,
+} from "@/components/assistant-ui/elements/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
@@ -130,6 +133,7 @@ export type ThreadProps = {
   components?: ThreadComponents | undefined;
   autoFocus?: boolean | undefined;
   afterMessages?: ReactNode;
+  footerAction?: ReactNode;
 };
 
 const EMPTY_COMPONENTS: ThreadComponents = {};
@@ -176,21 +180,28 @@ export const Thread: FC<ThreadProps> = ({
   components = EMPTY_COMPONENTS,
   autoFocus = true,
   afterMessages,
+  footerAction,
 }) => {
   const isEmpty = useAuiState(isNewChatView);
 
   return (
     <ThreadComponentsContext.Provider value={components}>
-      <ThreadRoot isEmpty={isEmpty} autoFocus={autoFocus} afterMessages={afterMessages} />
+      <ThreadRoot
+        isEmpty={isEmpty}
+        autoFocus={autoFocus}
+        afterMessages={afterMessages}
+        footerAction={footerAction}
+      />
     </ThreadComponentsContext.Provider>
   );
 };
 
-const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; afterMessages?: ReactNode }> = ({
-  isEmpty,
-  autoFocus,
-  afterMessages,
-}) => {
+const ThreadRoot: FC<{
+  isEmpty: boolean;
+  autoFocus: boolean;
+  afterMessages?: ReactNode;
+  footerAction?: ReactNode;
+}> = ({ isEmpty, autoFocus, afterMessages, footerAction }) => {
   const { Welcome = ThreadWelcome, Composer: ComposerComponent = Composer } =
     useContext(ThreadComponentsContext);
 
@@ -234,9 +245,14 @@ const ThreadRoot: FC<{ isEmpty: boolean; autoFocus: boolean; afterMessages?: Rea
           <ThreadPrimitive.ViewportFooter
             className={cn(
               "aui-thread-viewport-footer pointer-events-none flex flex-col gap-4 overflow-visible bg-transparent pb-4 [&>*]:pointer-events-auto md:pb-6",
-              !isEmpty && "sticky bottom-0 mt-auto rounded-t-(--composer-radius)",
+              isEmpty ? "relative" : "sticky bottom-0 mt-auto rounded-t-(--composer-radius)",
             )}
           >
+            {footerAction && (
+              <div className="absolute -top-12 z-10 -translate-x-12 self-center">
+                {footerAction}
+              </div>
+            )}
             <ThreadScrollToBottom />
             <ThreadFollowupSuggestions />
             <ComposerComponent autoFocus={autoFocus} />
@@ -423,13 +439,12 @@ const ThreadScrollToBottom: FC = () => {
   const { t } = useI18n();
   return (
     <ThreadPrimitive.ScrollToBottom asChild>
-      <TooltipIconButton
+      <FloatingIconButton
         tooltip={t("aui.scrollBottom")}
-        variant="outline"
-        className="aui-thread-scroll-to-bottom dark:border-border dark:bg-background dark:hover:bg-accent absolute -top-12 z-10 self-center rounded-full p-4 disabled:invisible"
+        className="aui-thread-scroll-to-bottom absolute -top-12 z-10 self-center disabled:invisible"
       >
         <ArrowDownIcon />
-      </TooltipIconButton>
+      </FloatingIconButton>
     </ThreadPrimitive.ScrollToBottom>
   );
 };

@@ -3096,6 +3096,44 @@ pub(super) struct SealedTurn {
     pub context_tokens: usize,
 }
 
+macro_rules! source_reducible_tokens {
+    ($name:ident, $transaction:ty) => {
+        pub(super) fn $name(
+            tx: &$transaction,
+            manifest: &crate::db::entities::ContextSourceManifest,
+        ) -> Result<usize, StorageError> {
+            if manifest.turns.is_empty() {
+                return Ok(0);
+            }
+            let jobs = tx.open_table(JOBS)?;
+            let states = tx.open_table(JOB_STATES)?;
+            let inputs = tx.open_table(JOB_INPUTS)?;
+            let outputs = tx.open_table(JOB_OUTPUTS)?;
+            let tools = tx.open_table(TOOL_CALLS)?;
+            let approvals = tx.open_table(APPROVALS)?;
+            let mut reducible = 0usize;
+            for boundary in &manifest.turns {
+                let source = source_turn(
+                    &jobs,
+                    &states,
+                    &inputs,
+                    &outputs,
+                    &tools,
+                    &approvals,
+                    boundary.turn,
+                    Some((boundary.input_through, boundary.output_through)),
+                )?;
+                reducible =
+                    reducible.saturating_add(source.map_or(0, |turn| turn.reducible_tokens));
+            }
+            Ok(reducible)
+        }
+    };
+}
+
+source_reducible_tokens!(source_reducible_read, ReadTransaction);
+source_reducible_tokens!(source_reducible_write, WriteTransaction);
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn source_turn(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
@@ -3587,20 +3625,7 @@ pub(crate) fn read_context_state(
     if let Some(tip) = tip
         && let Some(adopted) = adopted_context(&rx, tip)?
     {
-        for boundary in &adopted.source.turns {
-            if let Some(turn) = source_turn(
-                &rx.open_table(JOBS)?,
-                &rx.open_table(JOB_STATES)?,
-                &rx.open_table(JOB_INPUTS)?,
-                &rx.open_table(JOB_OUTPUTS)?,
-                &rx.open_table(TOOL_CALLS)?,
-                &rx.open_table(APPROVALS)?,
-                boundary.turn,
-                Some((boundary.input_through, boundary.output_through)),
-            )? {
-                tokens = tokens.saturating_sub(turn.reducible_tokens);
-            }
-        }
+        tokens = tokens.saturating_sub(source_reducible_read(&rx, &adopted.source)?);
         tokens = tokens.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
     }
     let settings = global_compaction_settings(&rx.open_table(META)?)?;

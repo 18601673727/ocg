@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { ArrowLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { FloatingIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
 import { cn } from "@/lib/utils";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
@@ -418,25 +419,6 @@ function AppShellContent({
               activeView={location.view}
               titleVisible={location.view === "chat" || !pageTitleInView}
               onOpenMobileSidebar={() => setMobile(true)}
-              backButton={
-                location.view === "chat" && ancestors.length > 1 ? (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="size-11 shrink-0 rounded-full bg-muted/80 backdrop-blur-sm"
-                    aria-label={t("chat.child.back")}
-                    title={t("chat.child.back")}
-                    onClick={() => {
-                      window.history.pushState(null, "", conversationPath(ancestors.slice(0, -1)));
-                      setSessionId("");
-                      setLocation(currentLocation());
-                    }}
-                  >
-                    <ArrowLeft className="size-4" />
-                  </Button>
-                ) : undefined
-              }
               inspectorToggle={
                 location.view === "chat" && inspectorAvailable && !inspectorOpen ? (
                   <Button
@@ -482,6 +464,26 @@ function AppShellContent({
                         <ChatScreen
                           key={session.id}
                           onOpenConversation={(job) => void openNestedConversation(job)}
+                          backButton={
+                            ancestors.length > 1 ? (
+                              <FloatingIconButton
+                                type="button"
+                                tooltip={t("chat.child.back")}
+                                aria-label={t("chat.child.back")}
+                                onClick={() => {
+                                  window.history.pushState(
+                                    null,
+                                    "",
+                                    conversationPath(ancestors.slice(0, -1)),
+                                  );
+                                  setSessionId("");
+                                  setLocation(currentLocation());
+                                }}
+                              >
+                                <ArrowLeft />
+                              </FloatingIconButton>
+                            ) : undefined
+                          }
                           session={session}
                           execution={null}
                           runtimeStatus={runtime.snapshot.status}

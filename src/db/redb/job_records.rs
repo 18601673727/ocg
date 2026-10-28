@@ -266,24 +266,7 @@ impl Batch {
                 }
                 None => 0,
             };
-            let mut reducible = 0usize;
-            for boundary in &source.turns {
-                reducible = reducible.saturating_add(
-                    self.step(|tx| {
-                        reader::source_turn(
-                            &tx.open_table(JOBS)?,
-                            &tx.open_table(JOB_STATES)?,
-                            &tx.open_table(JOB_INPUTS)?,
-                            &tx.open_table(JOB_OUTPUTS)?,
-                            &tx.open_table(TOOL_CALLS)?,
-                            &tx.open_table(APPROVALS)?,
-                            boundary.turn,
-                            Some((boundary.input_through, boundary.output_through)),
-                        )
-                    })?
-                    .map_or(0, |turn| turn.reducible_tokens),
-                );
-            }
+            let reducible = self.step(|tx| reader::source_reducible_write(tx, &source))?;
             let room =
                 (recipe.target as usize).saturating_sub(full_usage.saturating_sub(reducible));
             if room == 0 || reducible <= recipe.minimum_savings as usize {
@@ -870,24 +853,7 @@ impl Batch {
             return Ok(None);
         }
         let tokens = result.context_text().len().saturating_add(128).div_ceil(3);
-        let mut reducible = 0usize;
-        for boundary in &manifest.turns {
-            reducible = reducible.saturating_add(
-                self.step(|tx| {
-                    reader::source_turn(
-                        &tx.open_table(JOBS)?,
-                        &tx.open_table(JOB_STATES)?,
-                        &tx.open_table(JOB_INPUTS)?,
-                        &tx.open_table(JOB_OUTPUTS)?,
-                        &tx.open_table(TOOL_CALLS)?,
-                        &tx.open_table(APPROVALS)?,
-                        boundary.turn,
-                        Some((boundary.input_through, boundary.output_through)),
-                    )
-                })?
-                .map_or(0, |source| source.reducible_tokens),
-            );
-        }
+        let reducible = self.step(|tx| reader::source_reducible_write(tx, &manifest))?;
         if tokens > work.target_tokens as usize
             || reducible.saturating_sub(tokens) < work.minimum_savings_tokens as usize
         {
@@ -1321,23 +1287,8 @@ impl Batch {
             return Ok(None);
         }
         if let Some(adopted) = self.adopt_context(foreground.id)? {
-            for boundary in &adopted.source.turns {
-                occupancy = occupancy.saturating_sub(
-                    self.step(|tx| {
-                        reader::source_turn(
-                            &tx.open_table(JOBS)?,
-                            &tx.open_table(JOB_STATES)?,
-                            &tx.open_table(JOB_INPUTS)?,
-                            &tx.open_table(JOB_OUTPUTS)?,
-                            &tx.open_table(TOOL_CALLS)?,
-                            &tx.open_table(APPROVALS)?,
-                            boundary.turn,
-                            Some((boundary.input_through, boundary.output_through)),
-                        )
-                    })?
-                    .map_or(0, |source| source.reducible_tokens),
-                );
-            }
+            let reducible = self.step(|tx| reader::source_reducible_write(tx, &adopted.source))?;
+            occupancy = occupancy.saturating_sub(reducible);
             occupancy =
                 occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
         }
@@ -1572,22 +1523,8 @@ impl Batch {
             )
         })?;
         if let Some(adopted) = self.adopt_context(tip)? {
-            for boundary in &adopted.source.turns {
-                let source = self.step(|tx| {
-                    reader::source_turn(
-                        &tx.open_table(JOBS)?,
-                        &tx.open_table(JOB_STATES)?,
-                        &tx.open_table(JOB_INPUTS)?,
-                        &tx.open_table(JOB_OUTPUTS)?,
-                        &tx.open_table(TOOL_CALLS)?,
-                        &tx.open_table(APPROVALS)?,
-                        boundary.turn,
-                        Some((boundary.input_through, boundary.output_through)),
-                    )
-                })?;
-                occupancy =
-                    occupancy.saturating_sub(source.map_or(0, |source| source.reducible_tokens));
-            }
+            let reducible = self.step(|tx| reader::source_reducible_write(tx, &adopted.source))?;
+            occupancy = occupancy.saturating_sub(reducible);
             occupancy =
                 occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
         }

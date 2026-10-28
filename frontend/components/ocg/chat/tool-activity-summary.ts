@@ -22,6 +22,53 @@ export function jobPlanTitles(args: unknown): string {
     .join(" · ");
 }
 
+export function formatToolJson(text: string): string {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (value === null || typeof value !== "object") return text;
+  } catch {
+    return text;
+  }
+
+  let formatted = "";
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      formatted += char;
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+      formatted += char;
+    } else if (char === "{" || char === "[") {
+      depth++;
+      formatted += char;
+      let next = i + 1;
+      while (next < text.length && /\s/.test(text[next])) next++;
+      if (text[next] !== "}" && text[next] !== "]") {
+        formatted += `\n${"  ".repeat(depth)}`;
+      }
+    } else if (char === "}" || char === "]") {
+      depth--;
+      if (!formatted.endsWith("{") && !formatted.endsWith("[")) {
+        formatted += `\n${"  ".repeat(depth)}`;
+      }
+      formatted += char;
+    } else if (char === ",") {
+      formatted += `,\n${"  ".repeat(depth)}`;
+    } else if (char === ":") {
+      formatted += ": ";
+    } else if (!/\s/.test(char)) {
+      formatted += char;
+    }
+  }
+  return formatted;
+}
+
 const categories = ["read", "search", "code", "edit", "command", "agent", "other"] as const;
 type Category = (typeof categories)[number];
 

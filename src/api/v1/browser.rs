@@ -218,24 +218,54 @@ impl State {
             .remove(&session.key);
         Reply::with_cookie(
             StatusCode::OK,
-            envelope(serde_json::json!({
-                "session": (serde_json::json!({
-                    "authenticated": false,
-                })),
+            envelope(serde_json::json!(SessionResponseView {
+                session: SessionView::SignedOut(SignedOutView {
+                    authenticated: false,
+                }),
             })),
             format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
         )
     }
 }
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "SignedOut")]
+pub(crate) struct SignedOutView {
+    #[ts(type = "false")]
+    authenticated: bool,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "SignedIn")]
+pub(crate) struct SignedInView {
+    #[ts(type = "true")]
+    authenticated: bool,
+    csrf_token: String,
+    expires_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(untagged)]
+#[ts(rename = "Session")]
+pub(crate) enum SessionView {
+    SignedOut(SignedOutView),
+    SignedIn(SignedInView),
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "SessionResponse")]
+pub(crate) struct SessionResponseView {
+    session: SessionView,
+}
+
 /// What a signed-in request may read of its own session.
 pub(super) fn described(session: &Session) -> Value {
-    envelope(serde_json::json!({
-        "session": (serde_json::json!({
-            "authenticated": true,
-            "csrf_token": session.csrf.clone(),
-            "expires_at_us": session.expires_at_us,
-        })),
+    envelope(serde_json::json!(SessionResponseView {
+        session: SessionView::SignedIn(SignedInView {
+            authenticated: true,
+            csrf_token: session.csrf.clone(),
+            expires_at_us: session.expires_at_us,
+        }),
     }))
 }
 

@@ -1,6 +1,27 @@
 use super::contracts::*;
 use super::*;
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ProviderResponse")]
+pub(crate) struct ProviderResponseView {
+    request: u32,
+    text: String,
+    text_offset: u32,
+    text_complete: bool,
+    requests_tools: bool,
+    created_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ProviderResponses")]
+pub(crate) struct ProviderResponsesView {
+    job: String,
+    responses: Vec<ProviderResponseView>,
+    next_after: Option<u32>,
+    next_text_offset: Option<u32>,
+    has_more: bool,
+}
+
 /// Pages received assistant text, splitting large replies only at UTF-8 boundaries.
 pub(super) async fn provider_responses(
     shared: &Shared,
@@ -34,15 +55,16 @@ fn provider_response_page(
     if text_offset > 0 && records.responses.first().map(|response| response.request) != after {
         return Err(INVALID_REQUEST);
     }
-    let envelope = |responses: Vec<serde_json::Value>, next_after, next_text_offset, has_more| {
-        envelope(serde_json::json!({
-            "job": job.to_string(),
-            "responses": responses,
-            "next_after": next_after,
-            "next_text_offset": next_text_offset,
-            "has_more": has_more,
-        }))
-    };
+    let envelope =
+        |responses: Vec<ProviderResponseView>, next_after, next_text_offset, has_more| {
+            envelope(serde_json::json!(ProviderResponsesView {
+                job: job.to_string(),
+                responses,
+                next_after,
+                next_text_offset,
+                has_more,
+            }))
+        };
     let mut size = envelope(Vec::new(), Some(u32::MAX), Some(u32::MAX), true)
         .to_string()
         .len();
@@ -59,14 +81,14 @@ fn provider_response_page(
         if offset > record.text.len() || !record.text.is_char_boundary(offset) {
             return Err(INVALID_REQUEST);
         }
-        let mut response = serde_json::json!({
-            "request": record.request.get(),
-            "text": String::new(),
-            "text_offset": offset as u32,
-            "text_complete": false,
-            "requests_tools": record.requests_tools,
-            "created_at_us": record.recorded_at.as_unix_micros(),
-        });
+        let mut response = ProviderResponseView {
+            request: record.request.get(),
+            text: String::new(),
+            text_offset: offset as u32,
+            text_complete: false,
+            requests_tools: record.requests_tools,
+            created_at_us: record.recorded_at.as_unix_micros(),
+        };
         let base = json!(response).to_string().len() + 1;
         let available = response_bytes.saturating_sub(size + base);
         let mut bytes = 0;
@@ -86,9 +108,9 @@ fn provider_response_page(
             more = true;
             break;
         }
-        response["text"] = serde_json::json!(&record.text[offset..end]);
+        response.text = record.text[offset..end].to_owned();
         let text_complete = end == record.text.len();
-        response["text_complete"] = serde_json::json!(text_complete);
+        response.text_complete = text_complete;
         size += base + bytes;
         next = Some(record.request.get());
         next_offset = if text_complete { 0 } else { end as u32 };

@@ -229,143 +229,162 @@ pub(super) async fn job_input(database: &DatabaseHandle, job: JobId) -> Result<R
         .job_input_for_job(job)
         .await?
         .ok_or(INCONSISTENT_RECORD)?;
-    let configuration = database.job_configuration(job).await?.map(|submitted| {
-        serde_json::json!({
-            "agent_profile": submitted.agent_profile.map(|id| id.to_string()),
-            "llm_profile": submitted.llm_profile.to_string(),
-            "model": submitted.frozen.llm.config.model,
-            "context_window": submitted.frozen.llm.config.context_window,
-        })
-    });
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "job": job.to_string(),
-        "input": serde_json::json!({
-            "id": input.id.to_string(),
-            "objective": input.objective,
-            "submitted_at_us": input.submitted_at.map(|at| at.as_unix_micros()),
-            "attachments": input.attachments.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "configuration": configuration,
-        }),
+    let configuration = database
+        .job_configuration(job)
+        .await?
+        .map(configuration_view);
+    Ok(Reply::ok(envelope(serde_json::json!(JobInputView {
+        job: job.to_string(),
+        input: InputView {
+            id: input.id.to_string(),
+            objective: input.objective,
+            submitted_at_us: input.submitted_at.map(|at| at.as_unix_micros()),
+            attachments: input.attachments.iter().map(ToString::to_string).collect(),
+            configuration,
+        },
     }))))
 }
 
-pub(super) fn actor_view(actor: &crate::db::entities::Actor) -> serde_json::Value {
+pub(super) fn actor_view(actor: &crate::db::entities::Actor) -> ActorView {
     use crate::db::entities::Actor;
     match actor {
-        Actor::Auto => serde_json::json!({
-            "kind": "auto",
-        }),
-        Actor::User => serde_json::json!({
-            "kind": "user",
-        }),
-        Actor::Loop => serde_json::json!({
-            "kind": "loop",
-        }),
-        Actor::Agent { conversation } => serde_json::json!({
-            "kind": "agent",
-            "conversation": conversation.to_string(),
-        }),
+        Actor::Auto => ActorView::Auto,
+        Actor::User => ActorView::User,
+        Actor::Loop => ActorView::Loop,
+        Actor::Agent { conversation } => ActorView::Agent {
+            conversation: conversation.to_string(),
+        },
     }
 }
 
-pub(super) fn entry_json(
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(rename = "ResponseFormat")]
+pub(crate) enum ResponseFormatView {
+    JsonObject,
+    JsonSchema { name: String },
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(rename = "TurnEntryKind")]
+pub(crate) enum TurnEntryKindView {
+    ContextPreparation {
+        job: String,
+        policy_revision: String,
+    },
+    ContextUse {
+        artifact: Option<String>,
+    },
+    UserMessage {
+        text: String,
+        attachments: Vec<String>,
+    },
+    UserMessageEdit {
+        message: u32,
+        text: String,
+        attachments: Vec<String>,
+    },
+    UserMessageWithdraw {
+        message: u32,
+    },
+    AgentMessage {
+        text: String,
+        call: String,
+    },
+    Notice {
+        child: String,
+        event: String,
+        reference: String,
+    },
+    Decision {
+        approval: (String, u32, u32),
+    },
+    RetryOf {
+        turn: String,
+        by: ActorView,
+    },
+    Iteration {
+        n: u64,
+    },
+    ResponseFormat {
+        #[serde(flatten)]
+        format: ResponseFormatView,
+    },
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "TurnEntry")]
+pub(crate) struct TurnEntryView {
     seq: u32,
-    entry: &crate::db::entities::JobInputEntry,
-) -> serde_json::Value {
+    at_us: i64,
+    #[serde(flatten)]
+    entry: TurnEntryKindView,
+}
+
+pub(super) fn entry_json(seq: u32, entry: &crate::db::entities::JobInputEntry) -> TurnEntryView {
     use crate::db::entities::Entry;
-    let value = match &entry.entry {
-        Entry::UserMessage { text, attachments } => serde_json::json!({
-            "kind": "user_message",
-            "text": text.clone(),
-            "attachments": attachments.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        }),
+    let kind = match &entry.entry {
+        Entry::UserMessage { text, attachments } => TurnEntryKindView::UserMessage {
+            text: text.clone(),
+            attachments: attachments.iter().map(ToString::to_string).collect(),
+        },
         Entry::UserMessageEdit {
             message,
             text,
             attachments,
-        } => serde_json::json!({
-            "kind": "user_message_edit",
-            "message": *message,
-            "text": text.clone(),
-            "attachments": attachments.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        }),
+        } => TurnEntryKindView::UserMessageEdit {
+            message: *message,
+            text: text.clone(),
+            attachments: attachments.iter().map(ToString::to_string).collect(),
+        },
         Entry::UserMessageWithdraw { message } => {
-            serde_json::json!({
-                "kind": "user_message_withdraw",
-                "message": *message,
-            })
+            TurnEntryKindView::UserMessageWithdraw { message: *message }
         }
-        Entry::AgentMessage { text, call } => serde_json::json!({
-            "kind": "agent_message",
-            "text": text.clone(),
-            "call": format!("{}:{}/{}", call.job, call.request.get(), call.index),
-        }),
+        Entry::AgentMessage { text, call } => TurnEntryKindView::AgentMessage {
+            text: text.clone(),
+            call: format!("{}:{}/{}", call.job, call.request.get(), call.index),
+        },
         Entry::Notice {
             child,
             event,
             reference,
-        } => serde_json::json!({
-            "kind": "notice",
-            "child": child.to_string(),
-            "event": format!("{event:?}"),
-            "reference": reference.to_string(),
-        }),
-        Entry::Decision { approval } => serde_json::json!({
-            "kind": "decision",
-            "approval": (approval.0.to_string(), approval.1, approval.2),
-        }),
-        Entry::RetryOf { turn, by } => serde_json::json!({
-            "kind": "retry_of",
-            "turn": turn.to_string(),
-            "by": actor_view(by),
-        }),
+        } => TurnEntryKindView::Notice {
+            child: child.to_string(),
+            event: format!("{event:?}"),
+            reference: reference.to_string(),
+        },
+        Entry::Decision { approval } => TurnEntryKindView::Decision {
+            approval: (approval.0.to_string(), approval.1, approval.2),
+        },
+        Entry::RetryOf { turn, by } => TurnEntryKindView::RetryOf {
+            turn: turn.to_string(),
+            by: actor_view(by),
+        },
         Entry::ContextPreparation {
             job,
             policy_revision,
-        } => serde_json::json!({
-            "kind": "context_preparation",
-            "job": job.to_string(),
-            "policy_revision": policy_revision.to_string(),
-        }),
-        Entry::ContextUse { artifact } => serde_json::json!({
-            "kind": "context_use",
-            "artifact": artifact.map(|job| job.to_string()),
-        }),
-        Entry::Iteration { n } => serde_json::json!({
-            "kind": "iteration",
-            "n": *n,
-        }),
-        Entry::ResponseFormat { format } => {
-            let mut object = serde_json::json!({
-                "kind": "response_format",
-            });
-            if let (serde_json::Value::Object(target), serde_json::Value::Object(fields)) = (
-                &mut object,
-                serde_json::json!(match format {
-                    crate::db::entities::ResponseFormat::JsonObject =>
-                        serde_json::json!({"type":"json_object"}),
-                    crate::db::entities::ResponseFormat::JsonSchema { name, .. } => {
-                        serde_json::json!({"type": "json_schema",
-"name": (name.clone())})
-                    }
-                }),
-            ) {
-                target.extend(fields);
-            }
-            object
-        }
+        } => TurnEntryKindView::ContextPreparation {
+            job: job.to_string(),
+            policy_revision: policy_revision.to_string(),
+        },
+        Entry::ContextUse { artifact } => TurnEntryKindView::ContextUse {
+            artifact: artifact.map(|job| job.to_string()),
+        },
+        Entry::Iteration { n } => TurnEntryKindView::Iteration { n: *n },
+        Entry::ResponseFormat { format } => TurnEntryKindView::ResponseFormat {
+            format: match format {
+                crate::db::entities::ResponseFormat::JsonObject => ResponseFormatView::JsonObject,
+                crate::db::entities::ResponseFormat::JsonSchema { name, .. } => {
+                    ResponseFormatView::JsonSchema { name: name.clone() }
+                }
+            },
+        },
     };
-    {
-        let mut object = serde_json::json!({
-            "seq": seq,
-            "at_us": entry.at.as_unix_micros(),
-        });
-        if let (serde_json::Value::Object(target), serde_json::Value::Object(fields)) =
-            (&mut object, serde_json::json!(value))
-        {
-            target.extend(fields);
-        }
-        object
+    TurnEntryView {
+        seq,
+        at_us: entry.at.as_unix_micros(),
+        entry: kind,
     }
 }
 pub(super) async fn conversation_children(
@@ -385,37 +404,28 @@ pub(super) async fn conversation_children(
     let mut children = Vec::new();
     for record in records.iter().take(limit) {
         let c = &record.conversation;
-        children.push({
-            let mut object = serde_json::json!({
-                "id": c.root_job.to_string(),
-                "title": c.title.clone(),
-                "agent": c.agent.map(|id| ProfileId::from(id).to_string()),
-                "state": c.state.to_owned(),
-                "job_state": record.job_state,
-                "on_hold": c.on_hold.as_ref().map(|by| serde_json::json!({
-                    "by": actor_view(by),
-                })),
-                "keep_open": record.keep_open,
-                "recurrence": record.recurrence.as_ref().map(recurrence_json),
-            });
-            if let Some(value) = Some(
-                match record.origin {
-                    crate::db::entities::Origin::User => "user",
-                    crate::db::entities::Origin::Agent { .. } => "agent",
-                    crate::db::entities::Origin::System => "system",
-                }
-                .to_owned(),
-            ) {
-                object["origin"] = serde_json::json!(value);
+        children.push(ChildView {
+            id: c.root_job.to_string(),
+            title: c.title.clone(),
+            agent: c.agent.map(|id| ProfileId::from(id).to_string()),
+            state: c.state.clone(),
+            job_state: record.job_state.clone(),
+            on_hold: c.on_hold.as_ref().map(|by| HoldView { by: actor_view(by) }),
+            keep_open: record.keep_open,
+            recurrence: record.recurrence.as_ref().map(recurrence_json),
+            origin: match record.origin {
+                crate::db::entities::Origin::User => "user",
+                crate::db::entities::Origin::Agent { .. } => "agent",
+                crate::db::entities::Origin::System => "system",
             }
-            object
+            .to_owned(),
         });
     }
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "conversation": conversation.to_string(),
-        "children": children,
-        "has_more": has_more,
-        "next_before": if has_more {
+    Ok(Reply::ok(envelope(serde_json::json!(ChildrenView {
+        conversation: conversation.to_string(),
+        children,
+        has_more,
+        next_before: if has_more {
             records
                 .get(limit.saturating_sub(1))
                 .map(|record| record.conversation.root_job.to_string())
@@ -425,53 +435,53 @@ pub(super) async fn conversation_children(
     }))))
 }
 /// The recurrence of a conversation, as the children route reports it.
-fn recurrence_json(row: &Recurrence) -> serde_json::Value {
+fn recurrence_json(row: &Recurrence) -> RecurrenceView {
     use crate::db::entities::RecurrencePhase;
     let (phase, due) = match row.phase {
         RecurrencePhase::Active => ("active", None),
         RecurrencePhase::WaitingDue { due } => ("waiting_due", Some(due)),
         RecurrencePhase::Halted { .. } => ("halted", None),
     };
-    serde_json::json!({
-        "interval_s": row.interval_s,
-        "phase": phase.to_owned(),
-        "due_us": due,
-    })
+    RecurrenceView {
+        interval_s: row.interval_s,
+        phase: phase.to_owned(),
+        due_us: due,
+    }
 }
 
 /// One node of the tree, as the route reports it. The children of a node
 /// are the nodes the tree holds below it.
-fn tree_node_json(node: &TreeNode, tree: &JobTree) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "id": node.id.to_string(),
-        "kind": serde_json::json!("turn"),
-        "parent": node.parent_id.map(|id| id.to_string()),
-        "title": String::new(),
-        "state": String::new(),
-        "created_at_us": node.created_at.as_unix_micros(),
-        "agent": node
-        .agent
-        .as_ref()
-        .map(|(id, _)| ProfileId::from(*id).to_string()),
-        "agent_name": node.agent.as_ref().and_then(|(_, name)| name.clone()),
-        "model": serde_json::Value::Null,
-        "on_hold": serde_json::Value::Null,
-        "origin": serde_json::Value::Null,
-        "keep_open": serde_json::Value::Null,
-        "active_turn": serde_json::Value::Null,
-        "recurrence": serde_json::Value::Null,
-        "conversation": serde_json::Value::Null,
-        "previous": serde_json::Value::Null,
-        "depends_on": serde_json::json!([]),
-        "children": node.children.as_ref().map(|children| {
+fn tree_node_json(node: &TreeNode, tree: &JobTree) -> TreeNodeView {
+    let mut value = TreeNodeView {
+        id: node.id.to_string(),
+        kind: super::jobs::JobKindView::Turn,
+        parent: node.parent_id.map(|id| id.to_string()),
+        title: String::new(),
+        state: String::new(),
+        created_at_us: node.created_at.as_unix_micros(),
+        agent: node
+            .agent
+            .as_ref()
+            .map(|(id, _)| ProfileId::from(*id).to_string()),
+        agent_name: node.agent.as_ref().and_then(|(_, name)| name.clone()),
+        model: None,
+        on_hold: None,
+        origin: None,
+        keep_open: None,
+        active_turn: None,
+        recurrence: None,
+        conversation: None,
+        previous: None,
+        depends_on: Vec::new(),
+        children: node.children.as_ref().map(|children| {
             children
                 .iter()
                 .map(|index| tree_node_json(&tree.nodes[*index], tree))
-                .collect::<Vec<_>>()
+                .collect()
         }),
-        "has_more_children": node.has_more_children,
-        "next_after": node.next_after.map(|id| id.to_string()),
-    });
+        has_more_children: node.has_more_children,
+        next_after: node.next_after.map(|id| id.to_string()),
+    };
     match &node.facts {
         TreeFacts::Conversation {
             title,
@@ -482,21 +492,18 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> serde_json::Value {
             active_turn,
             recurrence,
         } => {
-            value["kind"] = serde_json::json!(serde_json::json!("conversation"));
-            value["title"] = serde_json::json!(title.clone());
-            value["state"] = serde_json::json!((*state).to_owned());
-            value["on_hold"] = serde_json::json!(
-                on_hold
-                    .as_ref()
-                    .map(|by| serde_json::json!({"by": (actor_view(by))}))
-            );
-            value["origin"] = serde_json::json!(Some((*origin).to_owned()));
-            value["keep_open"] = serde_json::json!(Some(*keep_open));
-            value["active_turn"] =
-                serde_json::json!(active_turn.as_ref().map(|(id, _, _)| id.to_string()));
-            value["recurrence"] = serde_json::json!(recurrence.as_ref().map(recurrence_json));
-            value["model"] = serde_json::json!(active_turn.as_ref().map(|(_, llm, model)| serde_json::json!({"llm_profile": (ProfileId::from(*llm).to_string()),
-"model": (model.clone())})));
+            value.kind = super::jobs::JobKindView::Conversation;
+            value.title = title.clone();
+            value.state = (*state).to_owned();
+            value.on_hold = on_hold.as_ref().map(|by| HoldView { by: actor_view(by) });
+            value.origin = Some((*origin).to_owned());
+            value.keep_open = Some(*keep_open);
+            value.active_turn = active_turn.as_ref().map(|(id, _, _)| id.to_string());
+            value.recurrence = recurrence.as_ref().map(recurrence_json);
+            value.model = active_turn.as_ref().map(|(_, llm, model)| ModelView {
+                llm_profile: ProfileId::from(*llm).to_string(),
+                model: model.clone(),
+            });
         }
         TreeFacts::Turn {
             title,
@@ -506,33 +513,31 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> serde_json::Value {
             model,
             depends_on,
         } => {
-            value["title"] = serde_json::json!(title.clone());
-            value["state"] = serde_json::json!((*state).to_owned());
-            value["model"] = serde_json::json!(Some(
-                serde_json::json!({"llm_profile": (ProfileId::from(model.0).to_string()),
-"model": (model.1.clone())})
-            ));
-            value["conversation"] = serde_json::json!(conversation.map(|id| id.to_string()));
-            value["previous"] = serde_json::json!(previous.map(|id| id.to_string()));
-            value["depends_on"] = serde_json::json!(
-                depends_on
-                    .iter()
-                    .map(
-                        |(job, condition, state)| serde_json::json!({"job": (job.to_string()),
-"condition": (match condition {
+            value.title = title.clone();
+            value.state = (*state).to_owned();
+            value.model = Some(ModelView {
+                llm_profile: ProfileId::from(model.0).to_string(),
+                model: model.1.clone(),
+            });
+            value.conversation = conversation.map(|id| id.to_string());
+            value.previous = previous.map(|id| id.to_string());
+            value.depends_on = depends_on
+                .iter()
+                .map(|(job, condition, state)| DependencyView {
+                    job: job.to_string(),
+                    condition: match condition {
                         DependencyCondition::Success => "success",
                         DependencyCondition::Settled => "settled",
                     }
-                    .to_owned()),
-"state": (match state {
+                    .to_owned(),
+                    state: match state {
                         DependencyState::Waiting => "waiting",
                         DependencyState::Satisfied => "satisfied",
                         DependencyState::Impossible => "impossible",
                     }
-                    .to_owned())})
-                    )
-                    .collect::<Vec<_>>()
-            );
+                    .to_owned(),
+                })
+                .collect();
         }
     }
     value
@@ -555,12 +560,52 @@ pub(super) async fn job_tree(
     let root = tree_node_json(&tree.nodes[0], &tree);
     dashboard::bounded(
         shared,
-        envelope(serde_json::json!({
-            "job": job.to_string(),
-            "ancestors": tree.ancestors.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            "root": root,
+        envelope(serde_json::json!(TreeView {
+            job: job.to_string(),
+            ancestors: tree.ancestors.iter().map(ToString::to_string).collect(),
+            root,
         })),
     )
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UncertainCall")]
+pub(crate) struct UncertainCallView {
+    request: u32,
+    index: u32,
+    tool: String,
+    argv: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "CompactionUse")]
+pub(crate) struct CompactionUseView {
+    artifact: String,
+    kind: String,
+    at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Turn")]
+pub(crate) struct TurnView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    compaction: Option<CompactionUseView>,
+    job: super::jobs::JobView,
+    entries: Vec<TurnEntryView>,
+    configuration: Option<ConfigurationView>,
+    outputs: Vec<super::outputs::OutputView>,
+    uncertain_calls: Vec<UncertainCallView>,
+    outputs_truncated: bool,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Turns")]
+pub(crate) struct TurnsView {
+    conversation: String,
+    turns: Vec<TurnView>,
+    has_more: bool,
+    next_before: Option<String>,
 }
 
 pub(super) async fn conversation_turns(
@@ -605,14 +650,7 @@ pub(super) async fn conversation_turns(
         let configuration = database
             .job_configuration(record.id)
             .await?
-            .map(|submitted| {
-                serde_json::json!({
-                    "agent_profile": submitted.agent_profile.map(|id| id.to_string()),
-                    "llm_profile": submitted.llm_profile.to_string(),
-                    "model": submitted.frozen.llm.config.model,
-                    "context_window": submitted.frozen.llm.config.context_window,
-                })
-            });
+            .map(configuration_view);
         let mut uncertain = Vec::new();
         if record.unknown_at.is_some() {
             for call in database.tool_evidence(record.id, None, 1000).await? {
@@ -624,48 +662,41 @@ pub(super) async fn conversation_turns(
                         )
                     })
                 {
-                    uncertain.push(serde_json::json!({
-                        "request": call.call.request.get(),
-                        "index": call.call.index,
-                        "tool": call.name.clone(),
-                        "argv": admission.arguments.as_str().to_owned(),
-                    }));
+                    uncertain.push(UncertainCallView {
+                        request: call.call.request.get(),
+                        index: call.call.index,
+                        tool: call.name.clone(),
+                        argv: admission.arguments.as_str().to_owned(),
+                    });
                 }
             }
         }
         let compaction = database
             .turn_compaction(record.id)
             .await?
-            .map(|(artifact, kind, at)| {
-                serde_json::json!({
-                    "artifact": artifact.to_string(),
-                    "kind": kind.to_owned(),
-                    "at_us": at.as_unix_micros(),
-                })
+            .map(|(artifact, kind, at)| CompactionUseView {
+                artifact: artifact.to_string(),
+                kind: kind.to_owned(),
+                at_us: at.as_unix_micros(),
             });
-        turns.push({
-            let mut object = serde_json::json!({
-                "job": super::jobs::job_view(record)?,
-                "entries": entries
+        turns.push(TurnView {
+            compaction,
+            job: super::jobs::job_view(record)?,
+            entries: entries
                 .iter()
                 .map(|(seq, entry)| entry_json(*seq, entry))
-                .collect::<Vec<_>>(),
-                "configuration": configuration,
-                "outputs": outputs.iter().map(super::outputs::output_view).collect::<Vec<_>>(),
-                "uncertain_calls": uncertain,
-                "outputs_truncated": outputs_truncated,
-            });
-            if let Some(value) = compaction {
-                object["compaction"] = serde_json::json!(value);
-            }
-            object
+                .collect(),
+            configuration,
+            outputs: outputs.iter().map(super::outputs::output_view).collect(),
+            uncertain_calls: uncertain,
+            outputs_truncated,
         });
     }
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "conversation": conversation.to_string(),
-        "turns": turns,
-        "has_more": has_more,
-        "next_before": if has_more {
+    Ok(Reply::ok(envelope(serde_json::json!(TurnsView {
+        conversation: conversation.to_string(),
+        turns,
+        has_more,
+        next_before: if has_more {
             records
                 .get(limit.saturating_sub(1))
                 .map(|record| record.id.to_string())
@@ -797,6 +828,36 @@ fn capability(capability: ModelCapability) -> &'static str {
 /// given. An Agent Profile is an Agent config; archived ones are not listed,
 /// so the page may hold fewer than `limit`; `next_before` continues from the
 /// oldest one read.
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "LlmTarget")]
+pub(crate) struct LlmTargetView {
+    reasoning_efforts: Option<Vec<String>>,
+    id: String,
+    name: String,
+    model: String,
+    context_window: Option<u32>,
+    parameters: crate::db::entities::LlmParameters,
+    declared_capabilities: Vec<String>,
+    executors: Vec<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "AgentProfile")]
+pub(crate) struct AgentProfileView {
+    id: String,
+    name: String,
+    capabilities: std::collections::BTreeSet<crate::db::entities::AgentCapability>,
+    llm_targets: Vec<LlmTargetView>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "AgentProfiles")]
+pub(crate) struct AgentProfilesView {
+    agent_profiles: Vec<AgentProfileView>,
+    has_more: bool,
+    next_before: Option<String>,
+}
+
 pub(super) async fn agent_profiles(
     database: &DatabaseHandle,
     before: Option<ProfileId>,
@@ -822,36 +883,36 @@ pub(super) async fn agent_profiles(
                 continue;
             };
             let executors = database.compatible_executors((*target).into()).await?;
-            llm_targets.push(serde_json::json!({
-                "id": ProfileId::from(llm.id).to_string(),
-                "name": llm.name,
-                "model": model.model,
-                "context_window": model.context_window,
-                "reasoning_efforts": model.reasoning_efforts,
-                "parameters": llm_parameters_json(&model.parameters),
-                "declared_capabilities": model
-                .declared_capabilities
-                .iter()
-                .map(|declared| capability(*declared).to_owned())
-                .collect::<Vec<_>>(),
-                "executors": executors.iter().map(ToString::to_string).collect::<Vec<_>>(),
-            }));
+            llm_targets.push(LlmTargetView {
+                id: ProfileId::from(llm.id).to_string(),
+                name: llm.name,
+                model: model.model,
+                context_window: model.context_window,
+                reasoning_efforts: model.reasoning_efforts,
+                parameters: model.parameters,
+                declared_capabilities: model
+                    .declared_capabilities
+                    .iter()
+                    .map(|declared| capability(*declared).to_owned())
+                    .collect(),
+                executors: executors.iter().map(ToString::to_string).collect(),
+            });
         }
-        agent_profiles.push(serde_json::json!({
-            "id": ProfileId::from(record.id).to_string(),
-            "name": record.name,
-            "capabilities": agent.capabilities,
-            "llm_targets": llm_targets,
-        }));
+        agent_profiles.push(AgentProfileView {
+            id: ProfileId::from(record.id).to_string(),
+            name: record.name,
+            capabilities: agent.capabilities,
+            llm_targets,
+        });
     }
     Ok(Reply::ok(page(agent_profiles, next_before)))
 }
 
-fn page(agent_profiles: Vec<serde_json::Value>, next_before: Option<String>) -> Value {
-    envelope(serde_json::json!({
-        "agent_profiles": agent_profiles,
-        "has_more": next_before.is_some(),
-        "next_before": next_before,
+fn page(agent_profiles: Vec<AgentProfileView>, next_before: Option<String>) -> Value {
+    envelope(serde_json::json!(AgentProfilesView {
+        has_more: next_before.is_some(),
+        agent_profiles,
+        next_before,
     }))
 }
 
@@ -881,28 +942,24 @@ fn conversation_page(page: crate::db::redb::ConversationsPage) -> serde_json::Va
     let items = page
         .conversations
         .into_iter()
-        .map(|c| {
-            serde_json::json!({
-                "job_state": c.job_state,
-                "has_children": c.has_children,
-                "root_job": c.root_job.to_string(),
-                "tip_job": c.tip_job.to_string(),
-                "agent": c.agent.map(|id| ProfileId::from(id).to_string()),
-                "title": c.title,
-                "project": c.project.map(|id| id.to_string()),
-                "state": c.state.to_owned(),
-                "on_hold": c.on_hold.as_ref().map(|by| serde_json::json!({
-                    "by": actor_view(by),
-                })),
-                "tip_settlement_state": c.tip_settlement_state.to_owned(),
-                "tip_created_at_us": c.tip_created_at.as_unix_micros(),
-            })
+        .map(|c| ConversationView {
+            job_state: c.job_state,
+            has_children: c.has_children,
+            root_job: c.root_job.to_string(),
+            tip_job: c.tip_job.to_string(),
+            agent: c.agent.map(|id| ProfileId::from(id).to_string()),
+            title: c.title,
+            project: c.project.map(|id| id.to_string()),
+            state: c.state,
+            on_hold: c.on_hold.as_ref().map(|by| HoldView { by: actor_view(by) }),
+            tip_settlement_state: c.tip_settlement_state,
+            tip_created_at_us: c.tip_created_at.as_unix_micros(),
         })
         .collect::<Vec<_>>();
-    serde_json::json!({
-        "conversations": items,
-        "has_more": page.has_more,
-        "next_before": page.next_before.map(|j| j.to_string()),
+    serde_json::json!(ConversationsView {
+        conversations: items,
+        has_more: page.has_more,
+        next_before: page.next_before.map(|j| j.to_string()),
     })
 }
 
@@ -927,14 +984,116 @@ pub(super) async fn group_limits(
         .group_limits(conversation)
         .await?
         .ok_or(NOT_FOUND)?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "conversation": conversation.to_string(),
-        "depth": depth,
-        "remaining_depth": limits.max_depth.saturating_sub(depth),
-        "max_depth": limits.max_depth,
-        "max_auto_turns": limits.max_auto_turns,
-        "max_iterations": limits.max_iterations,
-    }))))
+    Ok(Reply::ok(envelope(serde_json::json!(
+        ConversationLimitsView {
+            conversation: conversation.to_string(),
+            depth,
+            remaining_depth: limits.max_depth.saturating_sub(depth),
+            max_depth: limits.max_depth,
+            max_auto_turns: limits.max_auto_turns,
+            max_iterations: limits.max_iterations,
+        }
+    ))))
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ContextModel")]
+pub(crate) struct ContextModelView {
+    profile: String,
+    edit_seq: u32,
+    model: String,
+    capacity: Option<u32>,
+    capacity_source: String,
+    reserved_output_tokens: u32,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ContextUse")]
+pub(crate) struct ContextUseView {
+    turn: String,
+    seq: u32,
+    artifact: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ContextBoundary")]
+pub(crate) struct ContextBoundaryView {
+    turn: String,
+    input_through: u32,
+    output_through: u32,
+    fingerprint: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ContextSource")]
+pub(crate) struct ContextSourceView {
+    digest: String,
+    first: ContextBoundaryView,
+    through: ContextBoundaryView,
+    turn_count: usize,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(rename = "ContextWork")]
+pub(crate) enum ContextWorkView {
+    Summarization {
+        job: String,
+        conversation: String,
+        state: String,
+        summarizer: String,
+        failure: Option<String>,
+        automatic: bool,
+        stage: String,
+        chain: Option<String>,
+        prediction: Option<String>,
+        reserved_tokens: u32,
+        reserved_requests: u32,
+        source: ContextSourceView,
+    },
+    Prediction {
+        job: String,
+        conversation: String,
+        state: String,
+        predictor: String,
+        model: String,
+        activity_turn: String,
+        policy_revision: u64,
+        policy: CompactionPolicyInput,
+        max_tokens: u32,
+        forecast_tokens: Option<u64>,
+        result: Option<Value>,
+    },
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ContextStatus")]
+pub(crate) struct ContextStatusView {
+    conversation: String,
+    mode: String,
+    summarizer: Option<String>,
+    predictive: bool,
+    predictive_unavailable: Option<String>,
+    revision: u64,
+    uncalibrated: bool,
+    policy: CompactionPolicyInput,
+    policy_override: Option<CompactionPolicyInput>,
+    policy_source: String,
+    predictor: Option<String>,
+    predictor_model: Option<String>,
+    prediction_mode: String,
+    predictive_preparation_enabled: bool,
+    foreground_model: Option<ContextModelView>,
+    estimated_tokens: Option<u64>,
+    estimate_method: String,
+    recent_growth_tokens: u32,
+    last_context_use: Option<ContextUseView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    steer_blocked_by: Option<String>,
+    work: Vec<ContextWorkView>,
+    has_more: bool,
+    next_before: Option<String>,
 }
 
 /// `GET /api/v1/conversations/{id}/context`. Reports the stored override and
@@ -949,7 +1108,7 @@ pub(super) async fn conversation_context(
         .context_state(conversation, before, limit)
         .await?
         .ok_or(NOT_FOUND)?;
-    let policy_json = compaction_policy_json(state.policy.clone());
+    let policy_json = compaction_policy_view(state.policy.clone());
     let mode = match &state.policy.mode {
         crate::db::entities::CompactionMode::Off => "disabled",
         crate::db::entities::CompactionMode::Auto { preset } => match preset {
@@ -963,29 +1122,31 @@ pub(super) async fn conversation_context(
         .policy
         .summarization_model
         .or_else(|| state.model.as_ref().map(|model| model.model.id));
-    let boundary = |source: crate::db::entities::SourceBoundary| {
-        serde_json::json!({
-            "turn": source.turn.to_string(),
-            "input_through": source.input_through,
-            "output_through": source.output_through,
-            "fingerprint": source.content.to_string(),
-        })
+    let predictive_preparation_enabled =
+        state.prediction_unavailable.is_none()
+            && state.policy.predictive.as_ref().is_some_and(|binding| {
+                binding.mode == crate::db::entities::PredictionMode::Prepare
+            });
+    let boundary = |source: crate::db::entities::SourceBoundary| ContextBoundaryView {
+        turn: source.turn.to_string(),
+        input_through: source.input_through,
+        output_through: source.output_through,
+        fingerprint: source.content.to_string(),
     };
-    Ok(Reply::ok(envelope({
-        let mut object = serde_json::json!({
-            "conversation": conversation.to_string(),
-            "mode": mode.to_owned(),
-            "summarizer": summarizer.map(|id| id.to_string()),
-            "predictive": state.policy.predictive.is_some(),
-            "predictive_unavailable": state.prediction_unavailable,
-            "revision": state.revision,
-            "uncalibrated": true,
-            "policy": policy_json,
-            "policy_override": state.stored_override.map(compaction_policy_json),
-            "policy_source": state.policy_source.to_owned(),
-            "predictor": state.predictor.map(|id| id.to_string()),
-            "predictor_model": state.predictor_model.map(|id| id.to_string()),
-            "prediction_mode": state
+    Ok(Reply::ok(envelope(serde_json::json!(ContextStatusView {
+        conversation: conversation.to_string(),
+        mode: mode.to_owned(),
+        summarizer: summarizer.map(|id| id.to_string()),
+        predictive: state.policy.predictive.is_some(),
+        predictive_unavailable: state.prediction_unavailable,
+        revision: state.revision,
+        uncalibrated: true,
+        policy: policy_json,
+        policy_override: state.stored_override.map(compaction_policy_view),
+        policy_source: state.policy_source.to_owned(),
+        predictor: state.predictor.map(|id| id.to_string()),
+        predictor_model: state.predictor_model.map(|id| id.to_string()),
+        prediction_mode: state
             .policy
             .predictive
             .as_ref()
@@ -994,105 +1155,94 @@ pub(super) async fn conversation_context(
                 crate::db::entities::PredictionMode::Prepare => "prepare",
             })
             .to_owned(),
-            "predictive_preparation_enabled": state.prediction_unavailable.is_none()
-            && state
-                .policy
-                .predictive
-                .as_ref()
-                .is_some_and(|binding| binding.mode == crate::db::entities::PredictionMode::Prepare),
-            "foreground_model": state.model.map(|model| serde_json::json!({
-                "profile": model.model.id.to_string(),
-                "edit_seq": model.model.edit_seq,
-                "model": model.config.model,
-                "capacity": model.config.context_window,
-                "capacity_source": if model.config.context_window.is_some() {
-                    "frozen_model_configuration"
-                } else {
-                    "unknown"
-                }
-                .to_owned(),
-                "reserved_output_tokens": model
+        predictive_preparation_enabled,
+        foreground_model: state.model.map(|model| ContextModelView {
+            profile: model.model.id.to_string(),
+            edit_seq: model.model.edit_seq,
+            model: model.config.model,
+            capacity: model.config.context_window,
+            capacity_source: if model.config.context_window.is_some() {
+                "frozen_model_configuration"
+            } else {
+                "unknown"
+            }
+            .to_owned(),
+            reserved_output_tokens: model
                 .config
                 .parameters
                 .max_completion_tokens
                 .or(model.config.parameters.max_tokens)
                 .unwrap_or(4096),
-            })),
-            "estimated_tokens": state.estimated_tokens,
-            "estimate_method": "utf8_bytes_per_three_plus_framing_and_image_allowance".to_owned(),
-            "recent_growth_tokens": state.growth,
-            "last_context_use": state.last_use.map(|(turn, seq, artifact)| serde_json::json!({
-                "turn": turn.to_string(),
-                "seq": seq,
-                "artifact": artifact.map(|id| id.to_string()),
-            })),
-            "work": state
-                        .work
-                        .into_iter()
-                        .map(|work| match work.details {
-                            crate::db::redb::ContextWorkDetails::Summary {
-                                summarizer,
-                                failure,
-                                automatic,
-                                stage,
-                                chain,
-                                prediction,
-                                reserved_tokens,
-                                reserved_requests,
-                                source,
-                                first,
-                                through,
-                                turn_count,
-                            } => serde_json::json!({
-                                "kind": "summarization",
-                                "job": work.job.to_string(),
-                                "conversation": work.conversation.to_string(),
-                                "state": work.state.to_owned(),
-                                "summarizer": summarizer.to_string(),
-                                "failure": failure,
-                                "automatic": automatic,
-                                "stage": stage.to_owned(),
-                                "chain": chain.map(|id| id.to_string()),
-                                "prediction": prediction.map(|id| id.to_string()),
-                                "reserved_tokens": reserved_tokens,
-                                "reserved_requests": reserved_requests,
-                                "source": serde_json::json!({
-                                    "digest": source.to_string(),
-                                    "first": boundary(first),
-                                    "through": boundary(through),
-                                    "turn_count": turn_count,
-                                }),
-                            }),
-                            crate::db::redb::ContextWorkDetails::Prediction {
-                                predictor,
-                                model,
-                                binding,
-                                forecast_tokens,
-                                result,
-                            } => serde_json::json!({
-                                "kind": "prediction",
-                                "job": work.job.to_string(),
-                                "conversation": work.conversation.to_string(),
-                                "state": work.state.to_owned(),
-                                "predictor": predictor.to_string(),
-                                "model": model.to_string(),
-                                "activity_turn": binding.activity_turn.to_string(),
-                                "policy_revision": binding.policy_revision,
-                                "policy": compaction_policy_json(binding.policy),
-                                "max_tokens": binding.max_tokens,
-                                "forecast_tokens": forecast_tokens,
-                                "result": result.and_then(|result| serde_json::to_value(result).ok()),
-                            }),
-                        })
-                        .collect::<Vec<_>>(),
-            "has_more": state.next_before.is_some(),
-            "next_before": state.next_before.map(|id| id.to_string()),
-        });
-        if let Some(value) = state.steer_blocked_by.map(str::to_owned) {
-            object["steer_blocked_by"] = serde_json::json!(value);
-        }
-        object
-    })))
+        }),
+        estimated_tokens: state.estimated_tokens,
+        estimate_method: "utf8_bytes_per_three_plus_framing_and_image_allowance".to_owned(),
+        recent_growth_tokens: state.growth,
+        last_context_use: state.last_use.map(|(turn, seq, artifact)| ContextUseView {
+            turn: turn.to_string(),
+            seq,
+            artifact: artifact.map(|id| id.to_string()),
+        }),
+        steer_blocked_by: state.steer_blocked_by.map(str::to_owned),
+        work: state
+            .work
+            .into_iter()
+            .map(|work| match work.details {
+                crate::db::redb::ContextWorkDetails::Summary {
+                    summarizer,
+                    failure,
+                    automatic,
+                    stage,
+                    chain,
+                    prediction,
+                    reserved_tokens,
+                    reserved_requests,
+                    source,
+                    first,
+                    through,
+                    turn_count,
+                } => ContextWorkView::Summarization {
+                    job: work.job.to_string(),
+                    conversation: work.conversation.to_string(),
+                    state: work.state.to_owned(),
+                    summarizer: summarizer.to_string(),
+                    failure,
+                    automatic,
+                    stage: stage.to_owned(),
+                    chain: chain.map(|id| id.to_string()),
+                    prediction: prediction.map(|id| id.to_string()),
+                    reserved_tokens,
+                    reserved_requests,
+                    source: ContextSourceView {
+                        digest: source.to_string(),
+                        first: boundary(first),
+                        through: boundary(through),
+                        turn_count,
+                    },
+                },
+                crate::db::redb::ContextWorkDetails::Prediction {
+                    predictor,
+                    model,
+                    binding,
+                    forecast_tokens,
+                    result,
+                } => ContextWorkView::Prediction {
+                    job: work.job.to_string(),
+                    conversation: work.conversation.to_string(),
+                    state: work.state.to_owned(),
+                    predictor: predictor.to_string(),
+                    model: model.to_string(),
+                    activity_turn: binding.activity_turn.to_string(),
+                    policy_revision: binding.policy_revision,
+                    policy: compaction_policy_view(binding.policy),
+                    max_tokens: binding.max_tokens,
+                    forecast_tokens,
+                    result: result.and_then(|result| serde_json::to_value(result).ok()),
+                },
+            })
+            .collect(),
+        has_more: state.next_before.is_some(),
+        next_before: state.next_before.map(|id| id.to_string()),
+    }))))
 }
 
 /// `POST /api/v1/conversations/{job}`: renames the conversation whose root
@@ -1127,7 +1277,180 @@ pub(super) async fn edit_conversation(
             DatabaseError::Rejected(Violation::NotFound(RecordRef::Job(_))) => NOT_FOUND,
             other => profiles::map_mutation_error(other),
         })?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "conversation": root.to_string(),
-    }))))
+    Ok(Reply::ok(envelope(serde_json::json!(
+        ConversationEditedView {
+            conversation: root.to_string(),
+        }
+    ))))
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ConversationEdited")]
+pub(crate) struct ConversationEditedView {
+    conversation: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(rename = "Actor")]
+pub(crate) enum ActorView {
+    Auto,
+    User,
+    Loop,
+    Agent { conversation: String },
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Hold")]
+pub(crate) struct HoldView {
+    by: ActorView,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Conversation")]
+pub(crate) struct ConversationView {
+    job_state: String,
+    has_children: bool,
+    root_job: String,
+    tip_job: String,
+    agent: Option<String>,
+    title: String,
+    project: Option<String>,
+    state: String,
+    on_hold: Option<HoldView>,
+    tip_settlement_state: String,
+    tip_created_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Conversations")]
+pub(crate) struct ConversationsView {
+    conversations: Vec<ConversationView>,
+    has_more: bool,
+    next_before: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ConversationLimits")]
+pub(crate) struct ConversationLimitsView {
+    conversation: String,
+    depth: u8,
+    remaining_depth: u8,
+    max_depth: u8,
+    max_auto_turns: u8,
+    max_iterations: u32,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Configuration")]
+pub(crate) struct ConfigurationView {
+    agent_profile: Option<String>,
+    llm_profile: String,
+    model: String,
+    context_window: Option<u32>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Input")]
+pub(crate) struct InputView {
+    id: String,
+    objective: Option<String>,
+    submitted_at_us: Option<i64>,
+    attachments: Vec<String>,
+    configuration: Option<ConfigurationView>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "JobInput")]
+pub(crate) struct JobInputView {
+    job: String,
+    input: InputView,
+}
+
+fn configuration_view(submitted: crate::db::entities::SubmittedConfiguration) -> ConfigurationView {
+    ConfigurationView {
+        agent_profile: submitted.agent_profile.map(|id| id.to_string()),
+        llm_profile: submitted.llm_profile.to_string(),
+        model: submitted.frozen.llm.config.model,
+        context_window: submitted.frozen.llm.config.context_window,
+    }
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Recurrence")]
+pub(crate) struct RecurrenceView {
+    interval_s: u32,
+    phase: String,
+    due_us: Option<i64>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Child")]
+pub(crate) struct ChildView {
+    job_state: String,
+    id: String,
+    origin: String,
+    title: String,
+    agent: Option<String>,
+    state: String,
+    on_hold: Option<HoldView>,
+    keep_open: bool,
+    recurrence: Option<RecurrenceView>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Children")]
+pub(crate) struct ChildrenView {
+    conversation: String,
+    children: Vec<ChildView>,
+    has_more: bool,
+    next_before: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Model")]
+pub(crate) struct ModelView {
+    llm_profile: String,
+    model: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Dependency")]
+pub(crate) struct DependencyView {
+    job: String,
+    condition: String,
+    state: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "TreeNode")]
+pub(crate) struct TreeNodeView {
+    id: String,
+    kind: super::jobs::JobKindView,
+    parent: Option<String>,
+    title: String,
+    state: String,
+    created_at_us: i64,
+    agent: Option<String>,
+    agent_name: Option<String>,
+    model: Option<ModelView>,
+    on_hold: Option<HoldView>,
+    origin: Option<String>,
+    keep_open: Option<bool>,
+    active_turn: Option<String>,
+    recurrence: Option<RecurrenceView>,
+    conversation: Option<String>,
+    previous: Option<String>,
+    depends_on: Vec<DependencyView>,
+    children: Option<Vec<TreeNodeView>>,
+    has_more_children: bool,
+    next_after: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Tree")]
+pub(crate) struct TreeView {
+    job: String,
+    ancestors: Vec<String>,
+    root: TreeNodeView,
 }

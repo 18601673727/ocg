@@ -72,6 +72,27 @@ use super::{
 };
 use crate::db::entities::{JobId, JobOutputRecord, JobRecord, Timestamp};
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "JobEvent")]
+pub(crate) struct JobEventView {
+    job: super::jobs::JobView,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "OutputEvent")]
+pub(crate) struct OutputEventView {
+    job: String,
+    output: super::outputs::OutputView,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "SettlementEvent")]
+pub(crate) struct SettlementEventView {
+    job: String,
+    settlement: super::jobs::SettlementView,
+    stop_confirmed_at_us: Option<i64>,
+}
+
 /// The request header a reconnecting client names its cursor with.
 const LAST_EVENT_ID: &str = "last-event-id";
 
@@ -433,9 +454,7 @@ impl Feed {
         match job_view(&self.record) {
             Ok(described) => {
                 self.announced = Some(lifecycle(&self.record));
-                let data = envelope(serde_json::json!({
-                    "job": described,
-                }));
+                let data = envelope(serde_json::json!(JobEventView { job: described }));
                 self.send(event("job", &data))
             }
             Err(refusal) => self.fail(refusal),
@@ -446,13 +465,13 @@ impl Feed {
         match settlement_view(&self.record) {
             Ok(settlement) => {
                 self.ended = true;
-                let data = envelope(serde_json::json!({
-                    "job": self.job.to_string(),
-                    "settlement": settlement,
-                    "stop_confirmed_at_us": self
-                    .record
-                    .stop_confirmed_at
-                    .map(|at| at.as_unix_micros()),
+                let data = envelope(serde_json::json!(SettlementEventView {
+                    job: self.job.to_string(),
+                    settlement,
+                    stop_confirmed_at_us: self
+                        .record
+                        .stop_confirmed_at
+                        .map(|at| at.as_unix_micros()),
                 }));
                 self.send(event("settlement", &data))
             }
@@ -481,9 +500,9 @@ fn event(name: &str, data: &Value) -> Bytes {
 /// than a response may be. Such an output is larger than a page of the
 /// outputs route could carry too.
 fn output_event(shared: &Shared, job: JobId, output: &JobOutputRecord) -> Result<Bytes, Refusal> {
-    let data = envelope(serde_json::json!({
-        "job": job.to_string(),
-        "output": output_view(output),
+    let data = envelope(serde_json::json!(OutputEventView {
+        job: job.to_string(),
+        output: output_view(output),
     }));
     let event = format!("id: {}\nevent: output\ndata: {data}\n\n", output.seq);
     if event.len() > shared.response_bytes {

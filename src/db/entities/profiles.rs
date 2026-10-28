@@ -172,15 +172,16 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(rename = "ProviderModel")]
 pub struct DiscoveredModel {
     pub id: String,
     pub context_window: Option<u32>,
     pub reasoning_efforts: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, ts_rs::TS)]
 pub struct LlmParameters {
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,

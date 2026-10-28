@@ -224,7 +224,8 @@ pub enum NotInvokedReason {
 }
 
 /// The kind of a [`ToolOutcome`], without what it carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolOutcomeKind {
     Completed,
     CompletedWithheld,

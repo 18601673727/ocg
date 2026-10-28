@@ -16,7 +16,6 @@ type OcgTopbarProps = {
   titleVisible?: boolean;
   projectSelector?: React.ReactNode;
   inspectorToggle?: React.ReactNode;
-  backButton?: React.ReactNode;
 };
 
 export function OcgTopbar({
@@ -26,7 +25,6 @@ export function OcgTopbar({
   titleVisible = true,
   projectSelector,
   inspectorToggle,
-  backButton,
 }: OcgTopbarProps) {
   const { t } = useI18n();
 
@@ -95,7 +93,6 @@ export function OcgTopbar({
           <ConversationErrorHeader key={session?.id ?? "new"} />
         </div>
       )}
-      {backButton}
       {inspectorToggle}
     </header>
   );

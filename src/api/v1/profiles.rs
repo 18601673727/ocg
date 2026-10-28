@@ -631,6 +631,130 @@ const PROFILE_SCAN_FACTOR: usize = 4;
 /// The serialized budget one Profile page may exceed only for a single entry.
 const MAX_PROFILE_PAGE_BYTES: usize = 512 * 1024;
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "LlmProfile")]
+pub(crate) struct LlmProfileView {
+    reasoning_efforts: Option<Vec<String>>,
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    profile_type: Option<String>,
+    name: String,
+    model: String,
+    context_window: Option<u32>,
+    protocol: String,
+    endpoint: Option<String>,
+    credential_ref: Option<String>,
+    has_credential: bool,
+    declared_capabilities: Vec<String>,
+    parameters: LlmParameters,
+    editable: bool,
+    blocking_jobs: Vec<String>,
+    more_blocking_jobs: bool,
+    created_at_us: i64,
+    updated_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ManagedAgent")]
+pub(crate) struct ManagedAgentView {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    profile_type: Option<String>,
+    name: String,
+    instructions: Option<String>,
+    capabilities: BTreeSet<AgentCapability>,
+    llm_targets: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    compaction_policy: Option<CompactionPolicyInput>,
+    editable: bool,
+    blocking_jobs: Vec<String>,
+    more_blocking_jobs: bool,
+    created_at_us: i64,
+    updated_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "DecisionLimits")]
+pub(crate) struct DecisionLimitsView {
+    max_input_tokens_per_request: Option<u32>,
+    max_output_tokens_per_request: Option<u32>,
+    max_input_tokens_per_question: Option<u32>,
+    max_output_tokens_per_question: Option<u32>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "DecisionProfile")]
+pub(crate) struct DecisionProfileView {
+    id: String,
+    edit_seq: u32,
+    name: String,
+    model: String,
+    protocol: String,
+    endpoint: Option<String>,
+    credential_ref: Option<String>,
+    has_credential: bool,
+    declared_capabilities: Vec<String>,
+    limits: DecisionLimitsView,
+    editable: bool,
+    created_at_us: i64,
+    updated_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "DecisionAgentProfile")]
+pub(crate) struct DecisionAgentProfileView {
+    id: String,
+    name: String,
+    instructions: Option<String>,
+    models: Vec<String>,
+    default_model: Option<String>,
+    editable: bool,
+    created_at_us: i64,
+    updated_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ProfileExecutor")]
+pub(crate) struct ProfileExecutorView {
+    id: String,
+    protocol: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Provider")]
+pub(crate) struct ProviderView {
+    name: String,
+    protocol: String,
+    endpoint: Option<String>,
+    credential_ref: Option<String>,
+    has_credential: bool,
+    profile_ids: Vec<String>,
+    models: Vec<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Profiles")]
+pub(crate) struct ProfilesView {
+    llm_profiles: Vec<LlmProfileView>,
+    agent_profiles: Vec<ManagedAgentView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    decision_profiles: Option<Vec<DecisionProfileView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    decision_agent_profiles: Option<Vec<DecisionAgentProfileView>>,
+    executor_protocols: Vec<ProfileExecutorView>,
+    providers: Vec<ProviderView>,
+    has_more: bool,
+    next_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    profile_id: Option<String>,
+}
+
 /// Reads one page of LLM and Agent Profiles, newest first, and the Provider
 /// projection of the LLM Profiles on that page. `next_before` continues from
 /// the last Profile returned, or from the last config examined when the scan
@@ -715,29 +839,24 @@ fn build_profiles_page(
                     .map(|cap| capability_str(*cap))
                     .collect::<Vec<_>>();
                 let id_str = id.to_string();
-                let profile = {
-                    let mut object = serde_json::json!({
-                        "id": id_str.clone(),
-                        "name": record.name,
-                        "model": model.model.clone(),
-                        "context_window": model.context_window,
-                        "reasoning_efforts": model.reasoning_efforts,
-                        "protocol": protocol.to_owned(),
-                        "endpoint": connection.endpoint.clone(),
-                        "credential_ref": connection.credential_ref.clone(),
-                        "has_credential": has_credential,
-                        "declared_capabilities": capabilities.into_iter().map(str::to_owned).collect::<Vec<_>>(),
-                        "parameters": llm_parameters_json(&model.parameters),
-                        "editable": true,
-                        "blocking_jobs": serde_json::json!([]),
-                        "more_blocking_jobs": false,
-                        "created_at_us": record.created_at.as_unix_micros(),
-                        "updated_at_us": record.updated_at.as_unix_micros(),
-                    });
-                    if let Some(value) = Some("llm".to_owned()) {
-                        object["profile_type"] = serde_json::json!(value);
-                    }
-                    object
+                let profile = LlmProfileView {
+                    reasoning_efforts: model.reasoning_efforts,
+                    id: id_str.clone(),
+                    profile_type: Some("llm".to_owned()),
+                    name: record.name,
+                    model: model.model.clone(),
+                    context_window: model.context_window,
+                    protocol: protocol.to_owned(),
+                    endpoint: connection.endpoint.clone(),
+                    credential_ref: connection.credential_ref.clone(),
+                    has_credential,
+                    declared_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+                    parameters: model.parameters,
+                    editable: true,
+                    blocking_jobs: Vec::new(),
+                    more_blocking_jobs: false,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
                 };
                 if !fits_profile_page(&profile, &mut page_bytes)? {
                     next_before = last_emitted;
@@ -760,30 +879,23 @@ fn build_profiles_page(
                 last_emitted = Some(record.id);
             }
             ConfigBody::Agent(agent) => {
-                let profile = {
-                    let mut object = serde_json::json!({
-                        "id": id.to_string(),
-                        "name": record.name,
-                        "instructions": agent.instructions,
-                        "capabilities": agent.capabilities,
-                        "llm_targets": agent
+                let profile = ManagedAgentView {
+                    id: id.to_string(),
+                    profile_type: Some("agent".to_owned()),
+                    name: record.name,
+                    instructions: agent.instructions,
+                    capabilities: agent.capabilities,
+                    llm_targets: agent
                         .models
                         .iter()
                         .map(|id| ProfileId::from(*id).to_string())
-                        .collect::<Vec<_>>(),
-                        "editable": true,
-                        "blocking_jobs": serde_json::json!([]),
-                        "more_blocking_jobs": false,
-                        "created_at_us": record.created_at.as_unix_micros(),
-                        "updated_at_us": record.updated_at.as_unix_micros(),
-                    });
-                    if let Some(value) = Some("agent".to_owned()) {
-                        object["profile_type"] = serde_json::json!(value);
-                    }
-                    if let Some(value) = agent.compaction_policy.map(compaction_policy_json) {
-                        object["compaction_policy"] = serde_json::json!(value);
-                    }
-                    object
+                        .collect(),
+                    compaction_policy: agent.compaction_policy.map(compaction_policy_view),
+                    editable: true,
+                    blocking_jobs: Vec::new(),
+                    more_blocking_jobs: false,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
                 };
                 if !fits_profile_page(&profile, &mut page_bytes)? {
                     next_before = last_emitted;
@@ -802,11 +914,9 @@ fn build_profiles_page(
                 .filter(|protocol| {
                     pool.enabled && pool.offers(ExecutionOperation::LlmRequest, Some(*protocol))
                 })
-                .map(|protocol| {
-                    serde_json::json!({
-                        "id": record.id.to_string(),
-                        "protocol": protocol.as_str().to_owned(),
-                    })
+                .map(|protocol| ProfileExecutorView {
+                    id: record.id.to_string(),
+                    protocol: protocol.as_str().to_owned(),
                 })
                 .collect();
                 if !offered.is_empty() {
@@ -827,30 +937,30 @@ fn build_profiles_page(
                     .credential_ref
                     .as_deref()
                     .is_some_and(|reference| database.has_credential(reference));
-                let profile = serde_json::json!({
-                    "id": id.to_string(),
-                    "edit_seq": record.edit_seq,
-                    "name": record.name,
-                    "model": model.model.clone(),
-                    "protocol": model.protocol.as_str().to_owned(),
-                    "endpoint": connection.endpoint.clone(),
-                    "credential_ref": connection.credential_ref.clone(),
-                    "has_credential": has_credential,
-                    "declared_capabilities": model
-                    .declared_capabilities
-                    .iter()
-                    .map(|capability| decision_capability_str(*capability).to_owned())
-                    .collect::<Vec<_>>(),
-                    "limits": serde_json::json!({
-                        "max_input_tokens_per_request": model.limits.max_input_tokens_per_request,
-                        "max_output_tokens_per_request": model.limits.max_output_tokens_per_request,
-                        "max_input_tokens_per_question": model.limits.max_input_tokens_per_question,
-                        "max_output_tokens_per_question": model.limits.max_output_tokens_per_question,
-                    }),
-                    "editable": true,
-                    "created_at_us": record.created_at.as_unix_micros(),
-                    "updated_at_us": record.updated_at.as_unix_micros(),
-                });
+                let profile = DecisionProfileView {
+                    id: id.to_string(),
+                    edit_seq: record.edit_seq,
+                    name: record.name,
+                    model: model.model.clone(),
+                    protocol: model.protocol.as_str().to_owned(),
+                    endpoint: connection.endpoint.clone(),
+                    credential_ref: connection.credential_ref.clone(),
+                    has_credential,
+                    declared_capabilities: model
+                        .declared_capabilities
+                        .iter()
+                        .map(|capability| decision_capability_str(*capability).to_owned())
+                        .collect(),
+                    limits: DecisionLimitsView {
+                        max_input_tokens_per_request: model.limits.max_input_tokens_per_request,
+                        max_output_tokens_per_request: model.limits.max_output_tokens_per_request,
+                        max_input_tokens_per_question: model.limits.max_input_tokens_per_question,
+                        max_output_tokens_per_question: model.limits.max_output_tokens_per_question,
+                    },
+                    editable: true,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
+                };
                 if !fits_profile_page(&profile, &mut page_bytes)? {
                     next_before = last_emitted;
                     break;
@@ -859,22 +969,22 @@ fn build_profiles_page(
                 last_emitted = Some(record.id);
             }
             ConfigBody::DecisionAgent(agent) => {
-                let profile = serde_json::json!({
-                    "id": id.to_string(),
-                    "name": record.name,
-                    "instructions": agent.instructions,
-                    "models": agent
-                    .models
-                    .iter()
-                    .map(|id| ProfileId::from(*id).to_string())
-                    .collect::<Vec<_>>(),
-                    "default_model": agent
-                    .default_model
-                    .map(|id| ProfileId::from(id).to_string()),
-                    "editable": true,
-                    "created_at_us": record.created_at.as_unix_micros(),
-                    "updated_at_us": record.updated_at.as_unix_micros(),
-                });
+                let profile = DecisionAgentProfileView {
+                    id: id.to_string(),
+                    name: record.name,
+                    instructions: agent.instructions,
+                    models: agent
+                        .models
+                        .iter()
+                        .map(|id| ProfileId::from(*id).to_string())
+                        .collect(),
+                    default_model: agent
+                        .default_model
+                        .map(|id| ProfileId::from(id).to_string()),
+                    editable: true,
+                    created_at_us: record.created_at.as_unix_micros(),
+                    updated_at_us: record.updated_at.as_unix_micros(),
+                };
                 if !fits_profile_page(&profile, &mut page_bytes)? {
                     next_before = last_emitted;
                     break;
@@ -886,59 +996,37 @@ fn build_profiles_page(
     }
     // Newest first, as Profiles have always been listed.
     llm_profiles.sort_by_key(|profile| {
-        std::cmp::Reverse(
-            profile["id"]
-                .as_str()
-                .and_then(|id| profile_id(id).ok())
-                .map_or(0, ProfileId::get),
-        )
+        std::cmp::Reverse(profile_id(&profile.id).ok().map_or(0, ProfileId::get))
     });
     agent_profiles.sort_by_key(|profile| {
-        std::cmp::Reverse(
-            profile["id"]
-                .as_str()
-                .and_then(|id| profile_id(id).ok())
-                .map_or(0, ProfileId::get),
-        )
+        std::cmp::Reverse(profile_id(&profile.id).ok().map_or(0, ProfileId::get))
     });
 
     let providers = provider_groups
         .into_iter()
-        .map(|(key, group)| {
-            serde_json::json!({
-                "name": group.name,
-                "protocol": key.protocol.to_owned(),
-                "endpoint": key.endpoint,
-                "credential_ref": key.credential_ref,
-                "has_credential": group.has_credential,
-                "profile_ids": group.profile_ids,
-                "models": group.models.into_iter().collect::<Vec<_>>(),
-            })
+        .map(|(key, group)| ProviderView {
+            name: group.name,
+            protocol: key.protocol.to_owned(),
+            endpoint: key.endpoint,
+            credential_ref: key.credential_ref,
+            has_credential: group.has_credential,
+            profile_ids: group.profile_ids,
+            models: group.models.into_iter().collect(),
         })
-        .collect::<Vec<_>>();
+        .collect();
 
-    Ok(envelope({
-        let mut object = serde_json::json!({
-            "llm_profiles": llm_profiles,
-            "agent_profiles": agent_profiles,
-            "executor_protocols": executor_protocols,
-            "providers": providers,
-            "has_more": next_before.is_some(),
-            "next_before": next_before.map(|id| ProfileId::from(id).to_string()),
-        });
-        if let Some(value) = (!decision_profiles.is_empty()).then_some(decision_profiles) {
-            object["decision_profiles"] = serde_json::json!(value);
-        }
-        if let Some(value) =
-            (!decision_agent_profiles.is_empty()).then_some(decision_agent_profiles)
-        {
-            object["decision_agent_profiles"] = serde_json::json!(value);
-        }
-        if let Some(value) = saved_profile.map(|id| id.to_string()) {
-            object["profile_id"] = serde_json::json!(value);
-        }
-        object
-    }))
+    Ok(envelope(serde_json::json!(ProfilesView {
+        llm_profiles,
+        agent_profiles,
+        decision_profiles: (!decision_profiles.is_empty()).then_some(decision_profiles),
+        decision_agent_profiles: (!decision_agent_profiles.is_empty())
+            .then_some(decision_agent_profiles),
+        executor_protocols,
+        providers,
+        has_more: next_before.is_some(),
+        next_before: next_before.map(|id| ProfileId::from(id).to_string()),
+        profile_id: saved_profile.map(|id| id.to_string()),
+    })))
 }
 
 /// Whether `entry` fits the page budget. The first entry always does, so a
@@ -1374,6 +1462,20 @@ pub(crate) async fn save_profile(
     Ok(Reply::new(status, snapshot))
 }
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ImportedModels")]
+pub(crate) struct ImportedModelsView {
+    profile_ids: Vec<String>,
+    created: usize,
+    existing: usize,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ProviderModels")]
+pub(crate) struct ProviderModelsView {
+    models: Vec<crate::db::entities::DiscoveredModel>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportModelsRequest {
@@ -1512,13 +1614,13 @@ pub(crate) async fn import_models(
     let existing = ids.len().saturating_sub(created);
     Ok(Reply::new(
         StatusCode::CREATED,
-        envelope(serde_json::json!({
-            "profile_ids": ids
-            .into_iter()
-            .map(|id| ProfileId::from(id).to_string())
-            .collect::<Vec<_>>(),
-            "created": created,
-            "existing": existing,
+        envelope(serde_json::json!(ImportedModelsView {
+            profile_ids: ids
+                .into_iter()
+                .map(|id| ProfileId::from(id).to_string())
+                .collect(),
+            created,
+            existing,
         })),
     ))
 }
@@ -1635,8 +1737,8 @@ pub(crate) async fn provider_models(
                     )
                     .await?;
             }
-            return Ok(Reply::ok(envelope(serde_json::json!({
-                "models": models,
+            return Ok(Reply::ok(envelope(serde_json::json!(ProviderModelsView {
+                models
             }))));
         }
         Err(ModelListError::Unreachable) => (
@@ -1698,9 +1800,11 @@ pub(super) async fn global_compaction_settings(
             })?;
     }
     let settings = database.global_compaction_settings().await?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "revision": settings.revision,
-        "prediction_enabled": settings.prediction_enabled,
-        "policy": compaction_policy_json(settings.policy),
-    }))))
+    Ok(Reply::ok(envelope(serde_json::json!(
+        GlobalCompactionSettingsInput {
+            revision: settings.revision,
+            prediction_enabled: settings.prediction_enabled,
+            policy: compaction_policy_view(settings.policy),
+        }
+    ))))
 }

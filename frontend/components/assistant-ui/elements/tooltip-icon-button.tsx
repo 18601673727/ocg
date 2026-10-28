@@ -38,3 +38,19 @@ export const TooltipIconButton = forwardRef<HTMLButtonElement, TooltipIconButton
 );
 
 TooltipIconButton.displayName = "TooltipIconButton";
+
+export const FloatingIconButton = forwardRef<HTMLButtonElement, TooltipIconButtonProps>(
+  ({ className, ...props }, ref) => (
+    <TooltipIconButton
+      {...props}
+      ref={ref}
+      variant="outline"
+      className={cn(
+        "dark:border-border dark:bg-background dark:hover:bg-accent rounded-full p-4",
+        className,
+      )}
+    />
+  ),
+);
+
+FloatingIconButton.displayName = "FloatingIconButton";

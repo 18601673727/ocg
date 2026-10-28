@@ -112,16 +112,28 @@ fn attachment_refusal(error: AttachmentError) -> Refusal {
     }
 }
 
-fn attachment_json(record: &AttachmentRecord) -> serde_json::Value {
-    serde_json::json!({
-        "id": record.id.to_string(),
-        "mime": record.mime.clone(),
-        "byte_length": record.byte_length,
-        "sha256": record.sha256.to_string(),
-        "display_name": record.display_name.clone(),
-        "created_at_us": record.created_at.as_unix_micros(),
-        "available": record.is_available(),
-    })
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Attachment")]
+pub(crate) struct AttachmentView {
+    id: String,
+    mime: String,
+    byte_length: u64,
+    sha256: String,
+    display_name: Option<String>,
+    created_at_us: i64,
+    available: bool,
+}
+
+fn attachment_json(record: &AttachmentRecord) -> AttachmentView {
+    AttachmentView {
+        id: record.id.to_string(),
+        mime: record.mime.clone(),
+        byte_length: record.byte_length,
+        sha256: record.sha256.to_string(),
+        display_name: record.display_name.clone(),
+        created_at_us: record.created_at.as_unix_micros(),
+        available: record.is_available(),
+    }
 }
 
 /// Stores one checked image as a user-provided Attachment.

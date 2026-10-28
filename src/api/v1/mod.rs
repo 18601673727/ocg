@@ -158,6 +158,12 @@ mod system;
 mod tools;
 pub(crate) mod wire;
 
+pub(crate) use attachments::AttachmentView;
+pub(crate) use browser::SessionResponseView;
+pub(crate) use catalog::{
+    AgentProfilesView, ChildrenView, ContextStatusView, ConversationEditedView,
+    ConversationLimitsView, ConversationsView, JobInputView, TreeView, TurnsView,
+};
 pub use config::{
     API_VERSION, ConfigError, ControlPlaneConfig, MAX_ATTACHMENT_UPLOAD_BYTES, MAX_OUTPUT_PAGE,
     MAX_SUBMISSION_BYTES, MIN_TOKEN_CHARS, PORT_VARIABLE, TOKEN_VARIABLE, UI_VARIABLE,
@@ -165,10 +171,26 @@ pub use config::{
 use config::{
     DEFAULT_OUTPUT_PAGE, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES, Token,
 };
+pub(crate) use dashboard::{
+    AvailabilityView, LogsView, UsageBucketsView, UsageRetriesView, UsageSummaryView, UsageView,
+};
+pub(crate) use events::{JobEventView, OutputEventView, SettlementEventView};
+pub(crate) use jobs::{JobDetailsView, JobsView};
 pub use listener::{ControlPlane, StartError, StopError};
+pub(crate) use outputs::OutputsView;
 use outputs::outputs;
+pub(crate) use pools::{PoolAnswerView, PoolsView};
+pub(crate) use profiles::{ImportedModelsView, ProfilesView, ProviderModelsView};
+pub(crate) use projects::{ProjectAnswerView, ProjectsView};
+pub(crate) use responses::ProviderResponsesView;
 use routing::{Route, authorize, decimal, respond, route};
+pub(crate) use submissions::{
+    AdmissionResponseView, AppendView, ApprovalDecisionView, CardsView, CompactionView,
+    ReleaseSlotView, StopView,
+};
 use system::health;
+pub(crate) use system::{ActiveSystemSettingsView, HealthView};
+pub(crate) use tools::ToolsView;
 
 use security::{Caller, Destination, admit};
 use wire::{

@@ -1,24 +1,40 @@
 use super::contracts::*;
 use super::*;
 
-pub(super) fn output_view(record: &JobOutputRecord) -> serde_json::Value {
-    serde_json::json!({
-        "id": record.id.to_string(),
-        "seq": record.seq,
-        "kind": match record.kind {
-            OutputKind::Progress => serde_json::json!("progress"),
-            OutputKind::Evaluation => serde_json::json!("evaluation"),
-            OutputKind::Result => serde_json::json!("result"),
-            OutputKind::Reasoning => serde_json::json!("reasoning"),
-            OutputKind::Decision => serde_json::json!("decision"),
-            OutputKind::Summarization => serde_json::json!("summarization"),
-        },
-        "summary": record.summary.clone(),
-        "code": record.code.clone(),
-        "goal_reached": record.goal_reached,
-        "value": record.value.clone().unwrap_or(Value::Null),
-        "created_at_us": record.created_at.as_unix_micros(),
-    })
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Output")]
+pub(crate) struct OutputView {
+    id: String,
+    seq: i64,
+    kind: OutputKind,
+    summary: Option<String>,
+    code: Option<String>,
+    goal_reached: Option<bool>,
+    value: Option<Value>,
+    created_at_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Outputs")]
+pub(crate) struct OutputsView {
+    job: String,
+    after_seq: Option<i64>,
+    outputs: Vec<OutputView>,
+    next_after_seq: Option<i64>,
+    has_more: bool,
+}
+
+pub(super) fn output_view(record: &JobOutputRecord) -> OutputView {
+    OutputView {
+        id: record.id.to_string(),
+        seq: record.seq,
+        kind: record.kind,
+        summary: record.summary.clone(),
+        code: record.code.clone(),
+        goal_reached: record.goal_reached,
+        value: record.value.clone(),
+        created_at_us: record.created_at.as_unix_micros(),
+    }
 }
 
 /// A page of the Job's outputs, exactly as stored and in `seq` order: as
@@ -37,13 +53,13 @@ pub(super) async fn outputs(
         return Err(JOB_NOT_FOUND);
     }
     let records = database.job_outputs(job, after_seq, limit + 1).await?;
-    let envelope = |outputs: Vec<serde_json::Value>, next: Option<i64>, more: bool| {
-        envelope(serde_json::json!({
-            "job": job.to_string(),
-            "after_seq": after_seq,
-            "outputs": outputs,
-            "next_after_seq": next,
-            "has_more": more,
+    let envelope = |outputs: Vec<OutputView>, next: Option<i64>, more: bool| {
+        envelope(serde_json::json!(OutputsView {
+            job: job.to_string(),
+            after_seq,
+            outputs,
+            next_after_seq: next,
+            has_more: more,
         }))
     };
     let mut size = envelope(Vec::new(), Some(i64::MIN), true).to_string().len();
@@ -72,12 +88,12 @@ pub(super) async fn latest_output(shared: &Shared, job: JobId) -> Result<Value, 
         return Err(JOB_NOT_FOUND);
     }
     let output = shared.database.latest_output(job).await?;
-    let body = envelope(serde_json::json!({
-        "job": job.to_string(),
-        "after_seq": serde_json::Value::Null,
-        "outputs": output.as_ref().map(output_view).into_iter().collect::<Vec<_>>(),
-        "next_after_seq": output.as_ref().map(|output| output.seq),
-        "has_more": false,
+    let body = envelope(serde_json::json!(OutputsView {
+        job: job.to_string(),
+        after_seq: None,
+        outputs: output.as_ref().map(output_view).into_iter().collect(),
+        next_after_seq: output.as_ref().map(|output| output.seq),
+        has_more: false,
     }));
     dashboard::bounded(shared, body).map(|reply| reply.body)
 }

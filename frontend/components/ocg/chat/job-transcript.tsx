@@ -10,7 +10,8 @@ import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/c
 import type { TranscriptTurn } from "./job-transcript-model";
 import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 import { ToolActivityLabel } from "./tool-activity-label";
-import { jobPlanTitles } from "./tool-activity-summary";
+import { formatToolJson, jobPlanTitles } from "./tool-activity-summary";
+import { MarkdownBody } from "../markdown/markdown-body";
 import {
   ReasoningRoot,
   ReasoningTrigger,
@@ -140,8 +141,11 @@ function TurnRow({
             </div>
           ) : null}
           {reasoning}
-          {/* The Provider's text is shown as text: it is never interpreted as markup. */}
-          <p className="whitespace-pre-wrap break-words">{turn.content}</p>
+          {isUser ? (
+            <p className="whitespace-pre-wrap break-words">{turn.content}</p>
+          ) : (
+            <MarkdownBody content={turn.content} className="break-words" />
+          )}
           {turn.detail ? (
             <DismissibleNotice
               message={turn.detail}
@@ -308,7 +312,7 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
                       ) : null}
                     </div>
                     <pre className="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
-                      {tool.arguments ?? "—"}
+                      {tool.arguments === null ? "—" : formatToolJson(tool.arguments)}
                     </pre>
                   </div>
                   <div>
@@ -321,7 +325,7 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
                       ) : null}
                     </div>
                     <pre className="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
-                      {tool.result ?? "—"}
+                      {tool.result === null ? "—" : formatToolJson(tool.result)}
                     </pre>
                   </div>
                 </div>

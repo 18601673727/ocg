@@ -49,16 +49,42 @@ fn operation_str(operation: ExecutionOperation) -> &'static str {
     }
 }
 
-fn pool_json(pool: &ExecutionPoolRecord) -> serde_json::Value {
-    serde_json::json!({
-        "id": pool.id.to_string(),
-        "name": pool.name.clone(),
-        "concurrency_limit": pool.config.concurrency_limit.get(),
-        "enabled": pool.enabled,
-        "operations": pool.config.capabilities.operations.iter()
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Pool")]
+pub(crate) struct PoolView {
+    id: String,
+    name: String,
+    concurrency_limit: u32,
+    enabled: bool,
+    operations: Vec<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Pools")]
+pub(crate) struct PoolsView {
+    pools: Vec<PoolView>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "PoolAnswer")]
+pub(crate) struct PoolAnswerView {
+    pool: PoolView,
+}
+
+fn pool_json(pool: &ExecutionPoolRecord) -> PoolView {
+    PoolView {
+        id: pool.id.to_string(),
+        name: pool.name.clone(),
+        concurrency_limit: pool.config.concurrency_limit.get(),
+        enabled: pool.enabled,
+        operations: pool
+            .config
+            .capabilities
+            .operations
+            .iter()
             .map(|operation| operation_str(*operation).to_owned())
-            .collect::<Vec<_>>(),
-    })
+            .collect(),
+    }
 }
 
 pub(super) async fn list(database: &DatabaseHandle) -> Result<Reply, Refusal> {
@@ -73,9 +99,7 @@ pub(super) async fn list(database: &DatabaseHandle) -> Result<Reply, Refusal> {
             break;
         }
     }
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "pools": pools,
-    }))))
+    Ok(Reply::ok(envelope(serde_json::json!(PoolsView { pools }))))
 }
 
 fn refusal(error: DatabaseError) -> Refusal {
@@ -137,7 +161,7 @@ pub(super) async fn update(
         _ => return Err(INVALID_REQUEST),
     }
     let pool = database.execution_pool(id).await?.ok_or(POOL_NOT_FOUND)?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "pool": pool_json(&pool),
+    Ok(Reply::ok(envelope(serde_json::json!(PoolAnswerView {
+        pool: pool_json(&pool)
     }))))
 }

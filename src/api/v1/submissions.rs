@@ -700,10 +700,148 @@ impl Registry {
     }
 }
 
-fn admission(admission: serde_json::Value) -> Value {
-    envelope(serde_json::json!({
-        "admission": admission,
-    }))
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[ts(rename = "Admission")]
+pub(crate) enum AdmissionView {
+    Admitted {
+        job: String,
+        conversation: Option<String>,
+        seq: u32,
+        joined: bool,
+        model: String,
+        kept: bool,
+    },
+    Pending {
+        job: Option<String>,
+    },
+    Uncertain {
+        job: Option<String>,
+    },
+    NotFound {
+        job: Option<String>,
+    },
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "AdmissionResponse")]
+pub(crate) struct AdmissionResponseView {
+    admission: AdmissionView,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Append")]
+pub(crate) struct AppendView {
+    conversation: String,
+    turn: String,
+    seq: u32,
+    joined: bool,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Stop")]
+pub(crate) struct StopView {
+    conversation: String,
+    status: String,
+    record_seq: Option<u32>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Compaction")]
+pub(crate) struct CompactionView {
+    conversation: String,
+    status: String,
+    job: Option<String>,
+    system_conversation: Option<String>,
+    through: Option<String>,
+    subsequent: bool,
+    reason: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ApprovalDecision")]
+pub(crate) struct ApprovalDecisionView {
+    approval: (String, u32, u32),
+    decision: String,
+    turn: String,
+    seq: u32,
+    joined: bool,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ReleaseSlot")]
+pub(crate) struct ReleaseSlotView {
+    status: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "ApprovalAssessmentState")]
+pub(crate) enum ApprovalAssessmentStateView {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Unavailable,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "ApprovalAssessment")]
+pub(crate) struct ApprovalAssessmentView {
+    state: ApprovalAssessmentStateView,
+    confidence: Option<f64>,
+    minimum_confidence: f64,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[ts(rename = "Card")]
+pub(crate) enum CardView {
+    Dispatch {
+        conversation: String,
+        parent: Option<String>,
+        approval: (String, u32, u32),
+        tool: String,
+        arguments: String,
+    },
+    Approval {
+        conversation: String,
+        parent: Option<String>,
+        approval: (String, u32, u32),
+        tool: String,
+        arguments: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        assessment: Option<ApprovalAssessmentView>,
+    },
+    Question {
+        conversation: String,
+        parent: Option<String>,
+        approval: (String, u32, u32),
+        tool: String,
+        question: String,
+    },
+    LoopHold {
+        conversation: String,
+        parent: Option<String>,
+    },
+    Quarantine {
+        conversation: String,
+        parent: Option<String>,
+        turn: String,
+    },
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Cards")]
+pub(crate) struct CardsView {
+    conversation: String,
+    cards: Vec<CardView>,
+}
+
+fn admission(admission: AdmissionView) -> Value {
+    envelope(serde_json::json!(AdmissionResponseView { admission }))
 }
 
 /// Submits `request` once under `key`, see the module documentation, and
@@ -804,10 +942,7 @@ async fn submit_plan(
             Ok(Ok(Outcome::Uncertain) | Err(_)) => Err(UNCERTAIN),
             Err(()) => Ok(Reply::new(
                 StatusCode::ACCEPTED,
-                admission(serde_json::json!({
-                    "status": "pending",
-                    "job": serde_json::Value::Null,
-                })),
+                admission(AdmissionView::Pending { job: None }),
             )),
         };
     }
@@ -826,27 +961,18 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
         Some(Local::Resolving) => match shared.database.submission(key).await? {
             Some(record) => Some(record),
             None => {
-                return Ok(Reply::ok(admission(serde_json::json!({
-                    "status": "pending",
-                    "job": serde_json::Value::Null,
-                }))));
+                return Ok(Reply::ok(admission(AdmissionView::Pending { job: None })));
             }
         },
         Some(Local::Admitting) => {
-            return Ok(Reply::ok(admission(serde_json::json!({
-                "status": "pending",
-                "job": serde_json::Value::Null,
-            }))));
+            return Ok(Reply::ok(admission(AdmissionView::Pending { job: None })));
         }
         Some(Local::Uncertain { generation, epoch }) => {
             match reconcile(shared, key, generation, epoch).await {
                 Reconciled::Recorded(record) => Some(record),
                 Reconciled::Absent => None,
                 Reconciled::Unresolved => {
-                    return Ok(Reply::ok(admission(serde_json::json!({
-                        "status": "uncertain",
-                        "job": serde_json::Value::Null,
-                    }))));
+                    return Ok(Reply::ok(admission(AdmissionView::Uncertain { job: None })));
                 }
             }
         }
@@ -854,10 +980,7 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
     };
     Ok(Reply::ok(match found {
         Some(record) => admitted_value(shared, key, record.job).await?,
-        None => admission(serde_json::json!({
-            "status": "not_found",
-            "job": serde_json::Value::Null,
-        })),
+        None => admission(AdmissionView::NotFound { job: None }),
     }))
 }
 
@@ -1726,26 +1849,26 @@ pub(super) async fn compact(
             through,
             subsequent,
             already,
-        } => serde_json::json!({
-            "conversation": conversation.to_string(),
-            "status": if already { "already" } else { "queued" }.to_owned(),
-            "job": Some(job.to_string()),
-            "system_conversation": Some(child.to_string()),
-            "through": Some(through.to_string()),
-            "subsequent": subsequent,
-            "reason": serde_json::Value::Null,
-        }),
-        crate::db::entities::CompactionRequest::Noop { reason } => serde_json::json!({
-            "conversation": conversation.to_string(),
-            "status": "noop".to_owned(),
-            "job": serde_json::Value::Null,
-            "system_conversation": serde_json::Value::Null,
-            "through": serde_json::Value::Null,
-            "subsequent": false,
-            "reason": Some(reason.to_owned()),
-        }),
+        } => CompactionView {
+            conversation: conversation.to_string(),
+            status: if already { "already" } else { "queued" }.to_owned(),
+            job: Some(job.to_string()),
+            system_conversation: Some(child.to_string()),
+            through: Some(through.to_string()),
+            subsequent,
+            reason: None,
+        },
+        crate::db::entities::CompactionRequest::Noop { reason } => CompactionView {
+            conversation: conversation.to_string(),
+            status: "noop".to_owned(),
+            job: None,
+            system_conversation: None,
+            through: None,
+            subsequent: false,
+            reason: Some(reason.to_owned()),
+        },
     };
-    Ok(Reply::ok(envelope(wire)))
+    Ok(Reply::ok(envelope(serde_json::json!(wire))))
 }
 
 pub(super) async fn action(
@@ -1822,11 +1945,11 @@ pub(super) async fn action(
             .amend_queued_input(conversation, turn, entry)
             .await
             .map_err(action_error)?;
-        return Ok(Reply::ok(envelope(serde_json::json!({
-            "conversation": conversation.to_string(),
-            "turn": appended.turn.to_string(),
-            "seq": appended.seq,
-            "joined": true,
+        return Ok(Reply::ok(envelope(serde_json::json!(AppendView {
+            conversation: conversation.to_string(),
+            turn: appended.turn.to_string(),
+            seq: appended.seq,
+            joined: true,
         }))));
     }
     if action == "retry" {
@@ -1844,11 +1967,11 @@ pub(super) async fn action(
             .retry(conversation, turn, Actor::User)
             .await
             .map_err(action_error)?;
-        return Ok(Reply::ok(envelope(serde_json::json!({
-            "conversation": conversation.to_string(),
-            "turn": appended.turn.to_string(),
-            "seq": appended.seq,
-            "joined": appended.joined,
+        return Ok(Reply::ok(envelope(serde_json::json!(AppendView {
+            conversation: conversation.to_string(),
+            turn: appended.turn.to_string(),
+            seq: appended.seq,
+            joined: appended.joined,
         }))));
     }
     if !object.is_empty() {
@@ -1883,15 +2006,15 @@ pub(super) async fn action(
             .ok_or(INTERNAL)?
             .outcome
             .is_some();
-        return Ok(Reply::ok(envelope(serde_json::json!({
-            "conversation": conversation.to_string(),
-            "status": if settled {
+        return Ok(Reply::ok(envelope(serde_json::json!(StopView {
+            conversation: conversation.to_string(),
+            status: if settled {
                 "already_settled"
             } else {
                 "already_closing"
             }
             .to_owned(),
-            "record_seq": result.record_seq,
+            record_seq: result.record_seq,
         }))));
     }
     let changed = action != "stop"
@@ -1915,15 +2038,15 @@ pub(super) async fn action(
         } else {
             StatusCode::OK
         },
-        envelope(serde_json::json!({
-            "conversation": conversation.to_string(),
-            "status": if changed {
+        envelope(serde_json::json!(StopView {
+            conversation: conversation.to_string(),
+            status: if changed {
                 "requested"
             } else {
                 "already_settled"
             }
             .to_owned(),
-            "record_seq": result.record_seq,
+            record_seq: result.record_seq,
         })),
     ))
 }
@@ -1958,17 +2081,14 @@ async fn admitted_value(shared: &Shared, key: SubmissionKey, job: JobId) -> Resu
         .job_configuration(job)
         .await?
         .ok_or(INTERNAL)?;
-    Ok(envelope(serde_json::json!({
-        "admission": serde_json::json!({
-            "status": "admitted",
-            "job": job.to_string(),
-            "conversation": turn.group.map(|id| id.to_string()),
-            "seq": record.seq,
-            "joined": record.seq > 1,
-            "model": frozen.frozen.llm.config.model,
-            "kept": turn.cancelled_at.is_some(),
-        }),
-    })))
+    Ok(admission(AdmissionView::Admitted {
+        job: job.to_string(),
+        conversation: turn.group.map(|id| id.to_string()),
+        seq: record.seq,
+        joined: record.seq > 1,
+        model: frozen.frozen.llm.config.model,
+        kept: turn.cancelled_at.is_some(),
+    }))
 }
 
 /// The admission of a decision Job. Its model comes from the Decision Model
@@ -1981,17 +2101,14 @@ async fn admitted_decision_value(
     let record = shared.database.submission(key).await?.ok_or(INTERNAL)?;
     let turn = shared.database.job(job).await?.ok_or(INTERNAL)?;
     let work = shared.database.decision_work(job).await?.ok_or(INTERNAL)?;
-    Ok(envelope(serde_json::json!({
-        "admission": serde_json::json!({
-            "status": "admitted",
-            "job": job.to_string(),
-            "conversation": turn.group.map(|id| id.to_string()),
-            "seq": record.seq,
-            "joined": record.seq > 1,
-            "model": work.frozen.model_name().to_owned(),
-            "kept": turn.cancelled_at.is_some(),
-        }),
-    })))
+    Ok(admission(AdmissionView::Admitted {
+        job: job.to_string(),
+        conversation: turn.group.map(|id| id.to_string()),
+        seq: record.seq,
+        joined: record.seq > 1,
+        model: work.frozen.model_name().to_owned(),
+        kept: turn.cancelled_at.is_some(),
+    }))
 }
 
 pub(super) async fn decide(
@@ -2024,17 +2141,19 @@ pub(super) async fn decide(
         .decide_approval(approval, decision)
         .await
         .map_err(action_error)?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "approval": (
-            approval.job.to_string(),
-            approval.request.get(),
-            approval.index,
-        ),
-        "decision": name.to_owned(),
-        "turn": appended.turn.to_string(),
-        "seq": appended.seq,
-        "joined": appended.joined,
-    }))))
+    Ok(Reply::ok(envelope(serde_json::json!(
+        ApprovalDecisionView {
+            approval: (
+                approval.job.to_string(),
+                approval.request.get(),
+                approval.index,
+            ),
+            decision: name.to_owned(),
+            turn: appended.turn.to_string(),
+            seq: appended.seq,
+            joined: appended.joined,
+        }
+    ))))
 }
 
 pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply, Refusal> {
@@ -2052,11 +2171,11 @@ pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply,
         .await?
         .into_iter()
         .map(serde_json::from_value)
-        .collect::<Result<Vec<serde_json::Value>, _>>()
+        .collect::<Result<Vec<CardView>, _>>()
         .map_err(|_| INTERNAL)?;
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "conversation": conversation.to_string(),
-        "cards": cards,
+    Ok(Reply::ok(envelope(serde_json::json!(CardsView {
+        conversation: conversation.to_string(),
+        cards,
     }))))
 }
 
@@ -2081,8 +2200,8 @@ pub(super) async fn release_slot(
         return Err(conversation_refusal("not_quarantined"));
     }
     let released = || {
-        Reply::ok(envelope(serde_json::json!({
-            "status": "already_released".to_owned(),
+        Reply::ok(envelope(serde_json::json!(ReleaseSlotView {
+            status: "already_released".to_owned(),
         })))
     };
     if record.stop_confirmed_at.is_some() {
@@ -2110,8 +2229,8 @@ pub(super) async fn release_slot(
         JobProof::Untracked => return Err(conversation_refusal("confirm_required")),
     };
     match database.confirm_job_stopped(job, by).await {
-        Ok(()) => Ok(Reply::ok(envelope(serde_json::json!({
-            "status": "released".to_owned(),
+        Ok(()) => Ok(Reply::ok(envelope(serde_json::json!(ReleaseSlotView {
+            status: "released".to_owned(),
         })))),
         Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => Ok(released()),
         Err(error) => Err(action_error(error)),

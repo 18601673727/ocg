@@ -73,10 +73,10 @@ pub(super) async fn jobs(
             .collect::<Result<Vec<_>, _>>()?;
         return bounded(
             shared,
-            envelope(serde_json::json!({
-                "jobs": jobs,
-                "next_before": page.next_before.map(|id| id.to_string()),
-                "has_more": page.has_more,
+            envelope(serde_json::json!(super::jobs::JobsView {
+                jobs,
+                next_before: page.next_before.map(|id| id.to_string()),
+                has_more: page.has_more,
             })),
         );
     }
@@ -92,10 +92,10 @@ pub(super) async fn jobs(
         .flatten();
     bounded(
         shared,
-        envelope(serde_json::json!({
-            "jobs": page,
-            "next_before": next,
-            "has_more": more,
+        envelope(serde_json::json!(super::jobs::JobsView {
+            jobs: page,
+            next_before: next,
+            has_more: more,
         })),
     )
 }
@@ -184,70 +184,89 @@ impl ObservationQuery {
     }
 }
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageObservation")]
+pub(crate) struct UsageObservationView {
+    llm_profile: Option<String>,
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+    cache_read_tokens: Option<u32>,
+    cache_write_tokens: Option<u32>,
+    reasoning_tokens: Option<u32>,
+    ttfb_ms: Option<u64>,
+    finished_in_ms: Option<u64>,
+    eligibility: Option<String>,
+    finality: Option<String>,
+    id: String,
+    job: String,
+    request: u32,
+    observed_at_us: i64,
+    model: Option<String>,
+    provider: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Usage")]
+pub(crate) struct UsageView {
+    observations: Vec<UsageObservationView>,
+    next_after: Option<String>,
+}
+
 pub(super) async fn usage(shared: &Shared, query: ObservationQuery) -> Result<Reply, Refusal> {
     let page = shared
         .database
         .metrics(query.filter, query.after, query.limit)
         .await?;
-    let rows = page.records.iter().map(usage_record).collect::<Vec<_>>();
     bounded(
         shared,
-        envelope(serde_json::json!({
-            "observations": rows,
-            "next_after": next_cursor(page.next)?,
+        envelope(serde_json::json!(UsageView {
+            observations: page.records.iter().map(usage_record).collect(),
+            next_after: next_cursor(page.next)?,
         })),
     )
 }
 
-fn usage_record(record: &MetricsRecord) -> Value {
+fn usage_record(record: &MetricsRecord) -> UsageObservationView {
     let measurements = &record.measurements;
     let usage = &measurements.usage;
-    {
-        let mut object = serde_json::json!({
-            "llm_profile": record
+    UsageObservationView {
+        llm_profile: record
             .target
             .as_ref()
             .map(|target| target.llm_profile.to_string()),
-            "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens,
-            "cache_read_tokens": usage.cache_read_tokens,
-            "cache_write_tokens": usage.cache_write_tokens,
-            "reasoning_tokens": usage.reasoning_tokens,
-            "ttfb_ms": measurements.ttfb_ms,
-            "finished_in_ms": measurements.request_finished_in_ms,
-            "eligibility": record.token.map(|token| {
-                match token.eligibility {
-                    RequestEligibility::Eligible => "eligible",
-                    RequestEligibility::Excluded => "excluded",
-                }
-                .to_owned()
-            }),
-            "finality": record.token.map(|token| {
-                match token.finality {
-                    UsageFinality::Final => "final",
-                    UsageFinality::Cumulative => "cumulative",
-                }
-                .to_owned()
-            }),
-        });
-        if let (serde_json::Value::Object(target), serde_json::Value::Object(fields)) = (
-            &mut object,
-            serde_json::json!(serde_json::json!({"id": (record.id.to_string()),
-"job": (record.job.to_string()),
-"request": (record.request.get()),
-"observed_at_us": (record.observed_at.as_unix_micros()),
-"model": (record
-                        .target
-                        .as_ref()
-                        .map(|target| target.frozen.config.model.clone())),
-"provider": (record
-                        .target
-                        .as_ref()
-                        .map(|target| target.frozen.provider.name.clone()))})),
-        ) {
-            target.extend(fields);
-        }
-        object
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        ttfb_ms: measurements.ttfb_ms,
+        finished_in_ms: measurements.request_finished_in_ms,
+        eligibility: record.token.map(|token| {
+            match token.eligibility {
+                RequestEligibility::Eligible => "eligible",
+                RequestEligibility::Excluded => "excluded",
+            }
+            .to_owned()
+        }),
+        finality: record.token.map(|token| {
+            match token.finality {
+                UsageFinality::Final => "final",
+                UsageFinality::Cumulative => "cumulative",
+            }
+            .to_owned()
+        }),
+        id: record.id.to_string(),
+        job: record.job.to_string(),
+        request: record.request.get(),
+        observed_at_us: record.observed_at.as_unix_micros(),
+        model: record
+            .target
+            .as_ref()
+            .map(|target| target.frozen.config.model.clone()),
+        provider: record
+            .target
+            .as_ref()
+            .map(|target| target.frozen.provider.name.clone()),
     }
 }
 
@@ -458,29 +477,116 @@ fn usage_next_cursor(cursor: Option<UsageCursor>) -> Result<Option<String>, Refu
         .transpose()
 }
 
-fn usage_summary_row(row: &crate::db::entities::UsageSummaryRow) -> serde_json::Value {
-    serde_json::json!({
-        "agent": (row.agent != 0).then(|| ProfileId::new(row.agent).to_string()),
-        "provider": LlmProviderId::new(row.provider).to_string(),
-        "model": row.model.clone(),
-        "requests": row.requests,
-        "complete_requests": row.complete_requests,
-        "input_tokens": row.input_tokens,
-        "output_tokens": row.output_tokens,
-        "cache_read_tokens": row.cache_read_tokens,
-        "cache_write_tokens": row.cache_write_tokens,
-        "reasoning_tokens": row.reasoning_tokens,
-    })
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageSummaryRow")]
+pub(crate) struct UsageSummaryRowView {
+    agent: Option<String>,
+    provider: String,
+    model: Option<String>,
+    requests: u64,
+    complete_requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
 }
 
-fn usage_retry_row(row: &crate::db::entities::UsageRetryRow) -> serde_json::Value {
-    serde_json::json!({
-        "agent": (row.agent != 0).then(|| ProfileId::new(row.agent).to_string()),
-        "provider": LlmProviderId::new(row.provider).to_string(),
-        "model": row.model.clone(),
-        "retries": row.retries,
-        "bucket_us": row.bucket_us,
-    })
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageBucket")]
+pub(crate) struct UsageBucketView {
+    bucket_us: i64,
+    agent: Option<String>,
+    provider: String,
+    model: Option<String>,
+    requests: u64,
+    complete_requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: u64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageSummary")]
+pub(crate) struct UsageSummaryView {
+    from_us: i64,
+    until_us: i64,
+    complete: bool,
+    resume_after: Option<String>,
+    rows: Vec<UsageSummaryRowView>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageBuckets")]
+pub(crate) struct UsageBucketsView {
+    from_us: i64,
+    until_us: i64,
+    complete: bool,
+    resume_after: Option<String>,
+    rows: Vec<UsageBucketView>,
+    bucket: String,
+    tz_offset_minutes: i32,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageRetryRow")]
+pub(crate) struct UsageRetryRowView {
+    agent: Option<String>,
+    provider: String,
+    model: Option<String>,
+    retries: u64,
+    bucket_us: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "UsageRetries")]
+pub(crate) struct UsageRetriesView {
+    retry_rows: Vec<UsageRetryRowView>,
+    next_after: Option<String>,
+}
+
+fn usage_summary_row(row: &crate::db::entities::UsageSummaryRow) -> UsageSummaryRowView {
+    UsageSummaryRowView {
+        agent: (row.agent != 0).then(|| ProfileId::new(row.agent).to_string()),
+        provider: LlmProviderId::new(row.provider).to_string(),
+        model: row.model.clone(),
+        requests: row.requests,
+        complete_requests: row.complete_requests,
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_write_tokens: row.cache_write_tokens,
+        reasoning_tokens: row.reasoning_tokens,
+    }
+}
+
+fn usage_bucket_row(bucket: &crate::db::entities::UsageBucketRow) -> UsageBucketView {
+    let row = usage_summary_row(&bucket.row);
+    UsageBucketView {
+        bucket_us: bucket.bucket_us,
+        agent: row.agent,
+        provider: row.provider,
+        model: row.model,
+        requests: row.requests,
+        complete_requests: row.complete_requests,
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_write_tokens: row.cache_write_tokens,
+        reasoning_tokens: row.reasoning_tokens,
+    }
+}
+
+fn usage_retry_row(row: &crate::db::entities::UsageRetryRow) -> UsageRetryRowView {
+    UsageRetryRowView {
+        agent: (row.agent != 0).then(|| ProfileId::new(row.agent).to_string()),
+        provider: LlmProviderId::new(row.provider).to_string(),
+        model: row.model.clone(),
+        retries: row.retries,
+        bucket_us: row.bucket_us,
+    }
 }
 
 pub(super) async fn usage_summary(
@@ -495,16 +601,12 @@ pub(super) async fn usage_summary(
     let val = match bucketing {
         None => {
             let summary = shared.database.usage_summary(filter, after).await?;
-            let mut rows = Vec::new();
-            for row in &summary.rows {
-                rows.push(usage_summary_row(row));
-            }
-            envelope(serde_json::json!({
-                "from_us": summary.from_us,
-                "until_us": summary.until_us,
-                "complete": summary.complete,
-                "resume_after": usage_next_cursor(summary.resume_after)?,
-                "rows": rows,
+            envelope(serde_json::json!(UsageSummaryView {
+                from_us: summary.from_us,
+                until_us: summary.until_us,
+                complete: summary.complete,
+                resume_after: usage_next_cursor(summary.resume_after)?,
+                rows: summary.rows.iter().map(usage_summary_row).collect(),
             }))
         }
         Some(bucketing) => {
@@ -512,24 +614,18 @@ pub(super) async fn usage_summary(
                 .database
                 .usage_buckets(filter, bucketing, after)
                 .await?;
-            let mut rows = Vec::new();
-            for bucket in &summary.rows {
-                rows.push({ let mut object = serde_json::json!({
-                    "bucket_us": bucket.bucket_us,
-                }); if let (serde_json::Value::Object(target), serde_json::Value::Object(fields)) = (&mut object, serde_json::json!(usage_summary_row(&bucket.row))) { target.extend(fields); } object });
-            }
             let bucket = match bucketing.width {
                 crate::db::entities::UsageBucketWidth::Day => "day",
                 crate::db::entities::UsageBucketWidth::Week => "week",
             };
-            envelope(serde_json::json!({
-                "from_us": summary.from_us,
-                "until_us": summary.until_us,
-                "complete": summary.complete,
-                "resume_after": usage_next_cursor(summary.resume_after)?,
-                "rows": rows,
-                "bucket": bucket.to_owned(),
-                "tz_offset_minutes": bucketing.offset_minutes,
+            envelope(serde_json::json!(UsageBucketsView {
+                from_us: summary.from_us,
+                until_us: summary.until_us,
+                complete: summary.complete,
+                resume_after: usage_next_cursor(summary.resume_after)?,
+                rows: summary.rows.iter().map(usage_bucket_row).collect(),
+                bucket: bucket.to_owned(),
+                tz_offset_minutes: bucketing.offset_minutes,
             }))
         }
     };
@@ -594,11 +690,32 @@ pub(super) async fn usage_retries(
         .await?;
     bounded(
         shared,
-        envelope(serde_json::json!({
-            "retry_rows": page.rows.iter().map(usage_retry_row).collect::<Vec<_>>(),
-            "next_after": page.next.map(retry_cursor),
+        envelope(serde_json::json!(UsageRetriesView {
+            retry_rows: page.rows.iter().map(usage_retry_row).collect(),
+            next_after: page.next.map(retry_cursor),
         })),
     )
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "AvailabilityObservation")]
+pub(crate) struct AvailabilityObservationView {
+    status_code: Option<u16>,
+    finish_reason: Option<String>,
+    classification: String,
+    id: String,
+    job: String,
+    request: u32,
+    observed_at_us: i64,
+    model: Option<String>,
+    provider: Option<String>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Availability")]
+pub(crate) struct AvailabilityView {
+    observations: Vec<AvailabilityObservationView>,
+    next_after: Option<String>,
 }
 
 pub(super) async fn availability(
@@ -609,21 +726,16 @@ pub(super) async fn availability(
         .database
         .availability_stats(query.filter, query.after, query.limit)
         .await?;
-    let rows = page
-        .records
-        .iter()
-        .map(availability_record)
-        .collect::<Vec<_>>();
     bounded(
         shared,
-        envelope(serde_json::json!({
-            "observations": rows,
-            "next_after": next_cursor(page.next)?,
+        envelope(serde_json::json!(AvailabilityView {
+            observations: page.records.iter().map(availability_record).collect(),
+            next_after: next_cursor(page.next)?,
         })),
     )
 }
 
-fn availability_record(record: &AvailabilityStatRecord) -> Value {
+fn availability_record(record: &AvailabilityStatRecord) -> AvailabilityObservationView {
     let observation = &record.observation;
     let classification = match observation.classification() {
         AvailabilityClassification::Available => "available",
@@ -631,26 +743,18 @@ fn availability_record(record: &AvailabilityStatRecord) -> Value {
         AvailabilityClassification::Rejected(_) => "rejected",
         AvailabilityClassification::Unconfirmed => "unconfirmed",
     };
-    {
-        let mut object = serde_json::json!({
-            "status_code": observation.status_code,
-            "finish_reason": observation
+    AvailabilityObservationView {
+        status_code: observation.status_code,
+        finish_reason: observation
             .finish_reason
             .map(|reason| reason.as_openai_str().to_owned()),
-            "classification": classification.to_owned(),
-        });
-        if let (serde_json::Value::Object(target), serde_json::Value::Object(fields)) = (
-            &mut object,
-            serde_json::json!(serde_json::json!({"id": (record.id.to_string()),
-"job": (record.job.to_string()),
-"request": (record.request.get()),
-"observed_at_us": (record.observed_at.as_unix_micros()),
-"model": (Some(record.target.frozen.config.model.clone())),
-"provider": (Some(record.target.frozen.provider.name.clone()))})),
-        ) {
-            target.extend(fields);
-        }
-        object
+        classification: classification.to_owned(),
+        id: record.id.to_string(),
+        job: record.job.to_string(),
+        request: record.request.get(),
+        observed_at_us: record.observed_at.as_unix_micros(),
+        model: Some(record.target.frozen.config.model.clone()),
+        provider: Some(record.target.frozen.provider.name.clone()),
     }
 }
 
@@ -670,7 +774,10 @@ pub(super) async fn changed_observation(
             let Some(record) = records.first().filter(|record| record.id == id) else {
                 return Ok(None);
             };
-            Ok(record.target.as_ref().map(|_| usage_record(record)))
+            Ok(record
+                .target
+                .as_ref()
+                .map(|_| serde_json::json!(usage_record(record))))
         }
         ObservationChange::Availability(job, id) => {
             let Some(previous) = id.get().checked_sub(1) else {
@@ -683,7 +790,7 @@ pub(super) async fn changed_observation(
             let Some(record) = records.first().filter(|record| record.id == id) else {
                 return Ok(None);
             };
-            Ok(Some(availability_record(record)))
+            Ok(Some(serde_json::json!(availability_record(record))))
         }
     }
 }
@@ -726,6 +833,24 @@ impl LogQuery {
             before,
         })
     }
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "LogEntry")]
+pub(crate) struct LogEntryView {
+    offset: u64,
+    line: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Logs")]
+pub(crate) struct LogsView {
+    files: Vec<String>,
+    file: Option<String>,
+    entries: Vec<LogEntryView>,
+    next_before: Option<u64>,
+    truncated: bool,
+    files_truncated: bool,
 }
 
 pub(super) async fn logs(shared: &Shared, query: LogQuery) -> Result<Reply, Refusal> {
@@ -829,16 +954,19 @@ fn log_tail(directory: &std::path::Path, query: LogQuery) -> Result<Value, Refus
             .filter(|offset| *offset > 0);
         entries = remaining
             .iter()
-            .map(|(offset, line)| serde_json::json!({"offset": offset, "line": line}))
+            .map(|(offset, line)| LogEntryView {
+                offset: *offset,
+                line: line.clone(),
+            })
             .collect();
         truncated = next_before.is_some();
     }
-    Ok(envelope(serde_json::json!({
-        "files": files.into_iter().rev().collect::<Vec<_>>(),
-        "file": selected,
-        "entries": entries,
-        "next_before": next_before,
-        "truncated": truncated,
-        "files_truncated": matched > 100,
+    Ok(envelope(serde_json::json!(LogsView {
+        files: files.into_iter().rev().collect(),
+        file: selected,
+        entries,
+        next_before,
+        truncated,
+        files_truncated: matched > 100,
     })))
 }

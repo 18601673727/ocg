@@ -1,6 +1,69 @@
 use super::contracts::*;
 use super::*;
 
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ActiveSystemSettings")]
+pub(crate) struct ActiveSystemSettingsView {
+    pub(super) path: String,
+    pub(super) content: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "DatabaseHealth")]
+pub(crate) struct DatabaseHealthView {
+    status: String,
+    accepting_commands: bool,
+    readable: bool,
+    database_bytes: Option<u64>,
+    available_bytes: Option<u64>,
+    durable_commits: u64,
+    commit_us_mean: Option<u64>,
+    commit_us_max: u64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Claims")]
+pub(crate) struct ClaimsView {
+    count: u64,
+    mean_us: Option<u64>,
+    max_us: u64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Queue")]
+pub(crate) struct QueueView {
+    pending: Option<u64>,
+    ready: Option<u64>,
+    delayed: Option<u64>,
+    commands_waiting: u64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Process")]
+pub(crate) struct ProcessView {
+    rss_bytes: Option<u64>,
+    peak_rss_bytes: Option<u64>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Quarantined")]
+pub(crate) struct QuarantinedView {
+    job: String,
+    pool: Option<String>,
+    since: i64,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Health")]
+pub(crate) struct HealthView {
+    host: String,
+    database: DatabaseHealthView,
+    claims: ClaimsView,
+    queue: QueueView,
+    process: ProcessView,
+    quarantined: Vec<QuarantinedView>,
+}
+
 /// What the host can establish: it runs, as the listener answers only
 /// while it does, and what the database says of itself now.
 pub(super) async fn health(database: &DatabaseHandle) -> Value {
@@ -16,12 +79,10 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
     let quarantined = match database.unresolved_executions().await {
         Ok(unresolved) => unresolved
             .into_iter()
-            .map(|(job, execution)| {
-                serde_json::json!({
-                    "job": job.to_string(),
-                    "pool": execution.pool.map(|pool| pool.to_string()),
-                    "since": execution.unresolved_at.as_unix_micros(),
-                })
+            .map(|(job, execution)| QuarantinedView {
+                job: job.to_string(),
+                pool: execution.pool.map(|pool| pool.to_string()),
+                since: execution.unresolved_at.as_unix_micros(),
             })
             .collect::<Vec<_>>(),
         Err(error) => {
@@ -29,33 +90,33 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             Vec::new()
         }
     };
-    envelope(serde_json::json!({
-        "host": "running".to_owned(),
-        "database": serde_json::json!({
-            "status": status.to_owned(),
-            "accepting_commands": status == "open",
-            "readable": readable,
-            "database_bytes": vitals.database_bytes,
-            "available_bytes": vitals.available_bytes,
-            "durable_commits": vitals.durable_commits,
-            "commit_us_mean": vitals.commit_us_mean,
-            "commit_us_max": vitals.commit_us_max,
-        }),
-        "claims": serde_json::json!({
-            "count": vitals.claims_count,
-            "mean_us": vitals.claim_us_mean,
-            "max_us": vitals.claim_us_max,
-        }),
-        "queue": serde_json::json!({
-            "pending": vitals.queue_pending,
-            "ready": vitals.queue_ready,
-            "delayed": vitals.queue_delayed,
-            "commands_waiting": vitals.commands_waiting,
-        }),
-        "process": serde_json::json!({
-            "rss_bytes": vitals.rss_bytes,
-            "peak_rss_bytes": vitals.peak_rss_bytes,
-        }),
-        "quarantined": quarantined,
+    envelope(serde_json::json!(HealthView {
+        host: "running".to_owned(),
+        database: DatabaseHealthView {
+            status: status.to_owned(),
+            accepting_commands: status == "open",
+            readable,
+            database_bytes: vitals.database_bytes,
+            available_bytes: vitals.available_bytes,
+            durable_commits: vitals.durable_commits,
+            commit_us_mean: vitals.commit_us_mean,
+            commit_us_max: vitals.commit_us_max,
+        },
+        claims: ClaimsView {
+            count: vitals.claims_count,
+            mean_us: vitals.claim_us_mean,
+            max_us: vitals.claim_us_max,
+        },
+        queue: QueueView {
+            pending: vitals.queue_pending,
+            ready: vitals.queue_ready,
+            delayed: vitals.queue_delayed,
+            commands_waiting: vitals.commands_waiting,
+        },
+        process: ProcessView {
+            rss_bytes: vitals.rss_bytes,
+            peak_rss_bytes: vitals.peak_rss_bytes,
+        },
+        quarantined,
     }))
 }
