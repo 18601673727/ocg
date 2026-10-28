@@ -724,6 +724,23 @@ pub struct JobOutputRecord {
     pub created_at: Timestamp,
 }
 
+impl JobOutputRecord {
+    pub fn model_text(&self) -> Option<&str> {
+        self.value.as_ref()?.get("text")?.as_str()
+    }
+
+    pub fn display_text(&self) -> Option<String> {
+        match (
+            self.model_text().filter(|text| !text.is_empty()),
+            self.summary.as_deref().filter(|text| !text.is_empty()),
+        ) {
+            (Some(text), Some(summary)) => Some(format!("{text}\n{summary}")),
+            (Some(text), None) | (None, Some(text)) => Some(text.to_owned()),
+            (None, None) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(
     tag = "name",

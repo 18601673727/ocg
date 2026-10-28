@@ -16,6 +16,7 @@ export function SidebarConversationChildren({
   sessionId,
   onAvailabilityChange,
   onOpen,
+  onRename,
 }: {
   conversation: string;
   control: HttpCanonicalControlClient;
@@ -24,6 +25,7 @@ export function SidebarConversationChildren({
   sessionId: string;
   onAvailabilityChange: (sessionId: string, available: boolean) => void;
   onOpen: (conversation: string) => void;
+  onRename?: (child: ControlChildConversation) => void;
 }) {
   const { t } = useI18n();
   const [children, setChildren] = useState<ControlChildConversation[]>([]);
@@ -59,6 +61,7 @@ export function SidebarConversationChildren({
               <button
                 type="button"
                 onClick={() => onOpen(child.id)}
+                onDoubleClick={() => onRename?.(child)}
                 aria-current={activeChild === child.id ? "true" : undefined}
                 title={`${child.title || t("chat.child.untitled")} · ${child.state !== "settled" && child.on_hold ? t(`chat.child.hold.${child.on_hold.by.kind}`) : runtimeStateLabel(t, child.job_state)}`}
                 className={cn(

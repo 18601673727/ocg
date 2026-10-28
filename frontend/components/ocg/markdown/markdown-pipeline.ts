@@ -12,11 +12,19 @@ import hljs from "highlight.js/lib/common";
  * The parser is markdown-it with CommonMark plus the GFM extensions it ships
  * or that we implement here directly. Nothing in this module is allowed to
  * emit document-authored HTML: the parser runs with `html: false`, links and
- * images pass through {@link sanitizeUrl}, KaTeX runs with `trust: false`, and
- * Mermaid runs at `securityLevel: "strict"`.
+ * images pass through {@link sanitizeUrl}, and KaTeX runs with `trust: false`.
  */
 
 const DOLLAR = "$";
+
+function lineBreakTag(state: StateInline, silent: boolean): boolean {
+  if (state.src[state.pos] !== "<") return false;
+  const match = /^<br[ \t]*\/?>/i.exec(state.src.slice(state.pos, state.posMax));
+  if (!match) return false;
+  if (!silent) state.push("hardbreak", "br", 0);
+  state.pos += match[0].length;
+  return true;
+}
 
 function isEscaped(source: string, position: number): boolean {
   let backslashes = 0;
@@ -130,26 +138,11 @@ function mathBlock(
 const SAFE_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
 /**
- * Mermaid's initialization options.
- *
- * `securityLevel: "strict"` is what stops a diagram from smuggling markup
- * through, and `htmlLabels: false` keeps diagram labels out of raw HTML. These
- * are exported so the guarantee is asserted directly rather than inferred from
- * a rendered page, since Mermaid only ever runs in the browser.
- */
-export const MERMAID_OPTIONS = {
-  startOnLoad: false,
-  theme: "default",
-  securityLevel: "strict",
-  htmlLabels: false,
-} as const;
-
-/**
  * KaTeX's render options.
  *
  * `trust: false` is what keeps `\href`, `\url` and `\includegraphics` in a
- * source expression from becoming a live link or a remote fetch. Exported for
- * the same reason as {@link MERMAID_OPTIONS}.
+ * source expression from becoming a live link or a remote fetch. Exported so
+ * the guarantee can be asserted directly.
  */
 export const KATEX_OPTIONS = {
   throwOnError: true,
@@ -222,6 +215,7 @@ export function markdownParser(): MarkdownItType {
   })
     .use(taskLists, { enabled: true })
     .use((md) => {
+      md.inline.ruler.after("escape", "line_break_tag", lineBreakTag);
       md.inline.ruler.after("escape", "math_inline", mathInline);
       md.block.ruler.after("blockquote", "math_block", mathBlock, {
         alt: ["paragraph", "reference", "blockquote", "list"],

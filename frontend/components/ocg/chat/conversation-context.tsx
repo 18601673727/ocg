@@ -35,6 +35,12 @@ function formatShare(value: number): string {
     : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
 }
 
+function formatTokens(value: number): string {
+  if (value < 1000) return String(value);
+  if (value < 1_000_000) return `${(value / 1000).toFixed(1)}K`;
+  return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
 /** Presents a Decision answer plainly; provider confidence never reads as correctness. */
 function describeDecisionAnswer(
   answer: ControlDecisionAnswer,
@@ -99,7 +105,7 @@ export function ConversationContext({ conversation }: { conversation: string }) 
   const request = useRef<{ model: string; key: string } | null>(null);
   const initialized = useRef(false);
   useEffect(() => {
-    if (!open || !control) return;
+    if (!control) return;
     const controller = new AbortController();
     let reading = false;
     async function tick() {
@@ -139,7 +145,7 @@ export function ConversationContext({ conversation }: { conversation: string }) 
       controller.abort();
       unsubscribe();
     };
-  }, [open, control, conversation, refresh, t]);
+  }, [control, conversation, refresh, t]);
   async function act(action: () => Promise<void>) {
     setBusy(true);
     setError(undefined);
@@ -157,17 +163,48 @@ export function ConversationContext({ conversation }: { conversation: string }) 
     ...(status?.work ?? []),
     ...older.filter((work) => !status?.work.some((current) => current.job === work.job)),
   ];
+  const running = busy || Boolean(status?.steer_blocked_by);
+  async function compact() {
+    if (!control || !model) return;
+    await act(async () => {
+      if (!request.current || request.current.model !== model)
+        request.current = { model, key: crypto.randomUUID() };
+      setRetrying(true);
+      const result = await control.compactConversation(conversation, model, request.current.key);
+      request.current = null;
+      setRetrying(false);
+      setNotice(result.reason ?? undefined);
+      setStatus(await control.readContextStatus(conversation));
+    });
+  }
   return (
     <>
-      <Button
-        type="button"
-        variant="outline"
-        size="sm"
-        disabled={!control}
-        onClick={() => setOpen(true)}
-      >
-        {t("context.title")}
-      </Button>
+      <div className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-2">
+        <dt className="text-muted-foreground">{t("context.used")}</dt>
+        <dd className="flex items-center gap-2">
+          <span className="tabular-nums">
+            {status?.estimated_tokens == null ? "—" : formatTokens(status.estimated_tokens)}
+          </span>
+          <button
+            type="button"
+            className="text-foreground underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:text-muted-foreground"
+            disabled={!control || !status || running}
+            onClick={() => (model ? void compact() : setOpen(true))}
+          >
+            {t(running ? "context.running" : "context.manual")}
+          </button>
+        </dd>
+        {error && !open && (
+          <dd className="col-span-2">
+            <DismissibleNotice message={error} />
+          </dd>
+        )}
+        {notice && !open && (
+          <dd className="col-span-2" role="status">
+            {notice}
+          </dd>
+        )}
+      </div>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="flex max-h-[90dvh] flex-col overflow-hidden sm:max-w-xl">
           <DialogHeader>
@@ -246,21 +283,7 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                   <Button
                     disabled={busy || !model}
                     variant="outline"
-                    onClick={() =>
-                      void act(async () => {
-                        if (!request.current || request.current.model !== model)
-                          request.current = { model, key: crypto.randomUUID() };
-                        setRetrying(true);
-                        const result = await control!.compactConversation(
-                          conversation,
-                          model,
-                          request.current.key,
-                        );
-                        request.current = null;
-                        setRetrying(false);
-                        setNotice(result.reason ?? t("context.queued"));
-                      })
-                    }
+                    onClick={() => void compact()}
                   >
                     {busy
                       ? t("context.saving")

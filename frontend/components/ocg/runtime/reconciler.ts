@@ -114,7 +114,8 @@ function applyRuntimeEventToSnapshot(
       const incoming = event.messages;
       const matches = (left: ChatMessage, right: ChatMessage) =>
         left.id === right.id ||
-        (left.commandId !== undefined &&
+        ((left.optimistic || right.optimistic) &&
+          left.commandId !== undefined &&
           left.commandId === right.commandId &&
           left.role === right.role);
       const messages = incoming.map((message) => {

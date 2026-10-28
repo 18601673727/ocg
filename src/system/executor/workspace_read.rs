@@ -290,6 +290,30 @@ impl Workspace {
         read_lines(&file, start_line, line_count)
     }
 
+    pub(super) fn snapshot_range(&self, path: &str, line: u64) -> Result<Value, Refusal> {
+        match self.read(path) {
+            Ok(content) => {
+                let count = content.matches('\n').count() as u64
+                    + u64::from(!content.is_empty() && !content.ends_with('\n'));
+                if count > MAX_RANGE_LINES {
+                    return self
+                        .read_range(path, line.saturating_sub(8).max(1), 80)
+                        .map(|range| range.to_json(path));
+                }
+                Ok(json!({
+                    "path": path, "start_line": 1,
+                    "end_line": (count > 0).then_some(count), "total_lines": count,
+                    "content": content, "line_truncated": false,
+                }))
+            }
+            Err(Refusal::TooLargeToReadWhole { .. }) => {
+                let range = self.read_range(path, line.saturating_sub(8).max(1), 80)?;
+                Ok(range.to_json(path))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The whole content of the file at `path`, relative to the root, as
     /// bytes, when it has at most `limit` of them: the path rules, the walk
     /// and the checks of reading text, without requiring text. For a file
@@ -817,7 +841,7 @@ impl ToolHandler for ReadFile {
         ToolEffect::ReadOnly
     }
 
-    /// Reads on a dedicated blocking worker while holding a file permit.
+    /// Reads on the blocking pool while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let refused = |refusal: Refusal| ToolFailure::not_applied(refusal.to_string());

@@ -5,6 +5,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::task::{Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ const COMMANDS: usize = 1;
 const COMMAND_WAIT: Duration = Duration::from_secs(10 * 60);
 const CPU: usize = 2;
 const FILES: usize = 4;
+const MAX_WAITERS: usize = 64;
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
 const STARTUP_GRACE: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(10);
@@ -36,6 +38,8 @@ struct Counts {
     commands: usize,
     cpu: usize,
     files: usize,
+    waiters: Vec<(u64, Waker)>,
+    next_waiter: u64,
 }
 
 #[derive(Default)]
@@ -52,11 +56,75 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
-    pub(crate) fn acquire(kind: Kind) -> Self {
-        match Self::acquire_until_stopped(kind, None, None) {
-            Ok(permit) => permit,
-            Err(_) => unreachable!("a permit without cancellation cannot be stopped"),
+    async fn acquire_async(kind: Kind, stop: Option<&StopSignal>) -> Result<Self, &'static str> {
+        struct Registration {
+            governor: Arc<Governor>,
+            id: Option<u64>,
         }
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                if let Some(id) = self.id {
+                    let mut counts = self
+                        .governor
+                        .counts
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    counts.waiters.retain(|(key, _)| *key != id);
+                }
+            }
+        }
+        let governor = GOVERNOR
+            .get_or_init(|| Arc::new(Governor::default()))
+            .clone();
+        let mut registration = Registration {
+            governor: governor.clone(),
+            id: None,
+        };
+        std::future::poll_fn(|context| {
+            let mut counts = governor
+                .counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if stop.is_some_and(StopSignal::requested) {
+                return Poll::Ready(Err("the blocking task was stopped before it started"));
+            }
+            let category = match kind {
+                Kind::Command => counts.commands < COMMANDS,
+                Kind::Cpu => counts.cpu < CPU,
+                Kind::File => counts.files < FILES,
+            };
+            if counts.total < TOTAL && category {
+                counts.total += 1;
+                match kind {
+                    Kind::Command => counts.commands += 1,
+                    Kind::Cpu => counts.cpu += 1,
+                    Kind::File => counts.files += 1,
+                }
+                return Poll::Ready(Ok(Self {
+                    governor: governor.clone(),
+                    kind,
+                }));
+            }
+            if let Some(id) = registration.id {
+                if let Some((_, waker)) = counts.waiters.iter_mut().find(|(key, _)| *key == id)
+                    && !waker.will_wake(context.waker())
+                {
+                    *waker = context.waker().clone();
+                }
+            } else {
+                if counts.waiters.len() >= MAX_WAITERS {
+                    return Poll::Ready(Err("the blocking work queue is full"));
+                }
+                let Some(next) = counts.next_waiter.checked_add(1) else {
+                    return Poll::Ready(Err("the blocking work queue cannot register a waiter"));
+                };
+                counts.next_waiter = next;
+                counts.waiters.push((next, context.waker().clone()));
+                registration.id = Some(next);
+            }
+            Poll::Pending
+        })
+        .await
     }
 
     fn acquire_until_stopped(
@@ -142,7 +210,16 @@ impl Drop for Permit {
             Kind::Cpu => counts.cpu -= 1,
             Kind::File => counts.files -= 1,
         }
+        let waiters = counts
+            .waiters
+            .iter()
+            .map(|(_, waker)| waker.clone())
+            .collect::<Vec<_>>();
+        drop(counts);
         self.governor.changed.notify_all();
+        for waker in waiters {
+            waker.wake();
+        }
     }
 }
 
@@ -302,12 +379,21 @@ impl StopSignal {
     pub(crate) fn request(&self) {
         if let Some(governor) = GOVERNOR.get() {
             // The same lock as the permit wait closes the check/wait race.
-            let _counts = governor
+            let counts = governor
                 .counts
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             self.stopped.store(true, Ordering::Release);
+            let waiters = counts
+                .waiters
+                .iter()
+                .map(|(_, waker)| waker.clone())
+                .collect::<Vec<_>>();
+            drop(counts);
             governor.changed.notify_all();
+            for waker in waiters {
+                waker.wake();
+            }
         } else {
             self.stopped.store(true, Ordering::Release);
         }
@@ -475,31 +561,24 @@ impl Process {
     }
 }
 
-/// Runs synchronous work on a dedicated worker so neither the ntex executor
-/// nor its blocking pool waits for a permit or filesystem operation.
+/// Waits asynchronously for a bounded permit, then runs synchronous work on
+/// the ntex blocking pool. A full waiting queue or a failed task returns an error.
 pub async fn run<T, F>(kind: Kind, work: F) -> Result<T, &'static str>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let (send, receive) = flume::bounded(1);
-    thread::Builder::new()
-        .name("ocg-blocking-work".to_owned())
-        .spawn(move || {
-            let _permit = Permit::acquire(kind);
-            if send.send(work()).is_err() {
-                log::debug!("blocking work result was dropped");
-            }
-        })
-        .map_err(|_| "the blocking task could not be started")?;
-    receive
-        .recv_async()
-        .await
-        .map_err(|_| "the blocking task ended without a result")
+    let permit = Permit::acquire_async(kind, None).await?;
+    ntex::rt::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| "the blocking task ended without a result")
 }
 
-/// A worker of a Job still alive: its stop signal and a channel that
-/// disconnects when its thread ends.
+/// A Job's tracked work: its stop signal and a channel that disconnects
+/// when the work ends or is discarded before it starts.
 type TrackedWorker = (JobId, StopSignal, flume::Receiver<()>);
 
 #[derive(Default)]
@@ -508,9 +587,9 @@ pub(crate) struct WorkerTracker {
 }
 
 impl WorkerTracker {
-    /// Like [`run`], for work that mutates: the worker waits for its permit only
-    /// until `stop` is requested, `work` is given `stop` to check before it
-    /// changes anything, and [`Self::stop_job`] can wait for the thread to end.
+    /// Like [`run`], for work that mutates: waiting for a permit stops when
+    /// `stop` is requested, and `work` checks that signal before changing
+    /// anything. [`Self::stop_job`] waits for tracked work to finish.
     pub(crate) async fn run_tracked<T, F>(
         &self,
         job: Option<JobId>,
@@ -522,7 +601,6 @@ impl WorkerTracker {
         T: Send + 'static,
         F: FnOnce(&StopSignal) -> T + Send + 'static,
     {
-        let (send, receive) = flume::bounded(1);
         let (alive, ended) = flume::bounded::<()>(1);
         {
             let mut tracked = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -531,26 +609,18 @@ impl WorkerTracker {
                 tracked.push((job, stop.clone(), ended));
             }
         }
-        thread::Builder::new()
-            .name("ocg-blocking-work".to_owned())
-            .spawn(move || {
-                let _alive = alive;
-                let Ok(_permit) = Permit::acquire_until_stopped(kind, Some(&stop), None) else {
-                    return;
-                };
-                if send.send(work(&stop)).is_err() {
-                    log::debug!("blocking work result was dropped");
-                }
-            })
-            .map_err(|_| "the blocking task could not be started")?;
-        receive
-            .recv_async()
-            .await
-            .map_err(|_| "the blocking task ended without a result")
+        let permit = Permit::acquire_async(kind, Some(&stop)).await?;
+        ntex::rt::spawn_blocking(move || {
+            let _alive = alive;
+            let _permit = permit;
+            work(&stop)
+        })
+        .await
+        .map_err(|_| "the blocking task ended without a result")
     }
 
-    /// Requests a stop of the tracked workers of `job` and waits until their
-    /// threads have ended.
+    /// Requests a stop of the tracked work of `job` and waits until it has
+    /// ended or been discarded before starting.
     pub(crate) async fn stop_job(&self, job: JobId) {
         let workers = {
             let mut tracked = self.workers.lock().unwrap_or_else(PoisonError::into_inner);

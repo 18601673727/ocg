@@ -21,6 +21,7 @@ import {
   type JobStreamSubscription,
 } from "./control-client";
 import { jobTranscript } from "../chat/job-transcript-model";
+import { fileSnapshots } from "../markdown/source-snapshot";
 import { reconcileJob, taskPlanActive } from "./job-status";
 import { materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
@@ -367,7 +368,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     await Promise.all(
       conversation.turns.map(async (turn) => {
         const loaded = await this.readHistoryTurn(id, turn, isCurrent);
-        if (!loaded || !isCurrent()) return;
+        if (!loaded || !isCurrent() || !this.historyTurnIsCurrent(loaded)) return;
         for (const image of loaded.images) this.images.set(image.id, image);
         this.turns.set(turn.job.id, loaded.state);
       }),
@@ -502,7 +503,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         );
         if (!isCurrent()) return;
         for (const turn of loaded) {
-          if (!turn) continue;
+          if (!turn || !this.historyTurnIsCurrent(turn)) continue;
           for (const image of turn.images) this.images.set(image.id, image);
           this.turns.set(turn.state.job.id, turn.state);
         }
@@ -524,6 +525,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     isCurrent: () => boolean,
   ) {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
+    const previous = this.turns.get(turn.job.id);
+    const snapshot = previous ? { ...previous } : undefined;
     const outputs =
       turn.outputs_truncated || (turn.outputs.at(-1)?.seq ?? 0) > 200
         ? (await readOutputWindow(this.control, turn.job.id, { signal: this.lifetime.signal }))
@@ -557,7 +560,22 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }
     const images = await this.readImages(state);
     if (!isCurrent()) return null;
-    return { state, images };
+    return { state, images, previous, snapshot };
+  }
+
+  private historyTurnIsCurrent(loaded: {
+    state: Turn;
+    previous: Turn | undefined;
+    snapshot: Turn | undefined;
+  }) {
+    const current = this.turns.get(loaded.state.job.id);
+    if (this.streams.has(loaded.state.job.id) || current !== loaded.previous) return false;
+    if (!current || !loaded.snapshot) return true;
+    const snapshot = loaded.snapshot;
+    return (
+      Object.keys(current).length === Object.keys(snapshot).length &&
+      (Object.keys(snapshot) as (keyof Turn)[]).every((key) => current[key] === snapshot[key])
+    );
   }
 
   private readonly images = new Map<string, ChatImage>();
@@ -664,6 +682,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             : {
                 toolCalls: [...(message.tools ?? [])],
                 reasoning: message.reasoning,
+                sourceSnapshots: message.intermediate
+                  ? undefined
+                  : fileSnapshots(
+                      turn.outputs.findLast((output) => output.kind === "result")?.value,
+                    ),
                 reasoningDurationMs: message.reasoningDurationMs,
                 failureReason: message.intermediate
                   ? undefined
@@ -956,6 +979,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async trackTurn(sessionId: string, job: string, clearPending = true) {
+    const previous = this.turns.get(job);
+    const snapshot = previous ? { ...previous } : undefined;
     const [record, frozen, window] = await Promise.all([
       this.control.readJob(job),
       this.control.readJobInput(job),
@@ -988,8 +1013,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     };
     if (!this.getSnapshot().sessions.some((s) => s.id === sessionId)) return;
     const current = this.turns.get(job);
-    if (current) turn.job = reconcileJob(current.job, turn.job);
-    this.turns.set(job, turn);
+    if (current && !this.historyTurnIsCurrent({ state: turn, previous, snapshot })) {
+      // The watcher owns this object. Keep its live state and apply the
+      // freshly read entries, including queue edits, without replacing it.
+      current.entries = turn.entries;
+      current.input = turn.input;
+      current.compaction = turn.compaction;
+    } else {
+      if (current) turn.job = reconcileJob(current.job, turn.job);
+      this.turns.set(job, turn);
+    }
     if (clearPending) this.pending.delete(sessionId);
     this.publish(sessionId);
     if (record.settlement.state === "unsettled") this.watch(job);

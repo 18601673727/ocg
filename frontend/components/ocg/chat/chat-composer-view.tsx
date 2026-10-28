@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { SELECTED_ROW, TEXT_TONE } from "@/components/ocg/primitives";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
+import { MarkdownBody } from "@/components/ocg/markdown/markdown-body";
 
 type ComposerFormProps = Pick<
   ComponentPropsWithoutRef<"form">,
@@ -18,20 +19,18 @@ export function ChatComposerView({
   form,
   dragging,
   attachmentInput,
-  selectors,
   children,
   unavailableMessage,
 }: {
   form: ComposerFormProps;
   dragging: boolean;
   attachmentInput: ReactNode;
-  selectors: ReactNode;
   children: ReactNode;
   unavailableMessage?: string;
 }) {
   const { t } = useI18n();
   return (
-    <div className="shrink-0 bg-transparent px-3 pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-5">
+    <div className="shrink-0 bg-transparent pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
       <form {...form} className="relative mx-auto w-full">
         {dragging && (
           <div
@@ -42,7 +41,6 @@ export function ChatComposerView({
           </div>
         )}
         {attachmentInput}
-        {selectors}
         {children}
         {unavailableMessage && (
           <p
@@ -75,6 +73,7 @@ export function ChatComposerInput({
   textarea,
   suggestions,
   error,
+  selectors,
   actions,
 }: {
   textarea: ComposerTextareaProps;
@@ -84,6 +83,7 @@ export function ChatComposerInput({
     onSelect: (index: number) => void;
   };
   error: string | null;
+  selectors: ReactNode;
   actions: {
     busy: boolean;
     queueing: boolean;
@@ -103,6 +103,17 @@ export function ChatComposerInput({
   return (
     <>
       <div className="relative">
+        {textarea.value && (
+          <div
+            className="pointer-events-none absolute inset-0 z-0 max-h-[min(10rem,25dvh)] overflow-hidden px-3 pt-2.5 pb-1 text-base leading-6 sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
+            aria-hidden="true"
+          >
+            <MarkdownBody
+              content={textarea.value}
+              className="text-inherit leading-6 [&_blockquote]:my-0 [&_li]:leading-6 [&_ol]:mb-0 [&_ol]:space-y-0 [&_p]:mb-0 [&_ul]:mb-0 [&_ul]:space-y-0"
+            />
+          </div>
+        )}
         {suggestions && (
           <ul
             id="composer-suggestions"
@@ -163,7 +174,7 @@ export function ChatComposerInput({
             activeSuggestion ? `composer-suggestion-${activeSuggestion.id}` : undefined
           }
           aria-invalid={Boolean(error)}
-          className="max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
+          className="relative z-10 max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base leading-6 text-transparent caret-foreground outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
         />
       </div>
       {error && !errorInHeader && (
@@ -187,10 +198,8 @@ export function ChatComposerInput({
         >
           <Paperclip className="size-4" />
         </Button>
-        <span
-          id="composer-hint"
-          className="sr-only sm:ml-1 sm:not-sr-only sm:text-xs sm:text-muted-foreground"
-        >
+        {selectors}
+        <span id="composer-hint" className="sr-only">
           <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
           <span className="pointer-coarse:hidden">
             {actions.queueing ? t("chat.queueHint") : t("chat.hint")}

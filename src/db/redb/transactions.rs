@@ -1453,7 +1453,9 @@ impl Batch {
             && let Some(target) = self.title_target(&row)?
             && let Some(title) = result
                 .as_ref()
-                .and_then(|result| result.summary.as_deref())
+                .and_then(|result| result.value.as_ref())
+                .and_then(|value| value.get("text"))
+                .and_then(serde_json::Value::as_str)
                 .and_then(crate::db::entities::parse_suggested_title)
         {
             crate::db::mutations::set_conversation(

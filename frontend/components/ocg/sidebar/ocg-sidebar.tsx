@@ -90,6 +90,7 @@ type OcgSidebarProps = {
   onNewChat: () => void;
   onHome?: () => void;
   onRename?: (id: string, title: string) => Promise<void>;
+  onRenameChild?: (conversation: string, title: string) => Promise<void>;
   onHide?: (id: string) => Promise<void>;
   runtimeStatus: RuntimeStatus;
   /** Which runtime answers Chat, so the footer never claims a fixture runtime. */
@@ -155,6 +156,7 @@ export function OcgSidebar({
   onNewChat,
   onHome,
   onRename,
+  onRenameChild,
   onHide,
   runtimeAuthority,
   activeView = "chat",
@@ -215,7 +217,10 @@ export function OcgSidebar({
   const [hiding, setHiding] = useState(false);
   const [hideError, setHideError] = useState<string | null>(null);
 
-  const [renameTarget, setRenameTarget] = useState<ChatSession | null>(null);
+  const [renameTarget, setRenameTarget] = useState<{
+    id: string;
+    kind: "session" | "child";
+  } | null>(null);
   const [renameTitle, setRenameTitle] = useState("");
   const [renaming, setRenaming] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
@@ -242,13 +247,25 @@ export function OcgSidebar({
     return error instanceof Error ? error.message : String(error);
   };
 
+  const openRename = (id: string, title: string, kind: "session" | "child") => {
+    setRenameError(null);
+    setRenameTitle(title);
+    setRenameTarget({ id, kind });
+  };
+
   const confirmRename = async (event?: React.FormEvent) => {
     event?.preventDefault();
-    if (!renameTarget || !onRename || renaming) return;
+    if (!renameTarget || renaming) return;
     setRenaming(true);
     setRenameError(null);
     try {
-      await onRename(renameTarget.id, renameTitle);
+      if (renameTarget.kind === "session") {
+        if (!onRename) return;
+        await onRename(renameTarget.id, renameTitle);
+      } else {
+        if (!onRenameChild) return;
+        await onRenameChild(renameTarget.id, renameTitle);
+      }
       setRenameTarget(null);
     } catch (cause: unknown) {
       setRenameError(t("sidebar.renameFailed", { error: conversationError(cause, "rename") }));
@@ -656,6 +673,10 @@ export function OcgSidebar({
                           <button
                             type="button"
                             onClick={() => onSelect(session.id)}
+                            onDoubleClick={() => {
+                              if (onRename && session.sessionId)
+                                openRename(session.id, session.title || "", "session");
+                            }}
                             aria-current={active ? "true" : undefined}
                             title={session.title || t("sidebar.newChat")}
                             className="flex h-full min-w-0 flex-1 items-center pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
@@ -745,9 +766,7 @@ export function OcgSidebar({
                                     <DropdownMenuContent align="end">
                                       <DropdownMenuItem
                                         onSelect={() => {
-                                          setRenameError(null);
-                                          setRenameTitle(session.title || "");
-                                          setRenameTarget(session);
+                                          openRename(session.id, session.title || "", "session");
                                         }}
                                       >
                                         {t("sidebar.renameChat")}
@@ -773,6 +792,11 @@ export function OcgSidebar({
                               sessionId={session.id}
                               onAvailabilityChange={handleChildAvailability}
                               onOpen={onOpenConversation}
+                              onRename={
+                                onRenameChild
+                                  ? (child) => openRename(child.id, child.title || "", "child")
+                                  : undefined
+                              }
                             />
                           )}
                       </li>

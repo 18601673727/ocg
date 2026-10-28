@@ -2,9 +2,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { MarkdownText } from "./markdown-text";
+import type { FileSnapshot } from "@/components/ocg/markdown/source-snapshot";
 
 /** Smooth bursts from the provider without changing the Markdown renderer. */
-export function SmoothMarkdownText({ text, streaming }: { text: string; streaming: boolean }) {
+export function SmoothMarkdownText({
+  text,
+  streaming,
+  sourceSnapshots,
+}: {
+  text: string;
+  streaming: boolean;
+  sourceSnapshots?: readonly FileSnapshot[];
+}) {
   const [shown, setShown] = useState(text);
   const latest = useRef(text);
   const displayed = useRef(text);
@@ -53,7 +62,7 @@ export function SmoothMarkdownText({ text, streaming }: { text: string; streamin
           : undefined
       }
     >
-      <MarkdownText text={streaming ? shown : text} />
+      <MarkdownText text={streaming ? shown : text} sourceSnapshots={sourceSnapshots} />
     </div>
   );
 }

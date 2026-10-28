@@ -40,6 +40,7 @@ export type ChatMessage = {
   role: MessageRole;
   content: string;
   reasoning?: string;
+  sourceSnapshots?: import("./markdown/source-snapshot").FileSnapshot[];
   reasoningDurationMs?: number;
   intermediate?: boolean;
   failureReason?: string;

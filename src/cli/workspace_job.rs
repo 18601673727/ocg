@@ -583,7 +583,7 @@ async fn report(
         let _ = writeln!(
             report,
             "Result:\n{}",
-            output.summary.as_deref().unwrap_or("(none)")
+            output.display_text().as_deref().unwrap_or("(none)")
         );
     }
     let _ = writeln!(report, "Tool calls:");

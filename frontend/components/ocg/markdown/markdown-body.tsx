@@ -8,21 +8,22 @@ import {
   highlightCode,
   KATEX_OPTIONS,
   markdownParser,
-  MERMAID_OPTIONS,
   sanitizeUrl,
   type Token,
 } from "./markdown-pipeline";
 import { cn } from "@/lib/utils";
+import { useTheme } from "../appearance/theme-provider";
 import { useI18n } from "../i18n";
+import { SourceLink, sourceReference, type FileSnapshot } from "./source-snapshot";
+import { Chart, type ChatChartDefinition, type ChatChartSeries } from "../dashboard/chat-chart";
 
 export interface MarkdownBodyProps {
   content: string;
+  sourceSnapshots?: readonly FileSnapshot[];
   className?: string;
   /** Renders code and prose in the muted tone the reasoning panel uses. */
   inMuted?: boolean;
 }
-
-let diagramCounter = 0;
 
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
@@ -49,13 +50,6 @@ function CopyButton({ text, label }: { text: string; label: string }) {
   );
 }
 
-/**
- * Mermaid diagram.
- *
- * Mermaid runs at `securityLevel: "strict"`, which is what stops a diagram
- * from smuggling markup through, and its SVG is additionally passed through
- * DOMPurify before it reaches the document. Nothing here relaxes either guard.
- */
 function MermaidDiagram({
   code,
   inMuted,
@@ -67,66 +61,38 @@ function MermaidDiagram({
   errorLabel: string;
   diagramLabel: string;
 }) {
+  const { resolvedTheme, hydrated } = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
-  const [ready, setReady] = useState(false);
-  // Identifies the newest render attempt so a superseded async result — an
-  // older code that resolves after a newer one, or after unmount — is dropped
-  // rather than overwriting the diagram or resurrecting a cleared error.
   const attempt = useRef(0);
-  const rendered = useRef("");
-
-  useEffect(() => {
-    let mounted = true;
-
-    void import("mermaid")
-      .then(({ default: mermaid }) => {
-        mermaid.initialize({ ...MERMAID_OPTIONS });
-        if (mounted) setReady(true);
-      })
-      .catch((err: unknown) => {
-        if (mounted) {
-          setError(err instanceof Error ? err.message : errorLabel);
-        }
-      });
-
-    return () => {
-      mounted = false;
-      // Invalidate any in-flight render so it cannot write after unmount.
-      attempt.current += 1;
-    };
-  }, [errorLabel]);
 
   useEffect(() => {
     const container = containerRef.current;
-    // The host stays mounted across errors, so `container` remains available
-    // and a later valid code can render into it again.
-    if (!ready || !container || rendered.current === code) return;
+    if (!hydrated || !container) return;
 
-    rendered.current = code;
     const token = ++attempt.current;
-    let mounted = true;
-    // A new code clears the previous error before rendering, so an invalid
-    // diagram that becomes valid recovers instead of staying failed.
+    let cancelled = false;
     setError(null);
     container.innerHTML = "";
 
-    void Promise.all([import("mermaid"), import("dompurify")])
-      .then(async ([{ default: mermaid }, { default: purify }]) => {
-        const { svg } = await mermaid.render(`ocg-diagram-${++diagramCounter}`, code);
-        if (!mounted || attempt.current !== token) return;
-        container.innerHTML = purify.sanitize(svg, { USE_PROFILES: { svg: true } });
+    void import("@crafter/mermaid")
+      .then(({ render, THEMES }) => {
+        if (cancelled || attempt.current !== token) return;
+        container.innerHTML = render(code, {
+          theme: resolvedTheme === "dark" ? THEMES["zinc-dark"] : THEMES["zinc-light"],
+          transparent: true,
+        });
         setError(null);
       })
-      .catch((err: unknown) => {
-        if (!mounted || attempt.current !== token) return;
-        setError(err instanceof Error ? err.message : errorLabel);
+      .catch((cause: unknown) => {
+        if (cancelled || attempt.current !== token) return;
+        setError(cause instanceof Error ? cause.message : errorLabel);
       });
 
     return () => {
-      mounted = false;
+      cancelled = true;
     };
-  }, [code, ready, errorLabel]);
+  }, [code, errorLabel, hydrated, resolvedTheme]);
 
   return (
     <div className={cn("my-3", inMuted && "text-muted-foreground")}>
@@ -218,6 +184,62 @@ function MathBlock({
   );
 }
 
+function parseChart(code: string): ChatChartDefinition | null {
+  try {
+    const value: unknown = JSON.parse(code);
+    if (!value || typeof value !== "object") return null;
+    const record = value as Record<string, unknown>;
+    if (
+      !["line", "bar", "pie", "combo"].includes(String(record.type)) ||
+      !Array.isArray(record.labels) ||
+      !Array.isArray(record.series)
+    )
+      return null;
+    if (
+      record.labels.length === 0 ||
+      record.labels.length > 500 ||
+      record.series.length === 0 ||
+      record.series.length > 20
+    )
+      return null;
+    if (!record.labels.every((label) => typeof label === "string" && label.length <= 200))
+      return null;
+    const series: ChatChartSeries[] = [];
+    for (const raw of record.series) {
+      if (!raw || typeof raw !== "object") return null;
+      const item = raw as Record<string, unknown>;
+      if (
+        typeof item.label !== "string" ||
+        !Array.isArray(item.data) ||
+        item.data.length !== record.labels.length ||
+        !item.data.every((number) => typeof number === "number" && Number.isFinite(number))
+      )
+        return null;
+      if (item.type !== undefined && item.type !== "line" && item.type !== "bar") return null;
+      if (item.axis !== undefined && item.axis !== "left" && item.axis !== "right") return null;
+      series.push({
+        label: item.label,
+        data: item.data as number[],
+        type: item.type as ChatChartSeries["type"],
+        axis: item.axis as ChatChartSeries["axis"],
+      });
+    }
+    if (
+      record.type === "pie" &&
+      (series.length !== 1 || series[0].data.some((number) => number < 0))
+    )
+      return null;
+    return {
+      type: record.type as ChatChartDefinition["type"],
+      labels: record.labels as string[],
+      series,
+      ariaLabel: typeof record.ariaLabel === "string" ? record.ariaLabel : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function CodeBlock({
   code,
   language,
@@ -230,6 +252,7 @@ function CodeBlock({
   copyLabel: string;
 }) {
   const { t } = useI18n();
+  const chart = language === "ocg-chart" ? parseChart(code) : null;
   const highlight = highlightCode(code, language);
   const caption = highlight?.language || language || "text";
   const muted = inMuted ? "text-muted-foreground" : "";
@@ -242,6 +265,16 @@ function CodeBlock({
         errorLabel={t("chat.mermaidError")}
         diagramLabel={t("chat.mermaidDiagram")}
       />
+    );
+  }
+
+  if (language === "ocg-chart") {
+    return chart ? (
+      <Chart definition={chart} />
+    ) : (
+      <pre className="my-3 overflow-x-auto rounded-md border bg-muted p-3 text-sm">
+        <code>{code}</code>
+      </pre>
     );
   }
 
@@ -273,6 +306,7 @@ function CodeBlock({
 
 interface WalkContext {
   inMuted: boolean;
+  sourceSnapshots?: readonly FileSnapshot[];
   copyLabel: string;
   nextKey: { current: number };
 }
@@ -329,10 +363,19 @@ function inline(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length)
         break;
       }
       case "link_open": {
-        const href = sanitizeUrl(attr(token, "href"));
+        const rawHref = attr(token, "href");
+        const href = sanitizeUrl(rawHref);
         const close = findClose(tokens, i, to, "link_close");
         const body = inline(ctx, tokens, i + 1, close);
         i = close;
+        if (ctx.sourceSnapshots && sourceReference(rawHref)) {
+          out.push(
+            <SourceLink key={key(ctx)} href={rawHref} snapshots={ctx.sourceSnapshots}>
+              {body}
+            </SourceLink>,
+          );
+          break;
+        }
         if (!href) {
           // An unsafe target degrades to plain text rather than a live link.
           out.push(<Fragment key={key(ctx)}>{body}</Fragment>);
@@ -636,13 +679,17 @@ function table(ctx: WalkContext, tokens: Token[], start: number): ReactNode {
         token.type === "th_open" ? (
           <th
             key={key(ctx)}
-            className="font-semibold text-left px-3 py-2"
+            className="px-4 py-3 text-left align-top font-semibold leading-6"
             style={align ? { textAlign: align } : undefined}
           >
             {cells}
           </th>
         ) : (
-          <td key={key(ctx)} className="px-3 py-2" style={align ? { textAlign: align } : undefined}>
+          <td
+            key={key(ctx)}
+            className="px-4 py-3 align-top leading-6"
+            style={align ? { textAlign: align } : undefined}
+          >
             {cells}
           </td>
         ),
@@ -652,9 +699,9 @@ function table(ctx: WalkContext, tokens: Token[], start: number): ReactNode {
   }
 
   return (
-    <div key={key(ctx)} className="overflow-x-auto my-3">
-      <table className="min-w-full border-collapse border">
-        {head.length > 0 && <thead>{head}</thead>}
+    <div key={key(ctx)} className="my-3 max-w-full overflow-x-auto rounded-lg border">
+      <table className="min-w-full border-collapse text-sm">
+        {head.length > 0 && <thead className="bg-muted/50">{head}</thead>}
         {body.length > 0 && <tbody>{body}</tbody>}
       </table>
     </div>
@@ -676,11 +723,17 @@ function tableEnd(tokens: Token[], start: number): number {
  * token spans, KaTeX output, and Mermaid SVG, each of which is produced by a
  * library from the code rather than passed through from the document.
  */
-export function MarkdownBody({ content, className, inMuted = false }: MarkdownBodyProps) {
+export function MarkdownBody({
+  content,
+  className,
+  inMuted = false,
+  sourceSnapshots,
+}: MarkdownBodyProps) {
   const { t } = useI18n();
   const tokens = useMemo(() => markdownParser().parse(content, {}), [content]);
   const ctx: WalkContext = {
     inMuted,
+    sourceSnapshots,
     copyLabel: t("chat.copyCode"),
     nextKey: { current: 0 },
   };

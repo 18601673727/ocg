@@ -7,9 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
-import { UsageChart } from "./usage-chart";
-import { ReliabilityChart } from "./reliability-chart";
-import { HealthChart } from "./health-chart";
+import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
 import { LoadMore } from "../primitives/load-more";
 import {
   Select,
@@ -166,7 +164,7 @@ export function ObservationsSurface({
   ];
 
   return (
-    <ContentContainer>
+    <ContentContainer className={kind === "usage" ? "[overflow-anchor:none]" : undefined}>
       <ContentHeader
         title={kind === "usage" ? t("nav.usage") : t("observations.health")}
         actions={

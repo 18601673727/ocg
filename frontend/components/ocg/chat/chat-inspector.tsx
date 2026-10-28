@@ -74,14 +74,14 @@ export function ChatInspector({
                     {new Date(session.updatedAt).toLocaleString(locale)}
                   </dd>
                 </div>
+                {session.conversationId && (
+                  <ConversationContext
+                    key={`context:${session.conversationId}`}
+                    conversation={session.conversationId}
+                  />
+                )}
               </dl>
             </section>
-            {session.conversationId && (
-              <ConversationContext
-                key={`context:${session.conversationId}`}
-                conversation={session.conversationId}
-              />
-            )}
             {session.conversationId && (
               <ConversationLimitsEditor
                 key={session.conversationId}

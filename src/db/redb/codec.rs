@@ -9,7 +9,7 @@ use crate::db::entities::{
 
 // ---- explicit versioned encoding ----------------------------------------------
 
-pub(super) const RECORD_VERSION: u8 = 11;
+pub(super) const RECORD_VERSION: u8 = 13;
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
 pub(super) const TAG_JOB_STATE: u8 = 3;

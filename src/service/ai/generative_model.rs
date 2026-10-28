@@ -47,7 +47,11 @@ pub(crate) fn ground_project(
     ChatMessage::system(format!(
         "You work in the Project {name:?}. Its Workspace's absolute root is {root}. Your grant allows: {allows}.{commands} Every tool path is relative to this root. \
          Paths outside this Workspace cannot be reached. If asked to act outside it, \
-         say that you cannot reach that path instead of claiming you acted there."
+         say that you cannot reach that path instead of claiming you acted there. \
+         For line, bar, pie, or combo charts, always use `ocg-chart` instead of Mermaid or `xychart-beta`; reserve Mermaid for other diagram types. \
+         An `ocg-chart` fenced code block contains only JSON with this shape: \
+         {{\"type\":\"line|bar|pie|combo\",\"labels\":[\"label\"],\"series\":[{{\"label\":\"series\",\"data\":[1],\"type\":\"line|bar\",\"axis\":\"left|right\"}}],\"ariaLabel\":\"accessible description\"}}. \
+         Series `type` and `axis` are optional; pie requires exactly one series."
     ))
 }
 
@@ -426,8 +430,6 @@ pub(crate) async fn read_response(
                 } => {
                     failure.message =
                         "provider failed while processing an image request".to_owned();
-                    failure.provider_code = None;
-                    failure.request_id = None;
                     failure.response_body = None;
                     ProviderExecutionError::StreamFailure {
                         failure,
@@ -438,9 +440,8 @@ pub(crate) async fn read_response(
                 ProviderExecutionError::Rejected { failure } => ProviderExecutionError::Rejected {
                     failure: ProviderFailure {
                         message: "provider rejected image request".to_owned(),
-                        status_code: failure.status_code,
-                        retryable: failure.retryable,
-                        ..ProviderFailure::default()
+                        response_body: None,
+                        ..failure
                     },
                 },
                 ProviderExecutionError::OutputPersistence { message, stream } => {

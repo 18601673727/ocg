@@ -28,9 +28,9 @@
 //! A search walks depth first in that order, within a depth, a number of
 //! entries examined, a number of content bytes read and a time, and stops
 //! once its result is full; its result says whether it reached the end and,
-//! if not, which bound stopped it. A search runs on a thread of its own, so
-//! the executor never blocks on it; a call stopped by its time limit or by
-//! cancellation tells the search to stop, and it does at its next entry.
+//! if not, which bound stopped it. A search runs on the blocking pool, so the
+//! executor does not wait on its filesystem work; a call stopped by its time
+//! limit or cancellation signals a running search to stop at its next entry.
 //!
 //! What this does not establish is what `workspace_read_file` does not: a
 //! bind mount or hard-linked directory may still lead outside the Workspace
@@ -43,7 +43,6 @@ use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use regex::RegexBuilder;
@@ -53,7 +52,7 @@ use serde_json::{Value, json};
 
 use super::workspace_read::{Refusal, Step, Workspace, check_component, open_within, read_bytes};
 use crate::db::entities::ToolEffect;
-use crate::system::executor::blocking::{self, Kind as BlockingKind, Permit};
+use crate::system::executor::blocking::{self, Kind as BlockingKind};
 use crate::system::executor::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -668,7 +667,7 @@ impl ToolHandler for ListDirectory {
         ToolEffect::ReadOnly
     }
 
-    /// Lists on a dedicated blocking worker while holding a file permit.
+    /// Lists on the blocking pool while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let path = directory_path(&arguments).map_err(refused)?.to_owned();
@@ -698,8 +697,8 @@ impl ToolHandler for Search {
         ToolEffect::ReadOnly
     }
 
-    /// Searches on a thread of its own and awaits its result. Dropping the
-    /// call, as its time limit or cancellation does, stops the search.
+    /// Searches on the blocking pool and awaits its result. Dropping the call
+    /// signals a running search to stop.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let query = query(&arguments).map_err(refused)?;
@@ -707,19 +706,11 @@ impl ToolHandler for Search {
             let stopping = StopOnDrop(stop.clone());
             let (workspace, limits) = (self.workspace.clone(), self.limits);
 
-            let (report, reported) = flume::bounded(1);
-            thread::Builder::new()
-                .name("ocg-workspace-search".to_owned())
-                .spawn(move || {
-                    let _permit = Permit::acquire(BlockingKind::File);
-                    let found = search(&workspace, &query, &limits, &stop);
-                    report.send(found).ok();
-                })
-                .map_err(|_| ToolFailure::not_applied("the search could not be started"))?;
-            let found = reported
-                .recv_async()
-                .await
-                .map_err(|_| ToolFailure::not_applied("the search ended without a result"))?;
+            let found = blocking::run(BlockingKind::File, move || {
+                search(&workspace, &query, &limits, &stop)
+            })
+            .await
+            .map_err(|_| ToolFailure::not_applied("the search ended without a result"))?;
             drop(stopping);
             found.map_err(refused)
         })

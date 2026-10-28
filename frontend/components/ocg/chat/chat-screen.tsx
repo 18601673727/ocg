@@ -126,7 +126,7 @@ const ChatComposerSlot: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 const Welcome: FC = () => {
   const { t } = useI18n();
   return (
-    <div className="aui-thread-welcome-root mb-6 flex flex-col px-2">
+    <div className="aui-thread-welcome-root mb-6 flex flex-col">
       <p className="text-2xl font-medium tracking-tight">{t("chat.newThread")}</p>
       <p className="mt-1 text-sm text-muted-foreground">
         {t("chat.emptyPrefix")} {t("chat.emptySuffix")}

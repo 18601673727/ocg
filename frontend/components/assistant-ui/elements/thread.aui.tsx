@@ -437,7 +437,7 @@ const ThreadScrollToBottom: FC = () => {
 const ThreadWelcome: FC = () => {
   const { t } = useI18n();
   return (
-    <div className="aui-thread-welcome-root mb-6 flex flex-col px-2">
+    <div className="aui-thread-welcome-root mb-6 flex flex-col">
       <p className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-medium tracking-tight duration-200">
         {t("aui.welcome")}
       </p>
@@ -600,6 +600,9 @@ const AssistantMessage: FC = () => {
   const groupBy = TaskGroupComponent ? taskAwareGroupBy : messageGroupBy;
   const messageParts = useAuiState((s) => s.message.parts);
   const toolMetrics = useAuiState((s) => s.message.metadata.custom.toolMetrics);
+  const sourceSnapshots = useAuiState((s) => s.message.metadata.custom.sourceSnapshots) as
+    | import("@/components/ocg/markdown/source-snapshot").FileSnapshot[]
+    | undefined;
   const unsettled = useAuiState((s) => s.message.status?.type === "running");
   const compaction = useAuiState((s) => s.message.metadata.custom.compaction);
   const agentInstruction = useAuiState((s) => s.message.metadata.custom.agentInstruction === true);
@@ -688,7 +691,7 @@ const AssistantMessage: FC = () => {
       <div
         data-slot="aui_assistant-message-content"
         className={cn(
-          "px-2 leading-relaxed wrap-break-word",
+          "leading-relaxed wrap-break-word",
           intermediate ? "text-sm text-muted-foreground" : "text-foreground",
         )}
       >
@@ -771,7 +774,11 @@ const AssistantMessage: FC = () => {
               }
               case "text":
                 return (
-                  <SmoothMarkdownText text={part.text} streaming={part.status.type === "running"} />
+                  <SmoothMarkdownText
+                    text={part.text}
+                    streaming={part.status.type === "running"}
+                    sourceSnapshots={sourceSnapshots}
+                  />
                 );
               case "reasoning":
                 return <Reasoning {...part} />;
@@ -809,7 +816,7 @@ const AssistantMessage: FC = () => {
       {!intermediate && (
         <div
           data-slot="aui_assistant-message-footer"
-          className={cn("ms-2 flex items-center", ACTION_BAR_HEIGHT)}
+          className={cn("flex items-center", ACTION_BAR_HEIGHT)}
         >
           <BranchPicker />
           <AssistantActionBar />
@@ -935,7 +942,7 @@ const UserMessage: FC = () => {
   return (
     <MessagePrimitive.Root
       data-slot="aui_user-message-root"
-      className="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 px-2 [contain-intrinsic-size:auto_80px] [content-visibility:auto] [&>*]:col-start-2"
+      className="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] [content-visibility:auto] [&>*]:col-start-2"
       data-role="user"
     >
       <UserMessageAttachments />

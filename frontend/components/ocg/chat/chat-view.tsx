@@ -20,6 +20,7 @@ import { ChatComposerInput, ChatComposerView } from "./chat-composer-view";
 import { AttachmentStaging, useImageAttachments } from "./image-attachments";
 import { useConversationError } from "./conversation-errors";
 import { ApprovalRequest } from "./approval-request";
+import { outputDisplayText } from "./job-transcript-model";
 import { DispatchSelectionCard } from "./dispatch-selection-card";
 import {
   applyComposerSuggestion,
@@ -294,35 +295,6 @@ export function ChatComposer({
           }}
         />
       }
-      selectors={
-        <>
-          {/*
-            The turn's two selections sit outside and above the card as compact
-            dropdown buttons: which Project this turn belongs to, and the model
-            and reasoning effort the next turn runs with. Both hug their label up
-            to a share of the row and ellipsize beyond it, so they read as two
-            buttons rather than one bar. Keeping them outside the card means the
-            card stays the input, and a raised panel opens upward over the
-            conversation instead of covering it.
-          */}
-          <div className="relative z-30 flex min-w-0 items-stretch gap-1.5 px-0.5 pb-1.5">
-            {projectSelector && (
-              <div className="flex min-w-0 max-w-[min(18rem,58%)] shrink items-stretch [&>button]:h-full">
-                {projectSelector}
-              </div>
-            )}
-            <ModelSelector
-              sessionId={sessionId}
-              selection={selection}
-              onChange={onSelectionChange}
-              onPreference={onPreference}
-              busy={busy || submitting || cancelling}
-              active={active}
-              activity={activity}
-            />
-          </div>
-        </>
-      }
       unavailableMessage={
         chatReady
           ? undefined
@@ -361,6 +333,23 @@ export function ChatComposer({
             },
             onKeyDown: (e) => {
               if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+              if (e.key === "`" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                const input = e.currentTarget;
+                const start = input.selectionStart;
+                const end = input.selectionEnd;
+                const value = draft;
+                if (value.slice(Math.max(0, start - 2), start) === "``" && start === end) {
+                  e.preventDefault();
+                  const insertion = "`\n\n```";
+                  const next = value.slice(0, start) + insertion + value.slice(end);
+                  onDraftChange(next);
+                  requestAnimationFrame(() => {
+                    input.setSelectionRange(start + 2, start + 2);
+                    input.focus();
+                  });
+                  return;
+                }
+              }
               if (e.key === "Escape" && suggestionsOpen) {
                 e.preventDefault();
                 closeSuggestions();
@@ -408,6 +397,24 @@ export function ChatComposer({
               : undefined
           }
           error={error}
+          selectors={
+            <div className="flex min-w-0 flex-1 items-center gap-1.5">
+              {projectSelector && (
+                <div className="flex min-w-0 max-w-[min(18rem,40%)] shrink items-stretch">
+                  {projectSelector}
+                </div>
+              )}
+              <ModelSelector
+                sessionId={sessionId}
+                selection={selection}
+                onChange={onSelectionChange}
+                onPreference={onPreference}
+                busy={busy || submitting || cancelling}
+                active={active}
+                activity={activity}
+              />
+            </div>
+          }
           actions={{
             busy,
             queueing: defaultQueueing,
@@ -502,8 +509,8 @@ function ChildConversationCard({
   const status =
     state && state !== "unsettled" ? t(`state.${state}`) : t(`chat.child.${child.state}`);
   const title = child.title || t("chat.child.untitled");
-  const summary = detail?.result?.summary
-    ?.trim()
+  const summary = outputDisplayText(detail?.result)
+    .trim()
     .split(/\n+/)[0]
     ?.replace(/^#{1,6}\s*/, "")
     .replace(/[*`]/g, "")

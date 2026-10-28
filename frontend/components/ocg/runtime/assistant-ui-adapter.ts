@@ -53,6 +53,7 @@ function metadataFor(message: ChatMessage, context: MessageContext): OcgMetadata
     jobId: message.jobId,
     optimistic: message.optimistic,
     reasoning: message.reasoning,
+    sourceSnapshots: message.sourceSnapshots,
     reasoningDurationMs: message.reasoningDurationMs,
     intermediate: message.intermediate,
     compaction: message.compaction?.kind,

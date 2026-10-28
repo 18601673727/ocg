@@ -286,11 +286,15 @@ fn executor(handle: &DatabaseHandle) -> Result<Target> {
     let model = block_on(handle.create_config(Config {
         name: "benchmark model".into(),
         body: ConfigBody::Model(ModelConfig {
+            reasoning_efforts: None,
             connection_id: connection,
             model: "benchmark".into(),
             context_window: None,
             parameters: Default::default(),
-            declared_capabilities: Default::default(),
+            declared_capabilities: BTreeSet::from([
+                ocg::db::entities::ModelCapability::Chat,
+                ocg::db::entities::ModelCapability::Tools,
+            ]),
         }),
     }))?;
     let executor = block_on(handle.create_executor(Executor {
@@ -301,6 +305,7 @@ fn executor(handle: &DatabaseHandle) -> Result<Target> {
     Ok(Target {
         executor,
         configuration: ExecutionConfiguration {
+            reasoning_effort: None,
             agent_profile: None,
             llm_profile: model.into(),
         },
@@ -475,6 +480,7 @@ fn setup_scheduler_pools(handle: &DatabaseHandle) -> Result<Target> {
     let model = block_on(handle.create_config(Config {
         name: "benchmark model".into(),
         body: ConfigBody::Model(ModelConfig {
+            reasoning_efforts: None,
             connection_id: connection,
             model: "benchmark".into(),
             context_window: None,
@@ -503,6 +509,7 @@ fn setup_scheduler_pools(handle: &DatabaseHandle) -> Result<Target> {
     Ok(Target {
         executor,
         configuration: ExecutionConfiguration {
+            reasoning_effort: None,
             agent_profile: None,
             llm_profile: model.into(),
         },
@@ -1944,7 +1951,7 @@ fn observability(options: &Options) -> Result<()> {
         use ntex::web::{self, App, HttpResponse, HttpServer};
         use ocg::service::ai::providers::openai_compatible::{ChatMessage, ChatToolCallWire};
         use ocg::db::entities::{
-            AgentBehavior, AgentConfig, AvailabilityStat, ProviderAnswer, ToolEvidence,
+            AgentConfig, AvailabilityStat, ProviderAnswer, ToolEvidence,
             RequestNumber, Timestamp, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
             ToolOutcome, ToolPayload,
         };
@@ -2040,9 +2047,7 @@ fn observability(options: &Options) -> Result<()> {
             let agent = block_on(handle.create_config(Config {
                 name: "benchmark agent".into(),
                 body: ConfigBody::Agent(AgentConfig {
-                    dispatch_to: Vec::new(),
                     instructions: Some("benchmark".into()),
-                    behavior: AgentBehavior::General,
                     models: vec![target.configuration.llm_profile.into()],
                     ..Default::default()
                 }),

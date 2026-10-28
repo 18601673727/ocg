@@ -370,6 +370,30 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   const conversationListeners = new Set<() => void>();
   let closed = false;
 
+  // Browsers share a small HTTP/1 connection pool across tabs. Rotate event
+  // streams so ordinary requests can run even when several views are open.
+  function streamAttempt(parent: AbortSignal) {
+    const controller = new AbortController();
+    let rotated = false;
+    const abort = () => controller.abort();
+    parent.addEventListener("abort", abort, { once: true });
+    if (parent.aborted) abort();
+    const timer = programmatic
+      ? undefined
+      : setTimeout(() => {
+          rotated = true;
+          controller.abort();
+        }, 5000);
+    return {
+      signal: controller.signal,
+      rotated: () => rotated,
+      dispose: () => {
+        if (timer !== undefined) clearTimeout(timer);
+        parent.removeEventListener("abort", abort);
+      },
+    };
+  }
+
   // The one credential this client sends: the bearer token of its caller,
   // or nothing at all where the browser's own session cookie applies.
   async function credentials(): Promise<Record<string, string>> {
@@ -516,10 +540,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     void (async () => {
       let delay = 250;
       while (!signal.aborted) {
+        const attempt = streamAttempt(signal);
         try {
           const response = await fetchImpl(`${base}${typeof path === "string" ? path : path()}`, {
             headers: { Accept: "text/event-stream", ...(await credentials()) },
-            signal,
+            signal: attempt.signal,
             mode: "same-origin",
             credentials: programmatic ? "omit" : "same-origin",
             cache: "no-store",
@@ -565,7 +590,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
               } finally {
                 if (idle) clearTimeout(idle);
               }
-              signal.throwIfAborted();
+              attempt.signal.throwIfAborted();
               if (chunk.done) break;
               for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
                 if ("comment" in frame) continue;
@@ -586,6 +611,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           throw new ControlTransportError("connection_lost", 0, true);
         } catch (error) {
           if (signal.aborted) break;
+          if (attempt.rotated()) {
+            delay = 250;
+            await pause(100, signal);
+            continue;
+          }
           onError(error);
           if (
             error instanceof ContractError ||
@@ -594,6 +624,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             break;
           await pause(delay, signal);
           delay = Math.min(delay * 2, 10000);
+        } finally {
+          attempt.dispose();
         }
       }
     })()
@@ -1845,13 +1877,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         try {
           while (!signal.aborted) {
             let failure = new ControlTransportError("premature_end", 0, true);
+            const attempt = streamAttempt(signal);
             try {
-              const end = await connection(jobId, signal, listener, cursor);
+              const end = await connection(jobId, attempt.signal, listener, cursor);
               if (end) return end;
             } catch (error) {
               if (signal.aborted) return "aborted";
+              if (attempt.rotated()) {
+                delay = 250;
+                await pause(100, signal);
+                continue;
+              }
               if (!(error instanceof ControlTransportError) || !error.retryable) throw error;
               failure = error;
+            } finally {
+              attempt.dispose();
             }
             if (signal.aborted) return "aborted";
             await settings.onReconnect?.(failure);

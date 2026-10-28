@@ -788,7 +788,7 @@ impl ToolHandler for WriteFile {
 }
 
 impl WriteFile {
-    /// Writes on a dedicated blocking worker while holding a file permit.
+    /// Writes on the blocking pool while holding a file permit.
     fn write(&self, job: Option<JobId>, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let (path, operation) = parse(&arguments)

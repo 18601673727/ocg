@@ -89,8 +89,7 @@ export function ModelSelector({
       (target) => target.declared_capabilities.includes("chat") && target.executors.length,
     ) ?? [];
   const llm = targets.find((target) => target.id === selection?.llmProfile) ?? targets[0];
-  const executor =
-    llm?.executors.find((executor) => executor === selection?.executor) ?? llm?.executors[0];
+  const executor = llm?.executors[0];
   const agentId = agent?.id;
   const llmId = llm?.id;
   const model = llm?.model;
@@ -129,7 +128,7 @@ export function ModelSelector({
     if (sessionId) client.setChatSelection?.(sessionId, next);
   }, [agentId, llmId, executor, model, projectId, effort, selection, onChange, client, sessionId]);
 
-  function choose(agentProfile: string, llmProfile?: string, executor?: string) {
+  function choose(agentProfile: string, llmProfile?: string) {
     const agent = agents.find((agent) => agent.id === agentProfile);
     const choices =
       agent?.llm_targets.filter(
@@ -142,7 +141,7 @@ export function ModelSelector({
       effort: llm.id === selection?.llmProfile ? effort : null,
       agentProfile,
       llmProfile: llm.id,
-      executor: executor ?? llm.executors[0],
+      executor: llm.executors[0],
       ...(selection?.project ? { project: selection.project } : {}),
     };
     onChange(next);
@@ -172,8 +171,7 @@ export function ModelSelector({
             label: project.name,
           })),
           disabled: busy || !catalog || Boolean(fixedAgent),
-          placeholder:
-            !fixedAgent && !projects.length ? t("chat.projectNone") : t("chat.projectChoose"),
+          placeholder: t("chat.pureConversation"),
           onChange: chooseProject,
         }}
         provider={{
@@ -191,13 +189,6 @@ export function ModelSelector({
           })),
           onChange: (value) => {
             if (agentId) choose(agentId, value);
-          },
-        }}
-        executor={{
-          value: executor ?? "",
-          options: (llm?.executors ?? []).map((id) => ({ value: id, label: id })),
-          onChange: (value) => {
-            if (agentId) choose(agentId, llmId, value);
           },
         }}
         effort={{

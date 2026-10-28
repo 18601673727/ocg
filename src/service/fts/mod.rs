@@ -50,7 +50,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{AtFlags, Dir, FileType};
@@ -58,7 +57,7 @@ use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 
 use crate::db::entities::ToolEffect;
-use crate::system::executor::blocking::{Kind, Permit};
+use crate::system::executor::blocking::{self, Kind};
 use crate::system::executor::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
@@ -1726,7 +1725,7 @@ fn call_of(arguments: &Value) -> Result<Call, QueryRefusal> {
     })
 }
 
-/// What one worker thread does for one call: build or rebuild the snapshot
+/// What one blocking task does for one call: build or rebuild the snapshot
 /// when the call asks for one, then search it. A build is installed only if
 /// it finishes, so a stop leaves no half-built index behind.
 fn run_call(fts: &WorkspaceFts, call: &Call, stop: &AtomicBool) -> Result<Value, SearchRefusal> {
@@ -1752,9 +1751,9 @@ impl ToolHandler for FtsSearch {
         ToolEffect::ReadOnly
     }
 
-    /// Runs on a thread of its own and awaits its result. Dropping the
-    /// call, as its time limit or cancellation does, stops the work and
-    /// leaves no index a stopped call was building.
+    /// Runs on the blocking pool and awaits its result. Dropping the call
+    /// signals running work to stop and leaves no index a stopped call was
+    /// building.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let call = call_of(&arguments).map_err(refused)?;
@@ -1762,28 +1761,12 @@ impl ToolHandler for FtsSearch {
             let fts = self.fts.clone();
             let worker_fts = fts.clone();
             let worker_stop = stop.clone();
-            let (report, reported) = flume::bounded(1);
-            let worker = thread::Builder::new()
-                .name("ocg-workspace-fts".to_owned())
-                .spawn(move || {
-                    let _permit = Permit::acquire(Kind::Cpu);
-                    if report
-                        .send(run_call(&worker_fts, &call, &worker_stop))
-                        .is_err()
-                    {
-                        worker_stop.store(true, Ordering::Relaxed);
-                    }
-                })
-                .map_err(|_| ToolFailure::not_applied("the search could not be started"))?;
-            let stopping = StopOnDrop {
-                stop,
-                fts,
-                worker: Some(worker),
-            };
-            let found = reported
-                .recv_async()
-                .await
-                .map_err(|_| ToolFailure::not_applied("the search ended without a result"))?;
+            let stopping = StopOnDrop { stop, fts };
+            let found = blocking::run(Kind::Cpu, move || {
+                run_call(&worker_fts, &call, &worker_stop)
+            })
+            .await
+            .map_err(|_| ToolFailure::not_applied("the search ended without a result"))?;
             drop(stopping);
             found.map_err(refused)
         })
@@ -1795,7 +1778,6 @@ impl ToolHandler for FtsSearch {
 struct StopOnDrop {
     stop: Arc<AtomicBool>,
     fts: Arc<WorkspaceFts>,
-    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for StopOnDrop {
@@ -1803,16 +1785,6 @@ impl Drop for StopOnDrop {
         {
             let _slot = self.fts.lock();
             self.stop.store(true, Ordering::Relaxed);
-        }
-
-        if let Some(worker) = self.worker.take() {
-            let _ = thread::Builder::new()
-                .name("ocg-workspace-fts-join".to_owned())
-                .spawn(move || {
-                    if worker.join().is_err() {
-                        log::error!("workspace search worker panicked");
-                    }
-                });
         }
     }
 }

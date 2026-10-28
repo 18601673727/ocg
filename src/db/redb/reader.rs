@@ -2981,7 +2981,7 @@ fn entry_text(rx: &ReadTransaction, entry: &Entry) -> Result<String, StorageErro
                 .map(|(key, value)| decode_output(key.value(), value.value()))
                 .transpose()?
                 .filter(|output| output.kind == OutputKind::Result)
-                .and_then(|output| output.summary)
+                .and_then(|output| output.display_text())
                 .unwrap_or_default();
             format!("Child conversation {child}: {event:?}; result of turn {reference}: {answer}")
         }
@@ -3197,8 +3197,8 @@ pub(super) fn source_turn(
             if output.kind == OutputKind::Result {
                 output_through = key.value().1;
                 frame(bytes.value());
-                answer_bytes =
-                    answer_bytes.saturating_add(output.summary.as_ref().map_or(0, String::len));
+                answer_bytes = answer_bytes
+                    .saturating_add(output.display_text().as_ref().map_or(0, String::len));
                 text.push_str(&format!(
                     "Result: {:?} {:?}\n",
                     output.summary, output.value
@@ -3394,7 +3394,7 @@ pub(super) fn raw_context_usage(
             let (key, bytes_row) = output?;
             let output = decode_output(key.value(), bytes_row.value())?;
             if output.kind == OutputKind::Result {
-                bytes = bytes.saturating_add(output.summary.as_ref().map_or(0, String::len));
+                bytes = bytes.saturating_add(output.display_text().as_ref().map_or(0, String::len));
             }
         }
         let tokens = bytes.div_ceil(3);
@@ -4879,7 +4879,7 @@ pub(crate) fn read_turn_context(
                 .map(|(key, value)| decode_output(key.value(), value.value()))
                 .transpose()?
                 .filter(|output| output.kind == OutputKind::Result)
-                .and_then(|output| output.summary)
+                .and_then(|output| output.display_text())
         };
         cursor = match iteration_context {
             Some((first, previous)) if id == turn => previous

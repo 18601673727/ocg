@@ -123,7 +123,8 @@ function AppShellContent({
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [opening, setOpening] = useState(false);
+  const [openingJob, setOpeningJob] = useState<string | null>(null);
+  const opening = location.view === "chat" && location.job !== null && openingJob === location.job;
   const [attempt, setAttempt] = useState(0);
   const [pageTitleInView, setPageTitleInView] = useState(true);
   const session = runtime.snapshot.sessions.find((session) => session.id === sessionId);
@@ -185,7 +186,7 @@ function AppShellContent({
   useEffect(() => {
     if (!location.job || location.view !== "chat" || !runtime.client.openConversation) return;
     let alive = true;
-    setOpening(true);
+    setOpeningJob(location.job);
     void (async () => {
       const chain = await conversationAncestors((id) => client.readJob(id), location.job!);
       if (location.chain && conversationPath(chain) !== conversationPath(location.chain))
@@ -208,7 +209,7 @@ function AppShellContent({
           });
       })
       .finally(() => {
-        if (alive) setOpening(false);
+        if (alive) setOpeningJob(null);
       });
     return () => {
       alive = false;
@@ -248,7 +249,7 @@ function AppShellContent({
   );
 
   const go = useCallback(
-    (view: WorkspaceView, job: string | null = null, keepDraft?: string) => {
+    (view: WorkspaceView, job: string | null = null, keepDraft?: string, keepAncestors = false) => {
       if (!isReachableView(view)) return;
       discardEmptyDraft(keepDraft);
       const query = new URLSearchParams();
@@ -257,7 +258,7 @@ function AppShellContent({
       const href = `${path}${query.size ? `?${query}` : ""}`;
       window.history.pushState(null, "", href);
       setLocation({ view, job, chain: null, settingsSection: "models" });
-      setAncestors([]);
+      if (!keepAncestors) setAncestors([]);
       setMobile(false);
     },
     [discardEmptyDraft],
@@ -271,8 +272,9 @@ function AppShellContent({
   }, []);
 
   function openNestedConversation(job: string) {
+    if (!ancestors.length && session?.conversationId) setAncestors([session.conversationId]);
     setSessionId("");
-    go("chat", job);
+    go("chat", job, undefined, true);
   }
 
   const newChat = useCallback(async () => {
@@ -336,6 +338,16 @@ function AppShellContent({
           ? (id, title) => runtime.client.renameSession!(id, title)
           : undefined
       }
+      onRenameChild={async (conversation, title) => {
+        const child = runtime.snapshot.sessions.find(
+          (item) => item.conversationId === conversation,
+        );
+        if (child && runtime.client.renameSession) {
+          await runtime.client.renameSession(child.id, title);
+        } else {
+          await client.editConversation(conversation, { title: title.trim() });
+        }
+      }}
       onHide={
         runtime.client.hideSession
           ? async (id) => {

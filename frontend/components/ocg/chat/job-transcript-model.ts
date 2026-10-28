@@ -26,6 +26,18 @@ export type TranscriptTurn = {
   tools?: readonly ControlToolCall[];
 };
 
+export function outputText(output: ControlOutput | null | undefined): string | null {
+  const value = output?.value;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return "text" in value && typeof value.text === "string" ? value.text : null;
+}
+
+export function outputDisplayText(output: ControlOutput | null | undefined): string {
+  return [outputText(output), output?.summary]
+    .filter((text) => text != null && text !== "")
+    .join("\n");
+}
+
 /**
  * Projects one Job's frozen input and stored outputs into chat messages.
  * Recorded provider replies preserve each request's text and tool calls;
@@ -48,11 +60,11 @@ export function jobTranscript(
   const answerOutputs = outputs.filter((output) => output.kind !== "reasoning");
   const progress = answerOutputs
     .filter((output) => output.kind === "progress")
-    .map((output) => output.summary ?? "")
+    .map(outputDisplayText)
     .join("");
   const reasoning = outputs
     .filter((output) => output.kind === "reasoning")
-    .map((output) => output.summary ?? "")
+    .map(outputDisplayText)
     .join("");
   const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
   const state = settlement?.state ?? "unsettled";
@@ -78,7 +90,7 @@ export function jobTranscript(
   let reasoningStartedAt: number | null = null;
   let reasoningDurationUs = 0;
   for (const output of outputs) {
-    if (output.kind === "reasoning" && output.summary) {
+    if (output.kind === "reasoning" && outputText(output)) {
       reasoningStartedAt ??= output.created_at_us;
     } else if (output.kind !== "reasoning" && reasoningStartedAt !== null) {
       reasoningDurationUs += Math.max(0, output.created_at_us - reasoningStartedAt);
@@ -119,7 +131,9 @@ export function jobTranscript(
     // streamed pieces it was assembled from.
     answer = {
       ...base,
-      content: visibleAnswer(approvalAnswer(result?.summary ?? progress, tools ?? [])),
+      content: visibleAnswer(
+        approvalAnswer(result ? outputDisplayText(result) : progress, tools ?? []),
+      ),
       status: "completed",
       detail: null,
     };
@@ -217,8 +231,9 @@ function providerMessages(
     let at: number | null = null;
     while (outputIndex < outputs.length && outputs[outputIndex].created_at_us <= through) {
       const output = outputs[outputIndex++];
-      if (output.kind === "reasoning" && output.summary) {
-        text += output.summary;
+      const reasoning = outputText(output);
+      if (output.kind === "reasoning" && reasoning) {
+        text += reasoning;
         started ??= output.created_at_us;
         at ??= output.created_at_us;
       } else if (started !== null) {

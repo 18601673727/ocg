@@ -218,10 +218,10 @@ impl Redactor {
 
 /// What OCG keeps of a non-200 response to `conversation`. A Provider or
 /// gateway may echo the request it refuses, and an image-bearing request
-/// carries whole images, so of a refusal of one only the HTTP status, and
-/// the retryability it implies, is kept: never its body, nor the message or
-/// code read from it, nor its request id header. Nothing is redacted; all
-/// of it is dropped. A text-only refusal is kept as the Provider gave it.
+/// carries whole images, so an image refusal keeps a generic message, the
+/// provider code, request id and retry metadata, but drops the Provider's
+/// message and response body. A text-only refusal is kept as the Provider
+/// gave it.
 pub(crate) fn rejected_failure(
     conversation: &ChatConversation,
     status_code: u16,
@@ -233,9 +233,8 @@ pub(crate) fn rejected_failure(
     }
     ProviderFailure {
         message: format!("provider rejected image request (HTTP {status_code})"),
-        status_code: Some(status_code),
-        retryable: retryable_status(status_code),
-        ..ProviderFailure::default()
+        response_body: None,
+        ..provider_failure(status_code, request_id, response_body)
     }
 }
 
