@@ -2,7 +2,7 @@
 
 import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Maximize2, Minus, Plus } from "lucide-react";
 
 import {
   highlightCode,
@@ -12,6 +12,7 @@ import {
   type Token,
 } from "./markdown-pipeline";
 import { cn } from "@/lib/utils";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { useTheme } from "../appearance/theme-provider";
 import { useI18n } from "../i18n";
 import { SourceLink, sourceReference, type FileSnapshot } from "./source-snapshot";
@@ -64,6 +65,10 @@ function MermaidDiagram({
   const { resolvedTheme, hydrated } = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
+  const [svg, setSvg] = useState("");
+  const [open, setOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const { t } = useI18n();
   const attempt = useRef(0);
 
   useEffect(() => {
@@ -73,15 +78,18 @@ function MermaidDiagram({
     const token = ++attempt.current;
     let cancelled = false;
     setError(null);
+    setSvg("");
     container.innerHTML = "";
 
     void import("@crafter/mermaid")
       .then(({ render, THEMES }) => {
         if (cancelled || attempt.current !== token) return;
-        container.innerHTML = render(code, {
+        const rendered = render(code, {
           theme: resolvedTheme === "dark" ? THEMES["zinc-dark"] : THEMES["zinc-light"],
           transparent: true,
         });
+        container.innerHTML = rendered;
+        setSvg(rendered);
         setError(null);
       })
       .catch((cause: unknown) => {
@@ -95,13 +103,73 @@ function MermaidDiagram({
   }, [code, errorLabel, hydrated, resolvedTheme]);
 
   return (
-    <div className={cn("my-3", inMuted && "text-muted-foreground")}>
+    <div className={cn("group relative my-3", inMuted && "text-muted-foreground")}>
       <div
         ref={containerRef}
         className={cn("flex justify-center", error && "hidden")}
         role="img"
         aria-label={diagramLabel}
       />
+      {svg && !error && (
+        <Dialog open={open} onOpenChange={setOpen}>
+          <DialogTrigger
+            render={
+              <button
+                type="button"
+                className="absolute top-2 right-2 rounded-md border bg-popover p-2 text-popover-foreground shadow-sm transition-opacity hover:bg-muted focus-visible:opacity-100 max-md:opacity-100 md:opacity-0 md:group-hover:opacity-100"
+                aria-label={t("chat.expandDiagram")}
+                title={t("chat.expandDiagram")}
+              />
+            }
+          >
+            <Maximize2 className="h-4 w-4" />
+          </DialogTrigger>
+          <DialogContent className="flex h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none">
+            <div className="flex shrink-0 items-center gap-3 border-b px-6 py-4 pr-14">
+              <DialogTitle className="mr-auto">{diagramLabel}</DialogTitle>
+              <button
+                type="button"
+                className="rounded p-1.5 hover:bg-muted disabled:opacity-50"
+                onClick={() => setZoom((value) => Math.max(0.5, value - 0.25))}
+                disabled={zoom <= 0.5}
+                aria-label={t("chat.zoomOut")}
+                title={t("chat.zoomOut")}
+              >
+                <Minus className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                className="min-w-12 rounded p-1.5 tabular-nums hover:bg-muted"
+                onClick={() => setZoom(1)}
+                aria-label={t("chat.resetZoom")}
+                title={t("chat.resetZoom")}
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+              <button
+                type="button"
+                className="rounded p-1.5 hover:bg-muted disabled:opacity-50"
+                onClick={() => setZoom((value) => Math.min(3, value + 0.25))}
+                disabled={zoom >= 3}
+                aria-label={t("chat.zoomIn")}
+                title={t("chat.zoomIn")}
+              >
+                <Plus className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="ocg-subtle-scrollbar min-h-0 flex-1 overflow-auto p-6">
+              <div className="w-max min-w-full" style={{ zoom }}>
+                <div
+                  className="[&>svg]:mx-auto [&>svg]:max-w-none"
+                  role="img"
+                  aria-label={diagramLabel}
+                  dangerouslySetInnerHTML={{ __html: svg }}
+                />
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
+      )}
       {error && (
         <div className="border border-destructive/50 rounded-md p-4 bg-destructive/5">
           <div className="text-sm font-medium text-destructive mb-2">{errorLabel}</div>

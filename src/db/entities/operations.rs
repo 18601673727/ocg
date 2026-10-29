@@ -137,6 +137,8 @@ pub enum Violation {
     ValueOutOfRange(&'static str),
     #[error("{0} is invalid: {1}")]
     InvalidValue(&'static str, &'static str),
+    #[error("the Profile changed while it was being validated; reload and retry")]
+    ProfileChanged,
     #[error("{0} is the Genesis Job, which ordinary work cannot finalize, cancel or retry")]
     GenesisProtected(JobId),
     #[error("only the Genesis Job is its own parent; {0} cannot be")]

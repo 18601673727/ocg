@@ -11,7 +11,6 @@
 //! write-only and never returned in any read response.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::NonZeroU32;
 
 use super::contracts::*;
 use ntex::http::StatusCode;
@@ -25,8 +24,8 @@ use super::wire::{
 use crate::db::entities::{
     AgentCapability, AgentConfig, Config, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
     ConnectionConfig, DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionProtocol,
-    ExecutionOperation, Executor, LlmParameters, LlmTransport, ModelCapability, ProfileId,
-    RecordRef, Violation,
+    ExecutionOperation, LlmParameters, LlmTransport, ModelCapability, ProfileId, RecordRef,
+    Violation,
 };
 use crate::db::mutations::{ModelProfileDefinition, ModelProfileSave, ProfileCredentialRef};
 use crate::db::{DatabaseError, DatabaseHandle};
@@ -37,7 +36,6 @@ const MAX_ENDPOINT_BYTES: usize = 512;
 const MAX_CREDENTIAL_REF_BYTES: usize = 128;
 const MAX_PROVIDER_MESSAGE_BYTES: usize = 1024;
 const MAX_INSTRUCTIONS_BYTES: usize = 65_536;
-const PROFILE_SCAN_LIMIT: usize = 1_000;
 
 const INVALID_PROFILE_BODY: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
@@ -412,10 +410,7 @@ pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
     match error {
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "profile",
-            "changed while validating; reload and retry",
-        )) => PROFILE_CHANGED,
+        DatabaseError::Rejected(Violation::ProfileChanged) => PROFILE_CHANGED,
         DatabaseError::Rejected(Violation::DuplicateReference(_)) => INVALID_LLM_TARGET,
         DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
         DatabaseError::ShuttingDown | DatabaseError::ReadsClosed => SHUTTING_DOWN,
@@ -430,37 +425,6 @@ pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
         | DatabaseError::Read(_) => DATABASE_UNAVAILABLE,
         _ => INTERNAL,
     }
-}
-
-/// Ensures at least one Pool offers the requested protocol, so newly created
-/// LLM Profiles can be selected and executed immediately.
-async fn ensure_compatible_executor(
-    database: &DatabaseHandle,
-    protocol: LlmTransport,
-) -> Result<(), Refusal> {
-    let mut before = None;
-    let has_compatible = loop {
-        let page = database.executors(before, PROFILE_SCAN_LIMIT).await?;
-        let found = page
-            .iter()
-            .any(|executor| executor.llm_transports.contains(&protocol));
-        if found || page.len() < PROFILE_SCAN_LIMIT {
-            break found;
-        }
-        before = page.last().map(|executor| executor.id);
-    };
-    if !has_compatible {
-        let concurrency_limit = NonZeroU32::new(4).ok_or(INTERNAL)?;
-        database
-            .create_executor(Executor {
-                name: format!("local-{}-executor", protocol.as_str()),
-                concurrency_limit,
-                llm_transports: BTreeSet::from([protocol]),
-            })
-            .await
-            .map_err(map_mutation_error)?;
-    }
-    Ok(())
 }
 
 async fn previous_model_connection(
@@ -1587,10 +1551,9 @@ pub(crate) async fn import_models(
         }
         (None, None) | (Some(_), Some(_)) => return Err(INVALID_PROFILE_BODY),
     };
-    let ConfigBody::Connection(ref connection_body) = connection.body else {
+    if !matches!(&connection.body, ConfigBody::Connection(_)) {
         return Err(WRONG_PROFILE_KIND);
-    };
-    ensure_compatible_executor(database, connection_body.protocol).await?;
+    }
     let (ids, created) = database
         .import_models(connection, models.into_values().collect(), capabilities)
         .await

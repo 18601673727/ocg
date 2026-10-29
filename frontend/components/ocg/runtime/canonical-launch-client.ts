@@ -430,9 +430,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (existing) return existing;
     const cursor = this.earlier.get(sessionId);
     if (this.disposed) return Promise.resolve();
-    const partial = [...this.turns.values()].find(
-      (turn) => turn.sessionId === sessionId && (turn.outputs[0]?.seq ?? 1) > 1,
-    );
+    const partial = [...this.turns.values()]
+      .filter((turn) => turn.sessionId === sessionId && (turn.outputs[0]?.seq ?? 1) > 1)
+      .sort(
+        (a, b) => b.job.created_at_us - a.job.created_at_us || b.job.id.localeCompare(a.job.id),
+      )[0];
     if (!cursor && !partial) return Promise.resolve();
     const root = this.sessionRoot(sessionId);
     const isCurrent = () =>
@@ -608,7 +610,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       .sort(
         (a, b) => a.job.created_at_us - b.job.created_at_us || a.job.id.localeCompare(b.job.id),
       );
-    const messages: ChatMessage[] = turns.flatMap((turn) => {
+    // Keep the visible history contiguous: inputs and older turns precede any missing outputs.
+    const lastPartial = turns.findLastIndex((turn) => (turn.outputs[0]?.seq ?? 1) > 1);
+    const messages: ChatMessage[] = turns.slice(Math.max(lastPartial, 0)).flatMap((turn) => {
+      const partial = (turn.outputs[0]?.seq ?? 1) > 1;
       const entries = materializeUserEntries(turn.entries ?? []);
       const queued =
         turn.job.previous !== null &&
@@ -654,7 +659,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         ? []
         : jobTranscript(
             turn.job.id,
-            turn.entries ? null : turn.input.objective,
+            partial || turn.entries ? null : turn.input.objective,
             turn.outputs,
             turn.job.settlement,
             turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
@@ -664,8 +669,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             turn.responses,
           );
       return [
-        ...boundary,
-        ...inputs,
+        ...(partial ? [] : boundary),
+        ...(partial ? [] : inputs),
         ...transcript.map((message) => ({
           id: message.id,
           jobId: turn.job.id,

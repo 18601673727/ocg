@@ -571,18 +571,12 @@ impl Batch {
                     || guard.connection_id != connection_id
                     || guard.connection_edit_seq != connection.edit_seq)
             {
-                return self.reject(Violation::InvalidValue(
-                    "profile",
-                    "changed while validating; reload and retry",
-                ));
+                return self.reject(Violation::ProfileChanged);
             }
             Some((connection_id, connection_body.clone()))
         } else {
             if save.guard.is_some() {
-                return self.reject(Violation::InvalidValue(
-                    "profile",
-                    "changed while validating; reload and retry",
-                ));
+                return self.reject(Violation::ProfileChanged);
             }
             None
         };
@@ -610,7 +604,7 @@ impl Batch {
             | ProfileCredentialRef::Explicit(_) => None,
         };
 
-        let (has_executor, generated_refs) = self.step(|tx| {
+        let (_has_executor, generated_refs) = self.step(|tx| {
             let mut has_executor = false;
             let mut generated_refs = (false, std::collections::BTreeSet::new());
             let table = tx.open_table(CONFIGS)?;
@@ -675,18 +669,8 @@ impl Batch {
             },
         };
 
-        if matches!(&save.definition, ModelProfileDefinition::Llm { .. }) && !has_executor {
-            self.create_config(
-                format!("local-{}-executor", protocol.as_str()),
-                ConfigBody::Pool(PoolConfig {
-                    capabilities: std::collections::BTreeSet::from([(
-                        ExecutionOperation::LlmRequest,
-                        Some(protocol),
-                    )]),
-                    concurrency_limit: 4,
-                    enabled: true,
-                }),
-            )?;
+        if matches!(&save.definition, ModelProfileDefinition::Llm { .. }) {
+            self.ensure_llm_executor(protocol)?;
         }
 
         let matching_connection = self.step(|tx| {
@@ -763,6 +747,36 @@ impl Batch {
             None => self.create_config(save.name, body)?,
         };
         Ok((profile_id, credential_ref))
+    }
+
+    fn ensure_llm_executor(&mut self, protocol: LlmTransport) -> Result<(), BatchError> {
+        let has_executor = self.step(|tx| {
+            let table = tx.open_table(CONFIGS)?;
+            for entry in table.iter()? {
+                let (key, bytes) = entry?;
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+                if let ConfigBody::Pool(pool) = &row.body
+                    && pool.capability_set().llm_protocols.contains(&protocol)
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if !has_executor {
+            self.create_config(
+                format!("local-{}-executor", protocol.as_str()),
+                ConfigBody::Pool(PoolConfig {
+                    capabilities: std::collections::BTreeSet::from([(
+                        ExecutionOperation::LlmRequest,
+                        Some(protocol),
+                    )]),
+                    concurrency_limit: 4,
+                    enabled: true,
+                }),
+            )?;
+        }
+        Ok(())
     }
 
     fn check_config_body(&mut self, name: &str, body: &ConfigBody) -> Result<(), BatchError> {
@@ -1072,6 +1086,7 @@ impl Batch {
                 "must be a Connection",
             ));
         };
+        let wanted_protocol = wanted.protocol;
         if models.is_empty() || models.len() > 200 || capabilities.is_empty() {
             return self.reject(Violation::InvalidValue(
                 "models",
@@ -1094,6 +1109,7 @@ impl Batch {
             Some(id) => id,
             None => self.create_config(connection.name, connection.body)?,
         };
+        self.ensure_llm_executor(wanted_protocol)?;
         let mut known = self.step(|tx| {
             let mut known = std::collections::BTreeMap::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
