@@ -14,9 +14,7 @@ use crate::fixture::{FixtureConfig, FixtureGenerator, FixtureStats};
 use crate::http_client::BenchmarkClient;
 use crate::metadata::{BenchmarkMetadata, WorkloadParameters};
 use crate::mock_provider::{MockProvider, MockProviderConfig, ProviderCounterSnapshot};
-use crate::reporting::{
-    MeasurementRecord, Record, canonical_metric, emit_begin, emit_section_complete,
-};
+use crate::reporting::{MeasurementRecord, Record, emit_begin, emit_section_complete};
 use crate::{Options, Result, TemporaryRoot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +148,11 @@ impl MeasurementContext {
                 "stream_pace_ms": if section == "search" { None } else { Some(options.stream_pace.as_millis()) }}),
             )
             .with("load_model", json!("closed_loop"))
+            .with("diagnostic_controls", json!({
+                "admission_delay_ms": std::env::var("OCG_BENCHMARK_ADMISSION_DELAY_MS").ok(),
+                "split_decoded_output_records": std::env::var_os("OCG_BENCHMARK_SPLIT_OUTPUT_RECORDS").is_some(),
+                "inject_worker_error": std::env::var_os("OCG_BENCHMARK_INJECT_WORKER_ERROR").is_some(),
+            }))
             .with("units", json!({"latency": "ms", "timing_window": "s"}))
     }
 }
@@ -182,6 +185,7 @@ fn backend_config(
         startup_timeout: options.deadline,
         shutdown_timeout: options.deadline.min(Duration::from_secs(15)),
         hang_before_handshake: options.child_hang,
+        prepared_identities: None,
     }
 }
 
@@ -193,8 +197,35 @@ async fn spawn_ready(
     concurrency: usize,
     trial: usize,
 ) -> Result<(BackendProcess, BenchmarkClient, Duration)> {
+    spawn_ready_with_identities(
+        context,
+        options,
+        provider,
+        data_dir,
+        concurrency,
+        trial,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_ready_with_identities(
+    context: &MeasurementContext,
+    options: &Options,
+    provider: &MockProvider,
+    data_dir: PathBuf,
+    concurrency: usize,
+    trial: usize,
+    prepared: Option<&BackendHandshake>,
+) -> Result<(BackendProcess, BenchmarkClient, Duration)> {
+    let mut config = backend_config(context, options, provider, data_dir, concurrency, trial);
+    config.prepared_identities = prepared.map(|identity| {
+        json!({"executor": identity.executor,
+        "llm_profile": identity.llm_profile, "agent_profile": identity.agent_profile,
+        "project": identity.project, "pool": identity.pool})
+    });
     let started = Instant::now();
-    let config = backend_config(context, options, provider, data_dir, concurrency, trial);
     let backend = ntex::rt::spawn_blocking(move || BackendProcess::spawn(&config)).await??;
     let handshake = backend.handshake().clone();
     let client = BenchmarkClient::new(handshake.address, handshake.token, options.deadline)
@@ -267,6 +298,8 @@ struct WorkResult {
     max_overlap: usize,
     started: Instant,
     window: Duration,
+    audit_duration: Duration,
+    cpu_after: Option<f64>,
     provider_before: ProviderCounterSnapshot,
 }
 
@@ -369,6 +402,9 @@ async fn run_workload(
                 .await
                 .map_err(|error| format!("worker start barrier failed: {error}"))?;
             let client = client?;
+            if std::env::var_os("OCG_BENCHMARK_INJECT_WORKER_ERROR").is_some() {
+                return Err("benchmark-injected structural worker failure".to_owned());
+            }
             let mut observations = Vec::new();
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
@@ -406,6 +442,38 @@ async fn run_workload(
         observations.append(&mut result.jobs);
     }
     let window = started.elapsed();
+    let cpu_after = crate::benchmark::process_cpu_seconds(handshake.pid);
+    let audit_started = Instant::now();
+    if mode != WorkMode::Admission {
+        let client = BenchmarkClient::new(
+            handshake.address.clone(),
+            handshake.token.clone(),
+            options.deadline,
+        )
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+        for observation in &mut observations {
+            if observation.error.is_some() {
+                continue;
+            }
+            let Some(job_id) = observation.job_id.as_deref() else {
+                observation.error = Some("completed job lost its ID".into());
+                continue;
+            };
+            match client
+                .validate_reference_job(job_id, &observation.job_key, options.stream_chunks)
+                .await
+            {
+                Ok(validation) => {
+                    observation.model_requests = validation.model_requests;
+                    observation.tool_calls = validation.tool_calls;
+                    observation.completions = validation.completions;
+                }
+                Err(error) => observation.error = Some(error),
+            }
+        }
+    }
+    let audit_duration = audit_started.elapsed();
     observations.sort_by(|left, right| left.job_key.cmp(&right.job_key));
     Ok(WorkResult {
         jobs: observations,
@@ -413,6 +481,8 @@ async fn run_workload(
         max_overlap: overlap.maximum.load(Ordering::Relaxed),
         started,
         window,
+        audit_duration,
+        cpu_after,
         provider_before,
     })
 }
@@ -444,7 +514,15 @@ async fn execute_job(
         observation.pending_lookups = admission.pending_lookups;
         observation.job_id = Some(admission.job_id.clone());
         match mode {
-            WorkMode::Admission => {}
+            WorkMode::Admission => {
+                provider.release_markers(&job_key)?;
+                if let Ok(delay) = std::env::var("OCG_BENCHMARK_ADMISSION_DELAY_MS") {
+                    let millis = delay
+                        .parse::<u64>()
+                        .map_err(|_| "invalid admission delay")?;
+                    ntex::time::sleep(Duration::from_millis(millis)).await;
+                }
+            }
             WorkMode::Completion => {
                 client
                     .consume_events(
@@ -454,12 +532,6 @@ async fn execute_job(
                         |_| Ok(()),
                     )
                     .await?;
-                let validation = client
-                    .validate_reference_job(&admission.job_id, &job_key, options.stream_chunks)
-                    .await?;
-                observation.model_requests = validation.model_requests;
-                observation.tool_calls = validation.tool_calls;
-                observation.completions = validation.completions;
                 observation.completion = Some(submitted.elapsed());
             }
             WorkMode::Streaming => {
@@ -494,6 +566,128 @@ struct MarkerState {
     last_output_id: Option<i64>,
 }
 
+impl MarkerState {
+    fn new() -> Self {
+        Self {
+            content: String::new(),
+            scanned: 0,
+            next_sequence: 0,
+            seen: BTreeSet::new(),
+            first_content_at: None,
+            final_content_at: None,
+            last_output_id: None,
+        }
+    }
+}
+
+fn validate_marker_end(
+    state: &MarkerState,
+    expected: usize,
+    job_id: &str,
+) -> std::result::Result<(), String> {
+    let remaining = &state.content[state.scanned..];
+    if remaining.contains("OCGMARK-")
+        || (1..="OCGMARK-".len()).any(|n| remaining.ends_with(&"OCGMARK-"[..n]))
+    {
+        return Err(format!("job {job_id} ended with a truncated marker"));
+    }
+    if state.next_sequence != expected {
+        return Err(format!(
+            "job {job_id} delivered {} of {expected} markers",
+            state.next_sequence
+        ));
+    }
+    Ok(())
+}
+
+fn check_marker_record_splits() -> std::result::Result<(), String> {
+    let prefix = "OCGMARK-benchmark-";
+    let marker = format!("{prefix}0000 ");
+    for split in 1..marker.len() {
+        let mut state = MarkerState::new();
+        if !parse_marker_record(&mut state, &marker[..split], prefix, "split-check")?.is_empty() {
+            return Err(format!("marker accepted before delimiter at split {split}"));
+        }
+        if parse_marker_record(&mut state, &marker[split..], prefix, "split-check")? != [0] {
+            return Err(format!("marker lost across record split {split}"));
+        }
+        validate_marker_end(&state, 1, "split-check")?;
+        if parse_marker_record(&mut state, &marker, prefix, "split-check").is_ok() {
+            return Err("duplicate marker was accepted".into());
+        }
+    }
+    let mut truncated = MarkerState::new();
+    parse_marker_record(
+        &mut truncated,
+        &marker[..marker.len() - 1],
+        prefix,
+        "split-check",
+    )?;
+    if validate_marker_end(&truncated, 1, "split-check").is_ok() {
+        return Err("truncated marker was accepted".into());
+    }
+    let mut mismatch = MarkerState::new();
+    if parse_marker_record(&mut mismatch, "OCGMARK-wrong", prefix, "split-check").is_ok() {
+        return Err("mismatched marker prefix was accepted".into());
+    }
+    Ok(())
+}
+
+fn parse_marker_record(
+    state: &mut MarkerState,
+    text: &str,
+    prefix: &str,
+    job_id: &str,
+) -> std::result::Result<Vec<usize>, String> {
+    state.content.push_str(text);
+    let mut parsed = Vec::new();
+    while let Some(relative) = state.content[state.scanned..].find("OCGMARK-") {
+        let start = state.scanned + relative;
+        let candidate = &state.content[start..];
+        if prefix.starts_with(candidate) {
+            state.scanned = start;
+            break;
+        }
+        if !candidate.starts_with(prefix) {
+            return Err(format!("unexpected or malformed marker in {job_id}"));
+        }
+        let digits = start + prefix.len();
+        if !state.content.as_bytes()[digits..state.content.len().min(digits + 4)]
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            return Err(format!("malformed marker sequence in {job_id}"));
+        }
+        if state.content.len() <= digits + 4 {
+            state.scanned = start;
+            break;
+        }
+        let sequence = state
+            .content
+            .get(digits..digits + 4)
+            .ok_or_else(|| format!("malformed marker sequence in {job_id}"))?
+            .parse::<usize>()
+            .map_err(|_| format!("malformed marker sequence in {job_id}"))?;
+        if state.content[digits + 4..]
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err(format!("unterminated marker in {job_id}"));
+        }
+        if sequence != state.next_sequence || !state.seen.insert(sequence) {
+            return Err(format!(
+                "missing, duplicated, or reordered marker {sequence}; expected {}",
+                state.next_sequence
+            ));
+        }
+        state.next_sequence += 1;
+        state.scanned = digits + 4;
+        parsed.push(sequence);
+    }
+    Ok(parsed)
+}
+
 async fn stream_job(
     client: &BenchmarkClient,
     provider: &MockProvider,
@@ -503,15 +697,7 @@ async fn stream_job(
     submitted: Instant,
     observation: &mut JobObservation,
 ) -> std::result::Result<(), String> {
-    let mut state = MarkerState {
-        content: String::new(),
-        scanned: 0,
-        next_sequence: 0,
-        seen: BTreeSet::new(),
-        first_content_at: None,
-        final_content_at: None,
-        last_output_id: None,
-    };
+    let mut state = MarkerState::new();
     let prefix = format!("OCGMARK-{job_key}-");
     client
         .consume_events(
@@ -541,68 +727,37 @@ async fn stream_job(
                     return Ok(());
                 }
                 state.first_content_at.get_or_insert(event.observed_at);
-                state.content.push_str(text);
-                while let Some(relative) = state.content[state.scanned..].find("OCGMARK-") {
-                    let start = state.scanned + relative;
-                    if !state.content[start..].starts_with(&prefix) {
-                        return Err(format!("unexpected or malformed marker in {job_id}"));
-                    }
-                    let digits = start + prefix.len();
-                    if state.content.len() < digits + 4 {
-                        state.scanned = start;
-                        break;
-                    }
-                    let sequence = state.content[digits..digits + 4]
-                        .parse::<usize>()
-                        .map_err(|_| format!("malformed marker sequence in {job_id}"))?;
-                    if state.content[digits + 4..]
-                        .chars()
-                        .next()
-                        .is_some_and(|character| {
-                            character.is_ascii_alphanumeric() || character == '-'
-                        })
-                    {
-                        return Err(format!("unterminated marker in {job_id}"));
-                    }
-                    if sequence != state.next_sequence || !state.seen.insert(sequence) {
-                        return Err(format!(
-                            "missing, duplicated, or reordered marker {sequence}; expected {}",
-                            state.next_sequence
-                        ));
-                    }
-                    let marker = format!("{prefix}{sequence:04}");
-                    let emitted = provider
-                        .emitted_at(&marker)
-                        .ok_or_else(|| format!("observed marker was not emitted live: {marker}"))?;
-                    let delivered = event
-                        .observed_at
-                        .checked_duration_since(emitted)
-                        .ok_or_else(|| {
-                            format!("marker {marker} was observed before its live emission")
+                let pieces: Vec<&str> =
+                    if std::env::var_os("OCG_BENCHMARK_SPLIT_OUTPUT_RECORDS").is_some() {
+                        text.char_indices()
+                            .map(|(index, character)| &text[index..index + character.len_utf8()])
+                            .collect()
+                    } else {
+                        vec![text]
+                    };
+                for piece in pieces {
+                    for sequence in parse_marker_record(&mut state, piece, &prefix, job_id)? {
+                        let marker = format!("{prefix}{sequence:04}");
+                        let emitted = provider.emitted_at(&marker).ok_or_else(|| {
+                            format!("observed marker was not emitted live: {marker}")
                         })?;
-                    observation.delivery.push(delivered);
-                    state.next_sequence += 1;
-                    state.scanned = digits + 4;
-                    if state.next_sequence == options.stream_chunks {
-                        state.final_content_at = Some(event.observed_at);
+                        let delivered = event
+                            .observed_at
+                            .checked_duration_since(emitted)
+                            .ok_or_else(|| {
+                                format!("marker {marker} was observed before its live emission")
+                            })?;
+                        observation.delivery.push(delivered);
+                        if state.next_sequence == options.stream_chunks {
+                            state.final_content_at = Some(event.observed_at);
+                        }
                     }
                 }
                 Ok(())
             },
         )
         .await?;
-    if state.next_sequence != options.stream_chunks {
-        return Err(format!(
-            "job {job_id} delivered {} of {} markers",
-            state.next_sequence, options.stream_chunks
-        ));
-    }
-    let validation = client
-        .validate_reference_job(job_id, job_key, options.stream_chunks)
-        .await?;
-    observation.model_requests = validation.model_requests;
-    observation.tool_calls = validation.tool_calls;
-    observation.completions = validation.completions;
+    validate_marker_end(&state, options.stream_chunks, job_id)?;
     observation.completion = Some(submitted.elapsed());
     observation.first_content = state
         .first_content_at
@@ -614,13 +769,9 @@ async fn stream_job(
     Ok(())
 }
 
-async fn drain_admitted(
-    client: &BenchmarkClient,
-    provider: &MockProvider,
-    options: &Options,
-    result: &mut WorkResult,
-) {
-    for observation in &mut result.jobs {
+async fn drain_admitted(client: &BenchmarkClient, options: &Options, result: &mut WorkResult) {
+    // Intentionally wait newest-first so queued jobs can precede running ones.
+    for observation in result.jobs.iter_mut().rev() {
         if observation.error.is_some() {
             continue;
         }
@@ -630,12 +781,7 @@ async fn drain_admitted(
         };
         let drained = async {
             client
-                .consume_events(
-                    &job_id,
-                    options.deadline,
-                    || provider.release_markers(&observation.job_key),
-                    |_| Ok(()),
-                )
+                .consume_events(&job_id, options.deadline, || Ok(()), |_| Ok(()))
                 .await?;
             let validation = client
                 .validate_reference_job(&job_id, &observation.job_key, options.stream_chunks)
@@ -702,8 +848,7 @@ fn check_work_success(result: &WorkResult) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn cpu_values(pid: u32, before: Option<f64>, window: Duration) -> Value {
-    let after = crate::benchmark::process_cpu_seconds(pid);
+fn cpu_values(before: Option<f64>, after: Option<f64>, window: Duration) -> Value {
     let elapsed = window.as_secs_f64();
     let used = match (before, after) {
         (Some(before), Some(after)) if after >= before => Some(after - before),
@@ -852,13 +997,14 @@ async fn measure_startup(context: &MeasurementContext, options: &Options) -> Res
         format!("startup fixture creation failed: {error}").into()
     })?;
     for warmup in 0..options.warmup {
-        let (backend, _client, _) = spawn_ready(
+        let (backend, client, _) = spawn_ready_with_identities(
             context,
             options,
             &provider,
             data_dir.clone(),
             concurrency,
             warmup,
+            Some(&handshake),
         )
         .await?;
         let reopened = backend.handshake();
@@ -866,19 +1012,21 @@ async fn measure_startup(context: &MeasurementContext, options: &Options) -> Res
             && reopened.llm_profile == handshake.llm_profile
             && reopened.agent_profile == handshake.agent_profile
             && reopened.project == handshake.project;
+        let verified = verify_fixture_identities(&client, &handshake).await;
         shutdown_backend(backend).await?;
-        if !stable {
+        if !stable || verified.is_err() {
             return Err("startup warm-up reopen changed fixture identities".into());
         }
     }
     for trial in 0..options.trials {
-        let (backend, _client, duration) = spawn_ready(
+        let (backend, client, duration) = spawn_ready_with_identities(
             context,
             options,
             &provider,
             data_dir.clone(),
             concurrency,
             trial,
+            Some(&handshake),
         )
         .await?;
         let reopened = backend.handshake();
@@ -886,6 +1034,7 @@ async fn measure_startup(context: &MeasurementContext, options: &Options) -> Res
             && reopened.llm_profile == handshake.llm_profile
             && reopened.agent_profile == handshake.agent_profile
             && reopened.project == handshake.project;
+        let verified = verify_fixture_identities(&client, &handshake).await;
         shutdown_backend(backend).await?;
         let values = json!({"duration_ms": duration.as_secs_f64() * 1000.0,
             "fixture_completed_jobs": setup.attempted, "clean_close": true,
@@ -902,7 +1051,7 @@ async fn measure_startup(context: &MeasurementContext, options: &Options) -> Res
             duration,
             values,
             if stable {
-                Ok(())
+                verified
             } else {
                 Err("startup reopen created duplicate profiles or a duplicate project".into())
             },
@@ -910,6 +1059,35 @@ async fn measure_startup(context: &MeasurementContext, options: &Options) -> Res
     }
     stop_provider(provider).await?;
     emit_section_complete(&parameters);
+    Ok(())
+}
+
+async fn verify_fixture_identities(
+    client: &BenchmarkClient,
+    identity: &BackendHandshake,
+) -> std::result::Result<(), String> {
+    for (route, ids) in [
+        (
+            "/api/v1/agent-profiles?limit=100",
+            vec![
+                &identity.agent_profile,
+                &identity.llm_profile,
+                &identity.executor,
+            ],
+        ),
+        ("/api/v1/projects?limit=100", vec![&identity.project]),
+        ("/api/v1/pools", vec![&identity.pool]),
+    ] {
+        let value = client.get_json(route).await?;
+        let text = value.to_string();
+        for id in ids {
+            if !text.contains(id.as_str()) {
+                return Err(format!(
+                    "prepared identity {id} missing from {route}: {value}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -957,7 +1135,8 @@ async fn measure_throughput(context: &MeasurementContext, options: &Options) -> 
                 WorkMode::Completion,
             )
             .await?;
-            let mut values = cpu_values(backend.pid(), cpu_before, result.window);
+            let mut values = cpu_values(cpu_before, result.cpu_after, result.window);
+            values["audit_duration_s"] = json!(result.audit_duration.as_secs_f64());
             let outcomes = result.outcomes();
             let durations = result
                 .jobs
@@ -1017,7 +1196,7 @@ async fn measure_admission(context: &MeasurementContext, options: &Options) -> R
     for &concurrency in &options.clients {
         let parameters = context.parameters(options, "admission", concurrency, options.jobs)
             .with("observation_mechanism", json!("POST /api/v1/jobs; poll GET /api/v1/admissions with the same Idempotency-Key while pending"))
-            .with("completion_drain", json!("outside admission timing window"))
+            .with("completion_drain", json!("outside admission timing window; reverse job-key order"))
             .with("units", json!({"latency": "ms"}));
         emit_begin(&parameters);
         for trial in 0..options.trials {
@@ -1059,8 +1238,15 @@ async fn measure_admission(context: &MeasurementContext, options: &Options) -> R
                         Err("admission samples do not match confirmed admissions".into())
                     }
                 });
-            let mut values = cpu_values(backend.pid(), cpu_before, result.window);
-            drain_admitted(&client, &provider, options, &mut result).await;
+            let mut values = cpu_values(cpu_before, result.cpu_after, result.window);
+            values["provider_requests_at_end_of_admission_window"] = json!(
+                provider
+                    .counters()
+                    .snapshot()
+                    .requests
+                    .saturating_sub(result.provider_before.requests)
+            );
+            drain_admitted(&client, options, &mut result).await;
             let drain_validation = check_work_success(&result).and_then(|_| {
                 check_provider_counts(
                     &provider,
@@ -1165,9 +1351,17 @@ async fn measure_memory(context: &MeasurementContext, options: &Options) -> Resu
                 options.jobs,
                 WorkMode::Completion,
             )
-            .await?;
+            .await;
             stop.store(true, Ordering::Relaxed);
-            let samples = sampler.await.map_err(|_| "memory sampler panicked")?;
+            let joined = sampler.await.map_err(|_| "memory sampler panicked");
+            if result.is_err() {
+                eprintln!(
+                    "memory sampler stopped and joined after structural workload failure: {}",
+                    if joined.is_ok() { "yes" } else { "no" }
+                );
+            }
+            let result = result?;
+            let samples = joined?;
             let window_start = result.started.saturating_duration_since(sampler_started);
             let window_end = window_start + result.window;
             let samples = samples
@@ -1178,7 +1372,8 @@ async fn measure_memory(context: &MeasurementContext, options: &Options) -> Resu
             let peak = samples.iter().map(|sample| sample.1).max();
             let outcomes = result.outcomes();
             let (requests, tools, completions) = result.reference_counts();
-            let mut values = cpu_values(pid, cpu_before, sample_window);
+            let mut values = cpu_values(cpu_before, result.cpu_after, sample_window);
+            values["audit_duration_s"] = json!(result.audit_duration.as_secs_f64());
             values["idle_rss_bytes"] = json!(idle_rss);
             values["peak_rss_bytes"] = json!(peak);
             values["bytes"] = json!(peak);
@@ -1239,6 +1434,13 @@ async fn measure_memory(context: &MeasurementContext, options: &Options) -> Resu
 }
 
 async fn measure_streaming(context: &MeasurementContext, options: &Options) -> Result<()> {
+    if std::env::var_os("OCG_BENCHMARK_SPLIT_OUTPUT_RECORDS").is_some() {
+        check_marker_record_splits()?;
+        println!(
+            "{}",
+            json!({"type": "diagnostic", "section": "streaming", "check": "decoded output record splits, duplicates, mismatch, truncation", "status": "passed"})
+        );
+    }
     let provider = Rc::new(MockProvider::start(provider_config(options))?);
     for &concurrency in &options.clients {
         let parameters = context.parameters(options, "streaming", concurrency, options.jobs)
@@ -1289,7 +1491,8 @@ async fn measure_streaming(context: &MeasurementContext, options: &Options) -> R
                 .filter_map(|job| job.completion)
                 .collect::<Vec<_>>();
             let (requests, tools, completions) = result.reference_counts();
-            let mut values = cpu_values(backend.pid(), cpu_before, result.window);
+            let mut values = cpu_values(cpu_before, result.cpu_after, result.window);
+            values["audit_duration_s"] = json!(result.audit_duration.as_secs_f64());
             values["configured_concurrency"] = json!(concurrency);
             values["observed_max_overlap"] = json!(result.max_overlap);
             values["model_requests"] = json!(requests);
@@ -1792,7 +1995,11 @@ async fn measure_history(context: &MeasurementContext, options: &Options) -> Res
                 active.clone(),
             )
             .await?;
-            let mut values = cpu_values(backend.pid(), cpu_before, reads.window);
+            let mut values = cpu_values(
+                cpu_before,
+                crate::benchmark::process_cpu_seconds(backend.pid()),
+                reads.window,
+            );
             stop.store(true, Ordering::Relaxed);
             let background = writer
                 .await
@@ -2213,34 +2420,11 @@ fn finish_section(
     result: Result<()>,
 ) -> Result<()> {
     if let Err(error) = &result {
-        let mut parameters = context.parameters(
-            options,
-            &options.section,
-            options.clients.first().copied().unwrap_or(1),
-            0,
+        println!(
+            "{}",
+            json!({"type": "section_diagnostic", "section": options.section,
+            "run_id": context.run_id, "error": error.to_string()})
         );
-        parameters.custom["trial"] = json!(0);
-        parameters.custom["phase"] = json!("section/setup");
-        let record = MeasurementRecord {
-            name: canonical_metric(&options.section).to_owned(),
-            parameters,
-            metadata: context.metadata.clone(),
-            samples: crate::benchmark::Samples::new(),
-            sample_count: Some(0),
-            outcomes: OutcomeCounts::default(),
-            resources: None,
-            timing_window: Duration::ZERO,
-            warm_up_iterations: options.warmup,
-            note: Some(error.to_string()),
-            status: if error.to_string().starts_with("unsupported:") {
-                "unsupported"
-            } else {
-                "failed"
-            }
-            .into(),
-            values: json!({"error": error.to_string()}),
-        };
-        Record::Measurement(Box::new(record)).emit();
     }
     result
 }

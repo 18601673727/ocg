@@ -16,6 +16,7 @@ pub struct BackendConfig {
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub hang_before_handshake: bool,
+    pub prepared_identities: Option<Value>,
 }
 
 impl BackendConfig {
@@ -36,12 +37,14 @@ impl BackendConfig {
             startup_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(15),
             hang_before_handshake: false,
+            prepared_identities: None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct BackendHandshake {
+    pub pid: u32,
     pub address: String,
     pub token: String,
     pub executor: String,
@@ -53,7 +56,7 @@ pub struct BackendHandshake {
 }
 
 impl BackendHandshake {
-    fn parse(line: &str, startup: Duration) -> Result<Self, String> {
+    fn parse(line: &str, startup: Duration, pid: u32) -> Result<Self, String> {
         let value: Value = serde_json::from_str(line)
             .map_err(|error| format!("the backend handshake is not JSON: {error}"))?;
         let field = |name: &str| {
@@ -65,6 +68,7 @@ impl BackendHandshake {
                 .ok_or_else(|| format!("the backend handshake has no {name}"))
         };
         let handshake = Self {
+            pid,
             address: field("address")?,
             token: field("token")?,
             executor: field("executor")?,
@@ -109,8 +113,14 @@ impl BackendProcess {
     pub fn spawn(config: &BackendConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let executable = std::env::current_exe()?;
         let started = Instant::now();
-        let child = Command::new(executable)
-            .arg("server")
+        let mut command = Command::new(executable);
+        command.arg("server");
+        if let Some(identities) = &config.prepared_identities {
+            command
+                .arg("--prepared-identities")
+                .arg(identities.to_string());
+        }
+        let child = command
             .arg("--data-dir")
             .arg(&config.data_dir)
             .arg("--workspace")
@@ -239,7 +249,8 @@ fn read_handshake(
                     continue;
                 }
                 if trimmed.starts_with('{') {
-                    return BackendHandshake::parse(trimmed, started.elapsed()).map_err(Into::into);
+                    return BackendHandshake::parse(trimmed, started.elapsed(), pid)
+                        .map_err(Into::into);
                 }
                 eprintln!("backend {pid}: {trimmed}");
             }

@@ -2848,6 +2848,7 @@ fn run_server() -> Result<()> {
     let mut token: Option<String> = None;
     let mut concurrency: usize = 8;
     let mut hang_before_handshake = false;
+    let mut prepared_identities: Option<serde_json::Value> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2883,6 +2884,11 @@ fn run_server() -> Result<()> {
                     .map_err(|_| "invalid concurrency")?;
             }
             "--hang-before-handshake" => hang_before_handshake = true,
+            "--prepared-identities" => {
+                prepared_identities = Some(serde_json::from_str(
+                    &args.next().ok_or("missing prepared identities")?,
+                )?);
+            }
             _ => return Err(format!("unknown server argument: {arg}").into()),
         }
     }
@@ -2898,132 +2904,149 @@ fn run_server() -> Result<()> {
     }
 
     let directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
-    let policy = ocg::system::policy::SystemPolicy::load_for_startup(&directory)?;
-    let worker = DatabaseWorker::start_with_policy(&directory, policy)?;
-    let handle = worker.handle();
-    let connection = match benchmark_config(
-        &handle,
-        ocg::db::entities::ConfigKind::Connection,
-        "benchmark-provider",
-    )? {
-        Some(id) => {
-            let record = block_on(handle.config(id))?.ok_or("connection disappeared")?;
-            if !matches!(record.body, ConfigBody::Connection(ref config)
+    let identities = if let Some(identities) = prepared_identities {
+        for field in [
+            "executor",
+            "llm_profile",
+            "agent_profile",
+            "project",
+            "pool",
+        ] {
+            if identities[field].as_str().is_none_or(str::is_empty) {
+                return Err(format!("prepared identities omitted {field}").into());
+            }
+        }
+        identities
+    } else {
+        let policy = ocg::system::policy::SystemPolicy::load_for_startup(&directory)?;
+        let worker = DatabaseWorker::start_with_policy(&directory, policy)?;
+        let handle = worker.handle();
+        let connection = match benchmark_config(
+            &handle,
+            ocg::db::entities::ConfigKind::Connection,
+            "benchmark-provider",
+        )? {
+            Some(id) => {
+                let record = block_on(handle.config(id))?.ok_or("connection disappeared")?;
+                if !matches!(record.body, ConfigBody::Connection(ref config)
                 if config.endpoint.as_deref() == Some(provider_endpoint.as_str()))
-            {
-                return Err("existing benchmark provider connection differs".into());
+                {
+                    return Err("existing benchmark provider connection differs".into());
+                }
+                id
             }
-            id
-        }
-        None => block_on(handle.create_config(Config {
-            name: "benchmark-provider".into(),
-            body: ConfigBody::Connection(ConnectionConfig {
-                protocol: LlmTransport::OpenAiChatCompletions,
-                endpoint: Some(provider_endpoint),
-                credential_ref: None,
-            }),
-        }))?,
-    };
-    let model = match benchmark_config(
-        &handle,
-        ocg::db::entities::ConfigKind::Model,
-        "benchmark-model",
-    )? {
-        Some(id) => {
-            let record = block_on(handle.config(id))?.ok_or("model disappeared")?;
-            if !matches!(record.body, ConfigBody::Model(ref config)
+            None => block_on(handle.create_config(Config {
+                name: "benchmark-provider".into(),
+                body: ConfigBody::Connection(ConnectionConfig {
+                    protocol: LlmTransport::OpenAiChatCompletions,
+                    endpoint: Some(provider_endpoint),
+                    credential_ref: None,
+                }),
+            }))?,
+        };
+        let model = match benchmark_config(
+            &handle,
+            ocg::db::entities::ConfigKind::Model,
+            "benchmark-model",
+        )? {
+            Some(id) => {
+                let record = block_on(handle.config(id))?.ok_or("model disappeared")?;
+                if !matches!(record.body, ConfigBody::Model(ref config)
                 if config.connection_id == connection && config.model == "benchmark-mock")
-            {
-                return Err("existing benchmark model differs".into());
+                {
+                    return Err("existing benchmark model differs".into());
+                }
+                id
             }
-            id
-        }
-        None => block_on(handle.create_config(Config {
-            name: "benchmark-model".into(),
-            body: ConfigBody::Model(ModelConfig {
-                reasoning_efforts: None,
-                connection_id: connection,
-                model: "benchmark-mock".into(),
-                context_window: None,
-                parameters: Default::default(),
-                declared_capabilities: BTreeSet::from([
-                    ocg::db::entities::ModelCapability::Chat,
-                    ocg::db::entities::ModelCapability::Tools,
-                ]),
-            }),
-        }))?,
-    };
-    let requested_concurrency =
-        NonZeroU32::new(u32::try_from(concurrency)?).ok_or("concurrency must be positive")?;
-    let executor = match block_on(handle.executors(None, 1_000))?
-        .into_iter()
-        .find(|record| record.name == "benchmark-executor")
-    {
-        Some(record) => {
-            if record.concurrency_limit != requested_concurrency.get() {
-                return Err(format!(
+            None => block_on(handle.create_config(Config {
+                name: "benchmark-model".into(),
+                body: ConfigBody::Model(ModelConfig {
+                    reasoning_efforts: None,
+                    connection_id: connection,
+                    model: "benchmark-mock".into(),
+                    context_window: None,
+                    parameters: Default::default(),
+                    declared_capabilities: BTreeSet::from([
+                        ocg::db::entities::ModelCapability::Chat,
+                        ocg::db::entities::ModelCapability::Tools,
+                    ]),
+                }),
+            }))?,
+        };
+        let requested_concurrency =
+            NonZeroU32::new(u32::try_from(concurrency)?).ok_or("concurrency must be positive")?;
+        let executor = match block_on(handle.executors(None, 1_000))?
+            .into_iter()
+            .find(|record| record.name == "benchmark-executor")
+        {
+            Some(record) => {
+                if record.concurrency_limit != requested_concurrency.get() {
+                    return Err(format!(
                     "existing executor concurrency {} differs from requested {requested_concurrency}",
                     record.concurrency_limit
                 )
                 .into());
+                }
+                record.id
             }
-            record.id
-        }
-        None => block_on(handle.create_executor(Executor {
-            name: "benchmark-executor".into(),
-            concurrency_limit: requested_concurrency,
-            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
-        }))?,
-    };
-    let pool: ocg::db::entities::ExecutionPoolId = executor.into();
-    let llm_profile = model;
-    let agent_profile = match benchmark_config(
-        &handle,
-        ocg::db::entities::ConfigKind::Agent,
-        "benchmark-agent-profile",
-    )? {
-        Some(id) => {
-            let record = block_on(handle.config(id))?.ok_or("agent disappeared")?;
-            if !matches!(record.body, ConfigBody::Agent(ref config)
+            None => block_on(handle.create_executor(Executor {
+                name: "benchmark-executor".into(),
+                concurrency_limit: requested_concurrency,
+                llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+            }))?,
+        };
+        let pool: ocg::db::entities::ExecutionPoolId = executor.into();
+        let llm_profile = model;
+        let agent_profile = match benchmark_config(
+            &handle,
+            ocg::db::entities::ConfigKind::Agent,
+            "benchmark-agent-profile",
+        )? {
+            Some(id) => {
+                let record = block_on(handle.config(id))?.ok_or("agent disappeared")?;
+                if !matches!(record.body, ConfigBody::Agent(ref config)
                 if config.models.contains(&model)
                     && config.capabilities.contains(&ocg::db::entities::AgentCapability::Coding))
-            {
-                return Err("existing benchmark agent profile differs".into());
+                {
+                    return Err("existing benchmark agent profile differs".into());
+                }
+                id
             }
-            id
-        }
-        None => block_on(handle.create_config(Config {
-            name: "benchmark-agent-profile".into(),
-            body: ConfigBody::Agent(ocg::db::entities::AgentConfig {
-                capabilities: BTreeSet::from([ocg::db::entities::AgentCapability::Coding]),
-                models: vec![model],
-                ..Default::default()
-            }),
-        }))?,
-    };
-    let workspace_root = workspace
-        .to_str()
-        .ok_or("workspace path is not UTF-8")?
-        .to_owned();
-    let project = match block_on(handle.projects(None, 1_000))?
-        .into_iter()
-        .find(|record| record.name == "benchmark-project")
-    {
-        Some(record) => {
-            if record.root != workspace_root {
-                return Err("existing benchmark project root differs".into());
+            None => block_on(handle.create_config(Config {
+                name: "benchmark-agent-profile".into(),
+                body: ConfigBody::Agent(ocg::db::entities::AgentConfig {
+                    capabilities: BTreeSet::from([ocg::db::entities::AgentCapability::Coding]),
+                    models: vec![model],
+                    ..Default::default()
+                }),
+            }))?,
+        };
+        let workspace_root = workspace
+            .to_str()
+            .ok_or("workspace path is not UTF-8")?
+            .to_owned();
+        let project = match block_on(handle.projects(None, 1_000))?
+            .into_iter()
+            .find(|record| record.name == "benchmark-project")
+        {
+            Some(record) => {
+                if record.root != workspace_root {
+                    return Err("existing benchmark project root differs".into());
+                }
+                record.id
             }
-            record.id
-        }
-        None => block_on(handle.create_project(ocg::db::entities::Project {
-            name: "benchmark-project".into(),
-            root: workspace_root,
-            description: None,
-            commands: vec![],
-        }))?,
-    };
+            None => block_on(handle.create_project(ocg::db::entities::Project {
+                name: "benchmark-project".into(),
+                root: workspace_root,
+                description: None,
+                commands: vec![],
+            }))?,
+        };
 
-    worker.shutdown()?;
+        worker.shutdown()?;
+        json!({"executor": executor.to_string(), "llm_profile": llm_profile.to_string(),
+        "agent_profile": agent_profile.to_string(), "project": project.to_string(), "pool": pool.to_string()})
+    };
     let control_config = ocg::api::v1::ControlPlaneConfig::new(port, &token)?;
     ocg::system::runtime::run_controlled(
         &directory,
@@ -3035,11 +3058,11 @@ fn run_server() -> Result<()> {
                 json!({
                     "address": context.control_plane().map(|address| format!("http://{address}")),
                     "token": token,
-                    "executor": executor.to_string(),
-                    "llm_profile": llm_profile.to_string(),
-                    "agent_profile": agent_profile.to_string(),
-                    "project": project.to_string(),
-                    "pool": pool.to_string(),
+                    "executor": identities["executor"],
+                    "llm_profile": identities["llm_profile"],
+                    "agent_profile": identities["agent_profile"],
+                    "project": identities["project"],
+                    "pool": identities["pool"],
                 })
             );
             let _ = ntex::rt::spawn_blocking(|| {

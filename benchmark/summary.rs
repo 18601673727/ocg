@@ -44,6 +44,8 @@ pub struct Found {
     pub parameters: Value,
     pub environment: Value,
     pub outcomes: Value,
+    pub indexed_bytes: Option<u64>,
+    pub completed_fixture_jobs: Option<u64>,
 }
 
 #[derive(Default)]
@@ -63,6 +65,7 @@ impl Summary {
         lines: impl Iterator<Item = &'a str>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut summary = Summary::default();
+        let mut identities = BTreeMap::new();
         for (index, line) in lines.enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -74,7 +77,25 @@ impl Summary {
                 Some("environment") => summary.environment = Some(value),
                 Some("measurement") => {
                     if METRIC_NAMES.iter().any(|(_, name)| value["name"] == *name) {
-                        summary.measurements.push(found(&value)?);
+                        let measurement = found(&value)?;
+                        let identity = (
+                            measurement.name.clone(),
+                            measurement.mode.clone(),
+                            measurement.concurrency,
+                            measurement.run_id.clone(),
+                            measurement.trial,
+                        );
+                        if let Some(previous) = identities.get(&identity) {
+                            if previous != &value {
+                                return Err(format!(
+                                    "conflicting duplicate measurement identity: {identity:?}"
+                                )
+                                .into());
+                            }
+                        } else {
+                            identities.insert(identity, value.clone());
+                            summary.measurements.push(measurement);
+                        }
                     }
                 }
                 Some("skip") => {
@@ -178,6 +199,13 @@ impl Summary {
                 ));
                 continue;
             }
+            let selected_environment = signature(selected[0], true)?;
+            selected_environments.insert(selected_environment.clone());
+            for measurement in &selected {
+                if signature(measurement, true)? != selected_environment {
+                    return Err(format!("incompatible environments for {name}").into());
+                }
+            }
             if let Some(failed) = selected.iter().find(|measurement| {
                 matches!(
                     measurement.status.as_str(),
@@ -267,9 +295,38 @@ impl Summary {
             };
             let mut notes = vec![
                 mode.to_string(),
+                format!("concurrency {concurrency}"),
                 format!("{trials} trials/{runs} runs/{samples} samples"),
                 "median of per-trial values/p50".to_owned(),
             ];
+            let parameters = &selected[0].parameters;
+            if let Some(jobs) = parameters["fixture_completed_jobs"]
+                .as_u64()
+                .or(selected[0].completed_fixture_jobs)
+            {
+                notes.push(format!("fixture {jobs} completed jobs"));
+            }
+            if key == "history" {
+                notes.push(format!(
+                    "page size {}; background jobs per batch {}",
+                    parameters["applied"]["page_size"], parameters["applied"]["writer_jobs"]
+                ));
+            }
+            if key == "search" {
+                notes.push(format!(
+                    "files {}; indexed bytes {}",
+                    parameters["fixture_files"],
+                    selected[0]
+                        .indexed_bytes
+                        .map_or_else(|| "unavailable".to_owned(), |bytes| bytes.to_string())
+                ));
+            }
+            if key == "streaming" {
+                notes.push(format!(
+                    "{} markers/job; pace {} ms",
+                    parameters["markers_per_job"], parameters["pace_ms"]
+                ));
+            }
             if p95.is_some() {
                 notes.push("p95 is median of per-trial p95".to_owned());
             } else {
@@ -328,12 +385,12 @@ impl Summary {
         Ok(table)
     }
 
-    pub fn environment_line(&self) -> String {
+    pub fn environment_line(&self, concurrency: usize, mode: &str) -> String {
         let environment = self
             .measurements
-            .first()
-            .map(|measurement| &measurement.environment)
-            .or(self.environment.as_ref());
+            .iter()
+            .find(|measurement| measurement.concurrency == concurrency && measurement.mode == mode)
+            .map(|measurement| &measurement.environment);
         let Some(environment) = environment else {
             return "no environment record".to_owned();
         };
@@ -545,6 +602,8 @@ fn found(value: &Value) -> Result<Found, Box<dyn std::error::Error + Send + Sync
         parameters: parameters.clone(),
         environment: environment.clone(),
         outcomes: value["outcomes"].clone(),
+        indexed_bytes: value["content_bytes_indexed"].as_u64(),
+        completed_fixture_jobs: value["fixture_completed_jobs"].as_u64(),
     })
 }
 
@@ -605,6 +664,9 @@ pub fn run_summary() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     io::stdin().read_to_string(&mut buffer)?;
     let summary = Summary::from_lines(buffer.lines())?;
     print!("{}", summary.to_markdown(concurrency, &mode)?);
-    println!("\nEnvironment: {}", summary.environment_line());
+    println!(
+        "\nEnvironment: {}",
+        summary.environment_line(concurrency, &mode)
+    );
     Ok(())
 }
