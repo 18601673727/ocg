@@ -6,6 +6,52 @@ use crate::service::ai::providers::openai_compatible::{
 
 pub(crate) type OpResult<T> = Result<T, BatchError>;
 
+pub(crate) enum ProfileCredentialRef {
+    Preserve,
+    Clear,
+    Explicit(String),
+    PreserveOrGenerate(String),
+}
+
+pub(crate) struct ProfileSaveGuard {
+    pub(crate) profile_edit_seq: u32,
+    pub(crate) connection_id: ConfigId,
+    pub(crate) connection_edit_seq: u32,
+}
+
+pub(crate) enum ModelProfileDefinition {
+    Llm {
+        protocol: Option<LlmTransport>,
+        model: String,
+        context_window: Option<u32>,
+        parameters: LlmParameters,
+        declared_capabilities: std::collections::BTreeSet<ModelCapability>,
+    },
+    Decision {
+        protocol: DecisionProtocol,
+        model: String,
+        limits: DecisionLimits,
+        declared_capabilities: std::collections::BTreeSet<DecisionCapability>,
+    },
+}
+
+pub(crate) struct ModelProfileSave {
+    pub(crate) existing_id: Option<ProfileId>,
+    pub(crate) name: String,
+    pub(crate) connection_name: String,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) credential_ref: ProfileCredentialRef,
+    pub(crate) guard: Option<ProfileSaveGuard>,
+    pub(crate) definition: ModelProfileDefinition,
+}
+
+pub(crate) fn save_model_profile(
+    batch: &mut Batch,
+    save: ModelProfileSave,
+) -> OpResult<(ConfigId, Option<String>)> {
+    batch.save_model_profile(save)
+}
+
 // ---- Jobs ---------------------------------------------------------------------------
 
 /// The immutable spec of a Job about to be submitted: its input, its

@@ -45,7 +45,8 @@ export type ControlProjectUpdate = {
 
 export type ControlPoolUpdate =
   | { concurrency_limit: number; enabled?: never }
-  | { enabled: boolean; concurrency_limit?: never };
+  | { enabled: boolean; concurrency_limit?: never }
+  | { decision: boolean; concurrency_limit?: never; enabled?: never };
 
 export type ControlConversationEdit =
   | { title: string; hidden?: never }

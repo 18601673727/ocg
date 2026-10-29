@@ -213,6 +213,7 @@ export function markdownParser(): MarkdownItType {
     linkify: true,
     typographer: true,
   })
+    .disable("smartquotes")
     .use(taskLists, { enabled: true })
     .use((md) => {
       md.inline.ruler.after("escape", "line_break_tag", lineBreakTag);

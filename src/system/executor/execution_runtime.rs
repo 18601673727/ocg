@@ -79,12 +79,18 @@ pub struct ToolExecution {
     pub(crate) decider: bool,
 }
 
+/// Default maximum Provider requests per Job execution.
+const DEFAULT_MAX_PROVIDER_REQUESTS: u32 = 2048;
+
 /// Timeout for an individual tool handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToolLoopLimits {
     /// Longest one handler may run. A handler that never yields cannot be
     /// stopped by it.
     pub handler_timeout: Duration,
+    /// Maximum Provider request attempts per Job. Each retry, retry after
+    /// failure, and failed request attempt counts toward this limit.
+    pub max_provider_requests: u32,
 }
 
 /// A [`ToolLoopLimits`] that cannot bound an execution as written.
@@ -113,6 +119,7 @@ impl Default for ToolLoopLimits {
     fn default() -> Self {
         Self {
             handler_timeout: Duration::from_secs(10),
+            max_provider_requests: DEFAULT_MAX_PROVIDER_REQUESTS,
         }
     }
 }
@@ -124,6 +131,11 @@ pub enum ToolLoopStop {
     /// The limits cannot bound the execution, see
     /// [`ToolLoopLimits::validate`], so no Provider request was sent.
     InvalidLimits(ToolLimitsError),
+    /// The Provider request budget was exhausted before obtaining a final
+    /// answer.
+    RequestLimit {
+        limit: u32,
+    },
     /// A call was refused at dispatch: OCG did not offer it, it is no longer
     /// the registration offered or no longer authorized, its id repeats an
     /// earlier call's, its registered schema refuses its arguments, or its
@@ -216,6 +228,12 @@ impl std::fmt::Display for ToolLoopStop {
                 write!(
                     formatter,
                     "the evidence of tool call {index} could not be recorded"
+                )
+            }
+            Self::RequestLimit { limit } => {
+                write!(
+                    formatter,
+                    "the Provider request budget of {limit} was exhausted"
                 )
             }
             Self::ContextWindow => {
@@ -1671,6 +1689,21 @@ async fn run_provider_job_inner(
             && estimate_request_tokens(&conversation, context_limits.max_tokens) > window as u64
         {
             return stop_tool_loop(run, None, ToolLoopStop::ContextWindow).await;
+        }
+        // Check Provider request budget before attempting exchange. If tools are available,
+        // use their limits; otherwise use default limits.
+        let max_requests = tools
+            .map(|t| t.limits.max_provider_requests)
+            .unwrap_or(DEFAULT_MAX_PROVIDER_REQUESTS);
+        if sink.request.get() > max_requests {
+            return stop_tool_loop(
+                run,
+                None,
+                ToolLoopStop::RequestLimit {
+                    limit: max_requests,
+                },
+            )
+            .await;
         }
         let mut retries = 0;
         let mut execution = loop {

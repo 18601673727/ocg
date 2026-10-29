@@ -91,10 +91,28 @@
   animation: sidebar-title-shimmer 1.8s linear infinite;
 }
 
+@keyframes sidebar-title-marquee {
+  0%,
+  7.5% {
+    transform: translateX(0);
+  }
+  92.5%,
+  100% {
+    transform: translateX(var(--marquee-shift, 0px));
+  }
+}
+
+.sidebar-title-marquee {
+  animation: sidebar-title-marquee var(--marquee-duration, 4s) ease-in-out infinite alternate;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .sidebar-title-shimmer {
     color: var(--foreground);
     background: none;
+    animation: none;
+  }
+  .sidebar-title-marquee {
     animation: none;
   }
 }

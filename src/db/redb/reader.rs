@@ -537,13 +537,8 @@ pub(crate) fn read_job_search(
     let mut last = None;
     let mut has_more = false;
     for entry in jobs.range(..end)?.rev() {
-        if records.len() == limit {
-            has_more = true;
-            break;
-        }
         let (key, bytes) = entry?;
         let id = JobId::new(key.value());
-        last = Some(id);
         let record = job_record(&rx, JobSpec::decode_at(key.value(), bytes.value())?)?;
         let identity = record.id.to_string().to_lowercase();
         let name = record.name.as_deref().unwrap_or("").to_lowercase();
@@ -552,6 +547,11 @@ pub(crate) fn read_job_search(
             .iter()
             .all(|term| identity.contains(term) || name.contains(term) || objective.contains(term))
         {
+            if records.len() == limit {
+                has_more = true;
+                break;
+            }
+            last = Some(id);
             records.push(record);
         }
     }
@@ -2170,12 +2170,7 @@ fn conversation_page(
     let mut last = None;
     let mut has_more = false;
     for item in groups.range(..before.map_or(u128::MAX, JobId::get))?.rev() {
-        if conversations.len() == limit {
-            has_more = true;
-            break;
-        }
         let conversation = JobId::new(item?.0.value());
-        last = Some(conversation);
         let row = read_job_row(&rx, conversation)?
             .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
         if !indexes::searchable_conversation(&row)
@@ -2192,6 +2187,11 @@ fn conversation_page(
         };
         let summary = conversation_summary(&rx, conversation, tip)?;
         if terms.is_empty() || conversation_matches(&rx, conversation, &summary.title, terms)? {
+            if conversations.len() == limit {
+                has_more = true;
+                break;
+            }
+            last = Some(conversation);
             conversations.push(summary);
         }
     }

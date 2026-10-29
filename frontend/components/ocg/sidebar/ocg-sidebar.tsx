@@ -54,6 +54,7 @@ import { SELECTED_ROW } from "../primitives/selection";
 import type { ControlProject } from "../contracts";
 import { usePinnedConversations } from "./sidebar-preferences";
 import { SidebarConversationChildren } from "./conversation-children";
+import { HoverMarquee } from "./hover-marquee";
 
 const WORKSPACE_NAV: {
   target: WorkspaceView;
@@ -681,9 +682,9 @@ export function OcgSidebar({
                             title={session.title || t("sidebar.newChat")}
                             className="flex h-full min-w-0 flex-1 items-center pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
                           >
-                            <span className="min-w-0 flex-1 overflow-hidden whitespace-nowrap [mask-image:linear-gradient(to_right,black_calc(100%-1rem),transparent)]">
+                            <HoverMarquee className="min-w-0 flex-1">
                               {session.title || t("sidebar.newChat")}
-                            </span>
+                            </HoverMarquee>
                           </button>
                           <div className="relative mr-2 flex h-full w-18 shrink-0 items-center justify-end">
                             <span

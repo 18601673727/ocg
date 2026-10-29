@@ -34,6 +34,42 @@ fn filesystem_vitals(directory: &std::path::Path) -> (Option<u64>, Option<u64>) 
     )
 }
 
+fn model_profile_save_bytes(save: &mutations::ModelProfileSave) -> u64 {
+    let credential_ref_bytes = match &save.credential_ref {
+        mutations::ProfileCredentialRef::Preserve | mutations::ProfileCredentialRef::Clear => 0,
+        mutations::ProfileCredentialRef::Explicit(reference)
+        | mutations::ProfileCredentialRef::PreserveOrGenerate(reference) => {
+            byte_count(reference.len())
+        }
+    };
+    let definition_bytes = match &save.definition {
+        mutations::ModelProfileDefinition::Llm {
+            model,
+            declared_capabilities,
+            ..
+        } => byte_count(model.len())
+            .saturating_add(byte_count(declared_capabilities.len()).saturating_mul(8))
+            .saturating_add(512),
+        mutations::ModelProfileDefinition::Decision {
+            model,
+            declared_capabilities,
+            ..
+        } => byte_count(model.len())
+            .saturating_add(byte_count(declared_capabilities.len()).saturating_mul(8))
+            .saturating_add(2048),
+    };
+    byte_count(save.name.len())
+        .saturating_add(byte_count(save.connection_name.len()))
+        .saturating_add(
+            save.endpoint
+                .as_ref()
+                .map_or(0, |endpoint| byte_count(endpoint.len())),
+        )
+        .saturating_add(credential_ref_bytes)
+        .saturating_add(definition_bytes)
+        .saturating_add(4096)
+}
+
 /// Reads [`filesystem_vitals`] on a blocking worker, so a slow filesystem
 /// never holds an async worker.
 async fn filesystem_vitals_async(directory: std::path::PathBuf) -> (Option<u64>, Option<u64>) {
@@ -1097,6 +1133,29 @@ impl DatabaseHandle {
                 |(config,)| config_bytes(config),
                 OperationKind::CreateProfile,
                 |(config,), batch| mutations::create_config(batch, config),
+            )
+        })
+        .await
+    }
+
+    /// Creates or edits an LLM or Decision Model Profile, resolving its
+    /// Connection and any required LLM Executor in the same write batch.
+    pub(crate) async fn save_model_profile(
+        &self,
+        save: mutations::ModelProfileSave,
+    ) -> Result<(ConfigId, Option<String>), DatabaseError> {
+        let kind = if save.existing_id.is_some() {
+            OperationKind::UpdateProfile
+        } else {
+            OperationKind::CreateProfile
+        };
+        self.submit(|reply| {
+            Command::new(
+                (save,),
+                reply,
+                |(save,)| model_profile_save_bytes(save),
+                kind,
+                |(save,), batch| mutations::save_model_profile(batch, save),
             )
         })
         .await

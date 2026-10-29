@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
+import { HoverMarquee } from "./hover-marquee";
 import { LoaderCircle } from "lucide-react";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import type { ControlChildConversation } from "../contracts";
@@ -71,9 +72,7 @@ export function SidebarConversationChildren({
                     : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-foreground",
                 )}
               >
-                <span className="min-w-0 overflow-hidden whitespace-nowrap [mask-image:linear-gradient(to_right,black_calc(100%-1rem),transparent)]">
-                  {child.title || t("chat.child.untitled")}
-                </span>
+                <HoverMarquee>{child.title || t("chat.child.untitled")}</HoverMarquee>
                 <span
                   className={cn(
                     "ml-2 shrink-0 text-xs",

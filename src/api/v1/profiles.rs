@@ -24,10 +24,11 @@ use super::wire::{
 };
 use crate::db::entities::{
     AgentCapability, AgentConfig, Config, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
-    ConnectionConfig, DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig,
-    DecisionProtocol, ExecutionOperation, Executor, LlmParameters, LlmTransport, ModelCapability,
-    ModelConfig, ProfileId, RecordRef, Violation,
+    ConnectionConfig, DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionProtocol,
+    ExecutionOperation, Executor, LlmParameters, LlmTransport, ModelCapability, ProfileId,
+    RecordRef, Violation,
 };
+use crate::db::mutations::{ModelProfileDefinition, ModelProfileSave, ProfileCredentialRef};
 use crate::db::{DatabaseError, DatabaseHandle};
 
 const MAX_PROFILE_NAME_BYTES: usize = 128;
@@ -143,6 +144,11 @@ const WRONG_PROFILE_KIND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "wrong_profile_kind",
     "a Profile's kind cannot be changed after creation",
+);
+const PROFILE_CHANGED: Refusal = Refusal::new(
+    StatusCode::CONFLICT,
+    "profile_changed",
+    "the Profile changed while it was being validated; reload and retry",
 );
 const STORAGE_REFUSED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
@@ -406,6 +412,10 @@ pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
     match error {
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "profile",
+            "changed while validating; reload and retry",
+        )) => PROFILE_CHANGED,
         DatabaseError::Rejected(Violation::DuplicateReference(_)) => INVALID_LLM_TARGET,
         DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
         DatabaseError::ShuttingDown | DatabaseError::ReadsClosed => SHUTTING_DOWN,
@@ -453,40 +463,18 @@ async fn ensure_compatible_executor(
     Ok(())
 }
 
-/// Resolves or creates the Connection config matching the Profile-owned
-/// protocol, endpoint and credential reference.
-async fn resolve_or_create_connection(
-    database: &DatabaseHandle,
-    profile_name: &str,
-    protocol: LlmTransport,
-    endpoint: Option<String>,
-    credential_ref: Option<String>,
-) -> Result<ConfigId, Refusal> {
-    let wanted = ConnectionConfig {
-        protocol,
-        endpoint,
-        credential_ref,
-    };
-    if let Some(found) = database
-        .find_config(ConfigKind::Connection, |connection| matches!(&connection.body, ConfigBody::Connection(body) if *body == wanted))
-        .await?
-    {
-        return Ok(found.id);
-    }
-    database
-        .create_config(Config {
-            name: format!("{profile_name} provider"),
-            body: ConfigBody::Connection(wanted),
-        })
-        .await
-        .map_err(map_mutation_error)
-}
-
 async fn previous_model_connection(
     database: &DatabaseHandle,
     existing_id: Option<ProfileId>,
     kind: ConfigKind,
-) -> Result<Option<(ConfigBody, ConnectionConfig)>, Refusal> {
+) -> Result<
+    Option<(
+        ConfigBody,
+        ConnectionConfig,
+        crate::db::mutations::ProfileSaveGuard,
+    )>,
+    Refusal,
+> {
     let Some(id) = existing_id else {
         return Ok(None);
     };
@@ -505,27 +493,33 @@ async fn previous_model_connection(
         | ConfigBody::DecisionAgent(_)
         | ConfigBody::Pool(_) => return Err(WRONG_PROFILE_KIND),
     };
-    let connection = database
+    let connection_record = database
         .config(connection_id)
         .await?
         .ok_or(INCONSISTENT_RECORD)?;
-    let ConfigBody::Connection(connection) = connection.body else {
+    let ConfigBody::Connection(connection) = connection_record.body else {
         return Err(INCONSISTENT_RECORD);
     };
-    Ok(Some((record.body, connection)))
+    Ok(Some((
+        record.body,
+        connection,
+        crate::db::mutations::ProfileSaveGuard {
+            profile_edit_seq: record.edit_seq,
+            connection_id,
+            connection_edit_seq: connection_record.edit_seq,
+        },
+    )))
 }
 
 /// The credential reference a Profile names, and the secret to write, if
 /// any. An update keeps the reference it had when none is supplied, and an
 /// explicit clear removes it.
-async fn resolve_credential(
-    database: &DatabaseHandle,
+fn resolve_credential_input(
     profile_name: &str,
     credential_ref: Option<&str>,
     credential: Option<&str>,
     clear_credential: bool,
-    prior_credential_ref: Option<String>,
-) -> Result<(Option<String>, Option<(String, String)>), Refusal> {
+) -> Result<(ProfileCredentialRef, Option<String>), Refusal> {
     let explicit_ref = credential_ref
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -543,20 +537,25 @@ async fn resolve_credential(
         return Err(INVALID_CREDENTIAL);
     }
     if clear_credential {
-        return Ok((None, None));
+        return Ok((ProfileCredentialRef::Clear, None));
     }
     match secret {
         Some(secret_value) => {
-            let target_ref = match explicit_ref.or(prior_credential_ref) {
-                Some(reference) => reference,
-                None => unused_credential_ref(database, profile_name).await?,
+            let credential_ref = match explicit_ref {
+                Some(reference) => ProfileCredentialRef::Explicit(reference),
+                None => {
+                    ProfileCredentialRef::PreserveOrGenerate(default_credential_ref(profile_name))
+                }
             };
-            Ok((
-                Some(target_ref.clone()),
-                Some((target_ref, secret_value.to_owned())),
-            ))
+            Ok((credential_ref, Some(secret_value.to_owned())))
         }
-        None => Ok((explicit_ref.or(prior_credential_ref), None)),
+        None => Ok((
+            explicit_ref.map_or(
+                ProfileCredentialRef::Preserve,
+                ProfileCredentialRef::Explicit,
+            ),
+            None,
+        )),
     }
 }
 
@@ -1040,14 +1039,18 @@ fn fits_profile_page(entry: &impl serde::Serialize, bytes: &mut usize) -> Result
     Ok(true)
 }
 
+enum PreparedProfileSave {
+    Config(Config),
+    Model(ModelProfileSave, Option<String>),
+}
+
 pub(crate) async fn save_profile(
     database: &DatabaseHandle,
     existing_id: Option<ProfileId>,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let request: ProfileRequest = serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
-    let mut credential_to_save: Option<(String, String)> = None;
-    let new_config = match request {
+    let prepared = match request {
         ProfileRequest::Llm {
             name,
             model,
@@ -1066,13 +1069,11 @@ pub(crate) async fn save_profile(
             if !valid_single_line(&model, MAX_MODEL_BYTES) {
                 return Err(INVALID_MODEL);
             }
-            let keep_protocol = protocol.is_none();
-            let mut protocol = protocol
+            let protocol = protocol
                 .as_deref()
                 .map(str::trim)
-                .map(LlmTransport::parse)
-                .unwrap_or(Some(LlmTransport::OpenAiChatCompletions))
-                .ok_or(UNSUPPORTED_PROTOCOL)?;
+                .map(|value| LlmTransport::parse(value).ok_or(UNSUPPORTED_PROTOCOL))
+                .transpose()?;
             let normalized_endpoint = normalize_endpoint(endpoint.as_deref())?;
 
             let mut capabilities = BTreeSet::new();
@@ -1112,74 +1113,38 @@ pub(crate) async fn save_profile(
                 return Err(INVALID_PARAMETERS);
             }
 
-            // If updating an existing LLM profile, inspect its current
-            // Connection so we can preserve its credential_ref when none is
-            // supplied.
-            let mut reasoning_efforts = None;
-            let previous =
-                previous_model_connection(database, existing_id, ConfigKind::Model).await?;
-            let prior_credential_ref = if let Some((body, connection)) = previous {
-                let ConfigBody::Model(existing_model) = body else {
-                    return Err(WRONG_PROFILE_KIND);
-                };
-                if existing_model.model == model.trim() {
-                    reasoning_efforts = existing_model.reasoning_efforts;
-                }
-                if keep_protocol {
-                    protocol = connection.protocol;
-                }
-                connection.credential_ref
-            } else {
-                None
-            };
-
-            let (resolved_credential_ref, secret) = resolve_credential(
-                database,
+            let (credential_ref, secret) = resolve_credential_input(
                 name.trim(),
                 credential_ref.as_deref(),
                 credential.as_deref(),
                 clear_credential,
-                prior_credential_ref,
-            )
-            .await?;
-            credential_to_save = secret;
-
-            ensure_compatible_executor(database, protocol).await?;
-            let connection = resolve_or_create_connection(
-                database,
-                name.trim(),
-                protocol,
-                normalized_endpoint,
-                resolved_credential_ref,
-            )
-            .await?;
-
-            if let Some(id) = existing_id
-                && let Some(previous) = database.config(id.into()).await?
-                && let ConfigBody::Model(previous) = previous.body
-                && previous.connection_id != connection
-            {
-                reasoning_efforts = None;
-            }
-            Config {
-                name: name.trim().to_owned(),
-                body: ConfigBody::Model(ModelConfig {
-                    reasoning_efforts,
-                    connection_id: connection,
-                    model: model.trim().to_owned(),
-                    context_window,
-                    parameters: LlmParameters {
-                        temperature: parameters.temperature,
-                        top_p: parameters.top_p,
-                        max_tokens: parameters.max_tokens,
-                        reasoning_effort: parameters.reasoning_effort,
-                        max_completion_tokens: parameters.max_completion_tokens,
-                        presence_penalty: parameters.presence_penalty,
-                        frequency_penalty: parameters.frequency_penalty,
+            )?;
+            PreparedProfileSave::Model(
+                ModelProfileSave {
+                    existing_id,
+                    name: name.trim().to_owned(),
+                    connection_name: format!("{} provider", name.trim()),
+                    endpoint: normalized_endpoint,
+                    credential_ref,
+                    guard: None,
+                    definition: ModelProfileDefinition::Llm {
+                        protocol,
+                        model: model.trim().to_owned(),
+                        context_window,
+                        parameters: LlmParameters {
+                            temperature: parameters.temperature,
+                            top_p: parameters.top_p,
+                            max_tokens: parameters.max_tokens,
+                            reasoning_effort: parameters.reasoning_effort,
+                            max_completion_tokens: parameters.max_completion_tokens,
+                            presence_penalty: parameters.presence_penalty,
+                            frequency_penalty: parameters.frequency_penalty,
+                        },
+                        declared_capabilities: capabilities,
                     },
-                    declared_capabilities: capabilities,
-                }),
-            }
+                },
+                secret,
+            )
         }
         ProfileRequest::Agent {
             name,
@@ -1241,7 +1206,7 @@ pub(crate) async fn save_profile(
             } else {
                 AgentConfig::default()
             };
-            Config {
+            PreparedProfileSave::Config(Config {
                 name: name.trim().to_owned(),
                 body: ConfigBody::Agent(AgentConfig {
                     instructions: normalized_instructions,
@@ -1253,7 +1218,7 @@ pub(crate) async fn save_profile(
                         Some(Some(policy)) => Some(policy.into_policy()?),
                     },
                 }),
-            }
+            })
         }
         ProfileRequest::DecisionModel {
             name,
@@ -1324,51 +1289,51 @@ pub(crate) async fn save_profile(
             }
             // The existing Profile's Connection, when it is edited, keeps its
             // credential reference unless another one is named.
-            let prior_credential_ref =
-                previous_model_connection(database, existing_id, ConfigKind::DecisionModel)
-                    .await?
-                    .and_then(|(_, connection)| connection.credential_ref);
-            let (resolved_credential_ref, secret) = resolve_credential(
-                database,
+            let previous =
+                previous_model_connection(database, existing_id, ConfigKind::DecisionModel).await?;
+            let prior_credential_ref = previous
+                .as_ref()
+                .and_then(|(_, connection, _)| connection.credential_ref.clone());
+            let guard = previous.map(|(_, _, guard)| guard);
+            let (credential_ref, secret) = resolve_credential_input(
                 name.trim(),
                 credential_ref.as_deref(),
                 credential.as_deref(),
                 clear_credential,
-                prior_credential_ref,
-            )
-            .await?;
+            )?;
+            let validation_ref = match &credential_ref {
+                ProfileCredentialRef::Preserve | ProfileCredentialRef::PreserveOrGenerate(_) => {
+                    prior_credential_ref
+                }
+                ProfileCredentialRef::Clear => None,
+                ProfileCredentialRef::Explicit(reference) => Some(reference.clone()),
+            };
             validate_decision_model(
                 database,
                 decision_protocol,
                 normalized_endpoint.as_deref(),
                 model.trim(),
-                resolved_credential_ref.as_deref(),
-                secret.as_ref().map(|(_, secret)| secret.as_str()),
+                validation_ref.as_deref(),
+                secret.as_deref(),
             )
             .await?;
-            credential_to_save = secret;
-            // The Connection carries the endpoint and the credential. Its
-            // transport records how the endpoint would be spoken generatively
-            // and is never used for decision work: the decision protocol
-            // belongs to this Profile.
-            let connection = resolve_or_create_connection(
-                database,
-                &format!("{} decision provider", name.trim()),
-                LlmTransport::OpenAiChatCompletions,
-                normalized_endpoint,
-                resolved_credential_ref,
+            PreparedProfileSave::Model(
+                ModelProfileSave {
+                    existing_id,
+                    name: name.trim().to_owned(),
+                    connection_name: format!("{} decision provider provider", name.trim()),
+                    endpoint: normalized_endpoint,
+                    credential_ref,
+                    guard,
+                    definition: ModelProfileDefinition::Decision {
+                        protocol: decision_protocol,
+                        model: model.trim().to_owned(),
+                        limits: decision_limits,
+                        declared_capabilities: capabilities,
+                    },
+                },
+                secret,
             )
-            .await?;
-            Config {
-                name: name.trim().to_owned(),
-                body: ConfigBody::DecisionModel(DecisionModelConfig {
-                    connection_id: connection,
-                    model: model.trim().to_owned(),
-                    protocol: decision_protocol,
-                    limits: decision_limits,
-                    declared_capabilities: capabilities,
-                }),
-            }
         }
         ProfileRequest::DecisionAgent {
             name,
@@ -1422,34 +1387,59 @@ pub(crate) async fn save_profile(
             // Workspace reads are not implemented. A Decision Profile that
             // names metadata or full access would advertise a permission it
             // cannot use, so only none is accepted.
-            Config {
+            PreparedProfileSave::Config(Config {
                 name: name.trim().to_owned(),
                 body: ConfigBody::DecisionAgent(DecisionAgentConfig {
                     instructions: normalized_instructions,
                     models: parsed_models,
                     default_model,
                 }),
-            }
+            })
         }
     };
 
-    let (status, profile_id) = match existing_id {
-        None => {
-            let created = database
-                .create_config(new_config)
-                .await
-                .map_err(map_mutation_error)?;
-            (StatusCode::CREATED, ProfileId::from(created))
+    let (status, profile_id, credential_to_save) = match prepared {
+        PreparedProfileSave::Config(new_config) => {
+            let profile_id = match existing_id {
+                None => ProfileId::from(
+                    database
+                        .create_config(new_config)
+                        .await
+                        .map_err(map_mutation_error)?,
+                ),
+                Some(id) => {
+                    database
+                        .update_config(id.into(), new_config)
+                        .await
+                        .map_err(map_mutation_error)?;
+                    id
+                }
+            };
+            let status = if existing_id.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            (status, profile_id, None)
         }
-        Some(id) => {
-            database
-                .update_config(id.into(), new_config)
+        PreparedProfileSave::Model(save, secret) => {
+            let (saved_id, credential_ref) = database
+                .save_model_profile(save)
                 .await
                 .map_err(map_mutation_error)?;
-            (StatusCode::OK, id)
+            let status = if existing_id.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            (
+                status,
+                ProfileId::from(saved_id),
+                secret.zip(credential_ref),
+            )
         }
     };
-    if let Some((target_ref, secret_value)) = credential_to_save {
+    if let Some((secret_value, target_ref)) = credential_to_save {
         // The Profile change is already committed. A key that cannot be
         // written leaves it with the old key, or none, so never answer as if
         // the whole save succeeded.

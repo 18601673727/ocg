@@ -123,6 +123,7 @@ pub(crate) fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegis
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     ToolLoopLimits {
         handler_timeout: timeout.saturating_add(super::blocking::STOP_GRACE),
+        ..ToolLoopLimits::default()
     }
 }
 

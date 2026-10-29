@@ -723,6 +723,21 @@ function tableEnd(tokens: Token[], start: number): number {
  * token spans, KaTeX output, and Mermaid SVG, each of which is produced by a
  * library from the code rather than passed through from the document.
  */
+function jsonDocument(content: string): string | null {
+  const code = content.trim();
+  if (
+    !(code.startsWith("{") && code.endsWith("}")) &&
+    !(code.startsWith("[") && code.endsWith("]"))
+  )
+    return null;
+  try {
+    const value: unknown = JSON.parse(code);
+    return typeof value === "object" && value !== null ? code : null;
+  } catch {
+    return null;
+  }
+}
+
 export function MarkdownBody({
   content,
   className,
@@ -730,7 +745,11 @@ export function MarkdownBody({
   sourceSnapshots,
 }: MarkdownBodyProps) {
   const { t } = useI18n();
-  const tokens = useMemo(() => markdownParser().parse(content, {}), [content]);
+  const json = useMemo(() => jsonDocument(content), [content]);
+  const tokens = useMemo(
+    () => (json === null ? markdownParser().parse(content, {}) : []),
+    [content, json],
+  );
   const ctx: WalkContext = {
     inMuted,
     sourceSnapshots,
@@ -740,7 +759,11 @@ export function MarkdownBody({
 
   return (
     <div className={cn(inMuted ? "text-[13px] leading-6" : "text-base leading-7", className)}>
-      {walk(ctx, tokens)}
+      {json === null ? (
+        walk(ctx, tokens)
+      ) : (
+        <CodeBlock code={json} language="json" inMuted={inMuted} copyLabel={ctx.copyLabel} />
+      )}
     </div>
   );
 }

@@ -224,9 +224,11 @@ impl Shared {
         let mut file = options
             .open(&temp_path)
             .map_err(|error| format!("failed to open credential staging file: {error}"))?;
-        file.write_all(&serialized)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| format!("failed to write credential staging file: {error}"))?;
+        if let Err(error) = file.write_all(&serialized).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!("failed to write credential staging file: {error}"));
+        }
         drop(file);
         if let Err(error) = std::fs::rename(&temp_path, &self.credentials_path) {
             let _ = std::fs::remove_file(&temp_path);

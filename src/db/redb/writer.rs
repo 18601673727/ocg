@@ -1,9 +1,10 @@
 use super::rows::{decode_request_event, encode_request_event};
 use super::*;
 use crate::db::entities::{
-    AttachmentId, Config, ConfigBody, ConfigId, ConfigKind, JobId, OutputKind, ProjectId,
-    ProjectRecord, RequestEventRecord, RequestNumber, RequestPayload, SubmissionKey,
-    SubmissionRecord, ToolCallRef, ToolEvidenceRecord, Violation,
+    AttachmentId, Config, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, DecisionModelConfig,
+    JobId, ModelConfig, OutputKind, PoolConfig, ProjectId, ProjectRecord, RequestEventRecord,
+    RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, ToolCallRef,
+    ToolEvidenceRecord, Violation,
 };
 use ::redb::ReadableTableMetadata;
 use std::time::Instant;
@@ -528,6 +529,240 @@ impl Batch {
             });
         }
         Ok(row)
+    }
+
+    pub(crate) fn save_model_profile(
+        &mut self,
+        save: crate::db::mutations::ModelProfileSave,
+    ) -> Result<(ConfigId, Option<String>), BatchError> {
+        use crate::db::mutations::{ModelProfileDefinition, ProfileCredentialRef};
+
+        let profile_kind = match &save.definition {
+            ModelProfileDefinition::Llm { .. } => ConfigKind::Model,
+            ModelProfileDefinition::Decision { .. } => ConfigKind::DecisionModel,
+        };
+        let previous = save
+            .existing_id
+            .map(|id| self.require_config_kind(id.into(), profile_kind))
+            .transpose()?;
+        let previous_connection = if let Some(profile) = &previous {
+            let connection_id = match &profile.body {
+                ConfigBody::Model(model) => model.connection_id,
+                ConfigBody::DecisionModel(model) => model.connection_id,
+                ConfigBody::Connection(_)
+                | ConfigBody::Agent(_)
+                | ConfigBody::DecisionAgent(_)
+                | ConfigBody::Pool(_) => {
+                    return self.reject(Violation::WrongConfigKind {
+                        config: profile.id,
+                        expected: profile_kind,
+                        found: profile.kind,
+                    });
+                }
+            };
+            let Some(connection) = self.config(connection_id)? else {
+                return self.corrupted("Model Profile Connection is missing".into());
+            };
+            let ConfigBody::Connection(connection_body) = &connection.body else {
+                return self.corrupted("Model Profile references a non-Connection config".into());
+            };
+            if let Some(guard) = &save.guard
+                && (guard.profile_edit_seq != profile.edit_seq
+                    || guard.connection_id != connection_id
+                    || guard.connection_edit_seq != connection.edit_seq)
+            {
+                return self.reject(Violation::InvalidValue(
+                    "profile",
+                    "changed while validating; reload and retry",
+                ));
+            }
+            Some((connection_id, connection_body.clone()))
+        } else {
+            if save.guard.is_some() {
+                return self.reject(Violation::InvalidValue(
+                    "profile",
+                    "changed while validating; reload and retry",
+                ));
+            }
+            None
+        };
+
+        let protocol = match &save.definition {
+            ModelProfileDefinition::Llm { protocol, .. } => protocol
+                .or_else(|| {
+                    previous_connection
+                        .as_ref()
+                        .map(|(_, connection)| connection.protocol)
+                })
+                .unwrap_or(LlmTransport::OpenAiChatCompletions),
+            ModelProfileDefinition::Decision { .. } => LlmTransport::OpenAiChatCompletions,
+        };
+        let prior_credential_ref = previous_connection
+            .as_ref()
+            .and_then(|(_, connection)| connection.credential_ref.clone());
+        let generated_base = match &save.credential_ref {
+            ProfileCredentialRef::PreserveOrGenerate(base) if prior_credential_ref.is_none() => {
+                Some(base.as_str())
+            }
+            ProfileCredentialRef::PreserveOrGenerate(_)
+            | ProfileCredentialRef::Preserve
+            | ProfileCredentialRef::Clear
+            | ProfileCredentialRef::Explicit(_) => None,
+        };
+
+        let (has_executor, generated_refs) = self.step(|tx| {
+            let mut has_executor = false;
+            let mut generated_refs = (false, std::collections::BTreeSet::new());
+            let table = tx.open_table(CONFIGS)?;
+            for entry in table.iter()? {
+                let (key, bytes) = entry?;
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+                match &row.body {
+                    ConfigBody::Connection(connection) => {
+                        if let Some(base) = generated_base
+                            && let Some(reference) = connection.credential_ref.as_deref()
+                        {
+                            if reference == base {
+                                generated_refs.0 = true;
+                            } else if let Some(suffix) = reference
+                                .strip_prefix(base)
+                                .and_then(|value| value.strip_prefix('_'))
+                                && let Ok(number) = suffix.parse::<u64>()
+                                && number.to_string() == suffix
+                            {
+                                generated_refs.1.insert(number);
+                            }
+                        }
+                    }
+                    ConfigBody::Pool(pool)
+                        if pool.capability_set().llm_protocols.contains(&protocol) =>
+                    {
+                        has_executor = true;
+                    }
+                    ConfigBody::Model(_)
+                    | ConfigBody::Agent(_)
+                    | ConfigBody::Pool(_)
+                    | ConfigBody::DecisionModel(_)
+                    | ConfigBody::DecisionAgent(_) => {}
+                }
+            }
+            Ok((has_executor, generated_refs))
+        })?;
+
+        let credential_ref = match save.credential_ref {
+            ProfileCredentialRef::Preserve => prior_credential_ref,
+            ProfileCredentialRef::Clear => None,
+            ProfileCredentialRef::Explicit(reference) => Some(reference),
+            ProfileCredentialRef::PreserveOrGenerate(base) => match prior_credential_ref {
+                Some(reference) => Some(reference),
+                None => {
+                    let reference = if !generated_refs.0 {
+                        base
+                    } else {
+                        let mut suffix = 2u64;
+                        while generated_refs.1.contains(&suffix) {
+                            suffix = suffix.checked_add(1).ok_or({
+                                BatchError(Failure::Rejected(Violation::InvalidValue(
+                                    "credential_ref",
+                                    "could not allocate a unique reference",
+                                )))
+                            })?;
+                        }
+                        format!("{base}_{suffix}")
+                    };
+                    Some(reference)
+                }
+            },
+        };
+
+        if matches!(&save.definition, ModelProfileDefinition::Llm { .. }) && !has_executor {
+            self.create_config(
+                format!("local-{}-executor", protocol.as_str()),
+                ConfigBody::Pool(PoolConfig {
+                    capabilities: std::collections::BTreeSet::from([(
+                        ExecutionOperation::LlmRequest,
+                        Some(protocol),
+                    )]),
+                    concurrency_limit: 4,
+                    enabled: true,
+                }),
+            )?;
+        }
+
+        let matching_connection = self.step(|tx| {
+            let mut found = None;
+            let table = tx.open_table(CONFIGS)?;
+            for entry in table.iter()? {
+                let (key, bytes) = entry?;
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+                if let ConfigBody::Connection(connection) = &row.body
+                    && connection.protocol == protocol
+                    && connection.endpoint == save.endpoint
+                    && connection.credential_ref == credential_ref
+                {
+                    found = Some(row.id);
+                }
+            }
+            Ok(found)
+        })?;
+        let connection_id = match matching_connection {
+            Some(id) => id,
+            None => self.create_config(
+                save.connection_name,
+                ConfigBody::Connection(ConnectionConfig {
+                    protocol,
+                    endpoint: save.endpoint,
+                    credential_ref: credential_ref.clone(),
+                }),
+            )?,
+        };
+
+        let body = match save.definition {
+            ModelProfileDefinition::Llm {
+                model,
+                context_window,
+                parameters,
+                declared_capabilities,
+                ..
+            } => {
+                let reasoning_efforts = previous.as_ref().and_then(|profile| {
+                    let ConfigBody::Model(previous) = &profile.body else {
+                        return None;
+                    };
+                    (previous.connection_id == connection_id && previous.model == model)
+                        .then(|| previous.reasoning_efforts.clone())
+                        .flatten()
+                });
+                ConfigBody::Model(ModelConfig {
+                    reasoning_efforts,
+                    connection_id,
+                    model,
+                    context_window,
+                    parameters,
+                    declared_capabilities,
+                })
+            }
+            ModelProfileDefinition::Decision {
+                protocol,
+                model,
+                limits,
+                declared_capabilities,
+            } => ConfigBody::DecisionModel(DecisionModelConfig {
+                connection_id,
+                model,
+                protocol,
+                limits,
+                declared_capabilities,
+            }),
+        };
+        let profile_id = match save.existing_id {
+            Some(id) => {
+                self.update_config(id.into(), save.name, body)?;
+                id.into()
+            }
+            None => self.create_config(save.name, body)?,
+        };
+        Ok((profile_id, credential_ref))
     }
 
     fn check_config_body(&mut self, name: &str, body: &ConfigBody) -> Result<(), BatchError> {
