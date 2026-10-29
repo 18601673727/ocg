@@ -17,6 +17,18 @@ use ocg::system::data_directory::DataDirectory;
 use redb::{Database, ReadableDatabase, ReadableTableMetadata, TableDefinition};
 use serde_json::{Value, json};
 
+#[path = "mod.rs"]
+pub mod benchmark;
+
+pub mod backend_process;
+pub mod fixture;
+mod http_client;
+pub mod metadata;
+pub mod mock_provider;
+pub mod reporting;
+pub mod summary;
+pub mod workload;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 struct Unpark(std::thread::Thread);
@@ -57,6 +69,7 @@ impl Drop for TemporaryRoot {
     }
 }
 
+#[derive(Clone)]
 struct Options {
     section: String,
     iterations: usize,
@@ -166,7 +179,9 @@ impl Options {
                     }
                 }
                 "all" | "jobs" | "scheduler" | "reads" | "search" | "search_scale" | "mixed"
-                | "maintenance" | "provider-record" | "observability"
+                | "maintenance" | "provider-record" | "observability" | "server" | "summary"
+                | "startup" | "memory" | "admission" | "throughput" | "streaming" | "history"
+                | "database"
                     if !section_seen =>
                 {
                     options.section = argument;
@@ -1466,6 +1481,11 @@ fn maintenance(options: &Options) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        Some("server") => return run_server(),
+        Some("summary") => return summary::run_summary(),
+        _ => {}
+    }
     let Some(options) = Options::parse()? else {
         return Ok(());
     };
@@ -1519,6 +1539,24 @@ fn main() -> Result<()> {
             "public database and FTS APIs; excludes HTTP, scheduler dispatch and providers"
         }})
     );
+    // Summary report: read JSONL and emit Markdown table
+    if options.section == "summary" {
+        return summary::run_summary();
+    }
+    // New measurement sections with trial-based structure
+    if matches!(
+        options.section.as_str(),
+        "startup"
+            | "memory"
+            | "admission"
+            | "throughput"
+            | "streaming"
+            | "history"
+            | "database"
+            | "search"
+    ) {
+        return run_measurement_section(&options);
+    }
     if options.section == "provider-record" {
         return provider_record(&options);
     }
@@ -2487,4 +2525,978 @@ fn observability(options: &Options) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Run the backend as a server role for the measurement harness.
+///
+/// Parses CLI arguments, bootstraps the backend with an isolated data
+/// directory, registers the mock provider connection, starts the control
+/// plane and execution runtime, prints the handshake JSON, and waits for
+/// SIGTERM.
+fn run_server() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let mut data_dir: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
+    let mut provider_endpoint: Option<String> = None;
+    let mut port: u16 = 0;
+    let mut token: Option<String> = None;
+    let mut concurrency: usize = 8;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "server" => {}
+            "--data-dir" => {
+                data_dir = Some(PathBuf::from(
+                    args.next().ok_or("missing --data-dir value")?,
+                ));
+            }
+            "--workspace" => {
+                workspace = Some(PathBuf::from(
+                    args.next().ok_or("missing --workspace value")?,
+                ));
+            }
+            "--provider-endpoint" => {
+                provider_endpoint = Some(args.next().ok_or("missing --provider-endpoint value")?);
+            }
+            "--port" => {
+                port = args
+                    .next()
+                    .ok_or("missing --port value")?
+                    .parse()
+                    .map_err(|_| "invalid port")?;
+            }
+            "--token" => {
+                token = Some(args.next().ok_or("missing --token value")?);
+            }
+            "--concurrency" => {
+                concurrency = args
+                    .next()
+                    .ok_or("missing --concurrency value")?
+                    .parse()
+                    .map_err(|_| "invalid concurrency")?;
+            }
+            _ => return Err(format!("unknown server argument: {arg}").into()),
+        }
+    }
+
+    let data_dir = data_dir.ok_or("--data-dir is required")?;
+    let workspace = workspace.ok_or("--workspace is required")?;
+    let provider_endpoint = provider_endpoint.ok_or("--provider-endpoint is required")?;
+    let token = token.ok_or("--token is required")?;
+
+    // Bootstrap the data directory
+    let directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
+    let policy = ocg::system::policy::SystemPolicy::load_for_startup(&directory)?;
+    let worker = DatabaseWorker::start_with_policy(&directory, policy)?;
+    let handle = worker.handle();
+
+    // Register connection to mock provider
+    let connection = block_on(handle.create_config(Config {
+        name: "benchmark-provider".into(),
+        body: ConfigBody::Connection(ConnectionConfig {
+            protocol: LlmTransport::OpenAiChatCompletions,
+            endpoint: Some(provider_endpoint),
+            credential_ref: None,
+        }),
+    }))?;
+
+    // Register model with tool capabilities
+    let model = block_on(handle.create_config(Config {
+        name: "benchmark-model".into(),
+        body: ConfigBody::Model(ModelConfig {
+            reasoning_efforts: None,
+            connection_id: connection,
+            model: "benchmark-mock".into(),
+            context_window: None,
+            parameters: Default::default(),
+            declared_capabilities: BTreeSet::from([
+                ocg::db::entities::ModelCapability::Chat,
+                ocg::db::entities::ModelCapability::Tools,
+            ]),
+        }),
+    }))?;
+
+    // Register executor
+    let executor =
+        block_on(
+            handle.create_executor(Executor {
+                name: "benchmark-executor".into(),
+                concurrency_limit: NonZeroU32::new(u32::try_from(concurrency)?)
+                    .ok_or("concurrency must be positive")?,
+                llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+            }),
+        )?;
+    let pool: ocg::db::entities::ExecutionPoolId = executor.into();
+
+    // Create LLM profile
+    let llm_profile = model;
+
+    // Create agent profile with Coding capability (provides workspace tools)
+    let agent_profile = block_on(handle.create_config(Config {
+        name: "benchmark-agent-profile".into(),
+        body: ConfigBody::Agent(ocg::db::entities::AgentConfig {
+            capabilities: BTreeSet::from([ocg::db::entities::AgentCapability::Coding]),
+            models: vec![model],
+            ..Default::default()
+        }),
+    }))?;
+
+    // Create project
+    let project = block_on(
+        handle.create_project(ocg::db::entities::Project {
+            name: "benchmark-project".into(),
+            root: workspace
+                .to_str()
+                .ok_or("workspace path is not UTF-8")?
+                .to_owned(),
+            description: None,
+            commands: vec![],
+        }),
+    )?;
+
+    worker.shutdown()?;
+    let control_config = ocg::api::v1::ControlPlaneConfig::new(port, &token)?;
+    ocg::system::runtime::run_controlled(
+        &directory,
+        false,
+        Some(control_config),
+        move |context| async move {
+            // Print handshake JSON
+            println!(
+                "{}",
+                json!({
+                    "address": context.control_plane().map(|address| format!("http://{address}")),
+                    "token": token,
+                    "executor": executor.to_string(),
+                    "llm_profile": llm_profile.to_string(),
+                    "agent_profile": agent_profile.to_string(),
+                    "project": project.to_string(),
+                    "pool": pool.to_string(),
+                })
+            );
+
+            // Wait for termination signal (use ntex runtime)
+            let _ = ntex::rt::signals::signal().await;
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Dispatch to the appropriate measurement section.
+fn run_measurement_section(options: &Options) -> Result<()> {
+    let options = options.clone();
+    ntex::rt::System::new("benchmark-client", ntex::rt::DefaultRuntime).block_on(async move {
+        match options.section.as_str() {
+            "startup" => ntex::rt::spawn_blocking(move || measure_startup(&options)).await?,
+            "memory" => measure_memory(&options).await,
+            "admission" => measure_admission(&options).await,
+            "throughput" => measure_throughput(&options).await,
+            "streaming" => measure_streaming(&options).await,
+            "history" => measure_history(&options).await,
+            "search" => ntex::rt::spawn_blocking(move || measure_search(&options)).await?,
+            "database" => measure_database(&options).await,
+            _ => Err(format!("unknown measurement section: {}", options.section).into()),
+        }
+    })
+}
+
+/// Measure backend startup time.
+fn measure_startup(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::{FixtureConfig, FixtureGenerator};
+    use metadata::{BenchmarkMetadata, WorkloadParameters};
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let root = TemporaryRoot::new(&options.directory)?;
+    let fixture_config = FixtureConfig::small();
+    let generator = FixtureGenerator::new(fixture_config, root.0.clone());
+    let fixture_stats = generator.generate()?;
+    let metadata = BenchmarkMetadata::capture(root.0.clone(), "bench")?;
+    let parameters = WorkloadParameters::new("startup", 0, 1)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    for concurrency in ConcurrencyLevels::ALL {
+        for trial in 0..3 {
+            let trial_start = Instant::now();
+
+            let backend_config = BackendConfig {
+                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
+                workspace: generator.workspace_path().to_path_buf(),
+                provider_endpoint: "http://127.0.0.1:0".to_owned(),
+                port: 0,
+                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+                concurrency,
+                startup_timeout: Duration::from_secs(30),
+            };
+
+            let backend = BackendProcess::spawn(&backend_config)?;
+            let startup_duration = trial_start.elapsed();
+            backend.shutdown()?;
+
+            emit_trial_result(
+                &metadata,
+                &parameters,
+                concurrency,
+                trial,
+                startup_duration,
+                vec![startup_duration],
+                Default::default(),
+            );
+        }
+    }
+
+    emit_section_complete(&parameters);
+    Ok(())
+}
+
+/// Measure backend memory footprint.
+async fn prepare_measurement(
+    directory: PathBuf,
+    config: fixture::FixtureConfig,
+) -> Result<(
+    TemporaryRoot,
+    fixture::FixtureGenerator,
+    fixture::FixtureStats,
+    metadata::BenchmarkMetadata,
+)> {
+    ntex::rt::spawn_blocking(move || {
+        let root = TemporaryRoot::new(&directory)?;
+        let generator = fixture::FixtureGenerator::new(config, root.0.clone());
+        let stats = generator.generate()?;
+        let metadata = metadata::BenchmarkMetadata::capture(root.0.clone(), "bench")?;
+        Ok((root, generator, stats, metadata))
+    })
+    .await?
+}
+
+async fn measure_memory(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::FixtureConfig;
+    use metadata::WorkloadParameters;
+    use mock_provider::MockProvider;
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let (root, generator, fixture_stats, metadata) =
+        prepare_measurement(options.directory.clone(), FixtureConfig::medium()).await?;
+    let parameters = WorkloadParameters::new("memory", 0, 0)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    // Start mock provider
+    let mock_config = mock_provider::MockProviderConfig::default();
+    let provider = MockProvider::start(mock_config)?;
+
+    // Measure at reference concurrency only for memory baseline
+    let concurrency = ConcurrencyLevels::REFERENCE;
+
+    for trial in 0..3 {
+        let backend_config = BackendConfig {
+            data_dir: root.0.join(format!("data-{trial}")),
+            workspace: generator.workspace_path().to_path_buf(),
+            provider_endpoint: provider.endpoint(),
+            port: 0,
+            token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+            concurrency,
+            startup_timeout: Duration::from_secs(30),
+        };
+
+        let backend =
+            ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
+
+        // Give backend time to load workspace and stabilize
+        ntex::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Sample RSS after startup
+        let pid = backend.pid();
+        let rss_bytes =
+            ntex::rt::spawn_blocking(move || crate::benchmark::process_rss_bytes(pid)).await?;
+
+        ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
+
+        emit_trial_result(
+            &metadata,
+            &parameters,
+            concurrency,
+            trial,
+            std::time::Duration::ZERO,
+            vec![],
+            crate::benchmark::OutcomeCounts::default(),
+        );
+
+        // Emit memory measurement as metadata
+        println!(
+            "{}",
+            json!({
+                "type": "memory_sample",
+                "section": "memory",
+                "trial": trial,
+                "concurrency": concurrency,
+                "rss_bytes": rss_bytes,
+            })
+        );
+    }
+
+    provider.stop().await?;
+    emit_section_complete(&parameters);
+    ntex::rt::spawn_blocking(move || drop(root)).await?;
+    Ok(())
+}
+
+/// Measure job admission latency.
+async fn measure_admission(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::FixtureConfig;
+    use http_client::BenchmarkClient;
+    use metadata::WorkloadParameters;
+    use mock_provider::MockProvider;
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let (root, generator, fixture_stats, metadata) =
+        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
+    let parameters = WorkloadParameters::new("admission", 0, 50)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    let mock_config = mock_provider::MockProviderConfig::default();
+    let provider = MockProvider::start(mock_config)?;
+
+    for concurrency in ConcurrencyLevels::ALL {
+        for trial in 0..3 {
+            let backend_config = BackendConfig {
+                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
+                workspace: generator.workspace_path().to_path_buf(),
+                provider_endpoint: provider.endpoint(),
+                port: 0,
+                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+                concurrency,
+                startup_timeout: Duration::from_secs(30),
+            };
+
+            let backend =
+                ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
+            let handshake = backend.handshake();
+
+            let mut samples = crate::benchmark::Samples::new();
+            let mut counts = crate::benchmark::OutcomeCounts::default();
+
+            // Measure admission latency for 50 jobs
+            async {
+                let client =
+                    BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
+
+                for _ in 0..50 {
+                    let start = std::time::Instant::now();
+                    match client
+                        .submit_job(
+                            &handshake.executor,
+                            &handshake.llm_profile,
+                            &handshake.agent_profile,
+                            &handshake.project,
+                            "benchmark admission",
+                        )
+                        .await
+                    {
+                        Ok(_) => {
+                            let duration = start.elapsed();
+                            samples.add(duration);
+                            counts.record_success();
+                        }
+                        Err(e) => {
+                            eprintln!("admission failed: {}", e);
+                            counts.record_failure(crate::benchmark::Outcome::Failed);
+                        }
+                    }
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            }
+            .await?;
+
+            ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
+
+            samples.sort();
+            emit_trial_result(
+                &metadata,
+                &parameters,
+                concurrency,
+                trial,
+                std::time::Duration::ZERO,
+                samples.durations.clone(),
+                counts,
+            );
+        }
+    }
+
+    provider.stop().await?;
+    emit_section_complete(&parameters);
+    ntex::rt::spawn_blocking(move || drop(root)).await?;
+    Ok(())
+}
+
+/// Measure job throughput.
+async fn measure_throughput(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::FixtureConfig;
+    use http_client::BenchmarkClient;
+    use metadata::WorkloadParameters;
+    use mock_provider::MockProvider;
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let (root, generator, fixture_stats, metadata) =
+        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
+    let parameters = WorkloadParameters::new("throughput", 0, 30)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    let mock_config = mock_provider::MockProviderConfig::default();
+    let provider = MockProvider::start(mock_config)?;
+
+    for concurrency in ConcurrencyLevels::ALL {
+        for trial in 0..3 {
+            let backend_config = BackendConfig {
+                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
+                workspace: generator.workspace_path().to_path_buf(),
+                provider_endpoint: provider.endpoint(),
+                port: 0,
+                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+                concurrency,
+                startup_timeout: Duration::from_secs(30),
+            };
+
+            let backend =
+                ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
+            let handshake = backend.handshake();
+
+            let mut samples = crate::benchmark::Samples::new();
+            let mut counts = crate::benchmark::OutcomeCounts::default();
+            let wall_start = std::time::Instant::now();
+
+            // Run reference job workload to completion
+            async {
+                let client =
+                    BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
+
+                for _ in 0..30 {
+                    let start = std::time::Instant::now();
+                    match client
+                        .submit_job(
+                            &handshake.executor,
+                            &handshake.llm_profile,
+                            &handshake.agent_profile,
+                            &handshake.project,
+                            "benchmark throughput",
+                        )
+                        .await
+                    {
+                        Ok(job_id) => {
+                            match client
+                                .wait_for_settlement(&job_id, std::time::Duration::from_secs(30))
+                                .await
+                            {
+                                Ok(_) => {
+                                    let duration = start.elapsed();
+                                    samples.add(duration);
+                                    counts.record_success();
+                                }
+                                Err(e) => {
+                                    eprintln!("settlement failed: {}", e);
+                                    counts.record_failure(crate::benchmark::Outcome::Failed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("submission failed: {}", e);
+                            counts.record_failure(crate::benchmark::Outcome::Failed);
+                        }
+                    }
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            }
+            .await?;
+
+            let wall_elapsed = wall_start.elapsed();
+
+            ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
+
+            samples.sort();
+            emit_trial_result(
+                &metadata,
+                &parameters,
+                concurrency,
+                trial,
+                wall_elapsed,
+                samples.durations.clone(),
+                counts,
+            );
+        }
+    }
+
+    provider.stop().await?;
+    emit_section_complete(&parameters);
+    ntex::rt::spawn_blocking(move || drop(root)).await?;
+    Ok(())
+}
+
+/// Measure streaming delivery latency.
+async fn measure_streaming(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::FixtureConfig;
+    use http_client::BenchmarkClient;
+    use metadata::WorkloadParameters;
+    use mock_provider::MockProvider;
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let (root, generator, fixture_stats, metadata) =
+        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
+    let parameters = WorkloadParameters::new("streaming", 0, 30)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    let mock_config = mock_provider::MockProviderConfig::default();
+    let provider = MockProvider::start(mock_config)?;
+
+    for concurrency in ConcurrencyLevels::ALL {
+        for trial in 0..3 {
+            let backend_config = BackendConfig {
+                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
+                workspace: generator.workspace_path().to_path_buf(),
+                provider_endpoint: provider.endpoint(),
+                port: 0,
+                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+                concurrency,
+                startup_timeout: Duration::from_secs(30),
+            };
+
+            let backend =
+                ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
+            let handshake = backend.handshake();
+
+            let mut samples = crate::benchmark::Samples::new();
+            let mut counts = crate::benchmark::OutcomeCounts::default();
+
+            // Measure time to first output event
+            async {
+                let client =
+                    BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
+
+                for _ in 0..30 {
+                    let start = std::time::Instant::now();
+                    match client
+                        .submit_job(
+                            &handshake.executor,
+                            &handshake.llm_profile,
+                            &handshake.agent_profile,
+                            &handshake.project,
+                            "benchmark streaming",
+                        )
+                        .await
+                    {
+                        Ok(job_id) => {
+                            // Poll for first output event via SSE
+                            let http_client =
+                                http_client::client(std::time::Duration::from_secs(10))
+                                    .await
+                                    .map_err(|e| format!("HTTP client failed: {}", e))?;
+
+                            match http_client
+                                .get(format!(
+                                    "{}/api/v1/jobs/{}/events",
+                                    handshake.address, job_id
+                                ))
+                                .set_header("Authorization", format!("Bearer {}", handshake.token))
+                                .set_header("Accept", "text/event-stream")
+                                .send()
+                                .await
+                            {
+                                Ok(response) if response.status().is_success() => {
+                                    match response.body().await {
+                                        Ok(body) => {
+                                            let text = String::from_utf8_lossy(&body);
+                                            // Look for first output event (not just job announcement)
+                                            if text.contains("event: output") {
+                                                let duration = start.elapsed();
+                                                samples.add(duration);
+                                                counts.record_success();
+                                            } else {
+                                                counts.record_failure(
+                                                    crate::benchmark::Outcome::Failed,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("body read failed: {}", e);
+                                            counts
+                                                .record_failure(crate::benchmark::Outcome::Failed);
+                                        }
+                                    }
+                                }
+                                Ok(response) => {
+                                    eprintln!("HTTP status {}", response.status());
+                                    counts.record_failure(crate::benchmark::Outcome::Failed);
+                                }
+                                Err(e) => {
+                                    eprintln!("SSE request failed: {}", e);
+                                    counts.record_failure(crate::benchmark::Outcome::Failed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("submission failed: {}", e);
+                            counts.record_failure(crate::benchmark::Outcome::Failed);
+                        }
+                    }
+                }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            }
+            .await?;
+
+            ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
+
+            samples.sort();
+            emit_trial_result(
+                &metadata,
+                &parameters,
+                concurrency,
+                trial,
+                std::time::Duration::ZERO,
+                samples.durations.clone(),
+                counts,
+            );
+        }
+    }
+
+    provider.stop().await?;
+    emit_section_complete(&parameters);
+    ntex::rt::spawn_blocking(move || drop(root)).await?;
+    Ok(())
+}
+
+/// Measure history read latency.
+async fn measure_history(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::FixtureConfig;
+    use http_client::BenchmarkClient;
+    use metadata::WorkloadParameters;
+    use mock_provider::MockProvider;
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let (root, generator, fixture_stats, metadata) =
+        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
+    let parameters = WorkloadParameters::new("history", ConcurrencyLevels::REFERENCE, 50)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    let mock_config = mock_provider::MockProviderConfig::default();
+    let provider = MockProvider::start(mock_config)?;
+
+    for trial in 0..3 {
+        let backend_config = BackendConfig {
+            data_dir: root.0.join(format!("data-{trial}")),
+            workspace: generator.workspace_path().to_path_buf(),
+            provider_endpoint: provider.endpoint(),
+            port: 0,
+            token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+            concurrency: ConcurrencyLevels::REFERENCE,
+            startup_timeout: Duration::from_secs(30),
+        };
+
+        let backend =
+            ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
+        let handshake = backend.handshake();
+
+        let mut samples = crate::benchmark::Samples::new();
+        let mut counts = crate::benchmark::OutcomeCounts::default();
+
+        // Populate with some jobs first
+        async {
+            let client = BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
+
+            // Submit and settle 20 jobs to create history
+            for _ in 0..20 {
+                if let Ok(job_id) = client
+                    .submit_job(
+                        &handshake.executor,
+                        &handshake.llm_profile,
+                        &handshake.agent_profile,
+                        &handshake.project,
+                        "benchmark history",
+                    )
+                    .await
+                {
+                    let _ = client
+                        .wait_for_settlement(&job_id, std::time::Duration::from_secs(30))
+                        .await;
+                }
+            }
+
+            // Now measure observation read latency
+            let http_client = http_client::client(std::time::Duration::from_secs(10))
+                .await
+                .map_err(|e| format!("HTTP client failed: {}", e))?;
+
+            for _ in 0..50 {
+                let start = std::time::Instant::now();
+                match http_client
+                    .get(format!("{}/api/v1/observations", handshake.address))
+                    .set_header("Authorization", format!("Bearer {}", handshake.token))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.status().is_success() => {
+                        let duration = start.elapsed();
+                        samples.add(duration);
+                        counts.record_success();
+                    }
+                    Ok(response) => {
+                        eprintln!("HTTP status {}", response.status());
+                        counts.record_failure(crate::benchmark::Outcome::Failed);
+                    }
+                    Err(e) => {
+                        eprintln!("request failed: {}", e);
+                        counts.record_failure(crate::benchmark::Outcome::Failed);
+                    }
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await?;
+
+        ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
+
+        samples.sort();
+        emit_trial_result(
+            &metadata,
+            &parameters,
+            ConcurrencyLevels::REFERENCE,
+            trial,
+            std::time::Duration::ZERO,
+            samples.durations.clone(),
+            counts,
+        );
+    }
+
+    provider.stop().await?;
+    emit_section_complete(&parameters);
+    ntex::rt::spawn_blocking(move || drop(root)).await?;
+    Ok(())
+}
+
+/// Measure workspace search (FTS) build and query latency.
+fn measure_search(options: &Options) -> Result<()> {
+    use fixture::{FixtureConfig, FixtureGenerator};
+    use ocg::service::fts::{FtsLimits, WorkspaceFts};
+    use ocg::system::executor::workspace_read::Workspace;
+    use workload::ConcurrencyLevels;
+
+    let root = TemporaryRoot::new(&options.directory)?;
+    let workspace_path = root.0.join("workspace");
+    let fixture_config = FixtureConfig::medium();
+    let generator = FixtureGenerator::new(fixture_config, workspace_path.clone());
+    let fixture_stats = generator
+        .generate()
+        .map_err(|e| format!("fixture generation failed: {}", e))?;
+
+    // Authorize workspace for FTS
+    let data_dir = root.0.join("data");
+    let directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
+    let workspace = Workspace::authorize(&generator.workspace_path(), &directory)?;
+
+    // Emit section begin
+    println!(
+        "{}",
+        json!({
+            "type": "begin",
+            "section": "search",
+        })
+    );
+
+    // Run 3 trials at reference concurrency only
+    for trial in 0..3 {
+        // Create a new FTS index for each trial
+        let index = WorkspaceFts::new(workspace.clone(), FtsLimits::default());
+
+        // Measure index build time
+        let build_start = Instant::now();
+        let built = index.build()?;
+        let build_duration = build_start.elapsed();
+
+        if !built.coverage.complete {
+            return Err(format!(
+                "incomplete search index in trial {}: {:?}",
+                trial, built.coverage
+            )
+            .into());
+        }
+
+        // Emit build time measurement
+        let build_parameters = json!({
+            "trial": trial,
+            "fixture_size": "medium",
+            "fixture_files": fixture_stats.file_count,
+            "fixture_bytes": fixture_stats.total_file_bytes,
+            "files_indexed": built.coverage.files_indexed,
+            "content_bytes_indexed": built.coverage.content_bytes_indexed,
+            "tokens_indexed": built.coverage.tokens_indexed,
+        });
+
+        println!(
+            "{}",
+            json!({
+                "type": "measurement",
+                "name": "search.build",
+                "parameters": build_parameters,
+                "samples": 1,
+                "build_ms": build_duration.as_secs_f64() * 1000.0,
+                "memory_bytes_approx": built.memory_bytes_approx,
+            })
+        );
+
+        // Measure query latency for each query type
+        let mut query_durations = Vec::new();
+        for (_class, query) in SEARCH_QUERIES {
+            let query_start = Instant::now();
+            let _result = index.search(query, 20)?;
+            let query_duration = query_start.elapsed();
+            query_durations.push(query_duration);
+        }
+
+        // Emit query latency measurement
+        let query_parameters = json!({
+            "trial": trial,
+            "concurrency": ConcurrencyLevels::REFERENCE,
+            "query_count": SEARCH_QUERIES.len(),
+            "result_limit": 20,
+            "fixture_size": "medium",
+        });
+
+        report("search.query", &query_parameters, query_durations, None);
+    }
+
+    // Emit section complete
+    println!(
+        "{}",
+        json!({
+            "type": "complete",
+            "section": "search",
+        })
+    );
+
+    Ok(())
+}
+
+/// Measure database footprint.
+async fn measure_database(options: &Options) -> Result<()> {
+    use backend_process::{BackendConfig, BackendProcess};
+    use fixture::FixtureConfig;
+    use http_client::BenchmarkClient;
+    use metadata::WorkloadParameters;
+    use mock_provider::MockProvider;
+    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
+    use workload::ConcurrencyLevels;
+
+    let (root, generator, fixture_stats, metadata) =
+        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
+    let parameters = WorkloadParameters::new("database", ConcurrencyLevels::REFERENCE, 10)
+        .with_fixture_size(fixture_stats.file_count)
+        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
+
+    emit_begin(&parameters);
+
+    let mock_config = mock_provider::MockProviderConfig::default();
+    let provider = MockProvider::start(mock_config)?;
+
+    for trial in 0..3 {
+        let data_dir = root.0.join(format!("data-{trial}"));
+        let backend_config = BackendConfig {
+            data_dir: data_dir.clone(),
+            workspace: generator.workspace_path().to_path_buf(),
+            provider_endpoint: provider.endpoint(),
+            port: 0,
+            token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
+            concurrency: ConcurrencyLevels::REFERENCE,
+            startup_timeout: Duration::from_secs(30),
+        };
+
+        let backend =
+            ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
+        let handshake = backend.handshake();
+
+        // Run a small workload to populate database
+        async {
+            let client = BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
+
+            for _ in 0..10 {
+                let job_id = client
+                    .submit_job(
+                        &handshake.executor,
+                        &handshake.llm_profile,
+                        &handshake.agent_profile,
+                        &handshake.project,
+                        "benchmark objective",
+                    )
+                    .await
+                    .map_err(|e| format!("job submission failed: {}", e))?;
+
+                client
+                    .wait_for_settlement(&job_id, std::time::Duration::from_secs(30))
+                    .await
+                    .map_err(|e| format!("settlement wait failed: {}", e))?;
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+        }
+        .await?;
+
+        ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
+
+        // Measure database footprint after workload
+        let db_bytes = ntex::rt::spawn_blocking(move || -> Result<u64> {
+            let data_directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
+            Ok(crate::benchmark::database_bytes(&data_directory)?)
+        })
+        .await??;
+
+        emit_trial_result(
+            &metadata,
+            &parameters,
+            ConcurrencyLevels::REFERENCE,
+            trial,
+            std::time::Duration::ZERO,
+            vec![],
+            crate::benchmark::OutcomeCounts::default(),
+        );
+
+        println!(
+            "{}",
+            json!({
+                "type": "database_footprint",
+                "section": "database",
+                "trial": trial,
+                "bytes": db_bytes,
+            })
+        );
+    }
+
+    provider.stop().await?;
+    emit_section_complete(&parameters);
+    ntex::rt::spawn_blocking(move || drop(root)).await?;
+    Ok(())
 }

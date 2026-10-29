@@ -604,43 +604,29 @@ impl Batch {
             | ProfileCredentialRef::Explicit(_) => None,
         };
 
-        let (_has_executor, generated_refs) = self.step(|tx| {
-            let mut has_executor = false;
+        let generated_refs = self.step(|tx| {
             let mut generated_refs = (false, std::collections::BTreeSet::new());
             let table = tx.open_table(CONFIGS)?;
             for entry in table.iter()? {
                 let (key, bytes) = entry?;
                 let row = ConfigRow::decode_at(key.value(), bytes.value())?;
-                match &row.body {
-                    ConfigBody::Connection(connection) => {
-                        if let Some(base) = generated_base
-                            && let Some(reference) = connection.credential_ref.as_deref()
-                        {
-                            if reference == base {
-                                generated_refs.0 = true;
-                            } else if let Some(suffix) = reference
-                                .strip_prefix(base)
-                                .and_then(|value| value.strip_prefix('_'))
-                                && let Ok(number) = suffix.parse::<u64>()
-                                && number.to_string() == suffix
-                            {
-                                generated_refs.1.insert(number);
-                            }
-                        }
-                    }
-                    ConfigBody::Pool(pool)
-                        if pool.capability_set().llm_protocols.contains(&protocol) =>
+                if let ConfigBody::Connection(connection) = &row.body
+                    && let Some(base) = generated_base
+                    && let Some(reference) = connection.credential_ref.as_deref()
+                {
+                    if reference == base {
+                        generated_refs.0 = true;
+                    } else if let Some(suffix) = reference
+                        .strip_prefix(base)
+                        .and_then(|value| value.strip_prefix('_'))
+                        && let Ok(number) = suffix.parse::<u64>()
+                        && number.to_string() == suffix
                     {
-                        has_executor = true;
+                        generated_refs.1.insert(number);
                     }
-                    ConfigBody::Model(_)
-                    | ConfigBody::Agent(_)
-                    | ConfigBody::Pool(_)
-                    | ConfigBody::DecisionModel(_)
-                    | ConfigBody::DecisionAgent(_) => {}
                 }
             }
-            Ok((has_executor, generated_refs))
+            Ok(generated_refs)
         })?;
 
         let credential_ref = match save.credential_ref {
