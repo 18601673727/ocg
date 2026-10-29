@@ -396,7 +396,8 @@ function key(ctx: WalkContext): number {
  * links, images and escapes nests correctly instead of re-reading the same
  * tokens.
  */
-function inline(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length): ReactNode[] {
+function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.length): ReactNode[] {
+  const ctx = { ...parent, nextKey: { current: 0 } };
   const out: ReactNode[] = [];
 
   for (let i = from; i < to; i++) {
@@ -589,7 +590,8 @@ function listItem(
   ];
 }
 
-function walk(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length): ReactNode[] {
+function walk(parent: WalkContext, tokens: Token[], from = 0, to = tokens.length): ReactNode[] {
+  const ctx = { ...parent, nextKey: { current: 0 } };
   const out: ReactNode[] = [];
 
   for (let i = from; i < to; i++) {
@@ -696,7 +698,11 @@ function walk(ctx: WalkContext, tokens: Token[], from = 0, to = tokens.length): 
         out.push(<hr key={key(ctx)} className="my-6 border-border" />);
         break;
       case "table_open":
-        out.push(table(ctx, tokens, i));
+        out.push(
+          <Fragment key={key(ctx)}>
+            {table({ ...ctx, nextKey: { current: 0 } }, tokens, i)}
+          </Fragment>,
+        );
         i = tableEnd(tokens, i);
         break;
       case "html_block":

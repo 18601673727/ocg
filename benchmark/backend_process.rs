@@ -1,35 +1,21 @@
-//! The backend, isolated in its own process.
-//!
-//! A measurement that runs the backend inside the harness measures the
-//! harness as much as the backend, and a run that leaves a backend behind
-//! measures whatever the next run left on disk. The backend therefore runs
-//! as a child process of its own, with its own data directory, and the
-//! harness talks to it over the control plane it serves.
-
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-/// How the child backend is started.
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
-    /// The directory the child keeps its database and logs in.
     pub data_dir: PathBuf,
-    /// The workspace the child's Project is rooted at.
     pub workspace: PathBuf,
-    /// The endpoint of the mock provider the child sends its requests to.
     pub provider_endpoint: String,
-    /// The port the child's control plane listens on; 0 for any free one.
     pub port: u16,
-    /// The bearer token the child's control plane requires.
     pub token: String,
-    /// How many jobs the child's pool may run at once.
     pub concurrency: usize,
-    /// How long the child may take to become ready.
     pub startup_timeout: Duration,
+    pub shutdown_timeout: Duration,
+    pub hang_before_handshake: bool,
 }
 
 impl BackendConfig {
@@ -48,11 +34,12 @@ impl BackendConfig {
             token,
             concurrency,
             startup_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(15),
+            hang_before_handshake: false,
         }
     }
 }
 
-/// What the child reported about itself once it was ready.
 #[derive(Clone, Debug)]
 pub struct BackendHandshake {
     pub address: String,
@@ -62,7 +49,6 @@ pub struct BackendHandshake {
     pub agent_profile: String,
     pub project: String,
     pub pool: String,
-    /// How long the child took from spawn to ready.
     pub startup: Duration,
 }
 
@@ -74,10 +60,11 @@ impl BackendHandshake {
             value
                 .get(name)
                 .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
                 .map(str::to_owned)
                 .ok_or_else(|| format!("the backend handshake has no {name}"))
         };
-        Ok(Self {
+        let handshake = Self {
             address: field("address")?,
             token: field("token")?,
             executor: field("executor")?,
@@ -86,27 +73,43 @@ impl BackendHandshake {
             project: field("project")?,
             pool: field("pool")?,
             startup,
-        })
+        };
+        if !handshake.address.starts_with("http://") && !handshake.address.starts_with("https://") {
+            return Err(format!("invalid backend address: {}", handshake.address));
+        }
+        Ok(handshake)
     }
 }
 
-/// A running child backend.
-pub struct BackendProcess {
+struct ChildOwner {
     child: Child,
+}
+
+impl Drop for ChildOwner {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            eprintln!(
+                "forcing cleanup of benchmark backend child {}",
+                self.child.id()
+            );
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+pub struct BackendProcess {
+    owner: ChildOwner,
     handshake: BackendHandshake,
     pid: u32,
+    shutdown_timeout: Duration,
 }
 
 impl BackendProcess {
-    /// Starts the child and waits for it to report that it is ready.
-    ///
-    /// The startup time the handshake carries is the time from the spawn to
-    /// that report, which is what a cold start costs: the process is new,
-    /// its data directory is empty and its database has to be created.
     pub fn spawn(config: &BackendConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let executable = std::env::current_exe()?;
         let started = Instant::now();
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg("server")
             .arg("--data-dir")
             .arg(&config.data_dir)
@@ -120,21 +123,29 @@ impl BackendProcess {
             .arg(&config.token)
             .arg("--concurrency")
             .arg(config.concurrency.to_string())
-            .stdin(Stdio::null())
+            .args(if config.hang_before_handshake {
+                vec!["--hang-before-handshake"]
+            } else {
+                Vec::new()
+            })
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()?;
 
         let pid = child.id();
-        let stdout = child
+        let mut owner = ChildOwner { child };
+        let stdout = owner
+            .child
             .stdout
             .take()
             .ok_or("the backend child has no standard output")?;
         let handshake = read_handshake(stdout, started, config.startup_timeout, pid)?;
         Ok(Self {
-            child,
+            owner,
             handshake,
             pid,
+            shutdown_timeout: config.shutdown_timeout,
         })
     }
 
@@ -146,55 +157,104 @@ impl BackendProcess {
         self.pid
     }
 
-    /// The base URL of the child's control plane.
     pub fn base_url(&self) -> &str {
         &self.handshake.address
     }
 
-    /// Stops the child and waits for it to exit.
     pub fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.child.kill()?;
-        self.child.wait()?;
-        Ok(())
+        request_graceful_shutdown(&mut self.owner.child)?;
+        let deadline = Instant::now() + self.shutdown_timeout;
+        loop {
+            if let Some(status) = self.owner.child.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!("backend child exited unsuccessfully: {status}").into());
+            }
+            if Instant::now() >= deadline {
+                self.owner.child.kill()?;
+                let status = self.owner.child.wait()?;
+                return Err(format!(
+                    "backend child required forced termination after {:?}; it is not a clean close (status {status})",
+                    self.shutdown_timeout
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
-impl Drop for BackendProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+fn request_graceful_shutdown(
+    child: &mut Child,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or("backend shutdown pipe is unavailable")?;
+    stdin.write_all(b"\n")?;
+    stdin.flush()?;
+    Ok(())
 }
 
-/// Reads the child's handshake line, ignoring anything it logged before it.
 fn read_handshake(
     stdout: std::process::ChildStdout,
     started: Instant,
     timeout: Duration,
     pid: u32,
 ) -> Result<BackendHandshake, Box<dyn std::error::Error + Send + Sync>> {
-    let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(Err("backend standard output closed".to_owned()));
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(Ok(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    return;
+                }
+            }
+        }
+    });
     let deadline = Instant::now() + timeout;
     loop {
-        if Instant::now() > deadline {
-            return Err(
-                format!("the backend child {pid} did not become ready within {timeout:?}").into(),
-            );
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                format!("the backend child {pid} did not become ready within {timeout:?}")
+            })?;
+        match receiver.recv_timeout(remaining) {
+            Ok(Ok(line)) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with('{') {
+                    return BackendHandshake::parse(trimmed, started.elapsed()).map_err(Into::into);
+                }
+                eprintln!("backend {pid}: {trimmed}");
+            }
+            Ok(Err(error)) => {
+                return Err(format!("backend child {pid} handshake read failed: {error}").into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "the backend child {pid} did not become ready within {timeout:?}"
+                )
+                .into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("the backend child {pid} exited before it was ready").into());
+            }
         }
-        line.clear();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            return Err(format!("the backend child {pid} exited before it was ready").into());
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('{') {
-            return Ok(BackendHandshake::parse(trimmed, started.elapsed())?);
-        }
-        // Anything else the child printed is a log line, not the handshake.
-        eprintln!("backend {pid}: {trimmed}");
     }
 }

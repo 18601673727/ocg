@@ -1248,7 +1248,7 @@ pub(super) async fn conversation_context(
 /// `POST /api/v1/conversations/{job}`: renames the conversation whose root
 /// is `root`, hides it for good, or updates its limits. No Job spec changes.
 pub(super) async fn edit_conversation(
-    database: &DatabaseHandle,
+    shared: &Shared,
     root: JobId,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
@@ -1270,13 +1270,29 @@ pub(super) async fn edit_conversation(
         }
         _ => return Err(INVALID_REQUEST),
     };
-    database
-        .set_conversation(root, edit)
-        .await
-        .map_err(|error| match error {
-            DatabaseError::Rejected(Violation::NotFound(RecordRef::Job(_))) => NOT_FOUND,
-            other => profiles::map_mutation_error(other),
-        })?;
+    let map_error = |error| match error {
+        DatabaseError::Rejected(Violation::NotFound(RecordRef::Job(_))) => NOT_FOUND,
+        other => profiles::map_mutation_error(other),
+    };
+    if matches!(edit, JobEdit::Hide) {
+        let action = shared
+            .database
+            .hide_conversation(root)
+            .await
+            .map_err(map_error)?;
+        for running in action.running {
+            shared
+                .scheduler
+                .stop(running, crate::db::entities::StopCause::Closed)
+                .await;
+        }
+    } else {
+        shared
+            .database
+            .set_conversation(root, edit)
+            .await
+            .map_err(map_error)?;
+    }
     Ok(Reply::ok(envelope(serde_json::json!(
         ConversationEditedView {
             conversation: root.to_string(),

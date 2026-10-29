@@ -656,7 +656,7 @@ pub(super) async fn respond(
         }
         Route::JobEdit(job) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
-            catalog::edit_conversation(database, job, &body).await
+            catalog::edit_conversation(shared, job, &body).await
         }
         Route::Outputs {
             job,

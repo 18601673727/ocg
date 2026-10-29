@@ -117,15 +117,20 @@ fn write_workload(
 }
 
 fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
+    let started = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let read_latencies = Arc::new(Mutex::new(Vec::new()));
     let readers: Vec<_> = (0..2)
         .map(|_| {
             let handle = handle.clone();
+            let started = started.clone();
             let stop = stop.clone();
             let read_latencies = read_latencies.clone();
             std::thread::spawn(move || -> Result<(), DatabaseError> {
                 let mut local = Vec::new();
+                while !started.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
                 while !stop.load(Ordering::Relaxed) {
                     let began = Instant::now();
                     block_on(handle.projects(None, 20))?;
@@ -140,6 +145,7 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
         })
         .collect();
     let before = projects_now();
+    started.store(true, Ordering::Relaxed);
     let written = write_workload(handle, 16, 60, "mixed");
     stop.store(true, Ordering::Relaxed);
     for reader in readers {
@@ -170,51 +176,67 @@ fn read_while_writing(handle: &DatabaseHandle) -> BenchResult<()> {
     Ok(())
 }
 
+fn run_case(
+    root: &std::path::Path,
+    operation: impl FnOnce(&DatabaseHandle) -> BenchResult<()>,
+) -> BenchResult<()> {
+    std::fs::remove_dir_all(root).ok();
+    let directory = DataDirectory::bootstrap(root.to_path_buf().into_os_string())?;
+    let worker = DatabaseWorker::start(&directory)?;
+    let handle = worker.handle();
+    let outcome = (|| -> BenchResult<()> {
+        PROJECTS.store(0, Ordering::Relaxed);
+        write_workload(&handle, 1, 20, "warm")?;
+        operation(&handle)?;
+        let size = std::fs::metadata(ocg_database_file(&directory)?)?.len();
+        println!("database file: {size} bytes; initial projects before measurement: 20");
+        Ok(())
+    })();
+    let shutdown = worker.shutdown();
+    std::fs::remove_dir_all(root).ok();
+    outcome?;
+    shutdown?;
+    Ok(())
+}
+
 fn main() -> BenchResult<()> {
-    // `cargo bench` appends `--bench`; the first plain argument selects a section.
     let section = std::env::args()
         .skip(1)
         .find(|argument| !argument.starts_with("--"))
         .unwrap_or_else(|| "all".to_string());
     let selected = |name: &str| section == "all" || section == name;
-
     let root = std::env::temp_dir().join(format!("ocg-bench-{}", std::process::id()));
-    std::fs::remove_dir_all(&root).ok();
-    let directory = DataDirectory::bootstrap(root.clone().into_os_string())?;
-    let worker = DatabaseWorker::start(&directory)?;
-    let handle = worker.handle();
 
-    let outcome = (|| -> BenchResult<()> {
-        write_workload(&handle, 1, 20, "warm")?;
-        if selected("serial") {
+    if selected("serial") {
+        run_case(&root.join("serial"), |handle| {
             let before = projects_now();
-            let (latencies, elapsed) = write_workload(&handle, 1, 300, "serial")?;
+            let (latencies, elapsed) = write_workload(handle, 1, 300, "serial")?;
             report("serial,      1 writer ", before, latencies, elapsed);
-        }
-        if selected("concurrent") {
-            for writers in [4usize, 16, 64] {
+            Ok(())
+        })?;
+    }
+    if selected("concurrent") {
+        for writers in [4usize, 16, 64] {
+            run_case(&root.join(format!("concurrent-{writers}")), |handle| {
                 let per_writer = 600 / writers.min(60) + 20;
                 let before = projects_now();
                 let (latencies, elapsed) =
-                    write_workload(&handle, writers, per_writer, &format!("c{writers}"))?;
+                    write_workload(handle, writers, per_writer, &format!("c{writers}"))?;
                 report(
                     &format!("concurrent, {writers:>2} writers"),
                     before,
                     latencies,
                     elapsed,
                 );
-            }
+                Ok(())
+            })?;
         }
-        if selected("reads") {
-            read_while_writing(&handle)?;
-        }
-        let size = std::fs::metadata(ocg_database_file(&directory)?)?.len();
-        println!("database file: {size} bytes");
-        Ok(())
-    })();
-    worker.shutdown()?;
+    }
+    if selected("reads") {
+        run_case(&root.join("reads"), read_while_writing)?;
+    }
     std::fs::remove_dir_all(&root).ok();
-    outcome
+    Ok(())
 }
 
 fn ocg_database_file(directory: &DataDirectory) -> BenchResult<std::path::PathBuf> {

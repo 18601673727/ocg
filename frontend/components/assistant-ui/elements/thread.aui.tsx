@@ -17,7 +17,6 @@ import {
   ReasoningTrigger,
   estimateReasoningTokens,
 } from "@/components/assistant-ui/elements/reasoning.aui";
-import { SmoothMarkdownText } from "@/components/assistant-ui/elements/smooth-markdown-text";
 import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
 import {
   ToolGroupContent,
@@ -619,6 +618,9 @@ const AssistantMessage: FC = () => {
     | import("@/components/ocg/markdown/source-snapshot").FileSnapshot[]
     | undefined;
   const unsettled = useAuiState((s) => s.message.status?.type === "running");
+  const showActivityIndicator = useAuiState(
+    (s) => s.message.metadata.custom.showActivityIndicator === true,
+  );
   const compaction = useAuiState((s) => s.message.metadata.custom.compaction);
   const agentInstruction = useAuiState((s) => s.message.metadata.custom.agentInstruction === true);
   const intermediate = useAuiState((s) => s.message.metadata.custom.intermediate === true);
@@ -689,19 +691,17 @@ const AssistantMessage: FC = () => {
       </MessagePrimitive.Root>
     );
 
-  if ((intermediate || unsettled) && messageParts.length === 0 && !failureReason && !MessageFooter)
-    return null;
+  const hasVisibleParts = messageParts.some(
+    (part) => part.type !== "text" || part.text.trim().length > 0,
+  );
+  if (intermediate && !hasVisibleParts && !failureReason && !MessageFooter) return null;
 
   return (
     <MessagePrimitive.Root
       data-slot="aui_assistant-message-root"
       data-role="assistant"
       data-intermediate={intermediate || undefined}
-      className={cn(
-        "relative -mb-7.5 pb-7.5 [content-visibility:auto]",
-        intermediate ? "[contain-intrinsic-size:auto_48px]" : "[contain-intrinsic-size:auto_200px]",
-        unsettled && "fade-in slide-in-from-bottom-1 animate-in duration-150",
-      )}
+      className="relative -mb-7.5 pb-7.5"
     >
       <div
         data-slot="aui_assistant-message-content"
@@ -710,6 +710,14 @@ const AssistantMessage: FC = () => {
           intermediate ? "text-sm text-muted-foreground" : "text-foreground",
         )}
       >
+        {unsettled && showActivityIndicator && !hasVisibleParts && !failureReason && (
+          <div
+            role="status"
+            className="text-sm text-muted-foreground shimmer motion-reduce:animate-none"
+          >
+            {t("chat.thinking")}
+          </div>
+        )}
         <MessagePrimitive.GroupedParts groupBy={groupBy}>
           {({ part, children }) => {
             switch (part.type) {
@@ -788,13 +796,7 @@ const AssistantMessage: FC = () => {
                 );
               }
               case "text":
-                return (
-                  <SmoothMarkdownText
-                    text={part.text}
-                    streaming={part.status.type === "running"}
-                    sourceSnapshots={sourceSnapshots}
-                  />
-                );
+                return <MarkdownText text={part.text} sourceSnapshots={sourceSnapshots} />;
               case "reasoning":
                 return <Reasoning {...part} />;
               case "tool-call":

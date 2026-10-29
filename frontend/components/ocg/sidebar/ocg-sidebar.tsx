@@ -1,7 +1,7 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
 import {
   ChevronsLeft,
@@ -55,6 +55,27 @@ import type { ControlProject } from "../contracts";
 import { usePinnedConversations } from "./sidebar-preferences";
 import { SidebarConversationChildren } from "./conversation-children";
 import { HoverMarquee } from "./hover-marquee";
+
+const subscribePlatform = () => () => {};
+const isApplePlatform = () => /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
+const serverPlatform = () => false;
+
+function ShortcutHint({ keys }: { keys: readonly string[] }) {
+  return (
+    <span aria-hidden="true" className="flex shrink-0 items-center gap-1">
+      {keys.map((key) => (
+        <kbd
+          key={key}
+          className="rounded border border-border px-1.5 py-0.5 font-sans text-[10px] leading-4 text-muted-foreground"
+        >
+          {key}
+        </kbd>
+      ))}
+    </span>
+  );
+}
+
+const GROUP_PAGE_SIZE = 20;
 
 const WORKSPACE_NAV: {
   target: WorkspaceView;
@@ -115,11 +136,13 @@ function RailButton({
   onClick,
   children,
   active = false,
+  shortcut,
 }: {
   label: string;
   onClick?: () => void;
   children: React.ReactNode;
   active?: boolean;
+  shortcut?: string;
 }) {
   return (
     <Tooltip>
@@ -128,7 +151,7 @@ function RailButton({
           <button
             type="button"
             aria-label={label}
-            title={label}
+            title={shortcut ? `${label} (${shortcut})` : label}
             onClick={onClick}
             className={cn(
               "flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
@@ -139,7 +162,10 @@ function RailButton({
           </button>
         }
       />
-      <TooltipContent side="right">{label}</TooltipContent>
+      <TooltipContent side="right">
+        {label}
+        {shortcut && ` (${shortcut})`}
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -166,10 +192,35 @@ export function OcgSidebar({
   onSettingsClick,
 }: OcgSidebarProps) {
   const { t, locale } = useI18n();
+  const isApple = useSyncExternalStore(subscribePlatform, isApplePlatform, serverPlatform);
+  const modifier = isApple ? "⌘" : "Ctrl";
+  const alt = isApple ? "⌥" : "Alt";
+  const newChatShortcut = `${modifier}+${alt}+N`;
+  const searchShortcut = `${modifier}+K`;
   const { pinned, toggle: togglePinned } = usePinnedConversations();
   const [projects, setProjects] = useState<ControlProject[]>([]);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.repeat ||
+        event.shiftKey ||
+        !(event.metaKey || event.ctrlKey) ||
+        !event.altKey ||
+        (!event.metaKey && event.getModifierState("AltGraph")) ||
+        event.code !== "KeyN" ||
+        document.querySelector('[role="dialog"]')
+      )
+        return;
+      event.preventDefault();
+      onNewChat();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onNewChat]);
   useEffect(() => {
     if (!control) return;
     return control.subscribeProjects(
@@ -227,6 +278,8 @@ export function OcgSidebar({
   const [renameError, setRenameError] = useState<string | null>(null);
 
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
+  const [groupLimits, setGroupLimits] = useState<Record<string, number>>({});
   const [expandedSessions, setExpandedSessions] = useState<Record<string, boolean>>({});
   const [childAvailability, setChildAvailability] = useState<Record<string, boolean>>({});
   const activeRoot = activeAncestors?.[0] ?? activeSessionId;
@@ -309,7 +362,7 @@ export function OcgSidebar({
           onClick={() => onNavigate(item.target)}
           aria-current={active ? "page" : undefined}
           className={cn(
-            "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left",
+            "group flex min-h-10 w-full items-center gap-2 rounded-md px-3 py-1.5 text-left",
             TYPOGRAPHY_SCALE.body_sm,
             "leading-5 transition-colors",
             active
@@ -317,7 +370,7 @@ export function OcgSidebar({
               : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
           )}
         >
-          <Icon className="size-3.5 shrink-0" aria-hidden="true" />
+          <Icon className="size-4 shrink-0" aria-hidden="true" />
           <span className="min-w-0 flex-1 truncate">{label}</span>
           {item.target === "attention" && attentionCount > 0 && (
             <span
@@ -343,11 +396,15 @@ export function OcgSidebar({
         <Button
           variant="ghost"
           size="sm"
-          className="h-11 min-w-0 flex-1 justify-start rounded-lg px-3 text-sm font-normal"
+          className="group h-11 min-w-0 flex-1 justify-start gap-2 rounded-lg border-0 px-3 text-sm font-normal tracking-normal normal-case"
           onClick={onNewChat}
+          aria-keyshortcuts={isApple ? "Meta+Alt+N" : "Control+Alt+N"}
         >
-          <Plus className="size-3.5" data-icon="inline-start" />
-          {t("sidebar.newChat")}
+          <Plus className="size-4" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate text-left">{t("sidebar.newChat")}</span>
+          <span className="opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+            <ShortcutHint keys={[modifier, alt, "N"]} />
+          </span>
         </Button>
       </div>
 
@@ -369,16 +426,14 @@ export function OcgSidebar({
               "text-muted-foreground hover:bg-muted/60",
             )}
           >
-            <LayoutGrid className="size-3.5 shrink-0" aria-hidden="true" />
+            <LayoutGrid className="size-4 shrink-0" aria-hidden="true" />
             <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
             <ChevronDown
               className="size-3.5 shrink-0 -rotate-90 text-muted-foreground transition-transform duration-[180ms] group-open/workbench:rotate-0 motion-reduce:transition-none"
               aria-hidden="true"
             />
           </summary>
-          <ul className="mt-1 flex flex-col gap-px pl-2">
-            {workbenchNav.map(renderWorkspaceItem)}
-          </ul>
+          <ul className="mt-1 flex flex-col gap-px">{workbenchNav.map(renderWorkspaceItem)}</ul>
         </details>
       )}
     </>
@@ -407,7 +462,7 @@ export function OcgSidebar({
           <RailButton label={t("sidebar.expand")} onClick={onToggle}>
             <ChevronsLeft className="size-4 rotate-180" />
           </RailButton>
-          <RailButton label={t("sidebar.newChat")} onClick={onNewChat}>
+          <RailButton label={t("sidebar.newChat")} shortcut={newChatShortcut} onClick={onNewChat}>
             <Plus className="size-4" />
           </RailButton>
           <ConversationSearch
@@ -420,7 +475,8 @@ export function OcgSidebar({
               <button
                 type="button"
                 aria-label={t("sidebar.searchConversations")}
-                title={t("sidebar.searchConversations")}
+                title={`${t("sidebar.searchConversations")} (${searchShortcut})`}
+                aria-keyshortcuts={isApple ? "Meta+K" : "Control+K"}
                 className="flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
               >
                 <Search className="size-4" aria-hidden="true" />
@@ -540,9 +596,17 @@ export function OcgSidebar({
                 variant="ghost"
                 size="icon-xs"
                 aria-label={t("sidebar.searchConversations")}
-                title={t("sidebar.searchConversations")}
+                title={`${t("sidebar.searchConversations")} (${searchShortcut})`}
+                aria-keyshortcuts={isApple ? "Meta+K" : "Control+K"}
+                className="group relative"
               >
                 <Search className="size-4" aria-hidden="true" />
+                <span
+                  aria-hidden="true"
+                  className="pointer-events-none absolute top-full right-0 z-10 hidden items-center gap-2 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md group-hover:flex group-focus-visible:flex"
+                >
+                  {t("sidebar.searchConversations")} <ShortcutHint keys={[modifier, "K"]} />
+                </span>
               </Button>
             }
           />
@@ -607,203 +671,250 @@ export function OcgSidebar({
           <ul className="space-y-3">
             {groups.map((group) => (
               <li key={group.id} className="min-w-0">
-                <div
-                  className="mb-1 flex h-8 min-w-0 items-center gap-2 px-2 text-[13px] text-muted-foreground"
+                <button
+                  type="button"
+                  className="mb-1 flex h-8 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-[13px] text-muted-foreground hover:bg-sidebar-accent focus-visible:outline-ring"
                   title={group.name}
+                  aria-expanded={!collapsedGroups[group.id]}
+                  onClick={() =>
+                    setCollapsedGroups((current) => ({
+                      ...current,
+                      [group.id]: !current[group.id],
+                    }))
+                  }
                 >
                   <FolderOpen className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="truncate">{group.name}</span>
-                </div>
-                <ul className="space-y-0.5">
-                  {group.items.map((session) => {
-                    const active =
-                      session.id === activeSessionId ||
-                      session.conversationId === activeRoot ||
-                      session.id === activeRoot;
-                    const isMenuOpen = openMenuId === session.id;
-                    const expanded = expandedSessions[session.id] ?? active;
-                    const canLoadChildren = Boolean(
-                      control && onOpenConversation && session.conversationId,
-                    );
-                    const canExpand =
-                      canLoadChildren &&
-                      (session.hasChildren ?? childAvailability[session.id] === true);
-                    const running = session.jobState
-                      ? session.jobState === "running"
-                      : runningSessionIds.has(session.id);
-                    const pinId = session.conversationId ?? session.id;
-                    const isPinned = pinned.has(pinId);
-                    const hasActions = Boolean(session.conversationId && (onRename || onHide));
-                    const actions =
-                      "opacity-0 group-hover/session:opacity-100 group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100";
-                    return (
-                      <li key={session.id} className="min-w-0" data-sidebar-level="1">
-                        <div
-                          className={cn(
-                            "group/session relative flex h-8 min-w-0 items-center rounded-lg text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent",
-                            active && "bg-sidebar-accent text-sidebar-accent-foreground",
-                          )}
-                        >
-                          <span className="flex w-8 shrink-0 items-center justify-center">
-                            {canExpand && (
-                              <button
-                                type="button"
-                                aria-expanded={expanded}
-                                aria-label={t(
-                                  expanded ? "sidebar.hideChildren" : "sidebar.showChildren",
-                                  { title: session.title || t("sidebar.newChat") },
-                                )}
-                                className="flex size-6 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
-                                onClick={() =>
-                                  setExpandedSessions((current) => ({
-                                    ...current,
-                                    [session.id]: !expanded,
-                                  }))
-                                }
-                              >
-                                <ChevronDown
-                                  className={cn(
-                                    "size-3.5 transition-transform motion-reduce:transition-none",
-                                    !expanded && "-rotate-90",
-                                  )}
-                                  aria-hidden="true"
-                                />
-                              </button>
-                            )}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => onSelect(session.id)}
-                            onDoubleClick={() => {
-                              if (onRename && session.sessionId)
-                                openRename(session.id, session.title || "", "session");
-                            }}
-                            aria-current={active ? "true" : undefined}
-                            title={session.title || t("sidebar.newChat")}
-                            className="flex h-full min-w-0 flex-1 items-center pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
-                          >
-                            <HoverMarquee className="min-w-0 flex-1">
-                              {session.title || t("sidebar.newChat")}
-                            </HoverMarquee>
-                          </button>
-                          <div className="relative mr-2 flex h-full w-18 shrink-0 items-center justify-end">
-                            <span
+                  <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                  <ChevronDown
+                    className={cn(
+                      "size-3.5 shrink-0 transition-transform",
+                      collapsedGroups[group.id] && "-rotate-90",
+                    )}
+                    aria-hidden="true"
+                  />
+                </button>
+                {!collapsedGroups[group.id] && (
+                  <ul className="space-y-0.5">
+                    {group.items
+                      .filter(
+                        (session, index) =>
+                          index < (groupLimits[group.id] ?? GROUP_PAGE_SIZE) ||
+                          session.id === activeSessionId ||
+                          session.conversationId === activeRoot ||
+                          session.id === activeRoot,
+                      )
+                      .map((session) => {
+                        const active =
+                          session.id === activeSessionId ||
+                          session.conversationId === activeRoot ||
+                          session.id === activeRoot;
+                        const isMenuOpen = openMenuId === session.id;
+                        const expanded = expandedSessions[session.id] ?? active;
+                        const canLoadChildren = Boolean(
+                          control && onOpenConversation && session.conversationId,
+                        );
+                        const canExpand =
+                          canLoadChildren &&
+                          (session.hasChildren ?? childAvailability[session.id] === true);
+                        const running = session.jobState
+                          ? session.jobState === "running"
+                          : runningSessionIds.has(session.id);
+                        const pinId = session.conversationId ?? session.id;
+                        const isPinned = pinned.has(pinId);
+                        const hasActions = Boolean(session.conversationId && (onRename || onHide));
+                        const actions =
+                          "opacity-0 group-hover/session:opacity-100 group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100";
+                        return (
+                          <li key={session.id} className="min-w-0" data-sidebar-level="1">
+                            <div
                               className={cn(
-                                "flex items-center gap-1 text-xs tabular-nums text-muted-foreground transition-opacity",
-                                hasActions &&
-                                  "group-hover/session:opacity-0 group-focus-within/session:opacity-0 [@media(hover:none)]:opacity-0",
-                                isMenuOpen && "opacity-0",
+                                "group/session relative flex h-8 min-w-0 items-center rounded-lg text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent",
+                                active && "bg-sidebar-accent text-sidebar-accent-foreground",
                               )}
                             >
-                              {running ? (
-                                <LoaderCircle
-                                  className="size-3.5 animate-spin text-primary motion-reduce:animate-none"
-                                  aria-label={t("sidebar.running")}
-                                />
-                              ) : (
-                                <>
-                                  <time
-                                    dateTime={session.updatedAt}
-                                    title={new Date(session.updatedAt).toLocaleString(locale)}
-                                  >
-                                    {relativeTime(session.updatedAt)}
-                                  </time>
-                                  {isPinned && (
-                                    <Pin className="size-3" aria-label={t("sidebar.pinned")} />
-                                  )}
-                                </>
-                              )}
-                            </span>
-                            {hasActions && (
-                              <div
-                                className={cn(
-                                  "absolute inset-0 flex items-center justify-end gap-0.5 transition-opacity",
-                                  isMenuOpen ? "opacity-100" : actions,
-                                )}
-                              >
-                                <button
-                                  type="button"
-                                  className="flex size-6 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
-                                  aria-label={t(isPinned ? "sidebar.unpin" : "sidebar.pin")}
-                                  title={t(isPinned ? "sidebar.unpin" : "sidebar.pin")}
-                                  onClick={() => togglePinned(pinId)}
-                                >
-                                  {isPinned ? (
-                                    <PinOff className="size-3.5" />
-                                  ) : (
-                                    <Pin className="size-3.5" />
-                                  )}
-                                </button>
-                                {onHide && session.sessionId && (
+                              <span className="flex w-9 shrink-0 items-center justify-center">
+                                {canExpand && (
                                   <button
                                     type="button"
+                                    aria-expanded={expanded}
+                                    aria-label={t(
+                                      expanded ? "sidebar.hideChildren" : "sidebar.showChildren",
+                                      { title: session.title || t("sidebar.newChat") },
+                                    )}
                                     className="flex size-6 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
-                                    aria-label={t("sidebar.hideChat")}
-                                    title={t("sidebar.hideChat")}
-                                    onClick={() => {
-                                      setHideError(null);
-                                      setHideTarget(session);
-                                    }}
+                                    onClick={() =>
+                                      setExpandedSessions((current) => ({
+                                        ...current,
+                                        [session.id]: !expanded,
+                                      }))
+                                    }
                                   >
-                                    <Archive className="size-3.5" />
+                                    <ChevronDown
+                                      className={cn(
+                                        "size-3.5 transition-transform motion-reduce:transition-none",
+                                        !expanded && "-rotate-90",
+                                      )}
+                                      aria-hidden="true"
+                                    />
                                   </button>
                                 )}
-                                {onRename && session.sessionId && (
-                                  <DropdownMenu
-                                    open={isMenuOpen}
-                                    onOpenChange={(open) => setOpenMenuId(open ? session.id : null)}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => onSelect(session.id)}
+                                onDoubleClick={() => {
+                                  if (onRename && session.sessionId)
+                                    openRename(session.id, session.title || "", "session");
+                                }}
+                                aria-current={active ? "true" : undefined}
+                                title={session.title || t("sidebar.newChat")}
+                                className="flex h-full min-w-0 flex-1 items-center pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+                              >
+                                <HoverMarquee className="min-w-0 flex-1">
+                                  {session.title || t("sidebar.newChat")}
+                                </HoverMarquee>
+                              </button>
+                              <div className="relative mr-2 flex h-full w-18 shrink-0 items-center justify-end">
+                                <span
+                                  className={cn(
+                                    "flex items-center gap-1 text-xs tabular-nums text-muted-foreground transition-opacity",
+                                    hasActions &&
+                                      "group-hover/session:opacity-0 group-focus-within/session:opacity-0 [@media(hover:none)]:opacity-0",
+                                    isMenuOpen && "opacity-0",
+                                  )}
+                                >
+                                  {running ? (
+                                    <LoaderCircle
+                                      className="size-3.5 animate-spin text-primary motion-reduce:animate-none"
+                                      aria-label={t("sidebar.running")}
+                                    />
+                                  ) : (
+                                    <>
+                                      <time
+                                        dateTime={session.updatedAt}
+                                        title={new Date(session.updatedAt).toLocaleString(locale)}
+                                      >
+                                        {relativeTime(session.updatedAt)}
+                                      </time>
+                                      {isPinned && (
+                                        <Pin className="size-3" aria-label={t("sidebar.pinned")} />
+                                      )}
+                                    </>
+                                  )}
+                                </span>
+                                {hasActions && (
+                                  <div
+                                    className={cn(
+                                      "absolute inset-0 flex items-center justify-end gap-0.5 transition-opacity",
+                                      isMenuOpen ? "opacity-100" : actions,
+                                    )}
                                   >
-                                    <DropdownMenuTrigger asChild>
+                                    <button
+                                      type="button"
+                                      className="flex size-6 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
+                                      aria-label={t(isPinned ? "sidebar.unpin" : "sidebar.pin")}
+                                      title={t(isPinned ? "sidebar.unpin" : "sidebar.pin")}
+                                      onClick={() => togglePinned(pinId)}
+                                    >
+                                      {isPinned ? (
+                                        <PinOff className="size-3.5" />
+                                      ) : (
+                                        <Pin className="size-3.5" />
+                                      )}
+                                    </button>
+                                    {onHide && session.sessionId && (
                                       <button
                                         type="button"
-                                        aria-label={t("sidebar.chatActions", {
-                                          title: session.title || t("sidebar.newChat"),
-                                        })}
-                                        className="flex size-5 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
-                                      >
-                                        <MoreVertical className="size-3.5" />
-                                      </button>
-                                    </DropdownMenuTrigger>
-                                    <DropdownMenuContent align="end">
-                                      <DropdownMenuItem
-                                        onSelect={() => {
-                                          openRename(session.id, session.title || "", "session");
+                                        className="flex size-6 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
+                                        aria-label={t("sidebar.hideChat")}
+                                        title={t("sidebar.hideChat")}
+                                        onClick={() => {
+                                          setHideError(null);
+                                          setHideTarget(session);
                                         }}
                                       >
-                                        {t("sidebar.renameChat")}
-                                      </DropdownMenuItem>
-                                    </DropdownMenuContent>
-                                  </DropdownMenu>
+                                        <Archive className="size-3.5" />
+                                      </button>
+                                    )}
+                                    {onRename && session.sessionId && (
+                                      <DropdownMenu
+                                        open={isMenuOpen}
+                                        onOpenChange={(open) =>
+                                          setOpenMenuId(open ? session.id : null)
+                                        }
+                                      >
+                                        <DropdownMenuTrigger asChild>
+                                          <button
+                                            type="button"
+                                            aria-label={t("sidebar.chatActions", {
+                                              title: session.title || t("sidebar.newChat"),
+                                            })}
+                                            className="flex size-5 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
+                                          >
+                                            <MoreVertical className="size-3.5" />
+                                          </button>
+                                        </DropdownMenuTrigger>
+                                        <DropdownMenuContent align="end">
+                                          <DropdownMenuItem
+                                            onSelect={() => {
+                                              openRename(
+                                                session.id,
+                                                session.title || "",
+                                                "session",
+                                              );
+                                            }}
+                                          >
+                                            {t("sidebar.renameChat")}
+                                          </DropdownMenuItem>
+                                        </DropdownMenuContent>
+                                      </DropdownMenu>
+                                    )}
+                                  </div>
                                 )}
                               </div>
-                            )}
-                          </div>
-                        </div>
-                        {canExpand &&
-                          expanded &&
-                          control &&
-                          onOpenConversation &&
-                          session.conversationId && (
-                            <SidebarConversationChildren
-                              key={session.conversationId}
-                              conversation={session.conversationId}
-                              control={control}
-                              activeChild={activeAncestors?.[1]}
-                              expanded
-                              sessionId={session.id}
-                              onAvailabilityChange={handleChildAvailability}
-                              onOpen={onOpenConversation}
-                              onRename={
-                                onRenameChild
-                                  ? (child) => openRename(child.id, child.title || "", "child")
-                                  : undefined
-                              }
-                            />
-                          )}
+                            </div>
+                            {canExpand &&
+                              expanded &&
+                              control &&
+                              onOpenConversation &&
+                              session.conversationId && (
+                                <SidebarConversationChildren
+                                  key={session.conversationId}
+                                  conversation={session.conversationId}
+                                  control={control}
+                                  activeChild={activeAncestors?.[1]}
+                                  expanded
+                                  sessionId={session.id}
+                                  onAvailabilityChange={handleChildAvailability}
+                                  onOpen={onOpenConversation}
+                                  onRename={
+                                    onRenameChild
+                                      ? (child) => openRename(child.id, child.title || "", "child")
+                                      : undefined
+                                  }
+                                />
+                              )}
+                          </li>
+                        );
+                      })}
+                    {group.items.length > (groupLimits[group.id] ?? GROUP_PAGE_SIZE) && (
+                      <li>
+                        <button
+                          type="button"
+                          className="ml-9 rounded py-1 text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:outline-ring"
+                          onClick={() =>
+                            setGroupLimits((current) => ({
+                              ...current,
+                              [group.id]: (current[group.id] ?? GROUP_PAGE_SIZE) + GROUP_PAGE_SIZE,
+                            }))
+                          }
+                        >
+                          {t("common.loadMore")}
+                        </button>
                       </li>
-                    );
-                  })}
-                </ul>
+                    )}
+                  </ul>
+                )}
               </li>
             ))}
           </ul>

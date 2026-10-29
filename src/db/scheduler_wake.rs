@@ -41,6 +41,8 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::SetExecutionPoolEnabled
         | OperationKind::SetExecutionPoolProfile
         | OperationKind::CreateJobWithInput
+        | OperationKind::Open
+        | OperationKind::Append
         | OperationKind::StopTurn
         | OperationKind::Close
         | OperationKind::Hold
@@ -63,8 +65,6 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::RecordToolOutcome
         | OperationKind::ReconcileToolEffect => true,
         OperationKind::BoundaryB
-        | OperationKind::Open
-        | OperationKind::Append
         | OperationKind::ClaimExecution
         | OperationKind::SaveJobInput
         | OperationKind::CreateProject

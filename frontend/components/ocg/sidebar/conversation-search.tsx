@@ -20,7 +20,7 @@
  * `listbox` / `option` markup for the selectable entries.
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactElement } from "react";
 import { MessageSquare, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
@@ -77,8 +77,32 @@ export function ConversationSearch({
   const [failed, setFailed] = useState(false);
   const [before, setBefore] = useState<string | undefined>();
   const [attempt, setAttempt] = useState(0);
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listId = useId();
+  const hintId = useId();
   const needle = query.trim();
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.isComposing ||
+        event.repeat ||
+        event.altKey ||
+        event.shiftKey ||
+        !(event.metaKey || event.ctrlKey) ||
+        event.key.toLowerCase() !== "k"
+      )
+        return;
+      if (!open && document.querySelector('[role="dialog"]')) return;
+      event.preventDefault();
+      setOpen(true);
+      inputRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [open]);
 
   useEffect(() => {
     if (!open || !control || !needle) return;
@@ -125,6 +149,14 @@ export function ConversationSearch({
     );
   }, [sessions, needle, serverResults, untitledLabel]);
 
+  const highlightedIndex = matches.findIndex((match) => match.id === highlightedId);
+  const highlightedOption =
+    highlightedIndex >= 0 ? `${listId}-option-${highlightedIndex}` : undefined;
+  useEffect(() => {
+    if (open && highlightedOption)
+      document.getElementById(highlightedOption)?.scrollIntoView({ block: "nearest" });
+  }, [open, highlightedOption]);
+
   const close = () => setOpen(false);
   const select = (match: SearchMatch) => {
     close();
@@ -145,6 +177,7 @@ export function ConversationSearch({
           setLoading(false);
           setFailed(false);
           setBefore(undefined);
+          setHighlightedId(null);
         }
       }}
     >
@@ -177,11 +210,18 @@ export function ConversationSearch({
             <Input
               ref={inputRef}
               type="search"
+              role="combobox"
               placeholder={t("sidebar.searchChats")}
               aria-label={t("sidebar.searchChatsLabel")}
+              aria-autocomplete="list"
+              aria-expanded={true}
+              aria-controls={listId}
+              aria-activedescendant={highlightedOption}
+              aria-describedby={hintId}
               value={query}
               onChange={(event) => {
                 setQuery(event.target.value);
+                setHighlightedId(null);
                 if (event.target.value.trim() === needle) return;
                 // A new needle invalidates the previous server result.
                 setServerResults(null);
@@ -191,15 +231,35 @@ export function ConversationSearch({
                 setBefore(undefined);
               }}
               onKeyDown={(event) => {
-                // Enter takes the first match; Escape belongs to the dialog.
-                if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
-                event.preventDefault();
-                const first = matches[0];
-                if (first) select(first);
+                if (event.nativeEvent.isComposing) return;
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  if (!matches.length) return;
+                  event.preventDefault();
+                  const next =
+                    highlightedIndex < 0
+                      ? event.key === "ArrowDown"
+                        ? 0
+                        : matches.length - 1
+                      : Math.max(
+                          0,
+                          Math.min(
+                            matches.length - 1,
+                            highlightedIndex + (event.key === "ArrowDown" ? 1 : -1),
+                          ),
+                        );
+                  setHighlightedId(matches[next].id);
+                } else if (event.key === "Enter") {
+                  event.preventDefault();
+                  const match = matches[highlightedIndex < 0 ? 0 : highlightedIndex];
+                  if (match) select(match);
+                }
               }}
               className="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
           </div>
+          <span id={hintId} className="sr-only">
+            {t("sidebar.searchKeyboardHint")}
+          </span>
         </div>
 
         <ScrollArea
@@ -229,25 +289,30 @@ export function ConversationSearch({
             </div>
           )}
           <ul
+            id={listId}
             aria-busy={loading}
             role="listbox"
             aria-label={t("nav.chatSessions")}
             className="flex flex-col gap-px pb-2"
           >
-            {matches.map((session) => {
+            {matches.map((session, index) => {
               const active = session.id === activeSessionId;
+              const highlighted = index === highlightedIndex;
               return (
-                <li key={session.id}>
+                <li key={session.id} role="presentation">
                   <button
+                    id={`${listId}-option-${index}`}
                     type="button"
                     role="option"
-                    aria-selected={active}
+                    tabIndex={-1}
+                    aria-selected={highlighted}
+                    aria-current={active ? "page" : undefined}
                     onClick={() => select(session)}
                     className={cn(
                       "flex w-full min-w-0 items-center gap-2 rounded-md border border-transparent px-2 py-2 text-left",
                       TYPOGRAPHY_SCALE.body_sm,
                       "transition-colors",
-                      active
+                      highlighted || (active && highlightedIndex < 0)
                         ? cn(SELECTED_ROW, "font-medium")
                         : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                     )}
@@ -260,20 +325,20 @@ export function ConversationSearch({
                 </li>
               );
             })}
-            {matches.length === 0 && !loading && !failed && (
-              <li
-                role="status"
-                className={cn(
-                  "px-2 py-6 text-center text-muted-foreground",
-                  TYPOGRAPHY_SCALE.caption,
-                )}
-              >
-                {sessions.length === 0
-                  ? t("sidebar.searchNoConversations")
-                  : t("sidebar.noSearchMatches")}
-              </li>
-            )}
           </ul>
+          {matches.length === 0 && !loading && !failed && (
+            <p
+              role="status"
+              className={cn(
+                "px-2 py-6 text-center text-muted-foreground",
+                TYPOGRAPHY_SCALE.caption,
+              )}
+            >
+              {sessions.length === 0
+                ? t("sidebar.searchNoConversations")
+                : t("sidebar.noSearchMatches")}
+            </p>
+          )}
           {nextBefore && (
             <Button
               variant="outline"

@@ -93,6 +93,40 @@ impl OutcomeCounts {
         self.attempted += 1;
         self.successful += 1;
     }
+
+    pub fn validate(
+        &self,
+        expected_attempted: usize,
+        expected_rejected: usize,
+    ) -> Result<(), String> {
+        let accounted = self
+            .successful
+            .saturating_add(self.rejected)
+            .saturating_add(self.failed)
+            .saturating_add(self.timed_out)
+            .saturating_add(self.unfinished);
+        if self.attempted != expected_attempted || accounted != self.attempted {
+            return Err(format!(
+                "outcome counters do not reconcile: attempted={} expected={expected_attempted}, accounted={accounted}; {self:?}",
+                self.attempted
+            ));
+        }
+        if self.rejected != expected_rejected
+            || self.failed != 0
+            || self.timed_out != 0
+            || self.unfinished != 0
+        {
+            return Err(format!(
+                "unexpected unsuccessful operations (expected rejections={expected_rejected}): {self:?}"
+            ));
+        }
+        if expected_attempted > expected_rejected && self.successful == 0 {
+            return Err(format!(
+                "no successful operations where work was required: {self:?}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// How one attempted operation ended.
@@ -277,12 +311,18 @@ fn current_rss() -> Option<u64> {
     None
 }
 
-fn lifetime_rusage() -> (Option<u64>, Option<f64>, Option<f64>) {
-    #[cfg(target_os = "macos")]
+pub fn lifetime_rusage() -> (Option<u64>, Option<f64>, Option<f64>) {
+    #[cfg(unix)]
     unsafe {
         let mut usage = std::mem::zeroed::<libc::rusage>();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
-            let peak = Some(usage.ru_maxrss as u64);
+            let peak = u64::try_from(usage.ru_maxrss).ok().map(|maximum| {
+                if cfg!(target_os = "macos") {
+                    maximum
+                } else {
+                    maximum.saturating_mul(1024)
+                }
+            });
             let user =
                 Some(usage.ru_utime.tv_sec as f64 + usage.ru_utime.tv_usec as f64 / 1_000_000.0);
             let system =
@@ -290,33 +330,10 @@ fn lifetime_rusage() -> (Option<u64>, Option<f64>, Option<f64>) {
             return (peak, user, system);
         }
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    unsafe {
-        #[repr(C)]
-        struct Rusage {
-            ru_utime: [i64; 2],
-            ru_stime: [i64; 2],
-            ru_maxrss: i64,
-            _pad: [i64; 13],
-        }
-        unsafe extern "C" {
-            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
-        }
-        let mut usage = std::mem::zeroed::<Rusage>();
-        if getrusage(0, &mut usage) == 0 {
-            let peak = Some((usage.ru_maxrss as u64) * 1024);
-            let user = Some(usage.ru_utime[0] as f64 + usage.ru_utime[1] as f64 / 1_000_000.0);
-            let system = Some(usage.ru_stime[0] as f64 + usage.ru_stime[1] as f64 / 1_000_000.0);
-            return (peak, user, system);
-        }
-    }
     (None, None, None)
 }
 
-/// Database footprint measurement.
-///
-/// Only the redb files count: they are the database the backend reads and
-/// writes. Logs and attachments live beside them and are not database state.
+/// Database files owned by the direct legacy write-path measurements.
 pub fn database_bytes(
     directory: &ocg::system::data_directory::DataDirectory,
 ) -> std::io::Result<u64> {
@@ -334,35 +351,29 @@ pub fn database_bytes(
     Ok(total)
 }
 
+/// The cleanly closed production database alone, excluding logs and attachments.
+pub fn ocg_database_bytes(
+    directory: &ocg::system::data_directory::DataDirectory,
+) -> std::io::Result<u64> {
+    Ok(std::fs::metadata(directory.database_path().join("ocg.redb"))?.len())
+}
+
 /// The resident memory of another process, by its identifier.
-///
-/// The backend runs in its own process, so its footprint is measured there
-/// rather than in the harness that drives it.
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let output = std::process::Command::new("ps")
             .args(["-o", "rss=", "-p", &pid.to_string()])
             .output()
             .ok()?;
+        if !output.status.success() {
+            return None;
+        }
         let text = String::from_utf8(output.stdout).ok()?;
         text.split_whitespace()
             .next()
             .and_then(|value| value.parse::<u64>().ok())
-            .map(|kilobytes| kilobytes * 1024)
-    }
-    #[cfg(all(target_os = "linux", not(target_os = "macos")))]
-    {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
-        status
-            .lines()
-            .find(|line| line.starts_with("VmRSS:"))
-            .and_then(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(|kilobytes| kilobytes * 1024)
-            })
+            .map(|kilobytes| kilobytes.saturating_mul(1024))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -371,21 +382,9 @@ pub fn process_rss_bytes(pid: u32) -> Option<u64> {
     }
 }
 
-/// The peak resident memory of another process, by its identifier.
+/// A lifetime child high-water mark where the platform exposes one.
 pub fn process_peak_rss_bytes(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        let text = String::from_utf8(output.stdout).ok()?;
-        text.split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<u64>().ok())
-            .map(|kilobytes| kilobytes * 1024)
-    }
-    #[cfg(all(target_os = "linux", not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         status
@@ -395,12 +394,55 @@ pub fn process_peak_rss_bytes(pid: u32) -> Option<u64> {
                 line.split_whitespace()
                     .nth(1)
                     .and_then(|value| value.parse::<u64>().ok())
-                    .map(|kilobytes| kilobytes * 1024)
+                    .map(|kilobytes| kilobytes.saturating_mul(1024))
             })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Total child CPU time, suitable for subtraction across a workload window.
+pub fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "time=", "-p", &pid.to_string()])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_process_time(&String::from_utf8(output.stdout).ok()?)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn parse_process_time(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let (days, clock) = text.split_once('-').map_or((0.0, text), |(days, clock)| {
+        (days.parse::<f64>().unwrap_or(0.0), clock)
+    });
+    let fields = clock.split(':').collect::<Vec<_>>();
+    let (hours, minutes, seconds) = match fields.as_slice() {
+        [minutes, seconds] => (
+            0.0,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        [hours, minutes, seconds] => (
+            hours.parse::<f64>().ok()?,
+            minutes.parse::<f64>().ok()?,
+            seconds.parse::<f64>().ok()?,
+        ),
+        _ => return None,
+    };
+    Some(days * 86_400.0 + hours * 3_600.0 + minutes * 60.0 + seconds)
 }

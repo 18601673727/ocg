@@ -10,7 +10,7 @@ use ntex::http::Uri;
 use ntex::http::header::HeaderValue;
 use ntex::io::{Io, IoBoxed};
 use ntex::service::apply_fn_factory;
-use ntex::time::Millis;
+use ntex::time::{Millis, Seconds};
 
 use crate::service::ai::providers::ProviderExecutionError;
 
@@ -39,7 +39,12 @@ pub(crate) async fn provider_client(timeout: Duration) -> Result<Client, Provide
         .disable_redirects()
         .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
         .response_payload_timeout(Millis::ZERO)
-        .build(ntex::SharedCfg::default())
+        // Stream idle deadlines bound stalled requests without terminating
+        // long replies when an intermediary does not answer HTTP/2 PINGs.
+        .build(
+            ntex::SharedCfg::new("provider")
+                .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
+        )
         .await
         .map_err(|_| ProviderExecutionError::Build {
             message: "provider HTTP client could not be initialized".to_owned(),

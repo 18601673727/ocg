@@ -15,6 +15,8 @@ pub struct BenchmarkMetadata {
     pub commit_hash: Option<String>,
     /// Whether the tree carried uncommitted changes.
     pub dirty_tree: bool,
+    /// Fingerprint of tracked changes and the worktree status for comparison.
+    pub tree_fingerprint: Option<String>,
     /// The compiler that built the binary.
     pub compiler_version: String,
     /// The Cargo profile the binary was built with.
@@ -41,11 +43,18 @@ impl BenchmarkMetadata {
         build_profile: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let commit_hash = git_output(&["rev-parse", "HEAD"]);
-        let dirty_tree = std::process::Command::new("git")
-            .args(["diff-index", "--quiet", "HEAD", "--"])
-            .status()
-            .map(|status| !status.success())
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success());
+        let dirty_tree = status
+            .as_ref()
+            .map(|output| !output.stdout.is_empty())
             .unwrap_or(false);
+        let tree_fingerprint = status
+            .as_ref()
+            .and_then(|status| worktree_fingerprint(&status.stdout));
 
         let compiler_version = std::process::Command::new("rustc")
             .arg("--version")
@@ -58,6 +67,7 @@ impl BenchmarkMetadata {
         Ok(Self {
             commit_hash,
             dirty_tree,
+            tree_fingerprint,
             compiler_version,
             build_profile: build_profile.to_owned(),
             os: std::env::consts::OS.to_owned(),
@@ -74,6 +84,7 @@ impl BenchmarkMetadata {
         json!({
             "commit": self.commit_hash,
             "dirty_tree": self.dirty_tree,
+            "tree_fingerprint": self.tree_fingerprint,
             "compiler": self.compiler_version,
             "build_profile": self.build_profile,
             "os": self.os,
@@ -85,6 +96,32 @@ impl BenchmarkMetadata {
             "filesystem": self.filesystem_info,
         })
     }
+}
+
+fn worktree_fingerprint(status: &[u8]) -> Option<String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--binary", "HEAD", "--"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let mut child = std::process::Command::new("git")
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    {
+        let mut input = child.stdin.take()?;
+        input.write_all(status).ok()?;
+        input.write_all(&diff.stdout).ok()?;
+    }
+    let output = child.wait_with_output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// The output of a git command, when it succeeded.
@@ -133,14 +170,29 @@ fn filesystem_of(path: &Path) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("df")
-            .args(["-H", &path.display().to_string()])
+            .args(["-P", &path.display().to_string()])
             .output()
             .ok()?;
+        if !output.status.success() {
+            return None;
+        }
         let text = String::from_utf8(output.stdout).ok()?;
         let last = text.lines().last()?;
-        let mut fields = last.split_whitespace();
-        let _device = fields.next()?;
-        Some(fields.next()?.to_owned())
+        let fields = last.split_whitespace().collect::<Vec<_>>();
+        let device = fields.first()?;
+        let mountpoint = fields.last()?;
+        let mount = std::process::Command::new("mount")
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|output| {
+                output
+                    .lines()
+                    .find(|line| line.starts_with(&format!("{device} on {mountpoint} (")))
+                    .map(str::to_owned)
+            });
+        Some(mount.unwrap_or_else(|| format!("device {device} mounted at {mountpoint}")))
     }
     #[cfg(all(target_os = "linux", not(target_os = "macos")))]
     {

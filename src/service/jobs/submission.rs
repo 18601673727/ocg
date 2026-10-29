@@ -486,6 +486,11 @@ impl Batch {
             JobKind::Group { project, .. } => *project,
             JobKind::Execution { .. } => None,
         };
+        // A projectless chat has no explicit decision policy. Let the agent
+        // choose its strategy without a second request for every message.
+        if project.is_none() {
+            return Ok(None);
+        }
         let mut root = parent;
         while let Some(id) = root.parent_id {
             root = self.require_job(id)?;

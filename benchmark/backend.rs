@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::{Arc, Barrier};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ pub mod summary;
 pub mod workload;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+static LEGACY_CONTEXT: OnceLock<Value> = OnceLock::new();
 
 struct Unpark(std::thread::Thread);
 
@@ -73,6 +75,8 @@ impl Drop for TemporaryRoot {
 struct Options {
     section: String,
     iterations: usize,
+    trials: usize,
+    warmup: usize,
     jobs: usize,
     files: usize,
     clients: Vec<usize>,
@@ -81,9 +85,16 @@ struct Options {
     scheduler_jobs: Vec<usize>,
     provider_jobs: usize,
     directory: PathBuf,
+    deadline: Duration,
+    page_size: usize,
+    writer_jobs: usize,
+    stream_chunks: usize,
+    stream_pace: Duration,
+    mode: String,
+    provider_failure: bool,
+    child_hang: bool,
 }
 
-/// One comma-separated list of positive sizes, as `--clients 1,8` carries.
 fn sizes(argument: &str) -> Result<Vec<usize>> {
     let mut values = Vec::new();
     for part in argument.split(',') {
@@ -105,6 +116,8 @@ impl Options {
             directory: std::env::current_dir()?.join("target/backend-bench"),
             section: "all".into(),
             iterations: 50,
+            trials: 3,
+            warmup: 1,
             jobs: 1_000,
             provider_jobs: 100_000,
             files: 1_000,
@@ -112,6 +125,14 @@ impl Options {
             payloads: vec![1_024, 65_536],
             outputs: vec![3],
             scheduler_jobs: vec![1_000, 10_000, 100_000, 1_000_000],
+            deadline: Duration::from_secs(60),
+            page_size: 20,
+            writer_jobs: 4,
+            stream_chunks: 4,
+            stream_pace: Duration::from_millis(5),
+            mode: "smoke".into(),
+            provider_failure: false,
+            child_hang: false,
         };
         let mut arguments = std::env::args().skip(1);
         let mut section_seen = false;
@@ -120,32 +141,13 @@ impl Options {
                 "--bench" => {}
                 "--help" | "-h" => {
                     println!(
-                        "cargo bench --bench backend -- \
-                         [all|jobs|scheduler|reads|search|search_scale|mixed|maintenance|provider-record|observability] \
-                         [--iterations N] [--jobs N] [--files N] [--dir PATH] \
-                         [--clients 1,8] [--payloads 1024,65536] [--outputs 3]\n\
-                         Defaults: all, 50 iterations per client, 1000 read-fixture jobs, \
-                         1000 search files, 1 and 8 clients, 1/64 KiB payloads, 3 progress \
-                         outputs per job.\n\
-                         JSONL on stdout; setup/warmup excluded. Errors abort the run.\n\
-                         Jobs: create+claim, N progress outputs, finalize; closed loop, one \
-                         measurement per command stage and one for the whole lifecycle.\n\
-                         Scheduler: 1k, 10k, 100k, 1m Jobs spread over 4 Pools with 16 slots total;\n\
-                         T1 admission, claim_batch + finalize loop, dependency settlement, and unclean reopen.\n\
-                         Reads: warm point/page/output reads at 100 and N jobs.\n\
-                         Mixed: job lifecycles written while readers poll the Job views.\n\
-                         Search (Unix): 5 fresh index builds over cached files, warm queries, \
-                         5 full rebuilds; production limits and coverage reported.\n\
-                         Search scale (Unix): the same queries over corpora of 1, 4 and 16 MiB \
-                         (the production content bound), then one corpus over it, which is the \
-                         partial snapshot a larger repository indexes to.\n\
-                         Maintenance: grows the file past the compaction policy, then reports what \
-                         the compaction did and what concurrent readers and commands paid for it; \
-                         refusals are counted, not fatal.\n\
-                         Provider-record (opt-in): 100000 Jobs, 3 mock HTTP requests each; shared system\n\
-                         prompt/tools and 2 history turns; durable command and replay HTTP latency.\n\
-                         Observability (opt-in): 100000 Jobs, 3 requests and 2 tool calls each; vitals, tool stats, and usage summary read latency; unclean reopen duration and memory.\n\
-                         Other sections exclude HTTP, scheduler dispatch, external providers and LLM inference."
+                        "cargo bench --features benchmarks --bench backend -- \\\n                         [all|startup|memory|admission|throughput|streaming|history|search|database|jobs|scheduler|reads|search_scale|mixed|maintenance|provider-record|observability] \\\n                         [--jobs N] [--iterations N] [--trials N] [--warmup N] [--clients 1,8,16] \\\n                         [--files N] [--dir PATH] [--deadline-ms N] [--mode smoke|reference] \\\n                         [--page-size N] [--writer-jobs N] [--stream-chunks N] [--stream-pace-ms N]\n\
+                         Runtime workloads are closed-loop with bounded in-flight jobs. Setup and\n\
+                         warm-up are excluded. The reference job makes 3 model requests, 2 real\n\
+                         workspace reads, and one validated completion. JSONL is written to stdout;\n\
+                         unsuccessful required work returns nonzero. `summary --concurrency N`\n\
+                         reads JSONL on stdin. --provider-failure and --child-hang are explicit\n\
+                         negative-check controls; --child-hang uses --deadline-ms for cleanup."
                     );
                     return Ok(None);
                 }
@@ -153,20 +155,46 @@ impl Options {
                     options.directory =
                         PathBuf::from(arguments.next().ok_or("missing option value")?);
                 }
-                "--iterations" | "--files" => {
+                "--iterations" | "--files" | "--trials" | "--page-size" | "--writer-jobs"
+                | "--stream-chunks" => {
                     let value: usize = arguments.next().ok_or("missing option value")?.parse()?;
                     if value == 0 {
                         return Err("benchmark sizes must be positive".into());
                     }
                     match argument.as_str() {
                         "--iterations" => options.iterations = value,
-                        _ => options.files = value,
+                        "--files" => options.files = value,
+                        "--trials" => options.trials = value,
+                        "--page-size" => options.page_size = value,
+                        "--writer-jobs" => options.writer_jobs = value,
+                        _ => options.stream_chunks = value,
                     }
                 }
+                "--warmup" => {
+                    options.warmup = arguments.next().ok_or("missing option value")?.parse()?;
+                }
+                "--deadline-ms" | "--stream-pace-ms" => {
+                    let milliseconds: u64 =
+                        arguments.next().ok_or("missing option value")?.parse()?;
+                    if milliseconds == 0 {
+                        return Err("benchmark durations must be positive".into());
+                    }
+                    match argument.as_str() {
+                        "--deadline-ms" => options.deadline = Duration::from_millis(milliseconds),
+                        _ => options.stream_pace = Duration::from_millis(milliseconds),
+                    }
+                }
+                "--mode" => {
+                    options.mode = arguments.next().ok_or("missing option value")?;
+                    if !matches!(options.mode.as_str(), "smoke" | "reference") {
+                        return Err("--mode must be smoke or reference".into());
+                    }
+                }
+                "--provider-failure" => options.provider_failure = true,
+                "--child-hang" => options.child_hang = true,
                 "--jobs" => {
-                    let val_str = arguments.next().ok_or("missing option value")?;
-                    let values = sizes(&val_str)?;
-                    options.jobs = *values.first().unwrap();
+                    let values = sizes(&arguments.next().ok_or("missing option value")?)?;
+                    options.jobs = values.first().copied().ok_or("a job count is required")?;
                     options.provider_jobs = options.jobs;
                     options.scheduler_jobs = values;
                 }
@@ -190,12 +218,8 @@ impl Options {
                 _ => return Err(format!("unknown argument: {argument}; use --help").into()),
             }
         }
-        if !matches!(
-            options.section.as_str(),
-            "scheduler" | "provider-record" | "observability"
-        ) && (options.jobs > 4_000 || options.files > 4_000)
-        {
-            return Err("--jobs and --files must be at most 4000 (production limits)".into());
+        if options.page_size > 100 {
+            return Err("--page-size must not exceed the production maximum of 100".into());
         }
         std::fs::create_dir_all(&options.directory)?;
         options.directory = options.directory.canonicalize()?;
@@ -207,7 +231,12 @@ impl Options {
     }
 }
 
-fn report(name: &str, parameters: &Value, mut samples: Vec<Duration>, elapsed: Option<Duration>) {
+fn report(
+    name: &str,
+    parameters: &Value,
+    mut samples: Vec<Duration>,
+    elapsed: Option<Duration>,
+) -> Result<()> {
     samples.sort_unstable();
     let percentile = |percent: usize| {
         let index = samples
@@ -218,28 +247,60 @@ fn report(name: &str, parameters: &Value, mut samples: Vec<Duration>, elapsed: O
         samples
             .get(index)
             .copied()
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1000.0
+            .map(|sample| sample.as_secs_f64() * 1000.0)
     };
-    println!(
-        "{}",
-        json!({
-            "type": "measurement", "name": name, "parameters": parameters,
-            "samples": samples.len(), "p50_ms": percentile(50),
-            "p95_ms": percentile(95), "p99_ms": percentile(99),
-            "max_ms": samples.last().copied().unwrap_or_default().as_secs_f64() * 1000.0,
-            "elapsed_s": elapsed.map(|duration| duration.as_secs_f64()),
-            "throughput_per_second": elapsed.map(|duration| samples.len() as f64 / duration.as_secs_f64()),
-        })
-    );
+    let mut value = json!({
+        "type": "measurement", "name": name, "parameters": parameters,
+        "status": if samples.is_empty() { "unavailable" } else { "success" },
+        "samples": samples.len(),
+        "outcomes": {"attempted": samples.len(), "successful": samples.len(),
+            "rejected": 0, "failed": 0, "timed_out": 0, "unfinished": 0},
+        "context": LEGACY_CONTEXT.get(), "trial": null,
+        "trial_scope": "component samples aggregated in one section run",
+        "elapsed_s": elapsed.map(|duration| duration.as_secs_f64()),
+    });
+    if let Some(object) = value.as_object_mut() {
+        if samples.is_empty() {
+            object.insert(
+                "unavailable_reason".into(),
+                json!("no successful latency samples"),
+            );
+        } else {
+            object.insert("p50_ms".into(), json!(percentile(50)));
+            let reference = LEGACY_CONTEXT
+                .get()
+                .is_some_and(|context| context["mode"] == "reference");
+            if reference && samples.len() >= 100 {
+                object.insert("p95_ms".into(), json!(percentile(95)));
+            }
+            if reference && samples.len() >= 1_000 {
+                object.insert("p99_ms".into(), json!(percentile(99)));
+            }
+            object.insert(
+                "max_ms".into(),
+                json!(samples.last().map(|sample| sample.as_secs_f64() * 1000.0)),
+            );
+            if let Some(elapsed) = elapsed {
+                object.insert(
+                    "throughput_per_second".into(),
+                    json!(samples.len() as f64 / elapsed.as_secs_f64()),
+                );
+            }
+        }
+    }
+    println!("{value}");
+    if samples.is_empty() && !name.starts_with("maintenance.") {
+        return Err(format!("{name}: no successful samples where work was required").into());
+    }
+    Ok(())
 }
 
 fn measure<T>(
     iterations: usize,
+    warmup: usize,
     mut operation: impl FnMut() -> Result<T>,
 ) -> Result<(Vec<Duration>, Duration)> {
-    for _ in 0..3 {
+    for _ in 0..warmup {
         std::hint::black_box(operation()?);
     }
     let mut samples = Vec::with_capacity(iterations);
@@ -426,7 +487,7 @@ fn jobs(options: &Options) -> Result<()> {
                 with_database(options, |handle, _directory| {
                     let executor = executor(handle)?;
                     let payload = "x".repeat(payload_bytes);
-                    for _ in 0..3 {
+                    for _ in 0..options.warmup {
                         lifecycle(handle, executor, &payload, outputs, &mut Timings::new())?;
                     }
                     let ready = Barrier::new(clients + 1);
@@ -473,7 +534,7 @@ fn jobs(options: &Options) -> Result<()> {
                             &parameters,
                             samples,
                             (stage == "job.lifecycle").then_some(elapsed),
-                        );
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -610,37 +671,13 @@ fn claim_and_finalize(
 }
 
 fn peak_memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "macos")]
-    unsafe {
-        let mut usage = std::mem::zeroed::<libc::rusage>();
-        if libc::getrusage(libc::RUSAGE_SELF, &mut usage) == 0 {
-            return Some(usage.ru_maxrss as u64);
-        }
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    unsafe {
-        #[repr(C)]
-        struct Rusage {
-            ru_utime: [u64; 2],
-            ru_stime: [u64; 2],
-            ru_maxrss: i64,
-            _pad: [i64; 13],
-        }
-        unsafe extern "C" {
-            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
-        }
-        let mut usage = std::mem::zeroed::<Rusage>();
-        if getrusage(0, &mut usage) == 0 {
-            return Some((usage.ru_maxrss as u64) * 1024);
-        }
-    }
-    None
+    benchmark::lifetime_rusage().0
 }
 
 fn stop_unclean_and_reopen(
     directory: &DataDirectory,
     worker: DatabaseWorker,
-    expected: (u64, u64, u64, u64),
+    expected: (u64, u64, u64, u64, u64),
     check: impl FnOnce(&DatabaseHandle) -> Result<()>,
 ) -> Result<(Duration, u64, Option<u64>)> {
     worker.shutdown()?;
@@ -668,20 +705,27 @@ fn stop_unclean_and_reopen(
     {
         let db = Database::open(&db_path)?;
         let tx = db.begin_read()?;
-        let pending_table: TableDefinition<u64, ()> = TableDefinition::new("pending");
-        let ready_table: TableDefinition<(u16, u64), ()> = TableDefinition::new("ready");
-        let delayed_table: TableDefinition<(i64, u64), ()> = TableDefinition::new("delayed");
-        let waiters_table: TableDefinition<(u64, u64), u8> =
+        let pending_table: TableDefinition<u128, ()> = TableDefinition::new("pending");
+        let ready_table: TableDefinition<(u16, u128), ()> = TableDefinition::new("ready");
+        let delayed_table: TableDefinition<(i64, u128), ()> = TableDefinition::new("delayed");
+        let waiters_table: TableDefinition<(u128, u128), u8> =
             TableDefinition::new("dependency_waiter");
-        let unsettled_table: TableDefinition<u64, (u32, u32)> = TableDefinition::new("unsettled");
+        let unsettled_table: TableDefinition<u128, (u32, u32)> = TableDefinition::new("unsettled");
         let pending_count = tx.open_table(pending_table)?.len()?;
         let ready_count = tx.open_table(ready_table)?.len()?;
         let delayed_count = tx.open_table(delayed_table)?.len()?;
         let waiters_count = tx.open_table(waiters_table)?.len()?;
         let unsettled_count = tx.open_table(unsettled_table)?.len()?;
-        if (pending_count, ready_count, delayed_count, unsettled_count) != expected {
+        let actual = (
+            pending_count,
+            ready_count,
+            delayed_count,
+            waiters_count,
+            unsettled_count,
+        );
+        if actual != expected {
             return Err(format!(
-                "jobs still pending after reopen: pending={pending_count}, ready={ready_count}, delayed={delayed_count}, waiters={waiters_count}, unsettled={unsettled_count}"
+                "reopen index counts differ: actual={actual:?}, expected={expected:?} (pending, ready, delayed, dependency_waiter, unsettled)"
             )
             .into());
         }
@@ -751,21 +795,27 @@ fn scheduler(options: &Options) -> Result<()> {
             &parameters_independent,
             admit_samples,
             Some(elapsed_admit),
-        );
+        )?;
 
         let (claim_samples, finalize_samples, elapsed_claim) = claim_and_finalize(&handle, count)?;
+        println!(
+            "{}",
+            json!({"type":"fixture", "name":"scheduler.drain",
+            "parameters": parameters_independent, "elapsed_s": elapsed_claim.as_secs_f64(),
+            "scope":"claim_batch plus finalize loop"})
+        );
         report(
             "scheduler.claim_batch",
             &parameters_independent,
             claim_samples,
-            Some(elapsed_claim),
-        );
+            None,
+        )?;
         report(
             "scheduler.finalize",
             &parameters_independent,
             finalize_samples,
-            Some(elapsed_claim),
-        );
+            None,
+        )?;
         worker.shutdown()?;
         drop(root);
 
@@ -789,28 +839,35 @@ fn scheduler(options: &Options) -> Result<()> {
             &parameters_dependent,
             dep_admit_samples,
             Some(elapsed_dep_admit),
-        );
+        )?;
 
         let (dep_claim_samples, dep_finalize_samples, elapsed_dep_claim) =
             claim_and_finalize(&handle, count)?;
+        println!(
+            "{}",
+            json!({"type":"fixture", "name":"scheduler.drain",
+            "parameters": parameters_dependent, "elapsed_s": elapsed_dep_claim.as_secs_f64(),
+            "scope":"claim_batch plus finalize loop"})
+        );
         report(
             "scheduler.claim_batch",
             &parameters_dependent,
             dep_claim_samples,
-            Some(elapsed_dep_claim),
-        );
+            None,
+        )?;
         report(
             "scheduler.finalize",
             &parameters_dependent,
             dep_finalize_samples,
-            Some(elapsed_dep_claim),
-        );
+            None,
+        )?;
 
-        // 4: Stop without clean shutdown and reopen it (after all jobs completed)
+        // 4: Close cleanly, write an unclean marker, and reopen after completion.
+        // This checks marker recovery, not real process-crash recovery.
         let (reopen_duration, file_size, peak_memory) = stop_unclean_and_reopen(
             &directory,
             worker,
-            (0, 0, 0, count.div_ceil(2) as u64),
+            (0, 0, 0, 0, count.div_ceil(2) as u64),
             |_| Ok(()),
         )?;
         let reopen_params = json!({
@@ -825,7 +882,7 @@ fn scheduler(options: &Options) -> Result<()> {
             &reopen_params,
             vec![reopen_duration],
             Some(reopen_duration),
-        );
+        )?;
         println!(
             "{}",
             json!({
@@ -859,6 +916,7 @@ fn scheduler(options: &Options) -> Result<()> {
                     count as u64,
                     count.div_ceil(2) as u64,
                     0,
+                    (count / 2) as u64,
                     (count + count.div_ceil(2)) as u64,
                 ),
                 |handle| {
@@ -889,7 +947,7 @@ fn scheduler(options: &Options) -> Result<()> {
             &queued_reopen_params,
             vec![queued_reopen_duration],
             Some(queued_reopen_duration),
-        );
+        )?;
         println!(
             "{}",
             json!({
@@ -1012,14 +1070,14 @@ fn mixed(options: &Options) -> Result<()> {
                 &parameters,
                 writes,
                 Some(elapsed),
-            );
+            )?;
             for (operation, samples) in reads {
                 report(
                     &format!("mixed.{operation}"),
                     &parameters,
                     samples,
                     Some(elapsed),
-                );
+                )?;
             }
             Ok(())
         })?;
@@ -1042,7 +1100,7 @@ fn reads(options: &Options) -> Result<()> {
             }
             finish(handle, first)?;
             let cursor = ids.get(count / 2).copied();
-            for clients in [1, 8] {
+            for clients in options.clients.iter().copied() {
                 for operation in [
                     "read.job",
                     "read.jobs_first_page",
@@ -1080,7 +1138,7 @@ fn reads(options: &Options) -> Result<()> {
                         }
                         Ok(())
                     };
-                    for index in 0..3 {
+                    for index in 0..options.warmup {
                         read(index)?;
                     }
                     let ready = Barrier::new(clients + 1);
@@ -1117,7 +1175,7 @@ fn reads(options: &Options) -> Result<()> {
                         &json!({"fixture_jobs": count, "clients": clients, "page_limit": if operation == "read.outputs" {50} else {20}}),
                         samples,
                         Some(elapsed),
-                    );
+                    )?;
                 }
             }
             Ok(())
@@ -1134,29 +1192,65 @@ fn reads(options: &Options) -> Result<()> {
 const SEARCH_QUERIES: [(&str, &str); 7] = [
     ("rare", "rarebeacon"),
     ("missing", "neverpresenttoken"),
-    ("common", "packet"),
+    ("common", "commonbeacon"),
     ("and", "rarebeacon alpha"),
     ("phrase", "\"alpha beta\""),
-    ("broad_phrase", "\"packet state\""),
-    ("broad_phrase_zero", "\"state error\""),
+    ("broad_phrase", "\"commonbeacon marker\""),
+    ("broad_phrase_zero", "\"marker commonbeacon\""),
 ];
 
-/// Writes `files` files of four rotating `sizes`: one distribution the
-/// baseline corpus and every scaled corpus share, so a query's cost moves only
-/// with the corpus it is measured against. File 0 carries the rare term.
+#[cfg(unix)]
+fn validate_corpus_plan(
+    files: usize,
+    sizes: [usize; 4],
+    limits: &ocg::service::fts::FtsLimits,
+    within_content_bound: bool,
+) -> Result<u64> {
+    if files == 0 || files > limits.files {
+        return Err(format!(
+            "--files {files} is outside the production file count bound {}; choose 1..={}",
+            limits.files, limits.files
+        )
+        .into());
+    }
+    let mut planned_bytes = 0u64;
+    for file in 0..files {
+        let size = sizes[file % 4];
+        if size == 0 || size > limits.file_bytes {
+            return Err(format!(
+                "--files {files} plans {size} bytes for file {file}, exceeding the production per-file limit of {} bytes; increase --files or reduce the corpus size",
+                limits.file_bytes
+            )
+            .into());
+        }
+        planned_bytes = planned_bytes
+            .checked_add(size as u64)
+            .ok_or("planned corpus size overflow")?;
+    }
+    if within_content_bound && planned_bytes > limits.content_bytes {
+        return Err(format!(
+            "--files {files} plans {planned_bytes} bytes, exceeding the production total-content limit {}; increase --files or reduce the corpus size",
+            limits.content_bytes
+        )
+        .into());
+    }
+    Ok(planned_bytes)
+}
+
 #[cfg(unix)]
 fn corpus(source: &std::path::Path, files: usize, sizes: [usize; 4]) -> Result<()> {
     for file in 0..files {
         let group = source.join(format!("group{:03}", file / 40));
         std::fs::create_dir_all(&group)?;
         let target = sizes[file % 4];
-        let mut content = String::new();
+        let mut content = String::from("// commonbeacon marker\n");
         if file == 0 {
             content.push_str("// rarebeacon alpha beta HTTPServer\n");
         }
         while content.len() < target {
             content.push_str(&format!("pub fn itemcode{file:05x}part{:05x}(state: &mut State) -> Result<u64, Error> {{ let packet = state.apply(value)?; Ok(packet) }}\n", content.len()));
         }
+        content.truncate(target);
         std::fs::write(group.join(format!("unit{file:05}.rs")), content)?;
     }
     Ok(())
@@ -1171,6 +1265,7 @@ fn queries(
     prefix: &str,
     parameters: &Value,
     iterations: usize,
+    warmup: usize,
     strict: bool,
 ) -> Result<()> {
     for (class, query) in SEARCH_QUERIES {
@@ -1178,17 +1273,23 @@ fn queries(
         let results = value["results"]
             .as_array()
             .ok_or("search omitted results")?;
+        let files = parameters["files"]
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("search query parameters omitted the fixture file count")?;
         if strict {
-            if matches!(class, "rare" | "and" | "phrase" | "common" | "broad_phrase")
-                && results.is_empty()
-            {
-                return Err(format!("expected search hits for {class}").into());
-            }
-            if matches!(class, "missing" | "broad_phrase_zero") && !results.is_empty() {
-                return Err(format!("unexpected search hits for {class}").into());
-            }
+            workload::validate_query(class, &value, files)
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
         }
-        let (samples, elapsed) = measure(iterations, || Ok(index.search(query, 20)?))?;
+        let (samples, elapsed) = measure(iterations, warmup, || {
+            let value = index.search(query, 20)?;
+            if strict {
+                workload::validate_query(class, &value, files).map_err(
+                    |error| -> Box<dyn std::error::Error + Send + Sync> { error.into() },
+                )?;
+            }
+            Ok(value)
+        })?;
         let mut parameters = parameters.clone();
         parameters["result_limit"] = json!(20);
         parameters["records"] = json!(results.len());
@@ -1199,7 +1300,7 @@ fn queries(
             &parameters,
             samples,
             Some(elapsed),
-        );
+        )?;
     }
     Ok(())
 }
@@ -1216,7 +1317,7 @@ fn search(options: &Options) -> Result<()> {
     corpus(&source, options.files, [512, 2_048, 4_096, 9_216])?;
     let workspace = Workspace::authorize(&source, &directory)?;
     let parameters = json!({"files": options.files, "cache": "warm_os_cache", "result_limit": 20});
-    let (samples, elapsed) = measure(5, || {
+    let (samples, elapsed) = measure(options.trials, options.warmup, || {
         let index = WorkspaceFts::new(workspace.clone(), FtsLimits::default());
         let built = index.build()?;
         if !built.coverage.complete || built.coverage.files_indexed != options.files {
@@ -1229,7 +1330,7 @@ fn search(options: &Options) -> Result<()> {
         &parameters,
         samples,
         Some(elapsed),
-    );
+    )?;
     let index = WorkspaceFts::new(workspace, FtsLimits::default());
     let built = index.build()?;
     println!(
@@ -1243,10 +1344,11 @@ fn search(options: &Options) -> Result<()> {
         "search",
         &json!({"files": options.files}),
         options.iterations,
+        options.warmup,
         true,
     )?;
-    let (samples, elapsed) = measure(5, || Ok(index.rebuild()?))?;
-    report("search.full_rebuild", &parameters, samples, Some(elapsed));
+    let (samples, elapsed) = measure(options.trials, options.warmup, || Ok(index.rebuild()?))?;
+    report("search.full_rebuild", &parameters, samples, Some(elapsed))?;
     Ok(())
 }
 
@@ -1260,26 +1362,39 @@ fn search_scale(options: &Options) -> Result<()> {
     use ocg::system::executor::workspace_read::Workspace;
 
     let limits = FtsLimits::default();
-    for target in [1u64, 4, 16, 64].map(|mib| mib * 1024 * 1024) {
-        let within = target <= limits.content_bytes;
+    let plans = [1u64, 4, 16, 64]
+        .map(|mib| mib * 1024 * 1024)
+        .map(|target| {
+            let within = target <= limits.content_bytes;
+            let per_file = usize::try_from(target / options.files as u64)
+                .map_err(|_| "corpus file size does not fit this platform")?
+                .max(256);
+            let sizes = [per_file / 4, per_file / 2, per_file, per_file * 2];
+            let planned_bytes = validate_corpus_plan(options.files, sizes, &limits, within)?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                target,
+                sizes,
+                planned_bytes,
+                within,
+            ))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    for (target, sizes, planned_bytes, within) in plans {
         let label = format!("{}mib", target / (1024 * 1024));
         let root = TemporaryRoot::new(&options.directory)?;
         let directory = DataDirectory::bootstrap(root.0.join("data").into_os_string())?;
         let source = root.0.join("workspace");
         std::fs::create_dir(&source)?;
-        let per_file = usize::try_from(target / options.files as u64)
-            .unwrap_or(256)
-            .max(256);
-        corpus(
-            &source,
-            options.files,
-            [per_file / 4, per_file / 2, per_file, per_file * 2],
-        )?;
+        corpus(&source, options.files, sizes)?;
         let workspace = Workspace::authorize(&source, &directory)?;
-        let parameters = json!({"corpus": label, "corpus_bytes_target": target,
+        let parameters = json!({"corpus": label, "requested_corpus_bytes": target,
+            "effective_corpus_bytes": planned_bytes, "file_size_distribution": sizes,
             "files": options.files, "cache": "warm_os_cache",
-            "production_content_bytes_bound": limits.content_bytes, "within_bound": within});
-        let (samples, elapsed) = measure(5, || {
+            "production_file_bytes_bound": limits.file_bytes,
+            "production_content_bytes_bound": limits.content_bytes, "within_bound": within,
+            "deliberate_total_content_overflow": !within});
+        let (samples, elapsed) = measure(options.trials, options.warmup, || {
             let index = WorkspaceFts::new(workspace.clone(), limits);
             let built = index.build()?;
             if built.coverage.files_indexed == 0 {
@@ -1289,8 +1404,13 @@ fn search_scale(options: &Options) -> Result<()> {
             {
                 return Err(format!("partial search fixture: {:?}", built.coverage).into());
             }
-            if !within && built.coverage.complete {
-                return Err("a corpus past the content bound indexed whole".into());
+            if !within && built.coverage.limit != Some(ocg::service::fts::BuildLimit::ContentBytes)
+            {
+                return Err(format!(
+                    "oversized corpus did not reach the content-byte limit: {:?}",
+                    built.coverage
+                )
+                .into());
             }
             Ok(built)
         })?;
@@ -1299,31 +1419,35 @@ fn search_scale(options: &Options) -> Result<()> {
             &parameters,
             samples,
             Some(elapsed),
-        );
+        )?;
         let index = WorkspaceFts::new(workspace, limits);
         let built = index.build()?;
         println!(
             "{}",
             json!({"type": "fixture", "name": "search_scale.index", "corpus": label,
+            "requested_files": options.files, "generated_files": options.files,
+            "generated_bytes": planned_bytes,
             "files": built.coverage.files_indexed, "content_bytes": built.coverage.content_bytes_indexed,
             "tokens": built.coverage.tokens_indexed, "terms": built.coverage.terms,
             "memory_bytes_approx": built.memory_bytes_approx,
-            "complete": built.coverage.complete, "limit": format!("{:?}", built.coverage.limit)})
+            "complete": built.coverage.complete, "limit": format!("{:?}", built.coverage.limit),
+            "skipped": format!("{:?}", built.coverage.skipped)})
         );
         queries(
             &index,
             &format!("search_scale.{label}"),
             &parameters,
             options.iterations,
+            options.warmup,
             within,
         )?;
-        let (samples, elapsed) = measure(5, || Ok(index.rebuild()?))?;
+        let (samples, elapsed) = measure(options.trials, options.warmup, || Ok(index.rebuild()?))?;
         report(
             &format!("search_scale.full_rebuild.{label}"),
             &parameters,
             samples,
             Some(elapsed),
-        );
+        )?;
     }
     Ok(())
 }
@@ -1370,7 +1494,7 @@ fn maintenance(options: &Options) -> Result<()> {
             &grown,
             samples,
             Some(elapsed),
-        );
+        )?;
 
         let observed = create_claimed(handle, executor)?;
         let stop = AtomicBool::new(false);
@@ -1474,7 +1598,7 @@ fn maintenance(options: &Options) -> Result<()> {
             "samples": 1, "duration_ms": compaction.as_secs_f64() * 1000.0, "parameters": around})
         );
         for (operation, samples) in measured {
-            report(&format!("maintenance.{operation}"), &around, samples, None);
+            report(&format!("maintenance.{operation}"), &around, samples, None)?;
         }
         Ok(())
     })
@@ -1489,56 +1613,202 @@ fn main() -> Result<()> {
     let Some(options) = Options::parse()? else {
         return Ok(());
     };
-    if cfg!(debug_assertions) {
-        return Err("run with cargo bench (optimized build required)".into());
-    }
-    let compiler = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()?;
-    if !compiler.status.success() {
-        return Err("rustc --version failed".into());
-    }
-    // The provider-record section drives its own workload and applies neither
-    // file, payload, output nor iteration options. Reporting them as if they
-    // had been applied would describe a load this section never ran, so they
-    // are null and named instead.
+    let environment_metadata = metadata::BenchmarkMetadata::capture(
+        options.directory.clone(),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "bench"
+        },
+    )?;
     let is_provider = options.section == "provider-record";
     let is_observability = options.section == "observability";
     let is_large_load = is_provider || is_observability;
-    // Null means the section did not apply the option, so a reader is not
-    // left reading a declared parameter that describes no work.
-    let applied = |value: Value| {
-        if is_large_load { Value::Null } else { value }
+    let unused_options: &[&str] = match options.section.as_str() {
+        "jobs" => &[
+            "jobs",
+            "files",
+            "trials",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "scheduler" => &[
+            "iterations",
+            "clients",
+            "files",
+            "payloads",
+            "outputs",
+            "trials",
+            "warmup",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "reads" => &[
+            "files",
+            "payloads",
+            "outputs",
+            "trials",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "mixed" => &[
+            "files",
+            "trials",
+            "warmup",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "maintenance" => &[
+            "jobs",
+            "iterations",
+            "clients",
+            "files",
+            "payloads",
+            "outputs",
+            "trials",
+            "warmup",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "search_scale" => &[
+            "jobs",
+            "clients",
+            "payloads",
+            "outputs",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "provider-record" => &[
+            "iterations",
+            "files",
+            "payloads",
+            "outputs",
+            "trials",
+            "warmup",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "observability" => &[
+            "files",
+            "payloads",
+            "outputs",
+            "trials",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "search" => &[
+            "jobs",
+            "payloads",
+            "outputs",
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        "history" => &["payloads", "outputs"],
+        "database" => &[
+            "iterations",
+            "payloads",
+            "outputs",
+            "warmup",
+            "page_size",
+            "writer_jobs",
+        ],
+        "startup" | "memory" | "admission" | "throughput" | "streaming" => &[
+            "iterations",
+            "payloads",
+            "outputs",
+            "page_size",
+            "writer_jobs",
+        ],
+        "all" => &[
+            "deadline_ms",
+            "page_size",
+            "writer_jobs",
+            "stream_chunks",
+            "stream_pace_ms",
+        ],
+        _ => &[],
     };
-    println!(
-        "{}",
-        json!({"type": "environment", "os": std::env::consts::OS, "arch": std::env::consts::ARCH,
-        "compiler": String::from_utf8(compiler.stdout)?.trim(),
-        "available_parallelism": std::thread::available_parallelism()?.get(),
-        "section": options.section,
-        "iterations_per_client": if is_provider { Value::Null } else { json!(options.iterations) },
-        "jobs": if is_large_load { options.provider_jobs } else { options.jobs },
+    let applied = |name: &str, value: Value| {
+        if unused_options.contains(&name) {
+            Value::Null
+        } else {
+            value
+        }
+    };
+    let applied_options = json!({"section": options.section,
+        "iterations_per_client": applied("iterations", json!(options.iterations)),
+        "jobs": applied("jobs", json!(if is_large_load { options.provider_jobs } else { options.jobs })),
         "obs_jobs": if is_observability { json!(observability_jobs(&options)) } else { Value::Null },
-        "files": applied(json!(options.files)),
-        "clients": options.clients,
-        "payloads": applied(json!(options.payloads)),
-        "progress_outputs_per_job": applied(json!(options.outputs)),
-        "unused_options": if is_provider {
-            json!(["iterations", "files", "payloads", "outputs"])
-        } else if is_observability {
-            json!(["files", "payloads", "outputs"])
-        } else {
-            json!([])
-        },
-        "load_model": "closed_loop", "latency_unit": "ms", "storage_dir": options.directory,
-        "scope": if is_provider {
-            "mock provider HTTP, request persistence and replay HTTP; excludes tool handlers and scheduler dispatch"
-        } else if is_observability {
-            "100k jobs with 3 requests and 2 tool calls each; vitals, tool stats, usage summary, and unclean reopen"
-        } else {
-            "public database and FTS APIs; excludes HTTP, scheduler dispatch and providers"
-        }})
+        "files": applied("files", json!(options.files)), "clients": applied("clients", json!(options.clients)),
+        "payloads": applied("payloads", json!(options.payloads)),
+        "progress_outputs_per_job": applied("outputs", json!(options.outputs)),
+        "trials": applied("trials", json!(options.trials)), "warmup": applied("warmup", json!(options.warmup)),
+        "deadline_ms": applied("deadline_ms", json!(options.deadline.as_millis())),
+        "page_size": applied("page_size", json!(options.page_size)),
+        "writer_jobs": applied("writer_jobs", json!(options.writer_jobs)),
+        "stream_chunks": applied("stream_chunks", json!(options.stream_chunks)),
+        "stream_pace_ms": applied("stream_pace_ms", json!(options.stream_pace.as_millis())),
+        "unused_options": unused_options,
+        "all_scope": if options.section == "all" { Some("options apply to different legacy sections; see each record") } else { None }});
+    let _ = LEGACY_CONTEXT.set(json!({
+        "run_id": uuid::Uuid::now_v7().to_string(), "section": options.section,
+        "mode": options.mode, "warm_up": applied("warmup", json!(options.warmup)),
+        "requested": {"jobs": options.jobs, "iterations": options.iterations,
+            "clients": options.clients, "files": options.files, "trials": options.trials},
+        "applied": applied_options, "environment": environment_metadata.to_json(),
+    }));
+    let is_runtime = matches!(
+        options.section.as_str(),
+        "startup" | "memory" | "admission" | "throughput" | "streaming" | "history" | "database"
     );
+    let scope = if is_provider {
+        "mock provider HTTP, request persistence and replay HTTP; excludes tool handlers and scheduler dispatch"
+    } else if is_observability {
+        "configured jobs with 3 requests and 2 tool calls each; vitals, tool stats, usage summary, and marker-based reopen"
+    } else if is_runtime {
+        "authenticated HTTP, scheduler dispatch, execution runtime, mock provider, real workspace tools, and production persistence"
+    } else if options.section == "search" {
+        "direct production WorkspaceFts build, rebuild, and concurrent warm queries; excludes HTTP and providers"
+    } else {
+        "direct public database and FTS APIs; excludes HTTP, scheduler dispatch and providers"
+    };
+    reporting::Record::Environment(Box::new(reporting::EnvironmentRecord {
+        metadata: environment_metadata,
+        workload_model: "closed_loop".into(),
+        scope: scope.into(),
+        requested: json!({"section": options.section, "iterations": options.iterations,
+            "trials": options.trials, "warmup": options.warmup, "jobs": options.jobs,
+            "files": options.files, "clients": options.clients, "mode": options.mode}),
+        applied: applied_options,
+    }))
+    .emit();
     // Summary report: read JSONL and emit Markdown table
     if options.section == "summary" {
         return summary::run_summary();
@@ -1557,41 +1827,58 @@ fn main() -> Result<()> {
     ) {
         return run_measurement_section(&options);
     }
-    if options.section == "provider-record" {
-        return provider_record(&options);
+    let result = (|| -> Result<()> {
+        if options.section == "provider-record" {
+            return provider_record(&options);
+        }
+        if options.section == "observability" {
+            return observability(&options);
+        }
+        if options.selected("jobs") {
+            jobs(&options)?;
+        }
+        if options.selected("scheduler") {
+            scheduler(&options)?;
+        }
+        if options.selected("reads") {
+            reads(&options)?;
+        }
+        if options.selected("mixed") {
+            mixed(&options)?;
+        }
+        if options.selected("maintenance") {
+            maintenance(&options)?;
+        }
+        #[cfg(unix)]
+        if options.selected("search") {
+            search(&options)?;
+        }
+        #[cfg(unix)]
+        if options.selected("search_scale") {
+            search_scale(&options)?;
+        }
+        #[cfg(not(unix))]
+        if options.section == "all"
+            || options.section == "search"
+            || options.section == "search_scale"
+        {
+            return Err("search benchmarks require Unix".into());
+        }
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        println!(
+            "{}",
+            json!({"type": "diagnostic", "section": options.section,
+            "trial": null, "status": "failed", "error": error.to_string(),
+            "applied": {"jobs": options.jobs, "iterations": options.iterations,
+                "clients": options.clients, "files": options.files, "trials": options.trials},
+            "outcomes": {"attempted": 0, "successful": 0, "rejected": 0,
+                "failed": 0, "timed_out": 0, "unfinished": 0},
+            "outcome_scope": "unavailable for section/setup failure"})
+        );
     }
-    if options.section == "observability" {
-        return observability(&options);
-    }
-    if options.selected("jobs") {
-        jobs(&options)?;
-    }
-    if options.selected("scheduler") {
-        scheduler(&options)?;
-    }
-    if options.selected("reads") {
-        reads(&options)?;
-    }
-    if options.selected("mixed") {
-        mixed(&options)?;
-    }
-    if options.selected("maintenance") {
-        maintenance(&options)?;
-    }
-    #[cfg(unix)]
-    if options.selected("search") {
-        search(&options)?;
-    }
-    #[cfg(unix)]
-    if options.selected("search_scale") {
-        search_scale(&options)?;
-    }
-    #[cfg(not(unix))]
-    if options.section == "all" || options.section == "search" || options.section == "search_scale"
-    {
-        return Err("search benchmarks require Unix".into());
-    }
-    Ok(())
+    result
 }
 
 #[derive(Default)]
@@ -1767,8 +2054,9 @@ fn provider_record(options: &Options) -> Result<()> {
             let provider_address = listener.local_addr()?;
             let mock = HttpServer::new(async || {
                 App::new().default_service(web::to(async |body: web::types::Json<Value>| {
-                    let count = body["messages"].as_array().map_or(0, Vec::len);
-                    let round = count.saturating_sub(6) / 2;
+                    let round = body["messages"].as_array().map_or(0, |messages| {
+                        messages.iter().filter(|message| message["role"] == "tool" && !message["content"].is_null()).count()
+                    });
                     let question = body["messages"][5]["content"].as_str().ok_or_else(||
                         ntex::web::error::ErrorBadRequest("missing Job index"))?;
                     let index = question.strip_prefix("Current question for Job ")
@@ -1958,11 +2246,11 @@ fn provider_record(options: &Options) -> Result<()> {
                 ("answer", commits.answer), ("delivered", commits.delivered), ("usage", commits.usage),
                 ("not_delivered", commits.not_delivered)] {
                 if !samples.is_empty() {
-                    report(&format!("provider_record.{kind}_commit"), &parameters, samples, None);
+                    report(&format!("provider_record.{kind}_commit"), &parameters, samples, None)?;
                 }
             }
-            report("provider_record.job_commit", &parameters, job_commits, None);
-            report("provider_record.GET_requests_n", &parameters, gets, Some(gets_elapsed));
+            report("provider_record.job_commit", &parameters, job_commits, None)?;
+            report("provider_record.GET_requests_n", &parameters, gets, Some(gets_elapsed))?;
         }
         Ok(())
     })
@@ -1983,7 +2271,8 @@ fn observability(options: &Options) -> Result<()> {
     let obs_jobs = observability_jobs(options);
     let storage_dir = options.directory.clone();
     let client_sizes = options.clients.clone();
-    let iterations = options.iterations.max(10);
+    let iterations = options.iterations;
+    let warmup = options.warmup;
 
     ntex::rt::System::new("observability-bench", ntex::rt::DefaultRuntime).block_on(async move {
         use ntex::web::{self, App, HttpResponse, HttpServer};
@@ -2008,8 +2297,9 @@ fn observability(options: &Options) -> Result<()> {
             let provider_address = listener.local_addr()?;
             let mock = HttpServer::new(async || {
                 App::new().default_service(web::to(async |body: web::types::Json<Value>| {
-                    let count = body["messages"].as_array().map_or(0, Vec::len);
-                    let round = count.saturating_sub(6) / 2;
+                    let round = body["messages"].as_array().map_or(0, |messages| {
+                        messages.iter().filter(|message| message["role"] == "tool" && !message["content"].is_null()).count()
+                    });
                     let question = body["messages"][5]["content"].as_str().ok_or_else(|| {
                         ntex::web::error::ErrorBadRequest("missing Job index")
                     })?;
@@ -2344,13 +2634,13 @@ fn observability(options: &Options) -> Result<()> {
                 "iterations": iterations,
             });
 
-            let (vitals_samples, elapsed_vitals) = measure(iterations, || Ok(block_on(handle.vitals())))?;
-            report("observability.vitals", &parameters, vitals_samples, Some(elapsed_vitals));
+            let (vitals_samples, elapsed_vitals) = measure(iterations, warmup, || Ok(block_on(handle.vitals())))?;
+            report("observability.vitals", &parameters, vitals_samples, Some(elapsed_vitals))?;
 
-            let (tool_stats_samples, elapsed_tool_stats) = measure(iterations, || {
+            let (tool_stats_samples, elapsed_tool_stats) = measure(iterations, warmup, || {
                 Ok(block_on(handle.tool_stats())?)
             })?;
-            report("observability.tool_stats", &parameters, tool_stats_samples, Some(elapsed_tool_stats));
+            report("observability.tool_stats", &parameters, tool_stats_samples, Some(elapsed_tool_stats))?;
 
             let filter = ocg::db::entities::UsageSummaryFilter::default();
             // The unfiltered summary returns one row per (hour, Agent,
@@ -2358,10 +2648,10 @@ fn observability(options: &Options) -> Result<()> {
             // whether the whole range fit.
             let scanned = block_on(handle.usage_summary(filter.clone(), None))?;
             let rows_scanned = scanned.rows.len();
-            let (usage_samples, elapsed_usage) = measure(iterations, || {
+            let (usage_samples, elapsed_usage) = measure(iterations, warmup, || {
                 Ok(block_on(handle.usage_summary(filter.clone(), None))?)
             })?;
-            report("observability.usage_summary", &parameters, usage_samples, Some(elapsed_usage));
+            report("observability.usage_summary", &parameters, usage_samples, Some(elapsed_usage))?;
 
             let agent_parameters = json!({
                 "jobs": obs_jobs,
@@ -2378,7 +2668,7 @@ fn observability(options: &Options) -> Result<()> {
                 until_us: None,
                 agent: Some(agent.get()),
             };
-            let (usage_agent_samples, elapsed_agent_usage) = measure(iterations, || {
+            let (usage_agent_samples, elapsed_agent_usage) = measure(iterations, warmup, || {
                 Ok(block_on(handle.usage_summary(agent_filter.clone(), None))?)
             })?;
             report(
@@ -2386,7 +2676,7 @@ fn observability(options: &Options) -> Result<()> {
                 &agent_parameters,
                 usage_agent_samples,
                 Some(elapsed_agent_usage),
-            );
+            )?;
 
             let filter_30d = ocg::db::entities::UsageSummaryFilter {
                 generative_only: false,
@@ -2394,10 +2684,10 @@ fn observability(options: &Options) -> Result<()> {
                 until_us: Some(1_700_000_000_000_000 + 2_592_000_000_000),
                 agent: None,
             };
-            let (usage_30d_samples, elapsed_30d_usage) = measure(iterations, || {
+            let (usage_30d_samples, elapsed_30d_usage) = measure(iterations, warmup, || {
                 Ok(block_on(handle.usage_summary(filter_30d.clone(), None))?)
             })?;
-            report("observability.usage_summary_30d", &parameters, usage_30d_samples, Some(elapsed_30d_usage));
+            report("observability.usage_summary_30d", &parameters, usage_30d_samples, Some(elapsed_30d_usage))?;
 
             let filter_1d = ocg::db::entities::UsageSummaryFilter {
                 generative_only: false,
@@ -2405,10 +2695,10 @@ fn observability(options: &Options) -> Result<()> {
                 until_us: Some(1_700_000_000_000_000 + 86_400_000_000),
                 agent: None,
             };
-            let (usage_1d_samples, elapsed_1d_usage) = measure(iterations, || {
+            let (usage_1d_samples, elapsed_1d_usage) = measure(iterations, warmup, || {
                 Ok(block_on(handle.usage_summary(filter_1d.clone(), None))?)
             })?;
-            report("observability.usage_summary_1d", &parameters, usage_1d_samples, Some(elapsed_1d_usage));
+            report("observability.usage_summary_1d", &parameters, usage_1d_samples, Some(elapsed_1d_usage))?;
 
             let provider_commits = commits.sent.len()
                 + commits.output_flush.len()
@@ -2447,20 +2737,20 @@ fn observability(options: &Options) -> Result<()> {
                 ("not_delivered", commits.not_delivered),
             ] {
                 if !samples.is_empty() {
-                    report(&format!("observability.{kind}_commit"), &parameters, samples, None);
+                    report(&format!("observability.{kind}_commit"), &parameters, samples, None)?;
                 }
             }
             // Each observe commit is one record_metrics call; its samples are
             // reported as that command's latency.
-            report("observability.record_metrics", &parameters, commits.usage, None);
-            report("observability.job_commit", &parameters, job_commits, None);
-            report("observability.tool_decide_commit", &parameters, tool_decide_commits, None);
-            report("observability.tool_outcome_commit", &parameters, tool_outcome_commits, None);
+            report("observability.record_metrics", &parameters, commits.usage, None)?;
+            report("observability.job_commit", &parameters, job_commits, None)?;
+            report("observability.tool_decide_commit", &parameters, tool_decide_commits, None)?;
+            report("observability.tool_outcome_commit", &parameters, tool_outcome_commits, None)?;
 
             drop(handle);
 
             let (reopen_duration, file_size, peak_memory) =
-                stop_unclean_and_reopen(&directory, worker, (0, 0, 0, 0), |reopened_handle| {
+                stop_unclean_and_reopen(&directory, worker, (0, 0, 0, 0, 0), |reopened_handle| {
                     let stats = block_on(reopened_handle.tool_stats())?;
                     for name in ["lookup", "search", "calculate"] {
                         let stat = stats
@@ -2506,7 +2796,7 @@ fn observability(options: &Options) -> Result<()> {
                 &reopen_params,
                 vec![reopen_duration],
                 Some(reopen_duration),
-            );
+            )?;
             println!(
                 "{}",
                 json!({
@@ -2527,12 +2817,28 @@ fn observability(options: &Options) -> Result<()> {
     })
 }
 
-/// Run the backend as a server role for the measurement harness.
-///
-/// Parses CLI arguments, bootstraps the backend with an isolated data
-/// directory, registers the mock provider connection, starts the control
-/// plane and execution runtime, prints the handshake JSON, and waits for
-/// SIGTERM.
+fn benchmark_config(
+    handle: &DatabaseHandle,
+    kind: ocg::db::entities::ConfigKind,
+    name: &str,
+) -> Result<Option<ocg::db::entities::ConfigId>> {
+    let mut before = None;
+    loop {
+        let page = block_on(handle.configs(Some(kind), before, 1_000))?;
+        if let Some(record) = page
+            .records
+            .into_iter()
+            .find(|record| record.archived_at.is_none() && record.name == name)
+        {
+            return Ok(Some(record.id));
+        }
+        before = page.next;
+        if before.is_none() {
+            return Ok(None);
+        }
+    }
+}
+
 fn run_server() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut data_dir: Option<PathBuf> = None;
@@ -2541,6 +2847,7 @@ fn run_server() -> Result<()> {
     let mut port: u16 = 0;
     let mut token: Option<String> = None;
     let mut concurrency: usize = 8;
+    let mut hang_before_handshake = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2575,6 +2882,7 @@ fn run_server() -> Result<()> {
                     .parse()
                     .map_err(|_| "invalid concurrency")?;
             }
+            "--hang-before-handshake" => hang_before_handshake = true,
             _ => return Err(format!("unknown server argument: {arg}").into()),
         }
     }
@@ -2583,76 +2891,137 @@ fn run_server() -> Result<()> {
     let workspace = workspace.ok_or("--workspace is required")?;
     let provider_endpoint = provider_endpoint.ok_or("--provider-endpoint is required")?;
     let token = token.ok_or("--token is required")?;
+    if hang_before_handshake {
+        loop {
+            std::thread::park();
+        }
+    }
 
-    // Bootstrap the data directory
     let directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
     let policy = ocg::system::policy::SystemPolicy::load_for_startup(&directory)?;
     let worker = DatabaseWorker::start_with_policy(&directory, policy)?;
     let handle = worker.handle();
-
-    // Register connection to mock provider
-    let connection = block_on(handle.create_config(Config {
-        name: "benchmark-provider".into(),
-        body: ConfigBody::Connection(ConnectionConfig {
-            protocol: LlmTransport::OpenAiChatCompletions,
-            endpoint: Some(provider_endpoint),
-            credential_ref: None,
-        }),
-    }))?;
-
-    // Register model with tool capabilities
-    let model = block_on(handle.create_config(Config {
-        name: "benchmark-model".into(),
-        body: ConfigBody::Model(ModelConfig {
-            reasoning_efforts: None,
-            connection_id: connection,
-            model: "benchmark-mock".into(),
-            context_window: None,
-            parameters: Default::default(),
-            declared_capabilities: BTreeSet::from([
-                ocg::db::entities::ModelCapability::Chat,
-                ocg::db::entities::ModelCapability::Tools,
-            ]),
-        }),
-    }))?;
-
-    // Register executor
-    let executor =
-        block_on(
-            handle.create_executor(Executor {
-                name: "benchmark-executor".into(),
-                concurrency_limit: NonZeroU32::new(u32::try_from(concurrency)?)
-                    .ok_or("concurrency must be positive")?,
-                llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+    let connection = match benchmark_config(
+        &handle,
+        ocg::db::entities::ConfigKind::Connection,
+        "benchmark-provider",
+    )? {
+        Some(id) => {
+            let record = block_on(handle.config(id))?.ok_or("connection disappeared")?;
+            if !matches!(record.body, ConfigBody::Connection(ref config)
+                if config.endpoint.as_deref() == Some(provider_endpoint.as_str()))
+            {
+                return Err("existing benchmark provider connection differs".into());
+            }
+            id
+        }
+        None => block_on(handle.create_config(Config {
+            name: "benchmark-provider".into(),
+            body: ConfigBody::Connection(ConnectionConfig {
+                protocol: LlmTransport::OpenAiChatCompletions,
+                endpoint: Some(provider_endpoint),
+                credential_ref: None,
             }),
-        )?;
+        }))?,
+    };
+    let model = match benchmark_config(
+        &handle,
+        ocg::db::entities::ConfigKind::Model,
+        "benchmark-model",
+    )? {
+        Some(id) => {
+            let record = block_on(handle.config(id))?.ok_or("model disappeared")?;
+            if !matches!(record.body, ConfigBody::Model(ref config)
+                if config.connection_id == connection && config.model == "benchmark-mock")
+            {
+                return Err("existing benchmark model differs".into());
+            }
+            id
+        }
+        None => block_on(handle.create_config(Config {
+            name: "benchmark-model".into(),
+            body: ConfigBody::Model(ModelConfig {
+                reasoning_efforts: None,
+                connection_id: connection,
+                model: "benchmark-mock".into(),
+                context_window: None,
+                parameters: Default::default(),
+                declared_capabilities: BTreeSet::from([
+                    ocg::db::entities::ModelCapability::Chat,
+                    ocg::db::entities::ModelCapability::Tools,
+                ]),
+            }),
+        }))?,
+    };
+    let requested_concurrency =
+        NonZeroU32::new(u32::try_from(concurrency)?).ok_or("concurrency must be positive")?;
+    let executor = match block_on(handle.executors(None, 1_000))?
+        .into_iter()
+        .find(|record| record.name == "benchmark-executor")
+    {
+        Some(record) => {
+            if record.concurrency_limit != requested_concurrency.get() {
+                return Err(format!(
+                    "existing executor concurrency {} differs from requested {requested_concurrency}",
+                    record.concurrency_limit
+                )
+                .into());
+            }
+            record.id
+        }
+        None => block_on(handle.create_executor(Executor {
+            name: "benchmark-executor".into(),
+            concurrency_limit: requested_concurrency,
+            llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
+        }))?,
+    };
     let pool: ocg::db::entities::ExecutionPoolId = executor.into();
-
-    // Create LLM profile
     let llm_profile = model;
-
-    // Create agent profile with Coding capability (provides workspace tools)
-    let agent_profile = block_on(handle.create_config(Config {
-        name: "benchmark-agent-profile".into(),
-        body: ConfigBody::Agent(ocg::db::entities::AgentConfig {
-            capabilities: BTreeSet::from([ocg::db::entities::AgentCapability::Coding]),
-            models: vec![model],
-            ..Default::default()
-        }),
-    }))?;
-
-    // Create project
-    let project = block_on(
-        handle.create_project(ocg::db::entities::Project {
+    let agent_profile = match benchmark_config(
+        &handle,
+        ocg::db::entities::ConfigKind::Agent,
+        "benchmark-agent-profile",
+    )? {
+        Some(id) => {
+            let record = block_on(handle.config(id))?.ok_or("agent disappeared")?;
+            if !matches!(record.body, ConfigBody::Agent(ref config)
+                if config.models.contains(&model)
+                    && config.capabilities.contains(&ocg::db::entities::AgentCapability::Coding))
+            {
+                return Err("existing benchmark agent profile differs".into());
+            }
+            id
+        }
+        None => block_on(handle.create_config(Config {
+            name: "benchmark-agent-profile".into(),
+            body: ConfigBody::Agent(ocg::db::entities::AgentConfig {
+                capabilities: BTreeSet::from([ocg::db::entities::AgentCapability::Coding]),
+                models: vec![model],
+                ..Default::default()
+            }),
+        }))?,
+    };
+    let workspace_root = workspace
+        .to_str()
+        .ok_or("workspace path is not UTF-8")?
+        .to_owned();
+    let project = match block_on(handle.projects(None, 1_000))?
+        .into_iter()
+        .find(|record| record.name == "benchmark-project")
+    {
+        Some(record) => {
+            if record.root != workspace_root {
+                return Err("existing benchmark project root differs".into());
+            }
+            record.id
+        }
+        None => block_on(handle.create_project(ocg::db::entities::Project {
             name: "benchmark-project".into(),
-            root: workspace
-                .to_str()
-                .ok_or("workspace path is not UTF-8")?
-                .to_owned(),
+            root: workspace_root,
             description: None,
             commands: vec![],
-        }),
-    )?;
+        }))?,
+    };
 
     worker.shutdown()?;
     let control_config = ocg::api::v1::ControlPlaneConfig::new(port, &token)?;
@@ -2661,7 +3030,6 @@ fn run_server() -> Result<()> {
         false,
         Some(control_config),
         move |context| async move {
-            // Print handshake JSON
             println!(
                 "{}",
                 json!({
@@ -2674,829 +3042,20 @@ fn run_server() -> Result<()> {
                     "pool": pool.to_string(),
                 })
             );
-
-            // Wait for termination signal (use ntex runtime)
-            let _ = ntex::rt::signals::signal().await;
+            let _ = ntex::rt::spawn_blocking(|| {
+                use std::io::Read;
+                let mut byte = [0; 1];
+                std::io::stdin().read(&mut byte)
+            })
+            .await;
         },
     )?;
-
     Ok(())
 }
 
 /// Dispatch to the appropriate measurement section.
 fn run_measurement_section(options: &Options) -> Result<()> {
     let options = options.clone();
-    ntex::rt::System::new("benchmark-client", ntex::rt::DefaultRuntime).block_on(async move {
-        match options.section.as_str() {
-            "startup" => ntex::rt::spawn_blocking(move || measure_startup(&options)).await?,
-            "memory" => measure_memory(&options).await,
-            "admission" => measure_admission(&options).await,
-            "throughput" => measure_throughput(&options).await,
-            "streaming" => measure_streaming(&options).await,
-            "history" => measure_history(&options).await,
-            "search" => ntex::rt::spawn_blocking(move || measure_search(&options)).await?,
-            "database" => measure_database(&options).await,
-            _ => Err(format!("unknown measurement section: {}", options.section).into()),
-        }
-    })
-}
-
-/// Measure backend startup time.
-fn measure_startup(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::{FixtureConfig, FixtureGenerator};
-    use metadata::{BenchmarkMetadata, WorkloadParameters};
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let root = TemporaryRoot::new(&options.directory)?;
-    let fixture_config = FixtureConfig::small();
-    let generator = FixtureGenerator::new(fixture_config, root.0.clone());
-    let fixture_stats = generator.generate()?;
-    let metadata = BenchmarkMetadata::capture(root.0.clone(), "bench")?;
-    let parameters = WorkloadParameters::new("startup", 0, 1)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    for concurrency in ConcurrencyLevels::ALL {
-        for trial in 0..3 {
-            let trial_start = Instant::now();
-
-            let backend_config = BackendConfig {
-                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
-                workspace: generator.workspace_path().to_path_buf(),
-                provider_endpoint: "http://127.0.0.1:0".to_owned(),
-                port: 0,
-                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-                concurrency,
-                startup_timeout: Duration::from_secs(30),
-            };
-
-            let backend = BackendProcess::spawn(&backend_config)?;
-            let startup_duration = trial_start.elapsed();
-            backend.shutdown()?;
-
-            emit_trial_result(
-                &metadata,
-                &parameters,
-                concurrency,
-                trial,
-                startup_duration,
-                vec![startup_duration],
-                Default::default(),
-            );
-        }
-    }
-
-    emit_section_complete(&parameters);
-    Ok(())
-}
-
-/// Measure backend memory footprint.
-async fn prepare_measurement(
-    directory: PathBuf,
-    config: fixture::FixtureConfig,
-) -> Result<(
-    TemporaryRoot,
-    fixture::FixtureGenerator,
-    fixture::FixtureStats,
-    metadata::BenchmarkMetadata,
-)> {
-    ntex::rt::spawn_blocking(move || {
-        let root = TemporaryRoot::new(&directory)?;
-        let generator = fixture::FixtureGenerator::new(config, root.0.clone());
-        let stats = generator.generate()?;
-        let metadata = metadata::BenchmarkMetadata::capture(root.0.clone(), "bench")?;
-        Ok((root, generator, stats, metadata))
-    })
-    .await?
-}
-
-async fn measure_memory(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::FixtureConfig;
-    use metadata::WorkloadParameters;
-    use mock_provider::MockProvider;
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let (root, generator, fixture_stats, metadata) =
-        prepare_measurement(options.directory.clone(), FixtureConfig::medium()).await?;
-    let parameters = WorkloadParameters::new("memory", 0, 0)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    // Start mock provider
-    let mock_config = mock_provider::MockProviderConfig::default();
-    let provider = MockProvider::start(mock_config)?;
-
-    // Measure at reference concurrency only for memory baseline
-    let concurrency = ConcurrencyLevels::REFERENCE;
-
-    for trial in 0..3 {
-        let backend_config = BackendConfig {
-            data_dir: root.0.join(format!("data-{trial}")),
-            workspace: generator.workspace_path().to_path_buf(),
-            provider_endpoint: provider.endpoint(),
-            port: 0,
-            token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-            concurrency,
-            startup_timeout: Duration::from_secs(30),
-        };
-
-        let backend =
-            ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
-
-        // Give backend time to load workspace and stabilize
-        ntex::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Sample RSS after startup
-        let pid = backend.pid();
-        let rss_bytes =
-            ntex::rt::spawn_blocking(move || crate::benchmark::process_rss_bytes(pid)).await?;
-
-        ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
-
-        emit_trial_result(
-            &metadata,
-            &parameters,
-            concurrency,
-            trial,
-            std::time::Duration::ZERO,
-            vec![],
-            crate::benchmark::OutcomeCounts::default(),
-        );
-
-        // Emit memory measurement as metadata
-        println!(
-            "{}",
-            json!({
-                "type": "memory_sample",
-                "section": "memory",
-                "trial": trial,
-                "concurrency": concurrency,
-                "rss_bytes": rss_bytes,
-            })
-        );
-    }
-
-    provider.stop().await?;
-    emit_section_complete(&parameters);
-    ntex::rt::spawn_blocking(move || drop(root)).await?;
-    Ok(())
-}
-
-/// Measure job admission latency.
-async fn measure_admission(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::FixtureConfig;
-    use http_client::BenchmarkClient;
-    use metadata::WorkloadParameters;
-    use mock_provider::MockProvider;
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let (root, generator, fixture_stats, metadata) =
-        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
-    let parameters = WorkloadParameters::new("admission", 0, 50)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    let mock_config = mock_provider::MockProviderConfig::default();
-    let provider = MockProvider::start(mock_config)?;
-
-    for concurrency in ConcurrencyLevels::ALL {
-        for trial in 0..3 {
-            let backend_config = BackendConfig {
-                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
-                workspace: generator.workspace_path().to_path_buf(),
-                provider_endpoint: provider.endpoint(),
-                port: 0,
-                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-                concurrency,
-                startup_timeout: Duration::from_secs(30),
-            };
-
-            let backend =
-                ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
-            let handshake = backend.handshake();
-
-            let mut samples = crate::benchmark::Samples::new();
-            let mut counts = crate::benchmark::OutcomeCounts::default();
-
-            // Measure admission latency for 50 jobs
-            async {
-                let client =
-                    BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
-
-                for _ in 0..50 {
-                    let start = std::time::Instant::now();
-                    match client
-                        .submit_job(
-                            &handshake.executor,
-                            &handshake.llm_profile,
-                            &handshake.agent_profile,
-                            &handshake.project,
-                            "benchmark admission",
-                        )
-                        .await
-                    {
-                        Ok(_) => {
-                            let duration = start.elapsed();
-                            samples.add(duration);
-                            counts.record_success();
-                        }
-                        Err(e) => {
-                            eprintln!("admission failed: {}", e);
-                            counts.record_failure(crate::benchmark::Outcome::Failed);
-                        }
-                    }
-                }
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-            }
-            .await?;
-
-            ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
-
-            samples.sort();
-            emit_trial_result(
-                &metadata,
-                &parameters,
-                concurrency,
-                trial,
-                std::time::Duration::ZERO,
-                samples.durations.clone(),
-                counts,
-            );
-        }
-    }
-
-    provider.stop().await?;
-    emit_section_complete(&parameters);
-    ntex::rt::spawn_blocking(move || drop(root)).await?;
-    Ok(())
-}
-
-/// Measure job throughput.
-async fn measure_throughput(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::FixtureConfig;
-    use http_client::BenchmarkClient;
-    use metadata::WorkloadParameters;
-    use mock_provider::MockProvider;
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let (root, generator, fixture_stats, metadata) =
-        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
-    let parameters = WorkloadParameters::new("throughput", 0, 30)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    let mock_config = mock_provider::MockProviderConfig::default();
-    let provider = MockProvider::start(mock_config)?;
-
-    for concurrency in ConcurrencyLevels::ALL {
-        for trial in 0..3 {
-            let backend_config = BackendConfig {
-                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
-                workspace: generator.workspace_path().to_path_buf(),
-                provider_endpoint: provider.endpoint(),
-                port: 0,
-                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-                concurrency,
-                startup_timeout: Duration::from_secs(30),
-            };
-
-            let backend =
-                ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
-            let handshake = backend.handshake();
-
-            let mut samples = crate::benchmark::Samples::new();
-            let mut counts = crate::benchmark::OutcomeCounts::default();
-            let wall_start = std::time::Instant::now();
-
-            // Run reference job workload to completion
-            async {
-                let client =
-                    BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
-
-                for _ in 0..30 {
-                    let start = std::time::Instant::now();
-                    match client
-                        .submit_job(
-                            &handshake.executor,
-                            &handshake.llm_profile,
-                            &handshake.agent_profile,
-                            &handshake.project,
-                            "benchmark throughput",
-                        )
-                        .await
-                    {
-                        Ok(job_id) => {
-                            match client
-                                .wait_for_settlement(&job_id, std::time::Duration::from_secs(30))
-                                .await
-                            {
-                                Ok(_) => {
-                                    let duration = start.elapsed();
-                                    samples.add(duration);
-                                    counts.record_success();
-                                }
-                                Err(e) => {
-                                    eprintln!("settlement failed: {}", e);
-                                    counts.record_failure(crate::benchmark::Outcome::Failed);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("submission failed: {}", e);
-                            counts.record_failure(crate::benchmark::Outcome::Failed);
-                        }
-                    }
-                }
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-            }
-            .await?;
-
-            let wall_elapsed = wall_start.elapsed();
-
-            ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
-
-            samples.sort();
-            emit_trial_result(
-                &metadata,
-                &parameters,
-                concurrency,
-                trial,
-                wall_elapsed,
-                samples.durations.clone(),
-                counts,
-            );
-        }
-    }
-
-    provider.stop().await?;
-    emit_section_complete(&parameters);
-    ntex::rt::spawn_blocking(move || drop(root)).await?;
-    Ok(())
-}
-
-/// Measure streaming delivery latency.
-async fn measure_streaming(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::FixtureConfig;
-    use http_client::BenchmarkClient;
-    use metadata::WorkloadParameters;
-    use mock_provider::MockProvider;
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let (root, generator, fixture_stats, metadata) =
-        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
-    let parameters = WorkloadParameters::new("streaming", 0, 30)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    let mock_config = mock_provider::MockProviderConfig::default();
-    let provider = MockProvider::start(mock_config)?;
-
-    for concurrency in ConcurrencyLevels::ALL {
-        for trial in 0..3 {
-            let backend_config = BackendConfig {
-                data_dir: root.0.join(format!("data-{}-{}", concurrency, trial)),
-                workspace: generator.workspace_path().to_path_buf(),
-                provider_endpoint: provider.endpoint(),
-                port: 0,
-                token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-                concurrency,
-                startup_timeout: Duration::from_secs(30),
-            };
-
-            let backend =
-                ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
-            let handshake = backend.handshake();
-
-            let mut samples = crate::benchmark::Samples::new();
-            let mut counts = crate::benchmark::OutcomeCounts::default();
-
-            // Measure time to first output event
-            async {
-                let client =
-                    BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
-
-                for _ in 0..30 {
-                    let start = std::time::Instant::now();
-                    match client
-                        .submit_job(
-                            &handshake.executor,
-                            &handshake.llm_profile,
-                            &handshake.agent_profile,
-                            &handshake.project,
-                            "benchmark streaming",
-                        )
-                        .await
-                    {
-                        Ok(job_id) => {
-                            // Poll for first output event via SSE
-                            let http_client =
-                                http_client::client(std::time::Duration::from_secs(10))
-                                    .await
-                                    .map_err(|e| format!("HTTP client failed: {}", e))?;
-
-                            match http_client
-                                .get(format!(
-                                    "{}/api/v1/jobs/{}/events",
-                                    handshake.address, job_id
-                                ))
-                                .set_header("Authorization", format!("Bearer {}", handshake.token))
-                                .set_header("Accept", "text/event-stream")
-                                .send()
-                                .await
-                            {
-                                Ok(response) if response.status().is_success() => {
-                                    match response.body().await {
-                                        Ok(body) => {
-                                            let text = String::from_utf8_lossy(&body);
-                                            // Look for first output event (not just job announcement)
-                                            if text.contains("event: output") {
-                                                let duration = start.elapsed();
-                                                samples.add(duration);
-                                                counts.record_success();
-                                            } else {
-                                                counts.record_failure(
-                                                    crate::benchmark::Outcome::Failed,
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("body read failed: {}", e);
-                                            counts
-                                                .record_failure(crate::benchmark::Outcome::Failed);
-                                        }
-                                    }
-                                }
-                                Ok(response) => {
-                                    eprintln!("HTTP status {}", response.status());
-                                    counts.record_failure(crate::benchmark::Outcome::Failed);
-                                }
-                                Err(e) => {
-                                    eprintln!("SSE request failed: {}", e);
-                                    counts.record_failure(crate::benchmark::Outcome::Failed);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("submission failed: {}", e);
-                            counts.record_failure(crate::benchmark::Outcome::Failed);
-                        }
-                    }
-                }
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-            }
-            .await?;
-
-            ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
-
-            samples.sort();
-            emit_trial_result(
-                &metadata,
-                &parameters,
-                concurrency,
-                trial,
-                std::time::Duration::ZERO,
-                samples.durations.clone(),
-                counts,
-            );
-        }
-    }
-
-    provider.stop().await?;
-    emit_section_complete(&parameters);
-    ntex::rt::spawn_blocking(move || drop(root)).await?;
-    Ok(())
-}
-
-/// Measure history read latency.
-async fn measure_history(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::FixtureConfig;
-    use http_client::BenchmarkClient;
-    use metadata::WorkloadParameters;
-    use mock_provider::MockProvider;
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let (root, generator, fixture_stats, metadata) =
-        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
-    let parameters = WorkloadParameters::new("history", ConcurrencyLevels::REFERENCE, 50)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    let mock_config = mock_provider::MockProviderConfig::default();
-    let provider = MockProvider::start(mock_config)?;
-
-    for trial in 0..3 {
-        let backend_config = BackendConfig {
-            data_dir: root.0.join(format!("data-{trial}")),
-            workspace: generator.workspace_path().to_path_buf(),
-            provider_endpoint: provider.endpoint(),
-            port: 0,
-            token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-            concurrency: ConcurrencyLevels::REFERENCE,
-            startup_timeout: Duration::from_secs(30),
-        };
-
-        let backend =
-            ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
-        let handshake = backend.handshake();
-
-        let mut samples = crate::benchmark::Samples::new();
-        let mut counts = crate::benchmark::OutcomeCounts::default();
-
-        // Populate with some jobs first
-        async {
-            let client = BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
-
-            // Submit and settle 20 jobs to create history
-            for _ in 0..20 {
-                if let Ok(job_id) = client
-                    .submit_job(
-                        &handshake.executor,
-                        &handshake.llm_profile,
-                        &handshake.agent_profile,
-                        &handshake.project,
-                        "benchmark history",
-                    )
-                    .await
-                {
-                    let _ = client
-                        .wait_for_settlement(&job_id, std::time::Duration::from_secs(30))
-                        .await;
-                }
-            }
-
-            // Now measure observation read latency
-            let http_client = http_client::client(std::time::Duration::from_secs(10))
-                .await
-                .map_err(|e| format!("HTTP client failed: {}", e))?;
-
-            for _ in 0..50 {
-                let start = std::time::Instant::now();
-                match http_client
-                    .get(format!("{}/api/v1/observations", handshake.address))
-                    .set_header("Authorization", format!("Bearer {}", handshake.token))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.status().is_success() => {
-                        let duration = start.elapsed();
-                        samples.add(duration);
-                        counts.record_success();
-                    }
-                    Ok(response) => {
-                        eprintln!("HTTP status {}", response.status());
-                        counts.record_failure(crate::benchmark::Outcome::Failed);
-                    }
-                    Err(e) => {
-                        eprintln!("request failed: {}", e);
-                        counts.record_failure(crate::benchmark::Outcome::Failed);
-                    }
-                }
-            }
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        }
-        .await?;
-
-        ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
-
-        samples.sort();
-        emit_trial_result(
-            &metadata,
-            &parameters,
-            ConcurrencyLevels::REFERENCE,
-            trial,
-            std::time::Duration::ZERO,
-            samples.durations.clone(),
-            counts,
-        );
-    }
-
-    provider.stop().await?;
-    emit_section_complete(&parameters);
-    ntex::rt::spawn_blocking(move || drop(root)).await?;
-    Ok(())
-}
-
-/// Measure workspace search (FTS) build and query latency.
-fn measure_search(options: &Options) -> Result<()> {
-    use fixture::{FixtureConfig, FixtureGenerator};
-    use ocg::service::fts::{FtsLimits, WorkspaceFts};
-    use ocg::system::executor::workspace_read::Workspace;
-    use workload::ConcurrencyLevels;
-
-    let root = TemporaryRoot::new(&options.directory)?;
-    let workspace_path = root.0.join("workspace");
-    let fixture_config = FixtureConfig::medium();
-    let generator = FixtureGenerator::new(fixture_config, workspace_path.clone());
-    let fixture_stats = generator
-        .generate()
-        .map_err(|e| format!("fixture generation failed: {}", e))?;
-
-    // Authorize workspace for FTS
-    let data_dir = root.0.join("data");
-    let directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
-    let workspace = Workspace::authorize(&generator.workspace_path(), &directory)?;
-
-    // Emit section begin
-    println!(
-        "{}",
-        json!({
-            "type": "begin",
-            "section": "search",
-        })
-    );
-
-    // Run 3 trials at reference concurrency only
-    for trial in 0..3 {
-        // Create a new FTS index for each trial
-        let index = WorkspaceFts::new(workspace.clone(), FtsLimits::default());
-
-        // Measure index build time
-        let build_start = Instant::now();
-        let built = index.build()?;
-        let build_duration = build_start.elapsed();
-
-        if !built.coverage.complete {
-            return Err(format!(
-                "incomplete search index in trial {}: {:?}",
-                trial, built.coverage
-            )
-            .into());
-        }
-
-        // Emit build time measurement
-        let build_parameters = json!({
-            "trial": trial,
-            "fixture_size": "medium",
-            "fixture_files": fixture_stats.file_count,
-            "fixture_bytes": fixture_stats.total_file_bytes,
-            "files_indexed": built.coverage.files_indexed,
-            "content_bytes_indexed": built.coverage.content_bytes_indexed,
-            "tokens_indexed": built.coverage.tokens_indexed,
-        });
-
-        println!(
-            "{}",
-            json!({
-                "type": "measurement",
-                "name": "search.build",
-                "parameters": build_parameters,
-                "samples": 1,
-                "build_ms": build_duration.as_secs_f64() * 1000.0,
-                "memory_bytes_approx": built.memory_bytes_approx,
-            })
-        );
-
-        // Measure query latency for each query type
-        let mut query_durations = Vec::new();
-        for (_class, query) in SEARCH_QUERIES {
-            let query_start = Instant::now();
-            let _result = index.search(query, 20)?;
-            let query_duration = query_start.elapsed();
-            query_durations.push(query_duration);
-        }
-
-        // Emit query latency measurement
-        let query_parameters = json!({
-            "trial": trial,
-            "concurrency": ConcurrencyLevels::REFERENCE,
-            "query_count": SEARCH_QUERIES.len(),
-            "result_limit": 20,
-            "fixture_size": "medium",
-        });
-
-        report("search.query", &query_parameters, query_durations, None);
-    }
-
-    // Emit section complete
-    println!(
-        "{}",
-        json!({
-            "type": "complete",
-            "section": "search",
-        })
-    );
-
-    Ok(())
-}
-
-/// Measure database footprint.
-async fn measure_database(options: &Options) -> Result<()> {
-    use backend_process::{BackendConfig, BackendProcess};
-    use fixture::FixtureConfig;
-    use http_client::BenchmarkClient;
-    use metadata::WorkloadParameters;
-    use mock_provider::MockProvider;
-    use reporting::{emit_begin, emit_section_complete, emit_trial_result};
-    use workload::ConcurrencyLevels;
-
-    let (root, generator, fixture_stats, metadata) =
-        prepare_measurement(options.directory.clone(), FixtureConfig::small()).await?;
-    let parameters = WorkloadParameters::new("database", ConcurrencyLevels::REFERENCE, 10)
-        .with_fixture_size(fixture_stats.file_count)
-        .with("fixture_bytes", json!(fixture_stats.total_file_bytes));
-
-    emit_begin(&parameters);
-
-    let mock_config = mock_provider::MockProviderConfig::default();
-    let provider = MockProvider::start(mock_config)?;
-
-    for trial in 0..3 {
-        let data_dir = root.0.join(format!("data-{trial}"));
-        let backend_config = BackendConfig {
-            data_dir: data_dir.clone(),
-            workspace: generator.workspace_path().to_path_buf(),
-            provider_endpoint: provider.endpoint(),
-            port: 0,
-            token: format!("benchmark-0123456789-abcdefghijk-{trial}"),
-            concurrency: ConcurrencyLevels::REFERENCE,
-            startup_timeout: Duration::from_secs(30),
-        };
-
-        let backend =
-            ntex::rt::spawn_blocking(move || BackendProcess::spawn(&backend_config)).await??;
-        let handshake = backend.handshake();
-
-        // Run a small workload to populate database
-        async {
-            let client = BenchmarkClient::new(handshake.address.clone(), handshake.token.clone());
-
-            for _ in 0..10 {
-                let job_id = client
-                    .submit_job(
-                        &handshake.executor,
-                        &handshake.llm_profile,
-                        &handshake.agent_profile,
-                        &handshake.project,
-                        "benchmark objective",
-                    )
-                    .await
-                    .map_err(|e| format!("job submission failed: {}", e))?;
-
-                client
-                    .wait_for_settlement(&job_id, std::time::Duration::from_secs(30))
-                    .await
-                    .map_err(|e| format!("settlement wait failed: {}", e))?;
-            }
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
-        }
-        .await?;
-
-        ntex::rt::spawn_blocking(move || backend.shutdown()).await??;
-
-        // Measure database footprint after workload
-        let db_bytes = ntex::rt::spawn_blocking(move || -> Result<u64> {
-            let data_directory = DataDirectory::bootstrap(data_dir.into_os_string())?;
-            Ok(crate::benchmark::database_bytes(&data_directory)?)
-        })
-        .await??;
-
-        emit_trial_result(
-            &metadata,
-            &parameters,
-            ConcurrencyLevels::REFERENCE,
-            trial,
-            std::time::Duration::ZERO,
-            vec![],
-            crate::benchmark::OutcomeCounts::default(),
-        );
-
-        println!(
-            "{}",
-            json!({
-                "type": "database_footprint",
-                "section": "database",
-                "trial": trial,
-                "bytes": db_bytes,
-            })
-        );
-    }
-
-    provider.stop().await?;
-    emit_section_complete(&parameters);
-    ntex::rt::spawn_blocking(move || drop(root)).await?;
-    Ok(())
+    ntex::rt::System::new("benchmark-client", ntex::rt::DefaultRuntime)
+        .block_on(async move { workload::run(&options).await })
 }

@@ -332,7 +332,9 @@ export const ChatScreen: FC<ChatScreenProps> = ({
   projectSelector,
 }) => {
   const runtime = useOcgRuntime();
+  const { t } = useI18n();
   const [draft, setDraft] = useState("");
+  const [submittingChat, setSubmittingChat] = useState(false);
   const [selection, setSelection] = useState<ChatModelSelection | undefined>(() =>
     readModelPreference(session.projectId, session.conversationId ?? session.id),
   );
@@ -351,6 +353,18 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       (message.status === "streaming" || message.status === "pending"),
   );
   const busy = messageStreaming || liveExecution !== null;
+  const submitIntent = useCallback(
+    async (intent: ComposerIntent) => {
+      const showPending = intent.kind === "chat" && !busy;
+      if (showPending) setSubmittingChat(true);
+      try {
+        await onComposerIntent(intent);
+      } finally {
+        if (showPending) setSubmittingChat(false);
+      }
+    },
+    [busy, onComposerIntent],
+  );
   const lastAssistant = messages.findLast(
     (message) => message.role === "assistant" && !message.intermediate,
   );
@@ -387,7 +401,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       activity,
       runtimeStatus,
       onPreference,
-      onComposerIntent,
+      onComposerIntent: submitIntent,
       onCancel,
       composerSurface,
       projectSelector,
@@ -406,7 +420,7 @@ export const ChatScreen: FC<ChatScreenProps> = ({
       activity,
       runtimeStatus,
       onPreference,
-      onComposerIntent,
+      submitIntent,
       onCancel,
       composerSurface,
       projectSelector,
@@ -424,6 +438,14 @@ export const ChatScreen: FC<ChatScreenProps> = ({
             autoFocus
             afterMessages={
               <>
+                {submittingChat && !messageStreaming && (
+                  <div
+                    role="status"
+                    className="text-sm text-muted-foreground shimmer motion-reduce:animate-none"
+                  >
+                    {t("chat.sending")}
+                  </div>
+                )}
                 <ContextTranscript
                   key={`context:${session.id}`}
                   conversation={session.conversationId}

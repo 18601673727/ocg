@@ -2052,6 +2052,23 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Hides the conversation and closes its live subtree in the same transaction.
+    pub async fn hide_conversation(&self, root: JobId) -> Result<JobAction, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (root,),
+                reply,
+                |_| 4096,
+                OperationKind::Close,
+                |(root,), batch| {
+                    mutations::set_conversation(batch, root, JobEdit::Hide)?;
+                    batch.close(root, Actor::User)
+                },
+            )
+        })
+        .await
+    }
+
     /// Stores `attachment` as a new user-provided Attachment. Its content is
     /// published durably first, see [`crate::db::attachments`]; only then is the
     /// record committed. When the commit fails, the published content stays,

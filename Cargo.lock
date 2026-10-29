@@ -1261,6 +1261,7 @@ dependencies = [
  "memchr",
  "nix",
  "ntex",
+ "ntex-h2",
  "redb",
  "regex",
  "rustix",

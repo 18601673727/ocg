@@ -556,6 +556,7 @@ export const en = {
 
   // -- sidebar ----------------------------------------------------------------
   "sidebar.newChat": "New chat",
+  "chat.sending": "Sending…",
   "sidebar.noProject": "Chats",
   "sidebar.running": "Running",
   "sidebar.pin": "Pin chat",
@@ -566,6 +567,8 @@ export const en = {
   "sidebar.hideChildren": "Hide child conversations of {title}",
   "sidebar.searchChats": "Search chats",
   "sidebar.searchChatsLabel": "Search titles and messages",
+  "sidebar.searchKeyboardHint":
+    "Use the up and down arrow keys to choose a result, Enter to open it, and Escape to close search.",
   "sidebar.noSearchMatches": "No chats match your search",
   // Full-screen conversation search: it searches the current session list by
   // title and recent message text, and opens from the sidebar search control. The
@@ -1599,6 +1602,7 @@ export const zh: Dictionary = {
   "nav.chatSessions": "按工作类型分组的会话",
 
   "sidebar.newChat": "新建对话",
+  "chat.sending": "正在发送…",
   "sidebar.noProject": "对话",
   "sidebar.running": "运行中",
   "sidebar.pin": "置顶对话",
@@ -1609,6 +1613,7 @@ export const zh: Dictionary = {
   "sidebar.hideChildren": "收起 {title} 的子对话",
   "sidebar.searchChats": "搜索对话",
   "sidebar.searchChatsLabel": "搜索标题和消息内容",
+  "sidebar.searchKeyboardHint": "使用上下方向键选择结果，按回车打开，按 Escape 关闭搜索。",
   "sidebar.noSearchMatches": "没有匹配的对话",
   "sidebar.searchConversations": "搜索对话",
   "sidebar.searchFailed": "全文搜索失败，结果可能不完整，请重试。",
