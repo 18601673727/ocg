@@ -1684,29 +1684,32 @@ async fn run_provider_job_inner(
         conversation.response_format = None;
         conversation.parallel_tool_calls = None;
     }
+    // Track Provider exchange attempts separately from RequestNumber, which reserves
+    // FIRST for approved-tool evidence and may not accurately reflect attempt count.
+    let max_requests = tools
+        .map(|t| t.limits.max_provider_requests)
+        .unwrap_or(DEFAULT_MAX_PROVIDER_REQUESTS);
+    let mut attempt_count: u32 = 0;
     loop {
         if let Some(window) = context_limits.context_window
             && estimate_request_tokens(&conversation, context_limits.max_tokens) > window as u64
         {
             return stop_tool_loop(run, None, ToolLoopStop::ContextWindow).await;
         }
-        // Check Provider request budget before attempting exchange. If tools are available,
-        // use their limits; otherwise use default limits.
-        let max_requests = tools
-            .map(|t| t.limits.max_provider_requests)
-            .unwrap_or(DEFAULT_MAX_PROVIDER_REQUESTS);
-        if sink.request.get() > max_requests {
-            return stop_tool_loop(
-                run,
-                None,
-                ToolLoopStop::RequestLimit {
-                    limit: max_requests,
-                },
-            )
-            .await;
-        }
         let mut retries = 0;
         let mut execution = loop {
+            // Check Provider request budget before every exchange attempt, including retries.
+            if attempt_count >= max_requests {
+                return stop_tool_loop(
+                    run,
+                    None,
+                    ToolLoopStop::RequestLimit {
+                        limit: max_requests,
+                    },
+                )
+                .await;
+            }
+            attempt_count += 1;
             let execution = exchange(&conversation, &mut sink).await;
             let execution = if tools.is_none() {
                 execution.and_then(ProviderExecutionResult::admitted)
