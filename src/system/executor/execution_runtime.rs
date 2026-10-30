@@ -1627,10 +1627,6 @@ async fn run_provider_job_inner(
                     .to_owned(),
             })
             .collect::<Vec<_>>();
-        let links = approved
-            .iter()
-            .map(|record| record.call)
-            .collect::<Vec<_>>();
         let empty_tools = ToolExecution {
             offer: super::tools::ToolRegistry::default()
                 .offer(&[])
@@ -1650,7 +1646,7 @@ async fn run_provider_job_inner(
             &conversation,
             &calls,
             &[],
-            &links,
+            approved,
             cancellation,
             tool_may_have_run,
         )
@@ -2068,13 +2064,13 @@ async fn answer_calls(
     conversation: &ChatConversation,
     calls: &[CompletedToolCall],
     refused: &[InvalidToolCall],
-    approvals: &[ToolCallRef],
+    approved: &[crate::db::entities::ToolEvidenceRecord],
     cancellation: &CancellationToken,
     tool_may_have_run: &Cell<bool>,
 ) -> Result<(Vec<String>, Vec<u32>), ToolLoopStop> {
     let limits = &tools.limits;
     let dispatch_selection_pending =
-        approvals.is_empty() && calls.iter().any(|call| call.name == "job_dispatch");
+        approved.is_empty() && calls.iter().any(|call| call.name == "job_dispatch");
     if cancellation.is_cancelled() {
         return Err(ToolLoopStop::Cancelled);
     }
@@ -2085,7 +2081,7 @@ async fn answer_calls(
         .flatten()
         .map(|call| call.id.as_str())
         .collect::<std::collections::HashSet<_>>();
-    for call in calls.iter().filter(|_| approvals.is_empty()) {
+    for call in calls.iter().filter(|_| approved.is_empty()) {
         if earlier.contains(call.id.as_str()) {
             return Err(ToolLoopStop::Refused(InvalidToolCall::at(
                 ToolCallRefusal::ConflictingIdentity,
@@ -2132,7 +2128,8 @@ async fn answer_calls(
             );
             continue;
         }
-        let approval = approvals.get(call.index as usize).copied();
+        let original = approved.get(call.index as usize);
+        let approval = original.map(|record| record.call);
         let resolved = if dispatch_selection_pending && call.name != "job_dispatch" {
             Err(InvalidToolCall::at(
                 ToolCallRefusal::Unauthorized,
@@ -2176,6 +2173,23 @@ async fn answer_calls(
             arguments: ToolPayload::new(call.arguments.clone()),
             authorization: AuthorizationBasis::RegistryGrant,
         };
+        // An approval authorizes the admission it was asked about, and no
+        // other: a definition that has changed since refuses the call.
+        if let Some(original) = original
+            && original.decision.fact.stored_admission() != Some(&decided)
+        {
+            let refusal = InvalidToolCall::at(
+                ToolCallRefusal::Unauthorized,
+                call.index,
+                "the approved call no longer matches the tool's admitted definition",
+            );
+            record_call_decision(site, call, ToolDecision::Refused(refusal.kind), approval).await?;
+            answers.push(
+                serde_json::json!({"refused":refusal.kind.as_str(), "reason":refusal.message})
+                    .to_string(),
+            );
+            continue;
+        }
         if approval.is_none() && needs_decision(&call.name) {
             if tools.decider {
                 let decision = if matches!(call.name.as_str(), "ask_user" | "job_dispatch") {

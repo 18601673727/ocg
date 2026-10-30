@@ -1144,6 +1144,29 @@ impl Batch {
                     "must equal the approved tool name",
                 ));
             }
+            let (ToolDecision::AwaitingApproval(awaited) | ToolDecision::AwaitingAnswer(awaited)) =
+                &original.decision.fact
+            else {
+                return self.reject(Violation::InvalidValue(
+                    "approval_executed",
+                    "the approved call was not awaiting a decision",
+                ));
+            };
+            match &decision {
+                ToolDecision::Admitted(admitted) if admitted != awaited => {
+                    return self.reject(Violation::InvalidValue(
+                        "admission",
+                        "must equal the approved admission",
+                    ));
+                }
+                ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_) => {
+                    return self.reject(Violation::InvalidValue(
+                        "decision",
+                        "an approved call cannot await another decision",
+                    ));
+                }
+                ToolDecision::Admitted(_) | ToolDecision::Refused(_) => {}
+            }
             if call.request == RequestNumber::FIRST
                 && !self.request_observed(call.job, call.request)?
             {
