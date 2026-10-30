@@ -127,6 +127,7 @@ pub(super) struct Shared {
     pub(super) protection: Arc<ProtectionCell>,
     /// The content files of Attachments, opened with the database.
     pub(super) attachments: AttachmentStore,
+    pub(super) attachment_slots: (flume::Sender<()>, flume::Receiver<()>),
     /// What this worker's start did to the content files that committed
     /// cleanups authorized it to reclaim; see
     /// [`DatabaseHandle::reclaimed_at_open`].

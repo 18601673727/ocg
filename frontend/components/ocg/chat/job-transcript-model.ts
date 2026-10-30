@@ -1,14 +1,13 @@
-import type {
-  ControlOutput,
-  ControlProviderResponse,
-  ControlToolCall,
-} from "@/components/ocg/contracts";
+import type { ControlProviderResponse, ControlToolCall } from "@/components/ocg/contracts";
+import type { OutputSequence, OutputView } from "../runtime/output-history";
 
 /** How a Job settled, as the Control Plane reports it. */
 export type TranscriptSettlement = {
   state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown";
   settled_at_us?: number | null;
 };
+
+export type PartialToolBoundary = { request: number; at: number };
 
 export type TranscriptTurn = {
   id: string;
@@ -26,16 +25,117 @@ export type TranscriptTurn = {
   tools?: readonly ControlToolCall[];
 };
 
-export function outputText(output: ControlOutput | null | undefined): string | null {
+export function outputText(output: OutputView | null | undefined): string | null {
   const value = output?.value;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return "text" in value && typeof value.text === "string" ? value.text : null;
 }
 
-export function outputDisplayText(output: ControlOutput | null | undefined): string {
+export function outputDisplayText(output: OutputView | null | undefined): string {
   return [outputText(output), output?.summary]
     .filter((text) => text != null && text !== "")
     .join("\n");
+}
+
+// Rebuildable presentation state. The stored outputs remain the authority for
+// sequence and request boundaries; this only avoids rescanning their text.
+export class TranscriptAccumulator {
+  progress = "";
+  reasoning = "";
+  result: OutputView | null = null;
+  lastAt: number | null = null;
+  reasoningStartedAt: number | null = null;
+  reasoningDurationUs = 0;
+  provider?: ProviderProjection;
+
+  append(output: OutputView) {
+    if (output.kind === "progress") this.progress += outputDisplayText(output);
+    if (output.kind === "reasoning") this.reasoning += outputDisplayText(output);
+    if (output.kind === "result") this.result = output;
+    if (output.kind === "reasoning" && outputText(output)) {
+      this.reasoningStartedAt ??= output.created_at_us;
+    } else if (output.kind !== "reasoning" && this.reasoningStartedAt !== null) {
+      this.reasoningDurationUs += Math.max(0, output.created_at_us - this.reasoningStartedAt);
+      this.reasoningStartedAt = null;
+    }
+    this.lastAt = output.created_at_us;
+    this.provider?.append(output);
+  }
+}
+
+type ReasoningInterval = {
+  text: string;
+  started: number | null;
+  duration: number;
+  at: number | null;
+};
+
+class ProviderProjection {
+  readonly recorded: string;
+  readonly byRequest: Map<number, ControlProviderResponse>;
+  readonly toolsByRequest = new Map<number, ControlToolCall[]>();
+  readonly requests: number[];
+  readonly intervals: ReasoningInterval[];
+  readonly through: number[];
+  readonly requestMessages = new Map<number, TranscriptTurn>();
+  private index = 0;
+  private compared = 0;
+  private compatible = true;
+
+  constructor(
+    readonly responses: readonly ControlProviderResponse[],
+    readonly tools: readonly ControlToolCall[] | undefined,
+    readonly completed: boolean,
+    readonly answerId: string,
+    readonly titleMetadata: boolean,
+    public titleUnsettled: boolean,
+    outputs: OutputSequence,
+  ) {
+    this.recorded = responses.map((response) => response.text).join("");
+    this.byRequest = new Map(responses.map((response) => [response.request, response]));
+    for (const call of tools ?? []) {
+      const group = this.toolsByRequest.get(call.request) ?? [];
+      group.push(call);
+      this.toolsByRequest.set(call.request, group);
+    }
+    this.requests = [...new Set([...this.byRequest.keys(), ...this.toolsByRequest.keys()])].sort(
+      (a, b) => a - b,
+    );
+    this.through = this.requests.flatMap((request) => {
+      const response = this.byRequest.get(request);
+      return response
+        ? [completed && response === responses.at(-1) ? Infinity : response.created_at_us]
+        : [];
+    });
+    this.through.push(Infinity);
+    this.intervals = this.through.map(() => ({ text: "", started: null, duration: 0, at: null }));
+    for (const output of outputs) this.append(output);
+  }
+
+  append(output: OutputView) {
+    while (this.index < this.through.length - 1 && output.created_at_us > this.through[this.index])
+      this.index++;
+    const interval = this.intervals[this.index];
+    const text = outputText(output);
+    if (output.kind === "reasoning" && text) {
+      interval.text += text;
+      interval.started ??= output.created_at_us;
+      interval.at ??= output.created_at_us;
+    } else if (interval.started !== null) {
+      interval.duration += Math.max(0, output.created_at_us - interval.started);
+      interval.started = null;
+    }
+  }
+
+  matches(progress: string): boolean {
+    const end = Math.min(progress.length, this.recorded.length);
+    if (this.compatible && end > this.compared) {
+      this.compatible =
+        progress.slice(this.compared, end) === this.recorded.slice(this.compared, end);
+      this.compared = end;
+    }
+    return this.compatible;
+  }
 }
 
 /**
@@ -49,24 +149,20 @@ export function outputDisplayText(output: ControlOutput | null | undefined): str
 export function jobTranscript(
   jobId: string,
   objective: string | null,
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
   settlement: TranscriptSettlement | null,
   streaming: boolean,
   attachments?: readonly string[],
   tools?: readonly ControlToolCall[],
   titleMetadata = false,
   responses?: readonly ControlProviderResponse[],
+  partialOutput = false,
+  partialToolBoundaries?: readonly PartialToolBoundary[] | null,
+  accumulated?: TranscriptAccumulator,
 ): TranscriptTurn[] {
-  const answerOutputs = outputs.filter((output) => output.kind !== "reasoning");
-  const progress = answerOutputs
-    .filter((output) => output.kind === "progress")
-    .map(outputDisplayText)
-    .join("");
-  const reasoning = outputs
-    .filter((output) => output.kind === "reasoning")
-    .map(outputDisplayText)
-    .join("");
-  const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
+  const aggregate = accumulated ?? new TranscriptAccumulator();
+  if (!accumulated) for (const output of outputs) aggregate.append(output);
+  const { progress, reasoning, result } = aggregate;
   const state = settlement?.state ?? "unsettled";
   const visibleAnswer = (text: string) => {
     if (!titleMetadata) return text;
@@ -87,27 +183,19 @@ export function jobTranscript(
       return text;
     return start.slice(end + "</ocg-title>".length).trimStart();
   };
-  let reasoningStartedAt: number | null = null;
-  let reasoningDurationUs = 0;
-  for (const output of outputs) {
-    if (output.kind === "reasoning" && outputText(output)) {
-      reasoningStartedAt ??= output.created_at_us;
-    } else if (output.kind !== "reasoning" && reasoningStartedAt !== null) {
-      reasoningDurationUs += Math.max(0, output.created_at_us - reasoningStartedAt);
-      reasoningStartedAt = null;
-    }
-  }
+  const { reasoningStartedAt } = aggregate;
+  let reasoningDurationUs = aggregate.reasoningDurationUs;
   if (reasoningStartedAt !== null) {
     const endedAt =
       (state !== "unsettled" ? settlement?.settled_at_us : null) ??
-      outputs.at(-1)?.created_at_us ??
+      aggregate.lastAt ??
       reasoningStartedAt;
     reasoningDurationUs += Math.max(0, endedAt - reasoningStartedAt);
   }
   const base = {
     id: `${jobId}:answer`,
     role: "assistant" as const,
-    createdAtUs: outputs.at(-1)?.created_at_us ?? null,
+    createdAtUs: aggregate.lastAt,
     tools,
     ...(reasoning ? { reasoning, reasoningDurationMs: reasoningDurationUs / 1000 } : {}),
   };
@@ -126,13 +214,14 @@ export function jobTranscript(
         },
       ];
   let answer: TranscriptTurn;
+  const strippedPending = new Set<ControlToolCall>();
   if (state === "completed") {
     // The Result carries the Provider's complete text; it supersedes the
     // streamed pieces it was assembled from.
     answer = {
       ...base,
       content: visibleAnswer(
-        approvalAnswer(result ? outputDisplayText(result) : progress, tools ?? []),
+        approvalAnswer(result ? outputDisplayText(result) : progress, tools ?? [], strippedPending),
       ),
       status: "completed",
       detail: null,
@@ -152,10 +241,24 @@ export function jobTranscript(
       detail: providerFailureDetail(result),
     };
   }
-  return [...user, ...providerMessages(answer, progress, responses, visibleAnswer, outputs)];
+  return [
+    ...user,
+    ...providerMessages(
+      answer,
+      progress,
+      responses,
+      visibleAnswer,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+      strippedPending,
+      aggregate,
+      titleMetadata,
+    ),
+  ];
 }
 
-function providerFailureDetail(result: ControlOutput | null): string | null {
+function providerFailureDetail(result: OutputView | null): string | null {
   const message = result?.summary ?? null;
   if (
     result?.code !== "provider_rejected" ||
@@ -172,7 +275,11 @@ function providerFailureDetail(result: ControlOutput | null): string | null {
   return [message, ...details].filter(Boolean).join("\n") || null;
 }
 
-function approvalAnswer(text: string, tools: readonly ControlToolCall[]): string {
+function approvalAnswer(
+  text: string,
+  tools: readonly ControlToolCall[],
+  strippedPending: Set<ControlToolCall>,
+): string {
   let answer = text;
   const pending = tools
     .filter((call) => call.decision === "awaiting_approval" || call.decision === "awaiting_answer")
@@ -204,6 +311,7 @@ function approvalAnswer(text: string, tools: readonly ControlToolCall[]): string
     const suffix = answer.slice(start + marker.length);
     if (call.arguments_cut ? !payload || !suffix.startsWith(payload) : suffix !== payload) continue;
     answer = answer.slice(0, start > 0 ? start - 1 : 0);
+    strippedPending.add(call);
   }
   return answer;
 }
@@ -213,34 +321,69 @@ function providerMessages(
   progress: string,
   responses: readonly ControlProviderResponse[] | undefined,
   visible: (text: string) => string,
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
+  partialOutput: boolean,
+  partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
+  strippedPending: ReadonlySet<ControlToolCall>,
+  aggregate: TranscriptAccumulator,
+  titleMetadata: boolean,
 ): TranscriptTurn[] {
-  if (!responses?.length) return fallbackMessages(answer, progress, visible);
-  const recorded = responses.map((response) => response.text).join("");
-  if (!progress.startsWith(recorded) && !recorded.startsWith(progress)) {
-    return fallbackMessages(answer, progress, visible);
+  if (!responses?.length) {
+    aggregate.provider = undefined;
+    return fallbackMessages(
+      answer,
+      progress,
+      visible,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+      strippedPending,
+    );
   }
-  const remainder = progress.startsWith(recorded) ? progress.slice(recorded.length) : "";
+  let projection = aggregate.provider;
+  if (
+    !projection ||
+    projection.responses !== responses ||
+    projection.tools !== answer.tools ||
+    projection.completed !== (answer.status === "completed") ||
+    projection.answerId !== answer.id ||
+    projection.titleMetadata !== titleMetadata
+  ) {
+    projection = new ProviderProjection(
+      responses,
+      answer.tools,
+      answer.status === "completed",
+      answer.id,
+      titleMetadata,
+      answer.status === "streaming" || answer.status === "pending",
+      outputs,
+    );
+    aggregate.provider = projection;
+  }
+  const titleUnsettled = answer.status === "streaming" || answer.status === "pending";
+  if (projection.titleMetadata && projection.titleUnsettled !== titleUnsettled) {
+    projection.requestMessages.clear();
+    projection.titleUnsettled = titleUnsettled;
+  }
+  const { recorded, byRequest, toolsByRequest, requests } = projection;
+  if (!projection.matches(progress)) {
+    return fallbackMessages(
+      answer,
+      progress,
+      visible,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+      strippedPending,
+    );
+  }
+  const remainder = progress.length >= recorded.length ? progress.slice(recorded.length) : "";
   const tools = answer.tools ?? [];
   const messages: TranscriptTurn[] = [];
-  let outputIndex = 0;
+  let intervalIndex = 0;
   const reasoningBefore = (through: number, id: string, live = false) => {
-    let text = "";
-    let started: number | null = null;
-    let duration = 0;
-    let at: number | null = null;
-    while (outputIndex < outputs.length && outputs[outputIndex].created_at_us <= through) {
-      const output = outputs[outputIndex++];
-      const reasoning = outputText(output);
-      if (output.kind === "reasoning" && reasoning) {
-        text += reasoning;
-        started ??= output.created_at_us;
-        at ??= output.created_at_us;
-      } else if (started !== null) {
-        duration += Math.max(0, output.created_at_us - started);
-        started = null;
-      }
-    }
+    const { text, started, at } = projection.intervals[intervalIndex++];
+    let { duration } = projection.intervals[intervalIndex - 1];
     if (started !== null)
       duration += Math.max(
         0,
@@ -260,16 +403,6 @@ function providerMessages(
         intermediate: true,
       });
   };
-  const byRequest = new Map(responses.map((response) => [response.request, response]));
-  const toolsByRequest = new Map<number, ControlToolCall[]>();
-  for (const call of tools) {
-    const group = toolsByRequest.get(call.request) ?? [];
-    group.push(call);
-    toolsByRequest.set(call.request, group);
-  }
-  const requests = [...new Set([...byRequest.keys(), ...toolsByRequest.keys()])].sort(
-    (a, b) => a - b,
-  );
   let final = false;
   for (const request of requests) {
     const response = byRequest.get(request);
@@ -299,7 +432,9 @@ function providerMessages(
       );
     const running =
       active && calls.some((call) => !call.outcome_kind && call.decision === "admitted");
-    messages.push({
+    const reusable = response && !isFinal && !waiting && !running;
+    const cachedMessage = reusable ? projection.requestMessages.get(request) : undefined;
+    const message: TranscriptTurn = cachedMessage ?? {
       ...answer,
       id: isFinal ? answer.id : `${answer.id}:request:${request}`,
       content: response ? visible(response.text) : "",
@@ -310,7 +445,9 @@ function providerMessages(
       status: waiting ? "pending" : running ? "streaming" : "completed",
       detail: null,
       intermediate: !isFinal,
-    });
+    };
+    if (reusable && !cachedMessage) projection.requestMessages.set(request, message);
+    messages.push(message);
   }
   if (!final) {
     reasoningBefore(
@@ -380,9 +517,16 @@ function fallbackMessages(
   answer: TranscriptTurn,
   progress: string,
   visible: (text: string) => string,
+  outputs: OutputSequence,
+  partialOutput: boolean,
+  partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
+  strippedPending: ReadonlySet<ControlToolCall>,
 ): TranscriptTurn[] {
   if (answer.status !== "completed") return [answer];
   const text = visible(progress);
+  if (partialOutput && !answer.tools?.length && answer.content.endsWith(text)) return [answer];
+  if (partialOutput && partialToolBoundaries?.length)
+    return partialMessages(answer, outputs, visible, partialToolBoundaries, strippedPending);
   const earlier =
     answer.content && text.endsWith(answer.content) ? text.slice(0, -answer.content.length) : text;
   if (!earlier || text === answer.content) return [answer];
@@ -397,4 +541,92 @@ function fallbackMessages(
     },
     { ...answer, reasoning: undefined, tools: undefined },
   ];
+}
+
+function partialMessages(
+  answer: TranscriptTurn,
+  outputs: OutputSequence,
+  visible: (text: string) => string,
+  boundaries: readonly PartialToolBoundary[],
+  strippedPending: ReadonlySet<ControlToolCall>,
+): TranscriptTurn[] {
+  const tools = new Map<number, ControlToolCall[]>();
+  for (const call of answer.tools ?? []) {
+    const group = tools.get(call.request) ?? [];
+    group.push(call);
+    tools.set(call.request, group);
+  }
+  const times = new Map(boundaries.map(({ request, at }) => [request, at]));
+  const messages: TranscriptTurn[] = [];
+  let position = 0;
+  const take = (through: number) => {
+    const start = position;
+    while (
+      position < outputs.length &&
+      (outputs.at(position)?.created_at_us ?? Infinity) <= through
+    )
+      position++;
+    const part: OutputView[] = [];
+    for (let index = start; index < position; index++) {
+      const output = outputs.at(index);
+      if (output) part.push(output);
+    }
+    const text = part
+      .filter((output) => output.kind === "progress")
+      .map(outputDisplayText)
+      .join("");
+    const reasoning = part
+      .filter((output) => output.kind === "reasoning")
+      .map(outputDisplayText)
+      .join("");
+    return { text, reasoning, createdAtUs: part[0]?.created_at_us ?? null };
+  };
+  for (const request of [...tools.keys()].sort((a, b) => a - b)) {
+    const at = times.get(request);
+    // Requests older than the first boundary precede the retained output window.
+    const part = at === undefined ? { text: "", reasoning: "", createdAtUs: null } : take(at);
+    messages.push({
+      ...answer,
+      id: `${answer.id}:request:${request}`,
+      content: visible(part.text),
+      reasoning: part.reasoning || undefined,
+      reasoningDurationMs: undefined,
+      createdAtUs: part.createdAtUs,
+      tools: tools.get(request),
+      status: "completed",
+      intermediate: true,
+      detail: null,
+    });
+  }
+  const tail = take(Number.POSITIVE_INFINITY);
+  const streamed = visible(tail.text);
+  const separateTail = Boolean(streamed && !answer.content.endsWith(streamed));
+  if (separateTail) {
+    messages.push({
+      ...answer,
+      id: `${answer.id}:progress`,
+      content: streamed,
+      reasoning: tail.reasoning || undefined,
+      reasoningDurationMs: undefined,
+      tools: undefined,
+      intermediate: true,
+      detail: null,
+    });
+  }
+  const lastToolMessage = messages.at(-1);
+  const cardOnly =
+    !streamed &&
+    !!answer.content &&
+    lastToolMessage?.content === answer.content &&
+    lastToolMessage.tools?.some((call) => strippedPending.has(call));
+  if (!cardOnly || tail.reasoning) {
+    messages.push({
+      ...answer,
+      ...(cardOnly ? { id: `${answer.id}:reasoning:tail`, content: "", intermediate: true } : {}),
+      reasoning: separateTail ? undefined : tail.reasoning || undefined,
+      reasoningDurationMs: undefined,
+      tools: undefined,
+    });
+  }
+  return messages;
 }

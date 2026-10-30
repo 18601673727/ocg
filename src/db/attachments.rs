@@ -54,7 +54,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::db::entities::{AttachmentCleanup, AttachmentId, AttachmentRecord, ContentDigest};
 use crate::db::{DatabaseError, DatabaseHandle};
@@ -156,9 +156,12 @@ impl Pins {
     }
 
     /// Pins `digest`; waits while a reclamation holds the lock.
-    fn pin(&self, digest: ContentDigest) -> ContentPin<'_> {
+    fn pin(self: &Arc<Self>, digest: ContentDigest) -> ContentPin {
         *self.lock().entry(digest).or_default() += 1;
-        ContentPin { pins: self, digest }
+        ContentPin {
+            pins: Arc::clone(self),
+            digest,
+        }
     }
 }
 
@@ -168,12 +171,12 @@ impl Pins {
 /// pinned for the rest of this process run, because a record whose commit
 /// is unknown may still name it.
 #[derive(Debug)]
-pub(crate) struct ContentPin<'a> {
-    pins: &'a Pins,
+pub(crate) struct ContentPin {
+    pins: Arc<Pins>,
     digest: ContentDigest,
 }
 
-impl ContentPin<'_> {
+impl ContentPin {
     pub(crate) fn digest(&self) -> ContentDigest {
         self.digest
     }
@@ -281,7 +284,7 @@ mod supported {
         name: std::ffi::OsString,
         directory: File,
         identity: Identity,
-        pins: Pins,
+        pins: Arc<Pins>,
     }
 
     impl AttachmentStore {
@@ -304,7 +307,7 @@ mod supported {
                 name: name.to_owned(),
                 identity: Identity::of(&metadata),
                 directory,
-                pins: Pins::default(),
+                pins: Arc::new(Pins::default()),
             })
         }
 
@@ -337,7 +340,7 @@ mod supported {
         /// digest is reused once its bytes are verified equal to `content`;
         /// nothing is ever replaced. The digest is pinned before anything
         /// is looked at, after any reclamation of it in progress.
-        pub(crate) fn publish(&self, content: &[u8]) -> Result<ContentPin<'_>, StoreError> {
+        pub(crate) fn publish(&self, content: &[u8]) -> Result<ContentPin, StoreError> {
             let pin = self.pins.pin(ContentDigest::of(content));
             match self.publish_pinned(pin.digest(), content) {
                 Ok(()) => Ok(pin),
@@ -701,7 +704,7 @@ mod unsupported {
             Ok(Self)
         }
 
-        pub(crate) fn publish(&self, _content: &[u8]) -> Result<ContentPin<'_>, StoreError> {
+        pub(crate) fn publish(&self, _content: &[u8]) -> Result<ContentPin, StoreError> {
             Err(StoreError::Unsupported)
         }
 

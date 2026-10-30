@@ -458,7 +458,14 @@ impl Feed {
                 }
             }
             match self.snapshot().await {
-                Ok(Value::Null) => continue,
+                Ok(Value::Null) => {
+                    if matches!(self.topic, Topic::ObservationChanges(_))
+                        && matches!(self.page, Page::Wait)
+                    {
+                        return Some((Bytes::from_static(b": caught-up\n\n"), self));
+                    }
+                    continue;
+                }
                 Ok(value) => {
                     let bytes = match super::wire::bounded_json(&value, self.shared.response_bytes)
                     {

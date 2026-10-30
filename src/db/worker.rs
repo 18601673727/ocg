@@ -244,6 +244,10 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                let attachment_slots = flume::bounded(4);
+                for _ in 0..4 {
+                    let _ = attachment_slots.0.try_send(());
+                }
                 let shared = Arc::new(Shared {
                     data_directory: data_directory.clone(),
                     catalog_changes: Default::default(),
@@ -275,6 +279,7 @@ impl DatabaseWorker {
                     reads_stopped: RwLock::new(false),
                     protection: ProtectionCell::new(),
                     attachments,
+                    attachment_slots,
                     reclaimed_at_open: reclamation.details,
                     reclamation_omitted_at_open: reclamation.omitted,
                     recovery: SharedRequest::new(),

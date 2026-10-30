@@ -20,26 +20,192 @@ import {
   type HttpCanonicalControlClient,
   type JobStreamSubscription,
 } from "./control-client";
-import { jobTranscript } from "../chat/job-transcript-model";
+import {
+  jobTranscript,
+  TranscriptAccumulator,
+  type PartialToolBoundary,
+  type TranscriptTurn,
+} from "../chat/job-transcript-model";
 import { fileSnapshots } from "../markdown/source-snapshot";
 import { reconcileJob, taskPlanActive } from "./job-status";
-import { materializeUserEntries } from "../contracts";
+import { ContractError, materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
+import {
+  mergeOutputHistory,
+  type OutputHistory,
+  type OutputSequence,
+  type OutputView,
+} from "./output-history";
 
 /** Turns read per conversation page: the newest page and each earlier page. */
 const TURN_PAGE_SIZE = 20;
+// Catalog changes can include every output write; keep one trailing refresh.
+const CATALOG_REFRESH_DELAY_MS = 750;
+const MAX_RECOVERY_DELAY_MS = 10_000;
+const TOOL_TIME_CACHE_LIMIT = 128;
+const TOOL_TIME_BATCH_SIZE = 4;
+
+function reuseEvidence<T>(previous: T[], next: T[] | null | undefined): T[] {
+  if (!next || next === previous) return previous;
+  return JSON.stringify(previous) === JSON.stringify(next) ? previous : next;
+}
+
+class ToolTimeGate {
+  private active = 0;
+  private wake: () => void = () => {};
+  private changed = new Promise<void>((resolve) => {
+    this.wake = resolve;
+  });
+
+  async read<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    while (this.active >= TOOL_TIME_BATCH_SIZE) {
+      signal.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        signal.addEventListener("abort", abort, { once: true });
+        this.changed.then(() => {
+          signal.removeEventListener("abort", abort);
+          resolve();
+        });
+        if (signal.aborted) abort();
+      });
+    }
+    signal.throwIfAborted();
+    this.active++;
+    try {
+      return await operation();
+    } finally {
+      this.active--;
+      const wake = this.wake;
+      this.changed = new Promise<void>((resolve) => {
+        this.wake = resolve;
+      });
+      wake();
+    }
+  }
+}
+
+function rememberToolTime(times: Map<number, number>, request: number, at: number) {
+  if (!times.has(request) && times.size >= TOOL_TIME_CACHE_LIMIT) {
+    const oldest = Math.min(...times.keys());
+    if (request <= oldest) return;
+    times.delete(oldest);
+  }
+  times.set(request, at);
+}
+
+async function readMissingOutputs(
+  control: HttpCanonicalControlClient,
+  job: string,
+  after: number,
+  through: number,
+  signal: AbortSignal,
+): Promise<ControlOutput[]> {
+  const outputs: ControlOutput[] = [];
+  while (after < through) {
+    const page = await control.readOutputs(job, { afterSeq: after, limit: 100, signal });
+    signal.throwIfAborted();
+    const next = page.outputs.filter((output) => output.seq <= through);
+    for (const output of next) {
+      if (output.seq !== after + 1) throw new Error("Stored output sequence has a gap.");
+      outputs.push(output);
+      after = output.seq;
+    }
+    if (!next.length || (!page.has_more && after < through))
+      throw new Error("Stored output sequence could not be fully reconciled.");
+  }
+  return outputs;
+}
+
+async function readPartialToolBoundaries(
+  control: HttpCanonicalControlClient,
+  job: string,
+  tools: readonly ControlToolCall[],
+  outputs: OutputSequence,
+  signal: AbortSignal,
+  times: Map<number, number>,
+  responses: readonly ControlProviderResponse[],
+  gate?: ToolTimeGate,
+): Promise<PartialToolBoundary[] | null> {
+  const first = outputs.at(0)?.created_at_us;
+  if (!tools.length || first === undefined) return null;
+  try {
+    const requests = [...new Set(tools.map((call) => call.request))].sort((a, b) => b - a);
+    const boundaries: PartialToolBoundary[] = [];
+    const recorded = new Map(
+      responses
+        .filter((response) => response.requests_tools)
+        .map((response) => [response.request, response.created_at_us]),
+    );
+    for (let offset = 0; offset < requests.length; ) {
+      // The first request often already precedes the window. Later batches
+      // bound speculative reads while avoiding a serial walk through a long turn.
+      const count = offset === 0 ? 1 : TOOL_TIME_BATCH_SIZE;
+      let batch = requests.slice(offset, offset + count);
+      const knownBoundary = batch.findIndex((request) => {
+        const at = recorded.get(request) ?? times.get(request);
+        return at !== undefined && at < first;
+      });
+      if (knownBoundary >= 0) batch = batch.slice(0, knownBoundary + 1);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      try {
+        const values = batch.map((request) => {
+          const known = recorded.get(request) ?? times.get(request);
+          return Promise.resolve(
+            known === undefined
+              ? gate
+                ? gate.read(controller.signal, () =>
+                    control.readToolResponseTime(job, request, controller.signal),
+                  )
+                : control.readToolResponseTime(job, request, controller.signal)
+              : known,
+          ).then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          );
+        });
+        for (let i = 0; i < batch.length; i++) {
+          const result = await values[i];
+          signal.throwIfAborted();
+          if ("error" in result) throw result.error;
+          const at = result.value;
+          if (at === null) return null;
+          const request = batch[i];
+          rememberToolTime(times, request, at);
+          boundaries.push({ request, at });
+          if (at < first) return boundaries.reverse();
+        }
+      } finally {
+        controller.abort();
+        signal.removeEventListener("abort", abort);
+      }
+      offset += batch.length;
+    }
+    return boundaries.reverse();
+  } catch {
+    signal.throwIfAborted();
+    return null;
+  }
+}
 
 type Turn = {
   compaction?: ControlConversationTurn["compaction"];
   details?: ControlJobDetails;
-  outputWindow?: number;
   entries?: ControlConversationTurn["entries"];
   sessionId: string;
   job: ControlJob;
   input: ControlConversationTurn["input"];
-  outputs: ControlOutput[];
+  outputs: OutputHistory;
+  // Advances when the live array is appended in place, including while an
+  // asynchronous history read holds a shallow snapshot of this turn.
+  outputRevision?: number;
   tools: ControlToolCall[];
   responses: ControlProviderResponse[];
+  partialToolBoundaries?: PartialToolBoundary[] | null;
+  partialToolTimes?: ReadonlyMap<number, number>;
   error?: string;
   toolError?: string;
   unknownReason?: string | null;
@@ -54,6 +220,7 @@ type StreamEntry = {
   subscription: JobStreamSubscription | null;
   unsubscribeCatalog: (() => void) | null;
   stopped: boolean;
+  stop: () => void;
 };
 
 /** Projects and sessions are presentation scope only: every backend turn is a Job. */
@@ -62,7 +229,18 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private started = false;
   private disposed = false;
   private readonly lifetime = new AbortController();
+  private readonly toolTimeGate = new ToolTimeGate();
   private readonly turns = new Map<string, Turn>();
+  private readonly projections = new WeakMap<
+    Turn,
+    {
+      outputs: OutputHistory;
+      length: number;
+      aggregate: TranscriptAccumulator;
+      arguments?: readonly unknown[];
+      transcript?: TranscriptTurn[];
+    }
+  >();
   private readonly roots = new Map<string, string>();
   private listedRoots = new Set<string>();
   // hiddenRoots and unlisted live as long as the client.
@@ -267,10 +445,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         for (const id of turn.input.attachments) attachments.add(id);
         const stream = this.streams.get(jobId);
         if (stream) {
-          stream.stopped = true;
-          stream.unsubscribeCatalog?.();
-          stream.subscription?.close();
-          this.streams.delete(jobId);
+          stream.stop();
         }
         this.turns.delete(jobId);
       }
@@ -420,7 +595,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return (
       !!this.earlier.get(sessionId) ||
       [...this.turns.values()].some(
-        (turn) => turn.sessionId === sessionId && (turn.outputs[0]?.seq ?? 1) > 1,
+        (turn) => turn.sessionId === sessionId && turn.outputs.firstSeq > 1,
       )
     );
   }
@@ -431,7 +606,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const cursor = this.earlier.get(sessionId);
     if (this.disposed) return Promise.resolve();
     const partial = [...this.turns.values()]
-      .filter((turn) => turn.sessionId === sessionId && (turn.outputs[0]?.seq ?? 1) > 1)
+      .filter((turn) => turn.sessionId === sessionId && turn.outputs.firstSeq > 1)
       .sort(
         (a, b) => b.job.created_at_us - a.job.created_at_us || b.job.id.localeCompare(a.job.id),
       )[0];
@@ -443,16 +618,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       try {
         if (partial) {
           const held = partial.outputs;
-          let before = held[0].seq;
-          let outputWindow = partial.outputWindow ?? 200;
-          let loaded: typeof held = [];
+          let before = held.firstSeq;
+          let loaded: ControlOutput[] = [];
           while (true) {
             const earlier = await readOutputWindow(this.control, partial.job.id, {
               beforeSeq: before,
               signal: this.lifetime.signal,
             });
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
-            outputWindow += 200;
             loaded = [
               ...new Map(
                 [...earlier.outputs, ...loaded].map((output) => [output.seq, output]),
@@ -467,21 +640,32 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             if (next >= before) break;
             before = next;
           }
-          partial.outputWindow = outputWindow;
-          const merged = new Map(
-            [...loaded, ...held, ...partial.outputs].map((output) => [output.seq, output]),
-          );
-          partial.outputs = [...merged.values()]
-            .sort((a, b) => a.seq - b.seq)
-            .slice(-partial.outputWindow);
-          if (partial.outputs[0]?.seq === 1) {
+          partial.outputs = mergeOutputHistory(loaded, held, partial.outputs);
+          if (partial.outputs.firstSeq === 1) {
             const evidence = await readTranscriptEvidence(this.control, partial.job.id, {
               signal: this.lifetime.signal,
             });
             if (!isCurrent()) return;
-            partial.responses = evidence.responses ?? [];
-            partial.tools = evidence.tools ?? partial.tools;
+            partial.responses = reuseEvidence(partial.responses, evidence.responses ?? []);
+            partial.tools = reuseEvidence(partial.tools, evidence.tools);
             partial.toolError = evidence.error;
+            partial.partialToolTimes = undefined;
+            partial.partialToolBoundaries = undefined;
+          } else if (partial.job.settlement.state === "completed" && partial.tools.length) {
+            const times = new Map(partial.partialToolTimes);
+            const boundaries = await readPartialToolBoundaries(
+              this.control,
+              partial.job.id,
+              partial.tools,
+              partial.outputs,
+              this.lifetime.signal,
+              times,
+              partial.responses,
+              this.toolTimeGate,
+            );
+            if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
+            partial.partialToolTimes = times;
+            partial.partialToolBoundaries = boundaries;
           }
           this.publish(sessionId);
           return;
@@ -529,12 +713,24 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
     const previous = this.turns.get(turn.job.id);
     const snapshot = previous ? { ...previous } : undefined;
-    const outputs =
+    const window =
       turn.outputs_truncated || (turn.outputs.at(-1)?.seq ?? 0) > 200
         ? (await readOutputWindow(this.control, turn.job.id, { signal: this.lifetime.signal }))
             .outputs
         : turn.outputs;
-    const complete = (outputs[0]?.seq ?? 1) === 1;
+    let outputs = mergeOutputHistory(window);
+    if (previous?.outputs.length && window.length) {
+      const last = previous.outputs.lastSeq;
+      const gap = await readMissingOutputs(
+        this.control,
+        turn.job.id,
+        last,
+        window[0].seq - 1,
+        this.lifetime.signal,
+      );
+      outputs = mergeOutputHistory(previous.outputs, gap, window);
+    }
+    const complete = outputs.firstSeq === 1;
     const evidence = await readTranscriptEvidence(this.control, turn.job.id, {
       signal: this.lifetime.signal,
       readReplies: complete,
@@ -548,6 +744,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       responses: evidence.responses ?? [],
       toolError: evidence.error,
     };
+    if (!complete && turn.job.settlement.state === "completed" && state.tools.length) {
+      const times = new Map(previous?.partialToolTimes);
+      state.partialToolBoundaries = await readPartialToolBoundaries(
+        this.control,
+        turn.job.id,
+        state.tools,
+        outputs,
+        this.lifetime.signal,
+        times,
+        previous?.responses ?? [],
+        this.toolTimeGate,
+      );
+      state.partialToolTimes = times;
+    }
     if (turn.job.settlement.state === "unknown") {
       const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
       if (!isCurrent()) return null;
@@ -555,7 +765,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }
     if (
       turn.job.settlement.state === "unsettled" ||
-      outputs.some((output) => output.code === "task_plan_scheduled")
+      [...outputs].some((output) => output.code === "task_plan_scheduled")
     ) {
       state.details = await this.control.readJobDetails(turn.job.id, this.lifetime.signal);
       state.job = reconcileJob(state.job, state.details);
@@ -581,6 +791,52 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private readonly images = new Map<string, ChatImage>();
+  private projectTurn(
+    turn: Turn,
+    partial: boolean,
+  ): { transcript: TranscriptTurn[]; result: OutputView | null } {
+    let cached = this.projections.get(turn);
+    if (!cached || cached.outputs !== turn.outputs || cached.length > turn.outputs.length) {
+      cached = { outputs: turn.outputs, length: 0, aggregate: new TranscriptAccumulator() };
+      this.projections.set(turn, cached);
+    }
+    while (cached.length < turn.outputs.length) {
+      const output = turn.outputs.at(cached.length++);
+      if (!output) throw new Error("Stored output projection is incomplete.");
+      cached.aggregate.append(output);
+    }
+    const args = [
+      turn.outputRevision,
+      turn.outputs,
+      turn.outputs.length,
+      turn.job,
+      turn.input,
+      turn.entries,
+      turn.tools,
+      turn.responses,
+      turn.partialToolBoundaries,
+      partial,
+    ];
+    if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
+      cached.transcript = jobTranscript(
+        turn.job.id,
+        partial || turn.entries ? null : turn.input.objective,
+        turn.outputs,
+        turn.job.settlement,
+        turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
+        undefined,
+        turn.tools,
+        turn.job.previous === null,
+        turn.responses,
+        partial,
+        turn.partialToolBoundaries,
+        cached.aggregate,
+      );
+      cached.arguments = args;
+    }
+    return { transcript: cached.transcript ?? [], result: cached.aggregate.result };
+  }
+
   private async readImages(turn: Turn) {
     return Promise.all(
       [
@@ -611,9 +867,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         (a, b) => a.job.created_at_us - b.job.created_at_us || a.job.id.localeCompare(b.job.id),
       );
     // Keep the visible history contiguous: inputs and older turns precede any missing outputs.
-    const lastPartial = turns.findLastIndex((turn) => (turn.outputs[0]?.seq ?? 1) > 1);
+    const lastPartial = turns.findLastIndex((turn) => turn.outputs.firstSeq > 1);
     const messages: ChatMessage[] = turns.slice(Math.max(lastPartial, 0)).flatMap((turn) => {
-      const partial = (turn.outputs[0]?.seq ?? 1) > 1;
+      const partial = turn.outputs.firstSeq > 1;
       const entries = materializeUserEntries(turn.entries ?? []);
       const queued =
         turn.job.previous !== null &&
@@ -655,19 +911,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         !turn.outputs.length &&
         !turn.tools.length &&
         !turn.responses.length;
-      const transcript = withdrawnBeforeStart
-        ? []
-        : jobTranscript(
-            turn.job.id,
-            partial || turn.entries ? null : turn.input.objective,
-            turn.outputs,
-            turn.job.settlement,
-            turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
-            undefined,
-            turn.tools,
-            turn.job.previous === null,
-            turn.responses,
-          );
+      const projected = this.projectTurn(turn, partial);
+      const transcript = withdrawnBeforeStart ? [] : projected.transcript;
       return [
         ...(partial ? [] : boundary),
         ...(partial ? [] : inputs),
@@ -689,9 +934,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
                 reasoning: message.reasoning,
                 sourceSnapshots: message.intermediate
                   ? undefined
-                  : fileSnapshots(
-                      turn.outputs.findLast((output) => output.kind === "result")?.value,
-                    ),
+                  : fileSnapshots(projected.result?.value),
                 reasoningDurationMs: message.reasoningDurationMs,
                 failureReason: message.intermediate
                   ? undefined
@@ -741,36 +984,68 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private watch(jobId: string) {
     const turn = this.turns.get(jobId);
     if (!turn || this.streams.has(jobId) || this.disposed) return;
-    const entry: StreamEntry = { subscription: null, unsubscribeCatalog: null, stopped: false };
+    const entry: StreamEntry = {
+      subscription: null,
+      unsubscribeCatalog: null,
+      stopped: false,
+      stop: () => {},
+    };
     let inFlight = false;
     let queued = false;
+    let catalogDirty = false;
+    let catalogTimer: ReturnType<typeof setTimeout> | undefined;
+    let needsReplay = false;
+    let replayThrough = 0;
+    let recoveryDelay = CATALOG_REFRESH_DELAY_MS;
+    let recoveryAfter = 0;
     let loadedContinuation = false;
     const finish = () => {
       entry.stopped = true;
+      if (catalogTimer !== undefined) clearTimeout(catalogTimer);
       entry.unsubscribeCatalog?.();
       entry.subscription?.close();
       if (this.streams.get(jobId) === entry) this.streams.delete(jobId);
     };
+    entry.stop = finish;
     const requestTick = () => {
       if (entry.stopped || this.disposed) return;
+      if (needsReplay && Date.now() < recoveryAfter) {
+        scheduleCatalogTick();
+        return;
+      }
       if (inFlight) {
         queued = true;
         return;
       }
       void tick();
     };
+    const scheduleCatalogTick = () => {
+      catalogDirty = true;
+      if (entry.stopped || this.disposed || inFlight || catalogTimer !== undefined) return;
+      catalogTimer = setTimeout(
+        () => {
+          catalogTimer = undefined;
+          if (inFlight) return;
+          catalogDirty = false;
+          requestTick();
+        },
+        needsReplay && recoveryAfter > Date.now()
+          ? recoveryAfter - Date.now()
+          : CATALOG_REFRESH_DELAY_MS,
+      );
+    };
     const tick = async () => {
       if (inFlight || entry.stopped || this.disposed) return;
       inFlight = true;
       try {
-        const [details, evidence] = await Promise.all([
-          this.control.readJobDetails(jobId, this.lifetime.signal),
-          readTranscriptEvidence(this.control, jobId, {
-            signal: this.lifetime.signal,
-            previous: turn.responses,
-            readReplies: (turn.outputs[0]?.seq ?? 1) === 1,
-          }),
-        ]);
+        const details = await this.control.readJobDetails(jobId, this.lifetime.signal);
+        const readReplies = turn.outputs.firstSeq === 1;
+        const evidence = await readTranscriptEvidence(this.control, jobId, {
+          signal: this.lifetime.signal,
+          previous: turn.responses,
+          settled: readReplies && details.settlement.state !== "unsettled",
+          readReplies,
+        });
         if (entry.stopped || this.disposed) return;
         if (turn.job.conversation) {
           const page = await this.control.readConversationTurns(
@@ -791,25 +1066,55 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         turn.job = reconcileJob(turn.job, details);
         turn.details = details;
         turn.unknownReason = details.unknown_reason;
-        const last = turn.outputs.at(-1)?.seq ?? 0;
-        if (details.activity.last_output_seq > last) {
-          const window = await readOutputWindow(this.control, jobId, {
-            limit: turn.outputWindow ?? 200,
-            signal: this.lifetime.signal,
-          });
+        const last = turn.outputs.lastSeq;
+        const through = Math.max(
+          details.activity.last_output_seq,
+          details.result?.seq ?? 0,
+          replayThrough,
+        );
+        if (through > last) {
+          let missing: ControlOutput[];
+          try {
+            missing = await readMissingOutputs(
+              this.control,
+              jobId,
+              last,
+              through,
+              this.lifetime.signal,
+            );
+          } catch (error) {
+            needsReplay = true;
+            replayThrough = Math.max(replayThrough, through);
+            entry.subscription?.close();
+            throw error;
+          }
           if (entry.stopped || this.disposed) return;
-          const outputs = new Map(
-            [...turn.outputs, ...window.outputs].map((output) => [output.seq, output]),
-          );
-          turn.outputs = [...outputs.values()]
-            .sort((a, b) => a.seq - b.seq)
-            .slice(-(turn.outputWindow ?? 200));
+          turn.outputs = mergeOutputHistory(turn.outputs, missing);
         }
-        if (details.result && (turn.outputs.at(-1)?.seq ?? 0) < details.result.seq)
-          turn.outputs = [...turn.outputs, details.result].slice(-(turn.outputWindow ?? 200));
-        turn.tools = evidence.tools ?? turn.tools;
-        turn.responses =
-          (turn.outputs[0]?.seq ?? 1) === 1 ? (evidence.responses ?? turn.responses) : [];
+        turn.tools = reuseEvidence(turn.tools, evidence.tools);
+        if (readReplies && turn.outputs.firstSeq === 1)
+          turn.responses = reuseEvidence(turn.responses, evidence.responses);
+        if (
+          turn.outputs.firstSeq > 1 &&
+          details.settlement.state === "completed" &&
+          turn.tools.length &&
+          turn.partialToolBoundaries == null
+        ) {
+          const times = new Map(turn.partialToolTimes);
+          const boundaries = await readPartialToolBoundaries(
+            this.control,
+            jobId,
+            turn.tools,
+            turn.outputs,
+            this.lifetime.signal,
+            times,
+            turn.responses,
+            this.toolTimeGate,
+          );
+          if (entry.stopped || this.disposed) return;
+          turn.partialToolTimes = times;
+          turn.partialToolBoundaries = boundaries;
+        }
         turn.toolError = evidence.error;
         turn.error = undefined;
         this.publish(turn.sessionId);
@@ -817,12 +1122,22 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           loadedContinuation = true;
           await this.openConversation(details.task_plan.continuation);
         }
-        if (turn.job.settlement.state !== "unsettled" && !taskPlanActive(details.task_plan)) {
+        if (details.settlement.state !== "unsettled" && !taskPlanActive(details.task_plan)) {
           finish();
+        } else if (needsReplay) {
+          needsReplay = false;
+          replayThrough = 0;
+          recoveryAfter = 0;
+          recoveryDelay = CATALOG_REFRESH_DELAY_MS;
+          connect();
         }
       } catch (error) {
         if (!this.disposed && !entry.stopped) {
-          turn.error = `Status refresh unavailable: ${error instanceof Error ? error.message : String(error)}. Displayed state may be stale.`;
+          if (needsReplay) {
+            recoveryAfter = Date.now() + recoveryDelay;
+            recoveryDelay = Math.min(recoveryDelay * 2, MAX_RECOVERY_DELAY_MS);
+          }
+          turn.error = `Status refresh unavailable: ${error instanceof Error ? error.message : String(error)}. Displayed state may be stale.${needsReplay ? " Reload to retry now." : ""}`;
           this.publish(turn.sessionId);
         }
       } finally {
@@ -830,51 +1145,65 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         if (queued) {
           queued = false;
           requestTick();
-        }
+        } else if (catalogDirty || needsReplay) scheduleCatalogTick();
       }
     };
     this.streams.set(jobId, entry);
-    entry.subscription = this.control.subscribeJobEvents(
-      jobId,
-      (event) => {
-        if (this.disposed || entry.stopped) return;
-        if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
-        if (event.type === "output" && event.output.seq > (turn.outputs.at(-1)?.seq ?? 0)) {
-          turn.outputs = [...turn.outputs, event.output].slice(-(turn.outputWindow ?? 200));
-          if ((turn.outputs[0]?.seq ?? 1) > 1) turn.responses = [];
-        }
-        if (event.type === "settlement") {
-          turn.job = {
-            ...turn.job,
-            settlement: event.settlement,
-            stop_confirmed_at_us: event.stop_confirmed_at_us,
-          };
-        }
-        if (event.type === "stream_error")
-          turn.error = `${event.error.code}: ${event.error.message}`;
-        this.publish(turn.sessionId);
-        requestTick();
-      },
-      {
-        signal: this.lifetime.signal,
-        afterSeq: turn.outputs.at(-1)?.seq ?? 0,
-        onReconnect: (error) => {
-          turn.error = `Reconnecting: ${error.code}`;
+    const connect = () => {
+      const subscription = this.control.subscribeJobEvents(
+        jobId,
+        (event) => {
+          if (this.disposed || entry.stopped) return;
+          if (event.type === "heartbeat") return;
+          if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
+          if (event.type === "output" && event.output.seq > turn.outputs.lastSeq) {
+            if (event.output.seq !== turn.outputs.lastSeq + 1) {
+              replayThrough = Math.max(replayThrough, event.output.seq);
+              throw new ContractError("output.seq", "the next stored sequence without a gap");
+            }
+            turn.outputs.append(event.output);
+            turn.outputRevision = (turn.outputRevision ?? 0) + 1;
+          }
+          if (event.type === "settlement") {
+            turn.job = {
+              ...turn.job,
+              settlement: event.settlement,
+              stop_confirmed_at_us: event.stop_confirmed_at_us,
+            };
+          }
+          if (event.type === "stream_error")
+            turn.error = `${event.error.code}: ${event.error.message}`;
           this.publish(turn.sessionId);
+          if (event.type !== "output") requestTick();
         },
-      },
-    );
-    entry.unsubscribeCatalog = this.control.subscribeCatalog(requestTick, (error) => {
+        {
+          signal: this.lifetime.signal,
+          afterSeq: turn.outputs.lastSeq,
+          onReconnect: (error) => {
+            turn.error = `Reconnecting: ${error.code}`;
+            this.publish(turn.sessionId);
+            requestTick();
+          },
+        },
+      );
+      entry.subscription = subscription;
+      void subscription.closed.then(requestTick).catch((error) => {
+        if (this.disposed || entry.stopped) return;
+        turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Recovering stored status.`;
+        this.publish(turn.sessionId);
+        if (error instanceof ContractError && error.path === "output.seq") {
+          needsReplay = true;
+          scheduleCatalogTick();
+        }
+      });
+    };
+    connect();
+    entry.unsubscribeCatalog = this.control.subscribeCatalog(scheduleCatalogTick, (error) => {
       if (this.disposed || entry.stopped) return;
       turn.error = `Catalog subscription unavailable: ${error instanceof Error ? error.message : String(error)}`;
       this.publish(turn.sessionId);
     });
     void tick();
-    void entry.subscription.closed.then(requestTick).catch((error) => {
-      if (this.disposed || entry.stopped) return;
-      turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Recovering stored status.`;
-      this.publish(turn.sessionId);
-    });
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
@@ -991,9 +1320,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.control.readJobInput(job),
       readOutputWindow(this.control, job, { signal: this.lifetime.signal }),
     ]);
+    let outputs = mergeOutputHistory(window.outputs);
+    if (previous?.outputs.length && window.outputs.length) {
+      const gap = await readMissingOutputs(
+        this.control,
+        job,
+        previous.outputs.lastSeq,
+        window.outputs[0].seq - 1,
+        this.lifetime.signal,
+      );
+      outputs = mergeOutputHistory(previous.outputs, gap, window.outputs);
+    }
     const evidence = await readTranscriptEvidence(this.control, job, {
       signal: this.lifetime.signal,
-      readReplies: (window.outputs[0]?.seq ?? 1) === 1,
+      readReplies: outputs.firstSeq === 1,
     });
     const page = record.conversation
       ? await this.control.readConversationTurns(
@@ -1010,12 +1350,26 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       sessionId,
       job: record,
       input: stored?.input ?? frozen,
-      outputs: window.outputs,
+      outputs,
       tools: evidence.tools ?? [],
       responses: evidence.responses ?? [],
       toolError: evidence.error,
       unknownReason: record.unknown_reason ?? null,
     };
+    if (outputs.firstSeq > 1 && record.settlement.state === "completed" && turn.tools.length) {
+      const times = new Map(previous?.partialToolTimes);
+      turn.partialToolBoundaries = await readPartialToolBoundaries(
+        this.control,
+        job,
+        turn.tools,
+        outputs,
+        this.lifetime.signal,
+        times,
+        previous?.responses ?? [],
+        this.toolTimeGate,
+      );
+      turn.partialToolTimes = times;
+    }
     if (!this.getSnapshot().sessions.some((s) => s.id === sessionId)) return;
     const current = this.turns.get(job);
     if (current && !this.historyTurnIsCurrent({ state: turn, previous, snapshot })) {
@@ -1130,11 +1484,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.unsubscribeConversations = null;
     }
     for (const entry of this.streams.values()) {
-      entry.stopped = true;
-      entry.unsubscribeCatalog?.();
-      entry.subscription?.close();
+      entry.stop();
     }
     this.streams.clear();
+    this.turns.clear();
+    this.images.clear();
     super.dispose();
   }
 }
