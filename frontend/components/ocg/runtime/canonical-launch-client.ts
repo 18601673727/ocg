@@ -39,6 +39,11 @@ const MAX_RECOVERY_DELAY_MS = 10_000;
 const TOOL_TIME_CACHE_LIMIT = 128;
 const TOOL_TIME_BATCH_SIZE = 4;
 
+function reuseEvidence<T>(previous: T[], next: T[] | null | undefined): T[] {
+  if (!next || next === previous) return previous;
+  return JSON.stringify(previous) === JSON.stringify(next) ? previous : next;
+}
+
 class ToolTimeGate {
   private active = 0;
   private wake: () => void = () => {};
@@ -644,8 +649,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
               signal: this.lifetime.signal,
             });
             if (!isCurrent()) return;
-            partial.responses = evidence.responses ?? [];
-            partial.tools = evidence.tools ?? partial.tools;
+            partial.responses = reuseEvidence(partial.responses, evidence.responses ?? []);
+            partial.tools = reuseEvidence(partial.tools, evidence.tools);
             partial.toolError = evidence.error;
             partial.partialToolTimes = undefined;
             partial.partialToolBoundaries = undefined;
@@ -1085,9 +1090,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           if (entry.stopped || this.disposed) return;
           turn.outputs = mergeOutputs(turn.outputs, missing);
         }
-        turn.tools = evidence.tools ?? turn.tools;
+        turn.tools = reuseEvidence(turn.tools, evidence.tools);
         if (readReplies && (turn.outputs[0]?.seq ?? 1) === 1)
-          turn.responses = evidence.responses ?? turn.responses;
+          turn.responses = reuseEvidence(turn.responses, evidence.responses);
         if (
           (turn.outputs[0]?.seq ?? 1) > 1 &&
           details.settlement.state === "completed" &&

@@ -49,6 +49,7 @@ export class TranscriptAccumulator {
   lastAt: number | null = null;
   reasoningStartedAt: number | null = null;
   reasoningDurationUs = 0;
+  provider?: ProviderProjection;
 
   append(output: ControlOutput) {
     if (output.kind === "progress") this.progress += outputDisplayText(output);
@@ -61,6 +62,81 @@ export class TranscriptAccumulator {
       this.reasoningStartedAt = null;
     }
     this.lastAt = output.created_at_us;
+    this.provider?.append(output);
+  }
+}
+
+type ReasoningInterval = {
+  text: string;
+  started: number | null;
+  duration: number;
+  at: number | null;
+};
+
+class ProviderProjection {
+  readonly recorded: string;
+  readonly byRequest: Map<number, ControlProviderResponse>;
+  readonly toolsByRequest = new Map<number, ControlToolCall[]>();
+  readonly requests: number[];
+  readonly intervals: ReasoningInterval[];
+  readonly through: number[];
+  readonly requestMessages = new Map<number, TranscriptTurn>();
+  private index = 0;
+  private compared = 0;
+  private compatible = true;
+
+  constructor(
+    readonly responses: readonly ControlProviderResponse[],
+    readonly tools: readonly ControlToolCall[] | undefined,
+    readonly completed: boolean,
+    readonly answerId: string,
+    readonly titleMetadata: boolean,
+    outputs: readonly ControlOutput[],
+  ) {
+    this.recorded = responses.map((response) => response.text).join("");
+    this.byRequest = new Map(responses.map((response) => [response.request, response]));
+    for (const call of tools ?? []) {
+      const group = this.toolsByRequest.get(call.request) ?? [];
+      group.push(call);
+      this.toolsByRequest.set(call.request, group);
+    }
+    this.requests = [...new Set([...this.byRequest.keys(), ...this.toolsByRequest.keys()])].sort(
+      (a, b) => a - b,
+    );
+    this.through = this.requests.flatMap((request) => {
+      const response = this.byRequest.get(request);
+      return response
+        ? [completed && response === responses.at(-1) ? Infinity : response.created_at_us]
+        : [];
+    });
+    this.through.push(Infinity);
+    this.intervals = this.through.map(() => ({ text: "", started: null, duration: 0, at: null }));
+    for (const output of outputs) this.append(output);
+  }
+
+  append(output: ControlOutput) {
+    while (this.index < this.through.length - 1 && output.created_at_us > this.through[this.index])
+      this.index++;
+    const interval = this.intervals[this.index];
+    const text = outputText(output);
+    if (output.kind === "reasoning" && text) {
+      interval.text += text;
+      interval.started ??= output.created_at_us;
+      interval.at ??= output.created_at_us;
+    } else if (interval.started !== null) {
+      interval.duration += Math.max(0, output.created_at_us - interval.started);
+      interval.started = null;
+    }
+  }
+
+  matches(progress: string): boolean {
+    const end = Math.min(progress.length, this.recorded.length);
+    if (this.compatible && end > this.compared) {
+      this.compatible =
+        progress.slice(this.compared, end) === this.recorded.slice(this.compared, end);
+      this.compared = end;
+    }
+    return this.compatible;
   }
 }
 
@@ -178,6 +254,8 @@ export function jobTranscript(
       partialOutput,
       partialToolBoundaries,
       strippedPending,
+      aggregate,
+      titleMetadata,
     ),
   ];
 }
@@ -249,19 +327,11 @@ function providerMessages(
   partialOutput: boolean,
   partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
   strippedPending: ReadonlySet<ControlToolCall>,
+  aggregate: TranscriptAccumulator,
+  titleMetadata: boolean,
 ): TranscriptTurn[] {
-  if (!responses?.length)
-    return fallbackMessages(
-      answer,
-      progress,
-      visible,
-      outputs,
-      partialOutput,
-      partialToolBoundaries,
-      strippedPending,
-    );
-  const recorded = responses.map((response) => response.text).join("");
-  if (!progress.startsWith(recorded) && !recorded.startsWith(progress)) {
+  if (!responses?.length) {
+    aggregate.provider = undefined;
     return fallbackMessages(
       answer,
       progress,
@@ -272,27 +342,44 @@ function providerMessages(
       strippedPending,
     );
   }
-  const remainder = progress.startsWith(recorded) ? progress.slice(recorded.length) : "";
+  let projection = aggregate.provider;
+  if (
+    !projection ||
+    projection.responses !== responses ||
+    projection.tools !== answer.tools ||
+    projection.completed !== (answer.status === "completed") ||
+    projection.answerId !== answer.id ||
+    projection.titleMetadata !== titleMetadata
+  ) {
+    projection = new ProviderProjection(
+      responses,
+      answer.tools,
+      answer.status === "completed",
+      answer.id,
+      titleMetadata,
+      outputs,
+    );
+    aggregate.provider = projection;
+  }
+  const { recorded, byRequest, toolsByRequest, requests } = projection;
+  if (!projection.matches(progress)) {
+    return fallbackMessages(
+      answer,
+      progress,
+      visible,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+      strippedPending,
+    );
+  }
+  const remainder = progress.length >= recorded.length ? progress.slice(recorded.length) : "";
   const tools = answer.tools ?? [];
   const messages: TranscriptTurn[] = [];
-  let outputIndex = 0;
+  let intervalIndex = 0;
   const reasoningBefore = (through: number, id: string, live = false) => {
-    let text = "";
-    let started: number | null = null;
-    let duration = 0;
-    let at: number | null = null;
-    while (outputIndex < outputs.length && outputs[outputIndex].created_at_us <= through) {
-      const output = outputs[outputIndex++];
-      const reasoning = outputText(output);
-      if (output.kind === "reasoning" && reasoning) {
-        text += reasoning;
-        started ??= output.created_at_us;
-        at ??= output.created_at_us;
-      } else if (started !== null) {
-        duration += Math.max(0, output.created_at_us - started);
-        started = null;
-      }
-    }
+    const { text, started, at } = projection.intervals[intervalIndex++];
+    let { duration } = projection.intervals[intervalIndex - 1];
     if (started !== null)
       duration += Math.max(
         0,
@@ -312,16 +399,6 @@ function providerMessages(
         intermediate: true,
       });
   };
-  const byRequest = new Map(responses.map((response) => [response.request, response]));
-  const toolsByRequest = new Map<number, ControlToolCall[]>();
-  for (const call of tools) {
-    const group = toolsByRequest.get(call.request) ?? [];
-    group.push(call);
-    toolsByRequest.set(call.request, group);
-  }
-  const requests = [...new Set([...byRequest.keys(), ...toolsByRequest.keys()])].sort(
-    (a, b) => a - b,
-  );
   let final = false;
   for (const request of requests) {
     const response = byRequest.get(request);
@@ -351,7 +428,9 @@ function providerMessages(
       );
     const running =
       active && calls.some((call) => !call.outcome_kind && call.decision === "admitted");
-    messages.push({
+    const reusable = response && !isFinal && !waiting && !running;
+    const cachedMessage = reusable ? projection.requestMessages.get(request) : undefined;
+    const message: TranscriptTurn = cachedMessage ?? {
       ...answer,
       id: isFinal ? answer.id : `${answer.id}:request:${request}`,
       content: response ? visible(response.text) : "",
@@ -362,7 +441,9 @@ function providerMessages(
       status: waiting ? "pending" : running ? "streaming" : "completed",
       detail: null,
       intermediate: !isFinal,
-    });
+    };
+    if (reusable && !cachedMessage) projection.requestMessages.set(request, message);
+    messages.push(message);
   }
   if (!final) {
     reasoningBefore(
