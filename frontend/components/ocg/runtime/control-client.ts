@@ -1657,6 +1657,23 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
     },
 
+    /** Reads the timestamp of the response that introduced a tool call. */
+    async readToolResponseTime(job: string, request: number, signal?: AbortSignal) {
+      jobIdentity(job);
+      if (!Number.isSafeInteger(request) || request < 1)
+        throw new ContractError("request", "a positive request number");
+      const after = request === 1 ? "" : `&after=${request - 1}`;
+      const page = (
+        await send("GET", `/api/v1/jobs/${job}/responses?limit=1${after}`, {
+          signal,
+        })
+      ).input as Api.ProviderResponses;
+      const response = page.responses[0];
+      return response?.request === request && response.requests_tools
+        ? response.created_at_us
+        : null;
+    },
+
     /** Reassembles reply chunks; an incomplete 50-page walk is refused. */
     async readAllProviderResponses(
       job: string,

@@ -10,6 +10,8 @@ export type TranscriptSettlement = {
   settled_at_us?: number | null;
 };
 
+export type PartialToolBoundary = { request: number; at: number };
+
 export type TranscriptTurn = {
   id: string;
   role: "user" | "assistant";
@@ -56,6 +58,8 @@ export function jobTranscript(
   tools?: readonly ControlToolCall[],
   titleMetadata = false,
   responses?: readonly ControlProviderResponse[],
+  partialOutput = false,
+  partialToolBoundaries?: readonly PartialToolBoundary[] | null,
 ): TranscriptTurn[] {
   const answerOutputs = outputs.filter((output) => output.kind !== "reasoning");
   const progress = answerOutputs
@@ -152,7 +156,18 @@ export function jobTranscript(
       detail: providerFailureDetail(result),
     };
   }
-  return [...user, ...providerMessages(answer, progress, responses, visibleAnswer, outputs)];
+  return [
+    ...user,
+    ...providerMessages(
+      answer,
+      progress,
+      responses,
+      visibleAnswer,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+    ),
+  ];
 }
 
 function providerFailureDetail(result: ControlOutput | null): string | null {
@@ -214,11 +229,28 @@ function providerMessages(
   responses: readonly ControlProviderResponse[] | undefined,
   visible: (text: string) => string,
   outputs: readonly ControlOutput[],
+  partialOutput: boolean,
+  partialToolBoundaries?: readonly PartialToolBoundary[] | null,
 ): TranscriptTurn[] {
-  if (!responses?.length) return fallbackMessages(answer, progress, visible);
+  if (!responses?.length)
+    return fallbackMessages(
+      answer,
+      progress,
+      visible,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+    );
   const recorded = responses.map((response) => response.text).join("");
   if (!progress.startsWith(recorded) && !recorded.startsWith(progress)) {
-    return fallbackMessages(answer, progress, visible);
+    return fallbackMessages(
+      answer,
+      progress,
+      visible,
+      outputs,
+      partialOutput,
+      partialToolBoundaries,
+    );
   }
   const remainder = progress.startsWith(recorded) ? progress.slice(recorded.length) : "";
   const tools = answer.tools ?? [];
@@ -380,9 +412,15 @@ function fallbackMessages(
   answer: TranscriptTurn,
   progress: string,
   visible: (text: string) => string,
+  outputs: readonly ControlOutput[],
+  partialOutput: boolean,
+  partialToolBoundaries?: readonly PartialToolBoundary[] | null,
 ): TranscriptTurn[] {
   if (answer.status !== "completed") return [answer];
   const text = visible(progress);
+  if (partialOutput && !answer.tools?.length && answer.content.endsWith(text)) return [answer];
+  if (partialOutput && partialToolBoundaries?.length)
+    return partialMessages(answer, outputs, visible, partialToolBoundaries);
   const earlier =
     answer.content && text.endsWith(answer.content) ? text.slice(0, -answer.content.length) : text;
   if (!earlier || text === answer.content) return [answer];
@@ -397,4 +435,74 @@ function fallbackMessages(
     },
     { ...answer, reasoning: undefined, tools: undefined },
   ];
+}
+
+function partialMessages(
+  answer: TranscriptTurn,
+  outputs: readonly ControlOutput[],
+  visible: (text: string) => string,
+  boundaries: readonly PartialToolBoundary[],
+): TranscriptTurn[] {
+  const tools = new Map<number, ControlToolCall[]>();
+  for (const call of answer.tools ?? []) {
+    const group = tools.get(call.request) ?? [];
+    group.push(call);
+    tools.set(call.request, group);
+  }
+  const times = new Map(boundaries.map(({ request, at }) => [request, at]));
+  const messages: TranscriptTurn[] = [];
+  let position = 0;
+  const take = (through: number) => {
+    const start = position;
+    while (position < outputs.length && outputs[position].created_at_us <= through) position++;
+    const part = outputs.slice(start, position);
+    const text = part
+      .filter((output) => output.kind === "progress")
+      .map(outputDisplayText)
+      .join("");
+    const reasoning = part
+      .filter((output) => output.kind === "reasoning")
+      .map(outputDisplayText)
+      .join("");
+    return { text, reasoning, createdAtUs: part[0]?.created_at_us ?? null };
+  };
+  for (const request of [...tools.keys()].sort((a, b) => a - b)) {
+    const at = times.get(request);
+    // Requests older than the first boundary precede the retained output window.
+    const part = at === undefined ? { text: "", reasoning: "", createdAtUs: null } : take(at);
+    messages.push({
+      ...answer,
+      id: `${answer.id}:request:${request}`,
+      content: visible(part.text),
+      reasoning: part.reasoning || undefined,
+      reasoningDurationMs: undefined,
+      createdAtUs: part.createdAtUs,
+      tools: tools.get(request),
+      status: "completed",
+      intermediate: true,
+      detail: null,
+    });
+  }
+  const tail = take(Number.POSITIVE_INFINITY);
+  const streamed = visible(tail.text);
+  const separateTail = Boolean(streamed && !answer.content.endsWith(streamed));
+  if (separateTail) {
+    messages.push({
+      ...answer,
+      id: `${answer.id}:progress`,
+      content: streamed,
+      reasoning: tail.reasoning || undefined,
+      reasoningDurationMs: undefined,
+      tools: undefined,
+      intermediate: true,
+      detail: null,
+    });
+  }
+  messages.push({
+    ...answer,
+    reasoning: separateTail ? undefined : tail.reasoning || undefined,
+    reasoningDurationMs: undefined,
+    tools: undefined,
+  });
+  return messages;
 }

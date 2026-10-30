@@ -20,19 +20,74 @@ import {
   type HttpCanonicalControlClient,
   type JobStreamSubscription,
 } from "./control-client";
-import { jobTranscript } from "../chat/job-transcript-model";
+import { jobTranscript, type PartialToolBoundary } from "../chat/job-transcript-model";
 import { fileSnapshots } from "../markdown/source-snapshot";
 import { reconcileJob, taskPlanActive } from "./job-status";
-import { materializeUserEntries } from "../contracts";
+import { ContractError, materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
 
 /** Turns read per conversation page: the newest page and each earlier page. */
 const TURN_PAGE_SIZE = 20;
+// Catalog changes can include every output write; keep one trailing refresh.
+const CATALOG_REFRESH_DELAY_MS = 750;
+
+function mergeOutputs(...groups: readonly ControlOutput[][]): ControlOutput[] {
+  return [...new Map(groups.flat().map((output) => [output.seq, output])).values()].sort(
+    (a, b) => a.seq - b.seq,
+  );
+}
+
+async function readMissingOutputs(
+  control: HttpCanonicalControlClient,
+  job: string,
+  after: number,
+  through: number,
+  signal: AbortSignal,
+): Promise<ControlOutput[]> {
+  const outputs: ControlOutput[] = [];
+  while (after < through) {
+    const page = await control.readOutputs(job, { afterSeq: after, limit: 100, signal });
+    signal.throwIfAborted();
+    const next = page.outputs.filter((output) => output.seq <= through);
+    for (const output of next) {
+      if (output.seq !== after + 1) throw new Error("Stored output sequence has a gap.");
+      outputs.push(output);
+      after = output.seq;
+    }
+    if (!next.length || (!page.has_more && after < through))
+      throw new Error("Stored output sequence could not be fully reconciled.");
+  }
+  return outputs;
+}
+
+async function readPartialToolBoundaries(
+  control: HttpCanonicalControlClient,
+  job: string,
+  tools: readonly ControlToolCall[],
+  outputs: readonly ControlOutput[],
+  signal: AbortSignal,
+): Promise<PartialToolBoundary[] | null> {
+  const first = outputs[0]?.created_at_us;
+  if (!tools.length || first === undefined) return null;
+  try {
+    const requests = [...new Set(tools.map((call) => call.request))].sort((a, b) => b - a);
+    const boundaries: PartialToolBoundary[] = [];
+    for (const request of requests) {
+      const at = await control.readToolResponseTime(job, request, signal);
+      if (at === null) return null;
+      boundaries.push({ request, at });
+      if (at < first) break;
+    }
+    return boundaries.reverse();
+  } catch {
+    signal.throwIfAborted();
+    return null;
+  }
+}
 
 type Turn = {
   compaction?: ControlConversationTurn["compaction"];
   details?: ControlJobDetails;
-  outputWindow?: number;
   entries?: ControlConversationTurn["entries"];
   sessionId: string;
   job: ControlJob;
@@ -40,6 +95,7 @@ type Turn = {
   outputs: ControlOutput[];
   tools: ControlToolCall[];
   responses: ControlProviderResponse[];
+  partialToolBoundaries?: PartialToolBoundary[] | null;
   error?: string;
   toolError?: string;
   unknownReason?: string | null;
@@ -444,7 +500,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         if (partial) {
           const held = partial.outputs;
           let before = held[0].seq;
-          let outputWindow = partial.outputWindow ?? 200;
           let loaded: typeof held = [];
           while (true) {
             const earlier = await readOutputWindow(this.control, partial.job.id, {
@@ -452,7 +507,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
               signal: this.lifetime.signal,
             });
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
-            outputWindow += 200;
             loaded = [
               ...new Map(
                 [...earlier.outputs, ...loaded].map((output) => [output.seq, output]),
@@ -467,13 +521,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             if (next >= before) break;
             before = next;
           }
-          partial.outputWindow = outputWindow;
           const merged = new Map(
             [...loaded, ...held, ...partial.outputs].map((output) => [output.seq, output]),
           );
-          partial.outputs = [...merged.values()]
-            .sort((a, b) => a.seq - b.seq)
-            .slice(-partial.outputWindow);
+          partial.outputs = [...merged.values()].sort((a, b) => a.seq - b.seq);
           if (partial.outputs[0]?.seq === 1) {
             const evidence = await readTranscriptEvidence(this.control, partial.job.id, {
               signal: this.lifetime.signal,
@@ -482,6 +533,15 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             partial.responses = evidence.responses ?? [];
             partial.tools = evidence.tools ?? partial.tools;
             partial.toolError = evidence.error;
+          } else if (partial.job.settlement.state === "completed" && partial.tools.length) {
+            partial.partialToolBoundaries = await readPartialToolBoundaries(
+              this.control,
+              partial.job.id,
+              partial.tools,
+              partial.outputs,
+              this.lifetime.signal,
+            );
+            if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
           }
           this.publish(sessionId);
           return;
@@ -529,11 +589,22 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
     const previous = this.turns.get(turn.job.id);
     const snapshot = previous ? { ...previous } : undefined;
-    const outputs =
+    let outputs =
       turn.outputs_truncated || (turn.outputs.at(-1)?.seq ?? 0) > 200
         ? (await readOutputWindow(this.control, turn.job.id, { signal: this.lifetime.signal }))
             .outputs
         : turn.outputs;
+    if (previous?.outputs.length && outputs.length) {
+      const last = previous.outputs.at(-1)?.seq ?? 0;
+      const gap = await readMissingOutputs(
+        this.control,
+        turn.job.id,
+        last,
+        outputs[0].seq - 1,
+        this.lifetime.signal,
+      );
+      outputs = mergeOutputs(previous.outputs, gap, outputs);
+    }
     const complete = (outputs[0]?.seq ?? 1) === 1;
     const evidence = await readTranscriptEvidence(this.control, turn.job.id, {
       signal: this.lifetime.signal,
@@ -548,6 +619,15 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       responses: evidence.responses ?? [],
       toolError: evidence.error,
     };
+    if (!complete && turn.job.settlement.state === "completed" && state.tools.length) {
+      state.partialToolBoundaries = await readPartialToolBoundaries(
+        this.control,
+        turn.job.id,
+        state.tools,
+        outputs,
+        this.lifetime.signal,
+      );
+    }
     if (turn.job.settlement.state === "unknown") {
       const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
       if (!isCurrent()) return null;
@@ -667,6 +747,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             turn.tools,
             turn.job.previous === null,
             turn.responses,
+            partial,
+            turn.partialToolBoundaries,
           );
       return [
         ...(partial ? [] : boundary),
@@ -744,9 +826,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const entry: StreamEntry = { subscription: null, unsubscribeCatalog: null, stopped: false };
     let inFlight = false;
     let queued = false;
+    let catalogDirty = false;
+    let catalogTimer: ReturnType<typeof setTimeout> | undefined;
+    let needsReplay = false;
     let loadedContinuation = false;
     const finish = () => {
       entry.stopped = true;
+      if (catalogTimer !== undefined) clearTimeout(catalogTimer);
       entry.unsubscribeCatalog?.();
       entry.subscription?.close();
       if (this.streams.get(jobId) === entry) this.streams.delete(jobId);
@@ -759,18 +845,28 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       }
       void tick();
     };
+    const scheduleCatalogTick = () => {
+      catalogDirty = true;
+      if (entry.stopped || this.disposed || inFlight || catalogTimer !== undefined) return;
+      catalogTimer = setTimeout(() => {
+        catalogTimer = undefined;
+        if (inFlight) return;
+        catalogDirty = false;
+        requestTick();
+      }, CATALOG_REFRESH_DELAY_MS);
+    };
     const tick = async () => {
       if (inFlight || entry.stopped || this.disposed) return;
       inFlight = true;
       try {
-        const [details, evidence] = await Promise.all([
-          this.control.readJobDetails(jobId, this.lifetime.signal),
-          readTranscriptEvidence(this.control, jobId, {
-            signal: this.lifetime.signal,
-            previous: turn.responses,
-            readReplies: (turn.outputs[0]?.seq ?? 1) === 1,
-          }),
-        ]);
+        const details = await this.control.readJobDetails(jobId, this.lifetime.signal);
+        const readReplies = (turn.outputs[0]?.seq ?? 1) === 1;
+        const evidence = await readTranscriptEvidence(this.control, jobId, {
+          signal: this.lifetime.signal,
+          previous: turn.responses,
+          settled: readReplies && details.settlement.state !== "unsettled",
+          readReplies,
+        });
         if (entry.stopped || this.disposed) return;
         if (turn.job.conversation) {
           const page = await this.control.readConversationTurns(
@@ -792,24 +888,36 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         turn.details = details;
         turn.unknownReason = details.unknown_reason;
         const last = turn.outputs.at(-1)?.seq ?? 0;
-        if (details.activity.last_output_seq > last) {
-          const window = await readOutputWindow(this.control, jobId, {
-            limit: turn.outputWindow ?? 200,
-            signal: this.lifetime.signal,
-          });
-          if (entry.stopped || this.disposed) return;
-          const outputs = new Map(
-            [...turn.outputs, ...window.outputs].map((output) => [output.seq, output]),
+        const through = Math.max(details.activity.last_output_seq, details.result?.seq ?? 0);
+        if (through > last) {
+          const missing = await readMissingOutputs(
+            this.control,
+            jobId,
+            last,
+            through,
+            this.lifetime.signal,
           );
-          turn.outputs = [...outputs.values()]
-            .sort((a, b) => a.seq - b.seq)
-            .slice(-(turn.outputWindow ?? 200));
+          if (entry.stopped || this.disposed) return;
+          turn.outputs = mergeOutputs(turn.outputs, missing);
         }
-        if (details.result && (turn.outputs.at(-1)?.seq ?? 0) < details.result.seq)
-          turn.outputs = [...turn.outputs, details.result].slice(-(turn.outputWindow ?? 200));
         turn.tools = evidence.tools ?? turn.tools;
-        turn.responses =
-          (turn.outputs[0]?.seq ?? 1) === 1 ? (evidence.responses ?? turn.responses) : [];
+        if (readReplies && (turn.outputs[0]?.seq ?? 1) === 1)
+          turn.responses = evidence.responses ?? turn.responses;
+        if (
+          (turn.outputs[0]?.seq ?? 1) > 1 &&
+          details.settlement.state === "completed" &&
+          turn.tools.length &&
+          turn.partialToolBoundaries === undefined
+        ) {
+          turn.partialToolBoundaries = await readPartialToolBoundaries(
+            this.control,
+            jobId,
+            turn.tools,
+            turn.outputs,
+            this.lifetime.signal,
+          );
+          if (entry.stopped || this.disposed) return;
+        }
         turn.toolError = evidence.error;
         turn.error = undefined;
         this.publish(turn.sessionId);
@@ -817,8 +925,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           loadedContinuation = true;
           await this.openConversation(details.task_plan.continuation);
         }
-        if (turn.job.settlement.state !== "unsettled" && !taskPlanActive(details.task_plan)) {
+        if (details.settlement.state !== "unsettled" && !taskPlanActive(details.task_plan)) {
           finish();
+        } else if (needsReplay) {
+          needsReplay = false;
+          connect();
         }
       } catch (error) {
         if (!this.disposed && !entry.stopped) {
@@ -830,51 +941,62 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         if (queued) {
           queued = false;
           requestTick();
-        }
+        } else if (catalogDirty || needsReplay) scheduleCatalogTick();
       }
     };
     this.streams.set(jobId, entry);
-    entry.subscription = this.control.subscribeJobEvents(
-      jobId,
-      (event) => {
-        if (this.disposed || entry.stopped) return;
-        if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
-        if (event.type === "output" && event.output.seq > (turn.outputs.at(-1)?.seq ?? 0)) {
-          turn.outputs = [...turn.outputs, event.output].slice(-(turn.outputWindow ?? 200));
-          if ((turn.outputs[0]?.seq ?? 1) > 1) turn.responses = [];
-        }
-        if (event.type === "settlement") {
-          turn.job = {
-            ...turn.job,
-            settlement: event.settlement,
-            stop_confirmed_at_us: event.stop_confirmed_at_us,
-          };
-        }
-        if (event.type === "stream_error")
-          turn.error = `${event.error.code}: ${event.error.message}`;
-        this.publish(turn.sessionId);
-        requestTick();
-      },
-      {
-        signal: this.lifetime.signal,
-        afterSeq: turn.outputs.at(-1)?.seq ?? 0,
-        onReconnect: (error) => {
-          turn.error = `Reconnecting: ${error.code}`;
+    const connect = () => {
+      const subscription = this.control.subscribeJobEvents(
+        jobId,
+        (event) => {
+          if (this.disposed || entry.stopped) return;
+          if (event.type === "heartbeat") return;
+          if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
+          if (event.type === "output" && event.output.seq > (turn.outputs.at(-1)?.seq ?? 0)) {
+            if (event.output.seq !== (turn.outputs.at(-1)?.seq ?? 0) + 1)
+              throw new ContractError("output.seq", "the next stored sequence without a gap");
+            turn.outputs = [...turn.outputs, event.output];
+          }
+          if (event.type === "settlement") {
+            turn.job = {
+              ...turn.job,
+              settlement: event.settlement,
+              stop_confirmed_at_us: event.stop_confirmed_at_us,
+            };
+          }
+          if (event.type === "stream_error")
+            turn.error = `${event.error.code}: ${event.error.message}`;
           this.publish(turn.sessionId);
+          if (event.type !== "output") requestTick();
         },
-      },
-    );
-    entry.unsubscribeCatalog = this.control.subscribeCatalog(requestTick, (error) => {
+        {
+          signal: this.lifetime.signal,
+          afterSeq: turn.outputs.at(-1)?.seq ?? 0,
+          onReconnect: (error) => {
+            turn.error = `Reconnecting: ${error.code}`;
+            this.publish(turn.sessionId);
+            requestTick();
+          },
+        },
+      );
+      entry.subscription = subscription;
+      void subscription.closed.then(requestTick).catch((error) => {
+        if (this.disposed || entry.stopped) return;
+        turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Recovering stored status.`;
+        this.publish(turn.sessionId);
+        if (error instanceof ContractError && error.path === "output.seq") {
+          needsReplay = true;
+          scheduleCatalogTick();
+        }
+      });
+    };
+    connect();
+    entry.unsubscribeCatalog = this.control.subscribeCatalog(scheduleCatalogTick, (error) => {
       if (this.disposed || entry.stopped) return;
       turn.error = `Catalog subscription unavailable: ${error instanceof Error ? error.message : String(error)}`;
       this.publish(turn.sessionId);
     });
     void tick();
-    void entry.subscription.closed.then(requestTick).catch((error) => {
-      if (this.disposed || entry.stopped) return;
-      turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Recovering stored status.`;
-      this.publish(turn.sessionId);
-    });
   }
 
   override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
@@ -991,9 +1113,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.control.readJobInput(job),
       readOutputWindow(this.control, job, { signal: this.lifetime.signal }),
     ]);
+    let outputs = window.outputs;
+    if (previous?.outputs.length && outputs.length) {
+      const gap = await readMissingOutputs(
+        this.control,
+        job,
+        previous.outputs.at(-1)?.seq ?? 0,
+        outputs[0].seq - 1,
+        this.lifetime.signal,
+      );
+      outputs = mergeOutputs(previous.outputs, gap, outputs);
+    }
     const evidence = await readTranscriptEvidence(this.control, job, {
       signal: this.lifetime.signal,
-      readReplies: (window.outputs[0]?.seq ?? 1) === 1,
+      readReplies: (outputs[0]?.seq ?? 1) === 1,
     });
     const page = record.conversation
       ? await this.control.readConversationTurns(
@@ -1010,12 +1143,25 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       sessionId,
       job: record,
       input: stored?.input ?? frozen,
-      outputs: window.outputs,
+      outputs,
       tools: evidence.tools ?? [],
       responses: evidence.responses ?? [],
       toolError: evidence.error,
       unknownReason: record.unknown_reason ?? null,
     };
+    if (
+      (outputs[0]?.seq ?? 1) > 1 &&
+      record.settlement.state === "completed" &&
+      turn.tools.length
+    ) {
+      turn.partialToolBoundaries = await readPartialToolBoundaries(
+        this.control,
+        job,
+        turn.tools,
+        outputs,
+        this.lifetime.signal,
+      );
+    }
     if (!this.getSnapshot().sessions.some((s) => s.id === sessionId)) return;
     const current = this.turns.get(job);
     if (current && !this.historyTurnIsCurrent({ state: turn, previous, snapshot })) {
