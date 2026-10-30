@@ -916,6 +916,32 @@ pub(in crate::system) async fn run_started_provider_job(
         Some(conversation) => database.approved_calls(conversation).await?,
         None => Vec::new(),
     };
+    let replay_tools = if !dispatch
+        && approved
+            .iter()
+            .any(|record| super::job_tools::NAMES.contains(&record.name.as_str()))
+        && !summarizing
+        && job_scope.is_none()
+        && job_record.kind.is_persistent()
+        && configuration
+            .frozen
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.manages_jobs())
+        && configuration
+            .frozen
+            .llm
+            .config
+            .declared_capabilities
+            .contains(&crate::db::entities::ModelCapability::Tools)
+    {
+        Some(
+            super::job_tools::add(plan.tools.clone(), true, false)
+                .map_err(ExecutionRuntimeError::ToolsUnavailable)?,
+        )
+    } else {
+        None
+    };
     let context_limits = ContextLimits::for_profile(&configuration.frozen.llm.config);
     let mut prior_attachments = Vec::new();
     let mut prior_turns = Vec::new();
@@ -1169,6 +1195,7 @@ pub(in crate::system) async fn run_started_provider_job(
         },
         conversation,
         plan.tools.as_ref(),
+        replay_tools.as_ref(),
         &approved,
         planning,
         incomplete_jobs,
@@ -1548,6 +1575,7 @@ async fn run_provider_job_inner(
     run: ProviderRun,
     mut conversation: ChatConversation,
     tools: Option<&ToolExecution>,
+    replay_tools: Option<&ToolExecution>,
     approved: &[crate::db::entities::ToolEvidenceRecord],
     mut planning: bool,
     incomplete_jobs: bool,
@@ -1617,7 +1645,7 @@ async fn run_provider_job_inner(
             request: RequestNumber::FIRST,
         };
         let answers = match answer_calls(
-            tools.unwrap_or(&empty_tools),
+            replay_tools.or(tools).unwrap_or(&empty_tools),
             &site,
             &conversation,
             &calls,
