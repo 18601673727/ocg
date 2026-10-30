@@ -1,7 +1,7 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { TaskStatus } from "./task-status";
@@ -141,10 +141,14 @@ export function JobWatch(props: {
     job: ControlJob | null,
   ) => void;
 }) {
-  // Retry re-runs the whole load (record, stored history, stream) from scratch.
+  // Retry or switching Jobs re-runs the whole load (record, stored history, stream) from scratch.
   const [attempt, setAttempt] = useState(0);
   return (
-    <JobWatchBody key={attempt} {...props} onRetry={() => setAttempt((current) => current + 1)} />
+    <JobWatchBody
+      key={`${props.jobId}:${attempt}`}
+      {...props}
+      onRetry={() => setAttempt((current) => current + 1)}
+    />
   );
 }
 
@@ -199,6 +203,70 @@ function JobWatchBody({
   // unknown reason is refreshed on whichever arrives first, at most once
   // per watched Job.
   const unknownReasonRefreshed = useRef(false);
+  const reloadRef = useRef<() => void>(() => {});
+  const watchRef = useRef({
+    epoch: 0,
+    evidenceRevision: 0,
+    processed: 0,
+    historyComplete: false,
+    completed: false,
+    reconciled: false,
+    replies: [] as ControlProviderResponse[],
+  });
+
+  const applyEvidence = useCallback(
+    (
+      requestEpoch: number,
+      baseRevision: number,
+      completeWindow: boolean,
+      settled: boolean,
+      evidence: {
+        tools: ControlToolCall[] | null;
+        responses: ControlProviderResponse[] | null;
+        error: string | undefined;
+      },
+    ): boolean => {
+      const watch = watchRef.current;
+      if (watch.epoch !== requestEpoch || watch.evidenceRevision !== baseRevision) return false;
+      const windowCompleteNow = watch.historyComplete && watch.processed <= windowRef.current;
+      if (!completeWindow && windowCompleteNow) return false;
+      watch.evidenceRevision++;
+      if (settled) watch.reconciled = true;
+      if (evidence.tools) setTools(evidence.tools);
+      if (completeWindow && windowCompleteNow) {
+        watch.replies = evidence.responses ?? watch.replies;
+      } else {
+        watch.replies = [];
+      }
+      setResponses(watch.replies);
+      setEvidenceFailure(evidence.error);
+      return true;
+    },
+    [],
+  );
+
+  const applyEvidenceError = useCallback(
+    (
+      requestEpoch: number,
+      baseRevision: number,
+      completeWindow: boolean,
+      settled: boolean,
+      error: unknown,
+    ): boolean => {
+      const watch = watchRef.current;
+      if (watch.epoch !== requestEpoch || watch.evidenceRevision !== baseRevision) return false;
+      if (!completeWindow && watch.historyComplete && watch.processed <= windowRef.current)
+        return false;
+      watch.evidenceRevision++;
+      if (settled) watch.reconciled = true;
+      setEvidenceFailure(
+        `Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return true;
+    },
+    [],
+  );
+
   useEffect(
     () => () => {
       earlierLoad.current?.abort();
@@ -220,13 +288,17 @@ function JobWatchBody({
     let subscription: JobStreamSubscription | null = null;
     // The application consumes each stored output once: everything the
     // page reads and everything the stream replays passes this cursor.
-    let processed = 0;
-    let historyComplete = false;
-    let replies: ControlProviderResponse[] = [];
+    const watch = watchRef.current;
+    const epoch = ++watch.epoch;
+    watch.evidenceRevision++;
+    watch.processed = 0;
+    watch.historyComplete = false;
+    watch.completed = false;
+    watch.reconciled = false;
+    watch.replies = [];
+    windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
     let currentJob: ControlJob | null = null;
     let refreshingStatus = false;
-    let completed = false;
-    let reconciled = false;
     const evidenceController = new AbortController();
 
     // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
@@ -241,46 +313,42 @@ function JobWatchBody({
     let reloadQueued = false;
 
     const requestReload = () => {
-      if (!alive) return;
+      if (!alive || watch.epoch !== epoch) return;
       if (reloading) {
         reloadQueued = true;
         return;
       }
       reloading = true;
-      const completeWindow = historyComplete && processed <= windowRef.current;
-      const catchUp = completeWindow && completed && !reconciled;
-      if (catchUp) reconciled = true;
+      const baseRevision = watch.evidenceRevision;
+      const completeWindow = watch.historyComplete && watch.processed <= windowRef.current;
+      const catchUp = completeWindow && watch.completed && !watch.reconciled;
       readTranscriptEvidence(client, jobId, {
         signal: evidenceController.signal,
-        previous: completeWindow ? replies : [],
+        previous: completeWindow ? watch.replies : [],
         settled: catchUp,
         readReplies: completeWindow,
       })
         .then(
           (evidence) => {
             if (!alive) return;
-            if (evidence.tools) setTools(evidence.tools);
-            if (completeWindow && processed <= windowRef.current)
-              replies = evidence.responses ?? replies;
-            else replies = [];
-            setResponses(replies);
-            setEvidenceFailure(evidence.error);
+            if (!applyEvidence(epoch, baseRevision, completeWindow, catchUp, evidence))
+              reloadQueued = true;
           },
           (error) => {
-            if (alive && !evidenceController.signal.aborted)
-              setEvidenceFailure(
-                `Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`,
-              );
+            if (!alive || evidenceController.signal.aborted) return;
+            if (!applyEvidenceError(epoch, baseRevision, completeWindow, catchUp, error))
+              reloadQueued = true;
           },
         )
         .finally(() => {
           reloading = false;
-          if (reloadQueued && alive) {
+          if (reloadQueued && alive && watch.epoch === epoch) {
             reloadQueued = false;
             requestReload();
           }
         });
     };
+    reloadRef.current = requestReload;
 
     const refreshStatus = async () => {
       if (!alive || refreshingStatus) return;
@@ -293,14 +361,14 @@ function JobWatchBody({
         setDetails(record);
         setStatusFailure(false);
         setUnknownReason(record.unknown_reason);
-        completed = currentJob.settlement.state === "completed";
-        if (record.activity.last_output_seq > processed) {
+        watch.completed = currentJob.settlement.state === "completed";
+        if (record.activity.last_output_seq > watch.processed) {
           const window = await readOutputWindow(client, jobId, {
             signal: evidenceController.signal,
           });
           if (!alive) return;
-          processed = Math.max(processed, window.latestSeq);
-          setStoredTotal(processed);
+          watch.processed = Math.max(watch.processed, window.latestSeq);
+          setStoredTotal(watch.processed);
           setOutputs((existing) => mergeOutputWindow(existing, window.outputs, windowRef.current));
         }
         if (currentJob.settlement.state !== "unsettled") {
@@ -340,7 +408,7 @@ function JobWatchBody({
       if (event.type === "job") {
         currentJob = currentJob ? reconcileJob(currentJob, event.job) : event.job;
         setJob(currentJob);
-        completed = currentJob.settlement.state === "completed";
+        watch.completed = currentJob.settlement.state === "completed";
         if (currentJob !== event.job) return;
         if (event.job.settlement.state !== "unsettled") {
           setSettlement({
@@ -354,14 +422,14 @@ function JobWatchBody({
             refreshUnknownReasonOnce();
         }
       } else if (event.type === "output") {
-        if (event.output.seq <= processed) return;
-        processed = event.output.seq;
+        if (event.output.seq <= watch.processed) return;
+        watch.processed = event.output.seq;
         setStoredTotal(event.output.seq);
         const incoming = event.output;
         setOutputs((existing) => mergeOutputWindow(existing, [incoming], windowRef.current));
         requestReload();
       } else if (event.type === "settlement") {
-        completed = event.settlement.state === "completed";
+        watch.completed = event.settlement.state === "completed";
         setSettlement({
           state: event.settlement.state,
           settled_at_us: event.settlement.settled_at_us,
@@ -395,7 +463,7 @@ function JobWatchBody({
         currentJob = record;
         setJob(record);
         setDetails(record);
-        completed = record.settlement.state === "completed";
+        watch.completed = record.settlement.state === "completed";
         setUnknownReason(record.unknown_reason ?? null);
         // The record is the Job's own truth, whether or not the stream ever connects.
         if (record.settlement.state !== "unsettled") {
@@ -425,18 +493,18 @@ function JobWatchBody({
       try {
         const window = await readOutputWindow(client, jobId, { signal: evidenceController.signal });
         if (!alive) return;
-        processed = window.latestSeq;
-        setStoredTotal(processed);
+        watch.processed = window.latestSeq;
+        setStoredTotal(watch.processed);
         setOutputs(window.outputs);
       } catch (error) {
         if (alive) fail(error, "read");
         return;
       }
-      historyComplete = true;
+      watch.historyComplete = true;
       requestReload();
       try {
         subscription = client.subscribeJobEvents(jobId, listener, {
-          afterSeq: processed,
+          afterSeq: watch.processed,
           onReconnect: () => {
             if (alive) setStream("reconnecting");
           },
@@ -471,11 +539,12 @@ function JobWatchBody({
 
     return () => {
       alive = false;
+      if (reloadRef.current === requestReload) reloadRef.current = () => {};
       unsubscribeCatalog();
       subscription?.close();
       evidenceController.abort();
     };
-  }, [client, jobId]);
+  }, [client, jobId, applyEvidence, applyEvidenceError]);
 
   async function requestStop() {
     setStopBusy(true);
@@ -511,6 +580,8 @@ function JobWatchBody({
     if (earlierLoad.current) return;
     const controller = new AbortController();
     earlierLoad.current = controller;
+    const watch = watchRef.current;
+    const requestEpoch = watch.epoch;
     const nextWindow = windowRef.current + JOB_WATCH_WINDOW_STEP;
     setLoadingEarlier(true);
     setEarlierFailure(null);
@@ -520,19 +591,48 @@ function JobWatchBody({
         limit: JOB_WATCH_WINDOW_STEP,
         signal: controller.signal,
       });
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted || watch.epoch !== requestEpoch) return;
       windowRef.current = nextWindow;
       const incoming = walked;
       setOutputs((existing) => mergeOutputWindow([...outputs, ...existing], incoming, nextWindow));
-      if ((walked[0]?.seq ?? outputs[0]?.seq) === 1) {
-        const evidence = await readTranscriptEvidence(client, jobId, { signal: controller.signal });
-        if (!controller.signal.aborted) {
-          setResponses(evidence.responses ?? []);
-          setEvidenceFailure(evidence.error);
+      if ((walked[0]?.seq ?? outputs[0]?.seq) === 1 && watch.processed <= windowRef.current) {
+        const baseRevision = watch.evidenceRevision;
+        const completeWindow = watch.historyComplete && watch.processed <= windowRef.current;
+        const catchUp = completeWindow && watch.completed && !watch.reconciled;
+        let applied = false;
+        try {
+          const evidence = await readTranscriptEvidence(client, jobId, {
+            signal: controller.signal,
+            previous: completeWindow ? watch.replies : [],
+            settled: catchUp,
+            readReplies: completeWindow,
+          });
+          if (!controller.signal.aborted) {
+            applied = applyEvidence(requestEpoch, baseRevision, completeWindow, catchUp, evidence);
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) {
+            applied = applyEvidenceError(
+              requestEpoch,
+              baseRevision,
+              completeWindow,
+              catchUp,
+              error,
+            );
+          }
+        }
+        if (
+          !controller.signal.aborted &&
+          watch.epoch === requestEpoch &&
+          !applied &&
+          watch.completed &&
+          !watch.reconciled
+        ) {
+          reloadRef.current();
         }
       }
     } catch (error) {
-      if (!controller.signal.aborted) {
+      if (!controller.signal.aborted && watch.epoch === requestEpoch) {
         setEarlierFailure({
           code:
             error instanceof ControlTransportError
@@ -546,6 +646,8 @@ function JobWatchBody({
     } finally {
       if (earlierLoad.current === controller) {
         earlierLoad.current = null;
+        setLoadingEarlier(false);
+      } else if (earlierLoad.current === null) {
         setLoadingEarlier(false);
       }
     }
