@@ -77,7 +77,7 @@ pub(crate) async fn list_models(
                 };
                 (status, body)
             };
-            for model in parse_models(status, &body, credential)? {
+            for model in parse_models(status, &body, credential, protocol)? {
                 models.insert(model.id.clone(), model);
             }
             let value =
@@ -117,6 +117,7 @@ fn parse_models(
     status: u16,
     body: &[u8],
     credential: Option<&str>,
+    protocol: crate::db::entities::LlmTransport,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
     if status == 404 {
         return Err(ModelListError::NotListed);
@@ -153,6 +154,18 @@ fn parse_models(
         .ok_or(ModelListError::NotListed)?;
     let mut models = BTreeMap::<String, ProviderModel>::new();
     for entry in entries {
+        if protocol == crate::db::entities::LlmTransport::QuiverSvg
+            && !entry
+                .get("supported_operations")
+                .and_then(Value::as_array)
+                .is_some_and(|operations| {
+                    operations
+                        .iter()
+                        .any(|operation| operation.as_str() == Some("svg_generate"))
+                })
+        {
+            continue;
+        }
         let Some(id) = entry
             .get("id")
             .and_then(Value::as_str)

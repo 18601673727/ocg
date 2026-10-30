@@ -37,10 +37,21 @@ impl RequestRecorder {
         let mut bodies = Vec::new();
         let mut pending = BTreeSet::new();
         let responses = body.get("input").is_some();
-        let messages = body
-            .get(if responses { "input" } else { "messages" })
-            .and_then(Value::as_array)
-            .ok_or_else(|| record_error("request has no messages"))?;
+        let quiver = body.get("prompt").is_some() && !responses && body.get("messages").is_none();
+        let mut quiver_messages = Vec::new();
+        if quiver {
+            if let Some(instructions) = body.get("instructions") {
+                quiver_messages.push(json!({"role":"system", "content":instructions}));
+            }
+            quiver_messages.push(json!({"role":"user", "content":body["prompt"]}));
+        }
+        let messages = if quiver {
+            &quiver_messages
+        } else {
+            body.get(if responses { "input" } else { "messages" })
+                .and_then(Value::as_array)
+                .ok_or_else(|| record_error("request has no messages"))?
+        };
         let input_len = messages.len();
         let mut grouped = Vec::new();
         let mut index = 0;
@@ -117,7 +128,10 @@ impl RequestRecorder {
                 .as_object()
                 .ok_or_else(|| record_error("request is not an object"))?
                 .iter()
-                .filter(|(key, _)| !matches!(key.as_str(), "messages" | "input" | "tools"))
+                .filter(|(key, _)| {
+                    !matches!(key.as_str(), "messages" | "input" | "tools")
+                        && !(quiver && matches!(key.as_str(), "prompt" | "instructions"))
+                })
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
             self.keep(&Value::Object(parameters), &mut bodies, &mut pending)?

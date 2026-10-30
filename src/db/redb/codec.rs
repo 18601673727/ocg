@@ -10,7 +10,7 @@ use crate::db::entities::{
 
 // ---- explicit versioned encoding ----------------------------------------------
 
-pub(super) const RECORD_VERSION: u8 = 14;
+pub(super) const RECORD_VERSION: u8 = 15;
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
 pub(super) const TAG_JOB_STATE: u8 = 3;
@@ -749,7 +749,7 @@ pub(super) trait Code: Sized + Copy {
 codes!(OutputKind { OutputKind::Progress = 1, OutputKind::Evaluation = 2, OutputKind::Result = 3, OutputKind::Reasoning = 4, OutputKind::Decision = 5, OutputKind::Summarization = 6 });
 codes!(DependencyCondition { DependencyCondition::Success = 1, DependencyCondition::Settled = 2 });
 codes!(ModelCapability { ModelCapability::Chat = 1, ModelCapability::Tools = 2, ModelCapability::Vision = 3, ModelCapability::Reasoning = 4 });
-codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2, LlmTransport::AnthropicMessages = 3 });
+codes!(LlmTransport { LlmTransport::OpenAiChatCompletions = 1, LlmTransport::OpenAiResponses = 2, LlmTransport::AnthropicMessages = 3, LlmTransport::QuiverSvg = 4 });
 codes!(ExecutionOperation { ExecutionOperation::LlmRequest = 1, ExecutionOperation::Decision = 2 });
 codes!(ChatFinishReason {
     ChatFinishReason::Stop = 1, ChatFinishReason::Length = 2, ChatFinishReason::ToolCalls = 3,

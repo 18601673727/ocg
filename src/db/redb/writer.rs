@@ -1187,7 +1187,7 @@ impl Batch {
                 let (key, value) = entry?;
                 let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none() && matches!(&row.body, ConfigBody::Connection(body) if body.protocol == connection.protocol && body.credential_ref == connection.credential_ref && {
-                    let default = if body.protocol == LlmTransport::AnthropicMessages { "https://api.anthropic.com/v1" } else { "https://api.openai.com/v1" };
+                    let default = match body.protocol { LlmTransport::AnthropicMessages => "https://api.anthropic.com/v1", LlmTransport::QuiverSvg => "https://api.quiver.ai/v1", LlmTransport::OpenAiChatCompletions | LlmTransport::OpenAiResponses => "https://api.openai.com/v1" };
                     body.endpoint.as_deref().unwrap_or(default).trim_end_matches('/') == connection.endpoint.as_deref().unwrap_or(default).trim_end_matches('/')
                 }) {
                     connections.insert(row.id);

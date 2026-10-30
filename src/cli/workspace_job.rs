@@ -165,7 +165,7 @@ pub enum Error {
     #[error("{ENDPOINT_VARIABLE} must be an https:// URL")]
     NotHttps,
     #[error(
-        "OCG_PROVIDER_PROTOCOL must be openai_chat_completions, openai_responses or anthropic_messages"
+        "OCG_PROVIDER_PROTOCOL must be openai_chat_completions, openai_responses, anthropic_messages or quiver_svg"
     )]
     InvalidProtocol,
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]

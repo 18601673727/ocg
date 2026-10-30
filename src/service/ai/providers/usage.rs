@@ -86,6 +86,19 @@ pub(crate) fn reported_responses_usage(event: &Value) -> Option<ReportedUsage> {
     })
 }
 
+pub(crate) fn reported_quiver_usage(event: &Value) -> Option<ReportedUsage> {
+    let value = event.get("usage").filter(|value| value.is_object())?;
+    Some(ReportedUsage {
+        usage: NormalizedUsage {
+            input_tokens: counter(value.get("input_tokens")),
+            output_tokens: counter(value.get("output_tokens")),
+            raw: Some(value.clone()),
+            ..NormalizedUsage::default()
+        },
+        finality: UsageFinality::Final,
+    })
+}
+
 /// Hands each usage object a stream reports to the sink as it is parsed. It
 /// keeps no history, no count and no merged total: the only state is the last
 /// cumulative object, to skip an identical repeat, and the clock. Memory is

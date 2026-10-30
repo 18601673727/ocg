@@ -872,6 +872,7 @@ fn build_profiles_page(
                     LlmTransport::OpenAiChatCompletions,
                     LlmTransport::OpenAiResponses,
                     LlmTransport::AnthropicMessages,
+                    LlmTransport::QuiverSvg,
                 ]
                 .into_iter()
                 .filter(|protocol| {

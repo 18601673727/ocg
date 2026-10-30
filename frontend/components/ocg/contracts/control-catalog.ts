@@ -21,7 +21,11 @@ export type ControlAgentProfile = Omit<Api.AgentProfile, "llm_targets"> & {
 export type ControlAgentProfiles = Omit<Api.AgentProfiles, "agent_profiles"> & {
   agent_profiles: ControlAgentProfile[];
 };
-type Protocol = "openai_chat_completions" | "openai_responses" | "anthropic_messages";
+type Protocol =
+  | "openai_chat_completions"
+  | "openai_responses"
+  | "anthropic_messages"
+  | "quiver_svg";
 export type ControlProfilesSnapshot = Omit<
   Api.Profiles,
   | "profile_id"

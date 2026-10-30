@@ -2163,6 +2163,9 @@ impl Batch {
             return Ok(());
         }
         let (mut frozen, _, _) = self.job_execution(turn)?;
+        if frozen.llm.provider.transport == LlmTransport::QuiverSvg {
+            return Ok(());
+        }
         for id in [frozen.llm.model.id, frozen.llm.provider.id.into()] {
             if self.config(id)?.is_none_or(|row| row.archived_at.is_some()) {
                 return Ok(());
@@ -2210,7 +2213,7 @@ impl Batch {
             max_tokens: Some(match frozen.llm.provider.transport {
                 LlmTransport::OpenAiChatCompletions => 256,
                 LlmTransport::OpenAiResponses => 4096,
-                LlmTransport::AnthropicMessages => 256,
+                LlmTransport::AnthropicMessages | LlmTransport::QuiverSvg => 256,
             }),
             ..Default::default()
         };
@@ -2248,9 +2251,9 @@ impl Batch {
                 }),
                 strict: Some(true),
             },
-            LlmTransport::OpenAiChatCompletions | LlmTransport::OpenAiResponses => {
-                ResponseFormat::JsonObject
-            }
+            LlmTransport::OpenAiChatCompletions
+            | LlmTransport::OpenAiResponses
+            | LlmTransport::QuiverSvg => ResponseFormat::JsonObject,
         };
         self.append_named(
             conversation,

@@ -110,7 +110,11 @@ export type ControlProfileWriteRequest =
       name: string;
       model: string;
       context_window?: number | null;
-      protocol?: "openai_chat_completions" | "openai_responses" | "anthropic_messages";
+      protocol?:
+        | "openai_chat_completions"
+        | "openai_responses"
+        | "anthropic_messages"
+        | "quiver_svg";
       endpoint?: string | null;
       credential_ref?: string | null;
       credential?: string | null;
@@ -1739,7 +1743,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     async discoverProviderModels(
       connection: {
-        protocol?: "openai_chat_completions" | "openai_responses" | "anthropic_messages";
+        protocol?:
+          | "openai_chat_completions"
+          | "openai_responses"
+          | "anthropic_messages"
+          | "quiver_svg";
         endpoint: string;
         credential_ref?: string | null;
         credential?: string;
@@ -1760,7 +1768,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       source:
         | string
         | {
-            protocol?: "openai_chat_completions" | "openai_responses" | "anthropic_messages";
+            protocol?:
+              | "openai_chat_completions"
+              | "openai_responses"
+              | "anthropic_messages"
+              | "quiver_svg";
             name: string;
             endpoint: string;
             credential?: string;

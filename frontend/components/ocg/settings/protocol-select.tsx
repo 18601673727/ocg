@@ -9,7 +9,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-export type LlmProtocol = "openai_chat_completions" | "openai_responses" | "anthropic_messages";
+export type LlmProtocol =
+  | "openai_chat_completions"
+  | "openai_responses"
+  | "anthropic_messages"
+  | "quiver_svg";
 
 export function ProtocolSelect({
   value,
@@ -30,13 +34,15 @@ export function ProtocolSelect({
           { value: "openai_chat_completions", label: "OpenAI Chat Completions" },
           { value: "openai_responses", label: "OpenAI Responses" },
           { value: "anthropic_messages", label: "Anthropic Messages" },
+          { value: "quiver_svg", label: "Quiver SVG" },
         ]}
         disabled={disabled}
         onValueChange={(next) => {
           if (
             next === "openai_chat_completions" ||
             next === "openai_responses" ||
-            next === "anthropic_messages"
+            next === "anthropic_messages" ||
+            next === "quiver_svg"
           )
             onChange(next);
         }}
@@ -48,6 +54,7 @@ export function ProtocolSelect({
           <SelectItem value="openai_chat_completions">OpenAI Chat Completions</SelectItem>
           <SelectItem value="openai_responses">OpenAI Responses</SelectItem>
           <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
+          <SelectItem value="quiver_svg">Quiver SVG</SelectItem>
         </SelectContent>
       </Select>
     </label>

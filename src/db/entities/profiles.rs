@@ -22,6 +22,7 @@ pub enum LlmTransport {
     OpenAiChatCompletions,
     OpenAiResponses,
     AnthropicMessages,
+    QuiverSvg,
 }
 
 impl LlmTransport {
@@ -30,6 +31,7 @@ impl LlmTransport {
             Self::OpenAiChatCompletions => "openai_chat_completions",
             Self::OpenAiResponses => "openai_responses",
             Self::AnthropicMessages => "anthropic_messages",
+            Self::QuiverSvg => "quiver_svg",
         }
     }
 
@@ -38,6 +40,7 @@ impl LlmTransport {
             "openai_chat_completions" => Some(Self::OpenAiChatCompletions),
             "openai_responses" => Some(Self::OpenAiResponses),
             "anthropic_messages" => Some(Self::AnthropicMessages),
+            "quiver_svg" => Some(Self::QuiverSvg),
             _ => None,
         }
     }

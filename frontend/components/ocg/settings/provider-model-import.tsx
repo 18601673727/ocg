@@ -70,7 +70,9 @@ function ImportContent({
       : (provider?.endpoint ??
         (provider?.protocol === "anthropic_messages"
           ? "https://api.anthropic.com/v1"
-          : "https://api.openai.com/v1"));
+          : provider?.protocol === "quiver_svg"
+            ? "https://api.quiver.ai/v1"
+            : "https://api.openai.com/v1"));
   const protocol = sourceId === "new" ? newConnection?.protocol : provider?.protocol;
   const credentialRef = sourceId === "new" ? undefined : provider?.credential_ref;
   const credential = sourceId === "new" ? newConnection?.credential : undefined;

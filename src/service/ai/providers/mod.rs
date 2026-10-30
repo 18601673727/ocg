@@ -33,6 +33,7 @@ pub(crate) mod observe;
 pub mod openai_compatible;
 mod record;
 pub use record::{RequestRecorder, SentRequestState};
+pub(crate) mod quiver;
 pub(crate) mod responses;
 mod types;
 pub(crate) mod usage;
@@ -58,7 +59,8 @@ pub(crate) use usage::UsageCapture;
 pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, ProviderExecutionError> {
     let endpoint = endpoint.trim_end_matches('/');
     let base = endpoint
-        .strip_suffix("/chat/completions")
+        .strip_suffix("/svgs/generations")
+        .or_else(|| endpoint.strip_suffix("/chat/completions"))
         .or_else(|| endpoint.strip_suffix("/responses"))
         .or_else(|| endpoint.strip_suffix("/messages"))
         .or_else(|| endpoint.strip_suffix("/systemone"))

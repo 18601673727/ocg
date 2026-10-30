@@ -16,7 +16,7 @@ use super::providers::{
     CredentialResolver, MAX_PROVIDER_ERROR_BYTES, MAX_SSE_LINE_BYTES, OutputSinkError,
     ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
     ProviderObservation, ProviderOutputSink, ResponseFacts, UsageCapture, announce, anthropic,
-    endpoint, incomplete_tool_calls, openai_compatible, rejected_failure, responses,
+    endpoint, incomplete_tool_calls, openai_compatible, quiver, rejected_failure, responses,
     unannounced_fact,
 };
 use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters};
@@ -218,16 +218,19 @@ async fn exchange(
         })?;
     let provider = &frozen.llm.provider;
     let anthropic = config.transport == crate::db::entities::LlmTransport::AnthropicMessages;
+    let default_endpoint = match config.transport {
+        crate::db::entities::LlmTransport::AnthropicMessages => anthropic::DEFAULT_ENDPOINT,
+        crate::db::entities::LlmTransport::QuiverSvg => quiver::DEFAULT_ENDPOINT,
+        crate::db::entities::LlmTransport::OpenAiChatCompletions
+        | crate::db::entities::LlmTransport::OpenAiResponses => openai_compatible::DEFAULT_ENDPOINT,
+    };
     let endpoint = endpoint(
-        provider.endpoint.as_deref().unwrap_or(if anthropic {
-            anthropic::DEFAULT_ENDPOINT
-        } else {
-            openai_compatible::DEFAULT_ENDPOINT
-        }),
+        provider.endpoint.as_deref().unwrap_or(default_endpoint),
         match config.transport {
             crate::db::entities::LlmTransport::OpenAiChatCompletions => "chat/completions",
             crate::db::entities::LlmTransport::OpenAiResponses => "responses",
             crate::db::entities::LlmTransport::AnthropicMessages => "messages",
+            crate::db::entities::LlmTransport::QuiverSvg => "svgs/generations",
         },
     )?;
 
@@ -252,6 +255,7 @@ async fn exchange(
         conversation,
     )?;
     let body = match config.transport {
+        crate::db::entities::LlmTransport::QuiverSvg => quiver::request_body(&chat_body)?,
         crate::db::entities::LlmTransport::OpenAiChatCompletions => chat_body,
         crate::db::entities::LlmTransport::AnthropicMessages => {
             anthropic::request_body(chat_body, conversation)?
@@ -275,7 +279,14 @@ async fn exchange(
     let request = client
         .post(endpoint)
         .set_header(CONTENT_TYPE, "application/json")
-        .set_header(ACCEPT, "text/event-stream")
+        .set_header(
+            ACCEPT,
+            if config.transport == crate::db::entities::LlmTransport::QuiverSvg {
+                "application/json"
+            } else {
+                "text/event-stream"
+            },
+        )
         .set_header("Cache-Control", "no-cache")
         .if_some(session, |session, request| {
             request.set_header("x-opencode-session", session)
@@ -376,6 +387,125 @@ async fn exchange(
         });
     }
 
+    if config.transport == crate::db::entities::LlmTransport::QuiverSvg {
+        let head_elapsed = started.elapsed();
+        let body = match select(
+            config.cancellation.cancelled(),
+            ntex::time::timeout(
+                config.timeout,
+                bounded_body(
+                    response,
+                    config
+                        .max_output_bytes
+                        .saturating_mul(6)
+                        .saturating_add(65536),
+                ),
+            ),
+        )
+        .await
+        {
+            Either::Left(()) => {
+                return Err(local_stop(
+                    "provider execution was cancelled while reading the response",
+                    status,
+                    None,
+                    None,
+                ));
+            }
+            Either::Right(Err(())) => {
+                return Err(ProviderExecutionError::Unknown {
+                    message: "provider response timed out".to_owned(),
+                    facts: Some(ResponseFacts {
+                        status_code: status,
+                        finish_reason: None,
+                        raw_finish_reason: None,
+                    }),
+                    finished: false,
+                });
+            }
+            Either::Right(Ok(body)) => body.ok_or_else(|| ProviderExecutionError::Incomplete {
+                message: "Quiver response could not be read or exceeded its limit".to_owned(),
+                facts: ResponseFacts {
+                    status_code: status,
+                    finish_reason: None,
+                    raw_finish_reason: None,
+                },
+            })?,
+        };
+        let value: Value =
+            serde_json::from_str(&body).map_err(|_| ProviderExecutionError::Incomplete {
+                message: "invalid Quiver JSON response".to_owned(),
+                facts: ResponseFacts {
+                    status_code: status,
+                    finish_reason: None,
+                    raw_finish_reason: None,
+                },
+            })?;
+        let mut capture = UsageCapture::default();
+        let usage = usage::reported_quiver_usage(&value);
+        if let Some(reported) = usage.clone() {
+            capture.record(borrow_output_sink(sink), reported).await;
+        }
+        let data = value
+            .get("data")
+            .and_then(Value::as_array)
+            .filter(|v| !v.is_empty() && v.len() <= 128)
+            .ok_or_else(|| ProviderExecutionError::Incomplete {
+                message: "Quiver response has no SVG documents".to_owned(),
+                facts: ResponseFacts {
+                    status_code: status,
+                    finish_reason: None,
+                    raw_finish_reason: None,
+                },
+            })?;
+        let mut text = String::new();
+        for document in data {
+            let svg = document
+                .get("svg")
+                .and_then(Value::as_str)
+                .filter(|svg| !svg.is_empty())
+                .filter(|_| {
+                    document.get("mime_type").and_then(Value::as_str) == Some("image/svg+xml")
+                })
+                .ok_or_else(|| ProviderExecutionError::Incomplete {
+                    message: "invalid Quiver SVG document".to_owned(),
+                    facts: ResponseFacts {
+                        status_code: status,
+                        finish_reason: None,
+                        raw_finish_reason: None,
+                    },
+                })?;
+            if text.len().saturating_add(svg.len()).saturating_add(16) > config.max_output_bytes {
+                return Err(local_stop(
+                    "provider output exceeded its limit",
+                    status,
+                    None,
+                    None,
+                ));
+            }
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str("```svg\n");
+            text.push_str(svg);
+            text.push_str("\n```");
+        }
+        let finished_in = started.elapsed();
+        return Ok(ProviderExecutionResult {
+            response_items: Vec::new(),
+            text,
+            reasoning: String::new(),
+            tool_calls: Vec::new(),
+            refused: Vec::new(),
+            usage: usage.map_or_else(NormalizedUsage::default, |usage| usage.usage),
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: Some("completed".to_owned()),
+            status_code: status,
+            request_id,
+            ttfb: head_elapsed,
+            finished_in,
+        });
+    }
     let payload = response.take_payload();
     read_response(
         payload,
