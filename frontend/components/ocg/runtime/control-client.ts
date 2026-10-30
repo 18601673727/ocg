@@ -370,6 +370,42 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   const profileListeners = new Set<() => void>();
   const conversationListeners = new Set<() => void>();
   let closed = false;
+  let locksUnavailable = false;
+  function browserLocks(): LockManager | undefined {
+    if (programmatic || locksUnavailable || typeof navigator === "undefined") return undefined;
+    try {
+      return navigator.locks;
+    } catch {
+      locksUnavailable = true;
+      return undefined;
+    }
+  }
+  let snapshotBusy = false;
+  const snapshotWaiters: Array<() => void> = [];
+  async function snapshotSlot(signal: AbortSignal): Promise<() => void> {
+    signal.throwIfAborted();
+    if (snapshotBusy) {
+      await new Promise<void>((resolve, reject) => {
+        const wake = () => {
+          signal.removeEventListener("abort", abort);
+          resolve();
+        };
+        const abort = () => {
+          const index = snapshotWaiters.indexOf(wake);
+          if (index >= 0) snapshotWaiters.splice(index, 1);
+          reject(signal.reason);
+        };
+        snapshotWaiters.push(wake);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    } else snapshotBusy = true;
+    return () => {
+      const next = snapshotWaiters.shift();
+      if (next) next();
+      else snapshotBusy = false;
+    };
+  }
 
   // Browsers share a small HTTP/1 connection pool across tabs. Rotate event
   // streams so ordinary requests can run even when several views are open.
@@ -550,11 +586,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     const controller = new AbortController();
     active.add(controller);
     const signal = controller.signal;
-    const locks = !programmatic && typeof navigator !== "undefined" ? navigator.locks : undefined;
     void (async () => {
       let delay = 250;
       const runAttempt = async (): Promise<{ keepGoing: boolean; wait: number }> => {
-        const attempt = streamAttempt(signal, !!locks);
+        const attempt = streamAttempt(signal, !programmatic);
         const remaining = initialTopics ? new Set(initialTopics) : null;
         const started = new Set<string>();
         let initialComplete = false;
@@ -563,7 +598,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         let progressTimer: ReturnType<typeof setTimeout> | undefined;
         let lineKind: "start" | "comment" | "event" = "start";
         const progress = () => {
-          if (!locks || (initialComplete && !observationReady)) return;
+          if (programmatic || (initialComplete && !observationReady)) return;
           if (progressTimer !== undefined) clearTimeout(progressTimer);
           progressTimer = setTimeout(() => {
             stalled = true;
@@ -709,9 +744,30 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         }
       };
       while (!signal.aborted) {
-        const outcome = locks
-          ? await locks.request("ocg-snapshot-stream", { signal }, runAttempt)
-          : await runAttempt();
+        const release = programmatic ? () => {} : await snapshotSlot(signal);
+        let outcome: { keepGoing: boolean; wait: number };
+        try {
+          signal.throwIfAborted();
+          const previouslyUnavailable = locksUnavailable;
+          const locks = browserLocks();
+          if (!previouslyUnavailable && locksUnavailable) restartSidebar();
+          if (locks) {
+            let entered = false;
+            try {
+              outcome = await locks.request("ocg-snapshot-stream", { signal }, () => {
+                entered = true;
+                return runAttempt();
+              });
+            } catch (error) {
+              if (signal.aborted || entered) throw error;
+              locksUnavailable = true;
+              restartSidebar();
+              outcome = await runAttempt();
+            }
+          } else outcome = await runAttempt();
+        } finally {
+          release();
+        }
         if (!outcome.keepGoing) break;
         await pause(outcome.wait, signal);
       }
@@ -738,6 +794,149 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   let restartPending = false;
   let latestProjects: Projects | undefined;
   let latestConversations: Conversations | undefined;
+
+  function subscribeCatalogInternal(receive: () => void, error: (error: unknown) => void) {
+    const observer = { receive, error };
+    catalogObservers.add(observer);
+    if (!stopCatalog && !closed) {
+      stopCatalog = subscribeSnapshots(
+        "/api/v1/catalog/events",
+        () => {
+          catalogReady = true;
+          catalogError = undefined;
+          catalogObservers.forEach((item) => item.receive());
+        },
+        (cause) => {
+          catalogReady = false;
+          catalogError = cause;
+          catalogObservers.forEach((item) => item.error(cause));
+        },
+      );
+    } else if (catalogReady || catalogError !== undefined) {
+      queueMicrotask(() => {
+        if (!catalogObservers.has(observer)) return;
+        if (catalogReady) observer.receive();
+        else if (catalogError !== undefined) observer.error(catalogError);
+      });
+    }
+    return () => {
+      catalogObservers.delete(observer);
+      if (!catalogObservers.size) {
+        stopCatalog?.();
+        stopCatalog = undefined;
+        catalogReady = false;
+        catalogError = undefined;
+      }
+    };
+  }
+
+  function finiteSidebar() {
+    const controller = new AbortController();
+    const signal = controller.signal;
+    let dirty = true;
+    let running = false;
+    let retryDelay = 750;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const report = (error: unknown) => {
+      sidebarObservers.forEach((observer) => observer.error(error));
+      projectObservers.forEach((observer) => observer.error(error));
+      childObservers.forEach((observers) =>
+        observers.forEach((_, observer) => observer.error(error)),
+      );
+    };
+    const advance = (before: string | undefined, next: string | null | undefined) => {
+      if (!next || (before !== undefined && next >= before))
+        throw new ContractError("next_before", "an advancing sidebar cursor");
+      return next;
+    };
+    const schedule = (delay = 750) => {
+      if (signal.aborted || running || timer !== undefined) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        void refresh();
+      }, delay);
+    };
+    const refresh = async () => {
+      if (signal.aborted || running || !dirty) return;
+      running = true;
+      dirty = false;
+      let delay = 750;
+      try {
+        let before: string | undefined;
+        let projects: Projects["projects"] = [];
+        for (;;) {
+          const page = await readProjectPage({ before, limit: 100, signal });
+          projects = [...projects, ...page.projects];
+          if (!page.has_more) {
+            if (signal.aborted) return;
+            latestProjects = { ...page, projects };
+            projectObservers.forEach((observer) => observer.receive(latestProjects!));
+            break;
+          }
+          before = advance(before, page.next_before);
+        }
+        before = undefined;
+        let conversations: Conversations["conversations"] = [];
+        for (;;) {
+          const query = `?limit=100${before ? `&before=${jobIdentity(before)}` : ""}`;
+          const page = (await send("GET", `/api/v1/conversations${query}`, { signal }))
+            .input as Conversations;
+          conversations = [...conversations, ...page.conversations];
+          if (!page.has_more) {
+            if (signal.aborted) return;
+            latestConversations = { ...page, conversations };
+            sidebarObservers.forEach((observer) => observer.receive(latestConversations!));
+            break;
+          }
+          before = advance(before, page.next_before);
+        }
+        for (const [id, observers] of childObservers) {
+          const maxPages = Math.max(...observers.values());
+          let visiblePages = 0;
+          let childBefore: string | undefined;
+          let children: Children["children"] = [];
+          for (;;) {
+            const query = `?limit=20${childBefore ? `&before=${jobIdentity(childBefore)}` : ""}`;
+            const page = (
+              await send("GET", `/api/v1/conversations/${jobIdentity(id)}/children${query}`, {
+                signal,
+              })
+            ).input as Children;
+            children = [...children, ...page.children];
+            if (page.children.some((child) => child.origin !== "system")) visiblePages++;
+            if (!page.has_more || visiblePages >= maxPages) {
+              if (signal.aborted) return;
+              observers.forEach((_, observer) => observer.receive({ ...page, children }));
+              break;
+            }
+            childBefore = advance(childBefore, page.next_before);
+          }
+        }
+        retryDelay = 750;
+      } catch (error) {
+        if (!signal.aborted) {
+          dirty = true;
+          delay = retryDelay;
+          retryDelay = Math.min(retryDelay * 2, 10000);
+          report(error);
+        }
+      } finally {
+        running = false;
+        if (dirty) schedule(delay);
+      }
+    };
+    const unsubscribe = subscribeCatalogInternal(() => {
+      dirty = true;
+      schedule();
+    }, report);
+    schedule(0);
+    return () => {
+      controller.abort();
+      if (timer !== undefined) clearTimeout(timer);
+      unsubscribe();
+    };
+  }
+
   function restartSidebar() {
     if (restartPending) return;
     restartPending = true;
@@ -747,6 +946,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       stopSidebar = undefined;
       if (closed || !(sidebarObservers.size || projectObservers.size || childObservers.size))
         return;
+      if (!programmatic && !browserLocks()) {
+        stopSidebar = finiteSidebar();
+        return;
+      }
       let conversations: Conversations["conversations"] = [];
       let projects: Projects["projects"] = [];
       const children = new Map<string, Children["children"]>();
@@ -1031,38 +1234,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       );
     },
     subscribeCatalog(receive: () => void, error: (error: unknown) => void) {
-      const observer = { receive, error };
-      catalogObservers.add(observer);
-      if (!stopCatalog && !closed) {
-        stopCatalog = subscribeSnapshots(
-          "/api/v1/catalog/events",
-          () => {
-            catalogReady = true;
-            catalogError = undefined;
-            catalogObservers.forEach((item) => item.receive());
-          },
-          (cause) => {
-            catalogReady = false;
-            catalogError = cause;
-            catalogObservers.forEach((item) => item.error(cause));
-          },
-        );
-      } else if (catalogReady || catalogError !== undefined) {
-        queueMicrotask(() => {
-          if (!catalogObservers.has(observer)) return;
-          if (catalogReady) observer.receive();
-          else if (catalogError !== undefined) observer.error(catalogError);
-        });
-      }
-      return () => {
-        catalogObservers.delete(observer);
-        if (!catalogObservers.size) {
-          stopCatalog?.();
-          stopCatalog = undefined;
-          catalogReady = false;
-          catalogError = undefined;
-        }
-      };
+      return subscribeCatalogInternal(receive, error);
     },
     subscribeObservationChanges(
       receive: (value: {
