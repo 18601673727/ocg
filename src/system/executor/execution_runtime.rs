@@ -2637,7 +2637,7 @@ async fn capture_file_snapshots(
     static LINES: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$"));
     if ACTIVE
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < 4).then_some(count + 1)
         })
         .is_err()
