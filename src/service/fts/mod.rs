@@ -1212,7 +1212,17 @@ fn search_index(
     let mut suppressed_lines = false;
     for (rank, (document, score)) in candidates.iter().enumerate() {
         if rank == limits.query_candidates {
-            answer.limit = Some(QueryLimit::Candidates);
+            if answer.hits.is_empty() && !suppressed_lines {
+                for (remaining, _) in &candidates[rank..] {
+                    query_checkpoint(stop, deadline)?;
+                    if phrases_match(index, *remaining, query, stop, deadline)? {
+                        answer.limit = Some(QueryLimit::Candidates);
+                        break;
+                    }
+                }
+            } else {
+                answer.limit = Some(QueryLimit::Candidates);
+            }
             break;
         }
         if answer.hits.len() == limits.results {
