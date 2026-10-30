@@ -411,6 +411,12 @@ pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
     e.0
 }
 
+pub(super) fn output_kind(bytes: &[u8]) -> DecodeResult<OutputKind> {
+    let mut d = Dec::new(bytes, TAG_OUTPUT)?;
+    d.u128()?;
+    d.code(OutputKind::from_code)
+}
+
 pub(super) fn decode_output(
     (job_id, seq): (u128, u32),
     bytes: &[u8],

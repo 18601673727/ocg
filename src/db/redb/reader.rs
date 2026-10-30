@@ -2254,6 +2254,9 @@ fn conversation_matches(
                 .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
             {
                 let (key, bytes) = entry?;
+                if rows::output_kind(bytes.value())? != OutputKind::Result {
+                    continue;
+                }
                 let output = decode_output(key.value(), bytes.value())?;
                 if let Some(text) = indexes::search_output_text(&output, completed)
                     && text.to_lowercase().contains(term)
