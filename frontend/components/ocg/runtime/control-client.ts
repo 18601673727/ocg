@@ -553,16 +553,17 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     const locks = !programmatic && typeof navigator !== "undefined" ? navigator.locks : undefined;
     void (async () => {
       let delay = 250;
-      const runAttempt = async (): Promise<boolean> => {
+      const runAttempt = async (): Promise<{ keepGoing: boolean; wait: number }> => {
         const attempt = streamAttempt(signal, !!locks);
         const remaining = initialTopics ? new Set(initialTopics) : null;
         const started = new Set<string>();
         let initialComplete = false;
+        let observationReady = false;
         let stalled = false;
         let progressTimer: ReturnType<typeof setTimeout> | undefined;
         let lineKind: "start" | "comment" | "event" = "start";
         const progress = () => {
-          if (!locks || initialComplete) return;
+          if (!locks || (initialComplete && !observationReady)) return;
           if (progressTimer !== undefined) clearTimeout(progressTimer);
           progressTimer = setTimeout(() => {
             stalled = true;
@@ -632,7 +633,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
               }
               if (advanced) progress();
               for (const frame of parser.push(text)) {
-                if ("comment" in frame) continue;
+                if ("comment" in frame) {
+                  // The observation feed emits a heartbeat only after it has
+                  // checked the journal and found no more changes to replay.
+                  if (observationReady) {
+                    observationReady = false;
+                    if (progressTimer !== undefined) clearTimeout(progressTimer);
+                    attempt.complete();
+                  }
+                  continue;
+                }
                 const data = JSON.parse(frame.data);
                 if (frame.event === "stream_error") {
                   const error = (data as Api.ErrorResponse).error;
@@ -648,12 +658,24 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                 )
                   throw new ContractError("snapshot.first", "the first page of a snapshot");
                 receive(snapshot);
+                if (
+                  observationReady &&
+                  snapshot.topic === "observation_changes" &&
+                  !snapshot.first
+                ) {
+                  observationReady = false;
+                  if (progressTimer !== undefined) clearTimeout(progressTimer);
+                  attempt.complete();
+                }
                 if (!initialComplete && snapshot.last && started.has(key)) {
                   remaining?.delete(key);
                   if (!remaining || remaining.size === 0) {
                     initialComplete = true;
-                    if (progressTimer !== undefined) clearTimeout(progressTimer);
-                    attempt.complete();
+                    observationReady = snapshot.topic === "observation_changes" && snapshot.first;
+                    if (!observationReady) {
+                      if (progressTimer !== undefined) clearTimeout(progressTimer);
+                      attempt.complete();
+                    }
                   }
                 }
                 if (snapshot.last) started.delete(key);
@@ -666,11 +688,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           }
           throw new ControlTransportError("connection_lost", 0, true);
         } catch (error) {
-          if (signal.aborted) return false;
+          if (signal.aborted) return { keepGoing: false, wait: 0 };
           if (attempt.rotated()) {
             delay = 250;
-            await pause(100, signal);
-            return true;
+            return { keepGoing: true, wait: 100 };
           }
           if (stalled) error = new ControlTransportError("stream_idle", 0, true);
           onError(error);
@@ -678,20 +699,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             error instanceof ContractError ||
             (error instanceof ControlTransportError && !error.retryable)
           )
-            return false;
-          await pause(delay, signal);
+            return { keepGoing: false, wait: 0 };
+          const wait = delay;
           delay = Math.min(delay * 2, 10000);
+          return { keepGoing: true, wait };
         } finally {
           if (progressTimer !== undefined) clearTimeout(progressTimer);
           attempt.dispose();
         }
-        return true;
       };
       while (!signal.aborted) {
-        const keepGoing = locks
+        const outcome = locks
           ? await locks.request("ocg-snapshot-stream", { signal }, runAttempt)
           : await runAttempt();
-        if (!keepGoing) break;
+        if (!outcome.keepGoing) break;
+        await pause(outcome.wait, signal);
       }
     })()
       .catch((error) => {
