@@ -34,6 +34,50 @@ const MAX_RECOVERY_DELAY_MS = 10_000;
 const TOOL_TIME_CACHE_LIMIT = 128;
 const TOOL_TIME_BATCH_SIZE = 4;
 
+class ToolTimeGate {
+  private active = 0;
+  private wake: () => void = () => {};
+  private changed = new Promise<void>((resolve) => {
+    this.wake = resolve;
+  });
+
+  async read<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    while (this.active >= TOOL_TIME_BATCH_SIZE) {
+      signal.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        signal.addEventListener("abort", abort, { once: true });
+        this.changed.then(() => {
+          signal.removeEventListener("abort", abort);
+          resolve();
+        });
+        if (signal.aborted) abort();
+      });
+    }
+    signal.throwIfAborted();
+    this.active++;
+    try {
+      return await operation();
+    } finally {
+      this.active--;
+      const wake = this.wake;
+      this.changed = new Promise<void>((resolve) => {
+        this.wake = resolve;
+      });
+      wake();
+    }
+  }
+}
+
+function rememberToolTime(times: Map<number, number>, request: number, at: number) {
+  if (!times.has(request) && times.size >= TOOL_TIME_CACHE_LIMIT) {
+    const oldest = Math.min(...times.keys());
+    if (request <= oldest) return;
+    times.delete(oldest);
+  }
+  times.set(request, at);
+}
+
 function mergeOutputs(...groups: readonly ControlOutput[][]): ControlOutput[] {
   return [...new Map(groups.flat().map((output) => [output.seq, output])).values()].sort(
     (a, b) => a.seq - b.seq,
@@ -71,6 +115,7 @@ async function readPartialToolBoundaries(
   signal: AbortSignal,
   times: Map<number, number>,
   responses: readonly ControlProviderResponse[],
+  gate?: ToolTimeGate,
 ): Promise<PartialToolBoundary[] | null> {
   const first = outputs[0]?.created_at_us;
   if (!tools.length || first === undefined) return null;
@@ -101,7 +146,11 @@ async function readPartialToolBoundaries(
           const known = recorded.get(request) ?? times.get(request);
           return Promise.resolve(
             known === undefined
-              ? control.readToolResponseTime(job, request, controller.signal)
+              ? gate
+                ? gate.read(controller.signal, () =>
+                    control.readToolResponseTime(job, request, controller.signal),
+                  )
+                : control.readToolResponseTime(job, request, controller.signal)
               : known,
           ).then(
             (value) => ({ value }),
@@ -115,9 +164,7 @@ async function readPartialToolBoundaries(
           const at = result.value;
           if (at === null) return null;
           const request = batch[i];
-          times.delete(request);
-          times.set(request, at);
-          if (times.size > TOOL_TIME_CACHE_LIMIT) times.delete(times.keys().next().value!);
+          rememberToolTime(times, request, at);
           boundaries.push({ request, at });
           if (at < first) return boundaries.reverse();
         }
@@ -169,6 +216,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private started = false;
   private disposed = false;
   private readonly lifetime = new AbortController();
+  private readonly toolTimeGate = new ToolTimeGate();
   private readonly turns = new Map<string, Turn>();
   private readonly roots = new Map<string, string>();
   private listedRoots = new Set<string>();
@@ -593,6 +641,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
               this.lifetime.signal,
               times,
               partial.responses,
+              this.toolTimeGate,
             );
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
             partial.partialToolTimes = times;
@@ -684,6 +733,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         this.lifetime.signal,
         times,
         previous?.responses ?? [],
+        this.toolTimeGate,
       );
       state.partialToolTimes = times;
     }
@@ -1007,6 +1057,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             this.lifetime.signal,
             times,
             turn.responses,
+            this.toolTimeGate,
           );
           if (entry.stopped || this.disposed) return;
           turn.partialToolTimes = times;
@@ -1266,6 +1317,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         this.lifetime.signal,
         times,
         previous?.responses ?? [],
+        this.toolTimeGate,
       );
       turn.partialToolTimes = times;
     }
