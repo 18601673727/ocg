@@ -30,6 +30,7 @@ import { pageTurns } from "./history-page";
 const TURN_PAGE_SIZE = 20;
 // Catalog changes can include every output write; keep one trailing refresh.
 const CATALOG_REFRESH_DELAY_MS = 750;
+const MAX_RECOVERY_DELAY_MS = 10_000;
 
 function mergeOutputs(...groups: readonly ControlOutput[][]): ControlOutput[] {
   return [...new Map(groups.flat().map((output) => [output.seq, output])).values()].sort(
@@ -110,6 +111,7 @@ type StreamEntry = {
   subscription: JobStreamSubscription | null;
   unsubscribeCatalog: (() => void) | null;
   stopped: boolean;
+  stop: () => void;
 };
 
 /** Projects and sessions are presentation scope only: every backend turn is a Job. */
@@ -323,10 +325,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         for (const id of turn.input.attachments) attachments.add(id);
         const stream = this.streams.get(jobId);
         if (stream) {
-          stream.stopped = true;
-          stream.unsubscribeCatalog?.();
-          stream.subscription?.close();
-          this.streams.delete(jobId);
+          stream.stop();
         }
         this.turns.delete(jobId);
       }
@@ -823,12 +822,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private watch(jobId: string) {
     const turn = this.turns.get(jobId);
     if (!turn || this.streams.has(jobId) || this.disposed) return;
-    const entry: StreamEntry = { subscription: null, unsubscribeCatalog: null, stopped: false };
+    const entry: StreamEntry = {
+      subscription: null,
+      unsubscribeCatalog: null,
+      stopped: false,
+      stop: () => {},
+    };
     let inFlight = false;
     let queued = false;
     let catalogDirty = false;
     let catalogTimer: ReturnType<typeof setTimeout> | undefined;
     let needsReplay = false;
+    let replayThrough = 0;
+    let recoveryDelay = CATALOG_REFRESH_DELAY_MS;
+    let recoveryAfter = 0;
     let loadedContinuation = false;
     const finish = () => {
       entry.stopped = true;
@@ -837,8 +844,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       entry.subscription?.close();
       if (this.streams.get(jobId) === entry) this.streams.delete(jobId);
     };
+    entry.stop = finish;
     const requestTick = () => {
       if (entry.stopped || this.disposed) return;
+      if (needsReplay && Date.now() < recoveryAfter) {
+        scheduleCatalogTick();
+        return;
+      }
       if (inFlight) {
         queued = true;
         return;
@@ -848,12 +860,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const scheduleCatalogTick = () => {
       catalogDirty = true;
       if (entry.stopped || this.disposed || inFlight || catalogTimer !== undefined) return;
-      catalogTimer = setTimeout(() => {
-        catalogTimer = undefined;
-        if (inFlight) return;
-        catalogDirty = false;
-        requestTick();
-      }, CATALOG_REFRESH_DELAY_MS);
+      catalogTimer = setTimeout(
+        () => {
+          catalogTimer = undefined;
+          if (inFlight) return;
+          catalogDirty = false;
+          requestTick();
+        },
+        needsReplay && recoveryAfter > Date.now()
+          ? recoveryAfter - Date.now()
+          : CATALOG_REFRESH_DELAY_MS,
+      );
     };
     const tick = async () => {
       if (inFlight || entry.stopped || this.disposed) return;
@@ -888,15 +905,27 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         turn.details = details;
         turn.unknownReason = details.unknown_reason;
         const last = turn.outputs.at(-1)?.seq ?? 0;
-        const through = Math.max(details.activity.last_output_seq, details.result?.seq ?? 0);
+        const through = Math.max(
+          details.activity.last_output_seq,
+          details.result?.seq ?? 0,
+          replayThrough,
+        );
         if (through > last) {
-          const missing = await readMissingOutputs(
-            this.control,
-            jobId,
-            last,
-            through,
-            this.lifetime.signal,
-          );
+          let missing: ControlOutput[];
+          try {
+            missing = await readMissingOutputs(
+              this.control,
+              jobId,
+              last,
+              through,
+              this.lifetime.signal,
+            );
+          } catch (error) {
+            needsReplay = true;
+            replayThrough = Math.max(replayThrough, through);
+            entry.subscription?.close();
+            throw error;
+          }
           if (entry.stopped || this.disposed) return;
           turn.outputs = mergeOutputs(turn.outputs, missing);
         }
@@ -929,11 +958,18 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           finish();
         } else if (needsReplay) {
           needsReplay = false;
+          replayThrough = 0;
+          recoveryAfter = 0;
+          recoveryDelay = CATALOG_REFRESH_DELAY_MS;
           connect();
         }
       } catch (error) {
         if (!this.disposed && !entry.stopped) {
-          turn.error = `Status refresh unavailable: ${error instanceof Error ? error.message : String(error)}. Displayed state may be stale.`;
+          if (needsReplay) {
+            recoveryAfter = Date.now() + recoveryDelay;
+            recoveryDelay = Math.min(recoveryDelay * 2, MAX_RECOVERY_DELAY_MS);
+          }
+          turn.error = `Status refresh unavailable: ${error instanceof Error ? error.message : String(error)}. Displayed state may be stale.${needsReplay ? " Reload to retry now." : ""}`;
           this.publish(turn.sessionId);
         }
       } finally {
@@ -953,8 +989,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           if (event.type === "heartbeat") return;
           if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
           if (event.type === "output" && event.output.seq > (turn.outputs.at(-1)?.seq ?? 0)) {
-            if (event.output.seq !== (turn.outputs.at(-1)?.seq ?? 0) + 1)
+            if (event.output.seq !== (turn.outputs.at(-1)?.seq ?? 0) + 1) {
+              replayThrough = Math.max(replayThrough, event.output.seq);
               throw new ContractError("output.seq", "the next stored sequence without a gap");
+            }
             turn.outputs = [...turn.outputs, event.output];
           }
           if (event.type === "settlement") {
@@ -1276,9 +1314,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.unsubscribeConversations = null;
     }
     for (const entry of this.streams.values()) {
-      entry.stopped = true;
-      entry.unsubscribeCatalog?.();
-      entry.subscription?.close();
+      entry.stop();
     }
     this.streams.clear();
     super.dispose();
