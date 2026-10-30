@@ -202,6 +202,9 @@ type Turn = {
   // Advances when the live array is appended in place, including while an
   // asynchronous history read holds a shallow snapshot of this turn.
   outputRevision?: number;
+  // Advances whenever transcript evidence is committed so older in-flight
+  // reads cannot overwrite newer committed evidence.
+  evidenceRevision: number;
   tools: ControlToolCall[];
   responses: ControlProviderResponse[];
   partialToolBoundaries?: PartialToolBoundary[] | null;
@@ -613,7 +616,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!cursor && !partial) return Promise.resolve();
     const root = this.sessionRoot(sessionId);
     const isCurrent = () =>
-      !this.disposed && !this.hiddenRoots.has(root) && this.earlier.get(sessionId) === cursor;
+      !this.disposed &&
+      !this.hiddenRoots.has(root) &&
+      this.roots.get(root) === sessionId &&
+      this.earlier.get(sessionId) === cursor;
     const task = (async () => {
       try {
         if (partial) {
@@ -640,32 +646,44 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             if (next >= before) break;
             before = next;
           }
+          const previousFirstSeq = partial.outputs.firstSeq;
           partial.outputs = mergeOutputHistory(loaded, held, partial.outputs);
           if (partial.outputs.firstSeq === 1) {
+            partial.partialToolTimes = undefined;
+            partial.partialToolBoundaries = undefined;
+            const evidenceRevision = partial.evidenceRevision;
             const evidence = await readTranscriptEvidence(this.control, partial.job.id, {
               signal: this.lifetime.signal,
             });
-            if (!isCurrent()) return;
-            partial.responses = reuseEvidence(partial.responses, evidence.responses ?? []);
-            partial.tools = reuseEvidence(partial.tools, evidence.tools);
-            partial.toolError = evidence.error;
-            partial.partialToolTimes = undefined;
-            partial.partialToolBoundaries = undefined;
-          } else if (partial.job.settlement.state === "completed" && partial.tools.length) {
-            const times = new Map(partial.partialToolTimes);
-            const boundaries = await readPartialToolBoundaries(
-              this.control,
-              partial.job.id,
-              partial.tools,
-              partial.outputs,
-              this.lifetime.signal,
-              times,
-              partial.responses,
-              this.toolTimeGate,
-            );
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
-            partial.partialToolTimes = times;
-            partial.partialToolBoundaries = boundaries;
+            this.applyTranscriptEvidence(partial, evidenceRevision, evidence, true);
+          } else {
+            if (partial.outputs.firstSeq !== previousFirstSeq) {
+              partial.partialToolBoundaries = undefined;
+            }
+            if (partial.job.settlement.state === "completed" && partial.tools.length) {
+              const evidenceRevision = partial.evidenceRevision;
+              const firstSeq = partial.outputs.firstSeq;
+              const times = new Map(partial.partialToolTimes);
+              const boundaries = await readPartialToolBoundaries(
+                this.control,
+                partial.job.id,
+                partial.tools,
+                partial.outputs,
+                this.lifetime.signal,
+                times,
+                partial.responses,
+                this.toolTimeGate,
+              );
+              if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
+              if (
+                partial.evidenceRevision === evidenceRevision &&
+                partial.outputs.firstSeq === firstSeq
+              ) {
+                partial.partialToolTimes = times;
+                partial.partialToolBoundaries = boundaries;
+              }
+            }
           }
           this.publish(sessionId);
           return;
@@ -740,6 +758,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       sessionId,
       ...turn,
       outputs,
+      evidenceRevision: (previous?.evidenceRevision ?? 0) + 1,
       tools: evidence.tools ?? [],
       responses: evidence.responses ?? [],
       toolError: evidence.error,
@@ -773,6 +792,30 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const images = await this.readImages(state);
     if (!isCurrent()) return null;
     return { state, images, previous, snapshot };
+  }
+
+  private applyTranscriptEvidence(
+    turn: Turn,
+    baseRevision: number,
+    evidence: Awaited<ReturnType<typeof readTranscriptEvidence>>,
+    readReplies: boolean,
+  ): boolean {
+    if (turn.evidenceRevision !== baseRevision) return false;
+    if (!readReplies && turn.outputs.firstSeq === 1) return false;
+    turn.evidenceRevision++;
+    const previousTools = turn.tools;
+    turn.tools = reuseEvidence(turn.tools, evidence.tools);
+    if (readReplies) {
+      turn.responses = reuseEvidence(turn.responses, evidence.responses);
+    }
+    turn.toolError = evidence.error;
+    if (turn.outputs.firstSeq === 1) {
+      turn.partialToolTimes = undefined;
+      turn.partialToolBoundaries = undefined;
+    } else if (turn.tools !== previousTools) {
+      turn.partialToolBoundaries = undefined;
+    }
+    return true;
   }
 
   private historyTurnIsCurrent(loaded: {
@@ -1040,6 +1083,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       try {
         const details = await this.control.readJobDetails(jobId, this.lifetime.signal);
         const readReplies = turn.outputs.firstSeq === 1;
+        const evidenceRevision = turn.evidenceRevision;
         const evidence = await readTranscriptEvidence(this.control, jobId, {
           signal: this.lifetime.signal,
           previous: turn.responses,
@@ -1091,15 +1135,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           if (entry.stopped || this.disposed) return;
           turn.outputs = mergeOutputHistory(turn.outputs, missing);
         }
-        turn.tools = reuseEvidence(turn.tools, evidence.tools);
-        if (readReplies && turn.outputs.firstSeq === 1)
-          turn.responses = reuseEvidence(turn.responses, evidence.responses);
+        const evidenceApplied = this.applyTranscriptEvidence(
+          turn,
+          evidenceRevision,
+          evidence,
+          readReplies,
+        );
         if (
           turn.outputs.firstSeq > 1 &&
           details.settlement.state === "completed" &&
           turn.tools.length &&
           turn.partialToolBoundaries == null
         ) {
+          const boundaryRevision = turn.evidenceRevision;
+          const firstSeq = turn.outputs.firstSeq;
           const times = new Map(turn.partialToolTimes);
           const boundaries = await readPartialToolBoundaries(
             this.control,
@@ -1112,24 +1161,35 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             this.toolTimeGate,
           );
           if (entry.stopped || this.disposed) return;
-          turn.partialToolTimes = times;
-          turn.partialToolBoundaries = boundaries;
+          if (turn.evidenceRevision === boundaryRevision && turn.outputs.firstSeq === firstSeq) {
+            turn.partialToolTimes = times;
+            turn.partialToolBoundaries = boundaries;
+          }
         }
-        turn.toolError = evidence.error;
         turn.error = undefined;
         this.publish(turn.sessionId);
         if (details.task_plan && !loadedContinuation) {
           loadedContinuation = true;
           await this.openConversation(details.task_plan.continuation);
+          if (entry.stopped || this.disposed) return;
         }
-        if (details.settlement.state !== "unsettled" && !taskPlanActive(details.task_plan)) {
-          finish();
-        } else if (needsReplay) {
+        const active =
+          details.settlement.state === "unsettled" || taskPlanActive(details.task_plan);
+        if (needsReplay && active) {
           needsReplay = false;
           replayThrough = 0;
           recoveryAfter = 0;
           recoveryDelay = CATALOG_REFRESH_DELAY_MS;
           connect();
+        }
+        const evidenceCurrent =
+          evidenceApplied &&
+          turn.evidenceRevision === evidenceRevision + 1 &&
+          (readReplies || turn.outputs.firstSeq > 1);
+        if (!evidenceCurrent) {
+          queued = true;
+        } else if (!active) {
+          finish();
         }
       } catch (error) {
         if (!this.disposed && !entry.stopped) {
@@ -1351,6 +1411,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       job: record,
       input: stored?.input ?? frozen,
       outputs,
+      evidenceRevision: (previous?.evidenceRevision ?? 0) + 1,
       tools: evidence.tools ?? [],
       responses: evidence.responses ?? [],
       toolError: evidence.error,
