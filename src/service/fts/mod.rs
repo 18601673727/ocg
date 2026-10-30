@@ -310,12 +310,13 @@ struct Document {
     token_count: u32,
 }
 
-/// One `(document, subtoken)` posting: the document and the subtoken's term
-/// frequency there, which is all BM25 needs.
+/// One `(document, subtoken)` posting: the document, the subtoken's term
+/// frequency there, and the start of its occurrence positions.
 #[derive(Clone, Copy, Debug)]
 struct Posting {
     document: u32,
     frequency: u32,
+    position_start: u32,
 }
 
 /// The indexed snapshot of one build: immutable once installed, shared
@@ -329,6 +330,9 @@ struct Index {
     /// Subtoken to its postings, in ascending document order. A `BTreeMap`
     /// keeps every query and every report deterministic.
     postings: BTreeMap<String, Vec<Posting>>,
+    /// Posting occurrence ranges in one flat array, in zero-based subtoken
+    /// stream positions matching `scan_document`.
+    positions: Vec<u32>,
     total_tokens: u64,
     coverage: Coverage,
     mutation: MutationStamp,
@@ -337,8 +341,8 @@ struct Index {
 
 impl Index {
     /// What the snapshot occupies: its documents (path, text, line offsets),
-    /// its term dictionary and its postings, counted by their fields' own
-    /// sizes and a fixed per-record allowance. A structural approximation,
+    /// its term dictionary, postings and positions, counted by their fields'
+    /// own sizes and a fixed per-record allowance. A structural approximation,
     /// not a measured allocation; the formula is the point of the field.
     fn memory_bytes_approx(&self) -> u64 {
         let documents = self
@@ -354,9 +358,9 @@ impl Index {
         let terms = self
             .postings
             .iter()
-            .map(|(term, postings)| term.len() as u64 + 48 + postings.len() as u64 * 8)
+            .map(|(term, postings)| term.len() as u64 + 48 + postings.len() as u64 * 12)
             .sum::<u64>();
-        documents + terms
+        documents + terms + 24 + self.positions.len() as u64 * 4
     }
 
     fn average_length(&self) -> f64 {
@@ -821,6 +825,7 @@ struct Build<'a> {
     coverage: Coverage,
     documents: Vec<Document>,
     postings: BTreeMap<String, Vec<Posting>>,
+    positions: Vec<u32>,
     limit: Option<BuildLimit>,
     omission: Option<BuildLimit>,
 }
@@ -924,7 +929,7 @@ impl Build<'_> {
             return Err(Stopped);
         }
 
-        let mut frequencies: BTreeMap<String, u32> = BTreeMap::new();
+        let mut positions: BTreeMap<String, Vec<u32>> = BTreeMap::new();
         let mut token_count = 0u32;
         let mut interrupted = false;
         tokenize_while(
@@ -941,13 +946,13 @@ impl Build<'_> {
                     interrupted = true;
                     return;
                 }
-                token_count += 1;
-                match frequencies.get_mut(lower) {
-                    Some(frequency) => *frequency += 1,
+                match positions.get_mut(lower) {
+                    Some(term_positions) => term_positions.push(token_count),
                     None => {
-                        frequencies.insert(lower.to_owned(), 1);
+                        positions.insert(lower.to_owned(), vec![token_count]);
                     }
                 }
+                token_count += 1;
             },
             &mut || {
                 !self.stop.load(Ordering::Relaxed)
@@ -981,10 +986,14 @@ impl Build<'_> {
             line_starts.push(offset as u32 + 1);
         }
         let document = self.coverage.files_indexed as u32;
-        for (term, frequency) in frequencies {
+        for (term, term_positions) in positions {
+            let frequency = term_positions.len() as u32;
+            let position_start = self.positions.len() as u32;
+            self.positions.extend(term_positions);
             self.postings.entry(term).or_default().push(Posting {
                 document,
                 frequency,
+                position_start,
             });
             self.coverage.posting_entries += 1;
         }
@@ -1036,6 +1045,7 @@ fn build_index(
         },
         documents: Vec::new(),
         postings: BTreeMap::new(),
+        positions: Vec::new(),
         limit: None,
         omission: None,
     };
@@ -1059,6 +1069,7 @@ fn build_index(
         built_at: SystemTime::now(),
         documents: build.documents,
         postings: build.postings,
+        positions: build.positions,
         total_tokens,
         coverage: build.coverage,
         mutation,
@@ -1209,6 +1220,9 @@ fn search_index(
             break;
         }
         query_checkpoint(stop, deadline)?;
+        if !phrases_match(index, *document, query, stop, deadline)? {
+            continue;
+        }
         let document = &index.documents[*document as usize];
         let scanned = scan_document(document, query, stop, deadline)?;
         let mut lines = matching_lines(document, &scanned, query, stop, deadline)?;
@@ -1250,6 +1264,62 @@ fn search_index(
         answer.limit = Some(QueryLimit::MatchesPerFile);
     }
     Ok(answer)
+}
+
+/// Whether every multi-subtoken clause has one ordered, adjacent occurrence in
+/// `document`, using only the indexed positions and no document text scan.
+fn phrases_match(
+    index: &Index,
+    document: u32,
+    query: &ParsedQuery,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Result<bool, SearchRefusal> {
+    let positions = |subtoken: &str| -> Option<&[u32]> {
+        let postings = index.postings.get(subtoken)?;
+        let at = postings
+            .binary_search_by_key(&document, |posting| posting.document)
+            .ok()?;
+        let posting = postings.get(at)?;
+        let start = posting.position_start as usize;
+        let end = start.checked_add(posting.frequency as usize)?;
+        index.positions.get(start..end)
+    };
+    for clause in &query.clauses {
+        if clause.subtokens.len() < 2 {
+            continue;
+        }
+        let Some(first) = clause.subtokens.first() else {
+            continue;
+        };
+        let Some(first_positions) = positions(first) else {
+            return Ok(false);
+        };
+        let mut clause_matched = false;
+        for (number, start) in first_positions.iter().enumerate() {
+            if number.is_multiple_of(1024) {
+                query_checkpoint(stop, deadline)?;
+            }
+            let matched = clause
+                .subtokens
+                .iter()
+                .enumerate()
+                .skip(1)
+                .all(|(offset, subtoken)| {
+                    positions(subtoken).is_some_and(|positions| {
+                        positions.binary_search(&(*start + offset as u32)).is_ok()
+                    })
+                });
+            if matched {
+                clause_matched = true;
+                break;
+            }
+        }
+        if !clause_matched {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Every subtoken occurrence of `document`, with its line, in stream order.
