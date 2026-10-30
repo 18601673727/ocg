@@ -34,11 +34,11 @@ pub(super) fn search_grams(text: &str) -> BTreeSet<u64> {
     grams
 }
 
-fn turn_search_grams(
+fn searchable_turn_context(
     tx: &WriteTransaction,
     conversation: JobId,
     turn: JobId,
-) -> Result<BTreeSet<u64>, StorageError> {
+) -> Result<bool, StorageError> {
     let jobs = tx.open_table(JOBS)?;
     let row = jobs
         .get(conversation.get())?
@@ -46,9 +46,18 @@ fn turn_search_grams(
     let turn_row = jobs
         .get(turn.get())?
         .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
-    if !searchable_conversation(&JobSpec::decode_at(conversation.get(), row.value())?)
-        || !searchable_turn(&JobSpec::decode_at(turn.get(), turn_row.value())?)
-    {
+    Ok(
+        searchable_conversation(&JobSpec::decode_at(conversation.get(), row.value())?)
+            && searchable_turn(&JobSpec::decode_at(turn.get(), turn_row.value())?),
+    )
+}
+
+fn turn_search_grams(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+) -> Result<BTreeSet<u64>, StorageError> {
+    if !searchable_turn_context(tx, conversation, turn)? {
         return Ok(BTreeSet::new());
     }
     let mut grams = BTreeSet::new();
@@ -79,29 +88,91 @@ fn turn_search_grams(
     Ok(grams)
 }
 
-pub(super) fn rebuild_turn_search_index(
+fn insert_turn_search_grams(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+    grams: &BTreeSet<u64>,
+) -> Result<(), StorageError> {
+    let mut table = tx.open_table(CONVERSATION_SEARCH)?;
+    for gram in grams {
+        table.insert((conversation.get(), *gram, turn.get()), ())?;
+    }
+    Ok(())
+}
+
+pub(super) fn append_input_search_index(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+    entry: &Entry,
+) -> Result<(), StorageError> {
+    if !matches!(
+        entry,
+        Entry::UserMessage { .. } | Entry::AgentMessage { .. }
+    ) || !searchable_turn_context(tx, conversation, turn)?
+    {
+        return Ok(());
+    }
+    if let Some(text) = search_input_text(&tx.open_table(ATTACHMENTS)?, entry)? {
+        insert_turn_search_grams(tx, conversation, turn, &search_grams(&text))?;
+    }
+    Ok(())
+}
+
+pub(super) fn append_output_search_index(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+    output: &JobOutputRecord,
+    completed: bool,
+) -> Result<(), StorageError> {
+    if output.kind != OutputKind::Result || !searchable_turn_context(tx, conversation, turn)? {
+        return Ok(());
+    }
+    if let Some(text) = search_output_text(output, completed) {
+        insert_turn_search_grams(tx, conversation, turn, &search_grams(text))?;
+    }
+    Ok(())
+}
+
+pub(super) fn amend_turn_search_index(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+    previous: &BTreeSet<u64>,
+) -> Result<(), StorageError> {
+    let grams = turn_search_grams(tx, conversation, turn)?;
+    let mut table = tx.open_table(CONVERSATION_SEARCH)?;
+    for gram in previous.difference(&grams) {
+        table.remove((conversation.get(), *gram, turn.get()))?;
+    }
+    for gram in &grams {
+        table.insert((conversation.get(), *gram, turn.get()), ())?;
+    }
+    Ok(())
+}
+
+pub(super) fn complete_turn_search_index(
     tx: &WriteTransaction,
     conversation: JobId,
     turn: JobId,
 ) -> Result<(), StorageError> {
-    let grams = turn_search_grams(tx, conversation, turn)?;
-    let mut table = tx.open_table(CONVERSATION_SEARCH)?;
-    let existing = table
-        .range((conversation.get(), 0, 0)..=(conversation.get(), u64::MAX, u128::MAX))?
-        .map(|entry| {
-            let (key, _) = entry?;
-            Ok(key.value())
-        })
-        .collect::<Result<Vec<_>, StorageError>>()?;
-    for (_, gram, indexed_turn) in existing {
-        if indexed_turn == turn.get() && !grams.contains(&gram) {
-            table.remove((conversation.get(), gram, turn.get()))?;
+    if !searchable_turn_context(tx, conversation, turn)? {
+        return Ok(());
+    }
+    let mut grams = BTreeSet::new();
+    for entry in tx
+        .open_table(JOB_OUTPUTS)?
+        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+    {
+        let (key, bytes) = entry?;
+        let output = decode_output(key.value(), bytes.value())?;
+        if let Some(text) = search_output_text(&output, true) {
+            grams.extend(search_grams(text));
         }
     }
-    for gram in grams {
-        table.insert((conversation.get(), gram, turn.get()), ())?;
-    }
-    Ok(())
+    insert_turn_search_grams(tx, conversation, turn, &grams)
 }
 
 pub(super) fn searchable_conversation(row: &JobSpec) -> bool {

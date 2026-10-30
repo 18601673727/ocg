@@ -1465,6 +1465,11 @@ impl Batch {
         }
         self.put_job_state(job, &state)?;
         if kind == OutcomeKind::Completed
+            && let Some(conversation) = row.parent_id
+        {
+            self.step(|tx| indexes::complete_turn_search_index(tx, conversation, job))?;
+        }
+        if kind == OutcomeKind::Completed
             && let JobKind::Execution {
                 execution: JobExecution::Decision(work),
                 ..

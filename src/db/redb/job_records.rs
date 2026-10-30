@@ -1981,15 +1981,18 @@ impl Batch {
         let at = self.now;
         let (seq, first_user) = self.step(|tx| {
             let mut first_user = false;
-            match &entry {
+            let previous = match &entry {
                 Entry::UserMessageEdit { message, .. } | Entry::UserMessageWithdraw { message } => {
-                    reader::effective_entries(reader::job_entries_of(
+                    let (_, previous) = reader::effective_entries(reader::job_entries_of(
                         &tx.open_table(JOB_INPUTS)?,
                         turn,
                     )?)?
                     .into_iter()
                     .find(|(seq, _)| seq == message)
                     .ok_or_else(|| StorageError::corrupted("queued amendment target missing"))?;
+                    indexes::search_input_text(&tx.open_table(ATTACHMENTS)?, &previous.entry)?
+                        .map(|text| indexes::search_grams(&text))
+                        .unwrap_or_default()
                 }
                 Entry::UserMessage { .. }
                 | Entry::AgentMessage { .. }
@@ -1999,7 +2002,7 @@ impl Batch {
                 | Entry::Iteration { .. }
                 | Entry::ResponseFormat { .. }
                 | Entry::ContextPreparation { .. }
-                | Entry::ContextUse { .. } => {}
+                | Entry::ContextUse { .. } => BTreeSet::new(),
             };
             let mut table = tx.open_table(JOB_INPUTS)?;
             let seq = table
@@ -2018,7 +2021,21 @@ impl Batch {
             )?;
             drop(table);
             if let Some(conversation) = row.parent_id {
-                indexes::rebuild_turn_search_index(tx, conversation, turn)?;
+                match &entry {
+                    Entry::UserMessageEdit { .. } | Entry::UserMessageWithdraw { .. } => {
+                        indexes::amend_turn_search_index(tx, conversation, turn, &previous)?;
+                    }
+                    Entry::UserMessage { .. } | Entry::AgentMessage { .. } => {
+                        indexes::append_input_search_index(tx, conversation, turn, &entry)?;
+                    }
+                    Entry::Notice { .. }
+                    | Entry::Decision { .. }
+                    | Entry::RetryOf { .. }
+                    | Entry::Iteration { .. }
+                    | Entry::ResponseFormat { .. }
+                    | Entry::ContextPreparation { .. }
+                    | Entry::ContextUse { .. } => {}
+                }
             }
             match entry {
                 Entry::UserMessage { attachments, .. } => {
