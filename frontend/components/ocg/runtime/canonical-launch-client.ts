@@ -863,7 +863,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
       cached.transcript = jobTranscript(
         turn.job.id,
-        partial || turn.entries ? null : turn.input.objective,
+        turn.entries && turn.entries.length > 0 ? null : turn.input.objective,
         turn.outputs,
         turn.job.settlement,
         turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
@@ -909,9 +909,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       .sort(
         (a, b) => a.job.created_at_us - b.job.created_at_us || a.job.id.localeCompare(b.job.id),
       );
-    // Keep the visible history contiguous: inputs and older turns precede any missing outputs.
-    const lastPartial = turns.findLastIndex((turn) => turn.outputs.firstSeq > 1);
-    const messages: ChatMessage[] = turns.slice(Math.max(lastPartial, 0)).flatMap((turn) => {
+    const messages: ChatMessage[] = turns.flatMap((turn) => {
       const partial = turn.outputs.firstSeq > 1;
       const entries = materializeUserEntries(turn.entries ?? []);
       const queued =
@@ -937,6 +935,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         ? [
             {
               id: `${turn.job.id}:compaction`,
+              jobId: turn.job.id,
+              commandId: turn.job.id,
               role: "assistant",
               content: "",
               status: "completed",
@@ -957,8 +957,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       const projected = this.projectTurn(turn, partial);
       const transcript = withdrawnBeforeStart ? [] : projected.transcript;
       return [
-        ...(partial ? [] : boundary),
-        ...(partial ? [] : inputs),
+        ...boundary,
+        ...inputs,
         ...transcript.map((message) => ({
           id: message.id,
           jobId: turn.job.id,
