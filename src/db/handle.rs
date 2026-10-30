@@ -2112,12 +2112,20 @@ impl DatabaseHandle {
                 .unwrap_or_else(PoisonError::into_inner),
         )?;
         let permit = self.attachment_permit().await?;
+        let (handoff_tx, handoff_rx) = flume::bounded(1);
+        let (settle_tx, settle_rx) = flume::bounded(1);
+        let submitted = Arc::new(AtomicBool::new(false));
+        let submitted_for_worker = submitted.clone();
         let shared = self.shared.clone();
-        let (pin, published, permit) = ntex::rt::spawn_blocking(move || {
-            let pin = shared
-                .attachments
-                .publish(&attachment.content)
-                .map_err(AttachmentError::NotStored)?;
+        let blocking = ntex::rt::spawn_blocking(move || {
+            let pin = match shared.attachments.publish(&attachment.content) {
+                Ok(pin) => pin,
+                Err(error) => {
+                    let _ = handoff_tx.send(Err(AttachmentError::NotStored(error)));
+                    drop(permit);
+                    return;
+                }
+            };
             let published = PublishedAttachment {
                 sha256: pin.digest(),
                 byte_length: attachment.content.len() as u64,
@@ -2125,12 +2133,46 @@ impl DatabaseHandle {
                 display_name: attachment.display_name,
                 origin: AttachmentOrigin::UserProvided,
             };
-            Ok::<_, AttachmentError>((pin, published, permit))
-        })
-        .await
-        .map_err(|_| DatabaseError::WorkerPanicked)??;
+            if handoff_tx.send(Ok(published)).is_err() {
+                // The awaiting async future was cancelled while publication was in progress.
+                // Database submission certainly never occurred.
+                pin.release();
+                drop(permit);
+                return;
+            }
+            match settle_rx.recv() {
+                Ok(true) => {
+                    // Settled commit outcome (committed or known non-committed): release pin.
+                    pin.release();
+                }
+                Ok(false) => {
+                    // Unknown commit outcome: retain pin.
+                }
+                Err(_) => {
+                    // Async caller dropped / cancelled.
+                    if !submitted_for_worker.load(Ordering::Acquire) {
+                        // Certainly not submitted: release pin.
+                        pin.release();
+                    }
+                    // If submitted, outcome is unknown: retain pin without release.
+                }
+            }
+            drop(permit);
+        });
+        let published = match handoff_rx.recv_async().await {
+            Ok(Ok(published)) => published,
+            Ok(Err(error)) => {
+                let _ = blocking.await;
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = blocking.await;
+                return Err(DatabaseError::WorkerPanicked.into());
+            }
+        };
         let created = self
             .submit(|reply| {
+                submitted.store(true, Ordering::Release);
                 Command::new(
                     (Box::new(published),),
                     reply,
@@ -2152,13 +2194,8 @@ impl DatabaseHandle {
                 Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted)
             ),
         };
-        if settled {
-            let _ = ntex::rt::spawn_blocking(move || {
-                pin.release();
-                drop(permit);
-            })
-            .await;
-        }
+        let _ = settle_tx.send(settled);
+        let _ = blocking.await;
         Ok(created?)
     }
 
