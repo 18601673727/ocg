@@ -31,6 +31,8 @@ const TURN_PAGE_SIZE = 20;
 // Catalog changes can include every output write; keep one trailing refresh.
 const CATALOG_REFRESH_DELAY_MS = 750;
 const MAX_RECOVERY_DELAY_MS = 10_000;
+const TOOL_TIME_CACHE_LIMIT = 128;
+const TOOL_TIME_BATCH_SIZE = 4;
 
 function mergeOutputs(...groups: readonly ControlOutput[][]): ControlOutput[] {
   return [...new Map(groups.flat().map((output) => [output.seq, output])).values()].sort(
@@ -67,17 +69,48 @@ async function readPartialToolBoundaries(
   tools: readonly ControlToolCall[],
   outputs: readonly ControlOutput[],
   signal: AbortSignal,
+  times: Map<number, number>,
+  responses: readonly ControlProviderResponse[],
 ): Promise<PartialToolBoundary[] | null> {
   const first = outputs[0]?.created_at_us;
   if (!tools.length || first === undefined) return null;
   try {
     const requests = [...new Set(tools.map((call) => call.request))].sort((a, b) => b - a);
     const boundaries: PartialToolBoundary[] = [];
-    for (const request of requests) {
-      const at = await control.readToolResponseTime(job, request, signal);
-      if (at === null) return null;
-      boundaries.push({ request, at });
-      if (at < first) break;
+    const recorded = new Map(
+      responses
+        .filter((response) => response.requests_tools)
+        .map((response) => [response.request, response.created_at_us]),
+    );
+    for (let offset = 0; offset < requests.length; ) {
+      // The first request often already precedes the window. Later batches
+      // bound speculative reads while avoiding a serial walk through a long turn.
+      const count = offset === 0 ? 1 : TOOL_TIME_BATCH_SIZE;
+      const batch = requests.slice(offset, offset + count);
+      const values = await Promise.allSettled(
+        batch.map((request) => {
+          const known = recorded.get(request) ?? times.get(request);
+          return known === undefined ? control.readToolResponseTime(job, request, signal) : known;
+        }),
+      );
+      signal.throwIfAborted();
+      for (let i = 0; i < batch.length; i++) {
+        const value = values[i];
+        if (value.status !== "fulfilled" || value.value === null) continue;
+        times.delete(batch[i]);
+        times.set(batch[i], value.value);
+        if (times.size > TOOL_TIME_CACHE_LIMIT) times.delete(times.keys().next().value!);
+      }
+      for (let i = 0; i < batch.length; i++) {
+        const value = values[i];
+        if (value.status === "rejected") throw value.reason;
+        const at = value.value;
+        if (at === null) return null;
+        const request = batch[i];
+        boundaries.push({ request, at });
+        if (at < first) return boundaries.reverse();
+      }
+      offset += batch.length;
     }
     return boundaries.reverse();
   } catch {
@@ -97,6 +130,7 @@ type Turn = {
   tools: ControlToolCall[];
   responses: ControlProviderResponse[];
   partialToolBoundaries?: PartialToolBoundary[] | null;
+  partialToolTimes?: ReadonlyMap<number, number>;
   error?: string;
   toolError?: string;
   unknownReason?: string | null;
@@ -532,15 +566,22 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             partial.responses = evidence.responses ?? [];
             partial.tools = evidence.tools ?? partial.tools;
             partial.toolError = evidence.error;
+            partial.partialToolTimes = undefined;
+            partial.partialToolBoundaries = undefined;
           } else if (partial.job.settlement.state === "completed" && partial.tools.length) {
-            partial.partialToolBoundaries = await readPartialToolBoundaries(
+            const times = new Map(partial.partialToolTimes);
+            const boundaries = await readPartialToolBoundaries(
               this.control,
               partial.job.id,
               partial.tools,
               partial.outputs,
               this.lifetime.signal,
+              times,
+              partial.responses,
             );
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
+            partial.partialToolTimes = times;
+            partial.partialToolBoundaries = boundaries;
           }
           this.publish(sessionId);
           return;
@@ -619,13 +660,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       toolError: evidence.error,
     };
     if (!complete && turn.job.settlement.state === "completed" && state.tools.length) {
+      const times = new Map(previous?.partialToolTimes);
       state.partialToolBoundaries = await readPartialToolBoundaries(
         this.control,
         turn.job.id,
         state.tools,
         outputs,
         this.lifetime.signal,
+        times,
+        previous?.responses ?? [],
       );
+      state.partialToolTimes = times;
     }
     if (turn.job.settlement.state === "unknown") {
       const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
@@ -936,16 +981,21 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           (turn.outputs[0]?.seq ?? 1) > 1 &&
           details.settlement.state === "completed" &&
           turn.tools.length &&
-          turn.partialToolBoundaries === undefined
+          turn.partialToolBoundaries == null
         ) {
-          turn.partialToolBoundaries = await readPartialToolBoundaries(
+          const times = new Map(turn.partialToolTimes);
+          const boundaries = await readPartialToolBoundaries(
             this.control,
             jobId,
             turn.tools,
             turn.outputs,
             this.lifetime.signal,
+            times,
+            turn.responses,
           );
           if (entry.stopped || this.disposed) return;
+          turn.partialToolTimes = times;
+          turn.partialToolBoundaries = boundaries;
         }
         turn.toolError = evidence.error;
         turn.error = undefined;
@@ -1192,13 +1242,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       record.settlement.state === "completed" &&
       turn.tools.length
     ) {
+      const times = new Map(previous?.partialToolTimes);
       turn.partialToolBoundaries = await readPartialToolBoundaries(
         this.control,
         job,
         turn.tools,
         outputs,
         this.lifetime.signal,
+        times,
+        previous?.responses ?? [],
       );
+      turn.partialToolTimes = times;
     }
     if (!this.getSnapshot().sessions.some((s) => s.id === sessionId)) return;
     const current = this.turns.get(job);
