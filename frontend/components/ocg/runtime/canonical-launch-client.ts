@@ -20,7 +20,12 @@ import {
   type HttpCanonicalControlClient,
   type JobStreamSubscription,
 } from "./control-client";
-import { jobTranscript, type PartialToolBoundary } from "../chat/job-transcript-model";
+import {
+  jobTranscript,
+  TranscriptAccumulator,
+  type PartialToolBoundary,
+  type TranscriptTurn,
+} from "../chat/job-transcript-model";
 import { fileSnapshots } from "../markdown/source-snapshot";
 import { reconcileJob, taskPlanActive } from "./job-status";
 import { ContractError, materializeUserEntries } from "../contracts";
@@ -189,6 +194,9 @@ type Turn = {
   job: ControlJob;
   input: ControlConversationTurn["input"];
   outputs: ControlOutput[];
+  // Advances when the live array is appended in place, including while an
+  // asynchronous history read holds a shallow snapshot of this turn.
+  outputRevision?: number;
   tools: ControlToolCall[];
   responses: ControlProviderResponse[];
   partialToolBoundaries?: PartialToolBoundary[] | null;
@@ -218,6 +226,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly lifetime = new AbortController();
   private readonly toolTimeGate = new ToolTimeGate();
   private readonly turns = new Map<string, Turn>();
+  private readonly projections = new WeakMap<
+    Turn,
+    {
+      outputs: ControlOutput[];
+      length: number;
+      aggregate: TranscriptAccumulator;
+      arguments?: readonly unknown[];
+      transcript?: TranscriptTurn[];
+    }
+  >();
   private readonly roots = new Map<string, string>();
   private listedRoots = new Set<string>();
   // hiddenRoots and unlisted live as long as the client.
@@ -770,6 +788,49 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private readonly images = new Map<string, ChatImage>();
+  private projectTurn(
+    turn: Turn,
+    partial: boolean,
+  ): { transcript: TranscriptTurn[]; result: ControlOutput | null } {
+    let cached = this.projections.get(turn);
+    if (!cached || cached.outputs !== turn.outputs || cached.length > turn.outputs.length) {
+      cached = { outputs: turn.outputs, length: 0, aggregate: new TranscriptAccumulator() };
+      this.projections.set(turn, cached);
+    }
+    while (cached.length < turn.outputs.length)
+      cached.aggregate.append(turn.outputs[cached.length++]);
+    const args = [
+      turn.outputRevision,
+      turn.outputs,
+      turn.outputs.length,
+      turn.job,
+      turn.input,
+      turn.entries,
+      turn.tools,
+      turn.responses,
+      turn.partialToolBoundaries,
+      partial,
+    ];
+    if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
+      cached.transcript = jobTranscript(
+        turn.job.id,
+        partial || turn.entries ? null : turn.input.objective,
+        turn.outputs,
+        turn.job.settlement,
+        turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
+        undefined,
+        turn.tools,
+        turn.job.previous === null,
+        turn.responses,
+        partial,
+        turn.partialToolBoundaries,
+        cached.aggregate,
+      );
+      cached.arguments = args;
+    }
+    return { transcript: cached.transcript ?? [], result: cached.aggregate.result };
+  }
+
   private async readImages(turn: Turn) {
     return Promise.all(
       [
@@ -844,21 +905,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         !turn.outputs.length &&
         !turn.tools.length &&
         !turn.responses.length;
-      const transcript = withdrawnBeforeStart
-        ? []
-        : jobTranscript(
-            turn.job.id,
-            partial || turn.entries ? null : turn.input.objective,
-            turn.outputs,
-            turn.job.settlement,
-            turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
-            undefined,
-            turn.tools,
-            turn.job.previous === null,
-            turn.responses,
-            partial,
-            turn.partialToolBoundaries,
-          );
+      const projected = this.projectTurn(turn, partial);
+      const transcript = withdrawnBeforeStart ? [] : projected.transcript;
       return [
         ...(partial ? [] : boundary),
         ...(partial ? [] : inputs),
@@ -880,9 +928,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
                 reasoning: message.reasoning,
                 sourceSnapshots: message.intermediate
                   ? undefined
-                  : fileSnapshots(
-                      turn.outputs.findLast((output) => output.kind === "result")?.value,
-                    ),
+                  : fileSnapshots(projected.result?.value),
                 reasoningDurationMs: message.reasoningDurationMs,
                 failureReason: message.intermediate
                   ? undefined
@@ -1109,7 +1155,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
               replayThrough = Math.max(replayThrough, event.output.seq);
               throw new ContractError("output.seq", "the next stored sequence without a gap");
             }
-            turn.outputs = [...turn.outputs, event.output];
+            turn.outputs.push(event.output);
+            turn.outputRevision = (turn.outputRevision ?? 0) + 1;
           }
           if (event.type === "settlement") {
             turn.job = {

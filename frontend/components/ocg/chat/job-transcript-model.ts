@@ -40,6 +40,30 @@ export function outputDisplayText(output: ControlOutput | null | undefined): str
     .join("\n");
 }
 
+// Rebuildable presentation state. The stored outputs remain the authority for
+// sequence and request boundaries; this only avoids rescanning their text.
+export class TranscriptAccumulator {
+  progress = "";
+  reasoning = "";
+  result: ControlOutput | null = null;
+  lastAt: number | null = null;
+  reasoningStartedAt: number | null = null;
+  reasoningDurationUs = 0;
+
+  append(output: ControlOutput) {
+    if (output.kind === "progress") this.progress += outputDisplayText(output);
+    if (output.kind === "reasoning") this.reasoning += outputDisplayText(output);
+    if (output.kind === "result") this.result = output;
+    if (output.kind === "reasoning" && outputText(output)) {
+      this.reasoningStartedAt ??= output.created_at_us;
+    } else if (output.kind !== "reasoning" && this.reasoningStartedAt !== null) {
+      this.reasoningDurationUs += Math.max(0, output.created_at_us - this.reasoningStartedAt);
+      this.reasoningStartedAt = null;
+    }
+    this.lastAt = output.created_at_us;
+  }
+}
+
 /**
  * Projects one Job's frozen input and stored outputs into chat messages.
  * Recorded provider replies preserve each request's text and tool calls;
@@ -60,17 +84,11 @@ export function jobTranscript(
   responses?: readonly ControlProviderResponse[],
   partialOutput = false,
   partialToolBoundaries?: readonly PartialToolBoundary[] | null,
+  accumulated?: TranscriptAccumulator,
 ): TranscriptTurn[] {
-  const answerOutputs = outputs.filter((output) => output.kind !== "reasoning");
-  const progress = answerOutputs
-    .filter((output) => output.kind === "progress")
-    .map(outputDisplayText)
-    .join("");
-  const reasoning = outputs
-    .filter((output) => output.kind === "reasoning")
-    .map(outputDisplayText)
-    .join("");
-  const result = answerOutputs.findLast((output) => output.kind === "result") ?? null;
+  const aggregate = accumulated ?? new TranscriptAccumulator();
+  if (!accumulated) for (const output of outputs) aggregate.append(output);
+  const { progress, reasoning, result } = aggregate;
   const state = settlement?.state ?? "unsettled";
   const visibleAnswer = (text: string) => {
     if (!titleMetadata) return text;
@@ -91,27 +109,19 @@ export function jobTranscript(
       return text;
     return start.slice(end + "</ocg-title>".length).trimStart();
   };
-  let reasoningStartedAt: number | null = null;
-  let reasoningDurationUs = 0;
-  for (const output of outputs) {
-    if (output.kind === "reasoning" && outputText(output)) {
-      reasoningStartedAt ??= output.created_at_us;
-    } else if (output.kind !== "reasoning" && reasoningStartedAt !== null) {
-      reasoningDurationUs += Math.max(0, output.created_at_us - reasoningStartedAt);
-      reasoningStartedAt = null;
-    }
-  }
+  const { reasoningStartedAt } = aggregate;
+  let reasoningDurationUs = aggregate.reasoningDurationUs;
   if (reasoningStartedAt !== null) {
     const endedAt =
       (state !== "unsettled" ? settlement?.settled_at_us : null) ??
-      outputs.at(-1)?.created_at_us ??
+      aggregate.lastAt ??
       reasoningStartedAt;
     reasoningDurationUs += Math.max(0, endedAt - reasoningStartedAt);
   }
   const base = {
     id: `${jobId}:answer`,
     role: "assistant" as const,
-    createdAtUs: outputs.at(-1)?.created_at_us ?? null,
+    createdAtUs: aggregate.lastAt,
     tools,
     ...(reasoning ? { reasoning, reasoningDurationMs: reasoningDurationUs / 1000 } : {}),
   };
