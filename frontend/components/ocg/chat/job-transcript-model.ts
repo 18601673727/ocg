@@ -130,13 +130,14 @@ export function jobTranscript(
         },
       ];
   let answer: TranscriptTurn;
+  const strippedPending = new Set<ControlToolCall>();
   if (state === "completed") {
     // The Result carries the Provider's complete text; it supersedes the
     // streamed pieces it was assembled from.
     answer = {
       ...base,
       content: visibleAnswer(
-        approvalAnswer(result ? outputDisplayText(result) : progress, tools ?? []),
+        approvalAnswer(result ? outputDisplayText(result) : progress, tools ?? [], strippedPending),
       ),
       status: "completed",
       detail: null,
@@ -166,6 +167,7 @@ export function jobTranscript(
       outputs,
       partialOutput,
       partialToolBoundaries,
+      strippedPending,
     ),
   ];
 }
@@ -187,7 +189,11 @@ function providerFailureDetail(result: ControlOutput | null): string | null {
   return [message, ...details].filter(Boolean).join("\n") || null;
 }
 
-function approvalAnswer(text: string, tools: readonly ControlToolCall[]): string {
+function approvalAnswer(
+  text: string,
+  tools: readonly ControlToolCall[],
+  strippedPending: Set<ControlToolCall>,
+): string {
   let answer = text;
   const pending = tools
     .filter((call) => call.decision === "awaiting_approval" || call.decision === "awaiting_answer")
@@ -219,6 +225,7 @@ function approvalAnswer(text: string, tools: readonly ControlToolCall[]): string
     const suffix = answer.slice(start + marker.length);
     if (call.arguments_cut ? !payload || !suffix.startsWith(payload) : suffix !== payload) continue;
     answer = answer.slice(0, start > 0 ? start - 1 : 0);
+    strippedPending.add(call);
   }
   return answer;
 }
@@ -230,7 +237,8 @@ function providerMessages(
   visible: (text: string) => string,
   outputs: readonly ControlOutput[],
   partialOutput: boolean,
-  partialToolBoundaries?: readonly PartialToolBoundary[] | null,
+  partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
+  strippedPending: ReadonlySet<ControlToolCall>,
 ): TranscriptTurn[] {
   if (!responses?.length)
     return fallbackMessages(
@@ -240,6 +248,7 @@ function providerMessages(
       outputs,
       partialOutput,
       partialToolBoundaries,
+      strippedPending,
     );
   const recorded = responses.map((response) => response.text).join("");
   if (!progress.startsWith(recorded) && !recorded.startsWith(progress)) {
@@ -250,6 +259,7 @@ function providerMessages(
       outputs,
       partialOutput,
       partialToolBoundaries,
+      strippedPending,
     );
   }
   const remainder = progress.startsWith(recorded) ? progress.slice(recorded.length) : "";
@@ -414,13 +424,14 @@ function fallbackMessages(
   visible: (text: string) => string,
   outputs: readonly ControlOutput[],
   partialOutput: boolean,
-  partialToolBoundaries?: readonly PartialToolBoundary[] | null,
+  partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
+  strippedPending: ReadonlySet<ControlToolCall>,
 ): TranscriptTurn[] {
   if (answer.status !== "completed") return [answer];
   const text = visible(progress);
   if (partialOutput && !answer.tools?.length && answer.content.endsWith(text)) return [answer];
   if (partialOutput && partialToolBoundaries?.length)
-    return partialMessages(answer, outputs, visible, partialToolBoundaries);
+    return partialMessages(answer, outputs, visible, partialToolBoundaries, strippedPending);
   const earlier =
     answer.content && text.endsWith(answer.content) ? text.slice(0, -answer.content.length) : text;
   if (!earlier || text === answer.content) return [answer];
@@ -442,6 +453,7 @@ function partialMessages(
   outputs: readonly ControlOutput[],
   visible: (text: string) => string,
   boundaries: readonly PartialToolBoundary[],
+  strippedPending: ReadonlySet<ControlToolCall>,
 ): TranscriptTurn[] {
   const tools = new Map<number, ControlToolCall[]>();
   for (const call of answer.tools ?? []) {
@@ -498,11 +510,20 @@ function partialMessages(
       detail: null,
     });
   }
-  messages.push({
-    ...answer,
-    reasoning: separateTail ? undefined : tail.reasoning || undefined,
-    reasoningDurationMs: undefined,
-    tools: undefined,
-  });
+  const lastToolMessage = messages.at(-1);
+  const cardOnly =
+    !streamed &&
+    !!answer.content &&
+    lastToolMessage?.content === answer.content &&
+    lastToolMessage.tools?.some((call) => strippedPending.has(call));
+  if (!cardOnly || tail.reasoning) {
+    messages.push({
+      ...answer,
+      ...(cardOnly ? { id: `${answer.id}:reasoning:tail`, content: "", intermediate: true } : {}),
+      reasoning: separateTail ? undefined : tail.reasoning || undefined,
+      reasoningDurationMs: undefined,
+      tools: undefined,
+    });
+  }
   return messages;
 }
