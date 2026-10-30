@@ -91,6 +91,7 @@ class ProviderProjection {
     readonly completed: boolean,
     readonly answerId: string,
     readonly titleMetadata: boolean,
+    public titleUnsettled: boolean,
     outputs: readonly ControlOutput[],
   ) {
     this.recorded = responses.map((response) => response.text).join("");
@@ -357,9 +358,15 @@ function providerMessages(
       answer.status === "completed",
       answer.id,
       titleMetadata,
+      answer.status === "streaming" || answer.status === "pending",
       outputs,
     );
     aggregate.provider = projection;
+  }
+  const titleUnsettled = answer.status === "streaming" || answer.status === "pending";
+  if (projection.titleMetadata && projection.titleUnsettled !== titleUnsettled) {
+    projection.requestMessages.clear();
+    projection.titleUnsettled = titleUnsettled;
   }
   const { recorded, byRequest, toolsByRequest, requests } = projection;
   if (!projection.matches(progress)) {
