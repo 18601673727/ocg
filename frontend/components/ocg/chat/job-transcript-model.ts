@@ -1,8 +1,5 @@
-import type {
-  ControlOutput,
-  ControlProviderResponse,
-  ControlToolCall,
-} from "@/components/ocg/contracts";
+import type { ControlProviderResponse, ControlToolCall } from "@/components/ocg/contracts";
+import type { OutputSequence, OutputView } from "../runtime/output-history";
 
 /** How a Job settled, as the Control Plane reports it. */
 export type TranscriptSettlement = {
@@ -28,13 +25,13 @@ export type TranscriptTurn = {
   tools?: readonly ControlToolCall[];
 };
 
-export function outputText(output: ControlOutput | null | undefined): string | null {
+export function outputText(output: OutputView | null | undefined): string | null {
   const value = output?.value;
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return "text" in value && typeof value.text === "string" ? value.text : null;
 }
 
-export function outputDisplayText(output: ControlOutput | null | undefined): string {
+export function outputDisplayText(output: OutputView | null | undefined): string {
   return [outputText(output), output?.summary]
     .filter((text) => text != null && text !== "")
     .join("\n");
@@ -45,13 +42,13 @@ export function outputDisplayText(output: ControlOutput | null | undefined): str
 export class TranscriptAccumulator {
   progress = "";
   reasoning = "";
-  result: ControlOutput | null = null;
+  result: OutputView | null = null;
   lastAt: number | null = null;
   reasoningStartedAt: number | null = null;
   reasoningDurationUs = 0;
   provider?: ProviderProjection;
 
-  append(output: ControlOutput) {
+  append(output: OutputView) {
     if (output.kind === "progress") this.progress += outputDisplayText(output);
     if (output.kind === "reasoning") this.reasoning += outputDisplayText(output);
     if (output.kind === "result") this.result = output;
@@ -92,7 +89,7 @@ class ProviderProjection {
     readonly answerId: string,
     readonly titleMetadata: boolean,
     public titleUnsettled: boolean,
-    outputs: readonly ControlOutput[],
+    outputs: OutputSequence,
   ) {
     this.recorded = responses.map((response) => response.text).join("");
     this.byRequest = new Map(responses.map((response) => [response.request, response]));
@@ -115,7 +112,7 @@ class ProviderProjection {
     for (const output of outputs) this.append(output);
   }
 
-  append(output: ControlOutput) {
+  append(output: OutputView) {
     while (this.index < this.through.length - 1 && output.created_at_us > this.through[this.index])
       this.index++;
     const interval = this.intervals[this.index];
@@ -152,7 +149,7 @@ class ProviderProjection {
 export function jobTranscript(
   jobId: string,
   objective: string | null,
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
   settlement: TranscriptSettlement | null,
   streaming: boolean,
   attachments?: readonly string[],
@@ -261,7 +258,7 @@ export function jobTranscript(
   ];
 }
 
-function providerFailureDetail(result: ControlOutput | null): string | null {
+function providerFailureDetail(result: OutputView | null): string | null {
   const message = result?.summary ?? null;
   if (
     result?.code !== "provider_rejected" ||
@@ -324,7 +321,7 @@ function providerMessages(
   progress: string,
   responses: readonly ControlProviderResponse[] | undefined,
   visible: (text: string) => string,
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
   partialOutput: boolean,
   partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
   strippedPending: ReadonlySet<ControlToolCall>,
@@ -520,7 +517,7 @@ function fallbackMessages(
   answer: TranscriptTurn,
   progress: string,
   visible: (text: string) => string,
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
   partialOutput: boolean,
   partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
   strippedPending: ReadonlySet<ControlToolCall>,
@@ -548,7 +545,7 @@ function fallbackMessages(
 
 function partialMessages(
   answer: TranscriptTurn,
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
   visible: (text: string) => string,
   boundaries: readonly PartialToolBoundary[],
   strippedPending: ReadonlySet<ControlToolCall>,
@@ -564,8 +561,16 @@ function partialMessages(
   let position = 0;
   const take = (through: number) => {
     const start = position;
-    while (position < outputs.length && outputs[position].created_at_us <= through) position++;
-    const part = outputs.slice(start, position);
+    while (
+      position < outputs.length &&
+      (outputs.at(position)?.created_at_us ?? Infinity) <= through
+    )
+      position++;
+    const part: OutputView[] = [];
+    for (let index = start; index < position; index++) {
+      const output = outputs.at(index);
+      if (output) part.push(output);
+    }
     const text = part
       .filter((output) => output.kind === "progress")
       .map(outputDisplayText)

@@ -30,6 +30,12 @@ import { fileSnapshots } from "../markdown/source-snapshot";
 import { reconcileJob, taskPlanActive } from "./job-status";
 import { ContractError, materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
+import {
+  mergeOutputHistory,
+  type OutputHistory,
+  type OutputSequence,
+  type OutputView,
+} from "./output-history";
 
 /** Turns read per conversation page: the newest page and each earlier page. */
 const TURN_PAGE_SIZE = 20;
@@ -88,12 +94,6 @@ function rememberToolTime(times: Map<number, number>, request: number, at: numbe
   times.set(request, at);
 }
 
-function mergeOutputs(...groups: readonly ControlOutput[][]): ControlOutput[] {
-  return [...new Map(groups.flat().map((output) => [output.seq, output])).values()].sort(
-    (a, b) => a.seq - b.seq,
-  );
-}
-
 async function readMissingOutputs(
   control: HttpCanonicalControlClient,
   job: string,
@@ -121,13 +121,13 @@ async function readPartialToolBoundaries(
   control: HttpCanonicalControlClient,
   job: string,
   tools: readonly ControlToolCall[],
-  outputs: readonly ControlOutput[],
+  outputs: OutputSequence,
   signal: AbortSignal,
   times: Map<number, number>,
   responses: readonly ControlProviderResponse[],
   gate?: ToolTimeGate,
 ): Promise<PartialToolBoundary[] | null> {
-  const first = outputs[0]?.created_at_us;
+  const first = outputs.at(0)?.created_at_us;
   if (!tools.length || first === undefined) return null;
   try {
     const requests = [...new Set(tools.map((call) => call.request))].sort((a, b) => b - a);
@@ -198,7 +198,7 @@ type Turn = {
   sessionId: string;
   job: ControlJob;
   input: ControlConversationTurn["input"];
-  outputs: ControlOutput[];
+  outputs: OutputHistory;
   // Advances when the live array is appended in place, including while an
   // asynchronous history read holds a shallow snapshot of this turn.
   outputRevision?: number;
@@ -234,7 +234,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly projections = new WeakMap<
     Turn,
     {
-      outputs: ControlOutput[];
+      outputs: OutputHistory;
       length: number;
       aggregate: TranscriptAccumulator;
       arguments?: readonly unknown[];
@@ -595,7 +595,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return (
       !!this.earlier.get(sessionId) ||
       [...this.turns.values()].some(
-        (turn) => turn.sessionId === sessionId && (turn.outputs[0]?.seq ?? 1) > 1,
+        (turn) => turn.sessionId === sessionId && turn.outputs.firstSeq > 1,
       )
     );
   }
@@ -606,7 +606,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const cursor = this.earlier.get(sessionId);
     if (this.disposed) return Promise.resolve();
     const partial = [...this.turns.values()]
-      .filter((turn) => turn.sessionId === sessionId && (turn.outputs[0]?.seq ?? 1) > 1)
+      .filter((turn) => turn.sessionId === sessionId && turn.outputs.firstSeq > 1)
       .sort(
         (a, b) => b.job.created_at_us - a.job.created_at_us || b.job.id.localeCompare(a.job.id),
       )[0];
@@ -618,8 +618,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       try {
         if (partial) {
           const held = partial.outputs;
-          let before = held[0].seq;
-          let loaded: typeof held = [];
+          let before = held.firstSeq;
+          let loaded: ControlOutput[] = [];
           while (true) {
             const earlier = await readOutputWindow(this.control, partial.job.id, {
               beforeSeq: before,
@@ -640,11 +640,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             if (next >= before) break;
             before = next;
           }
-          const merged = new Map(
-            [...loaded, ...held, ...partial.outputs].map((output) => [output.seq, output]),
-          );
-          partial.outputs = [...merged.values()].sort((a, b) => a.seq - b.seq);
-          if (partial.outputs[0]?.seq === 1) {
+          partial.outputs = mergeOutputHistory(loaded, held, partial.outputs);
+          if (partial.outputs.firstSeq === 1) {
             const evidence = await readTranscriptEvidence(this.control, partial.job.id, {
               signal: this.lifetime.signal,
             });
@@ -716,23 +713,24 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
     const previous = this.turns.get(turn.job.id);
     const snapshot = previous ? { ...previous } : undefined;
-    let outputs =
+    const window =
       turn.outputs_truncated || (turn.outputs.at(-1)?.seq ?? 0) > 200
         ? (await readOutputWindow(this.control, turn.job.id, { signal: this.lifetime.signal }))
             .outputs
         : turn.outputs;
-    if (previous?.outputs.length && outputs.length) {
-      const last = previous.outputs.at(-1)?.seq ?? 0;
+    let outputs = mergeOutputHistory(window);
+    if (previous?.outputs.length && window.length) {
+      const last = previous.outputs.lastSeq;
       const gap = await readMissingOutputs(
         this.control,
         turn.job.id,
         last,
-        outputs[0].seq - 1,
+        window[0].seq - 1,
         this.lifetime.signal,
       );
-      outputs = mergeOutputs(previous.outputs, gap, outputs);
+      outputs = mergeOutputHistory(previous.outputs, gap, window);
     }
-    const complete = (outputs[0]?.seq ?? 1) === 1;
+    const complete = outputs.firstSeq === 1;
     const evidence = await readTranscriptEvidence(this.control, turn.job.id, {
       signal: this.lifetime.signal,
       readReplies: complete,
@@ -767,7 +765,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     }
     if (
       turn.job.settlement.state === "unsettled" ||
-      outputs.some((output) => output.code === "task_plan_scheduled")
+      [...outputs].some((output) => output.code === "task_plan_scheduled")
     ) {
       state.details = await this.control.readJobDetails(turn.job.id, this.lifetime.signal);
       state.job = reconcileJob(state.job, state.details);
@@ -796,14 +794,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private projectTurn(
     turn: Turn,
     partial: boolean,
-  ): { transcript: TranscriptTurn[]; result: ControlOutput | null } {
+  ): { transcript: TranscriptTurn[]; result: OutputView | null } {
     let cached = this.projections.get(turn);
     if (!cached || cached.outputs !== turn.outputs || cached.length > turn.outputs.length) {
       cached = { outputs: turn.outputs, length: 0, aggregate: new TranscriptAccumulator() };
       this.projections.set(turn, cached);
     }
-    while (cached.length < turn.outputs.length)
-      cached.aggregate.append(turn.outputs[cached.length++]);
+    while (cached.length < turn.outputs.length) {
+      const output = turn.outputs.at(cached.length++);
+      if (!output) throw new Error("Stored output projection is incomplete.");
+      cached.aggregate.append(output);
+    }
     const args = [
       turn.outputRevision,
       turn.outputs,
@@ -866,9 +867,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         (a, b) => a.job.created_at_us - b.job.created_at_us || a.job.id.localeCompare(b.job.id),
       );
     // Keep the visible history contiguous: inputs and older turns precede any missing outputs.
-    const lastPartial = turns.findLastIndex((turn) => (turn.outputs[0]?.seq ?? 1) > 1);
+    const lastPartial = turns.findLastIndex((turn) => turn.outputs.firstSeq > 1);
     const messages: ChatMessage[] = turns.slice(Math.max(lastPartial, 0)).flatMap((turn) => {
-      const partial = (turn.outputs[0]?.seq ?? 1) > 1;
+      const partial = turn.outputs.firstSeq > 1;
       const entries = materializeUserEntries(turn.entries ?? []);
       const queued =
         turn.job.previous !== null &&
@@ -1038,7 +1039,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       inFlight = true;
       try {
         const details = await this.control.readJobDetails(jobId, this.lifetime.signal);
-        const readReplies = (turn.outputs[0]?.seq ?? 1) === 1;
+        const readReplies = turn.outputs.firstSeq === 1;
         const evidence = await readTranscriptEvidence(this.control, jobId, {
           signal: this.lifetime.signal,
           previous: turn.responses,
@@ -1065,7 +1066,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         turn.job = reconcileJob(turn.job, details);
         turn.details = details;
         turn.unknownReason = details.unknown_reason;
-        const last = turn.outputs.at(-1)?.seq ?? 0;
+        const last = turn.outputs.lastSeq;
         const through = Math.max(
           details.activity.last_output_seq,
           details.result?.seq ?? 0,
@@ -1088,13 +1089,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             throw error;
           }
           if (entry.stopped || this.disposed) return;
-          turn.outputs = mergeOutputs(turn.outputs, missing);
+          turn.outputs = mergeOutputHistory(turn.outputs, missing);
         }
         turn.tools = reuseEvidence(turn.tools, evidence.tools);
-        if (readReplies && (turn.outputs[0]?.seq ?? 1) === 1)
+        if (readReplies && turn.outputs.firstSeq === 1)
           turn.responses = reuseEvidence(turn.responses, evidence.responses);
         if (
-          (turn.outputs[0]?.seq ?? 1) > 1 &&
+          turn.outputs.firstSeq > 1 &&
           details.settlement.state === "completed" &&
           turn.tools.length &&
           turn.partialToolBoundaries == null
@@ -1155,12 +1156,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           if (this.disposed || entry.stopped) return;
           if (event.type === "heartbeat") return;
           if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
-          if (event.type === "output" && event.output.seq > (turn.outputs.at(-1)?.seq ?? 0)) {
-            if (event.output.seq !== (turn.outputs.at(-1)?.seq ?? 0) + 1) {
+          if (event.type === "output" && event.output.seq > turn.outputs.lastSeq) {
+            if (event.output.seq !== turn.outputs.lastSeq + 1) {
               replayThrough = Math.max(replayThrough, event.output.seq);
               throw new ContractError("output.seq", "the next stored sequence without a gap");
             }
-            turn.outputs.push(event.output);
+            turn.outputs.append(event.output);
             turn.outputRevision = (turn.outputRevision ?? 0) + 1;
           }
           if (event.type === "settlement") {
@@ -1177,7 +1178,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         },
         {
           signal: this.lifetime.signal,
-          afterSeq: turn.outputs.at(-1)?.seq ?? 0,
+          afterSeq: turn.outputs.lastSeq,
           onReconnect: (error) => {
             turn.error = `Reconnecting: ${error.code}`;
             this.publish(turn.sessionId);
@@ -1319,20 +1320,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.control.readJobInput(job),
       readOutputWindow(this.control, job, { signal: this.lifetime.signal }),
     ]);
-    let outputs = window.outputs;
-    if (previous?.outputs.length && outputs.length) {
+    let outputs = mergeOutputHistory(window.outputs);
+    if (previous?.outputs.length && window.outputs.length) {
       const gap = await readMissingOutputs(
         this.control,
         job,
-        previous.outputs.at(-1)?.seq ?? 0,
-        outputs[0].seq - 1,
+        previous.outputs.lastSeq,
+        window.outputs[0].seq - 1,
         this.lifetime.signal,
       );
-      outputs = mergeOutputs(previous.outputs, gap, outputs);
+      outputs = mergeOutputHistory(previous.outputs, gap, window.outputs);
     }
     const evidence = await readTranscriptEvidence(this.control, job, {
       signal: this.lifetime.signal,
-      readReplies: (outputs[0]?.seq ?? 1) === 1,
+      readReplies: outputs.firstSeq === 1,
     });
     const page = record.conversation
       ? await this.control.readConversationTurns(
@@ -1355,11 +1356,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       toolError: evidence.error,
       unknownReason: record.unknown_reason ?? null,
     };
-    if (
-      (outputs[0]?.seq ?? 1) > 1 &&
-      record.settlement.state === "completed" &&
-      turn.tools.length
-    ) {
+    if (outputs.firstSeq > 1 && record.settlement.state === "completed" && turn.tools.length) {
       const times = new Map(previous?.partialToolTimes);
       turn.partialToolBoundaries = await readPartialToolBoundaries(
         this.control,
@@ -1490,6 +1487,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       entry.stop();
     }
     this.streams.clear();
+    this.turns.clear();
+    this.images.clear();
     super.dispose();
   }
 }
