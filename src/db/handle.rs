@@ -4,6 +4,14 @@ use super::commands::{
 };
 use super::*;
 
+struct AttachmentPermit(flume::Sender<()>);
+
+impl Drop for AttachmentPermit {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Vitals {
     pub database_bytes: Option<u64>,
@@ -121,6 +129,16 @@ fn process_memory() -> (Option<u64>, Option<u64>) {
 }
 
 impl DatabaseHandle {
+    async fn attachment_permit(&self) -> Result<AttachmentPermit, DatabaseError> {
+        self.shared
+            .attachment_slots
+            .1
+            .recv_async()
+            .await
+            .map_err(|_| DatabaseError::ShuttingDown)?;
+        Ok(AttachmentPermit(self.shared.attachment_slots.0.clone()))
+    }
+
     pub(crate) async fn terminal_jobs(
         &self,
         jobs: Vec<JobId>,
@@ -2093,18 +2111,24 @@ impl DatabaseHandle {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
         )?;
-        let pin = self
-            .shared
-            .attachments
-            .publish(&attachment.content)
-            .map_err(AttachmentError::NotStored)?;
-        let published = PublishedAttachment {
-            sha256: pin.digest(),
-            byte_length: attachment.content.len() as u64,
-            mime: attachment.mime,
-            display_name: attachment.display_name,
-            origin: AttachmentOrigin::UserProvided,
-        };
+        let permit = self.attachment_permit().await?;
+        let shared = self.shared.clone();
+        let (pin, published, permit) = ntex::rt::spawn_blocking(move || {
+            let pin = shared
+                .attachments
+                .publish(&attachment.content)
+                .map_err(AttachmentError::NotStored)?;
+            let published = PublishedAttachment {
+                sha256: pin.digest(),
+                byte_length: attachment.content.len() as u64,
+                mime: attachment.mime,
+                display_name: attachment.display_name,
+                origin: AttachmentOrigin::UserProvided,
+            };
+            Ok::<_, AttachmentError>((pin, published, permit))
+        })
+        .await
+        .map_err(|_| DatabaseError::WorkerPanicked)??;
         let created = self
             .submit(|reply| {
                 Command::new(
@@ -2129,7 +2153,11 @@ impl DatabaseHandle {
             ),
         };
         if settled {
-            pin.release();
+            let _ = ntex::rt::spawn_blocking(move || {
+                pin.release();
+                drop(permit);
+            })
+            .await;
         }
         Ok(created?)
     }
@@ -2167,11 +2195,18 @@ impl DatabaseHandle {
         if let Some(cleanup) = record.cleanup {
             return Err(AttachmentError::CleanedUp { id, cleanup });
         }
-        let bytes = match self
-            .shared
-            .attachments
-            .load(record.sha256, record.byte_length)
-        {
+        let permit = self.attachment_permit().await?;
+        let shared = self.shared.clone();
+        let digest = record.sha256;
+        let length = record.byte_length;
+        let loaded = ntex::rt::spawn_blocking(move || {
+            let result = shared.attachments.load(digest, length);
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|_| DatabaseError::WorkerPanicked)?;
+        let bytes = match loaded {
             Ok(bytes) => bytes,
             // Reclaimed since the record was read, by a cleanup that
             // committed meanwhile; otherwise the file is truly missing.
