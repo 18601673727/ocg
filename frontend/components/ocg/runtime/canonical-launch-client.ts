@@ -86,29 +86,44 @@ async function readPartialToolBoundaries(
       // The first request often already precedes the window. Later batches
       // bound speculative reads while avoiding a serial walk through a long turn.
       const count = offset === 0 ? 1 : TOOL_TIME_BATCH_SIZE;
-      const batch = requests.slice(offset, offset + count);
-      const values = await Promise.allSettled(
-        batch.map((request) => {
+      let batch = requests.slice(offset, offset + count);
+      const knownBoundary = batch.findIndex((request) => {
+        const at = recorded.get(request) ?? times.get(request);
+        return at !== undefined && at < first;
+      });
+      if (knownBoundary >= 0) batch = batch.slice(0, knownBoundary + 1);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+      try {
+        const values = batch.map((request) => {
           const known = recorded.get(request) ?? times.get(request);
-          return known === undefined ? control.readToolResponseTime(job, request, signal) : known;
-        }),
-      );
-      signal.throwIfAborted();
-      for (let i = 0; i < batch.length; i++) {
-        const value = values[i];
-        if (value.status !== "fulfilled" || value.value === null) continue;
-        times.delete(batch[i]);
-        times.set(batch[i], value.value);
-        if (times.size > TOOL_TIME_CACHE_LIMIT) times.delete(times.keys().next().value!);
-      }
-      for (let i = 0; i < batch.length; i++) {
-        const value = values[i];
-        if (value.status === "rejected") throw value.reason;
-        const at = value.value;
-        if (at === null) return null;
-        const request = batch[i];
-        boundaries.push({ request, at });
-        if (at < first) return boundaries.reverse();
+          return Promise.resolve(
+            known === undefined
+              ? control.readToolResponseTime(job, request, controller.signal)
+              : known,
+          ).then(
+            (value) => ({ value }),
+            (error: unknown) => ({ error }),
+          );
+        });
+        for (let i = 0; i < batch.length; i++) {
+          const result = await values[i];
+          signal.throwIfAborted();
+          if ("error" in result) throw result.error;
+          const at = result.value;
+          if (at === null) return null;
+          const request = batch[i];
+          times.delete(request);
+          times.set(request, at);
+          if (times.size > TOOL_TIME_CACHE_LIMIT) times.delete(times.keys().next().value!);
+          boundaries.push({ request, at });
+          if (at < first) return boundaries.reverse();
+        }
+      } finally {
+        controller.abort();
+        signal.removeEventListener("abort", abort);
       }
       offset += batch.length;
     }
