@@ -2220,52 +2220,49 @@ fn conversation_matches(
         let chars = term.chars().take(3).collect::<Vec<_>>();
         let gram = indexes::search_gram(&chars);
         let mut matched = false;
-        for candidate in index.range(
-            (conversation.get(), gram, 0, 0, 0)
-                ..=(conversation.get(), gram, u128::MAX, u8::MAX, u32::MAX),
-        )? {
-            let (_, _, turn, source, seq) = candidate?.0.value();
-            let row = read_job_row(rx, JobId::new(turn))?
+        for candidate in
+            index.range((conversation.get(), gram, 0)..=(conversation.get(), gram, u128::MAX))?
+        {
+            let (_, _, turn) = candidate?.0.value();
+            let turn = JobId::new(turn);
+            let row = read_job_row(rx, turn)?
                 .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
             if !indexes::searchable_turn(&row) {
                 continue;
             }
-            let text = match source {
-                0 => {
-                    let entries = turn_entries(rx, JobId::new(turn))?;
-                    let Some((_, entry)) = entries.iter().find(|(current, _)| *current == seq)
-                    else {
-                        continue;
-                    };
-                    let Some(text) =
-                        indexes::search_input_text(&rx.open_table(ATTACHMENTS)?, &entry.entry)?
-                    else {
-                        continue;
-                    };
-                    text
+            for (_, entry) in turn_entries(rx, turn)? {
+                if let Some(text) =
+                    indexes::search_input_text(&rx.open_table(ATTACHMENTS)?, &entry.entry)?
+                    && text.to_lowercase().contains(term)
+                {
+                    matched = true;
+                    break;
                 }
-                1 => {
-                    let table = rx.open_table(JOB_OUTPUTS)?;
-                    let bytes = table
-                        .get((turn, seq))?
-                        .ok_or_else(|| StorageError::corrupted("search output missing"))?;
-                    let output = decode_output((turn, seq), bytes.value())?;
-                    let completed = rx
-                        .open_table(JOB_STATES)?
-                        .get(turn)?
-                        .map(|bytes| JobState::decode_at(turn, bytes.value()))
-                        .transpose()?
-                        .and_then(|state| state.outcome)
-                        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
-                    let Some(text) = indexes::search_output_text(&output, completed) else {
-                        continue;
-                    };
-                    text.to_owned()
+            }
+            if matched {
+                break;
+            }
+            let completed = rx
+                .open_table(JOB_STATES)?
+                .get(turn.get())?
+                .map(|bytes| JobState::decode_at(turn.get(), bytes.value()))
+                .transpose()?
+                .and_then(|state| state.outcome)
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+            for entry in rx
+                .open_table(JOB_OUTPUTS)?
+                .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+            {
+                let (key, bytes) = entry?;
+                let output = decode_output(key.value(), bytes.value())?;
+                if let Some(text) = indexes::search_output_text(&output, completed)
+                    && text.to_lowercase().contains(term)
+                {
+                    matched = true;
+                    break;
                 }
-                _ => return Err(StorageError::corrupted("invalid search source")),
-            };
-            if text.to_lowercase().contains(term) {
-                matched = true;
+            }
+            if matched {
                 break;
             }
         }

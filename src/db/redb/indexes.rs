@@ -12,14 +12,14 @@ use ::redb::TableHandle;
 use super::*;
 use crate::db::entities::{OutcomeKind, RequestEventRecord, RequestPayload};
 
-/// Encodes up to three Unicode scalars, including the length.
-pub(super) fn search_gram(chars: &[char]) -> u128 {
-    chars.iter().fold(chars.len() as u128, |key, ch| {
-        (key << 21) | u128::from(u32::from(*ch))
-    })
+/// Encodes up to three Unicode scalars as char + 1 in 21-bit slots.
+pub(super) fn search_gram(chars: &[char]) -> u64 {
+    chars
+        .iter()
+        .fold(0, |key, ch| (key << 21) | u64::from(u32::from(*ch) + 1))
 }
 
-pub(super) fn search_grams(text: &str) -> BTreeSet<u128> {
+pub(super) fn search_grams(text: &str) -> BTreeSet<u64> {
     let mut grams = BTreeSet::new();
     let mut window = [char::default(); 3];
     let mut count = 0;
@@ -34,14 +34,11 @@ pub(super) fn search_grams(text: &str) -> BTreeSet<u128> {
     grams
 }
 
-pub(super) fn index_search_text(
+fn turn_search_grams(
     tx: &WriteTransaction,
     conversation: JobId,
     turn: JobId,
-    source: u8,
-    seq: u32,
-    text: &str,
-) -> Result<(), StorageError> {
+) -> Result<BTreeSet<u64>, StorageError> {
     let jobs = tx.open_table(JOBS)?;
     let row = jobs
         .get(conversation.get())?
@@ -52,11 +49,57 @@ pub(super) fn index_search_text(
     if !searchable_conversation(&JobSpec::decode_at(conversation.get(), row.value())?)
         || !searchable_turn(&JobSpec::decode_at(turn.get(), turn_row.value())?)
     {
-        return Ok(());
+        return Ok(BTreeSet::new());
     }
+    let mut grams = BTreeSet::new();
+    for (_, entry) in
+        reader::effective_entries(reader::job_entries_of(&tx.open_table(JOB_INPUTS)?, turn)?)?
+    {
+        if let Some(text) = search_input_text(&tx.open_table(ATTACHMENTS)?, &entry.entry)? {
+            grams.extend(search_grams(&text));
+        }
+    }
+    let completed = tx
+        .open_table(JOB_STATES)?
+        .get(turn.get())?
+        .map(|bytes| JobState::decode_at(turn.get(), bytes.value()))
+        .transpose()?
+        .and_then(|state| state.outcome)
+        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+    for entry in tx
+        .open_table(JOB_OUTPUTS)?
+        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+    {
+        let (key, bytes) = entry?;
+        let output = decode_output(key.value(), bytes.value())?;
+        if let Some(text) = search_output_text(&output, completed) {
+            grams.extend(search_grams(text));
+        }
+    }
+    Ok(grams)
+}
+
+pub(super) fn rebuild_turn_search_index(
+    tx: &WriteTransaction,
+    conversation: JobId,
+    turn: JobId,
+) -> Result<(), StorageError> {
+    let grams = turn_search_grams(tx, conversation, turn)?;
     let mut table = tx.open_table(CONVERSATION_SEARCH)?;
-    for gram in search_grams(text) {
-        table.insert((conversation.get(), gram, turn.get(), source, seq), ())?;
+    let existing = table
+        .range((conversation.get(), 0, 0)..=(conversation.get(), u64::MAX, u128::MAX))?
+        .map(|entry| {
+            let (key, _) = entry?;
+            Ok(key.value())
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    for (_, gram, indexed_turn) in existing {
+        if indexed_turn == turn.get() && !grams.contains(&gram) {
+            table.remove((conversation.get(), gram, turn.get()))?;
+        }
+    }
+    for gram in grams {
+        table.insert((conversation.get(), gram, turn.get()), ())?;
     }
     Ok(())
 }
@@ -130,58 +173,37 @@ fn visit_search_keys(
     tx: &WriteTransaction,
     mut visit: impl FnMut(schema::ConversationSearchKey) -> Result<(), StorageError>,
 ) -> Result<(), StorageError> {
-    let jobs = tx.open_table(JOBS)?;
-    let conversation_for = |turn: u128| -> Result<Option<JobId>, StorageError> {
-        let row = jobs
-            .get(turn)?
-            .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
-        let row = JobSpec::decode_at(turn, row.value())?;
-        if !searchable_turn(&row) {
-            return Ok(None);
-        }
-        let Some(parent) = row.parent_id else {
-            return Ok(None);
+    let turns = {
+        let jobs = tx.open_table(JOBS)?;
+        let conversation_for = |turn: u128| -> Result<Option<JobId>, StorageError> {
+            let row = jobs
+                .get(turn)?
+                .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
+            let row = JobSpec::decode_at(turn, row.value())?;
+            if !searchable_turn(&row) {
+                return Ok(None);
+            }
+            let Some(parent) = row.parent_id else {
+                return Ok(None);
+            };
+            let row = jobs
+                .get(parent.get())?
+                .ok_or_else(|| StorageError::corrupted("search parent missing"))?;
+            Ok(
+                searchable_conversation(&JobSpec::decode_at(parent.get(), row.value())?)
+                    .then_some(parent),
+            )
         };
-        let row = jobs
-            .get(parent.get())?
-            .ok_or_else(|| StorageError::corrupted("search parent missing"))?;
-        Ok(
-            searchable_conversation(&JobSpec::decode_at(parent.get(), row.value())?)
-                .then_some(parent),
-        )
+        jobs.iter()?
+            .map(|entry| {
+                let turn = entry?.0.value();
+                Ok(conversation_for(turn)?.map(|conversation| (conversation, turn)))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?
     };
-    let inputs = tx.open_table(JOB_INPUTS)?;
-    for entry in jobs.iter()? {
-        let turn = entry?.0.value();
-        if let Some(conversation) = conversation_for(turn)? {
-            for (seq, entry) in
-                reader::effective_entries(reader::job_entries_of(&inputs, JobId::new(turn))?)?
-            {
-                if let Some(text) = search_input_text(&tx.open_table(ATTACHMENTS)?, &entry.entry)? {
-                    for gram in search_grams(&text) {
-                        visit((conversation.get(), gram, turn, 0, seq))?;
-                    }
-                }
-            }
-        }
-    }
-    for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
-        let (key, bytes) = entry?;
-        let (turn, seq) = key.value();
-        let completed = tx
-            .open_table(JOB_STATES)?
-            .get(turn)?
-            .map(|bytes| JobState::decode_at(turn, bytes.value()))
-            .transpose()?
-            .and_then(|state| state.outcome)
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
-        if let Some(conversation) = conversation_for(turn)? {
-            let output = decode_output(key.value(), bytes.value())?;
-            if let Some(text) = search_output_text(&output, completed) {
-                for gram in search_grams(text) {
-                    visit((conversation.get(), gram, turn, 1, seq))?;
-                }
-            }
+    for (conversation, turn) in turns.into_iter().flatten() {
+        for gram in turn_search_grams(tx, conversation, JobId::new(turn))? {
+            visit((conversation.get(), gram, turn))?;
         }
     }
     Ok(())

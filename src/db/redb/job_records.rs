@@ -1981,22 +1981,15 @@ impl Batch {
         let at = self.now;
         let (seq, first_user) = self.step(|tx| {
             let mut first_user = false;
-            let replaced = match &entry {
+            match &entry {
                 Entry::UserMessageEdit { message, .. } | Entry::UserMessageWithdraw { message } => {
-                    let previous = reader::effective_entries(reader::job_entries_of(
+                    reader::effective_entries(reader::job_entries_of(
                         &tx.open_table(JOB_INPUTS)?,
                         turn,
                     )?)?
                     .into_iter()
                     .find(|(seq, _)| seq == message)
                     .ok_or_else(|| StorageError::corrupted("queued amendment target missing"))?;
-                    Some((
-                        *message,
-                        indexes::search_input_text(
-                            &tx.open_table(ATTACHMENTS)?,
-                            &previous.1.entry,
-                        )?,
-                    ))
                 }
                 Entry::UserMessage { .. }
                 | Entry::AgentMessage { .. }
@@ -2006,7 +1999,7 @@ impl Batch {
                 | Entry::Iteration { .. }
                 | Entry::ResponseFormat { .. }
                 | Entry::ContextPreparation { .. }
-                | Entry::ContextUse { .. } => None,
+                | Entry::ContextUse { .. } => {}
             };
             let mut table = tx.open_table(JOB_INPUTS)?;
             let seq = table
@@ -2023,26 +2016,9 @@ impl Batch {
                 .encode()
                 .as_slice(),
             )?;
-            if let Some(conversation) = row.parent_id
-                && let Some((message, Some(text))) = &replaced
-            {
-                let mut index = tx.open_table(CONVERSATION_SEARCH)?;
-                for gram in indexes::search_grams(text) {
-                    index.remove((conversation.get(), gram, turn.get(), 0, *message))?;
-                }
-            }
-            if let Some(conversation) = row.parent_id
-                && let Some(text) =
-                    indexes::search_input_text(&tx.open_table(ATTACHMENTS)?, &entry)?
-            {
-                indexes::index_search_text(
-                    tx,
-                    conversation,
-                    turn,
-                    0,
-                    replaced.as_ref().map_or(seq, |(message, _)| *message),
-                    &text,
-                )?;
+            drop(table);
+            if let Some(conversation) = row.parent_id {
+                indexes::rebuild_turn_search_index(tx, conversation, turn)?;
             }
             match entry {
                 Entry::UserMessage { attachments, .. } => {

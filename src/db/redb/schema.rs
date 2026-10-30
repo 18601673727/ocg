@@ -56,8 +56,8 @@ pub(super) const HELD_SLOTS: TableDefinition<(u128, u128), (u64, bool)> =
 pub(super) const CHILDREN: TableDefinition<(u128, u128), ()> = TableDefinition::new("children");
 pub(super) const SUCCESSORS: TableDefinition<u128, u128> = TableDefinition::new("successor");
 pub(super) const GROUP_HEADS: TableDefinition<u128, u128> = TableDefinition::new("job_group_head");
-/// (conversation, Unicode gram, turn, source: input=0/result=1, sequence)
-pub(crate) type ConversationSearchKey = (u128, u128, u128, u8, u32);
+/// (conversation, Unicode gram, turn)
+pub(crate) type ConversationSearchKey = (u128, u64, u128);
 pub(super) const CONVERSATION_SEARCH: TableDefinition<ConversationSearchKey, ()> =
     TableDefinition::new("conversation_search");
 pub(super) const CHILD_GROUPS: TableDefinition<(u128, u128), ()> =

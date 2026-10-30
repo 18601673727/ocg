@@ -1517,23 +1517,14 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(JOB_OUTPUTS)?
                 .insert((job.get(), seq), encode_output(&record).as_slice())?;
-            let completed = tx
-                .open_table(JOB_STATES)?
-                .get(job.get())?
-                .map(|bytes| JobState::decode_at(job.get(), bytes.value()))
-                .transpose()?
-                .and_then(|state| state.outcome)
-                .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
             let conversation = tx
                 .open_table(JOBS)?
                 .get(job.get())?
                 .map(|bytes| JobSpec::decode_at(job.get(), bytes.value()))
                 .transpose()?
                 .and_then(|row| row.parent_id);
-            if let Some(text) = indexes::search_output_text(&record, completed)
-                && let Some(conversation) = conversation
-            {
-                indexes::index_search_text(tx, conversation, job, 1, seq, text)?;
+            if let Some(conversation) = conversation {
+                indexes::rebuild_turn_search_index(tx, conversation, job)?;
             }
             Ok(())
         })?;
