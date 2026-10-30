@@ -23,7 +23,7 @@ use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmPara
 use crate::system::http::{authorization, provider_client};
 
 const STREAM_OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
-const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(crate) const CHART_INSTRUCTIONS: &str = "For line, bar, pie, or combo charts, always use `ocg-chart` instead of Mermaid or `xychart-beta`; reserve Mermaid for other diagram types. \
      An `ocg-chart` fenced code block contains only JSON with this shape: \
