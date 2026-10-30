@@ -373,21 +373,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
   // Browsers share a small HTTP/1 connection pool across tabs. Rotate event
   // streams so ordinary requests can run even when several views are open.
-  function streamAttempt(parent: AbortSignal) {
+  function streamAttempt(parent: AbortSignal, completeBeforeRotation = false) {
     const controller = new AbortController();
     let rotated = false;
+    let rotationDue = false;
+    let complete = !completeBeforeRotation;
+    const rotate = () => {
+      rotated = true;
+      controller.abort();
+    };
     const abort = () => controller.abort();
     parent.addEventListener("abort", abort, { once: true });
     if (parent.aborted) abort();
     const timer = programmatic
       ? undefined
       : setTimeout(() => {
-          rotated = true;
-          controller.abort();
+          rotationDue = true;
+          if (complete) rotate();
         }, 5000);
     return {
       signal: controller.signal,
       rotated: () => rotated,
+      complete: () => {
+        complete = true;
+        if (rotationDue) rotate();
+      },
+      abort: () => controller.abort(),
       dispose: () => {
         if (timer !== undefined) clearTimeout(timer);
         parent.removeEventListener("abort", abort);
@@ -534,14 +545,31 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     path: string | (() => string),
     receive: (snapshot: Snapshot) => void,
     onError: (error: unknown) => void,
+    initialTopics?: readonly string[],
   ) {
     const controller = new AbortController();
     active.add(controller);
     const signal = controller.signal;
+    const locks = !programmatic && typeof navigator !== "undefined" ? navigator.locks : undefined;
     void (async () => {
       let delay = 250;
-      while (!signal.aborted) {
-        const attempt = streamAttempt(signal);
+      const runAttempt = async (): Promise<boolean> => {
+        const attempt = streamAttempt(signal, !!locks);
+        const remaining = initialTopics ? new Set(initialTopics) : null;
+        const started = new Set<string>();
+        let initialComplete = false;
+        let stalled = false;
+        let progressTimer: ReturnType<typeof setTimeout> | undefined;
+        let lineKind: "start" | "comment" | "event" = "start";
+        const progress = () => {
+          if (!locks || initialComplete) return;
+          if (progressTimer !== undefined) clearTimeout(progressTimer);
+          progressTimer = setTimeout(() => {
+            stalled = true;
+            attempt.abort();
+          }, options.streamIdleMs ?? 45000);
+        };
+        progress();
         try {
           const response = await fetchImpl(`${base}${typeof path === "string" ? path : path()}`, {
             headers: { Accept: "text/event-stream", ...(await credentials()) },
@@ -593,7 +621,17 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
               }
               attempt.signal.throwIfAborted();
               if (chunk.done) break;
-              for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
+              const text = decoder.decode(chunk.value, { stream: true });
+              let advanced = false;
+              for (const character of text) {
+                if (character === "\n" || character === "\r") lineKind = "start";
+                else {
+                  if (lineKind === "start") lineKind = character === ":" ? "comment" : "event";
+                  if (lineKind === "event") advanced = true;
+                }
+              }
+              if (advanced) progress();
+              for (const frame of parser.push(text)) {
                 if ("comment" in frame) continue;
                 const data = JSON.parse(frame.data);
                 if (frame.event === "stream_error") {
@@ -601,7 +639,24 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                   throw new ControlTransportError(error.code, 503, retryable(503, error.code));
                 }
                 if (frame.event !== "snapshot") continue;
-                receive(data as Snapshot);
+                const snapshot = data as Snapshot;
+                const key = `${snapshot.topic}:${snapshot.key ?? ""}`;
+                if (snapshot.first) started.add(key);
+                if (
+                  !started.has(key) &&
+                  !(initialComplete && snapshot.topic === "observation_changes")
+                )
+                  throw new ContractError("snapshot.first", "the first page of a snapshot");
+                receive(snapshot);
+                if (!initialComplete && snapshot.last && started.has(key)) {
+                  remaining?.delete(key);
+                  if (!remaining || remaining.size === 0) {
+                    initialComplete = true;
+                    if (progressTimer !== undefined) clearTimeout(progressTimer);
+                    attempt.complete();
+                  }
+                }
+                if (snapshot.last) started.delete(key);
                 delay = 250;
               }
             }
@@ -611,23 +666,32 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           }
           throw new ControlTransportError("connection_lost", 0, true);
         } catch (error) {
-          if (signal.aborted) break;
+          if (signal.aborted) return false;
           if (attempt.rotated()) {
             delay = 250;
             await pause(100, signal);
-            continue;
+            return true;
           }
+          if (stalled) error = new ControlTransportError("stream_idle", 0, true);
           onError(error);
           if (
             error instanceof ContractError ||
             (error instanceof ControlTransportError && !error.retryable)
           )
-            break;
+            return false;
           await pause(delay, signal);
           delay = Math.min(delay * 2, 10000);
         } finally {
+          if (progressTimer !== undefined) clearTimeout(progressTimer);
           attempt.dispose();
         }
+        return true;
+      };
+      while (!signal.aborted) {
+        const keepGoing = locks
+          ? await locks.request("ocg-snapshot-stream", { signal }, runAttempt)
+          : await runAttempt();
+        if (!keepGoing) break;
       }
     })()
       .catch((error) => {
@@ -705,6 +769,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             observers.forEach((_, observer) => observer.error(error)),
           );
         },
+        [
+          "projects:",
+          "conversations:",
+          ...[...childObservers.keys()].map((id) => `children:${id}`),
+        ],
       );
     });
   }
