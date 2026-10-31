@@ -350,6 +350,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             done
             launchctl bootstrap "$domain/$uid" "$plist" </dev/null || true
         fi
+        rolled=false
         count=0
         if now=$(date +%s </dev/null); then deadline=$((now + 30)); else deadline=0; fi
         while [ "$count" -lt 30 ]; do
@@ -357,16 +358,16 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             if body=$(printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" | curl -sS -o - -w '\n%{http_code}' --max-time 2 --noproxy '*' -K - "http://127.0.0.1:$port/api/v1/health" 2>/dev/null); then
                 case $body in
                     *"\"version\":\"$previous\""*'
-200') break ;;
+200') rolled=true; break ;;
                     *'"version":'*) ;;
                     *'
-200') break ;;
+200') rolled=true; break ;;
                 esac
             fi
             sleep 1 </dev/null || true
             count=$((count + 1))
         done
-        printf 'Update to %s failed; back on %s. Logs: %s/service.log and %s/ocg_logs\n' "$version" "$previous" "$prefix" "$data" >&2
+        if [ "$rolled" = true ]; then printf 'Update to %s failed; back on %s. Logs: %s/service.log and %s/ocg_logs\n' "$version" "$previous" "$prefix" "$data" >&2; else printf 'Update to %s failed, and %s did not come back healthy. Logs: %s/service.log and %s/ocg_logs\n' "$version" "$previous" "$prefix" "$data" >&2; fi
     else
         printf 'OCG did not become healthy. Logs: %s/service.log and %s/ocg_logs\n' "$prefix" "$data" >&2
     fi
