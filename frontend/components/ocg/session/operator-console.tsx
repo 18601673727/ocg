@@ -70,10 +70,19 @@ export function OperatorConsole() {
       } catch (error: unknown) {
         if (!alive) return;
         if (error instanceof ControlTransportError && error.status === 401) {
-          // The session ended; the console asks to sign in again.
-          csrf.current = "";
-          setSession(null);
-          setPhase("out");
+          try {
+            const renewed = await client.readSession();
+            if (alive) {
+              csrf.current = renewed.csrfToken;
+              setSession(renewed);
+            }
+          } catch {
+            if (alive) {
+              csrf.current = "";
+              setSession(null);
+              setPhase("out");
+            }
+          }
         } else {
           setHealth(null);
         }

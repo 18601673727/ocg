@@ -1464,6 +1464,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return (await send("GET", "/api/v1/health", { signal })).input as Api.Health;
     },
 
+    async readUpdate(latest: boolean, signal?: AbortSignal) {
+      return (await send("GET", `/api/v1/update${latest ? "?latest=1" : ""}`, { signal }))
+        .input as Api.Update;
+    },
+
+    async startUpdate(version: string) {
+      return (await send("POST", "/api/v1/update", { body: { version }, sign: true }))
+        .input as Api.UpdateState;
+    },
+
     /** The Job's persisted lifecycle record. */
     async readJob(job: string, signal?: AbortSignal) {
       jobIdentity(job);

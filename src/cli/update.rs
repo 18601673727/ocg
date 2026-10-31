@@ -280,12 +280,16 @@ fn run_installer(
     let mut child = command.spawn()?;
     let stderr = child.stderr.take().ok_or("installer stderr unavailable")?;
     let mut message = None;
+    let mut fallback = None;
     for line in BufReader::new(stderr).lines() {
         let line = line?;
         writeln!(std::io::stderr().lock(), "{line}")?;
         if line.starts_with("Update to ") || line.starts_with("OCG did not") {
             message = Some(line);
+        } else if line.starts_with("OCG failed:") || (fallback.is_none() && !line.trim().is_empty())
+        {
+            fallback = Some(line);
         }
     }
-    Ok((child.wait()?, message))
+    Ok((child.wait()?, message.or(fallback)))
 }

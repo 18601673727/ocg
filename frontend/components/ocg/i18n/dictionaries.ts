@@ -1089,6 +1089,22 @@ export const en = {
   "aui.imageBlocked": "The provider blocked this image.",
 
   // -- language -------------------------------------------------------------------------
+  "updates.title": "Updates",
+  "updates.description": "Check for a newer OCG release.",
+  "updates.available": "OCG {running} is running. {latest} is available.",
+  "updates.current": "OCG {running} is up to date.",
+  "updates.running": "OCG {running} is running.",
+  "updates.release": "Release notes",
+  "updates.check": "Check now",
+  "updates.update": "Update",
+  "updates.terminal": "Run ocg update in a terminal.",
+  "updates.waitOne": "Waiting for {count} running Job",
+  "updates.waitMany": "Waiting for {count} running Jobs",
+  "updates.waiting": "Waiting to update",
+  "updates.installing": "Installing {version}",
+  "updates.still": "Still updating; see {path}",
+  "updates.succeeded": "Updated to {version}",
+  "updates.failed": "Update failed.",
   "language.title": "Language",
 } as const;
 
@@ -2099,6 +2115,22 @@ export const zh: Dictionary = {
   "aui.imagePreview": "图片预览",
   "aui.imageBlocked": "提供方屏蔽了这张图片。",
 
+  "updates.title": "更新",
+  "updates.description": "检查是否有更新的 OCG 版本。",
+  "updates.available": "正在运行 OCG {running}。版本 {latest} 可用。",
+  "updates.current": "OCG {running} 已是最新版本。",
+  "updates.running": "正在运行 OCG {running}。",
+  "updates.release": "发布说明",
+  "updates.check": "立即检查",
+  "updates.update": "更新",
+  "updates.terminal": "请在终端中运行 ocg update。",
+  "updates.waitOne": "正在等待 {count} 个运行中的任务",
+  "updates.waitMany": "正在等待 {count} 个运行中的任务",
+  "updates.waiting": "正在等待更新",
+  "updates.installing": "正在安装 {version}",
+  "updates.still": "仍在更新；请查看 {path}",
+  "updates.succeeded": "已更新到 {version}",
+  "updates.failed": "更新失败。",
   "language.title": "语言",
 };
 

@@ -226,6 +226,21 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         if launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1; then domain=gui; stopped=true
         elif launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; then domain=user; stopped=true
         fi
+        if [ "$stopped" = true ]; then
+            service_pid=$(launchctl print "$domain/$uid/$label" </dev/null 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)
+            case $service_pid in
+                ''|*[!0-9]*) ;;
+                *)
+                    launchctl kill SIGTERM "$domain/$uid/$label" </dev/null >/dev/null 2>&1 || true
+                    count=0
+                    while kill -0 "$service_pid" 2>/dev/null; do
+                        [ "$count" -lt 30 ] || break
+                        sleep 1 </dev/null
+                        count=$((count + 1))
+                    done
+                    ;;
+            esac
+        fi
         launchctl bootout "gui/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
         launchctl bootout "user/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
         count=0

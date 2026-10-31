@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/dialog";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { GlobalCompactionSection } from "./global-compaction-section";
+import { UpdatesSection } from "./updates-section";
 import { DecisionProfilesSection } from "./decision-profiles-section";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
@@ -1524,7 +1525,10 @@ export function SettingsSurface({
             </Section>
           )}
           {section === "system" && client && (
-            <GlobalCompactionSection client={client} profiles={snapshot} />
+            <>
+              <UpdatesSection client={client} />
+              <GlobalCompactionSection client={client} profiles={snapshot} />
+            </>
           )}
         </div>
       </div>
