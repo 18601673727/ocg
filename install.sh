@@ -324,13 +324,52 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     deadline=$(($(date +%s </dev/null) + 30))
     while [ "$(date +%s </dev/null)" -lt "$deadline" ]; do
-        if printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" | curl -fsS -o /dev/null --max-time 2 --noproxy '*' -K - "http://127.0.0.1:$port/api/v1/health" 2>/dev/null; then
-            printf 'OCG %s is available at http://127.0.0.1:%s\nData: %s\nSettings: %s\nStop: %s\nUninstall: curl -fsSL https://github.com/18601673727/ocg/releases/latest/download/install.sh | sh -s -- --prefix '\''%s'\'' --uninstall\n' "$version" "$port" "$data" "$settings" "$stop" "$prefix"
-            exit 0
+        if body=$(printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" | curl -sS -o - -w '\n%{http_code}' --max-time 2 --noproxy '*' -K - "http://127.0.0.1:$port/api/v1/health" 2>/dev/null); then
+            case $body in
+                *"\"version\":\"$version\""*'
+200')
+                    printf 'OCG %s is available at http://127.0.0.1:%s\nData: %s\nSettings: %s\nStop: %s\nUninstall: curl -fsSL https://github.com/18601673727/ocg/releases/latest/download/install.sh | sh -s -- --prefix '\''%s'\'' --uninstall\n' "$version" "$port" "$data" "$settings" "$stop" "$prefix"
+                    exit 0 ;;
+            esac
         fi
         sleep 1 </dev/null
     done
-    printf 'OCG did not become healthy. Logs: %s/service.log and %s/ocg_logs\n' "$prefix" "$data" >&2
+    if [ -n "$previous" ] && [ "$previous" != "$version" ] && [ -d "$prefix/versions/$previous" ]; then
+        ln -sfn "versions/$previous" "$prefix/current" </dev/null || true
+        if [ "$os" = Linux ]; then
+            systemctl --user reset-failed ocg </dev/null || true
+            systemctl --user restart ocg </dev/null || true
+        else
+            launchctl bootout "gui/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
+            launchctl bootout "user/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
+            count=0
+            while launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1 || launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; do
+                [ "$count" -lt 30 ] || break
+                sleep 1 </dev/null || true
+                count=$((count + 1))
+            done
+            launchctl bootstrap "$domain/$uid" "$plist" </dev/null || true
+        fi
+        count=0
+        if now=$(date +%s </dev/null); then deadline=$((now + 30)); else deadline=0; fi
+        while [ "$count" -lt 30 ]; do
+            if now=$(date +%s </dev/null); then [ "$now" -lt "$deadline" ] || break; else break; fi
+            if body=$(printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" | curl -sS -o - -w '\n%{http_code}' --max-time 2 --noproxy '*' -K - "http://127.0.0.1:$port/api/v1/health" 2>/dev/null); then
+                case $body in
+                    *"\"version\":\"$previous\""*'
+200') break ;;
+                    *'"version":'*) ;;
+                    *'
+200') break ;;
+                esac
+            fi
+            sleep 1 </dev/null || true
+            count=$((count + 1))
+        done
+        printf 'Update to %s failed; back on %s. Logs: %s/service.log and %s/ocg_logs\n' "$version" "$previous" "$prefix" "$data" >&2
+    else
+        printf 'OCG did not become healthy. Logs: %s/service.log and %s/ocg_logs\n' "$prefix" "$data" >&2
+    fi
     if [ -n "$previous" ]; then printf 'Rollback: ln -sfn versions/%s '\''%s/current'\'' and restart the service.\n' "$previous" "$prefix" >&2; fi
     exit 1
 }
