@@ -201,9 +201,13 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             }
         });
     state = returned_state;
-    if !check && prepared.is_err() && state.is_none() {
+    if !check
+        && prepared.is_err()
+        && state.is_none()
+        && let Some(to) = error_target
+    {
         state = Some(State {
-            to: error_target.unwrap_or_default(),
+            to,
             phase: Phase::Waiting,
             running_jobs: None,
             message: None,
