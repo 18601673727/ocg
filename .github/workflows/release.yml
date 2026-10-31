@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+      - id: version
+        shell: bash
+        run: |
+          version=$(awk '/^\[package\]/{package=1; next} /^\[/{package=0} package && /^version = / {gsub(/"/, "", $3); print $3; exit}' Cargo.toml)
+          tag_version=${GITHUB_REF_NAME#v}
+          printf 'Tag version: %s\nCargo.toml version: %s\n' "$tag_version" "$version"
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || [[ "$tag_version" != "$version" ]]; then
+            echo 'Tag does not match the Cargo.toml version.' >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo 'Tagged commit is not an ancestor of origin/main.' >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo 'prerelease=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'prerelease=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  ui:
+    runs-on: ubuntu-22.04
+    needs: check
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - run: cargo run --locked --bin ocg-rs-ts
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: frontend/package.json
+      - name: Build UI
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ui
+          path: frontend/out/
+          if-no-files-found: error
+
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
+      - name: Build and check binary
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.check.outputs.version }}
+        shell: bash
+        run: |
+          cargo build --release --locked --bin ocg --target "$TARGET"
+          actual=$("target/$TARGET/release/ocg" --version)
+          printf 'Binary version: %s\n' "$actual"
+          if [[ "$actual" != "ocg $VERSION" ]]; then
+            echo 'Binary version does not match the release version.' >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ocg
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-22.04
+    needs: [check, ui, build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: artifacts
+      - name: Package release
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        shell: bash
+        run: |
+          mkdir -p packages
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            name="ocg-v$VERSION-$target"
+            mkdir -p "packages/$name"
+            cp "artifacts/bin-$target/ocg" "packages/$name/ocg"
+            chmod 0755 "packages/$name/ocg"
+            cp -R artifacts/ui "packages/$name/ui"
+            cp LICENSE "packages/$name/LICENSE"
+            tar --owner=0 --group=0 --numeric-owner -czf "packages/$name.tar.gz" -C packages "$name"
+          done
+          cd packages
+          sha256sum *.tar.gz > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          PRERELEASE: ${{ needs.check.outputs.prerelease }}
+        shell: bash
+        run: |
+          cd packages
+          prerelease=()
+          if [[ "$PRERELEASE" == true ]]; then
+            prerelease+=(--prerelease)
+          fi
+          gh release create "v$VERSION" ./*.tar.gz SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "OCG $VERSION" \
+            --generate-notes "${prerelease[@]}"
