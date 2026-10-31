@@ -1,6 +1,33 @@
 #!/bin/sh
 set -eu
 
+stop_launchd() {
+    if [ -n "$domain" ]; then
+        stop_pid=$(launchctl print "$domain/$uid/$label" </dev/null 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)
+        launchctl kill SIGTERM "$domain/$uid/$label" </dev/null >/dev/null 2>&1 || true
+        case $stop_pid in
+            ''|*[!0-9]*) ;;
+            *)
+                stop_count=0
+                while kill -0 "$stop_pid" 2>/dev/null; do
+                    [ "$stop_count" -lt 30 ] || break
+                    sleep 1 </dev/null || true
+                    stop_count=$((stop_count + 1))
+                done
+                ;;
+        esac
+    fi
+    launchctl bootout "gui/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
+    launchctl bootout "user/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
+    stop_count=0
+    while launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1 || launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; do
+        [ "$stop_count" -lt 30 ] || return 1
+        sleep 1 </dev/null || true
+        stop_count=$((stop_count + 1))
+    done
+    return 0
+}
+
 main() {
     usage='Usage: install.sh [--version X.Y.Z] [--prefix DIR] [--port N] [--no-service] [--uninstall] [--help]
 Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releases/latest/download/install.sh | sh -s -- --version X.Y.Z'
@@ -226,29 +253,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         if launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1; then domain=gui; stopped=true
         elif launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; then domain=user; stopped=true
         fi
-        if [ "$stopped" = true ]; then
-            service_pid=$(launchctl print "$domain/$uid/$label" </dev/null 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }' || true)
-            case $service_pid in
-                ''|*[!0-9]*) ;;
-                *)
-                    launchctl kill SIGTERM "$domain/$uid/$label" </dev/null >/dev/null 2>&1 || true
-                    count=0
-                    while kill -0 "$service_pid" 2>/dev/null; do
-                        [ "$count" -lt 30 ] || break
-                        sleep 1 </dev/null
-                        count=$((count + 1))
-                    done
-                    ;;
-            esac
-        fi
-        launchctl bootout "gui/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
-        launchctl bootout "user/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
-        count=0
-        while launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1 || launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; do
-            [ "$count" -lt 30 ] || { printf '%s\n' 'Timed out stopping OCG.' >&2; exit 1; }
-            sleep 1 </dev/null
-            count=$((count + 1))
-        done
+        stop_launchd || { printf '%s\n' 'Timed out stopping OCG.' >&2; exit 1; }
     fi
     if [ -f "$data/ocg.redb" ]; then
         check_ok=false
@@ -355,14 +360,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             systemctl --user reset-failed ocg </dev/null || true
             systemctl --user restart ocg </dev/null || true
         else
-            launchctl bootout "gui/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
-            launchctl bootout "user/$uid" "$plist" </dev/null >/dev/null 2>&1 || true
-            count=0
-            while launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1 || launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; do
-                [ "$count" -lt 30 ] || break
-                sleep 1 </dev/null || true
-                count=$((count + 1))
-            done
+            stop_launchd || true
             launchctl bootstrap "$domain/$uid" "$plist" </dev/null || true
         fi
         rolled=false
