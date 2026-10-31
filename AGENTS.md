@@ -19,8 +19,9 @@
    - If explicitly authorized through `OCG-AI-RULE-CHANGE` to commit, use a single-line commit title only. No body or `Co-authored-by` attribution.
 
 5. **Storage format**
-   - Any change to a stored key, row, or encoding requires a format version bump.
-   - Do not implement migrations or compatibility shims.
+   - Any change to a stored key, row, or encoding bumps `DATABASE_FORMAT_VERSION` (and `RECORD_VERSION` when a record encoding changes).
+   - Every bump adds its step to `ocg migrate` in the same commit. The step runs offline on a copy, keeps every authoritative fact, and is verified before publish; the source is never modified.
+   - No compatibility shims at runtime: OCG opens only the current format and refuses any other with "run ocg migrate".
    - The format version only tracks database format changes.
 
 6. **Single source of truth**
