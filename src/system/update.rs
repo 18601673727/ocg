@@ -270,3 +270,68 @@ pub(crate) async fn lookup(
     }
     Ok((client, base, local, version, checksum))
 }
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[ts(rename = "UpdateState")]
+pub(crate) struct State {
+    pub to: String,
+    pub phase: Phase,
+    pub running_jobs: Option<u64>,
+    pub message: Option<String>,
+    pub started_at: u64,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "UpdatePhase")]
+pub(crate) enum Phase {
+    Waiting,
+    Installing,
+    Succeeded,
+    Failed,
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
+}
+
+pub(crate) fn write_state(prefix: &Path, state: &State) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let temp = prefix.join(format!(".update-{}.tmp", uuid::Uuid::now_v7()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        serde_json::to_writer(&mut file, state)?;
+        file.flush()?;
+        fs::rename(&temp, prefix.join("update.json"))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
+}
+
+pub(crate) fn read_state(prefix: &Path) -> Option<State> {
+    serde_json::from_slice(&fs::read(prefix.join("update.json")).ok()?).ok()
+}
+
+pub(crate) fn lock(prefix: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(prefix.join("update.lock"))?;
+    file.try_lock()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(file)
+}
