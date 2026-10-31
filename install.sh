@@ -325,7 +325,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     deadline=$(($(date +%s </dev/null) + 30))
     while [ "$(date +%s </dev/null)" -lt "$deadline" ]; do
         if printf 'header = "Authorization: Bearer %s"\n' "$escaped_token" | curl -fsS -o /dev/null --max-time 2 --noproxy '*' -K - "http://127.0.0.1:$port/api/v1/health" 2>/dev/null; then
-            printf 'OCG %s is available at http://127.0.0.1:%s\nData: %s\nSettings: %s\nStop: %s\nUninstall: sh install.sh --prefix '\''%s'\'' --uninstall\n' "$version" "$port" "$data" "$settings" "$stop" "$prefix"
+            printf 'OCG %s is available at http://127.0.0.1:%s\nData: %s\nSettings: %s\nStop: %s\nUninstall: curl -fsSL https://github.com/18601673727/ocg/releases/latest/download/install.sh | sh -s -- --prefix '\''%s'\'' --uninstall\n' "$version" "$port" "$data" "$settings" "$stop" "$prefix"
             exit 0
         fi
         sleep 1 </dev/null
