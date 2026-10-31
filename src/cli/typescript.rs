@@ -69,6 +69,7 @@ pub fn typescript() -> String {
     declarations.visit::<crate::api::v1::ProviderResponsesView>();
     declarations.visit::<crate::api::v1::ToolsView>();
     declarations.visit::<crate::api::v1::HealthView>();
+    declarations.visit::<crate::api::v1::UpdateView>();
     declarations.visit::<crate::api::v1::ActiveSystemSettingsView>();
     declarations.visit::<crate::api::v1::AttachmentView>();
     declarations.visit::<crate::api::v1::ProjectsView>();

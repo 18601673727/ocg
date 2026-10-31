@@ -42,7 +42,8 @@ fn approval_or_release(rest: &str) -> bool {
 fn takes_post(path: &str) -> bool {
     match path.strip_prefix("/api/v1/") {
         Some(
-            "jobs"
+            "update"
+            | "jobs"
             | "decisions"
             | "profiles"
             | "projects"
@@ -75,6 +76,7 @@ fn takes_delete(path: &str) -> bool {
 fn json_post_limit(path: &str) -> Option<usize> {
     match path.strip_prefix("/api/v1/") {
         Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
+        Some("update") => Some(update::UPDATE_BODY_LIMIT),
         Some(
             "jobs"
             | "decisions"

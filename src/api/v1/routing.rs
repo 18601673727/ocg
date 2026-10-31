@@ -4,6 +4,8 @@ use super::*;
 /// A request's route, once admitted.
 pub(super) enum Route {
     Health,
+    Update(bool),
+    StartUpdate,
     Jobs {
         before: Option<JobId>,
         limit: usize,
@@ -139,6 +141,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
         (
             Caller::Operator(_),
             Route::Health
+            | Route::Update(_)
+            | Route::StartUpdate
             | Route::Jobs { .. }
             | Route::Conversations { .. }
             | Route::ConversationSearch { .. }
@@ -212,6 +216,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         .collect::<Vec<_>>();
     if request.method() == Method::POST {
         return match segments.as_slice() {
+            ["update"] => no_query(query).map(|()| Route::StartUpdate),
             ["jobs"] => no_query(query).map(|()| Route::Submit),
             ["decisions"] => no_query(query).map(|()| Route::DecisionSubmit),
             ["jobs", job, "release-slot"] => {
@@ -299,6 +304,11 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         };
     }
     match segments.as_slice() {
+        ["update"] => match query {
+            "" => Ok(Route::Update(false)),
+            "latest=1" => Ok(Route::Update(true)),
+            _ => Err(INVALID_REQUEST),
+        },
         ["health"] => no_query(query).map(|()| Route::Health),
         ["job-history"] => dashboard::jobs_query(query).map(|(before, limit, terms)| Route::Jobs {
             before,
@@ -530,6 +540,11 @@ pub(super) async fn respond(
     let database = &shared.database;
     match route {
         Route::Health => Ok(Reply::ok(health(database).await)),
+        Route::Update(latest) => update::get(latest).await,
+        Route::StartUpdate => {
+            let body = read_body(payload, update::UPDATE_BODY_LIMIT).await?;
+            update::post(&body).await
+        }
         Route::Jobs {
             before,
             limit,

@@ -331,7 +331,9 @@ pub(crate) fn lock(prefix: &Path) -> std::io::Result<std::fs::File> {
         .truncate(false)
         .mode(0o600)
         .open(prefix.join("update.lock"))?;
-    file.try_lock()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => std::io::Error::from(std::io::ErrorKind::WouldBlock),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
     Ok(file)
 }

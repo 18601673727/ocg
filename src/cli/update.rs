@@ -149,12 +149,12 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
         match update::lock(&install.prefix) {
             Ok(lock) => break lock,
             Err(error)
-                if error.kind() == std::io::ErrorKind::Other
+                if error.kind() == std::io::ErrorKind::WouldBlock
                     && start.elapsed() < Duration::from_secs(2) =>
             {
                 std::thread::sleep(Duration::from_millis(100))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Other => {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err("an update is already running".into());
             }
             Err(error) => return Err(error.into()),
@@ -187,6 +187,7 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     if let Some(progress) = &state {
         update::write_state(&install.prefix, progress)?;
     }
+    let error_target = version.clone();
     let (prepared, returned_state) = ntex::rt::System::build()
         .name("ocg-update")
         .signals(false)
@@ -200,6 +201,15 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             }
         });
     state = returned_state;
+    if !check && prepared.is_err() && state.is_none() {
+        state = Some(State {
+            to: error_target.unwrap_or_default(),
+            phase: Phase::Waiting,
+            running_jobs: None,
+            message: None,
+            started_at: update::now_ms(),
+        });
+    }
     let result = (|| -> Result<Option<i32>> {
         let Some(download) = prepared? else {
             return Ok(None);

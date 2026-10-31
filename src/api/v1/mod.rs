@@ -156,6 +156,7 @@ mod submissions;
 mod subscriptions;
 mod system;
 mod tools;
+mod update;
 pub(crate) mod wire;
 
 pub(crate) use attachments::AttachmentView;
@@ -191,6 +192,7 @@ pub(crate) use submissions::{
 use system::health;
 pub(crate) use system::{ActiveSystemSettingsView, HealthView};
 pub(crate) use tools::ToolsView;
+pub(crate) use update::UpdateView;
 
 use security::{Caller, Destination, admit};
 use wire::{
