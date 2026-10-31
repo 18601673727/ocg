@@ -11,7 +11,7 @@ use crate::db::entities::{
 // ---- explicit versioned encoding ----------------------------------------------
 
 // Per-record encoding marker; the database format version is stored in meta.
-pub(super) const RECORD_VERSION: u8 = 14;
+pub(super) const RECORD_VERSION: u8 = 15;
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
 pub(super) const TAG_JOB_STATE: u8 = 3;

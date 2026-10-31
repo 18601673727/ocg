@@ -69,6 +69,8 @@ pub(super) enum Route {
     ProfileCreate,
     ProfileImport,
     ProfileDelete(ProfileId),
+    ProfileAvailability(ProfileId),
+    ProviderDelete(ProfileId),
     ProviderModels,
     ProfileUpdate(ProfileId),
     Projects {
@@ -164,6 +166,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ProviderModels
             | Route::ProfileImport
             | Route::ProfileDelete(_)
+            | Route::ProfileAvailability(_)
+            | Route::ProviderDelete(_)
             | Route::ActiveSystemSettings
             | Route::GlobalCompactionSettings
             | Route::SaveGlobalCompactionSettings
@@ -249,6 +253,10 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             }
             ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
             ["profiles", "import"] => no_query(query).map(|()| Route::ProfileImport),
+            ["profiles", profile, "availability"] => {
+                let id = profiles::profile_id(profile)?;
+                no_query(query).map(|()| Route::ProfileAvailability(id))
+            }
             ["provider-models"] => no_query(query).map(|()| Route::ProviderModels),
             ["profiles", profile] => {
                 let profile = profiles::profile_id(profile)?;
@@ -278,6 +286,10 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     }
     if request.method() == Method::DELETE {
         return match segments.as_slice() {
+            ["providers", id] => {
+                let id = profiles::profile_id(id)?;
+                no_query(query).map(|()| Route::ProviderDelete(id))
+            }
             ["session"] => no_query(query).map(|()| Route::SessionRevoke),
             ["profiles", id] => {
                 let id = profiles::profile_id(id)?;
@@ -628,6 +640,11 @@ pub(super) async fn respond(
             profiles::global_compaction_settings(database, Some(&body)).await
         }
         Route::ProfileDelete(id) => profiles::delete_model(database, id).await,
+        Route::ProviderDelete(id) => profiles::remove_provider(database, id).await,
+        Route::ProfileAvailability(id) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::set_model_availability(database, id, &body).await
+        }
         Route::ProfileCreate => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::save_profile(database, None, &body).await

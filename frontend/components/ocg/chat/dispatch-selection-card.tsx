@@ -86,7 +86,8 @@ export function DispatchSelectionCard({
     return () => controller.abort();
   }, [client, argumentsText, revision]);
   const models = (catalog?.profiles.llm_profiles ?? []).filter(
-    (model) => model.declared_capabilities.includes("chat") && model.executors.length > 0,
+    (model) =>
+      model.enabled && model.declared_capabilities.includes("chat") && model.executors.length > 0,
   );
   const agents = (catalog?.profiles.agent_profiles ?? []).filter(
     (agent) =>

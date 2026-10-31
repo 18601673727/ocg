@@ -255,10 +255,12 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       value={model}
                       items={[
                         { value: "", label: t("context.summarizer") },
-                        ...profiles.llm_profiles.map((model) => ({
-                          value: model.id,
-                          label: model.name,
-                        })),
+                        ...profiles.llm_profiles
+                          .filter((model) => model.enabled)
+                          .map((model) => ({
+                            value: model.id,
+                            label: model.name,
+                          })),
                       ]}
                       onValueChange={(next) => {
                         if (next === null) return;
@@ -272,11 +274,13 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="">{t("context.summarizer")}</SelectItem>
-                        {profiles.llm_profiles.map((model) => (
-                          <SelectItem key={model.id} value={model.id}>
-                            {model.name}
-                          </SelectItem>
-                        ))}
+                        {profiles.llm_profiles
+                          .filter((model) => model.enabled)
+                          .map((model) => (
+                            <SelectItem key={model.id} value={model.id}>
+                              {model.name}
+                            </SelectItem>
+                          ))}
                       </SelectContent>
                     </Select>
                   </label>

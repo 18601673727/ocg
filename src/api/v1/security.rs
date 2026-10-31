@@ -15,6 +15,11 @@ fn decision(rest: &str) -> bool {
     matches!(segments.as_slice(), ["projects", id, "decision"] if !id.is_empty())
 }
 
+fn profile_availability(rest: &str) -> bool {
+    let segments: Vec<_> = rest.split('/').collect();
+    matches!(segments.as_slice(), ["profiles", id, "availability"] if !id.is_empty())
+}
+
 fn conversation_action(rest: &str) -> bool {
     let mut segments = rest.split('/');
     matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry" | "compact" | "queue"), None) if !id.is_empty())
@@ -48,6 +53,7 @@ fn takes_post(path: &str) -> bool {
         Some(rest) => {
             conversation_action(rest)
                 || decision(rest)
+                || profile_availability(rest)
                 || approval_or_release(rest)
                 || MEMBER_COLLECTIONS
                     .iter()
@@ -61,7 +67,7 @@ fn takes_post(path: &str) -> bool {
 /// member, whose LLM Profile is archived in place.
 fn takes_delete(path: &str) -> bool {
     path.strip_prefix("/api/v1/")
-        .is_some_and(|rest| member(rest, "profiles"))
+        .is_some_and(|rest| member(rest, "profiles") || member(rest, "providers"))
 }
 
 /// The largest JSON body `path` accepts with `POST`, or `None` when it
@@ -78,6 +84,7 @@ fn json_post_limit(path: &str) -> Option<usize> {
             | "settings/compaction",
         ) => Some(MAX_SUBMISSION_BYTES),
         Some(rest) => (decision(rest)
+            || profile_availability(rest)
             || conversation_action(rest)
             || approval_or_release(rest)
             || MEMBER_COLLECTIONS

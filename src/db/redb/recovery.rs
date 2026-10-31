@@ -598,6 +598,7 @@ fn unsupported_format(detail: &str) -> StorageError {
 pub(crate) enum MigrationFormat {
     Legacy,
     UnmarkedCurrent,
+    Format15,
     Current,
 }
 
@@ -628,7 +629,8 @@ fn check_record_headers<K: Key + 'static>(
             [actual, version, ..]
                 if *actual == tag
                     && (matches!(*version, 11 | 13)
-                        || (*version == 14 && format != MigrationFormat::Legacy)) => {}
+                        || (*version == 14 && format != MigrationFormat::Legacy)
+                        || (*version == 15 && format == MigrationFormat::Current)) => {}
             _ => return Err(unsupported_format("unsupported record encoding")),
         }
     }
@@ -716,6 +718,10 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
             drop(tx.open_table(CONVERSATION_SEARCH)?);
             MigrationFormat::Current
         }
+        Some(value) if value == 15u64.to_le_bytes() && !legacy => {
+            drop(tx.open_table(CONVERSATION_SEARCH)?);
+            MigrationFormat::Format15
+        }
         None if legacy => MigrationFormat::Legacy,
         None => {
             drop(tx.open_table(CONVERSATION_SEARCH)?);
@@ -746,7 +752,9 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
     let settings = meta
         .get("compaction_settings")?
         .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
-    if !matches!(settings.value(), [14, 11 | 13 | 14, ..]) {
+    if !matches!(settings.value(), [14, 11 | 13 | 14, ..])
+        && !(format == MigrationFormat::Current && matches!(settings.value(), [14, 15, ..]))
+    {
         return Err(unsupported_format(
             "unsupported compaction settings encoding",
         ));
@@ -762,7 +770,14 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
             }
         };
     }
-    decode_rows!(CONFIGS, |key, bytes| ConfigRow::decode_at(key, bytes));
+    for row in tx.open_table(CONFIGS)?.iter()? {
+        let (key, value) = row?;
+        if format == MigrationFormat::Current {
+            ConfigRow::decode_at(key.value(), value.value())?;
+        } else {
+            migration_upgrade_config(key.value(), value.value())?;
+        }
+    }
     decode_rows!(JOBS, |key, bytes| JobSpec::decode_at(key, bytes));
     decode_rows!(JOB_STATES, |key, bytes| JobState::decode_at(key, bytes));
     decode_rows!(JOB_OUTPUTS, |key, bytes| rows::decode_output(key, bytes));
@@ -815,7 +830,61 @@ fn migration_fingerprint<K: Key + 'static, V: Value + 'static>(
         .map_err(|_| StorageError::corrupted("invalid digest"))
 }
 
-fn authoritative_snapshot(tx: &impl TxRead) -> Result<Vec<[u8; 32]>, StorageError> {
+fn migration_upgrade_config(key: u128, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+    let mut upgraded = bytes.to_vec();
+    match upgraded.get(18) {
+        Some(1 | 2) => {
+            upgraded[1] = codec::RECORD_VERSION;
+            upgraded.push(1);
+        }
+        Some(_) => {}
+        None => return Err(StorageError::corrupted("short config record")),
+    }
+    ConfigRow::decode_at(key, &upgraded)?;
+    Ok(upgraded)
+}
+
+fn migration_config_fingerprint(
+    tx: &impl TxRead,
+    format: MigrationFormat,
+) -> Result<[u8; 32], StorageError> {
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    for row in tx.table(CONFIGS)?.iter()? {
+        let (key, value) = row?;
+        let id = key.value();
+        let bytes = if format == MigrationFormat::Current {
+            let mut bytes = value.value().to_vec();
+            if matches!(bytes.get(18), Some(1 | 2)) && bytes.pop() != Some(1) {
+                return Err(StorageError::corrupted("migrated config default differs"));
+            }
+            bytes
+        } else {
+            let mut bytes = migration_upgrade_config(id, value.value())?;
+            if matches!(bytes.get(18), Some(1 | 2)) {
+                bytes.pop();
+            }
+            bytes
+        };
+        let mut bytes = bytes;
+        *bytes
+            .get_mut(1)
+            .ok_or_else(|| StorageError::corrupted("short config record"))? = 0;
+        let key = u128::as_bytes(&id);
+        for data in [key.as_ref(), bytes.as_slice()] {
+            hash.update(&(data.len() as u64).to_le_bytes());
+            hash.update(data);
+        }
+    }
+    hash.finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid digest"))
+}
+
+fn authoritative_snapshot(
+    tx: &impl TxRead,
+    format: MigrationFormat,
+) -> Result<Vec<[u8; 32]>, StorageError> {
     let meta = tx.table(META)?;
     let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
     for row in meta.iter()? {
@@ -836,7 +905,7 @@ fn authoritative_snapshot(tx: &impl TxRead) -> Result<Vec<[u8; 32]>, StorageErro
     Ok(vec![
         metadata,
         migration_fingerprint(tx, SEQUENCES)?,
-        migration_fingerprint(tx, CONFIGS)?,
+        migration_config_fingerprint(tx, format)?,
         migration_fingerprint(tx, JOBS)?,
         migration_fingerprint(tx, JOB_STATES)?,
         migration_fingerprint(tx, JOB_OUTPUTS)?,
@@ -854,8 +923,11 @@ fn authoritative_snapshot(tx: &impl TxRead) -> Result<Vec<[u8; 32]>, StorageErro
     ])
 }
 
-pub(crate) fn migration_snapshot(source: &MigrationSource) -> Result<Vec<[u8; 32]>, StorageError> {
-    authoritative_snapshot(&source.0.begin_read()?)
+pub(crate) fn migration_snapshot(
+    source: &MigrationSource,
+    format: MigrationFormat,
+) -> Result<Vec<[u8; 32]>, StorageError> {
+    authoritative_snapshot(&source.0.begin_read()?, format)
 }
 
 pub(crate) fn migration_apply(
@@ -866,7 +938,7 @@ pub(crate) fn migration_apply(
     let db = Database::open(path)?;
     let mut tx = db.begin_write()?;
     tx.set_durability(Durability::Immediate)?;
-    if authoritative_snapshot(&tx)? != expected {
+    if authoritative_snapshot(&tx, format)? != expected {
         return Err(StorageError::corrupted(
             "copied authoritative records differ",
         ));
@@ -880,12 +952,38 @@ pub(crate) fn migration_apply(
             indexes::rebuild_conversation_search(&tx)?;
             indexes::verify_search_index(&tx)?;
         }
-        MigrationFormat::UnmarkedCurrent => {
+        MigrationFormat::UnmarkedCurrent | MigrationFormat::Format15 => {
             drop(tx.open_table(CONVERSATION_SEARCH)?);
         }
         MigrationFormat::Current => return Err(unsupported_format("database is already current")),
     }
-    if authoritative_snapshot(&tx)? != expected {
+    {
+        use ::redb::ReadableTable;
+        let mut table = tx.open_table(CONFIGS)?;
+        let mut after = None;
+        loop {
+            let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+            let rows = table
+                .range((start, std::ops::Bound::Unbounded))?
+                .take(256)
+                .map(|entry| {
+                    let (key, value) = entry?;
+                    Ok((
+                        key.value(),
+                        migration_upgrade_config(key.value(), value.value())?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            if rows.is_empty() {
+                break;
+            }
+            for (key, value) in rows {
+                table.insert(key, value.as_slice())?;
+                after = Some(key);
+            }
+        }
+    }
+    if authoritative_snapshot(&tx, MigrationFormat::Current)? != expected {
         return Err(StorageError::corrupted(
             "authoritative records changed during migration",
         ));

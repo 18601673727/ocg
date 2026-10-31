@@ -1493,6 +1493,8 @@ pub(super) fn config_record(row: ConfigRow) -> ConfigRecord {
         created_at: row.created_at,
         updated_at: row.updated_at,
         archived_at: row.archived_at,
+        model_enabled: row.model_enabled,
+        discovery_visible: row.discovery_visible,
         body: row.body,
     }
 }
@@ -1547,7 +1549,7 @@ pub(crate) fn read_configs(
 /// `next_before` advances even when no visible config is found.
 pub(crate) struct ProfilePageRecords {
     pub records: Vec<ConfigRecord>,
-    pub connections: BTreeMap<ConfigId, (String, ConnectionConfig)>,
+    pub connections: BTreeMap<ConfigId, (String, ConnectionConfig, bool)>,
     pub next_before: Option<ConfigId>,
 }
 
@@ -1616,7 +1618,7 @@ pub(crate) fn read_profile_page(
         };
         let row = ConfigRow::decode_at(connection_id.get(), bytes.value())?;
         if let ConfigBody::Connection(connection) = row.body {
-            connections.insert(connection_id, (row.name, connection));
+            connections.insert(connection_id, (row.name, connection, row.discovery_visible));
         }
     }
     Ok(ProfilePageRecords {

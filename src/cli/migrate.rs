@@ -34,33 +34,34 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let format = migration_inspect(&db)?;
     match format {
         MigrationFormat::Legacy => println!(
-            "Database format: legacy unmarked (legacy conversation search schema); plan: rebuild conversation search and mark format 15."
+            "Database format: legacy unmarked; plan: rebuild conversation search and migrate to format 16."
         ),
-        MigrationFormat::UnmarkedCurrent => println!(
-            "Database format: current unmarked (current conversation search schema); plan: copy and mark format 15."
-        ),
-        MigrationFormat::Current => println!("Database format: 15; plan: no migration required."),
+        MigrationFormat::UnmarkedCurrent => {
+            println!("Database format: unmarked; plan: migrate to format 16.")
+        }
+        MigrationFormat::Format15 => println!("Database format: 15; plan: migrate to format 16."),
+        MigrationFormat::Current => println!("Database format: 16; plan: no migration required."),
     }
     let Some(destination) = destination else {
         return Ok(());
     };
     if format == MigrationFormat::Current {
-        return Err("database is already format 15; no destination was created".into());
+        return Err("database is already format 16; no destination was created".into());
     }
-    let expected = migration_snapshot(&db)?;
+    let expected = migration_snapshot(&db, format)?;
     let parent = destination.parent().ok_or("destination has no parent")?;
     let staging = parent.join(format!(".ocg-migrate-{}", uuid::Uuid::now_v7()));
     copy_tree(&source, &staging)?;
     verify_tree(&source, &staging, false)?;
     let copied = migration_source(&staging.join("ocg.redb"))?;
-    if migration_inspect(&copied)? != format || migration_snapshot(&copied)? != expected {
+    if migration_inspect(&copied)? != format || migration_snapshot(&copied, format)? != expected {
         return Err("copied database does not match the source".into());
     }
     drop(copied);
     migration_apply(&staging.join("ocg.redb"), format, &expected)?;
     let migrated = migration_source(&staging.join("ocg.redb"))?;
     if migration_inspect(&migrated)? != MigrationFormat::Current
-        || migration_snapshot(&migrated)? != expected
+        || migration_snapshot(&migrated, MigrationFormat::Current)? != expected
     {
         return Err("migrated authoritative data differs from the source".into());
     }

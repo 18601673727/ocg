@@ -228,6 +228,8 @@ pub(crate) struct ConfigRow {
     pub(crate) created_at: Timestamp,
     pub(crate) updated_at: Timestamp,
     pub(crate) archived_at: Option<Timestamp>,
+    pub(crate) model_enabled: bool,
+    pub(crate) discovery_visible: bool,
     pub(crate) body: ConfigBody,
 }
 
@@ -295,6 +297,14 @@ impl ConfigRow {
                 e.u8(6);
                 e.decision_agent(agent);
             }
+        }
+        match self.kind {
+            ConfigKind::Connection => e.bool(self.discovery_visible),
+            ConfigKind::Model => e.bool(self.model_enabled),
+            ConfigKind::Agent
+            | ConfigKind::Pool
+            | ConfigKind::DecisionModel
+            | ConfigKind::DecisionAgent => {}
         }
         e.0
     }
@@ -378,6 +388,14 @@ impl ConfigRow {
             ConfigKind::DecisionModel => ConfigBody::DecisionModel(d.decision_model()?),
             ConfigKind::DecisionAgent => ConfigBody::DecisionAgent(d.decision_agent()?),
         };
+        let (model_enabled, discovery_visible) = match kind {
+            ConfigKind::Connection => (true, d.bool()?),
+            ConfigKind::Model => (d.bool()?, true),
+            ConfigKind::Agent
+            | ConfigKind::Pool
+            | ConfigKind::DecisionModel
+            | ConfigKind::DecisionAgent => (true, true),
+        };
         d.end()?;
         Ok(ConfigRow {
             id,
@@ -387,6 +405,8 @@ impl ConfigRow {
             created_at,
             updated_at,
             archived_at,
+            model_enabled,
+            discovery_visible,
             body,
         })
     }

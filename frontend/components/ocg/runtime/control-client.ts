@@ -1131,7 +1131,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         executors.set(executor.id, executor);
       }
       for (const provider of page.providers) {
-        const key = JSON.stringify([provider.protocol, provider.endpoint, provider.credential_ref]);
+        const key = provider.id;
         const merged = providers.get(key);
         if (!merged) {
           providers.set(key, {
@@ -1803,6 +1803,23 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       identity(profileId, "profile");
       const answer = await send("DELETE", `/api/v1/profiles/${profileId}`, { sign: true });
       projectProfiles(answer.input as Api.Profiles);
+      profileListeners.forEach((listener) => listener());
+      return readAllProfiles();
+    },
+
+    async setModelEnabled(profileId: string, enabled: boolean) {
+      identity(profileId, "profile");
+      await send("POST", `/api/v1/profiles/${profileId}/availability`, {
+        body: { enabled },
+        sign: true,
+      });
+      profileListeners.forEach((listener) => listener());
+      return readAllProfiles();
+    },
+
+    async removeProvider(providerId: string) {
+      identity(providerId, "provider");
+      await send("DELETE", `/api/v1/providers/${providerId}`, { sign: true });
       profileListeners.forEach((listener) => listener());
       return readAllProfiles();
     },

@@ -147,10 +147,12 @@ export function CompactionPolicyFields({
               value={policy.summarization_model ?? ""}
               items={[
                 { value: "", label: t("context.foregroundFallback") },
-                ...profiles.llm_profiles.map((model) => ({
-                  value: model.id,
-                  label: model.name,
-                })),
+                ...profiles.llm_profiles
+                  .filter((model) => model.enabled)
+                  .map((model) => ({
+                    value: model.id,
+                    label: model.name,
+                  })),
               ]}
               onValueChange={(next) => change({ summarization_model: next || null })}
             >
@@ -159,11 +161,13 @@ export function CompactionPolicyFields({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="">{t("context.foregroundFallback")}</SelectItem>
-                {profiles.llm_profiles.map((model) => (
-                  <SelectItem key={model.id} value={model.id}>
-                    {model.name}
-                  </SelectItem>
-                ))}
+                {profiles.llm_profiles
+                  .filter((model) => model.enabled)
+                  .map((model) => (
+                    <SelectItem key={model.id} value={model.id}>
+                      {model.name}
+                    </SelectItem>
+                  ))}
               </SelectContent>
             </Select>
           </label>

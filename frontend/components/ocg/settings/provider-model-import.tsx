@@ -1,9 +1,17 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { RefreshCw, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import type { ControlProfilesSnapshot } from "../contracts";
 import type { ProviderModel as ControlProviderModel } from "../contracts/api";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
@@ -35,7 +43,7 @@ function ImportContent({
   const { t } = useI18n();
   const providers = snapshot?.providers ?? [];
   const [sourceChoice, setSourceChoice] = useState<string>();
-  const sourceId = sourceChoice ?? providers[0]?.profile_ids[0] ?? "new";
+  const sourceId = sourceChoice ?? providers[0]?.id ?? "new";
   const [newName, setNewName] = useState("");
   const [newProtocol, setNewProtocol] = useState<LlmProtocol>("openai_chat_completions");
   const [newEndpoint, setNewEndpoint] = useState("");
@@ -54,13 +62,16 @@ function ImportContent({
             : {}),
         }
       : null;
-  const provider = providers.find((entry) => entry.profile_ids.includes(sourceId));
+  const provider = providers.find((entry) => entry.id === sourceId);
   const [models, setModels] = useState<ControlProviderModel[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(Boolean(provider));
   const [saving, setSaving] = useState(false);
+  const [removing, setRemoving] = useState<ControlProfilesSnapshot["providers"][number] | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   // A committed import stays committed even when the following catalog refresh fails.
   const [result, setResult] = useState<string | null>(null);
@@ -141,7 +152,7 @@ function ImportContent({
     setResult(null);
   }
   async function save() {
-    const source = sourceId === "new" ? newConnection : sourceId;
+    const source = sourceId === "new" ? newConnection : provider?.profile_ids[0];
     if (!source) return;
     setSaving(true);
     setError(null);
@@ -172,6 +183,53 @@ function ImportContent({
   }
   return (
     <div className="flex h-[70dvh] min-h-[32rem] flex-col gap-6">
+      <Dialog
+        open={removing !== null}
+        onOpenChange={(open) => {
+          if (!open && !saving) setRemoving(null);
+        }}
+      >
+        <DialogContent showCloseButton={!saving}>
+          <DialogHeader>
+            <DialogTitle>{t("settings.llm.removeSourceTitle")}</DialogTitle>
+            <DialogDescription>
+              {t("settings.llm.removeSourceDescription", {
+                name: removing?.name.replace(/\s+provider\s*$/i, "") ?? "",
+              })}
+            </DialogDescription>
+          </DialogHeader>
+          {error && (
+            <p role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" disabled={saving} onClick={() => setRemoving(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={saving}
+              onClick={() => {
+                if (!removing) return;
+                setSaving(true);
+                setError(null);
+                void client
+                  .removeProvider(removing.id)
+                  .then(() => {
+                    if (sourceId === removing.id) selectSource("new");
+                    setRemoving(null);
+                    onImported(t("settings.llm.sourceRemoved"));
+                  })
+                  .catch((reason) => setError(describeError(reason, t)))
+                  .finally(() => setSaving(false));
+              }}
+            >
+              {saving ? t("settings.saving") : t("common.remove")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <div className="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)] gap-5 overflow-hidden">
         <div
           role="group"
@@ -179,7 +237,7 @@ function ImportContent({
           className="ocg-subtle-scrollbar flex min-h-0 min-w-0 flex-col gap-2 overflow-y-auto overscroll-contain border-r border-border pr-4"
         >
           {providers.map((entry) => {
-            const id = entry.profile_ids[0];
+            const id = entry.id;
             const refreshing = sourceId === id && loading;
             return (
               <div key={id} className="relative">
@@ -188,13 +246,15 @@ function ImportContent({
                   size="sm"
                   aria-pressed={entry === provider}
                   disabled={saving}
-                  className="h-auto min-h-9 w-full max-w-full justify-start py-2 pr-9 whitespace-normal text-left"
+                  className="h-auto min-h-9 w-full max-w-full justify-start py-2 pr-16 whitespace-normal text-left"
                   onClick={() => {
                     setNewSecret("");
                     selectSource(id);
                   }}
                 >
-                  <span className="min-w-0 break-words">{entry.name}</span>
+                  <span className="min-w-0 break-words">
+                    {entry.name.replace(/\s+provider\s*$/i, "")}
+                  </span>
                 </Button>
                 <Button
                   variant="ghost"
@@ -202,10 +262,24 @@ function ImportContent({
                   aria-label={t("settings.llm.fetchModels")}
                   title={t("settings.llm.fetchModels")}
                   disabled={saving || refreshing}
-                  className="absolute top-1/2 right-1 -translate-y-1/2"
+                  className="absolute top-1/2 right-8 -translate-y-1/2"
                   onClick={() => refreshSource(id)}
                 >
                   <RefreshCw className={refreshing ? "animate-spin" : undefined} />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={t("settings.llm.removeSource")}
+                  title={t("settings.llm.removeSource")}
+                  disabled={saving}
+                  className="absolute top-1/2 right-1 -translate-y-1/2"
+                  onClick={() => {
+                    setError(null);
+                    setRemoving(entry);
+                  }}
+                >
+                  <Trash2 />
                 </Button>
               </div>
             );

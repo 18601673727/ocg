@@ -879,6 +879,9 @@ pub(super) async fn agent_profiles(
         let mut llm_targets = Vec::with_capacity(agent.models.len());
         for target in &agent.models {
             let llm = database.config(*target).await?.ok_or(INCONSISTENT_RECORD)?;
+            if !llm.model_enabled || llm.archived_at.is_some() {
+                continue;
+            }
             let ConfigBody::Model(model) = llm.body else {
                 continue;
             };

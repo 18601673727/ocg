@@ -120,7 +120,10 @@ function ProfileEditor({
       setCredential("");
     }
   }
-  const availableModels = [...profiles.llm_profiles, ...profiles.decision_profiles];
+  const availableModels = [
+    ...profiles.llm_profiles.filter((model) => model.enabled),
+    ...profiles.decision_profiles,
+  ];
   const selectedModels = availableModels.filter((model) => models.includes(model.id));
   return (
     <Section

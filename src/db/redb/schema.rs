@@ -3,7 +3,7 @@ use super::*;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 // Database format is independent of the per-record encoding version.
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const DATABASE_FORMAT_VERSION: u64 = 15;
+pub(super) const DATABASE_FORMAT_VERSION: u64 = 16;
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;

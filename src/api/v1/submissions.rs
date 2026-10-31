@@ -1504,6 +1504,7 @@ async fn check_decision_configuration(
         Some(ConfigRecord {
             body: ConfigBody::Model(model),
             archived_at: None,
+            model_enabled: true,
             ..
         }) if model
             .declared_capabilities
@@ -1565,6 +1566,7 @@ pub(super) async fn check_configuration(
         Some(ConfigRecord {
             body: ConfigBody::Model(model),
             archived_at: None,
+            model_enabled: true,
             ..
         }) => model,
         _ => return Err(PROFILE_NOT_FOUND),

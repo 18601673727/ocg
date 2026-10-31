@@ -20,6 +20,12 @@ impl Batch {
         }
         let model = ConfigId::new(self.job_tool_id(&selection.model, "profile:")?);
         let record = self.require_config_kind(model, ConfigKind::Model)?;
+        if !record.model_enabled {
+            return self.reject(Violation::InvalidValue(
+                "dispatch_selection",
+                "the selected model is disabled",
+            ));
+        }
         let ConfigBody::Model(body) = &record.body else {
             return self.corrupted("invalid dispatch model".into());
         };
@@ -127,7 +133,7 @@ impl Batch {
                     let record = self.require_config(model)?;
                     match record.body {
                         ConfigBody::Model(body) => {
-                            json!({"profile":ProfileId::new(model.get()).to_string(), "name":record.name, "model":body.model, "declared_capabilities":body.declared_capabilities.iter().map(|cap| match cap { ModelCapability::Chat => "chat", ModelCapability::Tools => "tools", ModelCapability::Vision => "vision", ModelCapability::Reasoning => "reasoning" }).collect::<Vec<_>>(), "archived":record.archived_at.is_some()})
+                            json!({"profile":ProfileId::new(model.get()).to_string(), "name":record.name, "model":body.model, "declared_capabilities":body.declared_capabilities.iter().map(|cap| match cap { ModelCapability::Chat => "chat", ModelCapability::Tools => "tools", ModelCapability::Vision => "vision", ModelCapability::Reasoning => "reasoning" }).collect::<Vec<_>>(), "enabled":record.model_enabled, "archived":record.archived_at.is_some()})
                         }
                         ConfigBody::DecisionModel(body) => {
                             json!({"profile":ProfileId::new(model.get()).to_string(), "name":record.name, "model":body.model, "kind":"decision_model", "declared_capabilities":body.declared_capabilities, "archived":record.archived_at.is_some()})

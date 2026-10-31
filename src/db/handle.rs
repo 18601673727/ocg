@@ -1156,6 +1156,37 @@ impl DatabaseHandle {
         .await
     }
 
+    pub(crate) async fn set_config_enabled(
+        &self,
+        id: ConfigId,
+        kind: crate::db::entities::ConfigKind,
+        enabled: bool,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, kind, enabled),
+                reply,
+                |(_, _, _)| 32,
+                OperationKind::UpdateProfile,
+                |(id, kind, enabled), batch| batch.set_config_enabled(id, kind, enabled),
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn remove_provider(&self, id: ConfigId) -> Result<(), DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id,),
+                reply,
+                |(_,)| 16,
+                OperationKind::UpdateProfile,
+                |(id,), batch| batch.remove_provider(id),
+            )
+        })
+        .await
+    }
+
     /// Creates or edits an LLM or Decision Model Profile, resolving its
     /// Connection and any required LLM Executor in the same write batch.
     pub(crate) async fn save_model_profile(

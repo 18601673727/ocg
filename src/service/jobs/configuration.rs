@@ -88,7 +88,7 @@ where
                 .freeze_decision_configuration(configuration, selected)
                 .map(FrozenConfiguration::Decision);
         }
-        if selected.archived_at.is_some() {
+        if selected.archived_at.is_some() || !selected.model_enabled {
             return self.reject(Violation::NotFound(RecordRef::Profile(
                 configuration.llm_profile,
             )));

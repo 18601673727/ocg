@@ -597,6 +597,7 @@ const MAX_PROFILE_PAGE_BYTES: usize = 512 * 1024;
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "LlmProfile")]
 pub(crate) struct LlmProfileView {
+    enabled: bool,
     reasoning_efforts: Option<Vec<String>>,
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -689,6 +690,7 @@ pub(crate) struct ProfileExecutorView {
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Provider")]
 pub(crate) struct ProviderView {
+    id: String,
     name: String,
     protocol: String,
     endpoint: Option<String>,
@@ -765,19 +767,16 @@ fn build_profiles_page(
     let mut decision_agent_profiles = Vec::new();
     let mut executor_protocols = Vec::new();
 
-    #[derive(Ord, PartialOrd, Eq, PartialEq)]
-    struct ProviderKey {
+    struct ProviderGroup {
+        name: String,
         protocol: &'static str,
         endpoint: Option<String>,
         credential_ref: Option<String>,
-    }
-    struct ProviderGroup {
-        name: String,
         has_credential: bool,
         profile_ids: Vec<String>,
         models: BTreeSet<String>,
     }
-    let mut provider_groups: BTreeMap<ProviderKey, ProviderGroup> = BTreeMap::new();
+    let mut provider_groups: BTreeMap<ConfigId, ProviderGroup> = BTreeMap::new();
     let mut last_emitted = None;
     let mut page_bytes = 0;
     let mut next_before = next_before;
@@ -786,7 +785,7 @@ fn build_profiles_page(
         let id = ProfileId::from(record.id);
         match record.body {
             ConfigBody::Model(model) => {
-                let Some((provider_name, connection)) =
+                let Some((provider_name, connection, discovery_visible)) =
                     connections.get(&model.connection_id).cloned()
                 else {
                     return Err(INCONSISTENT_RECORD);
@@ -803,6 +802,7 @@ fn build_profiles_page(
                     .collect::<Vec<_>>();
                 let id_str = id.to_string();
                 let profile = LlmProfileView {
+                    enabled: record.model_enabled,
                     reasoning_efforts: model.reasoning_efforts,
                     id: id_str.clone(),
                     profile_type: Some("llm".to_owned()),
@@ -825,19 +825,21 @@ fn build_profiles_page(
                     next_before = last_emitted;
                     break;
                 }
-                let key = ProviderKey {
-                    protocol,
-                    endpoint: connection.endpoint,
-                    credential_ref: connection.credential_ref,
-                };
-                let group = provider_groups.entry(key).or_insert_with(|| ProviderGroup {
-                    name: provider_name,
-                    has_credential,
-                    profile_ids: Vec::new(),
-                    models: BTreeSet::new(),
-                });
-                group.profile_ids.push(id_str);
-                group.models.insert(model.model);
+                if discovery_visible {
+                    let group = provider_groups
+                        .entry(model.connection_id)
+                        .or_insert_with(|| ProviderGroup {
+                            name: provider_name,
+                            protocol,
+                            endpoint: connection.endpoint,
+                            credential_ref: connection.credential_ref,
+                            has_credential,
+                            profile_ids: Vec::new(),
+                            models: BTreeSet::new(),
+                        });
+                    group.profile_ids.push(id_str);
+                    group.models.insert(model.model);
+                }
                 llm_profiles.push(profile);
                 last_emitted = Some(record.id);
             }
@@ -893,7 +895,8 @@ fn build_profiles_page(
             }
             ConfigBody::Connection(_) => {}
             ConfigBody::DecisionModel(model) => {
-                let Some((_, connection)) = connections.get(&model.connection_id).cloned() else {
+                let Some((_, connection, _)) = connections.get(&model.connection_id).cloned()
+                else {
                     return Err(INCONSISTENT_RECORD);
                 };
                 let has_credential = connection
@@ -968,10 +971,11 @@ fn build_profiles_page(
     let providers = provider_groups
         .into_iter()
         .map(|(key, group)| ProviderView {
+            id: ProfileId::from(key).to_string(),
             name: group.name,
-            protocol: key.protocol.to_owned(),
-            endpoint: key.endpoint,
-            credential_ref: key.credential_ref,
+            protocol: group.protocol.to_owned(),
+            endpoint: group.endpoint,
+            credential_ref: group.credential_ref,
             has_credential: group.has_credential,
             profile_ids: group.profile_ids,
             models: group.models.into_iter().collect(),
@@ -1589,6 +1593,39 @@ pub(crate) async fn delete_model(
     Ok(Reply::ok(
         build_profiles_snapshot(database, Some(id)).await?,
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelAvailability {
+    enabled: bool,
+}
+
+pub(crate) async fn set_model_availability(
+    database: &DatabaseHandle,
+    id: ProfileId,
+    body: &[u8],
+) -> Result<Reply, Refusal> {
+    let request: ModelAvailability =
+        serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
+    database
+        .set_config_enabled(id.into(), ConfigKind::Model, request.enabled)
+        .await
+        .map_err(map_mutation_error)?;
+    Ok(Reply::ok(
+        build_profiles_snapshot(database, Some(id)).await?,
+    ))
+}
+
+pub(crate) async fn remove_provider(
+    database: &DatabaseHandle,
+    id: ProfileId,
+) -> Result<Reply, Refusal> {
+    database
+        .remove_provider(id.into())
+        .await
+        .map_err(map_mutation_error)?;
+    Ok(Reply::ok(build_profiles_snapshot(database, None).await?))
 }
 
 #[derive(Deserialize)]

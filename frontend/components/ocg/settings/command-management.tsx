@@ -81,7 +81,10 @@ export function ProjectDecisionConfigButton({
     }
   }
   const decisionProfiles = profiles?.decision_agent_profiles ?? [];
-  const models = [...(profiles?.llm_profiles ?? []), ...(profiles?.decision_profiles ?? [])];
+  const models = [
+    ...(profiles?.llm_profiles ?? []).filter((model) => model.enabled),
+    ...(profiles?.decision_profiles ?? []),
+  ];
   const choices = [...decisionProfiles, ...models];
   const confidence = Number(cutoff);
   const validCutoff =

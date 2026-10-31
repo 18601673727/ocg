@@ -175,6 +175,7 @@ export function SettingsSurface({
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmError, setLlmError] = useState<string | null>(null);
   const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
+  const [availabilityId, setAvailabilityId] = useState<string | null>(null);
 
   // Agent Profile form state
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -473,7 +474,9 @@ export function SettingsSurface({
   const assignedModels = agentTargets.filter((id) =>
     eligibleModels.some((model) => model.id === id),
   );
-  const unassignedModels = eligibleModels.filter((model) => !assignedModels.includes(model.id));
+  const unassignedModels = eligibleModels.filter(
+    (model) => !assignedModels.includes(model.id) && (model.kind === "decision" || model.enabled),
+  );
   function toggleAgentCapability(capability: ControlAgentCapability) {
     const next = agentCapabilities.includes(capability)
       ? agentCapabilities.filter((value) => value !== capability)
@@ -672,6 +675,18 @@ export function SettingsSurface({
                               <Pill tone="sky" className="text-xs normal-case">
                                 {profile.model}
                               </Pill>
+                              {kind === "llm" && (
+                                <Pill
+                                  tone={profile.enabled ? "emerald" : "amber"}
+                                  className="text-xs normal-case"
+                                >
+                                  {t(
+                                    profile.enabled
+                                      ? "settings.llm.enabled"
+                                      : "settings.llm.disabled",
+                                  )}
+                                </Pill>
+                              )}
                               <Pill
                                 tone={kind === "llm" ? "violet" : "amber"}
                                 className="text-xs normal-case"
@@ -724,6 +739,27 @@ export function SettingsSurface({
                             </div>
                           </div>
                           <div className="flex shrink-0 gap-2">
+                            {kind === "llm" && (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="xs"
+                                disabled={availabilityId !== null}
+                                onClick={() => {
+                                  setAvailabilityId(profile.id);
+                                  setLoadError(null);
+                                  void client
+                                    .setModelEnabled(profile.id, !profile.enabled)
+                                    .then(setSnapshot)
+                                    .catch((error) => setLoadError(describeError(error, t)))
+                                    .finally(() => setAvailabilityId(null));
+                                }}
+                              >
+                                {t(
+                                  profile.enabled ? "settings.llm.disable" : "settings.llm.enable",
+                                )}
+                              </Button>
+                            )}
                             <Button
                               type="button"
                               variant="outline"

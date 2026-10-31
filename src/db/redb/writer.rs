@@ -992,6 +992,39 @@ impl Batch {
         self.insert(CONFIGS, row.id.get(), row.encode().as_slice())
     }
 
+    pub(crate) fn set_config_enabled(
+        &mut self,
+        id: ConfigId,
+        kind: ConfigKind,
+        enabled: bool,
+    ) -> Result<(), BatchError> {
+        let mut row = self.require_config_kind(id, kind)?;
+        if row.archived_at.is_some() {
+            return self.reject(Violation::NotFound(RecordRef::Profile(id.into())));
+        }
+        let value = match kind {
+            ConfigKind::Connection => &mut row.discovery_visible,
+            ConfigKind::Model => &mut row.model_enabled,
+            ConfigKind::Agent
+            | ConfigKind::Pool
+            | ConfigKind::DecisionModel
+            | ConfigKind::DecisionAgent => {
+                return self.reject(Violation::InvalidValue(
+                    "kind",
+                    "only connections and models have availability",
+                ));
+            }
+        };
+        if *value == enabled {
+            return Ok(());
+        }
+        *value = enabled;
+        row.updated_at = self.now;
+        row.edit_seq += 1;
+        self.catalog_changed = true;
+        self.put_config(&row)
+    }
+
     /// Inserts a new config with edit counter 1.
     pub(crate) fn create_config(
         &mut self,
@@ -1008,6 +1041,8 @@ impl Batch {
             created_at: self.now,
             updated_at: self.now,
             archived_at: None,
+            model_enabled: true,
+            discovery_visible: true,
             body,
         };
         if row.kind == ConfigKind::Pool {
@@ -1095,6 +1130,7 @@ impl Batch {
             Some(id) => id,
             None => self.create_config(connection.name, connection.body)?,
         };
+        self.set_config_enabled(connection_id, ConfigKind::Connection, true)?;
         self.ensure_llm_executor(wanted_protocol)?;
         let mut known = self.step(|tx| {
             let mut known = std::collections::BTreeMap::new();
@@ -1392,6 +1428,36 @@ impl Batch {
         row.updated_at = self.now;
         row.edit_seq += 1;
         self.put_config(&row)
+    }
+
+    pub(crate) fn remove_provider(&mut self, id: ConfigId) -> Result<(), BatchError> {
+        self.set_config_enabled(id, ConfigKind::Connection, false)?;
+        let mut after = None;
+        loop {
+            let rows = self.step(|tx| {
+                let table = tx.open_table(CONFIGS)?;
+                let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                let mut rows = Vec::new();
+                for entry in table.range((start, std::ops::Bound::Unbounded))?.take(256) {
+                    let (key, value) = entry?;
+                    let row = ConfigRow::decode_at(key.value(), value.value())?;
+                    let matches = row.archived_at.is_none()
+                        && matches!(&row.body, ConfigBody::Model(model) if model.connection_id == id);
+                    rows.push((key.value(), matches));
+                }
+                Ok(rows)
+            })?;
+            if rows.is_empty() {
+                break;
+            }
+            for (key, matches) in rows {
+                after = Some(key);
+                if matches {
+                    self.archive_model(ConfigId::new(key))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- jobs --------------------------------------------------------------------------

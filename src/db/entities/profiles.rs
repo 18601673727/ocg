@@ -404,6 +404,8 @@ pub struct ConfigRecord {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub archived_at: Option<Timestamp>,
+    pub model_enabled: bool,
+    pub discovery_visible: bool,
     pub body: ConfigBody,
 }
 
