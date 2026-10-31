@@ -25,6 +25,7 @@ pub struct Vitals {
     pub queue_pending: Option<u64>,
     pub queue_ready: Option<u64>,
     pub queue_delayed: Option<u64>,
+    pub queue_running: Option<u64>,
     pub commands_waiting: u64,
     pub rss_bytes: Option<u64>,
     pub peak_rss_bytes: Option<u64>,
@@ -159,10 +160,15 @@ impl DatabaseHandle {
         let (database_bytes, available_bytes) = filesystem_vitals_async(directory).await;
 
         let queue_counts = match self.read(redb::queue_counts).await {
-            Ok(counts) => (Some(counts.0), Some(counts.1), Some(counts.2)),
+            Ok(counts) => (
+                Some(counts.0),
+                Some(counts.1),
+                Some(counts.2),
+                Some(counts.3),
+            ),
             Err(error) => {
                 log::debug!("failed to read database vitals queue counts: {error}");
-                (None, None, None)
+                (None, None, None, None)
             }
         };
 
@@ -191,6 +197,7 @@ impl DatabaseHandle {
             queue_pending: queue_counts.0,
             queue_ready: queue_counts.1,
             queue_delayed: queue_counts.2,
+            queue_running: queue_counts.3,
             commands_waiting,
             rss_bytes,
             peak_rss_bytes,

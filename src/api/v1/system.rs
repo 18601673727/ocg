@@ -35,6 +35,7 @@ pub(crate) struct QueueView {
     pending: Option<u64>,
     ready: Option<u64>,
     delayed: Option<u64>,
+    running: Option<u64>,
     commands_waiting: u64,
 }
 
@@ -56,6 +57,7 @@ pub(crate) struct QuarantinedView {
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Health")]
 pub(crate) struct HealthView {
+    version: String,
     host: String,
     database: DatabaseHealthView,
     claims: ClaimsView,
@@ -91,6 +93,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         }
     };
     envelope(serde_json::json!(HealthView {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
         host: "running".to_owned(),
         database: DatabaseHealthView {
             status: status.to_owned(),
@@ -111,6 +114,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             pending: vitals.queue_pending,
             ready: vitals.queue_ready,
             delayed: vitals.queue_delayed,
+            running: vitals.queue_running,
             commands_waiting: vitals.commands_waiting,
         },
         process: ProcessView {

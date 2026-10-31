@@ -2277,12 +2277,18 @@ fn conversation_matches(
     }
     Ok(true)
 }
-pub(crate) fn queue_counts(database: &Database) -> Result<(u64, u64, u64), StorageError> {
+pub(crate) fn queue_counts(database: &Database) -> Result<(u64, u64, u64, u64), StorageError> {
     let rx = read(database)?;
     let pending = rx.open_table(PENDING)?.len()?;
     let ready = rx.open_table(READY)?.len()?;
     let delayed = rx.open_table(DELAYED)?.len()?;
-    Ok((pending, ready, delayed))
+    let mut running = 0;
+    for entry in rx.open_table(HELD_SLOTS)?.iter()? {
+        if !entry?.1.value().1 {
+            running += 1;
+        }
+    }
+    Ok((pending, ready, delayed, running))
 }
 
 pub(crate) fn read_tool_stats(
