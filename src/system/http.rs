@@ -51,6 +51,20 @@ pub(crate) async fn provider_client(timeout: Duration) -> Result<Client, Provide
         })
 }
 
+pub(crate) async fn release_client() -> Result<Client, ProviderExecutionError> {
+    Client::builder()
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
+        .connector::<()>(connector()?)
+        .disable_redirects()
+        .response_timeout(Millis(30_000))
+        .response_payload_timeout(Millis(30_000))
+        .build(ntex::SharedCfg::new("release"))
+        .await
+        .map_err(|_| ProviderExecutionError::Build {
+            message: "release HTTP client could not be initialized".to_owned(),
+        })
+}
+
 struct Proxy {
     uri: Uri,
     authorization: Option<HeaderValue>,

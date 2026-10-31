@@ -7,6 +7,8 @@ mod pool;
 mod release_slot;
 pub mod typescript;
 #[cfg(unix)]
+mod update;
+#[cfg(unix)]
 mod workspace_job;
 
 /// Without arguments, runs until a graceful shutdown signal (SIGINT,
@@ -39,6 +41,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if command == "migrate" {
             return migrate::run(arguments.collect());
+        }
+        #[cfg(unix)]
+        if command == "update" {
+            return update::run(arguments.collect());
         }
         if command == "release-slot" {
             let directory = DataDirectory::from_environment()?;
@@ -108,6 +114,7 @@ fn usage() -> &'static str {
      \n\
      Commands:\n\
        migrate [--check | --to <directory>]\n\
+       update [--check] [--version X.Y.Z] [--yes]\n\
        pool list | create <name> [nonzero-concurrency] | enable <pool> | disable <pool> | set-limit <pool> <nonzero-concurrency>\n\
        release-slot <job> [--yes]\n\
        workspace-read <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
