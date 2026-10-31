@@ -170,13 +170,17 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>)
     ]
     .iter()
     .any(|name| !existing.iter().any(|table| table == name));
-    let existing_tables = existing.len();
+    let empty = existing.is_empty() && tx.list_multimap_tables()?.next().is_none();
     let now = Timestamp::now();
     init_promotion_clock(now.as_unix_micros());
 
     let (epoch, clean_shutdown) = {
         let mut meta = tx.open_table(META).map_err(StorageError::from)?;
-        if existing_tables == 0 {
+        if empty {
+            meta.insert(
+                DATABASE_FORMAT_KEY,
+                DATABASE_FORMAT_VERSION.to_le_bytes().as_slice(),
+            )?;
             let settings = crate::db::entities::GlobalCompactionSettings::default();
             let mut encoded = Enc::new(TAG_GLOBAL_COMPACTION);
             encoded.u64(settings.revision);
@@ -188,6 +192,12 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>)
                 .map_err(StorageError::from)?;
             meta.insert("clean_shutdown", [1u8].as_slice())
                 .map_err(StorageError::from)?;
+        } else {
+            match meta.get(DATABASE_FORMAT_KEY)? {
+                Some(version) if version.value() == DATABASE_FORMAT_VERSION.to_le_bytes() => {}
+                Some(_) => return Err(unsupported_format("unsupported database format")),
+                None => return Err(unsupported_format("unmarked database; run ocg migrate")),
+            }
         }
         let epoch = meta
             .get("open_epoch")
@@ -571,4 +581,322 @@ pub(crate) fn reclaim_pending(
     }
     tx.commit()?;
     Ok(report)
+}
+
+const LEGACY_CONVERSATION_SEARCH: TableDefinition<(u128, u128, u128, u8, u32), ()> =
+    TableDefinition::new("conversation_search");
+
+fn unsupported_format(detail: &str) -> StorageError {
+    StorageError {
+        kind: StorageErrorKind::Other,
+        os_error: None,
+        detail: detail.to_owned(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MigrationFormat {
+    Legacy,
+    UnmarkedCurrent,
+    Current,
+}
+
+pub(crate) struct MigrationSource(::redb::ReadOnlyDatabase);
+
+pub(crate) fn migration_source(path: &Path) -> Result<MigrationSource, StorageError> {
+    if std::fs::metadata(path)
+        .map_err(|error| StorageError::from(::redb::Error::Io(error)))?
+        .len()
+        == 0
+    {
+        return Err(unsupported_format(
+            "database is empty/uninitialized; start OCG to initialize it",
+        ));
+    }
+    Ok(MigrationSource(::redb::ReadOnlyDatabase::open(path)?))
+}
+
+fn check_record_headers<K: Key + 'static>(
+    tx: &ReadTransaction,
+    definition: TableDefinition<K, &'static [u8]>,
+    tag: u8,
+    format: MigrationFormat,
+) -> Result<(), StorageError> {
+    for row in tx.open_table(definition)?.iter()? {
+        let (_, value) = row?;
+        match value.value() {
+            [actual, version, ..]
+                if *actual == tag
+                    && (matches!(*version, 11 | 13)
+                        || (*version == 14 && format != MigrationFormat::Legacy)) => {}
+            _ => return Err(unsupported_format("unsupported record encoding")),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFormat, StorageError> {
+    use ::redb::TableHandle;
+    let tx = source.0.begin_read()?;
+    if tx.list_tables()?.next().is_none() && tx.list_multimap_tables()?.next().is_none() {
+        return Err(unsupported_format(
+            "database is empty/uninitialized; start OCG to initialize it",
+        ));
+    }
+    let mut known = BTreeSet::new();
+    macro_rules! check_tables {
+        ($($table:ident),+ $(,)?) => { $(
+            known.insert($table.name().to_owned());
+            drop(tx.open_table($table)?);
+        )+ };
+    }
+    check_tables!(
+        META,
+        SEQUENCES,
+        CONFIGS,
+        JOBS,
+        JOB_STATES,
+        JOB_OUTPUTS,
+        SUBMISSIONS,
+        ATTACHMENTS,
+        TOOL_CALLS,
+        MESSAGES,
+        REQUEST_EVENTS,
+        PROJECTS,
+        JOB_CONTROLS,
+        JOB_INPUTS,
+        NOTICES,
+        APPROVALS,
+        RECURRENCES,
+        JOB_OBSERVATIONS,
+        CONTENT_REFERENCES,
+        CONTENT_RECLAIM,
+        JOB_ALLOCATIONS,
+        CONVERSATIONS,
+        TURNS,
+        PENDING,
+        READY,
+        DELAYED,
+        DEPENDENCY_WAITERS,
+        UNSETTLED,
+        HELD_SLOTS,
+        CHILDREN,
+        SUCCESSORS,
+        GROUP_HEADS,
+        CHILD_GROUPS,
+        LIVE_CHILDREN,
+        USER_INPUT_AT,
+        ACTIVE_JOBS,
+        GROUP_RESULTS,
+        NOTICE_READ,
+        TOOL_CALL_IDS,
+        TOOL_STATS,
+        USAGE_TOTALS,
+        RETRIES,
+        ATTACHMENT_REFS,
+        REQUEST_SCOPES,
+        REQUEST_TIMELINE,
+        OPEN_APPROVALS,
+        APPROVAL_CALLS,
+        RECURRENCE_DUE
+    );
+    known.insert(CONVERSATION_SEARCH.name().to_owned());
+    let actual: BTreeSet<String> = tx
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect();
+    if actual != known || tx.list_multimap_tables()?.next().is_some() {
+        return Err(unsupported_format("unsupported set of database tables"));
+    }
+    let meta = tx.open_table(META)?;
+    let marker = meta.get(DATABASE_FORMAT_KEY)?;
+    let legacy = tx.open_table(LEGACY_CONVERSATION_SEARCH).is_ok();
+    let format = match marker.as_ref().map(|value| value.value()) {
+        Some(value) if value == DATABASE_FORMAT_VERSION.to_le_bytes() && !legacy => {
+            drop(tx.open_table(CONVERSATION_SEARCH)?);
+            MigrationFormat::Current
+        }
+        None if legacy => MigrationFormat::Legacy,
+        None => {
+            drop(tx.open_table(CONVERSATION_SEARCH)?);
+            MigrationFormat::UnmarkedCurrent
+        }
+        Some(_) => {
+            return Err(unsupported_format("unsupported database format marker"));
+        }
+    };
+    for key in ["clean_shutdown", "open_epoch", "compaction_settings"] {
+        if meta.get(key)?.is_none() {
+            return Err(StorageError::corrupted("missing required metadata"));
+        }
+    }
+    let shutdown = meta
+        .get("clean_shutdown")?
+        .ok_or_else(|| StorageError::corrupted("missing shutdown flag"))?;
+    let epoch = meta
+        .get("open_epoch")?
+        .ok_or_else(|| StorageError::corrupted("missing open epoch"))?;
+    if !matches!(shutdown.value(), [0] | [1]) || epoch.value().len() != 8 {
+        return Err(unsupported_format("unsupported metadata encoding"));
+    }
+    macro_rules! headers { ($($table:ident => $tag:expr),+ $(,)?) => { $(check_record_headers(&tx, $table, $tag, format)?;)+ }; }
+    headers!(CONFIGS => 1, JOBS => 2, JOB_STATES => 3, JOB_OUTPUTS => 4, SUBMISSIONS => 5,
+        ATTACHMENTS => 6, TOOL_CALLS => 7, REQUEST_EVENTS => 8, PROJECTS => 9,
+        JOB_CONTROLS => 10, JOB_INPUTS => 11, NOTICES => 12, RECURRENCES => 13, APPROVALS => 15);
+    let settings = meta
+        .get("compaction_settings")?
+        .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
+    if !matches!(settings.value(), [14, 11 | 13 | 14, ..]) {
+        return Err(unsupported_format(
+            "unsupported compaction settings encoding",
+        ));
+    }
+    reader::global_compaction_settings(&meta)?;
+    macro_rules! decode_rows {
+        ($table:ident, |$key:ident, $bytes:ident| $body:expr) => {
+            for row in tx.open_table($table)?.iter()? {
+                let (key, value) = row?;
+                let $key = key.value();
+                let $bytes = value.value();
+                $body?;
+            }
+        };
+    }
+    decode_rows!(CONFIGS, |key, bytes| ConfigRow::decode_at(key, bytes));
+    decode_rows!(JOBS, |key, bytes| JobSpec::decode_at(key, bytes));
+    decode_rows!(JOB_STATES, |key, bytes| JobState::decode_at(key, bytes));
+    decode_rows!(JOB_OUTPUTS, |key, bytes| rows::decode_output(key, bytes));
+    decode_rows!(SUBMISSIONS, |key, bytes| rows::decode_submission(
+        key, bytes
+    ));
+    decode_rows!(ATTACHMENTS, |key, bytes| rows::decode_attachment(
+        key, bytes
+    ));
+    decode_rows!(TOOL_CALLS, |key, bytes| rows::decode_tool_evidence(
+        rows::tool_call_ref(key)?,
+        bytes
+    ));
+    decode_rows!(REQUEST_EVENTS, |key, bytes| rows::decode_request_event(
+        JobId::new(key.0),
+        RequestNumber::new(key.1)
+            .ok_or_else(|| StorageError::corrupted("invalid request number"))?,
+        key.2,
+        bytes
+    ));
+    decode_rows!(PROJECTS, |key, bytes| rows::decode_project(key, bytes));
+    decode_rows!(JOB_CONTROLS, |_key, bytes| JobControl::decode(bytes));
+    decode_rows!(JOB_INPUTS, |_key, bytes| JobInputEntry::decode(bytes));
+    decode_rows!(NOTICES, |_key, bytes| Notice::decode(bytes));
+    decode_rows!(APPROVALS, |_key, bytes| ApprovalRecord::decode(bytes));
+    decode_rows!(RECURRENCES, |_key, bytes| Recurrence::decode(bytes));
+    Ok(format)
+}
+
+fn migration_fingerprint<K: Key + 'static, V: Value + 'static>(
+    tx: &impl TxRead,
+    definition: TableDefinition<K, V>,
+) -> Result<[u8; 32], StorageError> {
+    let table = tx.table(definition)?;
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    for row in table.iter()? {
+        let (key, value) = row?;
+        let key = key.value();
+        let value = value.value();
+        let kb = K::as_bytes(&key);
+        let vb = V::as_bytes(&value);
+        for bytes in [kb.as_ref(), vb.as_ref()] {
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    hash.finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid digest"))
+}
+
+fn authoritative_snapshot(tx: &impl TxRead) -> Result<Vec<[u8; 32]>, StorageError> {
+    let meta = tx.table(META)?;
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    for row in meta.iter()? {
+        let (key, value) = row?;
+        if key.value() == DATABASE_FORMAT_KEY {
+            continue;
+        }
+        for bytes in [key.value().as_bytes(), value.value()] {
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    let metadata: [u8; 32] = hash
+        .finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid digest"))?;
+    Ok(vec![
+        metadata,
+        migration_fingerprint(tx, SEQUENCES)?,
+        migration_fingerprint(tx, CONFIGS)?,
+        migration_fingerprint(tx, JOBS)?,
+        migration_fingerprint(tx, JOB_STATES)?,
+        migration_fingerprint(tx, JOB_OUTPUTS)?,
+        migration_fingerprint(tx, SUBMISSIONS)?,
+        migration_fingerprint(tx, ATTACHMENTS)?,
+        migration_fingerprint(tx, TOOL_CALLS)?,
+        migration_fingerprint(tx, MESSAGES)?,
+        migration_fingerprint(tx, REQUEST_EVENTS)?,
+        migration_fingerprint(tx, PROJECTS)?,
+        migration_fingerprint(tx, JOB_CONTROLS)?,
+        migration_fingerprint(tx, JOB_INPUTS)?,
+        migration_fingerprint(tx, NOTICES)?,
+        migration_fingerprint(tx, APPROVALS)?,
+        migration_fingerprint(tx, RECURRENCES)?,
+    ])
+}
+
+pub(crate) fn migration_snapshot(source: &MigrationSource) -> Result<Vec<[u8; 32]>, StorageError> {
+    authoritative_snapshot(&source.0.begin_read()?)
+}
+
+pub(crate) fn migration_apply(
+    path: &Path,
+    format: MigrationFormat,
+    expected: &[[u8; 32]],
+) -> Result<(), StorageError> {
+    let db = Database::open(path)?;
+    let mut tx = db.begin_write()?;
+    tx.set_durability(Durability::Immediate)?;
+    if authoritative_snapshot(&tx)? != expected {
+        return Err(StorageError::corrupted(
+            "copied authoritative records differ",
+        ));
+    }
+    match format {
+        MigrationFormat::Legacy => {
+            if !tx.delete_table(LEGACY_CONVERSATION_SEARCH)? {
+                return Err(StorageError::corrupted("legacy search index missing"));
+            }
+            drop(tx.open_table(CONVERSATION_SEARCH)?);
+            indexes::rebuild_conversation_search(&tx)?;
+            indexes::verify_search_index(&tx)?;
+        }
+        MigrationFormat::UnmarkedCurrent => {
+            drop(tx.open_table(CONVERSATION_SEARCH)?);
+        }
+        MigrationFormat::Current => return Err(unsupported_format("database is already current")),
+    }
+    if authoritative_snapshot(&tx)? != expected {
+        return Err(StorageError::corrupted(
+            "authoritative records changed during migration",
+        ));
+    }
+    {
+        let mut meta = tx.open_table(META)?;
+        meta.insert(
+            DATABASE_FORMAT_KEY,
+            DATABASE_FORMAT_VERSION.to_le_bytes().as_slice(),
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
 }

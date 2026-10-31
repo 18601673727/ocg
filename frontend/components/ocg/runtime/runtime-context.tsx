@@ -11,30 +11,19 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
-import type {
-  CreateSessionInput,
-  JobLaunchResult,
-  OcgRuntimeClient,
-  RuntimeAuthority,
-  RuntimeSnapshot,
-} from "./runtime-types";
-import type { JobLaunchCommand } from "../job/draft-domain";
+import type { CreateSessionInput, OcgRuntimeClient, RuntimeSnapshot } from "./runtime-types";
 import type { ChatSession, SendMessageInput } from "../types";
-import type { RuntimeDiagnostic } from "./reconciler";
 import type { HttpCanonicalControlClient } from "./control-client";
 
 type RuntimeContextValue = {
   control: HttpCanonicalControlClient | null;
   client: OcgRuntimeClient;
-  authority: RuntimeAuthority;
   snapshot: RuntimeSnapshot;
-  diagnostics: readonly RuntimeDiagnostic[];
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
   deleteSession: (sessionId: string) => Promise<void>;
   sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
   retryMessage: (sessionId: string, messageId: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
-  launchJob: (command: JobLaunchCommand) => Promise<JobLaunchResult>;
 };
 
 const RuntimeContext = createContext<RuntimeContextValue | null>(null);
@@ -69,15 +58,12 @@ export function OcgRuntimeProvider({
       });
     };
   }, [client]);
-  const authority = client.authority;
   const subscribe = useCallback(
     (onStoreChange: () => void) => client.subscribe(() => onStoreChange()),
     [client],
   );
   const getSnapshot = useCallback(() => client.getSnapshot(), [client]);
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  const getDiagnostics = useCallback(() => client.getDiagnostics(), [client]);
-  const diagnostics = useSyncExternalStore(subscribe, getDiagnostics, getDiagnostics);
 
   const createSession = useCallback(
     async (input: CreateSessionInput) => client.createSession(input),
@@ -108,48 +94,24 @@ export function OcgRuntimeProvider({
     },
     [client],
   );
-  const launchJob = useCallback(
-    async (command: JobLaunchCommand): Promise<JobLaunchResult> => {
-      if (!client.launchJob) {
-        return {
-          outcome: "failed",
-          commandId: command.commandId,
-          draftId: command.draftId,
-          projectId: command.projectId,
-          sessionId: command.sessionId,
-          message: "This runtime client does not support Job launch.",
-          duplicate: false,
-        };
-      }
-      return client.launchJob(command);
-    },
-    [client],
-  );
-
   const value = useMemo(
     () => ({
       client,
       control:
         controlClient ?? (client instanceof CanonicalOcgRuntimeClient ? client.control : null),
-      authority,
       snapshot,
-      diagnostics,
       createSession,
       deleteSession,
       sendMessage,
       retryMessage,
       cancel,
-      launchJob,
     }),
     [
-      authority,
       cancel,
       client,
       controlClient,
       createSession,
       deleteSession,
-      diagnostics,
-      launchJob,
       retryMessage,
       sendMessage,
       snapshot,

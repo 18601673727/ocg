@@ -29,7 +29,6 @@ export class OutputHistory implements OutputSequence {
   private tailHead = 0;
   private latestResult: OutputView | null = null;
   private latestResultSeq: number | null = null;
-  revision = 0;
 
   get length() {
     return this.sequences.length + this.tail.length;
@@ -55,7 +54,6 @@ export class OutputHistory implements OutputSequence {
       this.latestResult = output;
       this.latestResultSeq = output.seq;
     }
-    this.revision++;
   }
 
   private compact(output: OutputView) {

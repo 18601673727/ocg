@@ -2,6 +2,7 @@ use crate::api::v1::ControlPlaneConfig;
 use crate::system::data_directory::DataDirectory;
 
 mod llm_target;
+mod migrate;
 mod pool;
 mod release_slot;
 pub mod typescript;
@@ -35,6 +36,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "pool" {
             let directory = DataDirectory::from_environment()?;
             return pool::run(&directory, arguments.collect());
+        }
+        if command == "migrate" {
+            return migrate::run(arguments.collect());
         }
         if command == "release-slot" {
             let directory = DataDirectory::from_environment()?;
@@ -103,6 +107,7 @@ fn usage() -> &'static str {
      Without command: run the OCG host (reads OCG_DATA_DIR, OCG_CONTROL_PORT, OCG_CONTROL_TOKEN, OCG_UI_DIR)\n\
      \n\
      Commands:\n\
+       migrate [--check | --to <directory>]\n\
        pool list | create <name> [nonzero-concurrency] | enable <pool> | disable <pool> | set-limit <pool> <nonzero-concurrency>\n\
        release-slot <job> [--yes]\n\
        workspace-read <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\

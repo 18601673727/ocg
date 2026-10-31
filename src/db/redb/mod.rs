@@ -58,6 +58,9 @@ mod observations;
 mod reader;
 mod recovery;
 pub(crate) use recovery::reclaim_pending;
+pub(crate) use recovery::{
+    MigrationFormat, migration_apply, migration_inspect, migration_snapshot, migration_source,
+};
 mod recurrences;
 mod rows;
 mod schema;

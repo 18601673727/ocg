@@ -1866,14 +1866,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return page.outputs[0] ?? null;
     },
 
-    /** One stored page of the Job's tool evidence. */
-    async readJobTools(
-      job: string,
-      settings: { after?: string; limit?: number; signal?: AbortSignal } = {},
-    ): Promise<ControlJobToolsPage> {
-      return readJobToolsInternal(job, settings);
-    },
-
     async readJobTool(
       job: string,
       request: number,
@@ -1896,28 +1888,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       )
         throw new ContractError("tool", "the complete requested tool evidence");
       return tool;
-    },
-
-    async readAllJobOutputs(job: string, signal?: AbortSignal) {
-      const outputs: Api.Outputs["outputs"] = [];
-      let after = 0;
-      for (;;) {
-        const page = (
-          await send(
-            "GET",
-            `/api/v1/jobs/${jobIdentity(job)}/outputs?limit=100&after_seq=${after}`,
-            { signal },
-          )
-        ).input as Api.Outputs;
-        if (page.outputs.some((output) => output.seq <= after))
-          throw new ContractError("outputs.seq", "a sequence after the cursor");
-        outputs.push(...page.outputs);
-        if (!page.has_more) return outputs;
-        const next = page.outputs.at(-1)?.seq;
-        if (next === undefined || next <= after)
-          throw new ContractError("next_after_seq", "an advancing output cursor");
-        after = next;
-      }
     },
 
     /** Reads the timestamp of the response that introduced a tool call. */

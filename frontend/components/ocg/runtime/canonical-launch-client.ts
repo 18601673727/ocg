@@ -125,7 +125,7 @@ async function readPartialToolBoundaries(
   signal: AbortSignal,
   times: Map<number, number>,
   responses: readonly ControlProviderResponse[],
-  gate?: ToolTimeGate,
+  gate: ToolTimeGate,
 ): Promise<PartialToolBoundary[] | null> {
   const first = outputs.at(0)?.created_at_us;
   if (!tools.length || first === undefined) return null;
@@ -156,11 +156,9 @@ async function readPartialToolBoundaries(
           const known = recorded.get(request) ?? times.get(request);
           return Promise.resolve(
             known === undefined
-              ? gate
-                ? gate.read(controller.signal, () =>
-                    control.readToolResponseTime(job, request, controller.signal),
-                  )
-                : control.readToolResponseTime(job, request, controller.signal)
+              ? gate.read(controller.signal, () =>
+                  control.readToolResponseTime(job, request, controller.signal),
+                )
               : known,
           ).then(
             (value) => ({ value }),
@@ -213,6 +211,12 @@ type Turn = {
   toolError?: string;
   unknownReason?: string | null;
 };
+
+function* turnAttachments(turn: Turn): Iterable<string> {
+  yield* turn.input.attachments;
+  for (const entry of turn.entries ?? []) yield* entry.attachments;
+}
+
 type Pending = {
   key: string;
   signature: string;
@@ -228,7 +232,6 @@ type StreamEntry = {
 
 /** Projects and sessions are presentation scope only: every backend turn is a Job. */
 export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
-  readonly authority = "canonical" as const;
   private started = false;
   private disposed = false;
   private readonly lifetime = new AbortController();
@@ -391,6 +394,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     throw new Error("This session has no admitted conversation.");
   }
 
+  private evictTurns(shouldEvict: (jobId: string, turn: Turn) => boolean) {
+    const attachments = new Set<string>();
+    for (const [jobId, turn] of this.turns) {
+      if (!shouldEvict(jobId, turn)) continue;
+      for (const id of turnAttachments(turn)) attachments.add(id);
+      this.streams.get(jobId)?.stop();
+      this.turns.delete(jobId);
+    }
+    for (const turn of this.turns.values()) {
+      for (const id of turnAttachments(turn)) attachments.delete(id);
+    }
+    for (const id of attachments) this.images.delete(id);
+  }
+
   /**
    * Records that `sessionId` presents the conversation `root`.
    *
@@ -442,20 +459,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.earlier.delete(sessionId);
       this.loadingEarlier.delete(sessionId);
       this.emit({ type: "conversation.session-deleted", sessionId });
-      const attachments = new Set<string>();
-      for (const [jobId, turn] of this.turns.entries()) {
-        if (turn.sessionId !== sessionId) continue;
-        for (const id of turn.input.attachments) attachments.add(id);
-        const stream = this.streams.get(jobId);
-        if (stream) {
-          stream.stop();
-        }
-        this.turns.delete(jobId);
-      }
-      for (const turn of this.turns.values()) {
-        for (const id of turn.input.attachments) attachments.delete(id);
-      }
-      for (const id of attachments) this.images.delete(id);
+      this.evictTurns((_, turn) => turn.sessionId === sessionId);
       this.tips.delete(sessionId);
       this.roots.delete(root);
     } finally {
@@ -560,16 +564,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       !page.turns.some((turn) => held.has(turn.job.id))
     ) {
       const pageIds = new Set(page.turns.map((turn) => turn.job.id));
-      const attachments = new Set<string>();
-      for (const [jobId, turn] of this.turns) {
-        if (turn.sessionId !== id || pageIds.has(jobId) || this.streams.has(jobId)) continue;
-        for (const imageId of turn.input.attachments) attachments.add(imageId);
-        this.turns.delete(jobId);
-      }
-      for (const turn of this.turns.values()) {
-        for (const imageId of turn.input.attachments) attachments.delete(imageId);
-      }
-      for (const imageId of attachments) this.images.delete(imageId);
+      this.evictTurns(
+        (jobId, turn) => turn.sessionId === id && !pageIds.has(jobId) && !this.streams.has(jobId),
+      );
       this.earlier.set(id, pageTurns(new Set(), undefined, page).next);
     }
     this.tips.set(id, job);
@@ -732,10 +729,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const previous = this.turns.get(turn.job.id);
     const snapshot = previous ? { ...previous } : undefined;
     const window =
-      turn.outputs_truncated || (turn.outputs.at(-1)?.seq ?? 0) > 200
+      turn.outputs_truncated ||
+      (turn.job.settlement.state === "unsettled" && (turn.outputs.at(-1)?.seq ?? 0) > 200)
         ? (await readOutputWindow(this.control, turn.job.id, { signal: this.lifetime.signal }))
             .outputs
-        : turn.outputs;
+        : turn.outputs.slice(-200);
     let outputs = mergeOutputHistory(window);
     if (previous?.outputs.length && window.length) {
       const last = previous.outputs.lastSeq;
@@ -777,16 +775,18 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       );
       state.partialToolTimes = times;
     }
-    if (turn.job.settlement.state === "unknown") {
+    const needsDetails =
+      turn.job.settlement.state === "unsettled" ||
+      [...outputs].some((output) => output.code === "task_plan_scheduled");
+    if (turn.job.settlement.state === "unknown" && !needsDetails) {
       const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
       if (!isCurrent()) return null;
       state.unknownReason = record.unknown_reason ?? null;
     }
-    if (
-      turn.job.settlement.state === "unsettled" ||
-      [...outputs].some((output) => output.code === "task_plan_scheduled")
-    ) {
+    if (needsDetails) {
       state.details = await this.control.readJobDetails(turn.job.id, this.lifetime.signal);
+      if (turn.job.settlement.state === "unknown")
+        state.unknownReason = state.details.unknown_reason ?? null;
       state.job = reconcileJob(state.job, state.details);
     }
     const images = await this.readImages(state);
@@ -849,7 +849,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       cached.aggregate.append(output);
     }
     const args = [
-      turn.outputRevision,
       turn.outputs,
       turn.outputs.length,
       turn.job,
@@ -882,12 +881,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   private async readImages(turn: Turn) {
     return Promise.all(
-      [
-        ...new Set([
-          ...turn.input.attachments,
-          ...(turn.entries ?? []).flatMap((entry) => entry.attachments),
-        ]),
-      ].map(async (id) => {
+      [...new Set(turnAttachments(turn))].map(async (id) => {
         const cached = this.images.get(id);
         if (cached) return cached;
         const attachment = await this.control.readAttachment(id, this.lifetime.signal);
@@ -1103,7 +1097,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             turn.entries = stored.entries;
             turn.compaction = stored.compaction;
             turn.input = stored.input;
-            for (const image of await this.readImages(turn)) this.images.set(image.id, image);
+            const images = await this.readImages(turn);
+            if (entry.stopped || this.disposed) return;
+            const attachments = new Set(turnAttachments(turn));
+            for (const image of images) {
+              if (attachments.has(image.id)) this.images.set(image.id, image);
+            }
           }
         }
         if (entry.stopped || this.disposed) return;
@@ -1133,7 +1132,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             throw error;
           }
           if (entry.stopped || this.disposed) return;
-          turn.outputs = mergeOutputHistory(turn.outputs, missing);
+          for (const output of missing) {
+            if (output.seq <= turn.outputs.lastSeq) continue;
+            turn.outputs.append(output);
+            turn.outputRevision = (turn.outputRevision ?? 0) + 1;
+          }
         }
         const evidenceApplied = this.applyTranscriptEvidence(
           turn,

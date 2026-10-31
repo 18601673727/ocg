@@ -1,7 +1,7 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { TaskStatus } from "./task-status";
@@ -175,9 +175,7 @@ function JobWatchBody({
   const [statusFailure, setStatusFailure] = useState(false);
   const [job, setJob] = useState<ControlJob | null>(null);
   const [outputs, setOutputs] = useState<ControlOutput[]>([]);
-  // Highest stored sequence processed so far: the reconnect/replay cursor,
-  // independent of how many rows the resident window retains.
-  const [storedTotal, setStoredTotal] = useState(0);
+  const storedTotal = outputs.at(-1)?.seq ?? 0;
   const [storedOpen, setStoredOpen] = useState(false);
   // Automatically retained rows; earlier outputs load only on explicit request.
   const windowRef = useRef(JOB_WATCH_RESIDENT_OUTPUTS);
@@ -198,14 +196,9 @@ function JobWatchBody({
   >(null);
   const [stop, setStop] = useState<string | null>(null);
   const [stopBusy, setStopBusy] = useState(false);
-  const [unknownReason, setUnknownReason] = useState<string | null>(null);
-  // One settlement arrives as both a "job" and a "settlement" event; the
-  // unknown reason is refreshed on whichever arrives first, at most once
-  // per watched Job.
-  const unknownReasonRefreshed = useRef(false);
+  const unknownReason = details?.unknown_reason ?? null;
   const reloadRef = useRef<() => void>(() => {});
   const watchRef = useRef({
-    epoch: 0,
     evidenceRevision: 0,
     processed: 0,
     historyComplete: false,
@@ -214,59 +207,6 @@ function JobWatchBody({
     replies: [] as ControlProviderResponse[],
   });
 
-  const applyEvidence = useCallback(
-    (
-      requestEpoch: number,
-      baseRevision: number,
-      completeWindow: boolean,
-      settled: boolean,
-      evidence: {
-        tools: ControlToolCall[] | null;
-        responses: ControlProviderResponse[] | null;
-        error: string | undefined;
-      },
-    ): boolean => {
-      const watch = watchRef.current;
-      if (watch.epoch !== requestEpoch || watch.evidenceRevision !== baseRevision) return false;
-      const windowCompleteNow = watch.historyComplete && watch.processed <= windowRef.current;
-      if (!completeWindow && windowCompleteNow) return false;
-      watch.evidenceRevision++;
-      if (settled) watch.reconciled = true;
-      if (evidence.tools) setTools(evidence.tools);
-      if (completeWindow && windowCompleteNow) {
-        watch.replies = evidence.responses ?? watch.replies;
-      } else {
-        watch.replies = [];
-      }
-      setResponses(watch.replies);
-      setEvidenceFailure(evidence.error);
-      return true;
-    },
-    [],
-  );
-
-  const applyEvidenceError = useCallback(
-    (
-      requestEpoch: number,
-      baseRevision: number,
-      completeWindow: boolean,
-      settled: boolean,
-      error: unknown,
-    ): boolean => {
-      const watch = watchRef.current;
-      if (watch.epoch !== requestEpoch || watch.evidenceRevision !== baseRevision) return false;
-      if (!completeWindow && watch.historyComplete && watch.processed <= windowRef.current)
-        return false;
-      watch.evidenceRevision++;
-      if (settled) watch.reconciled = true;
-      setEvidenceFailure(
-        `Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return true;
-    },
-    [],
-  );
-
   useEffect(
     () => () => {
       earlierLoad.current?.abort();
@@ -274,10 +214,6 @@ function JobWatchBody({
     },
     [client, jobId],
   );
-  useEffect(() => {
-    unknownReasonRefreshed.current = false;
-  }, [jobId]);
-
   useEffect(() => {
     if (!job && !settlement) return;
     onStateChange?.(settlement?.state ?? "unsettled", job);
@@ -289,8 +225,6 @@ function JobWatchBody({
     // The application consumes each stored output once: everything the
     // page reads and everything the stream replays passes this cursor.
     const watch = watchRef.current;
-    const epoch = ++watch.epoch;
-    watch.evidenceRevision++;
     watch.processed = 0;
     watch.historyComplete = false;
     watch.completed = false;
@@ -298,7 +232,9 @@ function JobWatchBody({
     watch.replies = [];
     windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
     let currentJob: ControlJob | null = null;
-    let refreshingStatus = false;
+    // Initial loading owns the status read until its output window is installed.
+    let refreshingStatus = true;
+    let statusQueued = false;
     const evidenceController = new AbortController();
 
     // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
@@ -311,11 +247,28 @@ function JobWatchBody({
 
     let reloading = false;
     let reloadQueued = false;
+    let retryAfter = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const invalidateReplies = () => {
+      watch.evidenceRevision++;
+      watch.reconciled = false;
+      watch.replies = [];
+      setResponses([]);
+    };
 
     const requestReload = () => {
-      if (!alive || watch.epoch !== epoch) return;
+      if (!alive) return;
       if (reloading) {
         reloadQueued = true;
+        return;
+      }
+      const delay = retryAfter - Date.now();
+      if (delay > 0) {
+        retryTimer ??= setTimeout(() => {
+          retryTimer = undefined;
+          requestReload();
+        }, delay);
         return;
       }
       reloading = true;
@@ -331,47 +284,101 @@ function JobWatchBody({
         .then(
           (evidence) => {
             if (!alive) return;
-            if (!applyEvidence(epoch, baseRevision, completeWindow, catchUp, evidence))
+            retryAfter = evidence.error ? Date.now() + 2000 : 0;
+            const windowCompleteNow = watch.historyComplete && watch.processed <= windowRef.current;
+            if (watch.evidenceRevision !== baseRevision || (!completeWindow && windowCompleteNow)) {
               reloadQueued = true;
+              return;
+            }
+            if (catchUp) watch.reconciled = true;
+            if (evidence.tools) setTools(evidence.tools);
+            watch.replies =
+              completeWindow && windowCompleteNow ? (evidence.responses ?? watch.replies) : [];
+            setResponses(watch.replies);
+            setEvidenceFailure(evidence.error);
           },
           (error) => {
             if (!alive || evidenceController.signal.aborted) return;
-            if (!applyEvidenceError(epoch, baseRevision, completeWindow, catchUp, error))
+            retryAfter = Date.now() + 2000;
+            const windowCompleteNow = watch.historyComplete && watch.processed <= windowRef.current;
+            if (watch.evidenceRevision !== baseRevision || (!completeWindow && windowCompleteNow)) {
               reloadQueued = true;
+              return;
+            }
+            if (catchUp) watch.reconciled = true;
+            setEvidenceFailure(
+              `Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`,
+            );
           },
         )
         .finally(() => {
           reloading = false;
-          if (reloadQueued && alive && watch.epoch === epoch) {
+          if (reloadQueued && alive) {
             reloadQueued = false;
             requestReload();
           }
         });
     };
     reloadRef.current = requestReload;
+    const onOnline = () => {
+      retryAfter = 0;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      retryTimer = undefined;
+      requestReload();
+    };
+    if (typeof window !== "undefined") window.addEventListener("online", onOnline);
 
     const refreshStatus = async () => {
-      if (!alive || refreshingStatus) return;
+      if (!alive) return;
+      if (refreshingStatus) {
+        statusQueued = true;
+        return;
+      }
       refreshingStatus = true;
       try {
         const record = await client.readJobDetails(jobId, evidenceController.signal);
         if (!alive) return;
-        currentJob = currentJob ? reconcileJob(currentJob, record) : record;
+        const reconciled = currentJob ? reconcileJob(currentJob, record) : record;
+        if (
+          reconciled === record &&
+          !(currentJob?.stop_confirmed_at_us != null && record.stop_confirmed_at_us === null)
+        ) {
+          currentJob = record;
+          setDetails(record);
+        } else {
+          currentJob = reconciled === record ? currentJob : reconciled;
+        }
         setJob(currentJob);
-        setDetails(record);
         setStatusFailure(false);
-        setUnknownReason(record.unknown_reason);
-        watch.completed = currentJob.settlement.state === "completed";
+        watch.completed = currentJob?.settlement.state === "completed";
         if (record.activity.last_output_seq > watch.processed) {
           const window = await readOutputWindow(client, jobId, {
             signal: evidenceController.signal,
           });
           if (!alive) return;
-          watch.processed = Math.max(watch.processed, window.latestSeq);
-          setStoredTotal(watch.processed);
-          setOutputs((existing) => mergeOutputWindow(existing, window.outputs, windowRef.current));
+          const previousProcessed = watch.processed;
+          if (window.latestSeq > previousProcessed) {
+            // Compare before advancing the cursor: a later window may not reach the resident tail.
+            const gap = (window.outputs[0]?.seq ?? 1) > previousProcessed + 1;
+            const lostCompleteness =
+              watch.historyComplete &&
+              previousProcessed <= windowRef.current &&
+              window.latestSeq > windowRef.current;
+            if (gap) {
+              earlierLoad.current?.abort();
+              earlierLoad.current = null;
+              setLoadingEarlier(false);
+              windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
+            }
+            if (gap || lostCompleteness) invalidateReplies();
+            watch.processed = window.latestSeq;
+            setOutputs((existing) =>
+              gap ? window.outputs : mergeOutputWindow(existing, window.outputs, windowRef.current),
+            );
+            if (gap || lostCompleteness) requestReload();
+          }
         }
-        if (currentJob.settlement.state !== "unsettled") {
+        if (currentJob && currentJob.settlement.state !== "unsettled") {
           setSettlement({
             ...currentJob.settlement,
             stop_confirmed_at_us: currentJob.stop_confirmed_at_us,
@@ -382,23 +389,16 @@ function JobWatchBody({
       } catch {
         if (alive) setStatusFailure(true);
       } finally {
-        refreshingStatus = false;
+        finishStatus();
       }
     };
 
-    let settledAtFirstRead = false;
-    const refreshUnknownReason = () => {
-      client.readJob(jobId).then(
-        (record) => {
-          if (alive) setUnknownReason(record.unknown_reason ?? null);
-        },
-        () => {},
-      );
-    };
-    const refreshUnknownReasonOnce = () => {
-      if (unknownReasonRefreshed.current) return;
-      unknownReasonRefreshed.current = true;
-      refreshUnknownReason();
+    const finishStatus = () => {
+      refreshingStatus = false;
+      if (statusQueued && alive) {
+        statusQueued = false;
+        void refreshStatus();
+      }
     };
 
     const listener = (event: JobStreamEvent) => {
@@ -418,27 +418,43 @@ function JobWatchBody({
           });
           void refreshStatus();
           requestReload();
-          if (event.job.settlement.state === "unknown" && !settledAtFirstRead)
-            refreshUnknownReasonOnce();
         }
       } else if (event.type === "output") {
         if (event.output.seq <= watch.processed) return;
+        if (
+          watch.historyComplete &&
+          watch.processed <= windowRef.current &&
+          event.output.seq > windowRef.current
+        )
+          invalidateReplies();
         watch.processed = event.output.seq;
-        setStoredTotal(event.output.seq);
         const incoming = event.output;
         setOutputs((existing) => mergeOutputWindow(existing, [incoming], windowRef.current));
         requestReload();
       } else if (event.type === "settlement") {
+        if (currentJob) {
+          const confirmed = currentJob.stop_confirmed_at_us ?? event.stop_confirmed_at_us;
+          currentJob = {
+            ...currentJob,
+            settlement: event.settlement,
+            stop_confirmed_at_us: confirmed,
+            updated_at_us: Math.max(
+              currentJob.updated_at_us,
+              event.settlement.settled_at_us ?? 0,
+              confirmed ?? 0,
+            ),
+          };
+          setJob(currentJob);
+        }
         watch.completed = event.settlement.state === "completed";
         setSettlement({
           state: event.settlement.state,
           settled_at_us: event.settlement.settled_at_us,
-          stop_confirmed_at_us: event.stop_confirmed_at_us,
+          stop_confirmed_at_us: currentJob?.stop_confirmed_at_us ?? event.stop_confirmed_at_us,
         });
         setStream("settled");
         void refreshStatus();
         requestReload();
-        if (event.settlement.state === "unknown" && !settledAtFirstRead) refreshUnknownReasonOnce();
       } else if (event.type === "stream_error") {
         setFailure({ code: event.error.code, scope: "stream" });
         setStream("stream_error");
@@ -464,10 +480,8 @@ function JobWatchBody({
         setJob(record);
         setDetails(record);
         watch.completed = record.settlement.state === "completed";
-        setUnknownReason(record.unknown_reason ?? null);
         // The record is the Job's own truth, whether or not the stream ever connects.
         if (record.settlement.state !== "unsettled") {
-          settledAtFirstRead = true;
           setSettlement({
             state: record.settlement.state,
             settled_at_us: record.settlement.settled_at_us,
@@ -494,7 +508,6 @@ function JobWatchBody({
         const window = await readOutputWindow(client, jobId, { signal: evidenceController.signal });
         if (!alive) return;
         watch.processed = window.latestSeq;
-        setStoredTotal(watch.processed);
         setOutputs(window.outputs);
       } catch (error) {
         if (alive) fail(error, "read");
@@ -535,16 +548,18 @@ function JobWatchBody({
       } catch (error) {
         if (alive) fail(error, "stream");
       }
-    })();
+    })().finally(finishStatus);
 
     return () => {
       alive = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
+      if (typeof window !== "undefined") window.removeEventListener("online", onOnline);
       if (reloadRef.current === requestReload) reloadRef.current = () => {};
       unsubscribeCatalog();
       subscription?.close();
       evidenceController.abort();
     };
-  }, [client, jobId, applyEvidence, applyEvidenceError]);
+  }, [client, jobId]);
 
   async function requestStop() {
     setStopBusy(true);
@@ -581,7 +596,6 @@ function JobWatchBody({
     const controller = new AbortController();
     earlierLoad.current = controller;
     const watch = watchRef.current;
-    const requestEpoch = watch.epoch;
     const nextWindow = windowRef.current + JOB_WATCH_WINDOW_STEP;
     setLoadingEarlier(true);
     setEarlierFailure(null);
@@ -591,48 +605,17 @@ function JobWatchBody({
         limit: JOB_WATCH_WINDOW_STEP,
         signal: controller.signal,
       });
-      if (controller.signal.aborted || watch.epoch !== requestEpoch) return;
+      if (controller.signal.aborted) return;
+      // The live window can move beyond the captured rows while this page is in flight.
+      if (watch.processed - (outputs.at(-1)?.seq ?? 0) > windowRef.current) return;
       windowRef.current = nextWindow;
       const incoming = walked;
       setOutputs((existing) => mergeOutputWindow([...outputs, ...existing], incoming, nextWindow));
       if ((walked[0]?.seq ?? outputs[0]?.seq) === 1 && watch.processed <= windowRef.current) {
-        const baseRevision = watch.evidenceRevision;
-        const completeWindow = watch.historyComplete && watch.processed <= windowRef.current;
-        const catchUp = completeWindow && watch.completed && !watch.reconciled;
-        let applied = false;
-        try {
-          const evidence = await readTranscriptEvidence(client, jobId, {
-            signal: controller.signal,
-            previous: completeWindow ? watch.replies : [],
-            settled: catchUp,
-            readReplies: completeWindow,
-          });
-          if (!controller.signal.aborted) {
-            applied = applyEvidence(requestEpoch, baseRevision, completeWindow, catchUp, evidence);
-          }
-        } catch (error) {
-          if (!controller.signal.aborted) {
-            applied = applyEvidenceError(
-              requestEpoch,
-              baseRevision,
-              completeWindow,
-              catchUp,
-              error,
-            );
-          }
-        }
-        if (
-          !controller.signal.aborted &&
-          watch.epoch === requestEpoch &&
-          !applied &&
-          watch.completed &&
-          !watch.reconciled
-        ) {
-          reloadRef.current();
-        }
+        reloadRef.current();
       }
     } catch (error) {
-      if (!controller.signal.aborted && watch.epoch === requestEpoch) {
+      if (!controller.signal.aborted) {
         setEarlierFailure({
           code:
             error instanceof ControlTransportError

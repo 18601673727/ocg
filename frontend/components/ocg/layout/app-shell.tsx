@@ -487,6 +487,7 @@ function AppShellContent({
                           session={session}
                           execution={null}
                           runtimeStatus={runtime.snapshot.status}
+                          queueState={runtime.snapshot.chatQueues?.[session.id]}
                           onComposerIntent={intent}
                           onCancel={() => runtime.cancel(session.id)}
                         />

@@ -283,6 +283,34 @@ fn visit_search_keys(
     Ok(())
 }
 
+pub(super) fn rebuild_conversation_search(tx: &WriteTransaction) -> Result<(), StorageError> {
+    visit_search_keys(tx, |key| {
+        tx.open_table(CONVERSATION_SEARCH)?.insert(key, ())?;
+        Ok(())
+    })
+}
+
+pub(super) fn verify_search_index(tx: &WriteTransaction) -> Result<(), StorageError> {
+    use ::redb::ReadableTableMetadata;
+    let table = tx.open_table(CONVERSATION_SEARCH)?;
+    let mut expected = 0u64;
+    visit_search_keys(tx, |key| {
+        if table.get(key)?.is_none() {
+            return Err(StorageError::corrupted(
+                "rebuilt search index is missing an entry",
+            ));
+        }
+        expected += 1;
+        Ok(())
+    })?;
+    if table.len()? != expected {
+        return Err(StorageError::corrupted(
+            "rebuilt search index contains unexpected entries",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn request_scope_key(
     identity: Option<&reader::UsageIdentity>,
     event: &RequestEventRecord,
@@ -957,10 +985,7 @@ pub(super) fn rebuild(tx: &WriteTransaction, clock: i64) -> Result<Vec<String>, 
                 .insert((due, id.value()), ())?;
         }
     }
-    visit_search_keys(tx, |key| {
-        tx.open_table(CONVERSATION_SEARCH)?.insert(key, ())?;
-        Ok(())
-    })?;
+    rebuild_conversation_search(tx)?;
     let mut changed = Vec::new();
     macro_rules! compare { ($($definition:ident),+ $(,)?) => {$({
         if before.iter().find(|(name, _)| *name == stringify!($definition)).map(|(_, digest)| *digest) != Some(fingerprint(tx, $definition)?) {
