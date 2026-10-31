@@ -131,8 +131,9 @@ jobs:
             cp LICENSE "packages/$name/LICENSE"
             tar --owner=0 --group=0 --numeric-owner -czf "packages/$name.tar.gz" -C packages "$name"
           done
+          cp install.sh packages/install.sh
           cd packages
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz install.sh > SHA256SUMS
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -145,6 +146,6 @@ jobs:
           if [[ "$PRERELEASE" == true ]]; then
             prerelease+=(--prerelease)
           fi
-          gh release create "v$VERSION" ./*.tar.gz SHA256SUMS \
+          gh release create "v$VERSION" ./*.tar.gz install.sh SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --title "OCG $VERSION" \
             --generate-notes "${prerelease[@]}"
