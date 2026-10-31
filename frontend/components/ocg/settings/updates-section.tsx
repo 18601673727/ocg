@@ -20,6 +20,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
   const [now, setNow] = useState(0);
   const [installingAt, setInstallingAt] = useState<number | null>(null);
   const running = useRef<string | null>(null);
+  const installing = useRef<{ id: string; started: number } | null>(null);
   const openedAt = useRef(0);
   const [seen, setSeen] = useState<string | null>(null);
 
@@ -30,17 +31,38 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
         if (signal?.aborted) return;
         if (next.state && (active(next.state) || next.state.started_at >= openedAt.current)) {
           const current = identity(next.state);
-          sessionStorage.setItem(seenKey, current);
+          try {
+            sessionStorage.setItem(seenKey, current);
+          } catch {
+            // The current page can still track the update without storage.
+          }
           setSeen(current);
           if (next.state.phase === "installing") {
             const key = `${seenKey}-installing`;
-            const saved = sessionStorage.getItem(key)?.split("|");
-            const started = saved?.[0] === current ? Number(saved[1]) : Date.now();
-            sessionStorage.setItem(key, `${current}|${started}`);
+            const fallback =
+              installing.current?.id === current ? installing.current.started : Date.now();
+            let started: number;
+            try {
+              const saved = sessionStorage.getItem(key)?.split("|");
+              started = saved?.[0] === current ? Number(saved[1]) : fallback;
+            } catch {
+              started = fallback;
+            }
+            installing.current = { id: current, started };
+            try {
+              sessionStorage.setItem(key, `${current}|${started}`);
+            } catch {
+              // Keep the timer in memory when storage is unavailable.
+            }
             setInstallingAt(started);
           }
         } else {
-          setSeen(sessionStorage.getItem(seenKey));
+          try {
+            const saved = sessionStorage.getItem(seenKey);
+            if (saved !== null) setSeen(saved);
+          } catch {
+            // Keep the current page's seen update.
+          }
         }
         if (running.current && running.current !== next.running) {
           window.location.reload();
@@ -77,7 +99,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
   }, [read]);
 
   useEffect(() => {
-    if (!view) return;
+    if (!view || !active(view.state)) return;
     const controller = new AbortController();
     const timer = window.setInterval(() => {
       setNow(Date.now());
@@ -168,7 +190,11 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
                   (state) => {
                     const current = identity(state);
                     setSeen(current);
-                    sessionStorage.setItem(seenKey, current);
+                    try {
+                      sessionStorage.setItem(seenKey, current);
+                    } catch {
+                      // The current page can still track the update without storage.
+                    }
                     setView((previous) => previous && { ...previous, state });
                   },
                   (cause) => setError(describeError(cause, t)),
