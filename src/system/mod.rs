@@ -8,3 +8,6 @@ pub(crate) mod notification;
 pub mod policy;
 pub mod runtime;
 pub mod scheduler;
+
+#[cfg(unix)]
+pub(crate) mod update;
