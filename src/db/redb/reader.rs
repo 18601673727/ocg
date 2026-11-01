@@ -2277,14 +2277,50 @@ fn conversation_matches(
     }
     Ok(true)
 }
-pub(crate) fn queue_counts(database: &Database) -> Result<(u64, u64, u64, u64), StorageError> {
+pub(crate) fn queue_counts(
+    database: &Database,
+    for_update: bool,
+) -> Result<(u64, u64, u64, u64), StorageError> {
     let rx = read(database)?;
-    let pending = rx.open_table(PENDING)?.len()?;
+    let pending_table = rx.open_table(PENDING)?;
+    let delayed_table = rx.open_table(DELAYED)?;
+    let (pending, delayed) = if for_update {
+        let clock = recovery::promotion_clock();
+        let mut pending = 0;
+        for entry in pending_table.iter()? {
+            let id = JobId::new(entry?.0.value());
+            let row = read_job_row(&rx, id)?
+                .ok_or_else(|| StorageError::corrupted("pending Job missing"))?;
+            if !row.kind.is_persistent()
+                || row
+                    .kind
+                    .eligible_at()
+                    .is_none_or(|at| at.as_unix_micros() <= clock)
+            {
+                pending += 1;
+            }
+        }
+        let mut delayed = 0;
+        for entry in delayed_table.range(..=(clock, u128::MAX))? {
+            entry?;
+            delayed += 1;
+        }
+        if rx
+            .open_table(RECURRENCE_DUE)?
+            .first()?
+            .is_some_and(|(key, _)| key.value().0 <= clock)
+        {
+            delayed += 1;
+        }
+        (pending, delayed)
+    } else {
+        (pending_table.len()?, delayed_table.len()?)
+    };
     let ready = rx.open_table(READY)?.len()?;
-    let delayed = rx.open_table(DELAYED)?.len()?;
     let mut running = 0;
     for entry in rx.open_table(HELD_SLOTS)?.iter()? {
-        if !entry?.1.value().1 {
+        let quarantined = entry?.1.value().1;
+        if for_update || !quarantined {
             running += 1;
         }
     }

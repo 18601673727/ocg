@@ -103,10 +103,16 @@ rollback_install() {
         fi
         if [ "$os" = Linux ]; then
             systemctl --user daemon-reload </dev/null || rollback_ok=false
+            if [ "$managed" = true ] && [ "$enablement_touched" = true ]; then
+                case $original_enablement in
+                    enabled) systemctl --user enable ocg </dev/null || rollback_ok=false ;;
+                    disabled) systemctl --user disable ocg </dev/null || rollback_ok=false ;;
+                esac
+            fi
         fi
     fi
     if [ "$settings_created" = true ]; then rm -f "$settings" </dev/null || rollback_ok=false; fi
-    if [ "$stopped" = true ]; then
+    if [ "$was_running" = true ] && [ "$service_touched" = true ]; then
         if [ "$os" = Linux ]; then
             systemctl --user reset-failed ocg </dev/null || true
             systemctl --user start ocg </dev/null || rollback_ok=false
@@ -189,9 +195,13 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             esac
             ;;
         Darwin)
-            for tool in sysctl launchctl; do
+            for tool in sysctl launchctl sw_vers; do
                 command -v "$tool" >/dev/null 2>&1 || { printf 'Missing required tool: %s\n' "$tool" >&2; exit 1; }
             done
+            macos_version=$(sw_vers -productVersion </dev/null)
+            macos_major=${macos_version%%.*}
+            case $macos_major in ''|*[!0-9]*) printf '%s\n' 'Cannot determine the macOS version.' >&2; exit 1 ;; esac
+            [ "$macos_major" -ge 15 ] || { printf 'OCG installation requires macOS 15 or newer for safe locking (found %s).\n' "$macos_version" >&2; exit 1; }
             case $cpu in
                 arm64) target=aarch64-apple-darwin ;;
                 x86_64)
@@ -225,12 +235,61 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         [ -n "$valid" ] && [ "$valid" = "$version" ] || { printf 'Invalid version: %s\n' "$version" >&2; exit 1; }
     fi
 
+    if [ "$os" = Linux ]; then install_lock_tool=flock; else install_lock_tool=lockf; fi
+    command -v "$install_lock_tool" >/dev/null 2>&1 || { printf 'Missing required tool: %s\n' "$install_lock_tool" >&2; exit 1; }
+    user_install_lock=$HOME/.ocg-install.lock
+    if [ -L "$user_install_lock" ] || { [ -e "$user_install_lock" ] && [ ! -f "$user_install_lock" ]; }; then
+        printf 'Refusing an unsafe user installation lock: %s\n' "$user_install_lock" >&2
+        exit 1
+    fi
+    install_umask=$(umask)
+    umask 077
+    # Always acquire the user lock before the prefix lock; never unlink either inode.
+    exec 8>> "$user_install_lock"
+    umask "$install_umask"
+    if [ "$os" = Linux ]; then
+        flock -n 8 || { printf 'User installation resources are locked or could not be locked: %s\n' "$user_install_lock" >&2; exit 1; }
+    else
+        lockf -s -t 0 8 || { printf 'User installation resources are locked or could not be locked: %s\n' "$user_install_lock" >&2; exit 1; }
+    fi
+    mkdir -p "$prefix" </dev/null
+    install_lock=$prefix/.install.lock
+    if [ -L "$install_lock" ] || { [ -e "$install_lock" ] && [ ! -f "$install_lock" ]; }; then
+        printf 'Refusing an unsafe installation lock: %s\n' "$install_lock" >&2
+        exit 1
+    fi
+    install_umask=$(umask)
+    umask 077
+    # Keep this inode in place; descriptor 9 owns the lock through exit cleanup.
+    exec 9>> "$install_lock"
+    umask "$install_umask"
+    if [ "$os" = Linux ]; then
+        flock -n 9 || { printf 'Installation is locked or could not be locked: %s\n' "$prefix" >&2; exit 1; }
+    else
+        lockf -s -t 0 9 || { printf 'Installation is locked or could not be locked: %s\n' "$prefix" >&2; exit 1; }
+    fi
+
     settings=$prefix/ocg.env
     data=$prefix/data
     label=io.github.18601673727.ocg
     unit=$HOME/.config/systemd/user/ocg.service
     plist=$HOME/Library/LaunchAgents/$label.plist
     uid=$(id -u </dev/null)
+    if [ -L "$HOME/.local/bin/ocg" ]; then
+        command_target=$(readlink "$HOME/.local/bin/ocg" </dev/null)
+        [ "$command_target" = "$prefix/current/ocg" ] || { printf 'The existing command does not belong to this prefix: %s\n' "$HOME/.local/bin/ocg" >&2; exit 1; }
+    fi
+    if [ "$os" = Linux ]; then service_file=$unit; else service_file=$plist; fi
+    if [ -e "$service_file" ] || [ -L "$service_file" ]; then
+        [ -f "$service_file" ] && [ ! -L "$service_file" ] || { printf 'Unsupported service file: %s\n' "$service_file" >&2; exit 1; }
+        if [ "$os" = Linux ]; then
+            service_path=$(systemd_path "$prefix" exec)
+            OCG_SERVICE_PATH="$service_path/current/ocg" awk '$0 == "ExecStart=\"" ENVIRON["OCG_SERVICE_PATH"] "\"" || $0 == "ExecStart=:\"" ENVIRON["OCG_SERVICE_PATH"] "\"" { found=1 } END { exit !found }' "$unit" </dev/null || { printf 'The existing service belongs to another prefix: %s\n' "$unit" >&2; exit 1; }
+        else
+            service_path=$(printf '%s\n' "$prefix" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&apos;/g')
+            OCG_SERVICE_PATH="$service_path/current/ocg" awk 'index($0,"<string>" ENVIRON["OCG_SERVICE_PATH"] "</string>") { found=1 } END { exit !found }' "$plist" </dev/null || { printf 'The existing service belongs to another prefix: %s\n' "$plist" >&2; exit 1; }
+        fi
+    fi
     if [ "$uninstall" = true ]; then
         if [ -f "$settings" ]; then
             data=$(sed -n "s/^OCG_DATA_DIR='\(.*\)'$/\1/p" "$settings" </dev/null)
@@ -246,13 +305,6 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             case $prefix_real/ in "$data_real/"*) printf 'Installation is inside the data directory: %s\n' "$data" >&2; exit 1 ;; esac
         fi
         [ ! -L "$prefix/versions" ] || { printf '%s\n' 'Refusing to remove a symlinked versions directory.' >&2; exit 1; }
-        if [ "$os" = Linux ] && [ -f "$unit" ]; then
-            service_path=$(systemd_path "$prefix" exec)
-            OCG_SERVICE_PATH="$service_path/current/ocg" awk '$0 == "ExecStart=\"" ENVIRON["OCG_SERVICE_PATH"] "\"" || $0 == "ExecStart=:\"" ENVIRON["OCG_SERVICE_PATH"] "\"" { found=1 } END { exit !found }' "$unit" </dev/null || { printf 'The existing service belongs to another prefix: %s\n' "$unit" >&2; exit 1; }
-        elif [ "$os" = Darwin ] && [ -f "$plist" ]; then
-            service_path=$(printf '%s\n' "$prefix" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&apos;/g')
-            awk -v path="$service_path/current/ocg" 'index($0,path) { found=1 } END { exit !found }' "$plist" </dev/null || { printf 'The existing service belongs to another prefix: %s\n' "$plist" >&2; exit 1; }
-        fi
         if [ "$os" = Linux ] && [ -f "$unit" ]; then
             systemctl --user stop ocg </dev/null
             systemctl --user disable ocg </dev/null
@@ -345,14 +397,11 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         case $data_real/ in "$prefix_real/versions/"*) printf 'Data is inside the versions directory: %s\n' "$data" >&2; exit 1 ;; esac
         case $prefix_real/ in "$data_real/"*) printf 'Installation is inside the data directory: %s\n' "$data" >&2; exit 1 ;; esac
     fi
-    if [ "$os" = Linux ] && [ -f "$unit" ]; then
-        service_path=$(systemd_path "$prefix" exec)
-        OCG_SERVICE_PATH="$service_path/current/ocg" awk '$0 == "ExecStart=\"" ENVIRON["OCG_SERVICE_PATH"] "\"" || $0 == "ExecStart=:\"" ENVIRON["OCG_SERVICE_PATH"] "\"" { found=1 } END { exit !found }' "$unit" </dev/null || { printf 'The existing service belongs to another prefix: %s\n' "$unit" >&2; exit 1; }
-    elif [ "$os" = Darwin ] && [ -f "$plist" ]; then
-        service_path=$(printf '%s\n' "$prefix" | sed 's/\&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g; s/'"'"'/\&apos;/g')
-        awk -v path="$service_path/current/ocg" 'index($0,path) { found=1 } END { exit !found }' "$plist" </dev/null || { printf 'The existing service belongs to another prefix: %s\n' "$plist" >&2; exit 1; }
-    fi
+    [ ! -L "$prefix/versions" ] || { printf '%s\n' 'Refusing a symlinked versions directory.' >&2; exit 1; }
+    mkdir -p "$prefix/versions" </dev/null
+    versions_real=$(cd -P "$prefix/versions" && pwd -P)
     previous_target=
+    previous_dir=
     previous_version=
     if [ -L "$prefix/current" ]; then
         previous_target=$(readlink "$prefix/current" </dev/null)
@@ -361,21 +410,29 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             *) printf '%s\n' 'Refusing an unmanaged current link.' >&2; exit 1 ;;
         esac
         case $previous in *[!0-9A-Za-z.-]*|''|.|..) printf '%s\n' 'Invalid current version directory.' >&2; exit 1 ;; esac
-        previous_version=$("$prefix/current/ocg" --version </dev/null)
+        previous_dir=$(cd -P "$prefix/current" && pwd -P) || { printf '%s\n' 'Cannot resolve the current version directory.' >&2; exit 1; }
+        case $previous_dir in
+            "$versions_real/"*) previous_name=${previous_dir#"$versions_real/"} ;;
+            *) printf '%s\n' 'The current version resolves outside the versions directory.' >&2; exit 1 ;;
+        esac
+        case $previous_name in *[!0-9A-Za-z.-]*|''|.|..) printf '%s\n' 'Unsupported current version directory.' >&2; exit 1 ;; esac
+        [ -f "$previous_dir/ocg" ] && [ ! -L "$previous_dir/ocg" ] &&
+            [ -d "$previous_dir/ui" ] && [ ! -L "$previous_dir/ui" ] || { printf '%s\n' 'Unsupported current version layout.' >&2; exit 1; }
+        previous_version=$("$previous_dir/ocg" --version </dev/null)
         previous_version=${previous_version#ocg }
     elif [ -e "$prefix/current" ]; then
         printf '%s\n' 'Refusing to replace an unmanaged current directory.' >&2
         exit 1
     fi
-    [ ! -L "$prefix/versions" ] || { printf '%s\n' 'Refusing a symlinked versions directory.' >&2; exit 1; }
-    mkdir -p "$prefix/versions" </dev/null
     staged=$(mktemp -d "$prefix/versions/$version-XXXXXX" </dev/null)
     cp -R "$tmp/$name/." "$staged/" </dev/null
     staged_version=$("$staged/ocg" --version </dev/null)
     [ "$staged_version" = "ocg $version" ] || { printf '%s\n' 'Staged binary has the wrong version.' >&2; exit 1; }
     next_target=versions/${staged##*/}
     managed=false
-    stopped=false
+    was_running=false
+    original_enablement=
+    enablement_touched=false
     service_touched=false
     current_changed=false
     command_changed=false
@@ -385,7 +442,8 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     domain=
     previous_domain=
     if [ "$os" = Linux ]; then service_file=$unit; else service_file=$plist; fi
-    if [ -f "$service_file" ]; then
+    if [ -e "$service_file" ] || [ -L "$service_file" ]; then
+        [ -f "$service_file" ] || { printf 'Unsupported service file: %s\n' "$service_file" >&2; exit 1; }
         managed=true
         service=true
         cp -p "$service_file" "$tmp/service" </dev/null
@@ -395,17 +453,56 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         [ -n "$token" ] || { printf 'Cannot read control token from %s\n' "$settings" >&2; exit 1; }
         escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     fi
+    if [ "$managed" = true ] && [ "$os" = Linux ]; then
+        enablement_status=0
+        original_enablement=$(systemctl --user is-enabled ocg </dev/null) || enablement_status=$?
+        case $original_enablement:$enablement_status in
+            enabled:0|disabled:1) ;;
+            *) printf 'Unsupported or unknown service enablement: %s\n' "$original_enablement" >&2; exit 1 ;;
+        esac
+        service_state=$(systemctl --user is-active ocg </dev/null) || true
+        case $service_state in
+            active|activating|reloading) was_running=true ;;
+            inactive|failed|deactivating) ;;
+            *) printf '%s\n' 'Cannot determine the existing service state.' >&2; exit 1 ;;
+        esac
+    elif [ "$managed" = true ]; then
+        for inspected_domain in gui user; do
+            if service_state=$(launchctl print "$inspected_domain/$uid/$label" </dev/null 2> "$tmp/launchctl.error"); then
+                [ -z "$domain" ] || { printf '%s\n' 'OCG is registered in multiple launchd domains; stop it before installing.' >&2; exit 1; }
+                running_state=$(printf '%s\n' "$service_state" | awk '
+                    $1 == "pid" && $2 == "=" && $3 ~ /^[0-9]+$/ && $3 > 0 { running=1 }
+                    $1 == "state" && $2 == "=" && !seen {
+                        state=$3; if ($3 == "not" && $4 == "running") state="not running";
+                        seen=1
+                    }
+                    END {
+                        if (running || state == "running") print "running";
+                        else if (state == "not running" || state == "waiting" || state == "exited") print "stopped";
+                        else exit 1
+                    }
+                ') || { printf '%s\n' 'Cannot determine the existing launchd service state.' >&2; exit 1; }
+                domain=$inspected_domain
+                if [ "$running_state" = running ]; then was_running=true; fi
+            else
+                inspection_status=$?
+                case $inspection_status in
+                    112|113) ;;
+                    *)
+                        sed -n 'p' "$tmp/launchctl.error" >&2
+                        printf '%s\n' 'Cannot inspect the existing launchd service.' >&2
+                        exit 1
+                        ;;
+                esac
+            fi
+        done
+        previous_domain=${domain:-gui}
+    fi
     rollback=true
     if [ "$managed" = true ] && [ "$os" = Linux ]; then
-        stopped=true
         service_touched=true
         systemctl --user stop ocg </dev/null
-    elif [ "$managed" = true ]; then
-        if launchctl print "gui/$uid/$label" </dev/null >/dev/null 2>&1; then domain=gui; stopped=true
-        elif launchctl print "user/$uid/$label" </dev/null >/dev/null 2>&1; then domain=user; stopped=true
-        fi
-        previous_domain=${domain:-gui}
-        stopped=true
+    elif [ "$managed" = true ] && [ -n "$domain" ]; then
         service_touched=true
         stop_launchd || { printf '%s\n' 'Timed out stopping OCG.' >&2; exit 1; }
     fi
@@ -466,6 +563,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         service_touched=true
         printf '[Unit]\nDescription=OCG\n[Service]\nEnvironmentFile=%s/ocg.env\nExecStart=:"%s/current/ocg"\nRestart=on-failure\nStandardOutput=append:%s/service.log\nStandardError=append:%s/service.log\n[Install]\nWantedBy=default.target\n' "$unit_path" "$unit_prefix" "$unit_path" "$unit_path" > "$unit"
         systemctl --user daemon-reload </dev/null
+        enablement_touched=true
         systemctl --user enable ocg </dev/null
         systemctl --user start ocg </dev/null
         printf 'The service stops at logout unless you run: loginctl enable-linger "%s"\n' "${USER:-$(id -un </dev/null)}"
@@ -492,8 +590,37 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     [ -n "$token" ] || { printf 'Cannot read control token from %s\n' "$settings" >&2; exit 1; }
     escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     if wait_health "$version"; then
+        active_dir=$(cd -P "$prefix/current" && pwd -P)
         rollback=false
         keep_staged=true
+        for obsolete in "$prefix/versions/"*; do
+            case $obsolete in "$staged"|"$prefix/$previous_target") continue ;; esac
+            [ -d "$obsolete" ] && [ ! -L "$obsolete" ] || continue
+            obsolete_dir=$(cd -P "$obsolete" && pwd -P) || continue
+            case $obsolete_dir in "$active_dir"|"$previous_dir") continue ;; esac
+            obsolete_name=${obsolete##*/}
+            case $obsolete_name in *[!0-9A-Za-z.-]*|''|.|..) continue ;; esac
+            [ -f "$obsolete/ocg" ] && [ ! -L "$obsolete/ocg" ] &&
+                [ -d "$obsolete/ui" ] && [ ! -L "$obsolete/ui" ] &&
+                [ -f "$obsolete/LICENSE" ] && [ ! -L "$obsolete/LICENSE" ] || continue
+            installer_owned=true
+            for artifact in "$obsolete/"* "$obsolete/".[!.]* "$obsolete/"..?*; do
+                [ -e "$artifact" ] || [ -L "$artifact" ] || continue
+                case $artifact in
+                    "$obsolete/ocg"|"$obsolete/ui"|"$obsolete/LICENSE") ;;
+                    *) installer_owned=false ;;
+                esac
+            done
+            [ "$installer_owned" = true ] || continue
+            obsolete_version=$("$obsolete/ocg" --version </dev/null 2>/dev/null) || continue
+            obsolete_version=${obsolete_version#ocg }
+            valid=$(printf '%s\n' "$obsolete_version" | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[0-9A-Za-z][0-9A-Za-z.-]*\)\{0,1\}$/p')
+            [ -n "$valid" ] && [ "$valid" = "$obsolete_version" ] || continue
+            case $obsolete_name in "$obsolete_version"|"$obsolete_version-"??????) ;;
+                *) continue ;;
+            esac
+            rm -rf "$obsolete" </dev/null || printf 'Could not remove obsolete version: %s\n' "$obsolete" >&2
+        done
         printf 'OCG %s is available at http://127.0.0.1:%s\nData: %s\nSettings: %s\nStop: %s\nUninstall: curl -fsSL https://github.com/18601673727/ocg/releases/latest/download/install.sh | sh -s -- --prefix '\''%s'\'' --uninstall\n' "$version" "$port" "$data" "$settings" "$stop" "$prefix"
         exit 0
     fi

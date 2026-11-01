@@ -168,7 +168,10 @@ impl DatabaseHandle {
         let directory = self.shared.database_directory.clone();
         let (database_bytes, available_bytes) = filesystem_vitals_async(directory).await;
 
-        let queue_counts = match self.read(redb::queue_counts).await {
+        let queue_counts = match self
+            .read(|database| redb::queue_counts(database, false))
+            .await
+        {
             Ok(counts) => (
                 Some(counts.0),
                 Some(counts.1),
@@ -361,7 +364,7 @@ impl DatabaseHandle {
         }
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
         let (pending, ready, delayed, running) =
-            redb::queue_counts(&opened.database).map_err(DatabaseError::Read)?;
+            redb::queue_counts(&opened.database, true).map_err(DatabaseError::Read)?;
         if pending != 0 || ready != 0 || delayed != 0 || running != 0 || !self.sender.is_empty() {
             return Ok(None);
         }

@@ -64,12 +64,9 @@ async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
         let running = counter("running")?;
         let ready = counter("ready")?;
         let pending = counter("pending")?;
-        let delayed = counter("delayed")?;
+        counter("delayed")?;
         let commands = counter("commands_waiting")?;
-        if delayed != 0 {
-            return Err("delayed Jobs remain; use --yes to override".into());
-        }
-        if running == 0 && ready == 0 && pending == 0 && commands == 0 {
+        if running == 0 && ready == 0 && commands == 0 {
             let response = client
                 .post(prepare_url.as_str())
                 .header(header::AUTHORIZATION, auth.clone())
