@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use std::time::Instant;
 
+use ntex::client::error::{ClientError, ConnectError};
 use ntex::client::{Client, Connector};
 use ntex::http::header;
 use ntex::time::Millis;
@@ -41,12 +42,21 @@ async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
         if Instant::now() >= deadline {
             return Err("Jobs did not drain within five minutes; use --yes to override".into());
         }
-        let response = client
+        let response = match client
             .get(url.as_str())
             .header(header::AUTHORIZATION, auth.clone())
             .send()
             .await
-            .map_err(|error| format!("health request failed: {error}"))?;
+        {
+            Ok(response) => response,
+            Err(ClientError::Connect(ConnectError::Disconnected(Some(error))))
+                if error.kind() == std::io::ErrorKind::ConnectionRefused =>
+            {
+                println!("OCG is not running; updating now");
+                return Ok(());
+            }
+            Err(error) => return Err(format!("health request failed: {error}").into()),
+        };
         if !response.status().is_success() {
             return Err(format!("health request returned {}", response.status()).into());
         }
