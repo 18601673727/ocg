@@ -121,7 +121,13 @@ rollback_install() {
         fi
         if ! wait_health "$previous_version"; then rollback_ok=false; fi
     fi
-    if [ "$rollback_ok" = true ]; then
+    if [ -n "$previous_version" ]; then
+        if [ "$rollback_ok" = true ]; then
+            printf 'Update to %s failed; back on %s. Logs: %s/service.log\n' "$version" "$previous_version" "$prefix" >&2
+        else
+            printf 'Update to %s failed, and %s could not be fully restored. Logs: %s/service.log\n' "$version" "$previous_version" "$prefix" >&2
+        fi
+    elif [ "$rollback_ok" = true ]; then
         printf 'Update to %s failed; previous installation restored. Logs: %s/service.log\n' "$version" "$prefix" >&2
     else
         printf 'Update to %s failed; previous service could not be fully restored. Logs: %s/service.log\n' "$version" "$prefix" >&2
