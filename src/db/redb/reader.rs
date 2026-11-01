@@ -2320,7 +2320,7 @@ pub(crate) fn queue_counts(
     let mut running = 0;
     for entry in rx.open_table(HELD_SLOTS)?.iter()? {
         let quarantined = entry?.1.value().1;
-        if for_update || !quarantined {
+        if !quarantined {
             running += 1;
         }
     }
