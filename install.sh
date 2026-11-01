@@ -350,7 +350,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     else
         base=${release_root%/download}/latest/download
     fi
-    if ! curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" </dev/null; then
+    if ! curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" </dev/null; then
         printf 'Failed to download release checksums from %s\n' "$base" >&2
         exit 1
     fi
@@ -368,7 +368,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     name=ocg-v$version-$target
     archive=$name.tar.gz
     expected=$(awk -v name="$archive" '{ file=$2; sub(/^\*/, "", file); if (file==name) { print $1; count++ } } END { if (count != 1) exit 1 }' "$tmp/SHA256SUMS" </dev/null) || { printf 'Missing or duplicate checksum for %s\n' "$archive" >&2; exit 1; }
-    if ! curl -fsSL "$base/$archive" -o "$tmp/$archive" </dev/null; then
+    if ! curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$base/$archive" -o "$tmp/$archive" </dev/null; then
         printf 'Failed to download %s\n' "$archive" >&2
         exit 1
     fi

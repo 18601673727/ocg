@@ -162,6 +162,7 @@ pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply
 #[cfg(unix)]
 async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
     use crate::system::update;
+    use std::time::Instant;
     let database = database.clone();
     let paused = ntex::rt::spawn_blocking(move || {
         let install = update::install().map_err(|_| CONFLICT)?;
@@ -172,17 +173,29 @@ async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
         }
         database
             .pause_for_update()
-            .map(|pause| (install.prefix, pause))
+            .map(|pause| {
+                (
+                    install.prefix,
+                    pause,
+                    Instant::now() + Duration::from_secs(600),
+                )
+            })
             .map_err(|_| INTERNAL)
     })
     .await
     .map_err(|_| INTERNAL)??;
-    let (prefix, pause) = paused;
+    let (prefix, pause, deadline) = paused;
     let idle = pause.is_some();
     if let Some(pause) = pause {
         ntex::rt::spawn(async move {
             let _pause = pause;
             loop {
+                if Instant::now() >= deadline {
+                    log::warn!(
+                        "update pause ended after 10 minutes; writes and Jobs are open again while the update runs."
+                    );
+                    break;
+                }
                 let prefix = prefix.clone();
                 let unlocked = ntex::rt::spawn_blocking(move || update::lock(&prefix).is_ok())
                     .await
