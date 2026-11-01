@@ -121,7 +121,7 @@ function ProfileEditor({
     }
   }
   const availableModels = [
-    ...profiles.llm_profiles.filter((model) => model.enabled),
+    ...profiles.llm_profiles.filter((model) => model.enabled || models.includes(model.id)),
     ...profiles.decision_profiles,
   ];
   const selectedModels = availableModels.filter((model) => models.includes(model.id));
@@ -302,6 +302,9 @@ function ProfileEditor({
                       <input
                         type="checkbox"
                         checked={models.includes(model.id)}
+                        disabled={
+                          "enabled" in model && !model.enabled && !models.includes(model.id)
+                        }
                         onChange={(event) => {
                           setModels(
                             event.target.checked
@@ -313,6 +316,7 @@ function ProfileEditor({
                         }}
                       />
                       {model.name}
+                      {"enabled" in model && !model.enabled && ` (${t("settings.llm.disabled")})`}
                     </label>
                   ))
                 )}
@@ -324,7 +328,13 @@ function ProfileEditor({
                     value={defaultModel ?? ""}
                     items={[
                       { value: "", label: t("decision.firstModel") },
-                      ...selectedModels.map((model) => ({ value: model.id, label: model.name })),
+                      ...selectedModels.map((model) => ({
+                        value: model.id,
+                        label:
+                          "enabled" in model && !model.enabled
+                            ? `${model.name} (${t("settings.llm.disabled")})`
+                            : model.name,
+                      })),
                     ]}
                     onValueChange={(next) => setDefaultModel(next || null)}
                   >
@@ -334,8 +344,15 @@ function ProfileEditor({
                     <SelectContent>
                       <SelectItem value="">{t("decision.firstModel")}</SelectItem>
                       {selectedModels.map((model) => (
-                        <SelectItem key={model.id} value={model.id}>
+                        <SelectItem
+                          key={model.id}
+                          value={model.id}
+                          disabled={"enabled" in model && !model.enabled}
+                        >
                           {model.name}
+                          {"enabled" in model &&
+                            !model.enabled &&
+                            ` (${t("settings.llm.disabled")})`}
                         </SelectItem>
                       ))}
                     </SelectContent>

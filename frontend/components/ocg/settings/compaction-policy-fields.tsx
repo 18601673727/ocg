@@ -148,10 +148,12 @@ export function CompactionPolicyFields({
               items={[
                 { value: "", label: t("context.foregroundFallback") },
                 ...profiles.llm_profiles
-                  .filter((model) => model.enabled)
+                  .filter((profile) => profile.enabled || profile.id === policy.summarization_model)
                   .map((model) => ({
                     value: model.id,
-                    label: model.name,
+                    label: model.enabled
+                      ? model.name
+                      : `${model.name} (${t("settings.llm.disabled")})`,
                   })),
               ]}
               onValueChange={(next) => change({ summarization_model: next || null })}
@@ -162,10 +164,11 @@ export function CompactionPolicyFields({
               <SelectContent>
                 <SelectItem value="">{t("context.foregroundFallback")}</SelectItem>
                 {profiles.llm_profiles
-                  .filter((model) => model.enabled)
+                  .filter((profile) => profile.enabled || profile.id === policy.summarization_model)
                   .map((model) => (
-                    <SelectItem key={model.id} value={model.id}>
+                    <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
                       {model.name}
+                      {!model.enabled && ` (${t("settings.llm.disabled")})`}
                     </SelectItem>
                   ))}
               </SelectContent>

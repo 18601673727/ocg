@@ -676,7 +676,12 @@ impl Batch {
             Ok(found)
         })?;
         let connection_id = match matching_connection {
-            Some(id) => id,
+            Some(id) => {
+                if profile_kind == ConfigKind::Model {
+                    self.set_config_enabled(id, ConfigKind::Connection, true)?;
+                }
+                id
+            }
             None => self.create_config(
                 save.connection_name,
                 ConfigBody::Connection(ConnectionConfig {
@@ -1261,7 +1266,7 @@ impl Batch {
     }
 
     pub(crate) fn archive_model(&mut self, id: ConfigId) -> Result<(), BatchError> {
-        let mut row = self.require_config(id)?;
+        let row = self.require_config(id)?;
         if !matches!(
             row.kind,
             ConfigKind::Model | ConfigKind::DecisionModel | ConfigKind::DecisionAgent
@@ -1275,59 +1280,48 @@ impl Batch {
         if row.archived_at.is_some() {
             return Ok(());
         }
-        let emptied = self.step(|tx| {
-            let mut emptied = BTreeSet::new();
-            if row.kind == ConfigKind::DecisionAgent {
-                emptied.insert(id);
-            }
-            for entry in tx.open_table(CONFIGS)?.iter()? {
-                let (key, value) = entry?;
-                let row = ConfigRow::decode_at(key.value(), value.value())?;
-                if row.archived_at.is_none()
-                    && let ConfigBody::DecisionAgent(agent) = row.body
-                    && agent.models.contains(&id)
-                    && agent.models.iter().all(|model| *model == id)
-                {
-                    emptied.insert(row.id);
-                }
-            }
-            Ok(emptied)
-        })?;
+        self.archive_models(vec![row])
+    }
+
+    fn archive_models(&mut self, rows: Vec<ConfigRow>) -> Result<(), BatchError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let ids: BTreeSet<_> = rows.iter().map(|row| row.id).collect();
         let agents = self.step(|tx| {
             let mut agents = Vec::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
                 let row = ConfigRow::decode_at(key.value(), value.value())?;
-                let references_model = match &row.body {
-                    ConfigBody::Agent(agent) => {
-                        agent.models.contains(&id)
-                            || agent.compaction_policy.as_ref().is_some_and(|policy| {
-                                policy.summarization_model == Some(id)
-                                    || policy.predictive.as_ref().is_some_and(|prediction| {
-                                        emptied.contains(&prediction.decision_agent)
-                                            || prediction
-                                                .acceptance
-                                                .as_ref()
-                                                .is_some_and(|pin| pin.model.id == id)
-                                    })
-                            })
-                    }
-                    ConfigBody::DecisionAgent(agent) => {
-                        agent.models.contains(&id) || agent.default_model == Some(id)
-                    }
-                    ConfigBody::Connection(_)
-                    | ConfigBody::Model(_)
-                    | ConfigBody::DecisionModel(_)
-                    | ConfigBody::Pool(_) => false,
-                };
-                if row.archived_at.is_none() && references_model {
+                if row.archived_at.is_none()
+                    && matches!(
+                        &row.body,
+                        ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_)
+                    )
+                {
                     agents.push(row);
                 }
             }
             Ok(agents)
         })?;
+        let mut emptied: BTreeSet<_> = rows
+            .iter()
+            .filter(|row| row.kind == ConfigKind::DecisionAgent)
+            .map(|row| row.id)
+            .collect();
+        for row in &agents {
+            if let ConfigBody::DecisionAgent(agent) = &row.body
+                && agent.models.iter().any(|model| ids.contains(model))
+                && agent.models.iter().all(|model| ids.contains(model))
+            {
+                emptied.insert(row.id);
+            }
+        }
         let clear_policy = |policy: &mut crate::db::entities::CompactionPolicy| {
-            if policy.summarization_model == Some(id) {
+            if policy
+                .summarization_model
+                .is_some_and(|model| ids.contains(&model))
+            {
                 policy.summarization_model = None;
             }
             if policy
@@ -1340,7 +1334,7 @@ impl Batch {
                 && prediction
                     .acceptance
                     .as_ref()
-                    .is_some_and(|pin| pin.model.id == id)
+                    .is_some_and(|pin| ids.contains(&pin.model.id))
             {
                 prediction.mode = crate::db::entities::PredictionMode::Shadow;
                 prediction.acceptance = None;
@@ -1350,14 +1344,17 @@ impl Batch {
             let before = agent_row.body.clone();
             match &mut agent_row.body {
                 ConfigBody::Agent(agent) => {
-                    agent.models.retain(|model| *model != id);
+                    agent.models.retain(|model| !ids.contains(model));
                     if let Some(policy) = &mut agent.compaction_policy {
                         clear_policy(policy);
                     }
                 }
                 ConfigBody::DecisionAgent(agent) => {
-                    agent.models.retain(|model| *model != id);
-                    if agent.default_model == Some(id) {
+                    agent.models.retain(|model| !ids.contains(model));
+                    if agent
+                        .default_model
+                        .is_some_and(|model| ids.contains(&model))
+                    {
                         agent.default_model = None;
                     }
                 }
@@ -1400,7 +1397,7 @@ impl Batch {
                     .decision
                     .as_ref()
                     .and_then(|policy| policy.decision_profile)
-                    .is_some_and(|profile| profile == id || emptied.contains(&profile))
+                    .is_some_and(|profile| ids.contains(&profile) || emptied.contains(&profile))
                 {
                     changes.push(project);
                 }
@@ -1424,40 +1421,31 @@ impl Batch {
         if settings.policy != before {
             self.set_global_compaction_settings(settings)?;
         }
-        row.archived_at = Some(self.now);
-        row.updated_at = self.now;
-        row.edit_seq += 1;
-        self.put_config(&row)
+        for mut row in rows {
+            row.archived_at = Some(self.now);
+            row.updated_at = self.now;
+            row.edit_seq += 1;
+            self.put_config(&row)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn remove_provider(&mut self, id: ConfigId) -> Result<(), BatchError> {
         self.set_config_enabled(id, ConfigKind::Connection, false)?;
-        let mut after = None;
-        loop {
-            let rows = self.step(|tx| {
-                let table = tx.open_table(CONFIGS)?;
-                let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-                let mut rows = Vec::new();
-                for entry in table.range((start, std::ops::Bound::Unbounded))?.take(256) {
-                    let (key, value) = entry?;
-                    let row = ConfigRow::decode_at(key.value(), value.value())?;
-                    let matches = row.archived_at.is_none()
-                        && matches!(&row.body, ConfigBody::Model(model) if model.connection_id == id);
-                    rows.push((key.value(), matches));
-                }
-                Ok(rows)
-            })?;
-            if rows.is_empty() {
-                break;
-            }
-            for (key, matches) in rows {
-                after = Some(key);
-                if matches {
-                    self.archive_model(ConfigId::new(key))?;
+        let models = self.step(|tx| {
+            let mut models = Vec::new();
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, value) = entry?;
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
+                if row.archived_at.is_none()
+                    && matches!(&row.body, ConfigBody::Model(model) if model.connection_id == id)
+                {
+                    models.push(row);
                 }
             }
-        }
-        Ok(())
+            Ok(models)
+        })?;
+        self.archive_models(models)
     }
 
     // ---- jobs --------------------------------------------------------------------------

@@ -256,10 +256,12 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       items={[
                         { value: "", label: t("context.summarizer") },
                         ...profiles.llm_profiles
-                          .filter((model) => model.enabled)
+                          .filter((profile) => profile.enabled || profile.id === model)
                           .map((model) => ({
                             value: model.id,
-                            label: model.name,
+                            label: model.enabled
+                              ? model.name
+                              : `${model.name} (${t("settings.llm.disabled")})`,
                           })),
                       ]}
                       onValueChange={(next) => {
@@ -275,10 +277,11 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       <SelectContent>
                         <SelectItem value="">{t("context.summarizer")}</SelectItem>
                         {profiles.llm_profiles
-                          .filter((model) => model.enabled)
+                          .filter((profile) => profile.enabled || profile.id === model)
                           .map((model) => (
-                            <SelectItem key={model.id} value={model.id}>
+                            <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
                               {model.name}
+                              {!model.enabled && ` (${t("settings.llm.disabled")})`}
                             </SelectItem>
                           ))}
                       </SelectContent>

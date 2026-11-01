@@ -82,6 +82,7 @@ pub(super) struct Shared {
     /// lock, so once admission is closed under the write lock, every accepted
     /// command and read is already in its queue.
     pub(super) admission: RwLock<Admission>,
+    pub(super) update_paused: AtomicBool,
     /// Read workers and the write worker hold the read lock while they use
     /// the database; releasing it takes the write lock, so it waits for them.
     pub(super) database: RwLock<Option<Opened>>,

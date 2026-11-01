@@ -543,7 +543,7 @@ pub(super) async fn respond(
         Route::Update(latest) => update::get(latest).await,
         Route::StartUpdate => {
             let body = read_body(payload, update::UPDATE_BODY_LIMIT).await?;
-            update::post(&body).await
+            update::post(database, &body).await
         }
         Route::Jobs {
             before,

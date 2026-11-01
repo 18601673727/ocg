@@ -262,6 +262,7 @@ impl DatabaseWorker {
                     log_files: Arc::new(crate::system::logger::LogFiles::default()),
                     cleanup_worker: Arc::new(AtomicBool::new(false)),
                     admission: RwLock::new(Admission::Open),
+                    update_paused: AtomicBool::new(false),
                     database: RwLock::new(Some(Opened { database, epoch })),
                     staging: RwLock::new(()),
                     genesis,
@@ -567,6 +568,12 @@ impl WriteWorker {
     /// answered here, before it starts, and `None` is returned.
     pub(super) fn admit(&mut self, envelope: Envelope) -> Option<Envelope> {
         let operation = envelope.operation;
+        if self.shared.update_paused.load(Ordering::SeqCst) {
+            envelope
+                .command
+                .refuse(|| DatabaseError::NeverExecuted { operation });
+            return None;
+        }
         // Activation drains the queue, so no command should arrive while
         // locked; refusing here keeps that true even if one did.
         if let Some(lock) = self.shared.protection.status().lock {

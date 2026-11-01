@@ -6,6 +6,15 @@ use super::*;
 
 struct AttachmentPermit(flume::Sender<()>);
 
+pub(crate) struct UpdatePause(Arc<Shared>);
+
+impl Drop for UpdatePause {
+    fn drop(&mut self) {
+        self.0.update_paused.store(false, Ordering::SeqCst);
+        self.0.scheduler_wake.publish(true, true);
+    }
+}
+
 impl Drop for AttachmentPermit {
     fn drop(&mut self) {
         let _ = self.0.try_send(());
@@ -330,6 +339,36 @@ impl DatabaseHandle {
         self.shared.active_policy
     }
 
+    pub(crate) fn pause_for_update(&self) -> Result<Option<UpdatePause>, DatabaseError> {
+        let _staging = self
+            .shared
+            .staging
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let database = self
+            .shared
+            .database
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let admission = self
+            .shared
+            .admission
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        admitted(&admission)?;
+        if self.shared.update_paused.load(Ordering::SeqCst) {
+            return Err(DatabaseError::ShuttingDown);
+        }
+        let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
+        let (pending, ready, delayed, running) =
+            redb::queue_counts(&opened.database).map_err(DatabaseError::Read)?;
+        if pending != 0 || ready != 0 || delayed != 0 || running != 0 || !self.sender.is_empty() {
+            return Ok(None);
+        }
+        self.shared.update_paused.store(true, Ordering::SeqCst);
+        Ok(Some(UpdatePause(self.shared.clone())))
+    }
+
     async fn submit<T>(
         &self,
         command: impl FnOnce(Reply<T>) -> Command,
@@ -343,6 +382,9 @@ impl DatabaseHandle {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
             admitted(&admission)?;
+            if self.shared.update_paused.load(Ordering::SeqCst) {
+                return Err(DatabaseError::ShuttingDown);
+            }
             let epoch = self.shared.epoch.load(Ordering::SeqCst);
             let operation = OperationId::new(
                 epoch,

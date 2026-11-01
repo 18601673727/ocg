@@ -244,16 +244,20 @@ pub(crate) fn service_file(home: &Path) -> PathBuf {
 pub(crate) async fn lookup(
     requested: Option<&str>,
 ) -> Result<(Client, String, bool, String, String)> {
-    let mirror = requested
-        .and_then(|_| std::env::var("OCG_RELEASE_URL").ok())
+    let mirror = std::env::var("OCG_RELEASE_URL")
+        .ok()
         .filter(|s| !s.is_empty());
     let default_base = format!("{RELEASES}/download");
+    let root = mirror
+        .as_deref()
+        .unwrap_or(&default_base)
+        .trim_end_matches('/');
     let base = match requested {
-        Some(version) => {
-            let base = mirror.as_deref().unwrap_or(&default_base);
-            format!("{}/v{version}", base.strip_suffix('/').unwrap_or(base))
-        }
-        None => format!("{RELEASES}/latest/download"),
+        Some(version) => format!("{root}/v{version}"),
+        None => format!(
+            "{}/latest/download",
+            root.strip_suffix("/download").unwrap_or(root)
+        ),
     };
     let local = mirror.as_deref().is_some_and(|base| {
         base.parse::<Uri>().ok().is_some_and(|uri| {

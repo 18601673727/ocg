@@ -9,6 +9,16 @@ use crate::db::redb::{
 };
 use crate::system::data_directory::DATA_DIRECTORY_VARIABLE;
 
+struct StagingDirectory(Option<PathBuf>);
+
+impl Drop for StagingDirectory {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
 pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let destination = match arguments.as_slice() {
         [] => None,
@@ -51,7 +61,15 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let expected = migration_snapshot(&db, format)?;
     let parent = destination.parent().ok_or("destination has no parent")?;
     let staging = parent.join(format!(".ocg-migrate-{}", uuid::Uuid::now_v7()));
-    copy_tree(&source, &staging)?;
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&staging)?;
+    let mut cleanup = StagingDirectory(Some(staging.clone()));
+    copy_tree_contents(&source, &staging)?;
     verify_tree(&source, &staging, false)?;
     let copied = migration_source(&staging.join("ocg.redb"))?;
     if migration_inspect(&copied)? != format || migration_snapshot(&copied, format)? != expected {
@@ -68,6 +86,7 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     verify_tree(&source, &staging, true)?;
     drop(migrated);
     publish(&staging, &destination)?;
+    cleanup.0 = None;
     let _ = writeln!(
         io::stdout().lock(),
         "Migration complete; authoritative records and copied files verified."
@@ -127,6 +146,11 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
         builder.mode(0o700);
     }
     builder.create(destination)?;
+    copy_tree_contents(source, destination)
+}
+
+fn copy_tree_contents(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    let metadata = fs::symlink_metadata(source)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();

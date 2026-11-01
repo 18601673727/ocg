@@ -303,16 +303,21 @@ where
         let (agent_profile, model) = match row.body {
             ConfigBody::DecisionAgent(agent) => (
                 Some(profile.into()),
-                agent
-                    .default_model
-                    .or_else(|| agent.models.first().copied()),
+                self.enabled_decision_model(&agent.models, agent.default_model, None)?,
             ),
             ConfigBody::Agent(agent)
                 if agent
                     .capabilities
                     .contains(&crate::db::entities::AgentCapability::Decision) =>
             {
-                (Some(profile.into()), agent.default_model())
+                (
+                    Some(profile.into()),
+                    self.enabled_decision_model(
+                        &agent.models,
+                        agent.default_model(),
+                        Some(&agent),
+                    )?,
+                )
             }
             ConfigBody::Agent(_) => (None, None),
             ConfigBody::Model(_) | ConfigBody::DecisionModel(_) => (None, Some(profile)),
@@ -344,5 +349,34 @@ where
             ));
         }
         Ok(frozen)
+    }
+
+    fn enabled_decision_model(
+        &mut self,
+        models: &[ConfigId],
+        default: Option<ConfigId>,
+        agent: Option<&AgentConfig>,
+    ) -> Result<Option<ConfigId>, BatchError> {
+        for id in default.into_iter().chain(models.iter().copied()) {
+            if !models.contains(&id) {
+                continue;
+            }
+            let Some(row) = (self.read)(id)? else {
+                continue;
+            };
+            if row.archived_at.is_some()
+                || (row.kind == ConfigKind::Model && !row.model_enabled)
+                || agent.is_some_and(|agent| !agent.supports_model(&row.body))
+            {
+                continue;
+            }
+            if matches!(
+                row.body,
+                ConfigBody::Model(_) | ConfigBody::DecisionModel(_)
+            ) {
+                return Ok(Some(id));
+            }
+        }
+        Ok(None)
     }
 }

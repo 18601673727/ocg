@@ -108,6 +108,8 @@ pub(super) async fn get(latest: bool) -> Result<Reply, Refusal> {
 #[serde(deny_unknown_fields)]
 struct Input {
     version: String,
+    #[serde(default)]
+    prepare: bool,
 }
 const CONFLICT: Refusal = Refusal::new(
     StatusCode::CONFLICT,
@@ -115,17 +117,20 @@ const CONFLICT: Refusal = Refusal::new(
     "an update cannot be started",
 );
 
-pub(super) async fn post(body: &[u8]) -> Result<Reply, Refusal> {
+pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply, Refusal> {
     let input: Input = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
     #[cfg(not(unix))]
     {
-        let _ = input;
+        let _ = (input, database);
         Err(CONFLICT)
     }
     #[cfg(unix)]
     {
         use crate::system::update::{self, Phase, State, Version};
         let version = Version::parse(&input.version).ok_or(INVALID_REQUEST)?;
+        if input.prepare {
+            return prepare(database).await;
+        }
         if Some(version) == Version::parse(env!("CARGO_PKG_VERSION")) {
             return Err(CONFLICT);
         }
@@ -155,7 +160,45 @@ pub(super) async fn post(body: &[u8]) -> Result<Reply, Refusal> {
 }
 
 #[cfg(unix)]
-fn launch(state: crate::system::update::State) -> Result<std::process::Child, Refusal> {
+async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
+    use crate::system::update;
+    let database = database.clone();
+    let paused = ntex::rt::spawn_blocking(move || {
+        let install = update::install().map_err(|_| CONFLICT)?;
+        match update::lock(&install.prefix) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Ok(_) => return Err(CONFLICT),
+            Err(_) => return Err(INTERNAL),
+        }
+        database
+            .pause_for_update()
+            .map(|pause| (install.prefix, pause))
+            .map_err(|_| INTERNAL)
+    })
+    .await
+    .map_err(|_| INTERNAL)??;
+    let (prefix, pause) = paused;
+    let idle = pause.is_some();
+    if let Some(pause) = pause {
+        ntex::rt::spawn(async move {
+            let _pause = pause;
+            loop {
+                let prefix = prefix.clone();
+                let unlocked = ntex::rt::spawn_blocking(move || update::lock(&prefix).is_ok())
+                    .await
+                    .unwrap_or(false);
+                if unlocked {
+                    break;
+                }
+                ntex::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    }
+    Ok(Reply::ok(envelope(serde_json::json!({ "idle": idle }))))
+}
+
+#[cfg(unix)]
+fn launch(mut state: crate::system::update::State) -> Result<std::process::Child, Refusal> {
     use crate::system::update::{self, Phase};
     use std::os::unix::fs::OpenOptionsExt;
     use std::process::{Command, Stdio};
@@ -222,6 +265,12 @@ fn launch(state: crate::system::update::State) -> Result<std::process::Child, Re
         .stdout(Stdio::from(output))
         .stderr(Stdio::from(error))
         .spawn();
+    let child = child.map_err(|error| {
+        state.phase = Phase::Failed;
+        state.message = Some(format!("failed to spawn updater: {error}"));
+        let _ = update::write_state(&install.prefix, &state);
+        INTERNAL
+    });
     drop(lock);
-    child.map_err(|_| INTERNAL)
+    child
 }

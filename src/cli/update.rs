@@ -32,41 +32,73 @@ async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
         .response_payload_timeout(Millis(2_000))
         .build(ntex::SharedCfg::new("update-health"))
         .await;
-    let Ok(client) = client else { return Ok(()) };
-    let Ok(auth) = http::authorization(&install.token) else {
-        return Ok(());
-    };
+    let client = client.map_err(|error| format!("health client failed: {error}"))?;
+    let auth = http::authorization(&install.token)?;
     let url = format!("http://127.0.0.1:{}/api/v1/health", install.port);
+    let prepare_url = format!("http://127.0.0.1:{}/api/v1/update", install.port);
+    let deadline = Instant::now() + Duration::from_secs(300);
     loop {
-        let Ok(response) = client
+        if Instant::now() >= deadline {
+            return Err("Jobs did not drain within five minutes; use --yes to override".into());
+        }
+        let response = client
             .get(url.as_str())
             .header(header::AUTHORIZATION, auth.clone())
             .send()
             .await
-        else {
-            break;
-        };
+            .map_err(|error| format!("health request failed: {error}"))?;
         if !response.status().is_success() {
-            break;
+            return Err(format!("health request returned {}", response.status()).into());
         }
-        let Ok(body) = response.body().await else {
-            break;
+        let body = response
+            .body()
+            .await
+            .map_err(|error| format!("health body failed: {error}"))?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        let counter = |name: &str| -> Result<u64> {
+            value
+                .pointer(&format!("/queue/{name}"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| format!("health response has no queue {name} counter").into())
         };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-            break;
-        };
-        let Some(running) = value
-            .pointer("/queue/running")
-            .and_then(serde_json::Value::as_u64)
-        else {
-            break;
-        };
-        if running == 0 {
-            break;
+        let running = counter("running")?;
+        let ready = counter("ready")?;
+        let pending = counter("pending")?;
+        let delayed = counter("delayed")?;
+        let commands = counter("commands_waiting")?;
+        if delayed != 0 {
+            return Err("delayed Jobs remain; use --yes to override".into());
+        }
+        if running == 0 && ready == 0 && pending == 0 && commands == 0 {
+            let response = client
+                .post(prepare_url.as_str())
+                .header(header::AUTHORIZATION, auth.clone())
+                .send_json(&serde_json::json!({ "version": state.to, "prepare": true }))
+                .await
+                .map_err(|error| format!("update admission request failed: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!(
+                    "could not pause Job admission: {} (use --yes to override)",
+                    response.status()
+                )
+                .into());
+            }
+            let body = response
+                .body()
+                .await
+                .map_err(|error| format!("update admission body failed: {error}"))?;
+            let value: serde_json::Value = serde_json::from_slice(&body)?;
+            match value.get("idle").and_then(serde_json::Value::as_bool) {
+                Some(true) => break,
+                Some(false) => {}
+                None => return Err("update admission response has no idle result".into()),
+            }
         }
         state.running_jobs = Some(running);
         write_progress(&install.prefix, state).await?;
-        println!("waiting for {running} running Jobs (use --yes to update now)");
+        println!(
+            "waiting for Jobs: {running} running, {ready} ready, {pending} pending (use --yes to update now)"
+        );
         ntex::time::sleep(Duration::from_secs(5)).await;
     }
     Ok(())
@@ -110,9 +142,6 @@ async fn prepare(
     }
     if let Some(progress) = state.as_mut() {
         write_progress(&install.prefix, progress).await?;
-        if !yes {
-            wait_jobs(install, progress).await?;
-        }
     }
     let installer = fetch(&client, &format!("{base}/install.sh"), local).await?;
     let actual = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &installer)
@@ -122,6 +151,11 @@ async fn prepare(
         .collect::<String>();
     if actual != checksum {
         return Err("installer checksum mismatch".into());
+    }
+    if !yes && let Some(progress) = state.as_mut() {
+        ntex::time::timeout(Duration::from_secs(300), wait_jobs(install, progress))
+            .await
+            .map_err(|_| "Jobs did not drain within five minutes; use --yes to override")??;
     }
     Ok(Some(Download { version, installer }))
 }
