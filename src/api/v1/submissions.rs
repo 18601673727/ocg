@@ -2237,6 +2237,18 @@ pub(super) async fn release_slot(
         .map_err(|_| INTERNAL)?;
     let by = match proof {
         JobProof::Proven => StopProof::Proof,
+        JobProof::Starting => {
+            let refusal = conversation_refusal("slot_live");
+            return Ok(Reply::new(
+                refusal.status,
+                envelope(serde_json::json!({
+                    "error": serde_json::json!({
+                        "code": refusal.code.to_owned(),
+                        "message": "a command may still be starting",
+                    }),
+                })),
+            ));
+        }
         JobProof::Live { group } => {
             let refusal = conversation_refusal("slot_live");
             return Ok(Reply::new(

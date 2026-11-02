@@ -76,6 +76,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
             : {
                 ...next,
                 latest: previous?.latest ?? null,
+                release_page: previous?.release_page ?? null,
                 latest_error: previous?.latest_error ?? null,
                 available: previous?.available ?? false,
               },

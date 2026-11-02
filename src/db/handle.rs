@@ -157,6 +157,16 @@ impl DatabaseHandle {
             .await
     }
 
+    /// Where each of `jobs` stands toward the confirmation of its stop, as
+    /// durably stored now.
+    pub(crate) async fn stop_standings(
+        &self,
+        jobs: Vec<JobId>,
+    ) -> Result<Vec<(JobId, redb::StopStanding)>, DatabaseError> {
+        self.read(move |database| redb::stop_standings(database, &jobs))
+            .await
+    }
+
     /// Successful durable commits of command groups since this worker started.
     /// A flushed group counts once; refused or declined commands and failed
     /// commits do not count. Recovery and maintenance commits are excluded.
@@ -369,8 +379,10 @@ impl DatabaseHandle {
             return Ok(None);
         }
         // A quarantined slot is not running, but its process group may still
-        // be tracked here; a restart would orphan it.
-        if crate::system::executor::blocking::groups_tracked() {
+        // be tracked here; a restart would orphan it. After a restart nothing
+        // is tracked, yet the persisted quarantine still holds the claim.
+        let quarantined = redb::quarantined_slots(&opened.database).map_err(DatabaseError::Read)?;
+        if quarantined != 0 || crate::system::executor::blocking::groups_tracked() {
             return Ok(None);
         }
         self.shared.update_paused.store(true, Ordering::SeqCst);

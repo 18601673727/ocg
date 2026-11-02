@@ -14,7 +14,7 @@ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::pipe::pipe;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
-use crate::db::entities::JobId;
+use crate::db::entities::{JobId, ToolCallRef};
 
 const TOTAL: usize = 4;
 const COMMANDS: usize = 1;
@@ -279,9 +279,130 @@ pub(crate) struct Process {
     running: Option<RunningGroup>,
 }
 
+/// Where a spawning call stands. The entry exists from before its admission
+/// can commit until its Job's stop is confirmed or no process can have
+/// started; it is the single record of the call's process ownership.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallState {
+    /// A supervisor may still start the call's process.
+    Starting,
+    /// The call's process group may be alive.
+    Running(Pid),
+    /// The group was proven empty, or no process can have started although
+    /// the call's admission may be committed; the proof stays until the
+    /// Job's stop or outcome is durably settled, see [`stop_settled`].
+    Cleaned,
+}
+
+static CALLS: Mutex<Vec<(ToolCallRef, CallState)>> = Mutex::new(Vec::new());
+
+fn set_call(call: ToolCallRef, from: impl Fn(CallState) -> bool, to: Option<CallState>) {
+    let mut calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(index) = calls
+        .iter()
+        .position(|(key, state)| *key == call && from(*state))
+    {
+        match to {
+            Some(state) => calls[index].1 = state,
+            None => {
+                calls.remove(index);
+            }
+        }
+    }
+}
+
+/// The obligation to supervise a process that a spawning call may still
+/// start. Dropping it means no process can start, unless a panic is
+/// unwinding: then the entry stays and the Job keeps answering as tracked.
+/// What the entry becomes depends on the call's admission: one that may have
+/// committed leaves the proof that nothing started, see
+/// [`Self::admission_pending`]; one that did not leaves nothing.
+pub(crate) struct StartingCall {
+    call: ToolCallRef,
+    armed: bool,
+    /// Whether the call's admission may be committed.
+    admitted: bool,
+}
+
+/// Registers `call` as starting. Done before the call's admission is
+/// recorded, so no interval in which the admission may be committed is
+/// untracked.
+pub(crate) fn begin_call(call: ToolCallRef) -> StartingCall {
+    CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((call, CallState::Starting));
+    StartingCall {
+        call,
+        armed: true,
+        admitted: false,
+    }
+}
+
+impl StartingCall {
+    pub(crate) fn job(&self) -> JobId {
+        self.call.job
+    }
+
+    /// The call's admission is about to be sent, and from here on may be
+    /// committed, whatever becomes of the request or of the task that made
+    /// it. Without a process, the entry then becomes the settled proof that
+    /// nothing started, because a committed admission without an outcome can
+    /// quarantine the Job.
+    pub(crate) fn admission_pending(&mut self) {
+        self.admitted = true;
+    }
+
+    /// The admission was refused by the database: nothing was committed, so
+    /// no proof is owed if no process starts.
+    pub(crate) fn admission_refused(&mut self) {
+        self.admitted = false;
+    }
+
+    /// The process exists: the same lock acquisition that ends the starting
+    /// state begins the running one.
+    fn running(mut self, group: Pid) -> RunningGroup {
+        self.armed = false;
+        set_call(
+            self.call,
+            |state| state == CallState::Starting,
+            Some(CallState::Running(group)),
+        );
+        RunningGroup {
+            call: self.call,
+            proven: false,
+        }
+    }
+}
+
+impl Drop for StartingCall {
+    fn drop(&mut self) {
+        if self.armed && !thread::panicking() {
+            // No process can start from here. When the admission may have
+            // committed, that is a proof to keep until the Job's stop or
+            // outcome is settled; otherwise the call left no trace.
+            let to = self.admitted.then_some(CallState::Cleaned);
+            set_call(self.call, |state| state == CallState::Starting, to);
+        }
+    }
+}
+
 struct RunningGroup {
-    job: JobId,
-    group: Pid,
+    call: ToolCallRef,
+    proven: bool,
+}
+
+impl RunningGroup {
+    /// The group was proven empty. The proof is kept, not forgotten, until
+    /// the Job's stop is settled.
+    fn proven(mut self) {
+        self.proven = true;
+        set_call(
+            self.call,
+            |state| matches!(state, CallState::Running(_)),
+            Some(CallState::Cleaned),
+        );
+    }
 }
 
 impl Drop for RunningGroup {
@@ -290,22 +411,16 @@ impl Drop for RunningGroup {
         // was supervising: its processes may still run, so the entry stays and
         // the job keeps answering slot_live. The operator restarts the host
         // rather than freeing a slot whose group may still be alive.
-        if thread::panicking() {
+        if self.proven || thread::panicking() {
             return;
         }
-        let mut groups = RUNNING_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(index) = groups
-            .iter()
-            .position(|(job, group)| *job == self.job && *group == self.group)
-        {
-            groups.remove(index);
-        }
+        set_call(
+            self.call,
+            |state| matches!(state, CallState::Running(_)),
+            None,
+        );
     }
 }
-
-static RUNNING_GROUPS: Mutex<Vec<(JobId, Pid)>> = Mutex::new(Vec::new());
 
 pub(crate) struct UnprovenGroup {
     pub(crate) job: Option<JobId>,
@@ -333,7 +448,7 @@ static UNCONFIRMED_STOPS: Mutex<BTreeSet<JobId>> = Mutex::new(BTreeSet::new());
 /// Whether this process still tracks a group that may be alive, or a proven
 /// stop not yet committed. None of them survives a restart.
 pub(crate) fn groups_tracked() -> bool {
-    !RUNNING_GROUPS
+    !CALLS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .is_empty()
@@ -347,18 +462,62 @@ pub(crate) fn groups_tracked() -> bool {
             .is_empty()
 }
 
-/// The Jobs whose stop was proven and still has to be committed.
+/// The Jobs whose stop was proven and still has to be committed: every
+/// call and group of the Job is resolved. A Job with a supervisor still
+/// starting, a group possibly alive or a group unproven is not listed.
+///
+/// Only a list of candidates: it is a snapshot, and says nothing once the
+/// caller awaits. Confirming a stop on its strength is unsound; use
+/// [`stop_proven`] right before the confirmation.
 pub(crate) fn unconfirmed_stops() -> Vec<JobId> {
-    UNCONFIRMED_STOPS
+    let calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
+    let unproven = UNPROVEN_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut jobs = UNCONFIRMED_STOPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .copied()
-        .collect()
+        .clone();
+    jobs.extend(calls.iter().map(|(call, _)| call.job));
+    jobs.retain(|job| resolved(*job, &calls, &unproven));
+    jobs.into_iter().collect()
 }
 
-/// The stop of `job` is committed, or can no longer be.
+/// Whether every call and group of `job` is resolved: none is starting or
+/// possibly alive, and no group is unproven.
+fn resolved(job: JobId, calls: &[(ToolCallRef, CallState)], unproven: &[UnprovenGroup]) -> bool {
+    !calls
+        .iter()
+        .any(|(call, state)| call.job == job && *state != CallState::Cleaned)
+        && !unproven.iter().any(|entry| entry.job == Some(job))
+}
+
+/// Whether, right now, the stop of `job` is proven by what this process
+/// tracks: every call and group of the Job is resolved, and some proof of it
+/// is held. The answer is fresh, not a snapshot, and holds through a later
+/// confirmation only if the Job's admission set cannot grow: the caller must
+/// have read an outcome durably stored for the Job before this check, since
+/// no call is admitted to a Job with an outcome and every admission that
+/// committed earlier registered its call before it was sent.
+pub(crate) fn stop_proven(job: JobId) -> bool {
+    let calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
+    let unproven = UNPROVEN_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let confirmed = UNCONFIRMED_STOPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&job);
+    resolved(job, &calls, &unproven) && (confirmed || calls.iter().any(|(call, _)| call.job == job))
+}
+
+/// The stop of `job` is committed, or can no longer be: the retained proof
+/// of its cleaned calls is released. Calls still starting or running stay.
 pub(crate) fn stop_settled(job: JobId) {
+    CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|(call, state)| call.job != job || *state != CallState::Cleaned);
     UNCONFIRMED_STOPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -494,7 +653,7 @@ impl Process {
         mut command: Command,
         kind: Kind,
         stop_signal: StopSignal,
-        job: Option<JobId>,
+        starting: Option<StartingCall>,
     ) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
 
@@ -518,13 +677,8 @@ impl Process {
         };
         let group = Pid::from_child(&child);
         drop(sentinel.write);
-        let running = job.map(|job| {
-            RUNNING_GROUPS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((job, group));
-            RunningGroup { job, group }
-        });
+        let job = starting.as_ref().map(StartingCall::job);
+        let running = starting.map(|starting| starting.running(group));
         Ok(Self {
             child,
             sentinel: sentinel.read,
@@ -601,6 +755,11 @@ impl Process {
             });
             drop(self.running);
             return Err(FinishError::NotProven(error));
+        }
+        // The group is empty, yet the proof is only useful once kept until
+        // the Job's outcome or stop is durable.
+        if let Some(running) = self.running {
+            running.proven();
         }
         let mut raw_status: libc::c_int = 0;
         let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -907,23 +1066,34 @@ fn live_group_members(_: Pid) -> std::io::Result<bool> {
 
 pub(crate) enum JobProof {
     Proven,
-    Live { group: u32 },
+    /// A supervisor may still start a process.
+    Starting,
+    Live {
+        group: u32,
+    },
     Untracked,
 }
 
 #[cfg(unix)]
 pub(crate) fn prove_job(job: JobId) -> JobProof {
-    let running = {
-        let groups = RUNNING_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        groups
-            .iter()
-            .find(|(running, _)| *running == job)
-            .map(|(_, group)| group.as_raw_pid() as u32)
-    };
-    if let Some(group) = running {
-        return JobProof::Live { group };
+    let mut cleaned = false;
+    {
+        let calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut starting = false;
+        for (_, state) in calls.iter().filter(|(call, _)| call.job == job) {
+            match state {
+                CallState::Running(group) => {
+                    return JobProof::Live {
+                        group: group.as_raw_pid() as u32,
+                    };
+                }
+                CallState::Starting => starting = true,
+                CallState::Cleaned => cleaned = true,
+            }
+        }
+        if starting {
+            return JobProof::Starting;
+        }
     }
     let mut groups = UNPROVEN_GROUPS
         .lock()
@@ -950,6 +1120,7 @@ pub(crate) fn prove_job(job: JobId) -> JobProof {
             }
         }
     }
+    let proven = tracked || cleaned;
     if live.is_none() && tracked {
         UNCONFIRMED_STOPS
             .lock()
@@ -959,7 +1130,7 @@ pub(crate) fn prove_job(job: JobId) -> JobProof {
     *groups = remaining;
     match live {
         Some(group) => JobProof::Live { group },
-        None if tracked => JobProof::Proven,
+        None if proven => JobProof::Proven,
         None => JobProof::Untracked,
     }
 }

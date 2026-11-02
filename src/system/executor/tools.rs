@@ -60,9 +60,27 @@ pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolF
 pub(crate) struct ToolStart {
     at: Arc<OnceLock<Instant>>,
     ready: crate::service::ai::providers::CancellationToken,
+    starting: Arc<Mutex<Option<super::blocking::StartingCall>>>,
 }
 
 impl ToolStart {
+    /// A start that carries the obligation of a spawning call, registered
+    /// before the call's admission could commit.
+    pub(crate) fn with_starting(starting: Option<super::blocking::StartingCall>) -> Self {
+        Self {
+            starting: Arc::new(Mutex::new(starting)),
+            ..Self::default()
+        }
+    }
+
+    /// Hands the obligation to the supervisor that will start the process.
+    pub(crate) fn take_starting(&self) -> Option<super::blocking::StartingCall> {
+        self.starting
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     pub(crate) fn mark_started(&self) {
         if self.at.set(Instant::now()).is_ok() {
             self.ready.cancel();

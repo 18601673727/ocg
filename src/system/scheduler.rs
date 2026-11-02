@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use ntex::util::{Either, select};
 
 use crate::db::entities::*;
+use crate::db::redb::StopStanding;
 use crate::db::{CommandOutcome, DatabaseError, DatabaseHandle, SchedulerWakeSubscription};
 use crate::service::ai::providers::openai_compatible::ToolWire;
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
@@ -764,7 +765,38 @@ async fn dispatch_runtime(
                 {
                     log::warn!("failed to retry unproven groups on blocking worker: {error}");
                 }
-                for job in blocking::unconfirmed_stops() {
+                let candidates = blocking::unconfirmed_stops();
+                // The snapshot only names candidates. What lets a stop be
+                // confirmed is the Job's outcome, durably Unknown (after
+                // which no call is admitted to it), and then a fresh look at
+                // its calls and groups, immediately before the confirmation.
+                let standings = if candidates.is_empty() {
+                    Vec::new()
+                } else {
+                    match database.stop_standings(candidates).await {
+                        Ok(standings) => standings,
+                        Err(error) => {
+                            log::warn!("failed to read job stop standings: {error}");
+                            Vec::new()
+                        }
+                    }
+                };
+                for (job, standing) in standings {
+                    match standing {
+                        // It may still admit calls: its proof stays.
+                        StopStanding::Open => continue,
+                        // Nothing to confirm; the proof is no longer needed.
+                        StopStanding::Settled => {
+                            blocking::stop_settled(job);
+                            continue;
+                        }
+                        StopStanding::Unconfirmed => {}
+                    }
+                    // A call admitted since the snapshot is Starting or
+                    // Running here, and defers the confirmation.
+                    if !blocking::stop_proven(job) {
+                        continue;
+                    }
                     let result = database
                         .confirm_job_stopped(job, crate::db::entities::StopProof::Proof)
                         .await;

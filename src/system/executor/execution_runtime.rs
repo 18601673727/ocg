@@ -2211,6 +2211,16 @@ async fn answer_calls(
             }
             continue;
         }
+        // A spawning call is tracked from before its admission can commit,
+        // until its process runs under supervision or cannot start. From the
+        // moment the admission is sent it may be committed, however the
+        // request ends; without a process, that leaves the proof of it.
+        let mut starting = decided
+            .spawns()
+            .then(|| super::blocking::begin_call(reference));
+        if let Some(starting) = &mut starting {
+            starting.admission_pending();
+        }
         let admission = ToolEvidence {
             approval,
             call: reference,
@@ -2224,6 +2234,9 @@ async fn answer_calls(
             Ok(()) => {}
             // Nothing was committed, and nothing runs.
             Err(DatabaseError::Rejected(violation)) => {
+                if let Some(starting) = &mut starting {
+                    starting.admission_refused();
+                }
                 return Err(ToolLoopStop::AdmissionRefused { index, violation });
             }
             // The admission may have committed, so the call is as uncertain
@@ -2352,7 +2365,7 @@ async fn answer_calls(
         let spawns = dispatch.spawns;
         let arguments = dispatch.arguments;
         let stopping_handler = handler.clone();
-        let start = ToolStart::default();
+        let start = ToolStart::with_starting(starting);
         let invocation_start = start.clone();
         let invocation = CatchPanic(Box::pin(async move {
             handler

@@ -82,7 +82,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::db::entities::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef, ToolEffect};
-use crate::system::executor::blocking::{FinishError, Finished, Kind, Process, StopSignal};
+use crate::system::executor::blocking::{
+    self, FinishError, Finished, Kind, Process, StartingCall, StopSignal,
+};
 use crate::system::executor::execution_runtime::{ToolExecution, ToolLoopLimits};
 use crate::system::executor::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, ToolStart,
@@ -672,7 +674,7 @@ fn supervise(
     invocation: Invocation,
     stop: StopSignal,
     start: ToolStart,
-    job: Option<JobId>,
+    starting: Option<StartingCall>,
 ) -> Result<Ended, Failure> {
     let mut command = Command::new(&invocation.program);
     command
@@ -689,7 +691,7 @@ fn supervise(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut process =
-        Process::spawn(command, Kind::Command, stop.clone(), job).map_err(|error| {
+        Process::spawn(command, Kind::Command, stop.clone(), starting).map_err(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
                 Refusal::CommandBusy
             } else {
@@ -888,15 +890,21 @@ impl RunCommand {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(active_id.clone(), (stop.clone(), proven));
             let process_start = start.clone();
-            let job = match call {
-                CommandCall::Job(call_ref) => Some(call_ref.job),
+            // The obligation is registered before the call's admission; a
+            // caller that made none registers it here, before any thread.
+            let starting = match call {
+                CommandCall::Job(call_ref) => Some(
+                    start
+                        .take_starting()
+                        .unwrap_or_else(|| blocking::begin_call(call_ref)),
+                ),
                 CommandCall::Standalone(_) => None,
             };
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {
                     let _mutation = mutation;
-                    let result = supervise(invocation, supervised, process_start, job);
+                    let result = supervise(invocation, supervised, process_start, starting);
                     if proof
                         .send(
                             result.as_ref().err()

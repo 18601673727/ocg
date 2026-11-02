@@ -21,7 +21,7 @@ import { describeError } from "./settings-parts";
 
 /** The backend saves a source as "<name> provider"; show the name it was given. */
 function sourceName(name: string) {
-  return name.endsWith(" provider") ? name.slice(0, -" provider".length) : name;
+  return name.replace(/\s+provider\s*$/i, "");
 }
 
 export function ProviderModelImport({

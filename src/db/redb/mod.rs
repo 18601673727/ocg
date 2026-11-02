@@ -108,9 +108,9 @@ pub(crate) use reader::{
 };
 pub(crate) use reader::{
     ContextState, ContextWorkDetails, JobDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
-    UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, queue_counts,
-    read_attachment, read_attachments, read_children, read_compatible_executors, read_config,
-    read_configs, read_context_state, read_conversation_search, read_conversations,
+    UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, quarantined_slots,
+    queue_counts, read_attachment, read_attachments, read_children, read_compatible_executors,
+    read_config, read_configs, read_context_state, read_conversation_search, read_conversations,
     read_decision_executors, read_decision_work, read_effective_context_policy,
     read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,
     read_job_configuration, read_job_details, read_job_input, read_job_input_for_job,
@@ -292,6 +292,50 @@ pub(crate) fn terminal_jobs(
         }
     }
     Ok(terminal)
+}
+
+/// Where a Job's durable state stands toward the confirmation of its stop.
+/// Both the outcome and the confirmation only ever appear, never revert, so a
+/// standing read once stays true for as long as it is not `Open`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopStanding {
+    /// No outcome is durable: the Job may still admit calls.
+    Open,
+    /// The outcome is durably Unknown and its stop is not yet confirmed. No
+    /// call can be admitted any more.
+    Unconfirmed,
+    /// There is nothing to confirm: the outcome is known, or the stop is
+    /// confirmed, or the Job is gone.
+    Settled,
+}
+
+pub(crate) fn stop_standings(
+    database: &Database,
+    jobs: &[JobId],
+) -> Result<Vec<(JobId, StopStanding)>, StorageError> {
+    let tx = read(database)?;
+    let states = tx.open_table(JOB_STATES)?;
+    let mut standings = Vec::with_capacity(jobs.len());
+    for &job in jobs {
+        let standing = match states.get(job.get())? {
+            None => StopStanding::Settled,
+            Some(state) => {
+                let state = JobState::decode_at(job.get(), state.value())?;
+                match &state.outcome {
+                    None => StopStanding::Open,
+                    Some(outcome)
+                        if outcome.kind == OutcomeKind::Unknown
+                            && state.stop_confirmed_at.is_none() =>
+                    {
+                        StopStanding::Unconfirmed
+                    }
+                    Some(_) => StopStanding::Settled,
+                }
+            }
+        };
+        standings.push((job, standing));
+    }
+    Ok(standings)
 }
 
 pub(crate) use crate::db::entities::{
