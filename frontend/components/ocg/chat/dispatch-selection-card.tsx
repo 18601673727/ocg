@@ -92,7 +92,7 @@ export function DispatchSelectionCard({
   const agents = (catalog?.profiles.agent_profiles ?? []).filter(
     (agent) =>
       (agent.capabilities.includes("chat") || agent.capabilities.includes("coding")) &&
-      models.some((model) => model.id === agent.llm_targets[0]),
+      agent.llm_targets.some((id) => models.some((model) => model.id === id)),
   );
   const agent = agents.find((agent) => target === `agent:${agent.id}`);
   const direct = target.startsWith("model:")

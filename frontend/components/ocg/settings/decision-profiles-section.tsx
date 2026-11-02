@@ -9,7 +9,7 @@ import type {
   ControlProfileWriteRequest,
 } from "../runtime/control-client";
 import { useI18n } from "../i18n";
-import { Section, describeError } from "./settings-parts";
+import { Section, describeError, selectableLlmProfiles } from "./settings-parts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -121,7 +121,7 @@ function ProfileEditor({
     }
   }
   const availableModels = [
-    ...profiles.llm_profiles.filter((model) => model.enabled || models.includes(model.id)),
+    ...selectableLlmProfiles(profiles.llm_profiles, ...models),
     ...profiles.decision_profiles,
   ];
   const selectedModels = availableModels.filter((model) => models.includes(model.id));

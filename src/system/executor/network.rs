@@ -230,12 +230,19 @@ fn decode_entities(text: &str) -> String {
 }
 
 fn html_text(html: &str) -> Result<String, ToolFailure> {
-    let hidden =
-        Regex::new(r"(?is)<!--.*?-->|<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>")
-            .map_err(|_| {
-                ToolFailure::not_applied("HTML text extraction could not be initialized")
-            })?;
-    let tags = Regex::new(r"(?s)<[^>]*>")
+    static HIDDEN: std::sync::LazyLock<Result<Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| {
+            Regex::new(
+                r"(?is)<!--.*?-->|<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>",
+            )
+        });
+    static TAGS: std::sync::LazyLock<Result<Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| Regex::new(r"(?s)<[^>]*>"));
+    let hidden = HIDDEN
+        .as_ref()
+        .map_err(|_| ToolFailure::not_applied("HTML text extraction could not be initialized"))?;
+    let tags = TAGS
+        .as_ref()
         .map_err(|_| ToolFailure::not_applied("HTML text extraction could not be initialized"))?;
     let visible = hidden.replace_all(html, "");
     let text = decode_entities(&tags.replace_all(&visible, "\n"));
@@ -259,7 +266,7 @@ impl ToolHandler for Fetch {
             let arguments: FetchArguments = serde_json::from_value(arguments)
                 .map_err(|_| ToolFailure::not_applied("invalid web_fetch arguments"))?;
             let response = request(&arguments.url).await?;
-            ntex::rt::spawn_blocking(move || {
+            super::blocking::run(super::blocking::Kind::Cpu, move || {
                 let source = String::from_utf8_lossy(&response.body);
                 let text = match arguments.format {
                     FetchFormat::Text

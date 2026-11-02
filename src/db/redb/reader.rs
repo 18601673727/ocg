@@ -1052,12 +1052,20 @@ pub(crate) fn read_outputs(
     after_seq: Option<i64>,
     limit: usize,
 ) -> Result<Vec<JobOutputRecord>, StorageError> {
-    let rx = read(database)?;
-    if read_job_row(&rx, job)?.is_some_and(|row| row.kind.is_group()) {
+    outputs(&read(database)?, job, after_seq, limit)
+}
+
+fn outputs(
+    rx: &ReadTransaction,
+    job: JobId,
+    after_seq: Option<i64>,
+    limit: usize,
+) -> Result<Vec<JobOutputRecord>, StorageError> {
+    if read_job_row(rx, job)?.is_some_and(|row| row.kind.is_group()) {
         if after_seq.is_some_and(|seq| seq >= 1) || limit == 0 {
             return Ok(Vec::new());
         }
-        return Ok(conversation_result(&rx, job)?.into_iter().collect());
+        return Ok(conversation_result(rx, job)?.into_iter().collect());
     }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     let start = match after_seq.map(u32::try_from) {
@@ -1085,9 +1093,15 @@ pub(crate) fn read_latest_output(
     database: &Database,
     job: JobId,
 ) -> Result<Option<JobOutputRecord>, StorageError> {
-    let rx = read(database)?;
-    if read_job_row(&rx, job)?.is_some_and(|row| row.kind.is_group()) {
-        return conversation_result(&rx, job);
+    latest_output(&read(database)?, job)
+}
+
+fn latest_output(
+    rx: &ReadTransaction,
+    job: JobId,
+) -> Result<Option<JobOutputRecord>, StorageError> {
+    if read_job_row(rx, job)?.is_some_and(|row| row.kind.is_group()) {
+        return conversation_result(rx, job);
     }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     outputs
@@ -1170,7 +1184,15 @@ pub(crate) fn read_tool_evidence(
     after: Option<(RequestNumber, u32)>,
     limit: usize,
 ) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
-    let rx = read(database)?;
+    tool_evidence(&read(database)?, job, after, limit)
+}
+
+fn tool_evidence(
+    rx: &ReadTransaction,
+    job: JobId,
+    after: Option<(RequestNumber, u32)>,
+    limit: usize,
+) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
     let table = rx.open_table(TOOL_CALLS)?;
     let start = match after {
         None => (job.get(), 0, 0),
@@ -1363,14 +1385,20 @@ pub(crate) fn read_job_configuration(
     database: &Database,
     job: JobId,
 ) -> Result<Option<SubmittedConfiguration>, StorageError> {
-    let rx = read(database)?;
-    let Some(row) = read_job_row(&rx, job)? else {
+    job_configuration(&read(database)?, job)
+}
+
+fn job_configuration(
+    rx: &ReadTransaction,
+    job: JobId,
+) -> Result<Option<SubmittedConfiguration>, StorageError> {
+    let Some(row) = read_job_row(rx, job)? else {
         return Ok(None);
     };
     if row.kind.is_group() {
         return Ok(None);
     }
-    let Some(execution) = turn_config(&rx, &row)? else {
+    let Some(execution) = turn_config(rx, &row)? else {
         return Ok(None);
     };
     Ok(Some(SubmittedConfiguration {
@@ -2277,6 +2305,9 @@ fn conversation_matches(
     }
     Ok(true)
 }
+/// (pending, ready, delayed, running). With `for_update`, pending and
+/// delayed count only Jobs due by now. Running never counts a quarantined
+/// slot in either mode; the update pause checks its process groups itself.
 pub(crate) fn queue_counts(
     database: &Database,
     for_update: bool,
@@ -2319,10 +2350,7 @@ pub(crate) fn queue_counts(
     let ready = rx.open_table(READY)?.len()?;
     let mut running = 0;
     for entry in rx.open_table(HELD_SLOTS)?.iter()? {
-        let quarantined = entry?.1.value().1;
-        if !quarantined {
-            running += 1;
-        }
+        running += u64::from(!entry?.1.value().1);
     }
     Ok((pending, ready, delayed, running))
 }
@@ -2793,18 +2821,17 @@ pub(crate) fn read_turn_execution(
     job_execution(&rx.open_table(JOBS)?, &row)
 }
 
-pub(crate) fn read_turn_compaction(
-    database: &Database,
+fn turn_compaction(
+    rx: &ReadTransaction,
     turn: JobId,
 ) -> Result<Option<(JobId, &'static str, Timestamp)>, StorageError> {
-    let rx = read(database)?;
-    let Some(row) = read_job_row(&rx, turn)? else {
+    let Some(row) = read_job_row(rx, turn)? else {
         return Ok(None);
     };
-    if read_state(&rx, turn)?.claim.is_none() {
+    if read_state(rx, turn)?.claim.is_none() {
         return Ok(None);
     }
-    let selected = turn_entries(&rx, turn)?
+    let selected = turn_entries(rx, turn)?
         .into_iter()
         .rev()
         .find_map(|(_, entry)| match entry.entry {
@@ -2820,7 +2847,7 @@ pub(crate) fn read_turn_compaction(
         if !seen.insert(id) {
             return Err(StorageError::corrupted("context ancestry cycle"));
         }
-        let used = turn_entries(&rx, id)?
+        let used = turn_entries(rx, id)?
             .into_iter()
             .rev()
             .find_map(|(_, entry)| match entry.entry {
@@ -2833,9 +2860,9 @@ pub(crate) fn read_turn_compaction(
             }
             break;
         }
-        previous = read_job_row(&rx, id)?.and_then(|row| row.kind.previous());
+        previous = read_job_row(rx, id)?.and_then(|row| row.kind.previous());
     }
-    let Some(producer) = read_job_row(&rx, artifact)? else {
+    let Some(producer) = read_job_row(rx, artifact)? else {
         return Err(StorageError::corrupted("adopted context artifact missing"));
     };
     let JobKind::Execution {
@@ -2858,13 +2885,6 @@ pub(crate) fn read_turn_compaction(
     Ok(Some((artifact, kind, at)))
 }
 
-pub(crate) fn read_turn_entries(
-    database: &Database,
-    turn: JobId,
-) -> Result<Vec<(u32, JobInputEntry)>, StorageError> {
-    let rx = read(database)?;
-    job_entries_of(&rx.open_table(JOB_INPUTS)?, turn)
-}
 fn turn_entries(
     rx: &ReadTransaction,
     turn: JobId,
@@ -2916,7 +2936,15 @@ pub(crate) fn read_conversation_turns(
     before: Option<JobId>,
     limit: usize,
 ) -> Result<Vec<JobRecord>, StorageError> {
-    let rx = read(database)?;
+    conversation_turns(&read(database)?, conversation, before, limit)
+}
+
+fn conversation_turns(
+    rx: &ReadTransaction,
+    conversation: JobId,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Vec<JobRecord>, StorageError> {
     if rx
         .open_table(CONVERSATIONS)?
         .get(conversation.get())?
@@ -2925,7 +2953,7 @@ pub(crate) fn read_conversation_turns(
         return Ok(Vec::new());
     }
     if let Some(before) = before
-        && !read_job_row(&rx, before)?
+        && !read_job_row(rx, before)?
             .is_some_and(|row| row.parent_id == Some(conversation) && row.kind.is_persistent())
     {
         return Ok(Vec::new());
@@ -2944,11 +2972,84 @@ pub(crate) fn read_conversation_turns(
         .take(limit.min(101))
     {
         let (key, _) = entry?;
-        let row = read_job_row(&rx, JobId::new(key.value().1))?
+        let row = read_job_row(rx, JobId::new(key.value().1))?
             .ok_or_else(|| StorageError::corrupted("turn projection has no source job"))?;
-        result.push(job_record(&rx, row)?);
+        result.push(job_record(rx, row)?);
     }
     Ok(result)
+}
+
+/// The most outputs one Turn of a page carries before the rest is truncated.
+const TURN_PAGE_OUTPUTS: usize = 1000;
+
+/// One Turn of a conversation page, read with the rest of its page.
+pub(crate) struct ConversationTurn {
+    pub record: JobRecord,
+    /// The Turn's raw input entries, as stored.
+    pub entries: Vec<(u32, JobInputEntry)>,
+    pub outputs: Vec<JobOutputRecord>,
+    pub outputs_truncated: bool,
+    pub configuration: Option<SubmittedConfiguration>,
+    /// The Turn's tool evidence, read only when the Turn ended unknown.
+    pub evidence: Vec<ToolEvidenceRecord>,
+    pub compaction: Option<(JobId, &'static str, Timestamp)>,
+}
+
+pub(crate) struct ConversationTurnPage {
+    pub turns: Vec<ConversationTurn>,
+    pub has_more: bool,
+}
+
+/// Up to `limit` Turns of a conversation, newest first, strictly before
+/// `before` when given, all from one snapshot. `None` when `conversation`
+/// is not a stored conversation.
+pub(crate) fn read_conversation_turn_page(
+    database: &Database,
+    conversation: JobId,
+    before: Option<JobId>,
+    limit: usize,
+) -> Result<Option<ConversationTurnPage>, StorageError> {
+    let rx = read(database)?;
+    if !read_job_row(&rx, conversation)?.is_some_and(|row| row.kind.is_group()) {
+        return Ok(None);
+    }
+    let mut records = conversation_turns(&rx, conversation, before, limit + 1)?;
+    let has_more = records.len() > limit;
+    records.truncate(limit);
+    let inputs = rx.open_table(JOB_INPUTS)?;
+    let mut turns = Vec::with_capacity(records.len());
+    for record in records {
+        let id = record.id;
+        let mut outputs = outputs(&rx, id, None, TURN_PAGE_OUTPUTS)?;
+        let mut outputs_truncated = false;
+        if outputs.len() == TURN_PAGE_OUTPUTS
+            && outputs
+                .last()
+                .is_some_and(|last| last.kind != OutputKind::Result)
+        {
+            outputs_truncated = true;
+            if let Some(latest) = latest_output(&rx, id)?
+                && latest.kind == OutputKind::Result
+            {
+                outputs.push(latest);
+            }
+        }
+        let evidence = if record.unknown_at.is_some() {
+            tool_evidence(&rx, id, None, TURN_PAGE_OUTPUTS)?
+        } else {
+            Vec::new()
+        };
+        turns.push(ConversationTurn {
+            entries: job_entries_of(&inputs, id)?,
+            outputs,
+            outputs_truncated,
+            configuration: job_configuration(&rx, id)?,
+            evidence,
+            compaction: turn_compaction(&rx, id)?,
+            record,
+        });
+    }
+    Ok(Some(ConversationTurnPage { turns, has_more }))
 }
 
 pub(crate) fn read_conversation_limits(

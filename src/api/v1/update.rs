@@ -9,6 +9,7 @@ pub(crate) struct UpdateView {
     running: String,
     latest: Option<String>,
     available: bool,
+    release_page: Option<String>,
     latest_error: Option<String>,
     can_update: bool,
     reason: Option<String>,
@@ -92,10 +93,15 @@ pub(super) async fn get(latest: bool) -> Result<Reply, Refusal> {
         .is_some_and(|(latest, running)| latest > running);
     #[cfg(not(unix))]
     let available = false;
+    let release_page = latest
+        .as_deref()
+        .filter(|_| available)
+        .and_then(crate::system::update::release_page);
     Ok(Reply::ok(envelope(serde_json::json!(UpdateView {
         running: env!("CARGO_PKG_VERSION").into(),
         latest,
         available,
+        release_page,
         latest_error,
         can_update,
         reason,

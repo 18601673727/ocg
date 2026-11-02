@@ -1824,14 +1824,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
       });
       profileListeners.forEach((listener) => listener());
-      return readAllProfiles();
     },
 
     async removeProvider(providerId: string) {
       identity(providerId, "provider");
       await send("DELETE", `/api/v1/providers/${providerId}`, { sign: true });
       profileListeners.forEach((listener) => listener());
-      return readAllProfiles();
     },
 
     /** Creates an LLM Profile or Agent Profile and returns the refreshed catalog. */

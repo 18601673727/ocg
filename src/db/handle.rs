@@ -368,6 +368,11 @@ impl DatabaseHandle {
         if pending != 0 || ready != 0 || delayed != 0 || running != 0 || !self.sender.is_empty() {
             return Ok(None);
         }
+        // A quarantined slot is not running, but its process group may still
+        // be tracked here; a restart would orphan it.
+        if crate::system::executor::blocking::groups_tracked() {
+            return Ok(None);
+        }
         self.shared.update_paused.store(true, Ordering::SeqCst);
         Ok(Some(UpdatePause(self.shared.clone())))
     }
@@ -620,20 +625,6 @@ impl DatabaseHandle {
         self.read(move |database| redb::read_turn_context(database, turn, budget))
             .await
     }
-    pub(crate) async fn turn_compaction(
-        &self,
-        turn: JobId,
-    ) -> Result<Option<(JobId, &'static str, crate::db::entities::Timestamp)>, DatabaseError> {
-        self.read(move |database| redb::read_turn_compaction(database, turn))
-            .await
-    }
-    pub async fn turn_entries(
-        &self,
-        turn: JobId,
-    ) -> Result<Vec<(u32, crate::db::entities::JobInputEntry)>, DatabaseError> {
-        self.read(move |database| redb::read_turn_entries(database, turn))
-            .await
-    }
     pub async fn conversation_children(
         &self,
         conversation: JobId,
@@ -661,6 +652,19 @@ impl DatabaseHandle {
     ) -> Result<Vec<JobRecord>, DatabaseError> {
         self.read(move |database| {
             redb::read_conversation_turns(database, conversation, before, limit)
+        })
+        .await
+    }
+    /// One page of a conversation's Turns with everything each one shows,
+    /// read in a single snapshot; `None` when it is not a conversation.
+    pub(crate) async fn conversation_turn_page(
+        &self,
+        conversation: JobId,
+        before: Option<JobId>,
+        limit: usize,
+    ) -> Result<Option<redb::ConversationTurnPage>, DatabaseError> {
+        self.read(move |database| {
+            redb::read_conversation_turn_page(database, conversation, before, limit)
         })
         .await
     }

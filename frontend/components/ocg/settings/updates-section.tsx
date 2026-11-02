@@ -15,7 +15,7 @@ const identity = (state: UpdateState) => `${state.started_at}:${state.to}`;
 export function UpdatesSection({ client }: { client: HttpCanonicalControlClient }) {
   const { t } = useI18n();
   const [view, setView] = useState<Update | null>(null);
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<unknown>();
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(0);
   const [installingAt, setInstallingAt] = useState<number | null>(null);
@@ -82,8 +82,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
         );
         setError(undefined);
       } catch (cause) {
-        if (!signal?.aborted && latest)
-          setError(cause instanceof Error ? cause.message : String(cause));
+        if (!signal?.aborted && latest) setError(cause);
       }
     },
     [client],
@@ -98,8 +97,9 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
     return () => controller.abort();
   }, [read]);
 
+  const polling = active(view?.state ?? null);
   useEffect(() => {
-    if (!view || !active(view.state)) return;
+    if (!polling) return;
     const controller = new AbortController();
     const timer = window.setInterval(() => {
       setNow(Date.now());
@@ -109,7 +109,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
       controller.abort();
       window.clearInterval(timer);
     };
-  }, [view, read]);
+  }, [polling, read]);
 
   const state = view?.state;
   const showState = state && (active(state) || seen === identity(state));
@@ -152,13 +152,8 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
             : t("updates.running", { running: view.running })}
         </p>
       )}
-      {view?.available && view.latest && (
-        <a
-          className="text-sm underline"
-          href={`https://github.com/18601673727/ocg/releases/tag/v${encodeURIComponent(view.latest)}`}
-          target="_blank"
-          rel="noreferrer"
-        >
+      {view?.release_page && (
+        <a className="text-sm underline" href={view.release_page} target="_blank" rel="noreferrer">
           {t("updates.release")}
         </a>
       )}
@@ -167,8 +162,10 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
           {progress}
         </p>
       )}
-      {(error || view?.latest_error) && (
-        <p className="text-sm text-destructive">{error ?? view?.latest_error}</p>
+      {(error !== undefined || view?.latest_error) && (
+        <p className="text-sm text-destructive">
+          {error !== undefined ? describeError(error, t) : view?.latest_error}
+        </p>
       )}
       {view && !view.can_update && <p className="text-sm">{t("updates.terminal")}</p>}
       <div className="flex gap-2">
@@ -197,7 +194,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
                     }
                     setView((previous) => previous && { ...previous, state });
                   },
-                  (cause) => setError(describeError(cause, t)),
+                  (cause) => setError(cause),
                 )
                 .finally(() => setBusy(false));
             }}

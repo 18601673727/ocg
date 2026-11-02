@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import type { ControlDecisionAnswer, ControlProfilesSnapshot } from "../contracts";
-import { describeError } from "../settings/settings-parts";
+import { describeError, selectableLlmProfiles } from "../settings/settings-parts";
 import { useI18n } from "../i18n";
 import { Button } from "@/components/ui/button";
 import {
@@ -255,14 +255,12 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       value={model}
                       items={[
                         { value: "", label: t("context.summarizer") },
-                        ...profiles.llm_profiles
-                          .filter((profile) => profile.enabled || profile.id === model)
-                          .map((model) => ({
-                            value: model.id,
-                            label: model.enabled
-                              ? model.name
-                              : `${model.name} (${t("settings.llm.disabled")})`,
-                          })),
+                        ...selectableLlmProfiles(profiles.llm_profiles, model).map((model) => ({
+                          value: model.id,
+                          label: model.enabled
+                            ? model.name
+                            : `${model.name} (${t("settings.llm.disabled")})`,
+                        })),
                       ]}
                       onValueChange={(next) => {
                         if (next === null) return;
@@ -276,14 +274,12 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="">{t("context.summarizer")}</SelectItem>
-                        {profiles.llm_profiles
-                          .filter((profile) => profile.enabled || profile.id === model)
-                          .map((model) => (
-                            <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
-                              {model.name}
-                              {!model.enabled && ` (${t("settings.llm.disabled")})`}
-                            </SelectItem>
-                          ))}
+                        {selectableLlmProfiles(profiles.llm_profiles, model).map((model) => (
+                          <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
+                            {model.name}
+                            {!model.enabled && ` (${t("settings.llm.disabled")})`}
+                          </SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                   </label>

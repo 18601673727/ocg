@@ -762,14 +762,14 @@ pub(super) async fn respond(
                 let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
                 browser.begin_session()
             }
-            _ => Err(NOT_FOUND),
+            Caller::Programmatic | Caller::Anonymous => Err(NOT_FOUND),
         },
         Route::SessionRevoke => match caller {
             Caller::Operator(session) => {
                 let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
                 Ok(browser.logout(session))
             }
-            _ => Err(NOT_FOUND),
+            Caller::Programmatic | Caller::Anonymous => Err(NOT_FOUND),
         },
         // Answered as a stream, before any reply.
         Route::Events { .. } | Route::Subscription(_) => Err(INTERNAL),

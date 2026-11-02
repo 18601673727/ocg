@@ -597,7 +597,6 @@ async fn dispatch_runtime(
     let catalog_changes = database.subscribe_catalog();
     let mut reconcile = true;
     let mut retry_at = Instant::now() + RECONCILE;
-    let mut unconfirmed_stopped = BTreeSet::new();
     enum Incoming {
         Message(Result<SchedulerMessage, flume::RecvError>),
         Wake,
@@ -761,19 +760,16 @@ async fn dispatch_runtime(
             SchedulerMessage::Reconcile => {
                 retry_at = Instant::now() + RECONCILE;
                 retry_unsettled(&database).await;
-                match ntex::rt::spawn_blocking(blocking::retry_unproven_groups).await {
-                    Ok(recovered) => unconfirmed_stopped.extend(recovered),
-                    Err(error) => {
-                        log::warn!("failed to retry unproven groups on blocking worker: {error}");
-                    }
+                if let Err(error) = ntex::rt::spawn_blocking(blocking::retry_unproven_groups).await
+                {
+                    log::warn!("failed to retry unproven groups on blocking worker: {error}");
                 }
-                let mut retry_next = BTreeSet::new();
-                for job in std::mem::take(&mut unconfirmed_stopped) {
+                for job in blocking::unconfirmed_stops() {
                     let result = database
                         .confirm_job_stopped(job, crate::db::entities::StopProof::Proof)
                         .await;
-                    if retry_stop_confirmation(&result) {
-                        retry_next.insert(job);
+                    if !retry_stop_confirmation(&result) {
+                        blocking::stop_settled(job);
                     }
                     match result {
                         Ok(())
@@ -789,7 +785,6 @@ async fn dispatch_runtime(
                         }
                     }
                 }
-                unconfirmed_stopped = retry_next;
                 match database
                     .terminal_jobs(pending.keys().copied().collect())
                     .await

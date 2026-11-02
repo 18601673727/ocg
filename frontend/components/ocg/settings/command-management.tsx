@@ -25,7 +25,7 @@ import {
 import type { ControlProfilesSnapshot, ControlProject } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
-import { describeError } from "./settings-parts";
+import { describeError, selectableLlmProfiles } from "./settings-parts";
 
 export function ProjectDecisionConfigButton({
   client,
@@ -82,7 +82,7 @@ export function ProjectDecisionConfigButton({
   }
   const decisionProfiles = profiles?.decision_agent_profiles ?? [];
   const models = [
-    ...(profiles?.llm_profiles ?? []).filter((model) => model.enabled),
+    ...selectableLlmProfiles(profiles?.llm_profiles ?? [], project?.decision?.decision_profile),
     ...(profiles?.decision_profiles ?? []),
   ];
   const choices = [...decisionProfiles, ...models];
@@ -150,7 +150,10 @@ export function ProjectDecisionConfigButton({
               { value: "off", label: t("commands.disable") },
               ...models.map((model) => ({
                 value: model.id,
-                label: `${model.name} · ${model.model}`,
+                label:
+                  "enabled" in model && !model.enabled
+                    ? `${model.name} · ${model.model} (${t("settings.llm.disabled")})`
+                    : `${model.name} · ${model.model}`,
               })),
               ...decisionProfiles.map((profile) => ({
                 value: profile.id,
@@ -171,8 +174,13 @@ export function ProjectDecisionConfigButton({
               <SelectGroup>
                 <SelectLabel>{t("settings.nav.models")}</SelectLabel>
                 {models.map((model) => (
-                  <SelectItem key={model.id} value={model.id}>
+                  <SelectItem
+                    key={model.id}
+                    value={model.id}
+                    disabled={"enabled" in model && !model.enabled}
+                  >
                     {model.name} · {model.model}
+                    {"enabled" in model && !model.enabled && ` (${t("settings.llm.disabled")})`}
                   </SelectItem>
                 ))}
               </SelectGroup>

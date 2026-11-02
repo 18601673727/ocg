@@ -6,6 +6,7 @@ import type {
   PredictiveCompaction as ControlPredictiveCompaction,
 } from "../contracts/api";
 import { useI18n, type I18nKey } from "../i18n";
+import { selectableLlmProfiles } from "./settings-parts";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -147,14 +148,14 @@ export function CompactionPolicyFields({
               value={policy.summarization_model ?? ""}
               items={[
                 { value: "", label: t("context.foregroundFallback") },
-                ...profiles.llm_profiles
-                  .filter((profile) => profile.enabled || profile.id === policy.summarization_model)
-                  .map((model) => ({
+                ...selectableLlmProfiles(profiles.llm_profiles, policy.summarization_model).map(
+                  (model) => ({
                     value: model.id,
                     label: model.enabled
                       ? model.name
                       : `${model.name} (${t("settings.llm.disabled")})`,
-                  })),
+                  }),
+                ),
               ]}
               onValueChange={(next) => change({ summarization_model: next || null })}
             >
@@ -163,14 +164,14 @@ export function CompactionPolicyFields({
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="">{t("context.foregroundFallback")}</SelectItem>
-                {profiles.llm_profiles
-                  .filter((profile) => profile.enabled || profile.id === policy.summarization_model)
-                  .map((model) => (
+                {selectableLlmProfiles(profiles.llm_profiles, policy.summarization_model).map(
+                  (model) => (
                     <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
                       {model.name}
                       {!model.enabled && ` (${t("settings.llm.disabled")})`}
                     </SelectItem>
-                  ))}
+                  ),
+                )}
               </SelectContent>
             </Select>
           </label>

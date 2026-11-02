@@ -61,6 +61,13 @@ export function OperatorConsole() {
     if (phase !== "in" || !client) return;
     let alive = true;
     let reading = false;
+    const unauthorized = (error: unknown) =>
+      error instanceof ControlTransportError && error.status === 401;
+    const signedOut = () => {
+      csrf.current = "";
+      setSession(null);
+      setPhase("out");
+    };
     const read = async () => {
       if (reading) return;
       reading = true;
@@ -69,22 +76,24 @@ export function OperatorConsole() {
         if (alive) setHealth(answer);
       } catch (error: unknown) {
         if (!alive) return;
-        if (error instanceof ControlTransportError && error.status === 401) {
-          try {
-            const renewed = await client.readSession();
-            if (alive) {
-              csrf.current = renewed.csrfToken;
-              setSession(renewed);
-            }
-          } catch {
-            if (alive) {
-              csrf.current = "";
-              setSession(null);
-              setPhase("out");
-            }
-          }
-        } else {
-          setHealth(null);
+        setHealth(null);
+        if (!unauthorized(error)) return;
+        let renewed: OperatorSession;
+        try {
+          renewed = await client.readSession();
+        } catch {
+          if (alive) signedOut();
+          return;
+        }
+        if (!alive) return;
+        csrf.current = renewed.csrfToken;
+        setSession(renewed);
+        // A session that still cannot read health is not signed in.
+        try {
+          const answer = await client.readHealth();
+          if (alive) setHealth(answer);
+        } catch (retry: unknown) {
+          if (alive && unauthorized(retry)) signedOut();
         }
       } finally {
         reading = false;

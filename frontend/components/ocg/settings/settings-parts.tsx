@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import type { ControlLlmProfile } from "../contracts";
 import { ControlTransportError } from "../runtime/control-client";
 import type { I18nKey, TranslateFn } from "../i18n";
 
@@ -55,4 +56,12 @@ export function refusalText(
     }
   }
   return describeError(error, t);
+}
+
+/** Enabled LLM profiles, plus any disabled one that is still selected. */
+export function selectableLlmProfiles(
+  profiles: readonly ControlLlmProfile[],
+  ...selected: (string | null | undefined)[]
+): ControlLlmProfile[] {
+  return profiles.filter((profile) => profile.enabled || selected.includes(profile.id));
 }

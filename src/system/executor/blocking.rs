@@ -1,5 +1,6 @@
 //! Limits and process supervision for blocking work started by tool calls.
 
+use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
@@ -324,14 +325,56 @@ pub(crate) fn record_unproven_group(group: UnprovenGroup) {
         .push(group);
 }
 
-pub(crate) fn retry_unproven_groups() -> Vec<JobId> {
+/// Jobs whose every group was proven empty but whose stop is not yet
+/// committed. Kept until the commit, or a restart would leave the slot
+/// quarantined with nothing left to prove it free.
+static UNCONFIRMED_STOPS: Mutex<BTreeSet<JobId>> = Mutex::new(BTreeSet::new());
+
+/// Whether this process still tracks a group that may be alive, or a proven
+/// stop not yet committed. None of them survives a restart.
+pub(crate) fn groups_tracked() -> bool {
+    !RUNNING_GROUPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty()
+        || !UNPROVEN_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+        || !UNCONFIRMED_STOPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+}
+
+/// The Jobs whose stop was proven and still has to be committed.
+pub(crate) fn unconfirmed_stops() -> Vec<JobId> {
+    UNCONFIRMED_STOPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .copied()
+        .collect()
+}
+
+/// The stop of `job` is committed, or can no longer be.
+pub(crate) fn stop_settled(job: JobId) {
+    UNCONFIRMED_STOPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(&job);
+}
+
+/// Kills every unproven group again; a Job whose groups are all proven
+/// empty joins the unconfirmed stops before its last group is forgotten.
+pub(crate) fn retry_unproven_groups() {
     let mut groups = UNPROVEN_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     if groups.is_empty() {
-        return Vec::new();
+        return;
     }
-    let mut candidate_jobs = std::collections::BTreeSet::new();
+    let mut candidate_jobs = BTreeSet::new();
     let mut remaining = Vec::new();
     for mut entry in groups.drain(..) {
         signal(entry.group, Signal::KILL);
@@ -352,8 +395,11 @@ pub(crate) fn retry_unproven_groups() -> Vec<JobId> {
             candidate_jobs.remove(&job);
         }
     }
+    UNCONFIRMED_STOPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .extend(candidate_jobs);
     *groups = remaining;
-    candidate_jobs.into_iter().collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -903,6 +949,12 @@ pub(crate) fn prove_job(job: JobId) -> JobProof {
                 remaining.push(entry);
             }
         }
+    }
+    if live.is_none() && tracked {
+        UNCONFIRMED_STOPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job);
     }
     *groups = remaining;
     match live {

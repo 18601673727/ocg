@@ -19,6 +19,11 @@ import { useI18n } from "../i18n";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { describeError } from "./settings-parts";
 
+/** The backend saves a source as "<name> provider"; show the name it was given. */
+function sourceName(name: string) {
+  return name.endsWith(" provider") ? name.slice(0, -" provider".length) : name;
+}
+
 export function ProviderModelImport({
   client,
   snapshot,
@@ -73,6 +78,7 @@ function ImportContent({
     null,
   );
   const [error, setError] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
   // A committed import stays committed even when the following catalog refresh fails.
   const [result, setResult] = useState<string | null>(null);
   const endpoint =
@@ -194,13 +200,13 @@ function ImportContent({
             <DialogTitle>{t("settings.llm.removeSourceTitle")}</DialogTitle>
             <DialogDescription>
               {t("settings.llm.removeSourceDescription", {
-                name: removing?.name.replace(/\s+provider\s*$/i, "") ?? "",
+                name: removing ? sourceName(removing.name) : "",
               })}
             </DialogDescription>
           </DialogHeader>
-          {error && (
+          {removeError && (
             <p role="alert" className="text-sm text-destructive">
-              {error}
+              {removeError}
             </p>
           )}
           <DialogFooter>
@@ -213,7 +219,7 @@ function ImportContent({
               onClick={() => {
                 if (!removing) return;
                 setSaving(true);
-                setError(null);
+                setRemoveError(null);
                 void client
                   .removeProvider(removing.id)
                   .then(() => {
@@ -221,7 +227,7 @@ function ImportContent({
                     setRemoving(null);
                     onImported(t("settings.llm.sourceRemoved"));
                   })
-                  .catch((reason) => setError(describeError(reason, t)))
+                  .catch((reason) => setRemoveError(describeError(reason, t)))
                   .finally(() => setSaving(false));
               }}
             >
@@ -252,9 +258,7 @@ function ImportContent({
                     selectSource(id);
                   }}
                 >
-                  <span className="min-w-0 break-words">
-                    {entry.name.replace(/\s+provider\s*$/i, "")}
-                  </span>
+                  <span className="min-w-0 break-words">{sourceName(entry.name)}</span>
                 </Button>
                 <Button
                   variant="ghost"
@@ -275,7 +279,7 @@ function ImportContent({
                   disabled={saving}
                   className="absolute top-1/2 right-1 -translate-y-1/2"
                   onClick={() => {
-                    setError(null);
+                    setRemoveError(null);
                     setRemoving(entry);
                   }}
                 >

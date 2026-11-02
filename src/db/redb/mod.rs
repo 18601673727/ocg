@@ -101,6 +101,7 @@ use reader::read;
 use recovery::allocate;
 pub(crate) use recovery::{OpenedFile, database_file, open};
 
+pub(crate) use reader::ProfilePageRecords;
 pub(crate) use reader::{
     ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage, read_approved_calls,
     read_cards, read_conversation_children, read_has_decider, read_has_pending_approvals,
@@ -119,10 +120,9 @@ pub(crate) use reader::{
     read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_buckets,
     read_usage_retries, read_usage_summary,
 };
-pub(crate) use reader::{ProfilePageRecords, read_turn_compaction};
 pub(crate) use reader::{
-    TurnContext, read_conversation_limits, read_conversation_turns, read_notices,
-    read_turn_context, read_turn_entries, read_turn_execution,
+    ConversationTurnPage, TurnContext, read_conversation_limits, read_conversation_turn_page,
+    read_conversation_turns, read_notices, read_turn_context, read_turn_execution,
 };
 
 pub(crate) use crate::db::entities::{JobControl, JobSpec, JobState};

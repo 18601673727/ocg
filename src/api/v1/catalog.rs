@@ -614,95 +614,68 @@ pub(super) async fn conversation_turns(
     before: Option<JobId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    let row = database.job(conversation).await?.ok_or(Refusal::new(
-        ntex::http::StatusCode::NOT_FOUND,
-        "conversation_not_found",
-        "conversation does not exist",
-    ))?;
-    if !row.kind.is_group() {
-        return Err(Refusal::new(
+    let page = database
+        .conversation_turn_page(conversation, before, limit)
+        .await?
+        .ok_or(Refusal::new(
             ntex::http::StatusCode::NOT_FOUND,
             "conversation_not_found",
             "conversation does not exist",
-        ));
-    }
-    let records = database
-        .conversation_turns(conversation, before, limit + 1)
-        .await?;
-    let has_more = records.len() > limit;
-    let mut turns = Vec::new();
-    for record in records.iter().take(limit) {
-        let entries = database.turn_entries(record.id).await?;
-        let mut outputs = database.job_outputs(record.id, None, 1000).await?;
-        let mut outputs_truncated = false;
-        if outputs.len() == 1000
-            && outputs
-                .last()
-                .is_some_and(|last| last.kind != crate::db::entities::OutputKind::Result)
-        {
-            outputs_truncated = true;
-            if let Some(latest) = database.latest_output(record.id).await?
-                && latest.kind == crate::db::entities::OutputKind::Result
-            {
-                outputs.push(latest);
-            }
-        }
-        let configuration = database
-            .job_configuration(record.id)
-            .await?
-            .map(configuration_view);
+        ))?;
+    let next_before = page
+        .turns
+        .last()
+        .filter(|_| page.has_more)
+        .map(|turn| turn.record.id.to_string());
+    let mut turns = Vec::with_capacity(page.turns.len());
+    for turn in page.turns {
         let mut uncertain = Vec::new();
-        if record.unknown_at.is_some() {
-            for call in database.tool_evidence(record.id, None, 1000).await? {
-                if let Some(admission) = call.admission()
-                    && call.outcome.as_ref().is_none_or(|outcome| {
-                        matches!(
-                            outcome.fact,
-                            crate::db::entities::ToolOutcome::Uncertain { .. }
-                        )
-                    })
-                {
-                    uncertain.push(UncertainCallView {
-                        request: call.call.request.get(),
-                        index: call.call.index,
-                        tool: call.name.clone(),
-                        argv: admission.arguments.as_str().to_owned(),
-                    });
-                }
+        for call in turn.evidence {
+            if let Some(admission) = call.admission()
+                && call.outcome.as_ref().is_none_or(|outcome| {
+                    matches!(
+                        outcome.fact,
+                        crate::db::entities::ToolOutcome::Uncertain { .. }
+                    )
+                })
+            {
+                uncertain.push(UncertainCallView {
+                    request: call.call.request.get(),
+                    index: call.call.index,
+                    tool: call.name.clone(),
+                    argv: admission.arguments.as_str().to_owned(),
+                });
             }
         }
-        let compaction = database
-            .turn_compaction(record.id)
-            .await?
-            .map(|(artifact, kind, at)| CompactionUseView {
-                artifact: artifact.to_string(),
-                kind: kind.to_owned(),
-                at_us: at.as_unix_micros(),
-            });
         turns.push(TurnView {
-            compaction,
-            job: super::jobs::job_view(record)?,
-            entries: entries
+            compaction: turn
+                .compaction
+                .map(|(artifact, kind, at)| CompactionUseView {
+                    artifact: artifact.to_string(),
+                    kind: kind.to_owned(),
+                    at_us: at.as_unix_micros(),
+                }),
+            job: super::jobs::job_view(&turn.record)?,
+            entries: turn
+                .entries
                 .iter()
                 .map(|(seq, entry)| entry_json(*seq, entry))
                 .collect(),
-            configuration,
-            outputs: outputs.iter().map(super::outputs::output_view).collect(),
+            configuration: turn.configuration.map(configuration_view),
+            outputs: turn
+                .outputs
+                .iter()
+                .map(super::outputs::output_view)
+                .collect(),
             uncertain_calls: uncertain,
-            outputs_truncated,
+            outputs_truncated: turn.outputs_truncated,
         });
     }
     Ok(Reply::ok(envelope(serde_json::json!(TurnsView {
         conversation: conversation.to_string(),
         turns,
-        has_more,
-        next_before: if has_more {
-            records
-                .get(limit.saturating_sub(1))
-                .map(|record| record.id.to_string())
-        } else {
-            None
-        },
+        has_more: page.has_more,
+        next_before,
     }))))
 }
 pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Result<Reply, Refusal> {

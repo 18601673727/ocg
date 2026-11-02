@@ -201,6 +201,9 @@ export function SettingsSurface({
         if (!signal?.aborted) {
           setLoadError(describeError(error, t));
         }
+      } finally {
+        // An availability change waits for the catalog it announced.
+        if (!signal?.aborted) setAvailabilityId(null);
       }
     },
     [client, t],
@@ -640,10 +643,8 @@ export function SettingsSurface({
                   <ProviderModelImport
                     client={client}
                     snapshot={snapshot}
-                    onImported={(message) => {
-                      setCatalogNotice(message);
-                      void refreshProfiles();
-                    }}
+                    // The client announces the change, which refreshes the catalog.
+                    onImported={setCatalogNotice}
                   />
                   <h3 className="border-t border-border pt-4 text-sm font-semibold">
                     {t("settings.llm.title")}
@@ -751,9 +752,10 @@ export function SettingsSurface({
                                   setLoadError(null);
                                   void client
                                     .setModelEnabled(profile.id, !profile.enabled)
-                                    .then(setSnapshot)
-                                    .catch((error) => setLoadError(describeError(error, t)))
-                                    .finally(() => setAvailabilityId(null));
+                                    .catch((error) => {
+                                      setLoadError(describeError(error, t));
+                                      setAvailabilityId(null);
+                                    });
                                 }}
                               >
                                 {t(
@@ -1278,7 +1280,12 @@ export function SettingsSurface({
                                       ←
                                     </Button>
                                     <span className="min-w-0 flex-1">
-                                      <span className="block break-words">{model.name}</span>
+                                      <span className="block break-words">
+                                        {model.name}
+                                        {model.kind === "generative" &&
+                                          !model.enabled &&
+                                          ` (${t("settings.llm.disabled")})`}
+                                      </span>
                                       <span
                                         className="block truncate text-xs text-muted-foreground"
                                         title={model.model}

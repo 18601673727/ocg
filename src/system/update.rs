@@ -241,12 +241,23 @@ pub(crate) fn service_file(home: &Path) -> PathBuf {
     }
 }
 
+fn mirror() -> Option<String> {
+    std::env::var("OCG_RELEASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// The release page of `version`. A mirror publishes no such page.
+pub(crate) fn release_page(version: &str) -> Option<String> {
+    mirror()
+        .is_none()
+        .then(|| format!("{RELEASES}/tag/v{version}"))
+}
+
 pub(crate) async fn lookup(
     requested: Option<&str>,
 ) -> Result<(Client, String, bool, String, String)> {
-    let mirror = std::env::var("OCG_RELEASE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let mirror = mirror();
     let default_base = format!("{RELEASES}/download");
     let root = mirror
         .as_deref()

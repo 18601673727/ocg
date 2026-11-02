@@ -1732,9 +1732,32 @@ fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
             | DatabaseError::ReadInterrupted
             | DatabaseError::ReadPoolStopped
             | DatabaseError::Read(_) => DATABASE_UNAVAILABLE,
-            _ => INTERNAL,
+            DatabaseError::StartupPolicy(_)
+            | DatabaseError::ControlQueueFull
+            | DatabaseError::StorageUnavailable(_)
+            | DatabaseError::OutcomeUnknown { .. }
+            | DatabaseError::UnknownOperation(_)
+            | DatabaseError::Startup(_)
+            | DatabaseError::Configuration(_)
+            | DatabaseError::InsufficientStartupSpace(_)
+            | DatabaseError::Open(_)
+            | DatabaseError::AttachmentStore(_)
+            | DatabaseError::WorkerPanicked => INTERNAL,
         },
-        _ => INTERNAL,
+        ExecutionRuntimeError::WorkspaceGrantUnsupported
+        | ExecutionRuntimeError::MissingPoolBinding(_)
+        | ExecutionRuntimeError::Startup(_)
+        | ExecutionRuntimeError::WorkerPanicked
+        | ExecutionRuntimeError::Provider(_)
+        | ExecutionRuntimeError::ObservationsNotRecorded { .. }
+        | ExecutionRuntimeError::ResponseNotRecorded { .. }
+        | ExecutionRuntimeError::CompletionRefused { .. }
+        | ExecutionRuntimeError::ToolsUnavailable(_)
+        | ExecutionRuntimeError::InvalidToolLimits(_)
+        | ExecutionRuntimeError::ToolLoopStopped { .. }
+        | ExecutionRuntimeError::ToolLoopNotSettled { .. }
+        | ExecutionRuntimeError::ProviderSettlementNotRecorded { .. }
+        | ExecutionRuntimeError::NotSettled { .. } => INTERNAL,
     }
 }
 
@@ -2230,11 +2253,18 @@ pub(super) async fn release_slot(
         JobProof::Untracked if object.get("confirm") == Some(&Value::Bool(true)) => StopProof::User,
         JobProof::Untracked => return Err(conversation_refusal("confirm_required")),
     };
+    // A proof whose commit fails stays unconfirmed; the scheduler retries it.
     match database.confirm_job_stopped(job, by).await {
-        Ok(()) => Ok(Reply::ok(envelope(serde_json::json!(ReleaseSlotView {
-            status: "released".to_owned(),
-        })))),
-        Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => Ok(released()),
+        Ok(()) => {
+            blocking::stop_settled(job);
+            Ok(Reply::ok(envelope(serde_json::json!(ReleaseSlotView {
+                status: "released".to_owned(),
+            }))))
+        }
+        Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => {
+            blocking::stop_settled(job);
+            Ok(released())
+        }
         Err(error) => Err(action_error(error)),
     }
 }
