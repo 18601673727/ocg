@@ -27,6 +27,7 @@ pub(super) const TAG_NOTICE: u8 = 12;
 pub(super) const TAG_RECURRENCE: u8 = 13;
 pub(super) const TAG_GLOBAL_COMPACTION: u8 = 14;
 pub(super) const TAG_APPROVAL: u8 = 15;
+pub(super) const TAG_CREDENTIAL: u8 = 16;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 

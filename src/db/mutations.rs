@@ -35,14 +35,31 @@ pub(crate) enum ModelProfileDefinition {
     },
 }
 
+#[derive(Clone)]
+pub(crate) struct CredentialPayload {
+    pub(crate) secret: crate::db::redb::CredentialSecret,
+    pub(crate) key: std::sync::Arc<crate::db::redb::CredentialKey>,
+}
+
 pub(crate) struct ModelProfileSave {
     pub(crate) existing_id: Option<ProfileId>,
     pub(crate) name: String,
     pub(crate) connection_name: String,
     pub(crate) endpoint: Option<String>,
     pub(crate) credential_ref: ProfileCredentialRef,
+    pub(crate) secret: Option<crate::db::redb::CredentialSecret>,
+    pub(crate) credential: Option<CredentialPayload>,
     pub(crate) guard: Option<ProfileSaveGuard>,
     pub(crate) definition: ModelProfileDefinition,
+}
+
+pub(crate) struct ImportModelsSave {
+    pub(crate) connection: Config,
+    pub(crate) credential_ref: ProfileCredentialRef,
+    pub(crate) secret: Option<crate::db::redb::CredentialSecret>,
+    pub(crate) credential: Option<CredentialPayload>,
+    pub(crate) models: Vec<crate::db::entities::DiscoveredModel>,
+    pub(crate) capabilities: std::collections::BTreeSet<ModelCapability>,
 }
 
 pub(crate) fn save_model_profile(
@@ -342,11 +359,9 @@ pub(crate) fn create_config(batch: &mut Batch, config: Config) -> OpResult<Confi
 
 pub(crate) fn import_models(
     batch: &mut Batch,
-    connection: Config,
-    models: Vec<crate::db::entities::DiscoveredModel>,
-    capabilities: std::collections::BTreeSet<ModelCapability>,
+    save: ImportModelsSave,
 ) -> OpResult<(Vec<ConfigId>, usize)> {
-    batch.import_models(connection, models, capabilities)
+    batch.import_models(save)
 }
 
 pub(crate) fn archive_model(batch: &mut Batch, id: ConfigId) -> OpResult<()> {

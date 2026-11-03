@@ -86,6 +86,7 @@ const MAX_PATH_COMPONENTS: usize = 64;
 const PROTECTED_NAMES: &[&str] = &[
     "ocg_db",
     "ocg.redb",
+    "ocg.key",
     "ocg_logs",
     "ocg_attachments",
     "credentials",

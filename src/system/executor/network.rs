@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ntex::http::Uri;
@@ -128,10 +129,12 @@ fn redirect_url(current: &Uri, location: &str) -> Result<Uri, ToolFailure> {
 async fn request(url: &str) -> Result<Response, ToolFailure> {
     let mut url = parse_url(url)?;
     ntex::time::timeout(TIMEOUT, async {
-        let client = crate::system::http::provider_client(TIMEOUT)
+        let non_public = Arc::new(AtomicBool::new(false));
+        let client = crate::system::http::web_client(TIMEOUT, non_public.clone())
             .await
             .map_err(|_| ToolFailure::not_applied("HTTP client could not be initialized"))?;
         for redirects in 0..=MAX_REDIRECTS {
+            non_public.store(false, Ordering::SeqCst);
             let response = client
                 .get(url.clone())
                 .set_header(
@@ -141,7 +144,13 @@ async fn request(url: &str) -> Result<Response, ToolFailure> {
                 .set_header("Accept-Encoding", "identity")
                 .send()
                 .await
-                .map_err(|_| ToolFailure::not_applied("HTTP request failed"))?;
+                .map_err(|_| {
+                    if non_public.load(Ordering::SeqCst) {
+                        ToolFailure::not_applied("address is not public")
+                    } else {
+                        ToolFailure::not_applied("HTTP request failed")
+                    }
+                })?;
             let status = response.status().as_u16();
             if matches!(status, 301 | 302 | 303 | 307 | 308)
                 && let Some(location) = response.header("location")
@@ -382,7 +391,7 @@ impl ToolHandler for Search {
 }
 
 pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
-    registry.register("web_fetch", Some("Access the internet: GET an HTTP or HTTPS webpage or API using OCG's configured proxy. Returns the final URL, HTTP status, content type and UTF-8 content. HTML becomes readable text by default; format=html returns source. Follow next_start with start_char to read more (the URL is fetched again). body_truncated means the downloaded body exceeded 2 MiB; use a smaller resource or the site's pagination. No JavaScript execution. Use URLs without credentials."), json!({
+    registry.register("web_fetch", Some("Access the internet: GET an HTTP or HTTPS webpage or API using OCG's configured proxy. Private and local addresses are refused. Returns the final URL, HTTP status, content type and UTF-8 content. HTML becomes readable text by default; format=html returns source. Follow next_start with start_char to read more (the URL is fetched again). body_truncated means the downloaded body exceeded 2 MiB; use a smaller resource or the site's pagination. No JavaScript execution. Use URLs without credentials."), json!({
         "type":"object", "additionalProperties":false,
         "properties":{
             "url":{"type":"string", "minLength":1, "maxLength":2048},

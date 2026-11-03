@@ -103,7 +103,7 @@ mod shared;
 
 mod worker;
 
-use commands::{Command, Control, Envelope, Message, Reply};
+use commands::{Command, Control, Envelope, InFlightCommand, Message, Reply};
 use errors::operation_status;
 pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,

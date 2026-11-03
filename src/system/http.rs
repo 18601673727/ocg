@@ -1,5 +1,7 @@
 use std::ffi::OsString;
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -62,6 +64,26 @@ pub(crate) async fn release_client() -> Result<Client, ProviderExecutionError> {
         .await
         .map_err(|_| ProviderExecutionError::Build {
             message: "release HTTP client could not be initialized".to_owned(),
+        })
+}
+
+pub(crate) async fn web_client(
+    timeout: Duration,
+    non_public: Arc<AtomicBool>,
+) -> Result<Client, ProviderExecutionError> {
+    Client::builder()
+        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
+        .connector::<()>(web_connector(non_public)?)
+        .disable_redirects()
+        .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
+        .response_payload_timeout(Millis::ZERO)
+        .build(
+            ntex::SharedCfg::new("web")
+                .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
+        )
+        .await
+        .map_err(|_| ProviderExecutionError::Build {
+            message: "web HTTP client could not be initialized".to_owned(),
         })
 }
 
@@ -360,6 +382,243 @@ fn connector() -> Result<Connector, ProviderExecutionError> {
                     .map_err(ConnectError::from)
             },
         )))
+}
+
+fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecutionError> {
+    let proxy =
+        PROXY
+            .get_or_init(load)
+            .as_ref()
+            .map_err(|message| ProviderExecutionError::Build {
+                message: message.clone(),
+            })?;
+    let tls = proxy.as_ref().map_or_else(tunnel_tls, Proxy::tls);
+    let http_non_public = non_public.clone();
+    Ok(Connector::default()
+        .connector(apply_fn_factory(
+            TcpConnector::<Uri>::new(),
+            async move |request: Connect<Uri>, service| {
+                let target = request.get_ref().clone();
+                let host = target.host().ok_or(ConnectError::InvalidInput)?;
+                let port = target.port_u16().unwrap_or(80);
+                let tunnel = proxy
+                    .as_ref()
+                    .is_some_and(|proxy| !proxy.bypasses(host, port));
+                if let (true, Some(proxy)) = (tunnel, proxy.as_ref()) {
+                    check_proxied_web_target(host, port, &http_non_public).await?;
+                    let io = service.call(Connect::new(proxy.uri.clone())).await?;
+                    connect_tunnel_with_timeout(
+                        &io,
+                        host,
+                        port,
+                        proxy.authorization.as_ref(),
+                        TUNNEL_TIMEOUT,
+                    )
+                    .await?;
+                    Ok::<_, ConnectError>(io)
+                } else {
+                    let addrs = resolve_direct_web_target(host, port, &http_non_public).await?;
+                    service.call(request.set_addrs(addrs)).await
+                }
+            },
+        ))
+        .secure_connector(apply_fn_factory(
+            TcpConnector::<Uri>::new(),
+            async move |request: Connect<Uri>, service| {
+                let target = request.get_ref().clone();
+                let host = target.host().ok_or(ConnectError::InvalidInput)?;
+                let port = target.port_u16().unwrap_or(443);
+                let tunnel = proxy
+                    .as_ref()
+                    .is_some_and(|proxy| !proxy.bypasses(host, port));
+                let io = if let (true, Some(proxy)) = (tunnel, proxy.as_ref()) {
+                    check_proxied_web_target(host, port, &non_public).await?;
+                    let io = service.call(Connect::new(proxy.uri.clone())).await?;
+                    connect_tunnel_with_timeout(
+                        &io,
+                        host,
+                        port,
+                        proxy.authorization.as_ref(),
+                        TUNNEL_TIMEOUT,
+                    )
+                    .await?;
+                    io
+                } else {
+                    let addrs = resolve_direct_web_target(host, port, &non_public).await?;
+                    service.call(request.set_addrs(addrs)).await?
+                };
+                let name = rustls::pki_types::ServerName::try_from(
+                    host.trim_matches(['[', ']']).to_owned(),
+                )
+                .map_err(|_| ConnectError::InvalidInput)?;
+                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
+                    .await
+                    .map(IoBoxed::from)
+                    .map_err(ConnectError::from)
+            },
+        )))
+}
+
+async fn resolve_direct_web_target(
+    host: &str,
+    port: u16,
+    non_public: &Arc<AtomicBool>,
+) -> Result<Vec<SocketAddr>, ConnectError> {
+    if is_non_public_host_literal(host) {
+        non_public.store(true, Ordering::SeqCst);
+        return Err(ConnectError::Unresolved);
+    }
+    let lookup_host = host.trim_matches(['[', ']']).to_owned();
+    let resolved = ntex::rt::spawn_blocking(move || (lookup_host.as_str(), port).to_socket_addrs())
+        .await
+        .map_err(|_| ConnectError::Unresolved)?
+        .map_err(|_| ConnectError::Unresolved)?;
+    let addrs: Vec<SocketAddr> = resolved.collect();
+    if addrs.is_empty() {
+        return Err(ConnectError::Unresolved);
+    }
+    if addrs.iter().any(|addr| !is_public_ip(addr.ip())) {
+        non_public.store(true, Ordering::SeqCst);
+        return Err(ConnectError::Unresolved);
+    }
+    Ok(addrs)
+}
+
+/// Checks a target before opening a CONNECT tunnel through the proxy. The
+/// proxy's own address is never checked (it is often 127.0.0.1), and local DNS
+/// is not required because proxy-only networks may not have working local
+/// resolution; DNS rebinding through the proxy is out of scope.
+async fn check_proxied_web_target(
+    host: &str,
+    port: u16,
+    non_public: &Arc<AtomicBool>,
+) -> Result<(), ConnectError> {
+    if is_non_public_host_literal(host) {
+        non_public.store(true, Ordering::SeqCst);
+        return Err(ConnectError::Unresolved);
+    }
+    let lookup_host = host.trim_matches(['[', ']']).to_owned();
+    if let Ok(Ok(addrs)) =
+        ntex::rt::spawn_blocking(move || (lookup_host.as_str(), port).to_socket_addrs()).await
+        && addrs.into_iter().any(|addr| !is_public_ip(addr.ip()))
+    {
+        non_public.store(true, Ordering::SeqCst);
+        return Err(ConnectError::Unresolved);
+    }
+    Ok(())
+}
+
+fn is_non_public_host_literal(host: &str) -> bool {
+    let bare = bare_host(host);
+    if bare == "localhost" || bare.ends_with(".localhost") {
+        return true;
+    }
+    let unzoned = bare.split_once('%').map_or(bare.as_str(), |(ip, _)| ip);
+    if let Ok(ipv6) = unzoned.parse::<Ipv6Addr>() {
+        return !is_public_ipv6(ipv6);
+    }
+    if host.trim().starts_with('[') {
+        return true;
+    }
+    if let Some(ipv4) = parse_inet_aton(&bare) {
+        return !is_public_ipv4(ipv4);
+    }
+    false
+}
+
+fn parse_inet_aton_part(part: &str) -> Option<u32> {
+    if part.is_empty() || part.starts_with('+') || part.starts_with('-') {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else if part.len() > 1 && part.starts_with('0') {
+        u32::from_str_radix(part, 8).ok()
+    } else {
+        part.parse::<u32>().ok()
+    }
+}
+
+fn parse_inet_aton(host: &str) -> Option<Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(parts.len());
+    for part in parts {
+        values.push(parse_inet_aton_part(part)?);
+    }
+    let address = match values.as_slice() {
+        [a] => *a,
+        [a, b] if *a <= 0xff && *b <= 0x00ff_ffff => (*a << 24) | *b,
+        [a, b, c] if *a <= 0xff && *b <= 0xff && *c <= 0xffff => (*a << 24) | (*b << 16) | *c,
+        [a, b, c, d] if *a <= 0xff && *b <= 0xff && *c <= 0xff && *d <= 0xff => {
+            (*a << 24) | (*b << 16) | (*c << 8) | *d
+        }
+        _ => return None,
+    };
+    Some(Ipv4Addr::from(address))
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_ipv4(v4),
+        IpAddr::V6(v6) => is_public_ipv6(v6),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    // 198.18.0.0/15 is intentionally allowed: Clash/Surge fake-IP DNS hands out
+    // these addresses for every name, so refusing them would break web tools
+    // for those users.
+    let [a, b, c, d] = ip.octets();
+    !(a == 0
+        || a == 10
+        || (a == 100 && (b & 0xc0) == 64)
+        || a == 127
+        || (a == 169 && b == 254)
+        || (a == 172 && (b & 0xf0) == 16)
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
+        || (a == 192 && b == 168)
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || (a & 0xf0) == 224
+        || (a & 0xf0) == 240
+        || (a == 255 && b == 255 && c == 255 && d == 255))
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    let embedded_v4 =
+        if s[0..6] == [0, 0, 0, 0, 0, 0xffff] || s[0..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
+            Some(Ipv4Addr::new(
+                (s[6] >> 8) as u8,
+                s[6] as u8,
+                (s[7] >> 8) as u8,
+                s[7] as u8,
+            ))
+        } else if s[0] == 0x2002 {
+            Some(Ipv4Addr::new(
+                (s[1] >> 8) as u8,
+                s[1] as u8,
+                (s[2] >> 8) as u8,
+                s[2] as u8,
+            ))
+        } else {
+            None
+        };
+    if let Some(v4) = embedded_v4 {
+        return is_public_ipv4(v4);
+    }
+    !(s == [0, 0, 0, 0, 0, 0, 0, 0]
+        || s == [0, 0, 0, 0, 0, 0, 0, 1]
+        || (s[0] & 0xfe00) == 0xfc00
+        || (s[0] & 0xffc0) == 0xfe80
+        || (s[0] & 0xffc0) == 0xfec0
+        || (s[0] & 0xff00) == 0xff00
+        || s[0..4] == [0x0100, 0, 0, 0]
+        || (s[0] == 0x2001 && s[1] == 0x0db8)
+        || (s[0] == 0x2001 && (s[1] & 0xfe00) == 0))
 }
 
 async fn connect_tunnel_with_timeout(

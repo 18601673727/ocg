@@ -231,7 +231,7 @@ async fn exchange(
         },
     )?;
 
-    let credential = resolver.resolve(provider.credential_ref.as_deref())?;
+    let credential = resolver.resolve(provider.credential_ref.as_deref()).await?;
     let redactor = Redactor::new(credential.as_deref());
     let authorization = credential
         .as_deref()

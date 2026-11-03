@@ -139,12 +139,14 @@ pub(super) struct Shared {
     /// The natural keys of the commands whose commit had an unknown outcome,
     /// by operation, so [`DatabaseHandle::reconcile_operation`] can read them.
     pub(super) probes: std::sync::Mutex<std::collections::HashMap<OperationId, Option<Probe>>>,
-    pub(super) credentials_path: PathBuf,
-    pub(super) credentials: RwLock<std::collections::BTreeMap<String, String>>,
-    /// Serializes credential-store writers. It is taken on a blocking worker,
-    /// so its wait never ties up an async worker, and it orders the file
-    /// replacement with the in-memory publication it belongs to.
-    pub(super) credentials_writer: std::sync::Mutex<()>,
+    /// Commands admitted by `submit` and not yet executed or refused by the
+    /// write worker.
+    pub(super) in_flight_commands: AtomicUsize,
+    pub(super) credential_key: std::sync::OnceLock<Arc<redb::CredentialKey>>,
+    pub(super) credential_key_writer: std::sync::Mutex<()>,
+    pub(super) obsolete_credentials_at_open: Option<PathBuf>,
+    pub(super) undecryptable_credentials_at_open: u64,
+    pub(super) open_warnings_logged: AtomicBool,
 }
 
 /// Makes the staged commits of a group durable.
@@ -188,63 +190,27 @@ impl Shared {
         self.released.store(true, Ordering::SeqCst);
     }
 
-    /// Durably writes one credential and then publishes it. This runs on a
-    /// blocking worker: admission was checked before it was scheduled, the
-    /// staging file is created private and new, the file and its directory
-    /// are synced, and the rename replaces the store atomically. The map is
-    /// replaced only after the new file is durable, so a failed write leaves
-    /// the old credentials in force. [`Self::credentials_writer`] orders
-    /// concurrent writers, so the published map always matches the file.
-    pub(super) fn publish_credential(&self, reference: &str, secret: &str) -> Result<(), String> {
+    pub(super) fn credential_key(&self) -> Option<Arc<redb::CredentialKey>> {
+        self.credential_key.get().cloned()
+    }
+
+    pub(super) fn ensure_credential_key(&self) -> Result<Arc<redb::CredentialKey>, StorageError> {
+        if let Some(key) = self.credential_key.get() {
+            return Ok(key.clone());
+        }
         let _writer = self
-            .credentials_writer
+            .credential_key_writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let mut updated = self
-            .credentials
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        updated.insert(reference.to_owned(), secret.to_owned());
-        let serialized = serde_json::to_vec(&updated)
-            .map_err(|error| format!("failed to serialize credentials: {error}"))?;
-        let temp_path = self.credentials_path.with_extension(format!(
-            "json.{}.{}.tmp",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_nanos())
-        ));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(
-            &mut options,
-            rustix::fs::OFlags::NOFOLLOW.bits() as i32,
-        );
-        crate::system::data_directory::private_file(&mut options);
-        let mut file = options
-            .open(&temp_path)
-            .map_err(|error| format!("failed to open credential staging file: {error}"))?;
-        if let Err(error) = file.write_all(&serialized).and_then(|()| file.sync_all()) {
-            drop(file);
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(format!("failed to write credential staging file: {error}"));
+        if let Some(key) = self.credential_key.get() {
+            return Ok(key.clone());
         }
-        drop(file);
-        if let Err(error) = std::fs::rename(&temp_path, &self.credentials_path) {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(format!("failed to commit credential store: {error}"));
-        }
-        std::fs::File::open(&self.database_directory)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("failed to sync the credential directory: {error}"))?;
-        let _ = crate::system::data_directory::restrict_file(&self.credentials_path);
-        *self
-            .credentials
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = updated;
-        Ok(())
+        let key = match redb::load_credential_key(&self.database_directory)? {
+            Some(key) => key,
+            None => redb::create_credential_key(&self.database_directory)?,
+        };
+        let _ = self.credential_key.set(key.clone());
+        Ok(key)
     }
 }
 

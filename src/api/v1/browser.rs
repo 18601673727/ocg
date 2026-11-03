@@ -52,6 +52,8 @@ pub(super) const CSRF_HEADER: &str = "x-ocg-csrf";
 
 /// How long one session is authorized; a sign-in is explicit again after.
 const SESSION_LIFETIME: Duration = Duration::from_secs(8 * 60 * 60);
+/// The most live browser sessions kept at once.
+const MAX_SESSIONS: usize = 256;
 /// The most failed sign-ins before the pairing code is closed for the run.
 const MAX_PAIRING_FAILURES: usize = 10;
 /// The random bytes behind a session id, a CSRF token and the code.
@@ -97,6 +99,7 @@ pub(super) struct Session {
     /// The digest of its cookie value: how it is kept and removed.
     key: [u8; 32],
     expires_at_us: i64,
+    last_seen_us: Option<i64>,
 }
 
 /// Everything the listener holds about browser sign-in: one pairing code,
@@ -149,7 +152,9 @@ impl State {
         sessions.retain(|_, session| session.expires_at_us > now);
         // The key is the digest of the cookie value: a found entry is the
         // one session that value named.
-        sessions.get(&key).cloned()
+        let session = sessions.get_mut(&key)?;
+        session.last_seen_us = Some(now);
+        Some(session.clone())
     }
 
     /// Whether the request carries `session`'s CSRF token, once, in its
@@ -194,6 +199,7 @@ impl State {
             csrf,
             key: digest_key(id.as_bytes()),
             expires_at_us,
+            last_seen_us: None,
         };
         let cookie = format!(
             "{COOKIE}={id}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -201,6 +207,15 @@ impl State {
         );
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         sessions.retain(|_, session| session.expires_at_us > now);
+        while sessions.len() >= MAX_SESSIONS {
+            let Some((&evict, _)) = sessions
+                .iter()
+                .min_by_key(|(_, session)| (session.last_seen_us, session.expires_at_us))
+            else {
+                break;
+            };
+            sessions.remove(&evict);
+        }
         sessions.insert(session.key, session.clone());
         Ok(Reply::with_cookie(
             StatusCode::CREATED,

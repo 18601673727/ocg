@@ -1585,6 +1585,38 @@ pub(crate) fn read_configs(
     })
 }
 
+pub(crate) enum StoredCredential {
+    Absent,
+    Decrypted(CredentialSecret),
+    Undecryptable,
+}
+
+pub(crate) fn read_credential(
+    database: &Database,
+    reference: &str,
+    key: Option<&CredentialKey>,
+) -> Result<StoredCredential, StorageError> {
+    let rx = read(database)?;
+    let table = rx.open_table(CREDENTIALS)?;
+    let Some(bytes) = table.get(reference)? else {
+        return Ok(StoredCredential::Absent);
+    };
+    let Some(key) = key else {
+        decode_credential(reference, bytes.value())?;
+        return Ok(StoredCredential::Undecryptable);
+    };
+    match key.decrypt(reference, bytes.value())? {
+        Some(secret) => Ok(StoredCredential::Decrypted(secret)),
+        None => Ok(StoredCredential::Undecryptable),
+    }
+}
+
+pub(crate) fn credential_count(database: &Database) -> Result<u64, StorageError> {
+    use ::redb::ReadableTableMetadata;
+    let rx = read(database)?;
+    Ok(rx.open_table(CREDENTIALS)?.len()?)
+}
+
 /// One bounded page of active Model, Agent and Pool configs before `before`,
 /// plus point reads of the Connections those Models name. Pool protocol offers
 /// travel in the same catalog scan; compatibility is joined after paging.
@@ -1592,11 +1624,13 @@ pub(crate) fn read_configs(
 pub(crate) struct ProfilePageRecords {
     pub records: Vec<ConfigRecord>,
     pub connections: BTreeMap<ConfigId, (String, ConnectionConfig, bool)>,
+    pub credentials: BTreeSet<String>,
     pub next_before: Option<ConfigId>,
 }
 
 pub(crate) fn read_profile_page(
     database: &Database,
+    key: Option<&CredentialKey>,
     before: Option<ConfigId>,
     limit: usize,
     scan: usize,
@@ -1663,9 +1697,21 @@ pub(crate) fn read_profile_page(
             connections.insert(connection_id, (row.name, connection, row.discovery_visible));
         }
     }
+    let mut credentials = BTreeSet::new();
+    if let Some(key) = key {
+        let table = rx.open_table(CREDENTIALS)?;
+        for entry in table.iter()? {
+            let (reference, bytes) = entry?;
+            let reference = reference.value();
+            if key.decrypt(reference, bytes.value())?.is_some() {
+                credentials.insert(reference.to_owned());
+            }
+        }
+    }
     Ok(ProfilePageRecords {
         records,
         connections,
+        credentials,
         next_before,
     })
 }

@@ -39,6 +39,23 @@ impl Control {
     }
 }
 
+/// Tracks an admitted command from `submit` until the write worker has either
+/// executed it (under `database.read`) or refused it.
+pub(super) struct InFlightCommand(Arc<Shared>);
+
+impl InFlightCommand {
+    pub(super) fn new(shared: Arc<Shared>) -> Self {
+        shared.in_flight_commands.fetch_add(1, Ordering::SeqCst);
+        Self(shared)
+    }
+}
+
+impl Drop for InFlightCommand {
+    fn drop(&mut self) {
+        self.0.in_flight_commands.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// An admitted command with its execution mark, which the worker sets before
 /// the command touches storage. The submitter keeps the other reference, so
 /// when the reply is lost it can tell a command that never began from one
@@ -47,6 +64,7 @@ pub(super) struct Envelope {
     pub(super) operation: OperationId,
     pub(super) started: Arc<AtomicBool>,
     pub(super) command: Command,
+    pub(super) in_flight: InFlightCommand,
 }
 
 pub(super) struct Command {

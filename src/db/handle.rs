@@ -76,6 +76,10 @@ fn model_profile_save_bytes(save: &mutations::ModelProfileSave) -> u64 {
             .saturating_add(byte_count(declared_capabilities.len()).saturating_mul(8))
             .saturating_add(2048),
     };
+    let secret_bytes = save
+        .secret
+        .as_ref()
+        .map_or(0, |secret| byte_count(secret.as_str().len()));
     byte_count(save.name.len())
         .saturating_add(byte_count(save.connection_name.len()))
         .saturating_add(
@@ -84,6 +88,7 @@ fn model_profile_save_bytes(save: &mutations::ModelProfileSave) -> u64 {
                 .map_or(0, |endpoint| byte_count(endpoint.len())),
         )
         .saturating_add(credential_ref_bytes)
+        .saturating_add(secret_bytes)
         .saturating_add(definition_bytes)
         .saturating_add(4096)
 }
@@ -375,8 +380,27 @@ impl DatabaseHandle {
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
         let (pending, ready, delayed, running) =
             redb::queue_counts(&opened.database, true).map_err(DatabaseError::Read)?;
-        if pending != 0 || ready != 0 || delayed != 0 || running != 0 || !self.sender.is_empty() {
+        if pending != 0
+            || ready != 0
+            || delayed != 0
+            || running != 0
+            || !self.sender.is_empty()
+            || self.shared.in_flight_commands.load(Ordering::SeqCst) != 0
+        {
             return Ok(None);
+        }
+        for (job, standing) in redb::stop_standings(
+            &opened.database,
+            &crate::system::executor::blocking::unconfirmed_stops(),
+        )
+        .map_err(DatabaseError::Read)?
+        {
+            match standing {
+                redb::StopStanding::Settled => {
+                    crate::system::executor::blocking::stop_settled(job);
+                }
+                redb::StopStanding::Open | redb::StopStanding::Unconfirmed => {}
+            }
         }
         if crate::system::executor::blocking::groups_tracked() {
             return Ok(None);
@@ -410,6 +434,7 @@ impl DatabaseHandle {
                 operation,
                 started: started.clone(),
                 command: command(reply),
+                in_flight: InFlightCommand::new(self.shared.clone()),
             };
             self.sender
                 .try_send(Message::Run(Box::new(envelope)))
@@ -1201,8 +1226,11 @@ impl DatabaseHandle {
         limit: usize,
         scan: usize,
     ) -> Result<redb::ProfilePageRecords, DatabaseError> {
-        self.read(move |database| redb::read_profile_page(database, before, limit, scan))
-            .await
+        let key = self.shared.credential_key();
+        self.read(move |database| {
+            redb::read_profile_page(database, key.as_deref(), before, limit, scan)
+        })
+        .await
     }
 
     /// Creates a Connection, Model, Agent or Pool config. Its references must
@@ -1255,8 +1283,12 @@ impl DatabaseHandle {
     /// Connection and any required LLM Executor in the same write batch.
     pub(crate) async fn save_model_profile(
         &self,
-        save: mutations::ModelProfileSave,
+        mut save: mutations::ModelProfileSave,
     ) -> Result<(ConfigId, Option<String>), DatabaseError> {
+        if let Some(secret) = save.secret.clone() {
+            let key = self.ensure_credential_key().await?;
+            save.credential = Some(mutations::CredentialPayload { secret, key });
+        }
         let kind = if save.existing_id.is_some() {
             OperationKind::UpdateProfile
         } else {
@@ -1301,28 +1333,51 @@ impl DatabaseHandle {
     }
 
     /// Imports missing models and their Provider connection in one transaction.
-    pub async fn import_models(
+    pub(crate) async fn import_models(
         &self,
-        connection: Config,
-        models: Vec<crate::db::entities::DiscoveredModel>,
-        capabilities: std::collections::BTreeSet<crate::db::entities::ModelCapability>,
+        mut save: mutations::ImportModelsSave,
     ) -> Result<(Vec<ConfigId>, usize), DatabaseError> {
+        if let Some(secret) = save.secret.clone() {
+            let key = self.ensure_credential_key().await?;
+            save.credential = Some(mutations::CredentialPayload { secret, key });
+        }
         self.submit(|reply| {
             Command::new(
-                (connection, models, capabilities),
+                (save,),
                 reply,
-                |(connection, models, _)| {
-                    let base = match &connection.body {
-                        ConfigBody::Connection(body) => text_bytes(&body.endpoint)
-                            .saturating_add(text_bytes(&body.credential_ref)),
+                |(save,)| {
+                    let ref_bytes = match &save.credential_ref {
+                        mutations::ProfileCredentialRef::Preserve => match &save.connection.body {
+                            ConfigBody::Connection(body) => text_bytes(&body.credential_ref),
+                            ConfigBody::Model(_)
+                            | ConfigBody::Agent(_)
+                            | ConfigBody::Pool(_)
+                            | ConfigBody::DecisionModel(_)
+                            | ConfigBody::DecisionAgent(_) => 0,
+                        },
+                        mutations::ProfileCredentialRef::Clear => 0,
+                        mutations::ProfileCredentialRef::Explicit(reference)
+                        | mutations::ProfileCredentialRef::PreserveOrGenerate(reference) => {
+                            byte_count(reference.len())
+                        }
+                    };
+                    let endpoint_bytes = match &save.connection.body {
+                        ConfigBody::Connection(body) => text_bytes(&body.endpoint),
                         ConfigBody::Model(_)
                         | ConfigBody::Agent(_)
                         | ConfigBody::Pool(_)
                         | ConfigBody::DecisionModel(_)
                         | ConfigBody::DecisionAgent(_) => 0,
                     };
-                    models.iter().fold(
-                        base.saturating_add(byte_count(connection.name.len())),
+                    let secret_bytes = save
+                        .secret
+                        .as_ref()
+                        .map_or(0, |secret| byte_count(secret.as_str().len()));
+                    let base = endpoint_bytes
+                        .saturating_add(ref_bytes)
+                        .saturating_add(secret_bytes);
+                    save.models.iter().fold(
+                        base.saturating_add(byte_count(save.connection.name.len())),
                         |bytes, model| {
                             bytes
                                 .saturating_add(byte_count(model.id.len()))
@@ -1332,9 +1387,7 @@ impl DatabaseHandle {
                     )
                 },
                 OperationKind::CreateProfile,
-                |(connection, models, capabilities), batch| {
-                    mutations::import_models(batch, connection, models, capabilities)
-                },
+                |(save,), batch| mutations::import_models(batch, save),
             )
         })
         .await
@@ -2789,18 +2842,9 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn set_credential(&self, reference: &str, secret: &str) -> Result<(), String> {
-        let reference = reference.trim().to_owned();
-        let secret = secret.trim().to_owned();
-        if reference.is_empty() || reference.len() > 128 || reference.chars().any(char::is_control)
-        {
-            return Err("credential reference must be 1..=128 non-control bytes".to_string());
-        }
-        if secret.is_empty() || secret.len() > 4096 {
-            return Err("credential secret must be 1..=4096 bytes".to_string());
-        }
-        if ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err() {
-            return Err("credential secret is not a valid HTTP Bearer token".to_string());
+    async fn ensure_credential_key(&self) -> Result<Arc<redb::CredentialKey>, DatabaseError> {
+        if let Some(key) = self.shared.credential_key() {
+            return Ok(key);
         }
         {
             let admission = self
@@ -2808,62 +2852,81 @@ impl DatabaseHandle {
                 .admission
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            admitted(&admission).map_err(|error| error.to_string())?;
+            admitted(&admission)?;
+            if self.shared.update_paused.load(Ordering::SeqCst) {
+                return Err(DatabaseError::ShuttingDown);
+            }
         }
         let shared = self.shared.clone();
-
-        ntex::rt::spawn_blocking(move || shared.publish_credential(&reference, &secret))
+        ntex::rt::spawn_blocking(move || shared.ensure_credential_key())
             .await
-            .map_err(|error| format!("credential writer failed: {error}"))?
+            .map_err(|_| DatabaseError::WorkerPanicked)?
+            .map_err(DatabaseError::RolledBack)
     }
 
-    pub fn has_credential(&self, reference: &str) -> bool {
+    pub(crate) async fn resolve_credential(
+        &self,
+        reference: &str,
+    ) -> Result<Option<String>, crate::service::ai::providers::ProviderExecutionError> {
+        use crate::service::ai::providers::{
+            CredentialResolver, EnvironmentCredentialResolver, ProviderExecutionError,
+        };
         let reference = reference.trim();
         if reference.is_empty() {
-            return false;
+            return Ok(None);
         }
-        let in_store = self
-            .shared
-            .credentials
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(reference)
-            .is_some_and(|secret| !secret.is_empty());
-        in_store || std::env::var_os(reference).is_some_and(|value| !value.is_empty())
+        let name = reference.to_owned();
+        let key = self.shared.credential_key();
+        let stored = self
+            .read(move |database| redb::read_credential(database, &name, key.as_deref()))
+            .await
+            .map_err(|error| ProviderExecutionError::Build {
+                message: format!("credential store could not be read: {error}"),
+            })?;
+        match stored {
+            redb::StoredCredential::Decrypted(secret) => Ok(Some(secret.into_inner())),
+            redb::StoredCredential::Undecryptable => Err(ProviderExecutionError::Build {
+                message: "stored credential cannot be decrypted; enter the key again".to_owned(),
+            }),
+            redb::StoredCredential::Absent => {
+                EnvironmentCredentialResolver.resolve(Some(reference)).await
+            }
+        }
     }
 
     pub fn credential_resolver(
         &self,
     ) -> Arc<dyn crate::service::ai::providers::CredentialResolver> {
         Arc::new(LocalCredentialResolver {
-            shared: self.shared.clone(),
+            database: self.clone(),
         })
     }
 }
 
 struct LocalCredentialResolver {
-    shared: Arc<Shared>,
+    database: DatabaseHandle,
 }
 
 impl crate::service::ai::providers::CredentialResolver for LocalCredentialResolver {
-    fn resolve(
-        &self,
-        credential_ref: Option<&str>,
-    ) -> Result<Option<String>, crate::service::ai::providers::ProviderExecutionError> {
-        let Some(name) = credential_ref else {
-            return Ok(None);
-        };
-        if let Some(secret) = self
-            .shared
-            .credentials
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
-            .filter(|secret| !secret.is_empty())
-            .cloned()
-        {
-            return Ok(Some(secret));
-        }
-        crate::service::ai::providers::EnvironmentCredentialResolver.resolve(Some(name))
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<String>,
+                        crate::service::ai::providers::ProviderExecutionError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let Some(name) = credential_ref else {
+                return Ok(None);
+            };
+            self.database.resolve_credential(name).await
+        })
     }
 }

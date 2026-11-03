@@ -247,6 +247,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(CONTENT_REFERENCES)?;
     tx.open_table(CONTENT_RECLAIM)?;
     tx.open_table(CONFIGS)?;
+    tx.open_table(CREDENTIALS)?;
     tx.open_table(JOBS)?;
     tx.open_table(JOB_ALLOCATIONS)?;
     tx.open_table(CONVERSATIONS)?;
@@ -607,6 +608,7 @@ pub(crate) enum MigrationFormat {
     UnmarkedCurrent,
     Format15,
     Format16,
+    Format17,
     Current,
 }
 
@@ -614,17 +616,18 @@ impl MigrationFormat {
     /// Whether configuration rows already use the current record encoding.
     fn has_current_configs(self) -> bool {
         match self {
-            Self::Format16 | Self::Current => true,
+            Self::Format16 | Self::Format17 | Self::Current => true,
             Self::Legacy | Self::UnmarkedCurrent | Self::Format15 => false,
         }
     }
 
     /// The format whose configuration comparison applies to the migrated
-    /// database: Format 16 rows are copied verbatim, older ones are upgraded
-    /// with default flags.
+    /// database: Format 16 and Format 17 rows are copied verbatim, older ones
+    /// are upgraded with default flags.
     pub(crate) fn migrated_snapshot_format(self) -> Self {
         match self {
             Self::Format16 => Self::Format16,
+            Self::Format17 => Self::Format17,
             Self::Legacy | Self::UnmarkedCurrent | Self::Format15 | Self::Current => Self::Current,
         }
     }
@@ -680,6 +683,7 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
         Some(value) if value == DATABASE_FORMAT_VERSION.to_le_bytes() && !legacy => {
             MigrationFormat::Current
         }
+        Some(value) if value == 17u64.to_le_bytes() && !legacy => MigrationFormat::Format17,
         Some(value) if value == 16u64.to_le_bytes() && !legacy => MigrationFormat::Format16,
         Some(value) if value == 15u64.to_le_bytes() && !legacy => MigrationFormat::Format15,
         None if legacy => MigrationFormat::Legacy,
@@ -742,6 +746,9 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
     );
     match format {
         MigrationFormat::Current => {
+            check_tables!(CREDENTIALS, SUCCESSORS, USER_INPUT_AT, USAGE_MODEL);
+        }
+        MigrationFormat::Format17 => {
             check_tables!(SUCCESSORS, USER_INPUT_AT, USAGE_MODEL);
         }
         MigrationFormat::Format16
@@ -786,6 +793,9 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
     headers!(CONFIGS => 1, JOBS => 2, JOB_STATES => 3, JOB_OUTPUTS => 4, SUBMISSIONS => 5,
         ATTACHMENTS => 6, TOOL_CALLS => 7, REQUEST_EVENTS => 8, PROJECTS => 9,
         JOB_CONTROLS => 10, JOB_INPUTS => 11, NOTICES => 12, RECURRENCES => 13, APPROVALS => 15);
+    if format == MigrationFormat::Current {
+        headers!(CREDENTIALS => codec::TAG_CREDENTIAL);
+    }
     let settings = meta
         .get("compaction_settings")?
         .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
@@ -841,6 +851,11 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
     decode_rows!(NOTICES, |_key, bytes| Notice::decode(bytes));
     decode_rows!(APPROVALS, |_key, bytes| ApprovalRecord::decode(bytes));
     decode_rows!(RECURRENCES, |_key, bytes| Recurrence::decode(bytes));
+    if format == MigrationFormat::Current {
+        decode_rows!(CREDENTIALS, |key, bytes| rows::decode_credential(
+            key, bytes
+        ));
+    }
     Ok(format)
 }
 
@@ -897,9 +912,9 @@ fn migration_config_fingerprint(
         let (key, value) = row?;
         let id = key.value();
         let bytes = match format {
-            // Format 16 rows already carry their flag byte; every value is
-            // authoritative, so the row is compared exactly as stored.
-            MigrationFormat::Format16 => value.value().to_vec(),
+            // Format 16 and Format 17 rows already carry their flag byte; every
+            // value is authoritative, so the row is compared exactly as stored.
+            MigrationFormat::Format16 | MigrationFormat::Format17 => value.value().to_vec(),
             MigrationFormat::Current => {
                 let mut bytes = value.value().to_vec();
                 if matches!(bytes.get(18), Some(1 | 2)) && bytes.pop() != Some(1) {
@@ -978,10 +993,94 @@ pub(crate) fn migration_snapshot(
     authoritative_snapshot(&source.0.begin_read()?, format)
 }
 
+pub(crate) fn parse_migration_credentials(
+    path: &Path,
+) -> Result<Option<BTreeMap<String, CredentialSecret>>, StorageError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StorageError::from(::redb::Error::Io(error))),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(StorageError::corrupted(
+            "credentials.json is not a regular file",
+        ));
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|error| StorageError::from(::redb::Error::Io(error)))?;
+    let parsed: BTreeMap<String, String> = serde_json::from_str(&raw)
+        .map_err(|_| StorageError::corrupted("invalid credentials.json"))?;
+    let mut entries = BTreeMap::new();
+    for (reference, secret) in parsed {
+        let secret = secret.trim();
+        if !rows::valid_credential_ref(&reference) {
+            return Err(StorageError::corrupted("invalid credentials.json"));
+        }
+        let secret = CredentialSecret::new(secret.to_owned())
+            .map_err(|_| StorageError::corrupted("invalid credentials.json"))?;
+        entries.insert(reference, secret);
+    }
+    Ok(Some(entries))
+}
+
+pub(crate) fn migration_credentials_digest(
+    entries: Option<&BTreeMap<String, CredentialSecret>>,
+) -> Result<[u8; 32], StorageError> {
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    if let Some(entries) = entries {
+        for (reference, secret) in entries {
+            for bytes in [reference.as_bytes(), secret.as_str().as_bytes()] {
+                hash.update(&(bytes.len() as u64).to_le_bytes());
+                hash.update(bytes);
+            }
+        }
+    }
+    hash.finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid digest"))
+}
+
+fn decrypted_credentials_digest(
+    tx: &impl TxRead,
+    key: Option<&CredentialKey>,
+) -> Result<[u8; 32], StorageError> {
+    let table = tx.table(CREDENTIALS)?;
+    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    for row in table.iter()? {
+        let (reference, value) = row?;
+        let reference = reference.value();
+        let key =
+            key.ok_or_else(|| StorageError::corrupted("missing credential encryption key"))?;
+        let secret = key
+            .decrypt(reference, value.value())?
+            .ok_or_else(|| StorageError::corrupted("migrated credential key id mismatch"))?;
+        for bytes in [reference.as_bytes(), secret.as_str().as_bytes()] {
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+    }
+    hash.finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid digest"))
+}
+
+pub(crate) fn migration_verify_credentials(
+    source: &MigrationSource,
+    key: Option<&CredentialKey>,
+    expected: &[u8; 32],
+) -> Result<bool, StorageError> {
+    Ok(&decrypted_credentials_digest(&source.0.begin_read()?, key)? == expected)
+}
+
 pub(crate) fn migration_apply(
     path: &Path,
     format: MigrationFormat,
     expected: &[[u8; 32]],
+    credentials: Option<&BTreeMap<String, CredentialSecret>>,
+    credential_key: Option<&CredentialKey>,
+    expected_credentials: &[u8; 32],
 ) -> Result<(), StorageError> {
     let db = Database::open(path)?;
     let mut tx = db.begin_write()?;
@@ -990,6 +1089,9 @@ pub(crate) fn migration_apply(
         return Err(StorageError::corrupted(
             "copied authoritative records differ",
         ));
+    }
+    if credentials.is_some() != credential_key.is_some() {
+        return Err(StorageError::corrupted("credential migration key mismatch"));
     }
     match format {
         MigrationFormat::Legacy => {
@@ -1000,7 +1102,8 @@ pub(crate) fn migration_apply(
         }
         MigrationFormat::UnmarkedCurrent
         | MigrationFormat::Format15
-        | MigrationFormat::Format16 => {}
+        | MigrationFormat::Format16
+        | MigrationFormat::Format17 => {}
         MigrationFormat::Current => return Err(unsupported_format("database is already current")),
     }
     if !format.has_current_configs() {
@@ -1029,15 +1132,26 @@ pub(crate) fn migration_apply(
             }
         }
     }
-    for removed in [
-        tx.delete_table(F16_HEAD_TABLE)?,
-        tx.delete_table(F16_ATTACHMENT_USE)?,
-        tx.delete_table(F16_SCOPE_TABLE)?,
-        tx.delete_table(F16_SUCCESSOR)?,
-        tx.delete_table(F16_USER_INPUT)?,
-    ] {
-        if !removed {
-            return Err(StorageError::corrupted("replaced derived table missing"));
+    if format != MigrationFormat::Format17 {
+        for removed in [
+            tx.delete_table(F16_HEAD_TABLE)?,
+            tx.delete_table(F16_ATTACHMENT_USE)?,
+            tx.delete_table(F16_SCOPE_TABLE)?,
+            tx.delete_table(F16_SUCCESSOR)?,
+            tx.delete_table(F16_USER_INPUT)?,
+        ] {
+            if !removed {
+                return Err(StorageError::corrupted("replaced derived table missing"));
+            }
+        }
+    }
+    {
+        let mut table = tx.open_table(CREDENTIALS)?;
+        if let (Some(entries), Some(key)) = (credentials, credential_key) {
+            for (reference, secret) in entries {
+                let encrypted = key.encrypt(reference, secret)?;
+                table.insert(reference.as_str(), encrypted.as_slice())?;
+            }
         }
     }
     indexes::rebuild(&tx, promotion_clock())?;
@@ -1047,6 +1161,11 @@ pub(crate) fn migration_apply(
     if authoritative_snapshot(&tx, format.migrated_snapshot_format())? != expected {
         return Err(StorageError::corrupted(
             "authoritative records changed during migration",
+        ));
+    }
+    if &decrypted_credentials_digest(&tx, credential_key)? != expected_credentials {
+        return Err(StorageError::corrupted(
+            "migrated credentials differ from source",
         ));
     }
     {

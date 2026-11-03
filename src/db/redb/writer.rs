@@ -1,8 +1,8 @@
 use super::rows::{decode_request_event, encode_request_event};
 use super::*;
 use crate::db::entities::{
-    AttachmentId, Config, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, DecisionModelConfig,
-    JobId, ModelConfig, OutputKind, PoolConfig, ProjectId, ProjectRecord, RequestEventRecord,
+    AttachmentId, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, DecisionModelConfig, JobId,
+    ModelConfig, OutputKind, PoolConfig, ProjectId, ProjectRecord, RequestEventRecord,
     RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, ToolCallRef,
     ToolEvidenceRecord, Violation,
 };
@@ -594,66 +594,24 @@ impl Batch {
         let prior_credential_ref = previous_connection
             .as_ref()
             .and_then(|(_, connection)| connection.credential_ref.clone());
-        let generated_base = match &save.credential_ref {
-            ProfileCredentialRef::PreserveOrGenerate(base) if prior_credential_ref.is_none() => {
-                Some(base.as_str())
-            }
-            ProfileCredentialRef::PreserveOrGenerate(_)
-            | ProfileCredentialRef::Preserve
-            | ProfileCredentialRef::Clear
-            | ProfileCredentialRef::Explicit(_) => None,
-        };
-
-        let generated_refs = self.step(|tx| {
-            let mut generated_refs = (false, std::collections::BTreeSet::new());
-            let table = tx.open_table(CONFIGS)?;
-            for entry in table.iter()? {
-                let (key, bytes) = entry?;
-                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
-                if let ConfigBody::Connection(connection) = &row.body
-                    && let Some(base) = generated_base
-                    && let Some(reference) = connection.credential_ref.as_deref()
-                {
-                    if reference == base {
-                        generated_refs.0 = true;
-                    } else if let Some(suffix) = reference
-                        .strip_prefix(base)
-                        .and_then(|value| value.strip_prefix('_'))
-                        && let Ok(number) = suffix.parse::<u64>()
-                        && number.to_string() == suffix
-                    {
-                        generated_refs.1.insert(number);
-                    }
-                }
-            }
-            Ok(generated_refs)
-        })?;
-
         let credential_ref = match save.credential_ref {
             ProfileCredentialRef::Preserve => prior_credential_ref,
             ProfileCredentialRef::Clear => None,
             ProfileCredentialRef::Explicit(reference) => Some(reference),
             ProfileCredentialRef::PreserveOrGenerate(base) => match prior_credential_ref {
                 Some(reference) => Some(reference),
-                None => {
-                    let reference = if !generated_refs.0 {
-                        base
-                    } else {
-                        let mut suffix = 2u64;
-                        while generated_refs.1.contains(&suffix) {
-                            suffix = suffix.checked_add(1).ok_or({
-                                BatchError(Failure::Rejected(Violation::InvalidValue(
-                                    "credential_ref",
-                                    "could not allocate a unique reference",
-                                )))
-                            })?;
-                        }
-                        format!("{base}_{suffix}")
-                    };
-                    Some(reference)
-                }
+                None => Some(self.allocate_credential_ref(&base)?),
             },
         };
+        if let Some(credential) = &save.credential {
+            let Some(reference) = credential_ref.as_deref() else {
+                return self.reject(Violation::InvalidValue(
+                    "credential_ref",
+                    "credential secret requires a reference",
+                ));
+            };
+            self.write_credential(reference, credential)?;
+        }
 
         if matches!(&save.definition, ModelProfileDefinition::Llm { .. }) {
             self.ensure_llm_executor(protocol)?;
@@ -737,7 +695,128 @@ impl Batch {
             }
             None => self.create_config(save.name, body)?,
         };
+        self.purge_unused_credentials()?;
         Ok((profile_id, credential_ref))
+    }
+
+    fn allocate_credential_ref(&mut self, base: &str) -> Result<String, BatchError> {
+        let (base_taken, suffixes) = self.step(|tx| {
+            let mut base_taken = false;
+            let mut suffixes = std::collections::BTreeSet::new();
+            let mut record = |reference: &str| {
+                if reference == base {
+                    base_taken = true;
+                } else if let Some(suffix) = reference
+                    .strip_prefix(base)
+                    .and_then(|value| value.strip_prefix('_'))
+                    && let Ok(number) = suffix.parse::<u64>()
+                    && number.to_string() == suffix
+                {
+                    suffixes.insert(number);
+                }
+            };
+            let table = tx.open_table(CONFIGS)?;
+            for entry in table.iter()? {
+                let (key, bytes) = entry?;
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+                if let ConfigBody::Connection(connection) = &row.body
+                    && let Some(reference) = connection.credential_ref.as_deref()
+                {
+                    record(reference);
+                }
+            }
+            for entry in tx.open_table(CREDENTIALS)?.iter()? {
+                let (key, _) = entry?;
+                record(key.value());
+            }
+            Ok((base_taken, suffixes))
+        })?;
+        if !base_taken {
+            return Ok(base.to_owned());
+        }
+        let mut suffix = 2u64;
+        while suffixes.contains(&suffix) {
+            suffix = suffix.checked_add(1).ok_or({
+                BatchError(Failure::Rejected(Violation::InvalidValue(
+                    "credential_ref",
+                    "could not allocate a unique reference",
+                )))
+            })?;
+        }
+        Ok(format!("{base}_{suffix}"))
+    }
+
+    fn write_credential(
+        &mut self,
+        reference: &str,
+        credential: &crate::db::mutations::CredentialPayload,
+    ) -> Result<(), BatchError> {
+        if !valid_credential_ref(reference) {
+            return self.reject(Violation::InvalidValue(
+                "credential_ref",
+                "must be 1..=128 non-control bytes",
+            ));
+        }
+        self.step(|tx| {
+            let encrypted = credential.key.encrypt(reference, &credential.secret)?;
+            tx.open_table(CREDENTIALS)?
+                .insert(reference, encrypted.as_slice())?;
+            Ok(())
+        })
+    }
+
+    /// Deletes every `credential` row whose reference no non-archived `Model`
+    /// or `DecisionModel` Profile uses through its `Connection`.
+    ///
+    /// This is the one authoritative row OCG deletes, on purpose: a secret
+    /// must not outlive its use, while the `Connection` config keeps the
+    /// reference for blame. Jobs already queued or running froze their
+    /// `credential_ref` in `service/jobs/configuration.rs`; after a purge they
+    /// fall back to the environment variable or fail as missing, which is
+    /// intended so a removed key stops working.
+    fn purge_unused_credentials(&mut self) -> Result<(), BatchError> {
+        self.step(|tx| {
+            let mut connection_refs = std::collections::BTreeMap::new();
+            let mut live_connections = std::collections::BTreeSet::new();
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, bytes) = entry?;
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+                match &row.body {
+                    ConfigBody::Connection(connection) => {
+                        if let Some(reference) = connection.credential_ref.as_ref() {
+                            connection_refs.insert(row.id, reference.clone());
+                        }
+                    }
+                    ConfigBody::Model(model) if row.archived_at.is_none() => {
+                        live_connections.insert(model.connection_id);
+                    }
+                    ConfigBody::DecisionModel(model) if row.archived_at.is_none() => {
+                        live_connections.insert(model.connection_id);
+                    }
+                    ConfigBody::Model(_)
+                    | ConfigBody::DecisionModel(_)
+                    | ConfigBody::Agent(_)
+                    | ConfigBody::DecisionAgent(_)
+                    | ConfigBody::Pool(_) => {}
+                }
+            }
+            let used_refs: std::collections::BTreeSet<&str> = live_connections
+                .iter()
+                .filter_map(|id| connection_refs.get(id).map(String::as_str))
+                .collect();
+            let mut credentials = tx.open_table(CREDENTIALS)?;
+            let unused: Vec<String> = credentials
+                .iter()?
+                .map(|entry| entry.map(|(key, _)| key.value().to_owned()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|reference| !used_refs.contains(reference.as_str()))
+                .collect();
+            for reference in unused {
+                credentials.remove(reference.as_str())?;
+            }
+            Ok(())
+        })
     }
 
     fn ensure_llm_executor(&mut self, protocol: LlmTransport) -> Result<(), BatchError> {
@@ -1101,17 +1180,41 @@ impl Batch {
 
     pub(crate) fn import_models(
         &mut self,
-        connection: Config,
-        models: Vec<crate::db::entities::DiscoveredModel>,
-        capabilities: std::collections::BTreeSet<crate::db::entities::ModelCapability>,
+        save: crate::db::mutations::ImportModelsSave,
     ) -> Result<(Vec<ConfigId>, usize), BatchError> {
         use crate::db::entities::{LlmParameters, ModelConfig};
-        let ConfigBody::Connection(wanted) = &connection.body else {
+        use crate::db::mutations::ProfileCredentialRef;
+        let crate::db::mutations::ImportModelsSave {
+            mut connection,
+            credential_ref,
+            secret: _,
+            credential,
+            models,
+            capabilities,
+        } = save;
+        let resolved_ref = match credential_ref {
+            ProfileCredentialRef::Preserve => match &connection.body {
+                ConfigBody::Connection(wanted) => wanted.credential_ref.clone(),
+                ConfigBody::Model(_)
+                | ConfigBody::Agent(_)
+                | ConfigBody::Pool(_)
+                | ConfigBody::DecisionModel(_)
+                | ConfigBody::DecisionAgent(_) => None,
+            },
+            ProfileCredentialRef::Clear => None,
+            ProfileCredentialRef::Explicit(reference) => Some(reference),
+            ProfileCredentialRef::PreserveOrGenerate(base) => {
+                Some(self.allocate_credential_ref(&base)?)
+            }
+        };
+        let ConfigBody::Connection(wanted) = &mut connection.body else {
             return self.reject(Violation::InvalidValue(
                 "connection",
                 "must be a Connection",
             ));
         };
+        wanted.credential_ref = resolved_ref;
+        let wanted = wanted.clone();
         let wanted_protocol = wanted.protocol;
         if models.is_empty() || models.len() > 200 || capabilities.is_empty() {
             return self.reject(Violation::InvalidValue(
@@ -1119,12 +1222,21 @@ impl Batch {
                 "select 1 to 200 models with capabilities",
             ));
         }
+        if let Some(credential) = &credential {
+            let Some(reference) = wanted.credential_ref.as_deref() else {
+                return self.reject(Violation::InvalidValue(
+                    "credential_ref",
+                    "credential secret requires a reference",
+                ));
+            };
+            self.write_credential(reference, credential)?;
+        }
         let existing = self.step(|tx| {
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
                 let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none()
-                    && matches!(&row.body, ConfigBody::Connection(body) if body == wanted)
+                    && matches!(&row.body, ConfigBody::Connection(body) if body == &wanted)
                 {
                     return Ok(Some(row.id));
                 }
@@ -1209,6 +1321,7 @@ impl Batch {
             };
             ids.push(id);
         }
+        self.purge_unused_credentials()?;
         Ok((ids, created))
     }
 
@@ -1285,7 +1398,7 @@ impl Batch {
 
     fn archive_models(&mut self, rows: Vec<ConfigRow>) -> Result<(), BatchError> {
         if rows.is_empty() {
-            return Ok(());
+            return self.purge_unused_credentials();
         }
         let ids: BTreeSet<_> = rows.iter().map(|row| row.id).collect();
         let agents = self.step(|tx| {
@@ -1427,6 +1540,7 @@ impl Batch {
             row.edit_seq += 1;
             self.put_config(&row)?;
         }
+        self.purge_unused_credentials()?;
         Ok(())
     }
 

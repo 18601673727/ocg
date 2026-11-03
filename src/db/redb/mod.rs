@@ -59,7 +59,9 @@ mod reader;
 mod recovery;
 pub(crate) use recovery::reclaim_pending;
 pub(crate) use recovery::{
-    MigrationFormat, migration_apply, migration_inspect, migration_snapshot, migration_source,
+    MigrationFormat, migration_apply, migration_credentials_digest, migration_inspect,
+    migration_snapshot, migration_source, migration_verify_credentials,
+    parse_migration_credentials,
 };
 mod recurrences;
 mod rows;
@@ -101,7 +103,6 @@ use reader::read;
 use recovery::allocate;
 pub(crate) use recovery::{OpenedFile, database_file, open};
 
-pub(crate) use reader::ProfilePageRecords;
 pub(crate) use reader::{
     ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage, read_approved_calls,
     read_cards, read_conversation_children, read_has_decider, read_has_pending_approvals,
@@ -124,16 +125,22 @@ pub(crate) use reader::{
     ConversationTurnPage, TurnContext, read_conversation_limits, read_conversation_turn_page,
     read_conversation_turns, read_notices, read_turn_context, read_turn_execution,
 };
+pub(crate) use reader::{ProfilePageRecords, StoredCredential, credential_count, read_credential};
 
 pub(crate) use crate::db::entities::{JobControl, JobSpec, JobState};
-pub(crate) use rows::{ConfigRow, usage_agent};
+pub(crate) use rows::{
+    ConfigRow, CredentialKey, CredentialSecret, create_credential_key, load_credential_key,
+    usage_agent, valid_credential_ref,
+};
 use rows::{
-    decode_attachment, decode_output, decode_project, decode_project_root, decode_submission,
-    decode_tool_evidence, encode_attachment, encode_output, encode_project, encode_submission,
-    encode_tool_evidence, job_tool_evidence, tool_call_key, tool_call_ref,
+    decode_attachment, decode_credential, decode_output, decode_project, decode_project_root,
+    decode_submission, decode_tool_evidence, encode_attachment, encode_output, encode_project,
+    encode_submission, encode_tool_evidence, job_tool_evidence, tool_call_key, tool_call_ref,
 };
 use schema::*;
-pub(crate) use schema::{CACHE_BYTES, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE};
+pub(crate) use schema::{
+    CACHE_BYTES, CREDENTIAL_KEY_FILE_NAME, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE,
+};
 
 // ---- storage errors -------------------------------------------------------------
 

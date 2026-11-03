@@ -236,14 +236,30 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                let credentials_path = directory.join("credentials.json");
-                let credentials = match load_credentials_file(&credentials_path) {
-                    Ok(credentials) => credentials,
+                let obsolete_credentials_at_open = Some(directory.join("credentials.json"))
+                    .filter(|path| std::fs::symlink_metadata(path).is_ok());
+                let credential_key = match redb::load_credential_key(&directory) {
+                    Ok(key) => key,
                     Err(error) => {
                         ready_sender.send(Err(DatabaseError::Open(error))).ok();
                         return Ok(());
                     }
                 };
+                let undecryptable_credentials_at_open = if credential_key.is_none() {
+                    match redb::credential_count(&database) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            ready_sender.send(Err(DatabaseError::Open(error))).ok();
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    0
+                };
+                let credential_key_cell = std::sync::OnceLock::new();
+                if let Some(key) = credential_key {
+                    let _ = credential_key_cell.set(key);
+                }
                 let attachment_slots = flume::bounded(4);
                 for _ in 0..4 {
                     let _ = attachment_slots.0.try_send(());
@@ -285,9 +301,12 @@ impl DatabaseWorker {
                     reclamation_omitted_at_open: reclamation.omitted,
                     recovery: SharedRequest::new(),
                     probes: std::sync::Mutex::new(std::collections::HashMap::new()),
-                    credentials_path,
-                    credentials: RwLock::new(credentials),
-                    credentials_writer: std::sync::Mutex::new(()),
+                    in_flight_commands: AtomicUsize::new(0),
+                    credential_key: credential_key_cell,
+                    credential_key_writer: std::sync::Mutex::new(()),
+                    obsolete_credentials_at_open,
+                    undecryptable_credentials_at_open,
+                    open_warnings_logged: AtomicBool::new(false),
                 });
                 let _release = ReleaseOnPanic {
                     shared: shared.clone(),
@@ -360,6 +379,7 @@ impl DatabaseWorker {
                 }
             }
         }
+        worker.handle.log_open_warnings();
         Ok(worker)
     }
 
@@ -440,23 +460,34 @@ pub(super) fn database_not_open() -> StorageError {
     }
 }
 
-fn load_credentials_file(
-    path: &std::path::Path,
-) -> Result<std::collections::BTreeMap<String, String>, StorageError> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(std::collections::BTreeMap::new());
-        }
-        Err(error) => return Err(::redb::Error::Io(error).into()),
-    };
-    let _ = crate::system::data_directory::restrict_file(path);
-    serde_json::from_str(&contents)
-        .map_err(|_| StorageError::corrupted("credentials.json is invalid"))
-}
-
 pub(super) fn join(thread: JoinHandle<Result<(), DatabaseError>>) -> Result<(), DatabaseError> {
     thread.join().map_err(|_| DatabaseError::WorkerPanicked)?
+}
+
+impl DatabaseHandle {
+    pub(crate) fn log_open_warnings(&self) {
+        if log::max_level() < log::LevelFilter::Warn
+            || self
+                .shared
+                .open_warnings_logged
+                .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        if let Some(path) = self.shared.obsolete_credentials_at_open.as_ref() {
+            log::warn!(
+                "ignoring obsolete {}; remove it after verifying migration",
+                path.display()
+            );
+        }
+        if self.shared.undecryptable_credentials_at_open > 0 {
+            log::warn!(
+                "ocg.key is missing in {}; {} stored credential(s) cannot be decrypted",
+                self.shared.database_directory.display(),
+                self.shared.undecryptable_credentials_at_open
+            );
+        }
+    }
 }
 
 /// Every protected filesystem that is below `threshold_bytes` or cannot be
@@ -569,40 +600,48 @@ impl WriteWorker {
     pub(super) fn admit(&mut self, envelope: Envelope) -> Option<Envelope> {
         let operation = envelope.operation;
         if self.shared.update_paused.load(Ordering::SeqCst) {
-            envelope
-                .command
-                .refuse(|| DatabaseError::NeverExecuted { operation });
+            let Envelope {
+                command, in_flight, ..
+            } = envelope;
+            drop(in_flight);
+            command.refuse(|| DatabaseError::NeverExecuted { operation });
             return None;
         }
         // Activation drains the queue, so no command should arrive while
         // locked; refusing here keeps that true even if one did.
         if let Some(lock) = self.shared.protection.status().lock {
-            envelope
-                .command
-                .refuse(|| DatabaseError::RefusedByDiskProtection {
-                    operation,
-                    lock: lock.clone(),
-                });
+            let Envelope {
+                command, in_flight, ..
+            } = envelope;
+            drop(in_flight);
+            command.refuse(|| DatabaseError::RefusedByDiskProtection {
+                operation,
+                lock: lock.clone(),
+            });
             return None;
         }
         match self.check_database_space(envelope.command.expected_write_bytes()) {
             Ok(()) => Some(envelope),
             Err(SpaceRefusal::Short(shortage)) => {
-                envelope
-                    .command
-                    .refuse(|| DatabaseError::InsufficientSpace {
-                        operation,
-                        shortage: shortage.clone(),
-                    });
+                let Envelope {
+                    command, in_flight, ..
+                } = envelope;
+                drop(in_flight);
+                command.refuse(|| DatabaseError::InsufficientSpace {
+                    operation,
+                    shortage: shortage.clone(),
+                });
                 None
             }
             Err(SpaceRefusal::Locked(lock)) => {
-                envelope
-                    .command
-                    .refuse(|| DatabaseError::RefusedByDiskProtection {
-                        operation,
-                        lock: lock.clone(),
-                    });
+                let Envelope {
+                    command, in_flight, ..
+                } = envelope;
+                drop(in_flight);
+                command.refuse(|| DatabaseError::RefusedByDiskProtection {
+                    operation,
+                    lock: lock.clone(),
+                });
                 None
             }
         }
@@ -685,17 +724,20 @@ impl WriteWorker {
                 let Some(envelope) = self.admit(envelope) else {
                     continue;
                 };
-                let operation = envelope.operation;
+                let Envelope {
+                    operation,
+                    started,
+                    command,
+                    in_flight,
+                } = envelope;
                 let Some(opened) = guard.as_ref() else {
-                    envelope
-                        .command
-                        .refuse(|| DatabaseError::NeverExecuted { operation });
+                    drop(in_flight);
+                    command.refuse(|| DatabaseError::NeverExecuted { operation });
                     continue;
                 };
-                envelope.started.store(true, Ordering::SeqCst);
-                let mut ran = envelope
-                    .command
-                    .execute(&opened.database, operation, commit);
+                started.store(true, Ordering::SeqCst);
+                let mut ran = command.execute(&opened.database, operation, commit);
+                drop(in_flight);
                 if let Some(commit_us) = ran.durable_commit_us {
                     shared.record_durable_commit(commit_us);
                 }
@@ -774,13 +816,17 @@ impl WriteWorker {
         }
         if let Some(lock) = lock {
             for envelope in unrun {
-                let operation = envelope.operation;
-                envelope
-                    .command
-                    .refuse(|| DatabaseError::RefusedByDiskProtection {
-                        operation,
-                        lock: lock.clone(),
-                    });
+                let Envelope {
+                    operation,
+                    command,
+                    in_flight,
+                    ..
+                } = envelope;
+                drop(in_flight);
+                command.refuse(|| DatabaseError::RefusedByDiskProtection {
+                    operation,
+                    lock: lock.clone(),
+                });
             }
         }
     }
@@ -1179,11 +1225,14 @@ impl WriteWorker {
         // finds nothing unless every handle was dropped without a shutdown.
         for message in self.receiver.drain() {
             if let Message::Run(envelope) = message {
-                let envelope = *envelope;
-                let operation = envelope.operation;
-                envelope
-                    .command
-                    .refuse(|| DatabaseError::NeverExecuted { operation });
+                let Envelope {
+                    operation,
+                    command,
+                    in_flight,
+                    ..
+                } = *envelope;
+                drop(in_flight);
+                command.refuse(|| DatabaseError::NeverExecuted { operation });
             }
         }
         self.shared

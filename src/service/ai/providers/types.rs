@@ -3,10 +3,10 @@ use super::*;
 /// The temporary bootstrap credential boundary. The name is persisted, while
 /// this resolver returns the secret only to the request builder.
 pub trait CredentialResolver: Send + Sync {
-    fn resolve(
-        &self,
-        credential_ref: Option<&str>,
-    ) -> Result<Option<String>, ProviderExecutionError>;
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ProviderExecutionError>> + Send + 'a>>;
 }
 
 /// Receives text deltas while the provider stream is still active. The
@@ -77,20 +77,23 @@ pub struct OutputSinkError {
 pub struct EnvironmentCredentialResolver;
 
 impl CredentialResolver for EnvironmentCredentialResolver {
-    fn resolve(
-        &self,
-        credential_ref: Option<&str>,
-    ) -> Result<Option<String>, ProviderExecutionError> {
-        let Some(name) = credential_ref else {
-            return Ok(None);
-        };
-        std::env::var(name).map(Some).map_err(|error| match error {
-            std::env::VarError::NotPresent => ProviderExecutionError::Build {
-                message: format!("credential reference `{name}` is not present"),
-            },
-            std::env::VarError::NotUnicode(_) => ProviderExecutionError::Build {
-                message: format!("credential reference `{name}` is not valid UTF-8"),
-            },
+    fn resolve<'a>(
+        &'a self,
+        credential_ref: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ProviderExecutionError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(name) = credential_ref else {
+                return Ok(None);
+            };
+            std::env::var(name).map(Some).map_err(|error| match error {
+                std::env::VarError::NotPresent => ProviderExecutionError::Build {
+                    message: format!("credential reference `{name}` is not present"),
+                },
+                std::env::VarError::NotUnicode(_) => ProviderExecutionError::Build {
+                    message: format!("credential reference `{name}` is not valid UTF-8"),
+                },
+            })
         })
     }
 }

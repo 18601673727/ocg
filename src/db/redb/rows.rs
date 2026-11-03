@@ -1064,3 +1064,241 @@ impl Notice {
         Ok(Self { class, body })
     }
 }
+
+const CREDENTIAL_AAD_PREFIX: &[u8] = b"ocg.credential.v1\0";
+
+fn credential_aad(reference: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(CREDENTIAL_AAD_PREFIX.len() + reference.len());
+    aad.extend_from_slice(CREDENTIAL_AAD_PREFIX);
+    aad.extend_from_slice(reference.as_bytes());
+    aad
+}
+
+pub(crate) fn valid_credential_ref(reference: &str) -> bool {
+    !reference.is_empty() && reference.len() <= 128 && !reference.chars().any(char::is_control)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CredentialSecret(String);
+
+impl CredentialSecret {
+    pub(crate) fn new(secret: impl Into<String>) -> Result<Self, &'static str> {
+        let secret = secret.into();
+        if secret.is_empty() || secret.len() > 4096 {
+            return Err("credential secret must be 1..=4096 bytes");
+        }
+        if ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err() {
+            return Err("credential secret is not a valid HTTP Bearer token");
+        }
+        Ok(Self(secret))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for CredentialSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Threat model: encrypting credentials in `ocg.redb` with `ocg.key`
+/// protects copies of `ocg.redb` on their own. A Code-grant command can
+/// read both files, just as it could read the retired credentials file.
+pub(crate) struct CredentialKey {
+    key_id: [u8; 8],
+    key: aws_lc_rs::aead::LessSafeKey,
+}
+
+impl std::fmt::Debug for CredentialKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialKey").finish_non_exhaustive()
+    }
+}
+
+pub(super) struct EncryptedCredential<'a> {
+    pub(super) key_id: [u8; 8],
+    pub(super) nonce: [u8; 12],
+    pub(super) ciphertext: &'a [u8],
+}
+
+pub(super) fn decode_credential<'a>(
+    reference: &str,
+    bytes: &'a [u8],
+) -> DecodeResult<EncryptedCredential<'a>> {
+    if !valid_credential_ref(reference) {
+        return Err(StorageError::corrupted("invalid credential reference"));
+    }
+    let Some((&[tag, version], rest)) = bytes.split_first_chunk::<2>() else {
+        return Err(StorageError::corrupted("short credential record"));
+    };
+    if tag != codec::TAG_CREDENTIAL || version != codec::RECORD_VERSION {
+        return Err(StorageError::corrupted("invalid credential record header"));
+    }
+    let Some((&key_id, rest)) = rest.split_first_chunk::<8>() else {
+        return Err(StorageError::corrupted("short credential key id"));
+    };
+    let Some((&nonce, ciphertext)) = rest.split_first_chunk::<12>() else {
+        return Err(StorageError::corrupted("short credential nonce"));
+    };
+    if !(17..=4096 + 16).contains(&ciphertext.len()) {
+        return Err(StorageError::corrupted(
+            "invalid credential ciphertext length",
+        ));
+    }
+    Ok(EncryptedCredential {
+        key_id,
+        nonce,
+        ciphertext,
+    })
+}
+
+impl CredentialKey {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> DecodeResult<Self> {
+        if bytes.len() != 32 {
+            return Err(StorageError::corrupted("ocg.key must be 32 bytes"));
+        }
+        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+        let key_id: [u8; 8] = digest.as_ref()[..8]
+            .try_into()
+            .expect("SHA-256 digest has 32 bytes");
+        let unbound = aws_lc_rs::aead::UnboundKey::new(&aws_lc_rs::aead::AES_256_GCM, bytes)
+            .map_err(|_| StorageError::corrupted("invalid credential key"))?;
+        Ok(Self {
+            key_id,
+            key: aws_lc_rs::aead::LessSafeKey::new(unbound),
+        })
+    }
+
+    pub(super) fn encrypt(
+        &self,
+        reference: &str,
+        secret: &CredentialSecret,
+    ) -> DecodeResult<Vec<u8>> {
+        use aws_lc_rs::rand::SecureRandom;
+        let mut nonce = [0u8; 12];
+        aws_lc_rs::rand::SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| StorageError::corrupted("system random source unavailable"))?;
+        let aad = credential_aad(reference);
+        let mut ciphertext = secret.as_str().as_bytes().to_vec();
+        self.key
+            .seal_in_place_append_tag(
+                aws_lc_rs::aead::Nonce::assume_unique_for_key(nonce),
+                aws_lc_rs::aead::Aad::from(&aad),
+                &mut ciphertext,
+            )
+            .map_err(|_| StorageError::corrupted("credential encryption failed"))?;
+        let mut encoded = Vec::with_capacity(2 + 8 + 12 + ciphertext.len());
+        encoded.push(codec::TAG_CREDENTIAL);
+        encoded.push(codec::RECORD_VERSION);
+        encoded.extend_from_slice(&self.key_id);
+        encoded.extend_from_slice(&nonce);
+        encoded.extend_from_slice(&ciphertext);
+        Ok(encoded)
+    }
+
+    pub(super) fn decrypt(
+        &self,
+        reference: &str,
+        bytes: &[u8],
+    ) -> DecodeResult<Option<CredentialSecret>> {
+        let row = decode_credential(reference, bytes)?;
+        if row.key_id != self.key_id {
+            return Ok(None);
+        }
+        let aad = credential_aad(reference);
+        let mut buffer = row.ciphertext.to_vec();
+        let Ok(plaintext) = self.key.open_in_place(
+            aws_lc_rs::aead::Nonce::assume_unique_for_key(row.nonce),
+            aws_lc_rs::aead::Aad::from(&aad),
+            &mut buffer,
+        ) else {
+            return Ok(None);
+        };
+        let secret = String::from_utf8(plaintext.to_vec())
+            .map_err(|_| StorageError::corrupted("decrypted credential is not UTF-8"))?;
+        CredentialSecret::new(secret)
+            .map(Some)
+            .map_err(StorageError::corrupted)
+    }
+}
+
+pub(crate) fn load_credential_key(
+    directory: &Path,
+) -> Result<Option<std::sync::Arc<CredentialKey>>, StorageError> {
+    let path = directory.join(CREDENTIAL_KEY_FILE_NAME);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(::redb::Error::Io(error).into()),
+    };
+    let _ = crate::system::data_directory::restrict_file(&path);
+    CredentialKey::from_bytes(&bytes)
+        .map(std::sync::Arc::new)
+        .map(Some)
+}
+
+pub(crate) fn create_credential_key(
+    directory: &Path,
+) -> Result<std::sync::Arc<CredentialKey>, StorageError> {
+    use aws_lc_rs::rand::SecureRandom;
+    use std::io::Write;
+    let mut raw = [0u8; 32];
+    aws_lc_rs::rand::SystemRandom::new()
+        .fill(&mut raw)
+        .map_err(|_| StorageError::corrupted("system random source unavailable"))?;
+    let key = std::sync::Arc::new(CredentialKey::from_bytes(&raw)?);
+    let key_path = directory.join(CREDENTIAL_KEY_FILE_NAME);
+    let temp_path = directory.join(format!(
+        ".{CREDENTIAL_KEY_FILE_NAME}.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        rustix::fs::OFlags::NOFOLLOW.bits() as i32,
+    );
+    crate::system::data_directory::private_file(&mut options);
+    let mut file = options.open(&temp_path).map_err(::redb::Error::Io)?;
+    if let Err(error) = file.write_all(&raw).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(::redb::Error::Io(error).into());
+    }
+    drop(file);
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    let renamed = rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        &temp_path,
+        rustix::fs::CWD,
+        &key_path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from);
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    let renamed: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace file publication is unsupported on this platform",
+    ));
+    if let Err(error) = renamed {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(::redb::Error::Io(error).into());
+    }
+    std::fs::File::open(directory)
+        .and_then(|dir| dir.sync_all())
+        .map_err(::redb::Error::Io)?;
+    let _ = crate::system::data_directory::restrict_file(&key_path);
+    Ok(key)
+}

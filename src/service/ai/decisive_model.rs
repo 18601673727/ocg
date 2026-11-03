@@ -67,7 +67,7 @@ async fn execute_native(
         frozen.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT),
         "systemone",
     )?;
-    let credential = resolver.resolve(frozen.credential_ref.as_deref())?;
+    let credential = resolver.resolve(frozen.credential_ref.as_deref()).await?;
     let redactor = Redactor::new(credential.as_deref());
     let authorization = credential.as_deref().map(authorization).transpose()?;
     if config.cancellation.is_cancelled() {
