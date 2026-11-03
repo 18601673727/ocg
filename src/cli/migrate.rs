@@ -44,19 +44,20 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let format = migration_inspect(&db)?;
     match format {
         MigrationFormat::Legacy => println!(
-            "Database format: legacy unmarked; plan: rebuild conversation search and migrate to format 16."
+            "Database format: legacy unmarked; plan: rebuild conversation search and migrate to format 17."
         ),
         MigrationFormat::UnmarkedCurrent => {
-            println!("Database format: unmarked; plan: migrate to format 16.")
+            println!("Database format: unmarked; plan: migrate to format 17.")
         }
-        MigrationFormat::Format15 => println!("Database format: 15; plan: migrate to format 16."),
-        MigrationFormat::Current => println!("Database format: 16; plan: no migration required."),
+        MigrationFormat::Format15 => println!("Database format: 15; plan: migrate to format 17."),
+        MigrationFormat::Format16 => println!("Database format: 16; plan: migrate to format 17."),
+        MigrationFormat::Current => println!("Database format: 17; plan: no migration required."),
     }
     let Some(destination) = destination else {
         return Ok(());
     };
     if format == MigrationFormat::Current {
-        return Err("database is already format 16; no destination was created".into());
+        return Err("database is already format 17; no destination was created".into());
     }
     let expected = migration_snapshot(&db, format)?;
     let parent = destination.parent().ok_or("destination has no parent")?;
@@ -79,7 +80,7 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     migration_apply(&staging.join("ocg.redb"), format, &expected)?;
     let migrated = migration_source(&staging.join("ocg.redb"))?;
     if migration_inspect(&migrated)? != MigrationFormat::Current
-        || migration_snapshot(&migrated, MigrationFormat::Current)? != expected
+        || migration_snapshot(&migrated, format.migrated_snapshot_format())? != expected
     {
         return Err("migrated authoritative data differs from the source".into());
     }

@@ -475,12 +475,7 @@ impl Batch {
     }
 
     pub(crate) fn group_head(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| {
-            Ok(tx
-                .open_table(GROUP_HEADS)?
-                .get(conversation.get())?
-                .map(|id| JobId::new(id.value())))
-        })
+        self.step(|tx| reader::turn_head(&tx.open_table(TURNS)?, conversation))
     }
     pub(crate) fn active_job(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
         self.step(|tx| {
@@ -973,7 +968,7 @@ impl Batch {
                 &tx.open_table(CONFIGS)?,
                 &tx.open_table(PROJECTS)?,
                 &tx.open_table(JOB_CONTROLS)?,
-                &tx.open_table(GROUP_HEADS)?,
+                reader::Turns(&tx.open_table(TURNS)?),
                 &predicted,
             )
         })? {
@@ -1042,7 +1037,7 @@ impl Batch {
             let mut reserved_requests = u64::from(requests);
             let mut preparations = 1u32;
             let children = tx.open_table(CHILD_GROUPS)?;
-            let tips = tx.open_table(GROUP_HEADS)?;
+            let turns = tx.open_table(TURNS)?;
             let events = tx.open_table(REQUEST_EVENTS)?;
             for (scanned, entry) in children
                 .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
@@ -1054,7 +1049,8 @@ impl Batch {
                     return Ok(false);
                 }
                 let child = entry?.0.value().1;
-                let Some(tip) = tips.get(child)?.map(|value| value.value()) else {
+                let Some(tip) = reader::turn_head(&turns, JobId::new(child))?.map(JobId::get)
+                else {
                     continue;
                 };
                 let Some(bytes) = jobs.get(tip)? else {
@@ -1071,8 +1067,13 @@ impl Batch {
                 if work.prediction.is_none() {
                     continue;
                 }
-                let (charge, charged_at) =
-                    reader::preparation_charge(&jobs, &children, &tips, &events, &row)?;
+                let (charge, charged_at) = reader::preparation_charge(
+                    &jobs,
+                    &children,
+                    reader::Turns(&turns),
+                    &events,
+                    &row,
+                )?;
                 if now
                     .as_unix_micros()
                     .saturating_sub(charged_at.as_unix_micros())
@@ -1114,7 +1115,7 @@ impl Batch {
                     &tx.open_table(CONFIGS)?,
                     &tx.open_table(PROJECTS)?,
                     &tx.open_table(JOB_CONTROLS)?,
-                    &tx.open_table(GROUP_HEADS)?,
+                    reader::Turns(&tx.open_table(TURNS)?),
                     &row,
                 )? || !reader::preparation_current(
                     &tx.open_table(META)?,
@@ -1211,7 +1212,7 @@ impl Batch {
                     &tx.open_table(CONFIGS)?,
                     &tx.open_table(PROJECTS)?,
                     &tx.open_table(JOB_CONTROLS)?,
-                    &tx.open_table(GROUP_HEADS)?,
+                    reader::Turns(&tx.open_table(TURNS)?),
                     &row,
                 )
             })?
@@ -1463,8 +1464,8 @@ impl Batch {
                     return Ok(None);
                 }
                 let child = entry?.0.value().1;
-                if let Some(tip) = tx.open_table(GROUP_HEADS)?.get(child)? {
-                    let tip = tip.value();
+                let tip = reader::turn_head(&tx.open_table(TURNS)?, JobId::new(child))?;
+                if let Some(tip) = tip.map(JobId::get) {
                     let row = tx
                         .open_table(JOBS)?
                         .get(tip)?
@@ -1605,10 +1606,7 @@ impl Batch {
                 .take(64)
             {
                 let child = JobId::new(entry?.0.value().1);
-                let tip = tx
-                    .open_table(GROUP_HEADS)?
-                    .get(child.get())?
-                    .map(|value| value.value());
+                let tip = reader::turn_head(&tx.open_table(TURNS)?, child)?.map(JobId::get);
                 if let Some(tip) = tip {
                     let row = tx
                         .open_table(JOBS)?
@@ -2038,23 +2036,13 @@ impl Batch {
                 }
             }
             match entry {
-                Entry::UserMessage { attachments, .. } => {
-                    for attachment in attachments {
-                        tx.open_table(ATTACHMENT_REFS)?
-                            .insert((attachment.get(), turn.get()), ())?;
-                    }
+                Entry::UserMessage { .. } => {
                     if let Some(conversation) = row.parent_id {
                         let mut user = tx.open_table(USER_INPUT_AT)?;
                         if user.get(conversation.get())?.is_none() {
-                            user.insert(conversation.get(), at.as_unix_micros())?;
+                            user.insert(conversation.get(), ())?;
                             first_user = true;
                         }
-                    }
-                }
-                Entry::UserMessageEdit { attachments, .. } => {
-                    for attachment in attachments {
-                        tx.open_table(ATTACHMENT_REFS)?
-                            .insert((attachment.get(), turn.get()), ())?;
                     }
                 }
                 Entry::RetryOf { turn: original, by } => {
@@ -2063,7 +2051,8 @@ impl Batch {
                         matches!(by, Actor::Agent { .. }),
                     )?;
                 }
-                Entry::AgentMessage { .. }
+                Entry::UserMessageEdit { .. }
+                | Entry::AgentMessage { .. }
                 | Entry::Notice { .. }
                 | Entry::Decision { .. }
                 | Entry::Iteration { .. }
@@ -2364,7 +2353,7 @@ impl Batch {
                 &tx.open_table(JOBS)?,
                 &tx.open_table(JOB_STATES)?,
                 &tx.open_table(LIVE_CHILDREN)?,
-                &tx.open_table(GROUP_HEADS)?,
+                reader::Turns(&tx.open_table(TURNS)?),
                 conversation,
             )
         })?;

@@ -3,7 +3,7 @@ use super::*;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 // Database format is independent of the per-record encoding version.
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const DATABASE_FORMAT_VERSION: u64 = 16;
+pub(super) const DATABASE_FORMAT_VERSION: u64 = 17;
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -57,8 +57,7 @@ pub(super) const UNSETTLED: TableDefinition<u128, (u32, u32)> = TableDefinition:
 pub(super) const HELD_SLOTS: TableDefinition<(u128, u128), (u64, bool)> =
     TableDefinition::new("held_slot");
 pub(super) const CHILDREN: TableDefinition<(u128, u128), ()> = TableDefinition::new("children");
-pub(super) const SUCCESSORS: TableDefinition<u128, u128> = TableDefinition::new("successor");
-pub(super) const GROUP_HEADS: TableDefinition<u128, u128> = TableDefinition::new("job_group_head");
+pub(super) const SUCCESSORS: TableDefinition<u128, ()> = TableDefinition::new("successor");
 /// (conversation, Unicode gram, turn)
 pub(crate) type ConversationSearchKey = (u128, u64, u128);
 pub(super) const CONVERSATION_SEARCH: TableDefinition<ConversationSearchKey, ()> =
@@ -67,7 +66,7 @@ pub(super) const CHILD_GROUPS: TableDefinition<(u128, u128), ()> =
     TableDefinition::new("child_group");
 pub(super) const LIVE_CHILDREN: TableDefinition<(u128, u128), ()> =
     TableDefinition::new("live_child");
-pub(super) const USER_INPUT_AT: TableDefinition<u128, i64> = TableDefinition::new("user_input_at");
+pub(super) const USER_INPUT_AT: TableDefinition<u128, ()> = TableDefinition::new("user_input_at");
 pub(super) const ACTIVE_JOBS: TableDefinition<u128, u128> = TableDefinition::new("active_job");
 pub(super) const GROUP_RESULTS: TableDefinition<u128, (u128, u128)> =
     TableDefinition::new("group_result");
@@ -87,11 +86,9 @@ pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) const USAGE_TOTALS: TableDefinition<UsageTotalKey, UsageTotalValue> =
     TableDefinition::new("usage_total");
 pub(super) const RETRIES: TableDefinition<(u128, u128), bool> = TableDefinition::new("retry");
-pub(super) const ATTACHMENT_REFS: TableDefinition<(u128, u128), ()> =
-    TableDefinition::new("attachment_ref");
-pub(super) type RequestScopeKey = (u128, [u8; 32], i64, u128, u32, u32);
-pub(super) const REQUEST_SCOPES: TableDefinition<RequestScopeKey, ()> =
-    TableDefinition::new("request_scope");
+/// (provider, model_hash) -> the smallest Job with a qualifying request event.
+pub(super) const USAGE_MODEL: TableDefinition<(u128, [u8; 32]), u128> =
+    TableDefinition::new("usage_model");
 pub(super) type RequestTimelineKey = (i64, u128, u32, u32);
 pub(super) const REQUEST_TIMELINE: TableDefinition<RequestTimelineKey, ()> =
     TableDefinition::new("request_timeline");

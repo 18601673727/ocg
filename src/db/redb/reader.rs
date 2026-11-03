@@ -39,6 +39,29 @@ fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobState, StorageError>
         .ok_or_else(|| StorageError::corrupted(format!("{id} has no job_state")))
 }
 
+/// The latest persistent turn of `group`: Job IDs only increase, so it is
+/// the largest `(group, turn)` key.
+pub(super) fn turn_head(
+    turns: &impl ReadableTable<(u128, u128), ()>,
+    group: JobId,
+) -> Result<Option<JobId>, StorageError> {
+    Ok(turns
+        .range((group.get(), 0)..=(group.get(), u128::MAX))?
+        .next_back()
+        .transpose()?
+        .map(|(key, _)| JobId::new(key.value().1)))
+}
+
+/// A `turn` table, which a function taking other `(u128, u128) -> ()` tables
+/// must not receive in their place.
+pub(super) struct Turns<'a, T>(pub(super) &'a T);
+
+impl<T: ReadableTable<(u128, u128), ()>> Turns<'_, T> {
+    pub(super) fn head(&self, group: JobId) -> Result<Option<JobId>, StorageError> {
+        turn_head(self.0, group)
+    }
+}
+
 pub(super) fn job_execution(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     row: &JobSpec,
@@ -199,10 +222,10 @@ fn job_plan_snapshot(
 ) -> Result<Option<(JobId, JobPlanSnapshot)>, StorageError> {
     let mut source = row.clone();
     if source.kind.is_group()
-        && let Some(tip) = rx.open_table(GROUP_HEADS)?.get(source.id.get())?
+        && let Some(tip) = turn_head(&rx.open_table(TURNS)?, source.id)?
     {
-        source = read_job_row(rx, JobId::new(tip.value()))?
-            .ok_or_else(|| StorageError::corrupted("missing group head"))?;
+        source =
+            read_job_row(rx, tip)?.ok_or_else(|| StorageError::corrupted("missing group head"))?;
     }
     let owner = if let Some(allocation) = &source.allocation {
         allocation.owner
@@ -303,10 +326,7 @@ pub(crate) fn read_job_scope(
     }
     for step in &receipt.steps {
         let conversation = step.group;
-        let tip = rx
-            .open_table(GROUP_HEADS)?
-            .get(conversation.get())?
-            .map(|id| JobId::new(id.value()));
+        let tip = turn_head(&rx.open_table(TURNS)?, conversation)?;
         if let Some(tip) = tip
             && (synthesis || prerequisites.contains(&conversation))
         {
@@ -352,10 +372,7 @@ fn job_plan_view(rx: &ReadTransaction, row: &JobSpec) -> Result<Option<JobPlanVi
     let mut steps = Vec::new();
     for step in receipt.steps.iter().take(6) {
         let conversation = step.group;
-        let tip = rx
-            .open_table(GROUP_HEADS)?
-            .get(conversation.get())?
-            .map(|id| JobId::new(id.value()))
+        let tip = turn_head(&rx.open_table(TURNS)?, conversation)?
             .ok_or_else(|| StorageError::corrupted("missing task tip"))?;
         let row =
             read_job_row(rx, tip)?.ok_or_else(|| StorageError::corrupted("missing task turn"))?;
@@ -867,10 +884,7 @@ fn tree_node(
         JobKind::Group {
             origin, keep_open, ..
         } => {
-            let tip = rx
-                .open_table(GROUP_HEADS)?
-                .get(row.id.get())?
-                .map(|id| JobId::new(id.value()))
+            let tip = turn_head(&rx.open_table(TURNS)?, row.id)?
                 .ok_or_else(|| StorageError::corrupted(format!("{} has no tip", row.id)))?;
             let summary = conversation_summary(rx, row.id, tip)?;
             let state = match summary.state.as_str() {
@@ -2149,10 +2163,7 @@ pub(crate) fn read_conversation_children(
         else {
             return Err(StorageError::corrupted("child is not a conversation"));
         };
-        let tip = rx
-            .open_table(GROUP_HEADS)?
-            .get(child.get())?
-            .map(|id| JobId::new(id.value()))
+        let tip = turn_head(&rx.open_table(TURNS)?, child)?
             .ok_or_else(|| StorageError::corrupted("child tip missing"))?;
         let conversation = conversation_summary(&rx, child, tip)?;
         children.push(ChildConversationEntry {
@@ -2208,11 +2219,7 @@ fn conversation_page(
         {
             continue;
         }
-        let Some(tip) = rx
-            .open_table(GROUP_HEADS)?
-            .get(conversation.get())?
-            .map(|value| JobId::new(value.value()))
-        else {
+        let Some(tip) = turn_head(&rx.open_table(TURNS)?, conversation)? else {
             continue;
         };
         let summary = conversation_summary(&rx, conversation, tip)?;
@@ -2400,28 +2407,22 @@ fn resolve_model_name(
     provider: u128,
     model_hash: [u8; 32],
 ) -> Result<Option<String>, StorageError> {
-    let scopes = rx.open_table(REQUEST_SCOPES)?;
-    let start = (provider, model_hash, i64::MIN, 0, 0, 0);
-    let end = (
-        provider,
-        model_hash,
-        i64::MAX,
-        u128::MAX,
-        u32::MAX,
-        u32::MAX,
-    );
-    for entry in scopes.range(start..=end)? {
-        let (key, _) = entry?;
-        let (_provider, _hash, _obs, job, _req, _seq) = key.value();
-        if let Some(job_row) = read_job_row(rx, JobId::new(job))? {
-            let jobs = rx.open_table(JOBS)?;
-            let Some(identity) = turn_usage_identity_of(&jobs, &job_row)? else {
-                continue;
-            };
-            return Ok(Some(identity.model));
-        }
-    }
-    Ok(None)
+    let Some(job) = rx
+        .open_table(USAGE_MODEL)?
+        .get((provider, model_hash))?
+        .map(|job| JobId::new(job.value()))
+    else {
+        return Ok(None);
+    };
+    let row = read_job_row(rx, job)?
+        .ok_or_else(|| StorageError::corrupted("usage model references a missing job"))?;
+    let identity = turn_usage_identity_of(&rx.open_table(JOBS)?, &row)?
+        .filter(|identity| {
+            identity.provider == provider
+                && ContentDigest::of(identity.model.as_bytes()).as_bytes() == &model_hash
+        })
+        .ok_or_else(|| StorageError::corrupted("usage model references a different identity"))?;
+    Ok(Some(identity.model))
 }
 
 type UsageGroupKey = (i64, u128, u128, [u8; 32]);
@@ -3646,12 +3647,12 @@ pub(super) fn steer_blocker(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     states: &impl ReadableTable<u128, &'static [u8]>,
     children: &impl ReadableTable<(u128, u128), ()>,
-    tips: &impl ReadableTable<u128, u128>,
+    turns: Turns<'_, impl ReadableTable<(u128, u128), ()>>,
     conversation: JobId,
 ) -> Result<Option<&'static str>, StorageError> {
     for child in children.range((conversation.get(), 0)..=(conversation.get(), u128::MAX))? {
         let child = child?.0.value().1;
-        let Some(tip) = tips.get(child)?.map(|value| value.value()) else {
+        let Some(tip) = turns.head(JobId::new(child))?.map(JobId::get) else {
             continue;
         };
         let row = jobs
@@ -3714,10 +3715,7 @@ pub(crate) fn read_context_state(
     }
     let (mut policy, revision, profile) = effective_context_policy(&rx.open_table(META)?)?;
     let stored_override = None;
-    let tip = rx
-        .open_table(GROUP_HEADS)?
-        .get(conversation.get())?
-        .map(|value| JobId::new(value.value()));
+    let tip = turn_head(&rx.open_table(TURNS)?, conversation)?;
     let active = tip
         .map(|tip| read_job_row(&rx, tip))
         .transpose()?
@@ -3836,11 +3834,7 @@ pub(crate) fn read_context_state(
             break;
         }
         next_before = Some(child);
-        let Some(job) = rx
-            .open_table(GROUP_HEADS)?
-            .get(child.get())?
-            .map(|value| JobId::new(value.value()))
-        else {
+        let Some(job) = turn_head(&rx.open_table(TURNS)?, child)? else {
             continue;
         };
         let Some(row) = read_job_row(&rx, job)? else {
@@ -3859,7 +3853,7 @@ pub(crate) fn read_context_state(
                 &rx.open_table(CONFIGS)?,
                 &rx.open_table(PROJECTS)?,
                 &rx.open_table(JOB_CONTROLS)?,
-                &rx.open_table(GROUP_HEADS)?,
+                Turns(&rx.open_table(TURNS)?),
                 &row,
             )?;
             let label = match state.outcome {
@@ -4069,7 +4063,7 @@ pub(crate) fn read_context_state(
         &rx.open_table(JOBS)?,
         &rx.open_table(JOB_STATES)?,
         &rx.open_table(LIVE_CHILDREN)?,
-        &rx.open_table(GROUP_HEADS)?,
+        Turns(&rx.open_table(TURNS)?),
         conversation,
     )?;
     Ok(Some(ContextState {
@@ -4166,7 +4160,7 @@ pub(super) fn prediction_current(
     configs: &impl ReadableTable<u128, &'static [u8]>,
     projects: &impl ReadableTable<u128, &'static [u8]>,
     conversations: &impl ReadableTable<u128, &'static [u8]>,
-    tips: &impl ReadableTable<u128, u128>,
+    turns: Turns<'_, impl ReadableTable<(u128, u128), ()>>,
     row: &JobSpec,
 ) -> Result<bool, StorageError> {
     let JobKind::Execution {
@@ -4220,11 +4214,7 @@ pub(super) fn prediction_current(
     {
         return Ok(false);
     }
-    if tips
-        .get(conversation.get())?
-        .map(|value| JobId::new(value.value()))
-        != Some(prediction.activity_turn)
-    {
+    if turns.head(conversation)? != Some(prediction.activity_turn) {
         return Ok(false);
     }
 
@@ -4248,7 +4238,7 @@ pub(crate) fn read_prediction_current(
         &rx.open_table(CONFIGS)?,
         &rx.open_table(PROJECTS)?,
         &rx.open_table(JOB_CONTROLS)?,
-        &rx.open_table(GROUP_HEADS)?,
+        Turns(&rx.open_table(TURNS)?),
         &row,
     )
 }
@@ -4314,7 +4304,7 @@ pub(super) fn context_work_stopped(
 pub(super) fn preparation_charge(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     children: &impl ReadableTable<(u128, u128), ()>,
-    tips: &impl ReadableTable<u128, u128>,
+    turns: Turns<'_, impl ReadableTable<(u128, u128), ()>>,
     events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
     row: &JobSpec,
 ) -> Result<(u64, Timestamp), StorageError> {
@@ -4351,7 +4341,7 @@ pub(super) fn preparation_charge(
             return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
         }
         let child = entry?.0.value().1;
-        let Some(tip) = tips.get(child)?.map(|tip| tip.value()) else {
+        let Some(tip) = turns.head(JobId::new(child))?.map(JobId::get) else {
             continue;
         };
         if tip < anchor.get() {
@@ -4456,7 +4446,7 @@ pub(crate) fn read_preparation_current(
             && preparation_charge(
                 &rx.open_table(JOBS)?,
                 &rx.open_table(CHILD_GROUPS)?,
-                &rx.open_table(GROUP_HEADS)?,
+                Turns(&rx.open_table(TURNS)?),
                 &rx.open_table(REQUEST_EVENTS)?,
                 &row,
             )?
@@ -4630,7 +4620,7 @@ pub(crate) fn read_summarization_input(
     let charge = preparation_charge(
         &rx.open_table(JOBS)?,
         &rx.open_table(CHILD_GROUPS)?,
-        &rx.open_table(GROUP_HEADS)?,
+        Turns(&rx.open_table(TURNS)?),
         &rx.open_table(REQUEST_EVENTS)?,
         &row,
     )?;
@@ -4692,11 +4682,7 @@ pub(crate) fn read_summarization_input(
                     current = false;
                     break;
                 }
-                let Some(part_job) = rx
-                    .open_table(GROUP_HEADS)?
-                    .get(child.get())?
-                    .map(|value| JobId::new(value.value()))
-                else {
+                let Some(part_job) = turn_head(&rx.open_table(TURNS)?, child)? else {
                     current = false;
                     break;
                 };

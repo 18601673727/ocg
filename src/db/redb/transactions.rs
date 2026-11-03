@@ -127,21 +127,11 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(CHILDREN)?
                 .insert((parent_key, job.get()), ())?;
-            for attachment in spec.kind.attachments() {
-                tx.open_table(ATTACHMENT_REFS)?
-                    .insert((attachment.get(), job.get()), ())?;
-            }
             if let Some(previous) = spec.kind.previous() {
-                tx.open_table(SUCCESSORS)?
-                    .insert(previous.get(), job.get())?;
+                tx.open_table(SUCCESSORS)?.insert(previous.get(), ())?;
             }
             Ok(())
         })?;
-        if spec.kind.is_persistent()
-            && let Some(conversation) = spec.parent_id
-        {
-            self.insert(GROUP_HEADS, conversation.get(), job.get())?;
-        }
         if let Some((key, fingerprint)) = submission {
             let record = SubmissionRecord {
                 key,
@@ -179,7 +169,7 @@ impl Batch {
                         &tx.open_table(CONFIGS)?,
                         &tx.open_table(PROJECTS)?,
                         &tx.open_table(JOB_CONTROLS)?,
-                        &tx.open_table(GROUP_HEADS)?,
+                        reader::Turns(&tx.open_table(TURNS)?),
                         spec,
                     )
                 })?
@@ -717,7 +707,7 @@ impl Batch {
                 &tx.open_table(CONFIGS)?,
                 &tx.open_table(PROJECTS)?,
                 &tx.open_table(JOB_CONTROLS)?,
-                &tx.open_table(GROUP_HEADS)?,
+                reader::Turns(&tx.open_table(TURNS)?),
                 &row,
             )
         })? {

@@ -1865,7 +1865,8 @@ impl Batch {
         };
         let identity =
             self.step(|tx| reader::turn_usage_identity_of(&tx.open_table(JOBS)?, &row))?;
-        let scope = indexes::request_scope_key(identity.as_ref(), &event);
+        let timeline = indexes::request_timeline_key(identity.as_ref(), &event);
+        let usage_model = indexes::usage_model_key(identity.as_ref(), &event);
         self.step(|tx| {
             tx.open_table(REQUEST_EVENTS)?.insert(
                 (job.get(), request.get(), seq),
@@ -1877,10 +1878,11 @@ impl Batch {
                 tx.open_table(JOB_OBSERVATIONS)?
                     .insert((job.get(), kind, event.id.get()), (request.get(), seq))?;
             }
-            if let Some(scope) = scope {
-                tx.open_table(REQUEST_SCOPES)?.insert(scope, ())?;
-                tx.open_table(REQUEST_TIMELINE)?
-                    .insert((scope.2, scope.3, scope.4, scope.5), ())?;
+            if let Some(key) = timeline {
+                tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
+            }
+            if let Some(key) = usage_model {
+                indexes::record_usage_model(tx, key, job)?;
             }
             Ok(())
         })?;

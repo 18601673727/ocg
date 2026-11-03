@@ -270,7 +270,6 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(SUCCESSORS)?;
     tx.open_table(JOB_INPUTS)?;
     tx.open_table(NOTICES)?;
-    tx.open_table(GROUP_HEADS)?;
     tx.open_table(CONVERSATION_SEARCH)?;
     tx.open_table(CHILD_GROUPS)?;
     tx.open_table(LIVE_CHILDREN)?;
@@ -287,8 +286,7 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(APPROVAL_CALLS)?;
     tx.open_table(RECURRENCES)?;
     tx.open_table(RECURRENCE_DUE)?;
-    tx.open_table(ATTACHMENT_REFS)?;
-    tx.open_table(REQUEST_SCOPES)?;
+    tx.open_table(USAGE_MODEL)?;
     tx.open_table(REQUEST_TIMELINE)?;
     Ok(())
 }
@@ -586,6 +584,15 @@ pub(crate) fn reclaim_pending(
 const LEGACY_CONVERSATION_SEARCH: TableDefinition<(u128, u128, u128, u8, u32), ()> =
     TableDefinition::new("conversation_search");
 
+// Tables of formats before 17, read only by the offline migration.
+const F16_HEAD_TABLE: TableDefinition<u128, u128> = TableDefinition::new("job_group_head");
+const F16_ATTACHMENT_USE: TableDefinition<(u128, u128), ()> =
+    TableDefinition::new("attachment_ref");
+type F16ScopeKey = (u128, [u8; 32], i64, u128, u32, u32);
+const F16_SCOPE_TABLE: TableDefinition<F16ScopeKey, ()> = TableDefinition::new("request_scope");
+const F16_SUCCESSOR: TableDefinition<u128, u128> = TableDefinition::new("successor");
+const F16_USER_INPUT: TableDefinition<u128, i64> = TableDefinition::new("user_input_at");
+
 fn unsupported_format(detail: &str) -> StorageError {
     StorageError {
         kind: StorageErrorKind::Other,
@@ -599,7 +606,28 @@ pub(crate) enum MigrationFormat {
     Legacy,
     UnmarkedCurrent,
     Format15,
+    Format16,
     Current,
+}
+
+impl MigrationFormat {
+    /// Whether configuration rows already use the current record encoding.
+    fn has_current_configs(self) -> bool {
+        match self {
+            Self::Format16 | Self::Current => true,
+            Self::Legacy | Self::UnmarkedCurrent | Self::Format15 => false,
+        }
+    }
+
+    /// The format whose configuration comparison applies to the migrated
+    /// database: Format 16 rows are copied verbatim, older ones are upgraded
+    /// with default flags.
+    pub(crate) fn migrated_snapshot_format(self) -> Self {
+        match self {
+            Self::Format16 => Self::Format16,
+            Self::Legacy | Self::UnmarkedCurrent | Self::Format15 | Self::Current => Self::Current,
+        }
+    }
 }
 
 pub(crate) struct MigrationSource(::redb::ReadOnlyDatabase);
@@ -630,7 +658,7 @@ fn check_record_headers<K: Key + 'static>(
                 if *actual == tag
                     && (matches!(*version, 11 | 13)
                         || (*version == 14 && format != MigrationFormat::Legacy)
-                        || (*version == 15 && format == MigrationFormat::Current)) => {}
+                        || (*version == 15 && format.has_current_configs())) => {}
             _ => return Err(unsupported_format("unsupported record encoding")),
         }
     }
@@ -645,6 +673,21 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
             "database is empty/uninitialized; start OCG to initialize it",
         ));
     }
+    let meta = tx.open_table(META)?;
+    let marker = meta.get(DATABASE_FORMAT_KEY)?;
+    let legacy = tx.open_table(LEGACY_CONVERSATION_SEARCH).is_ok();
+    let format = match marker.as_ref().map(|value| value.value()) {
+        Some(value) if value == DATABASE_FORMAT_VERSION.to_le_bytes() && !legacy => {
+            MigrationFormat::Current
+        }
+        Some(value) if value == 16u64.to_le_bytes() && !legacy => MigrationFormat::Format16,
+        Some(value) if value == 15u64.to_le_bytes() && !legacy => MigrationFormat::Format15,
+        None if legacy => MigrationFormat::Legacy,
+        None => MigrationFormat::UnmarkedCurrent,
+        Some(_) => {
+            return Err(unsupported_format("unsupported database format marker"));
+        }
+    };
     let mut known = BTreeSet::new();
     macro_rules! check_tables {
         ($($table:ident),+ $(,)?) => { $(
@@ -683,11 +726,8 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
         UNSETTLED,
         HELD_SLOTS,
         CHILDREN,
-        SUCCESSORS,
-        GROUP_HEADS,
         CHILD_GROUPS,
         LIVE_CHILDREN,
-        USER_INPUT_AT,
         ACTIVE_JOBS,
         GROUP_RESULTS,
         NOTICE_READ,
@@ -695,14 +735,32 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
         TOOL_STATS,
         USAGE_TOTALS,
         RETRIES,
-        ATTACHMENT_REFS,
-        REQUEST_SCOPES,
         REQUEST_TIMELINE,
         OPEN_APPROVALS,
         APPROVAL_CALLS,
         RECURRENCE_DUE
     );
+    match format {
+        MigrationFormat::Current => {
+            check_tables!(SUCCESSORS, USER_INPUT_AT, USAGE_MODEL);
+        }
+        MigrationFormat::Format16
+        | MigrationFormat::Format15
+        | MigrationFormat::UnmarkedCurrent
+        | MigrationFormat::Legacy => {
+            check_tables!(
+                F16_SUCCESSOR,
+                F16_USER_INPUT,
+                F16_HEAD_TABLE,
+                F16_ATTACHMENT_USE,
+                F16_SCOPE_TABLE
+            );
+        }
+    }
     known.insert(CONVERSATION_SEARCH.name().to_owned());
+    if format != MigrationFormat::Legacy {
+        drop(tx.open_table(CONVERSATION_SEARCH)?);
+    }
     let actual: BTreeSet<String> = tx
         .list_tables()?
         .map(|table| table.name().to_owned())
@@ -710,27 +768,6 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
     if actual != known || tx.list_multimap_tables()?.next().is_some() {
         return Err(unsupported_format("unsupported set of database tables"));
     }
-    let meta = tx.open_table(META)?;
-    let marker = meta.get(DATABASE_FORMAT_KEY)?;
-    let legacy = tx.open_table(LEGACY_CONVERSATION_SEARCH).is_ok();
-    let format = match marker.as_ref().map(|value| value.value()) {
-        Some(value) if value == DATABASE_FORMAT_VERSION.to_le_bytes() && !legacy => {
-            drop(tx.open_table(CONVERSATION_SEARCH)?);
-            MigrationFormat::Current
-        }
-        Some(value) if value == 15u64.to_le_bytes() && !legacy => {
-            drop(tx.open_table(CONVERSATION_SEARCH)?);
-            MigrationFormat::Format15
-        }
-        None if legacy => MigrationFormat::Legacy,
-        None => {
-            drop(tx.open_table(CONVERSATION_SEARCH)?);
-            MigrationFormat::UnmarkedCurrent
-        }
-        Some(_) => {
-            return Err(unsupported_format("unsupported database format marker"));
-        }
-    };
     for key in ["clean_shutdown", "open_epoch", "compaction_settings"] {
         if meta.get(key)?.is_none() {
             return Err(StorageError::corrupted("missing required metadata"));
@@ -753,7 +790,7 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
         .get("compaction_settings")?
         .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
     if !matches!(settings.value(), [14, 11 | 13 | 14, ..])
-        && !(format == MigrationFormat::Current && matches!(settings.value(), [14, 15, ..]))
+        && !(format.has_current_configs() && matches!(settings.value(), [14, 15, ..]))
     {
         return Err(unsupported_format(
             "unsupported compaction settings encoding",
@@ -772,7 +809,7 @@ pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFor
     }
     for row in tx.open_table(CONFIGS)?.iter()? {
         let (key, value) = row?;
-        if format == MigrationFormat::Current {
+        if format.has_current_configs() {
             ConfigRow::decode_at(key.value(), value.value())?;
         } else {
             migration_upgrade_config(key.value(), value.value())?;
@@ -844,6 +881,13 @@ fn migration_upgrade_config(key: u128, bytes: &[u8]) -> Result<Vec<u8>, StorageE
     Ok(upgraded)
 }
 
+fn zero_config_version(mut bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
+    *bytes
+        .get_mut(1)
+        .ok_or_else(|| StorageError::corrupted("short config record"))? = 0;
+    Ok(bytes)
+}
+
 fn migration_config_fingerprint(
     tx: &impl TxRead,
     format: MigrationFormat,
@@ -852,23 +896,27 @@ fn migration_config_fingerprint(
     for row in tx.table(CONFIGS)?.iter()? {
         let (key, value) = row?;
         let id = key.value();
-        let bytes = if format == MigrationFormat::Current {
-            let mut bytes = value.value().to_vec();
-            if matches!(bytes.get(18), Some(1 | 2)) && bytes.pop() != Some(1) {
-                return Err(StorageError::corrupted("migrated config default differs"));
+        let bytes = match format {
+            // Format 16 rows already carry their flag byte; every value is
+            // authoritative, so the row is compared exactly as stored.
+            MigrationFormat::Format16 => value.value().to_vec(),
+            MigrationFormat::Current => {
+                let mut bytes = value.value().to_vec();
+                if matches!(bytes.get(18), Some(1 | 2)) && bytes.pop() != Some(1) {
+                    return Err(StorageError::corrupted("migrated config default differs"));
+                }
+                zero_config_version(bytes)?
             }
-            bytes
-        } else {
-            let mut bytes = migration_upgrade_config(id, value.value())?;
-            if matches!(bytes.get(18), Some(1 | 2)) {
-                bytes.pop();
+            MigrationFormat::Legacy
+            | MigrationFormat::UnmarkedCurrent
+            | MigrationFormat::Format15 => {
+                let mut bytes = migration_upgrade_config(id, value.value())?;
+                if matches!(bytes.get(18), Some(1 | 2)) {
+                    bytes.pop();
+                }
+                zero_config_version(bytes)?
             }
-            bytes
         };
-        let mut bytes = bytes;
-        *bytes
-            .get_mut(1)
-            .ok_or_else(|| StorageError::corrupted("short config record"))? = 0;
         let key = u128::as_bytes(&id);
         for data in [key.as_ref(), bytes.as_slice()] {
             hash.update(&(data.len() as u64).to_le_bytes());
@@ -949,15 +997,13 @@ pub(crate) fn migration_apply(
                 return Err(StorageError::corrupted("legacy search index missing"));
             }
             drop(tx.open_table(CONVERSATION_SEARCH)?);
-            indexes::rebuild_conversation_search(&tx)?;
-            indexes::verify_search_index(&tx)?;
         }
-        MigrationFormat::UnmarkedCurrent | MigrationFormat::Format15 => {
-            drop(tx.open_table(CONVERSATION_SEARCH)?);
-        }
+        MigrationFormat::UnmarkedCurrent
+        | MigrationFormat::Format15
+        | MigrationFormat::Format16 => {}
         MigrationFormat::Current => return Err(unsupported_format("database is already current")),
     }
-    {
+    if !format.has_current_configs() {
         use ::redb::ReadableTable;
         let mut table = tx.open_table(CONFIGS)?;
         let mut after = None;
@@ -983,7 +1029,22 @@ pub(crate) fn migration_apply(
             }
         }
     }
-    if authoritative_snapshot(&tx, MigrationFormat::Current)? != expected {
+    for removed in [
+        tx.delete_table(F16_HEAD_TABLE)?,
+        tx.delete_table(F16_ATTACHMENT_USE)?,
+        tx.delete_table(F16_SCOPE_TABLE)?,
+        tx.delete_table(F16_SUCCESSOR)?,
+        tx.delete_table(F16_USER_INPUT)?,
+    ] {
+        if !removed {
+            return Err(StorageError::corrupted("replaced derived table missing"));
+        }
+    }
+    indexes::rebuild(&tx, promotion_clock())?;
+    if format == MigrationFormat::Legacy {
+        indexes::verify_search_index(&tx)?;
+    }
+    if authoritative_snapshot(&tx, format.migrated_snapshot_format())? != expected {
         return Err(StorageError::corrupted(
             "authoritative records changed during migration",
         ));

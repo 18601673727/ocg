@@ -311,29 +311,60 @@ pub(super) fn verify_search_index(tx: &WriteTransaction) -> Result<(), StorageEr
     Ok(())
 }
 
-pub(super) fn request_scope_key(
+/// The identity a request event is indexed under, when it qualifies for the
+/// request indexes at all.
+fn indexed_identity<'a>(
+    identity: Option<&'a reader::UsageIdentity>,
+    event: &RequestEventRecord,
+) -> Option<&'a reader::UsageIdentity> {
+    identity.filter(|_| {
+        !matches!(
+            event.payload,
+            RequestPayload::Sent { .. }
+                | RequestPayload::Received { .. }
+                | RequestPayload::ApprovedCalls
+        )
+    })
+}
+
+pub(super) fn request_timeline_key(
     identity: Option<&reader::UsageIdentity>,
     event: &RequestEventRecord,
-) -> Option<schema::RequestScopeKey> {
-    identity
-        .filter(|_| {
-            !matches!(
-                event.payload,
-                RequestPayload::Sent { .. }
-                    | RequestPayload::Received { .. }
-                    | RequestPayload::ApprovedCalls
-            )
-        })
-        .map(|identity| {
-            (
-                identity.provider,
-                *ContentDigest::of(identity.model.as_bytes()).as_bytes(),
-                event.observed_at.as_unix_micros(),
-                event.job_id.get(),
-                event.request.get(),
-                event.seq,
-            )
-        })
+) -> Option<schema::RequestTimelineKey> {
+    indexed_identity(identity, event).map(|_| {
+        (
+            event.observed_at.as_unix_micros(),
+            event.job_id.get(),
+            event.request.get(),
+            event.seq,
+        )
+    })
+}
+
+pub(super) fn usage_model_key(
+    identity: Option<&reader::UsageIdentity>,
+    event: &RequestEventRecord,
+) -> Option<(u128, [u8; 32])> {
+    indexed_identity(identity, event).map(|identity| {
+        (
+            identity.provider,
+            *ContentDigest::of(identity.model.as_bytes()).as_bytes(),
+        )
+    })
+}
+
+/// Keeps the smallest Job containing a qualifying request event of the key.
+pub(super) fn record_usage_model(
+    tx: &WriteTransaction,
+    key: (u128, [u8; 32]),
+    job: JobId,
+) -> Result<(), StorageError> {
+    let mut table = tx.open_table(USAGE_MODEL)?;
+    let current = table.get(key)?.map(|value| value.value());
+    if current.is_none_or(|current| job.get() < current) {
+        table.insert(key, job.get())?;
+    }
+    Ok(())
 }
 
 fn job(tx: &WriteTransaction, id: u128) -> Result<JobSpec, StorageError> {
@@ -462,12 +493,8 @@ fn rebuild_jobs(tx: &WriteTransaction, clock: i64) -> Result<(), StorageError> {
             tx.open_table(JOB_ALLOCATIONS)?
                 .insert((allocation.owner.get(), id), ())?;
         }
-        for attachment in row.kind.attachments() {
-            tx.open_table(ATTACHMENT_REFS)?
-                .insert((attachment.get(), id), ())?;
-        }
         if let Some(previous) = row.kind.previous() {
-            tx.open_table(SUCCESSORS)?.insert(previous.get(), id)?;
+            tx.open_table(SUCCESSORS)?.insert(previous.get(), ())?;
         }
         if row.kind.is_group() {
             control(tx, id)?;
@@ -477,7 +504,6 @@ fn rebuild_jobs(tx: &WriteTransaction, clock: i64) -> Result<(), StorageError> {
             }
         } else if row.kind.is_persistent() && row.parent_id.is_some() {
             tx.open_table(TURNS)?.insert((parent, id), ())?;
-            tx.open_table(GROUP_HEADS)?.insert(parent, id)?;
             if let Some(claim) = &state.claim {
                 let mut notices = tx.open_table(NOTICE_READ)?;
                 let previous = notices.get(parent)?.map_or(0, |value| value.value());
@@ -629,16 +655,9 @@ fn rebuild_inputs(tx: &WriteTransaction) -> Result<(), StorageError> {
         let input = JobInputEntry::decode(bytes.value())?;
         let user_message = matches!(input.entry, Entry::UserMessage { .. });
         match input.entry {
-            Entry::UserMessage { attachments, .. } | Entry::UserMessageEdit { attachments, .. } => {
-                for attachment in attachments {
-                    tx.open_table(ATTACHMENT_REFS)?
-                        .insert((attachment.get(), turn), ())?;
-                }
+            Entry::UserMessage { .. } | Entry::UserMessageEdit { .. } => {
                 if user_message && let Some(parent) = job(tx, turn)?.parent_id {
-                    let mut times = tx.open_table(USER_INPUT_AT)?;
-                    if times.get(parent.get())?.is_none() {
-                        times.insert(parent.get(), input.at.as_unix_micros())?;
-                    }
+                    tx.open_table(USER_INPUT_AT)?.insert(parent.get(), ())?;
                 }
             }
             Entry::RetryOf { turn: original, by } => {
@@ -836,10 +855,11 @@ fn rebuild_events(tx: &WriteTransaction) -> Result<(), StorageError> {
         let request = RequestNumber::new(request)
             .ok_or_else(|| StorageError::corrupted("stored request number is zero"))?;
         let event = rows::decode_request_event(JobId::new(id), request, seq, bytes.value())?;
-        if let Some(scope) = request_scope_key(identity.as_ref(), &event) {
-            tx.open_table(REQUEST_SCOPES)?.insert(scope, ())?;
-            tx.open_table(REQUEST_TIMELINE)?
-                .insert((scope.2, scope.3, scope.4, scope.5), ())?;
+        if let Some(key) = request_timeline_key(identity.as_ref(), &event) {
+            tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
+        }
+        if let Some(key) = usage_model_key(identity.as_ref(), &event) {
+            record_usage_model(tx, key, event.job_id)?;
         }
         if let Some(kind) = observations::observation_kind(&table, &event)? {
             tx.open_table(JOB_OBSERVATIONS)?
@@ -951,7 +971,6 @@ pub(super) fn rebuild(tx: &WriteTransaction, clock: i64) -> Result<Vec<String>, 
         HELD_SLOTS,
         CHILDREN,
         SUCCESSORS,
-        GROUP_HEADS,
         CONVERSATION_SEARCH,
         CHILD_GROUPS,
         LIVE_CHILDREN,
@@ -963,8 +982,7 @@ pub(super) fn rebuild(tx: &WriteTransaction, clock: i64) -> Result<Vec<String>, 
         TOOL_STATS,
         USAGE_TOTALS,
         RETRIES,
-        ATTACHMENT_REFS,
-        REQUEST_SCOPES,
+        USAGE_MODEL,
         REQUEST_TIMELINE,
         OPEN_APPROVALS,
         APPROVAL_CALLS,
@@ -1006,7 +1024,6 @@ pub(super) fn rebuild(tx: &WriteTransaction, clock: i64) -> Result<Vec<String>, 
         HELD_SLOTS,
         CHILDREN,
         SUCCESSORS,
-        GROUP_HEADS,
         CONVERSATION_SEARCH,
         CHILD_GROUPS,
         LIVE_CHILDREN,
@@ -1018,8 +1035,7 @@ pub(super) fn rebuild(tx: &WriteTransaction, clock: i64) -> Result<Vec<String>, 
         TOOL_STATS,
         USAGE_TOTALS,
         RETRIES,
-        ATTACHMENT_REFS,
-        REQUEST_SCOPES,
+        USAGE_MODEL,
         REQUEST_TIMELINE,
         OPEN_APPROVALS,
         APPROVAL_CALLS,
