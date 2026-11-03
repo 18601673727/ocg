@@ -100,7 +100,6 @@ export function ConversationContext({
   const [open, setOpen] = useState(false);
   const [profiles, setProfiles] = useState<ControlProfilesSnapshot>();
   const [status, setStatus] = useState<Status>();
-  const [inferredAgent, setInferredAgent] = useState<string | null>(null);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -127,22 +126,6 @@ export function ConversationContext({
           setBefore(state.next_before);
           initialized.current = true;
         }
-        if (!agentProfile) {
-          try {
-            const page = await control!.readConversations({
-              limit: 100,
-              signal: controller.signal,
-            });
-            const found = page.conversations.find(
-              (c) => c.root_job === conversation || c.tip_job === conversation,
-            );
-            if (found?.agent) {
-              setInferredAgent((current) => current ?? found.agent);
-            }
-          } catch {
-            /* ignore */
-          }
-        }
       } catch (cause) {
         if (!controller.signal.aborted) setError(describeError(cause, t));
       } finally {
@@ -168,7 +151,7 @@ export function ConversationContext({
       controller.abort();
       unsubscribe();
     };
-  }, [agentProfile, control, conversation, refresh, t]);
+  }, [control, conversation, refresh, t]);
   async function act(action: () => Promise<void>) {
     setBusy(true);
     setError(undefined);
@@ -187,10 +170,9 @@ export function ConversationContext({
     ...older.filter((work) => !status?.work.some((current) => current.job === work.job)),
   ];
   const running = busy || Boolean(status?.steer_blocked_by);
-  const effectiveAgentId = agentProfile ?? inferredAgent ?? undefined;
   const agent =
-    effectiveAgentId && profiles
-      ? profiles.agent_profiles.find((p) => p.id === effectiveAgentId)
+    agentProfile && profiles
+      ? profiles.agent_profiles.find((p) => p.id === agentProfile)
       : undefined;
   const policySummarizer = status?.policy.summarization_model;
   const allowedModelIds = new Set<string>();
