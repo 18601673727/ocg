@@ -701,9 +701,10 @@ fn supervise(
     start.mark_started();
     let (stdout_pipe, stderr_pipe) = process.take_output();
     let readers = match (stdout_pipe, stderr_pipe) {
-        (Some(stdout), Some(stderr)) => {
-            reader(stdout).and_then(|stdout| reader(stderr).map(|stderr| (stdout, stderr)))
-        }
+        (Some(stdout), Some(stderr)) => match reader(stdout) {
+            Some(stdout) => reader(stderr).map(|stderr| (stdout, stderr)),
+            None => None,
+        },
         _ => None,
     };
     let Some((stdout, stderr)) = readers else {

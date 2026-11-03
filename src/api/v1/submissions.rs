@@ -2262,6 +2262,19 @@ pub(super) async fn release_slot(
                 })),
             ));
         }
+        JobProof::Checking { group } => {
+            let refusal = conversation_refusal("slot_live");
+            return Ok(Reply::new(
+                refusal.status,
+                envelope(serde_json::json!({
+                    "error": serde_json::json!({
+                        "code": refusal.code.to_owned(),
+                        "message": format!("process group {group} is still being checked"),
+                        "group": group,
+                    }),
+                })),
+            ));
+        }
         JobProof::Untracked if object.get("confirm") == Some(&Value::Bool(true)) => StopProof::User,
         JobProof::Untracked => return Err(conversation_refusal("confirm_required")),
     };

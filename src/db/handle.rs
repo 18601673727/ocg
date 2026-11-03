@@ -378,11 +378,7 @@ impl DatabaseHandle {
         if pending != 0 || ready != 0 || delayed != 0 || running != 0 || !self.sender.is_empty() {
             return Ok(None);
         }
-        // A quarantined slot is not running, but its process group may still
-        // be tracked here; a restart would orphan it. After a restart nothing
-        // is tracked, yet the persisted quarantine still holds the claim.
-        let quarantined = redb::quarantined_slots(&opened.database).map_err(DatabaseError::Read)?;
-        if quarantined != 0 || crate::system::executor::blocking::groups_tracked() {
+        if crate::system::executor::blocking::groups_tracked() {
             return Ok(None);
         }
         self.shared.update_paused.store(true, Ordering::SeqCst);

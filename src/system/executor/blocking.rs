@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::task::{Poll, Waker};
 use std::thread;
@@ -422,22 +422,47 @@ impl Drop for RunningGroup {
     }
 }
 
-pub(crate) struct UnprovenGroup {
-    pub(crate) job: Option<JobId>,
-    pub(crate) group: Pid,
-    pub(crate) sentinel: OwnedFd,
-    pub(crate) leader: Child,
+/// What keeps an unproven group's sentinel, leader and command permit alive.
+struct GroupHandles {
+    sentinel: OwnedFd,
+    leader: Child,
     /// Held until the group is proven empty, so no new command runs beside it.
-    pub(crate) _permit: Permit,
+    _permit: Permit,
+}
+
+/// A process group that could not be proven empty. Its record stays in
+/// [`UNPROVEN_GROUPS`] until a probe proves the group, so its Job stays
+/// unresolved; the handles leave the record while a probe checks the group.
+struct UnprovenGroup {
+    id: u64,
+    job: Option<JobId>,
+    group: Pid,
+    /// `None` while a [`Probe`] holds them, which is what probing means.
+    handles: Option<GroupHandles>,
+}
+
+impl UnprovenGroup {
+    fn probing(&self) -> bool {
+        self.handles.is_none()
+    }
 }
 
 static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
 
-pub(crate) fn record_unproven_group(group: UnprovenGroup) {
+/// Gives each record an identity of its own. A group's pid is reused once a
+/// probe reaps its leader, so the pid cannot name the record.
+static NEXT_UNPROVEN_ID: AtomicU64 = AtomicU64::new(0);
+
+fn record_unproven_group(job: Option<JobId>, group: Pid, handles: GroupHandles) {
     UNPROVEN_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .push(group);
+        .push(UnprovenGroup {
+            id: NEXT_UNPROVEN_ID.fetch_add(1, Ordering::Relaxed),
+            job,
+            group,
+            handles: Some(handles),
+        });
 }
 
 /// Jobs whose every group was proven empty but whose stop is not yet
@@ -524,41 +549,106 @@ pub(crate) fn stop_settled(job: JobId) {
         .remove(&job);
 }
 
-/// Kills every unproven group again; a Job whose groups are all proven
-/// empty joins the unconfirmed stops before its last group is forgotten.
-pub(crate) fn retry_unproven_groups() {
+/// An unproven group that a prober is checking. Its handles are out of the
+/// record for the check, so no lock is held while the group is signalled and
+/// polled, and its permit stays with the group. Dropped unsettled, as when a
+/// prober panics, the handles return to the record.
+struct Probe {
+    id: u64,
+    job: Option<JobId>,
+    group: Pid,
+    handles: Option<GroupHandles>,
+}
+
+/// Takes the handles of each record that `wanted` selects and no prober
+/// holds, and marks those records as probing.
+fn take_probes(wanted: impl Fn(&UnprovenGroup) -> bool) -> Vec<Probe> {
     let mut groups = UNPROVEN_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    if groups.is_empty() {
-        return;
-    }
-    let mut candidate_jobs = BTreeSet::new();
-    let mut remaining = Vec::new();
-    for mut entry in groups.drain(..) {
-        signal(entry.group, Signal::KILL);
-        match prove_empty_timeout(entry.group, &entry.sentinel, Duration::from_millis(50)) {
-            Ok(()) => {
-                if let Err(error) = entry.leader.wait() {
-                    log::warn!("failed to reap unproven process leader: {error}");
-                }
-                candidate_jobs.extend(entry.job);
-            }
-            Err(_) => {
-                remaining.push(entry);
-            }
+    let mut probes = Vec::new();
+    for entry in groups.iter_mut() {
+        if !wanted(entry) {
+            continue;
+        }
+        if let Some(handles) = entry.handles.take() {
+            probes.push(Probe {
+                id: entry.id,
+                job: entry.job,
+                group: entry.group,
+                handles: Some(handles),
+            });
         }
     }
-    for entry in &remaining {
-        if let Some(job) = entry.job {
-            candidate_jobs.remove(&job);
+    probes
+}
+
+impl Probe {
+    /// Signals the group and waits up to `timeout` for it to empty, then reaps
+    /// its leader. Called with no lock held.
+    fn prove(&mut self, timeout: Duration) -> bool {
+        let Some(handles) = self.handles.as_mut() else {
+            return false;
+        };
+        signal(self.group, Signal::KILL);
+        if prove_empty_timeout(self.group, &handles.sentinel, timeout).is_err() {
+            return false;
+        }
+        if let Err(error) = handles.leader.wait() {
+            log::warn!("failed to reap unproven process leader: {error}");
+        }
+        true
+    }
+
+    /// The group is proven empty: its record leaves, and its Job becomes an
+    /// unconfirmed stop if no other group of the Job remains. The stop is
+    /// inserted first, in the same critical section, so the Job never goes
+    /// untracked.
+    fn proven(mut self) {
+        let handles = self.handles.take();
+        let mut groups = UNPROVEN_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(job) = self.job
+            && !groups
+                .iter()
+                .any(|entry| entry.id != self.id && entry.job == Some(job))
+        {
+            UNCONFIRMED_STOPS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(job);
+        }
+        groups.retain(|entry| entry.id != self.id);
+        drop(groups);
+        drop(handles);
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        // Not proven, or unwinding: the handles go back, so the permit stays
+        // with a group that may still be alive.
+        let Some(handles) = self.handles.take() else {
+            return;
+        };
+        let mut groups = UNPROVEN_GROUPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = groups.iter_mut().find(|entry| entry.id == self.id) {
+            entry.handles = Some(handles);
         }
     }
-    UNCONFIRMED_STOPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .extend(candidate_jobs);
-    *groups = remaining;
+}
+
+/// Kills every unproven group again; a Job whose groups are all proven
+/// empty joins the unconfirmed stops before its last group is forgotten.
+pub(crate) fn retry_unproven_groups() {
+    for mut probe in take_probes(|_| true) {
+        if probe.prove(Duration::from_millis(50)) {
+            probe.proven();
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -746,13 +836,15 @@ impl Process {
             }
         }
         if let Err(error) = prove_empty(self.group, &self.sentinel) {
-            record_unproven_group(UnprovenGroup {
-                job: self.job,
-                group: self.group,
-                sentinel: self.sentinel,
-                leader: self.child,
-                _permit: self.permit,
-            });
+            record_unproven_group(
+                self.job,
+                self.group,
+                GroupHandles {
+                    sentinel: self.sentinel,
+                    leader: self.child,
+                    _permit: self.permit,
+                },
+            );
             drop(self.running);
             return Err(FinishError::NotProven(error));
         }
@@ -1071,6 +1163,10 @@ pub(crate) enum JobProof {
     Live {
         group: u32,
     },
+    /// Another prover is checking this group right now, so nothing is proven.
+    Checking {
+        group: u32,
+    },
     Untracked,
 }
 
@@ -1095,43 +1191,40 @@ pub(crate) fn prove_job(job: JobId) -> JobProof {
             return JobProof::Starting;
         }
     }
-    let mut groups = UNPROVEN_GROUPS
+    let probes = take_probes(|entry| entry.job == Some(job));
+    let tracked = !probes.is_empty();
+    for mut probe in probes {
+        if probe.prove(Duration::from_millis(50)) {
+            probe.proven();
+        }
+    }
+    let unproven = UNPROVEN_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let mut tracked = false;
-    let mut live = None;
-    let mut remaining = Vec::new();
-    for mut entry in groups.drain(..) {
-        if entry.job != Some(job) {
-            remaining.push(entry);
-            continue;
-        }
-        tracked = true;
-        signal(entry.group, Signal::KILL);
-        match prove_empty_timeout(entry.group, &entry.sentinel, Duration::from_millis(50)) {
-            Ok(()) => {
-                if let Err(error) = entry.leader.wait() {
-                    log::warn!("failed to reap unproven process leader: {error}");
-                }
-            }
-            Err(_) => {
-                live.get_or_insert(entry.group.as_raw_pid() as u32);
-                remaining.push(entry);
-            }
-        }
+    // A group of the Job still unproven answers for it: a live one, or one
+    // that another prover is checking.
+    if let Some(entry) = unproven
+        .iter()
+        .find(|entry| entry.job == Some(job) && !entry.probing())
+    {
+        return JobProof::Live {
+            group: entry.group.as_raw_pid() as u32,
+        };
     }
-    let proven = tracked || cleaned;
-    if live.is_none() && tracked {
-        UNCONFIRMED_STOPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(job);
+    if let Some(entry) = unproven.iter().find(|entry| entry.job == Some(job)) {
+        return JobProof::Checking {
+            group: entry.group.as_raw_pid() as u32,
+        };
     }
-    *groups = remaining;
-    match live {
-        Some(group) => JobProof::Live { group },
-        None if proven => JobProof::Proven,
-        None => JobProof::Untracked,
+    // A stop proven by the scheduler, not yet committed, is still proof.
+    let confirmed = UNCONFIRMED_STOPS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&job);
+    if tracked || cleaned || confirmed {
+        JobProof::Proven
+    } else {
+        JobProof::Untracked
     }
 }
 

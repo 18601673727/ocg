@@ -2362,17 +2362,6 @@ pub(crate) fn queue_counts(
     Ok((pending, ready, delayed, running))
 }
 
-/// How many held slots are quarantined: their Job's external work was left
-/// unresolved, and only a proven stop frees them.
-pub(crate) fn quarantined_slots(database: &Database) -> Result<u64, StorageError> {
-    let rx = read(database)?;
-    let mut quarantined = 0;
-    for entry in rx.open_table(HELD_SLOTS)?.iter()? {
-        quarantined += u64::from(entry?.1.value().1);
-    }
-    Ok(quarantined)
-}
-
 pub(crate) fn read_tool_stats(
     database: &Database,
 ) -> Result<Vec<crate::db::entities::ToolStatRecord>, StorageError> {
