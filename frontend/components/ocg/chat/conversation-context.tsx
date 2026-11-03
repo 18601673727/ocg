@@ -88,12 +88,19 @@ function describeDecisionAnswer(
   }
   return parts.join(" · ");
 }
-export function ConversationContext({ conversation }: { conversation: string }) {
+export function ConversationContext({
+  conversation,
+  agentProfile,
+}: {
+  conversation: string;
+  agentProfile?: string;
+}) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [profiles, setProfiles] = useState<ControlProfilesSnapshot>();
   const [status, setStatus] = useState<Status>();
+  const [inferredAgent, setInferredAgent] = useState<string | null>(null);
   const [model, setModel] = useState("");
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -120,6 +127,22 @@ export function ConversationContext({ conversation }: { conversation: string }) 
           setBefore(state.next_before);
           initialized.current = true;
         }
+        if (!agentProfile) {
+          try {
+            const page = await control!.readConversations({
+              limit: 100,
+              signal: controller.signal,
+            });
+            const found = page.conversations.find(
+              (c) => c.root_job === conversation || c.tip_job === conversation,
+            );
+            if (found?.agent) {
+              setInferredAgent((current) => current ?? found.agent);
+            }
+          } catch {
+            /* ignore */
+          }
+        }
       } catch (cause) {
         if (!controller.signal.aborted) setError(describeError(cause, t));
       } finally {
@@ -145,7 +168,7 @@ export function ConversationContext({ conversation }: { conversation: string }) 
       controller.abort();
       unsubscribe();
     };
-  }, [control, conversation, refresh, t]);
+  }, [agentProfile, control, conversation, refresh, t]);
   async function act(action: () => Promise<void>) {
     setBusy(true);
     setError(undefined);
@@ -164,6 +187,23 @@ export function ConversationContext({ conversation }: { conversation: string }) 
     ...older.filter((work) => !status?.work.some((current) => current.job === work.job)),
   ];
   const running = busy || Boolean(status?.steer_blocked_by);
+  const effectiveAgentId = agentProfile ?? inferredAgent ?? undefined;
+  const agent =
+    effectiveAgentId && profiles
+      ? profiles.agent_profiles.find((p) => p.id === effectiveAgentId)
+      : undefined;
+  const policySummarizer = status?.policy.summarization_model;
+  const allowedModelIds = new Set<string>();
+  if (policySummarizer) allowedModelIds.add(policySummarizer);
+  if (agent) {
+    for (const target of agent.llm_targets) allowedModelIds.add(target);
+  }
+  const selectableModels = profiles
+    ? selectableLlmProfiles(
+        profiles.llm_profiles.filter((p) => allowedModelIds.has(p.id)),
+        model,
+      )
+    : [];
   async function compact() {
     if (!control || !model) return;
     await act(async () => {
@@ -255,7 +295,7 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       value={model}
                       items={[
                         { value: "", label: t("context.summarizer") },
-                        ...selectableLlmProfiles(profiles.llm_profiles, model).map((model) => ({
+                        ...selectableModels.map((model) => ({
                           value: model.id,
                           label: model.enabled
                             ? model.name
@@ -274,7 +314,7 @@ export function ConversationContext({ conversation }: { conversation: string }) 
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="">{t("context.summarizer")}</SelectItem>
-                        {selectableLlmProfiles(profiles.llm_profiles, model).map((model) => (
+                        {selectableModels.map((model) => (
                           <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
                             {model.name}
                             {!model.enabled && ` (${t("settings.llm.disabled")})`}

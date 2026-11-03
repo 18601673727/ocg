@@ -225,7 +225,6 @@ export const en = {
     "Execution is paused until you select the target and projects. Select up to 16 projects; each creates one Job under its own permissions.",
   "chat.dispatch.target": "Execution target",
   "chat.dispatch.choose": "Choose an Agent or model",
-  "chat.dispatch.modelOnly": "Model only (no Agent profile)",
   "chat.dispatch.projectRequired": "Select at least one project for workspace execution.",
   "chat.dispatch.commands": "{count} allowed commands",
   "chat.dispatch.jobCount":
@@ -1310,7 +1309,6 @@ export const zh: Dictionary = {
     "任务已暂停，请现场选择执行目标和项目。最多选择 16 个项目，每个项目创建一个 Job，执行遵守各自项目的权限。",
   "chat.dispatch.target": "执行目标",
   "chat.dispatch.choose": "请选择 Agent 或模型",
-  "chat.dispatch.modelOnly": "直接使用模型（不绑定 Agent Profile）",
   "chat.dispatch.projectRequired": "工作区任务至少需要选择一个项目。",
   "chat.dispatch.commands": "{count} 条已允许命令",
   "chat.dispatch.jobCount": "将创建 {count} 个 Job，仍遵守项目命令权限与执行限制。",

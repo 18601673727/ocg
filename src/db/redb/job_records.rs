@@ -1,7 +1,7 @@
 use super::*;
 use crate::db::entities::{
-    ConfigKind, ExecutionConfiguration, OutcomeCause, OutcomeKind, OutcomeRecord, Submission,
-    Violation,
+    ConfigBody, ConfigKind, ExecutionConfiguration, OutcomeCause, OutcomeKind, OutcomeRecord,
+    Submission, Violation,
 };
 use ::redb::ReadableTableMetadata;
 
@@ -97,6 +97,27 @@ impl Batch {
                 "conversation_not_found",
                 "expected a conversation",
             ));
+        }
+        if automatic.is_none() {
+            let (policy, _, _) =
+                self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
+            let allowed_by_policy = policy.summarization_model == Some(model);
+            let allowed_by_agent = match row.kind {
+                JobKind::Group {
+                    agent: Some(agent_id),
+                    ..
+                } => match self.require_config_kind(agent_id, ConfigKind::Agent)?.body {
+                    ConfigBody::Agent(body) => body.models.contains(&model),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !allowed_by_policy && !allowed_by_agent {
+                return self.reject(Violation::InvalidValue(
+                    "summarizer_not_allowed",
+                    "use the compaction setting's Model or one the conversation's Agent lists",
+                ));
+            }
         }
         let model_row = self.require_config_kind(model, ConfigKind::Model)?;
         let crate::db::entities::ConfigBody::Model(model_body) = model_row.body else {
@@ -231,7 +252,7 @@ impl Batch {
             agent_profile: None,
             llm_profile: model.into(),
         };
-        let frozen = match self.freeze_configuration(configuration)? {
+        let frozen = match self.freeze_system_configuration(configuration)? {
             crate::db::entities::FrozenConfiguration::Generative(frozen) => frozen,
             crate::db::entities::FrozenConfiguration::Decision(_) => {
                 return self.corrupted("summarizer is not generative".into());

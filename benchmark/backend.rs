@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ocg::db::entities::{
-    CapabilitySet, Config, ConfigBody, ConnectionConfig, ExecutionConfiguration,
+    AgentConfig, CapabilitySet, Config, ConfigBody, ConnectionConfig, ExecutionConfiguration,
     ExecutionOperation, ExecutionPool, ExecutionPoolConfig, Executor, ExecutorId, FinalResult,
     IntermediateOutputKind, Job, JobFinalization, JobId, JobInputDraft, JobOutput, LlmTransport,
     ModelConfig,
@@ -378,11 +378,19 @@ fn executor(handle: &DatabaseHandle) -> Result<Target> {
         concurrency_limit: NonZeroU32::new(8).ok_or("invalid concurrency")?,
         llm_transports: BTreeSet::from([LlmTransport::OpenAiChatCompletions]),
     }))?;
+    let agent = block_on(handle.create_config(Config {
+        name: "benchmark agent".into(),
+        body: ConfigBody::Agent(AgentConfig {
+            instructions: Some("benchmark".into()),
+            models: vec![model],
+            ..Default::default()
+        }),
+    }))?;
     Ok(Target {
         executor,
         configuration: ExecutionConfiguration {
             reasoning_effort: None,
-            agent_profile: None,
+            agent_profile: Some(agent.into()),
             llm_profile: model.into(),
         },
     })
@@ -582,11 +590,19 @@ fn setup_scheduler_pools(handle: &DatabaseHandle) -> Result<Target> {
             enabled: true,
         }))?;
     }
+    let agent = block_on(handle.create_config(Config {
+        name: "benchmark agent".into(),
+        body: ConfigBody::Agent(AgentConfig {
+            instructions: Some("benchmark".into()),
+            models: vec![model],
+            ..Default::default()
+        }),
+    }))?;
     Ok(Target {
         executor,
         configuration: ExecutionConfiguration {
             reasoning_effort: None,
-            agent_profile: None,
+            agent_profile: Some(agent.into()),
             llm_profile: model.into(),
         },
     })

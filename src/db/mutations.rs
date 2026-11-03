@@ -81,8 +81,9 @@ fn spec_of(batch: &mut Batch, job: &Job, allow_stored: bool) -> Result<JobSpec, 
             "turns are created by append or open_group",
         ));
     }
+    // CLI is being redesigned separately.
     let frozen = match job.configuration {
-        Some(configuration) => match batch.freeze_configuration(configuration)? {
+        Some(configuration) => match batch.freeze_system_configuration(configuration)? {
             FrozenConfiguration::Generative(frozen) => Some(frozen),
             FrozenConfiguration::Decision(_) => {
                 return batch.reject(Violation::InvalidValue(

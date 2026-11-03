@@ -328,35 +328,77 @@ impl Batch {
                         JobExecution::Frozen(frozen)
                     }
                     None => {
-                        let Some(tip) = tip else {
-                            return self.reject(Violation::InvalidValue(
-                                "configuration",
-                                "first turn requires configuration",
-                            ));
-                        };
-                        let tip = self.require_job(tip)?;
-                        match tip.kind {
-                            JobKind::Execution {
-                                execution: JobExecution::Ref(owner),
-                                ..
-                            } => JobExecution::Ref(owner),
-                            JobKind::Execution {
-                                execution: JobExecution::Frozen(_),
-                                ..
-                            } => JobExecution::Ref(tip.id),
-                            JobKind::Execution {
-                                execution:
-                                    JobExecution::Decision(_) | JobExecution::Summarization(_),
-                                ..
-                            } => {
+                        let inherited = (|| {
+                            if let JobKind::Group { origin, agent, .. } = &row.kind {
+                                match origin {
+                                    Origin::User | Origin::Agent { .. } => match agent {
+                                        None => {
+                                            return self.reject(Violation::InvalidValue(
+                                                "conversation_has_no_agent",
+                                                "this conversation has no Agent; start a new one",
+                                            ));
+                                        }
+                                        Some(agent_id) => {
+                                            let Some(tip) = tip else {
+                                                return self.reject(Violation::InvalidValue(
+                                                    "configuration",
+                                                    "first turn requires configuration",
+                                                ));
+                                            };
+                                            let tip = self.require_job(tip)?;
+                                            let (frozen, _, _) = self.job_execution(&tip)?;
+                                            let model = frozen.llm.model.id;
+                                            let available = matches!(
+                                                self.require_config_kind(*agent_id, ConfigKind::Agent)?.body,
+                                                ConfigBody::Agent(ref body) if body.models.contains(&model)
+                                            );
+                                            if !available {
+                                                return self.reject(
+                                                    Violation::NotAConfiguredTarget {
+                                                        agent_profile: (*agent_id).into(),
+                                                        llm_profile: model.into(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    },
+                                    Origin::System => {}
+                                }
+                            }
+                            let Some(tip) = tip else {
                                 return self.reject(Violation::InvalidValue(
+                                    "configuration",
+                                    "first turn requires configuration",
+                                ));
+                            };
+                            let tip = self.require_job(tip)?;
+                            match tip.kind {
+                                JobKind::Execution {
+                                    execution: JobExecution::Ref(owner),
+                                    ..
+                                } => Ok(JobExecution::Ref(owner)),
+                                JobKind::Execution {
+                                    execution: JobExecution::Frozen(_),
+                                    ..
+                                } => Ok(JobExecution::Ref(tip.id)),
+                                JobKind::Execution {
+                                    execution:
+                                        JobExecution::Decision(_) | JobExecution::Summarization(_),
+                                    ..
+                                } => self.reject(Violation::InvalidValue(
                                     "execution",
                                     "decision work requires the typed decision runtime",
-                                ));
+                                )),
+                                JobKind::Group { .. } => {
+                                    self.corrupted("conversation tip is not a turn".into())
+                                }
                             }
-                            JobKind::Group { .. } => {
-                                return self.corrupted("conversation tip is not a turn".into());
+                        })();
+                        match inherited {
+                            Err(BatchError(Failure::Rejected(_))) if event => {
+                                return self.attention_fallback(conversation, entry);
                             }
+                            result => result?,
                         }
                     }
                 }

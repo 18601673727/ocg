@@ -26,7 +26,7 @@ impl Batch {
                 "the selected model is disabled",
             ));
         }
-        let ConfigBody::Model(body) = &record.body else {
+        let ConfigBody::Model(_) = &record.body else {
             return self.corrupted("invalid dispatch model".into());
         };
         if let Some(agent) = &selection.agent {
@@ -47,13 +47,10 @@ impl Batch {
             if agent.workspace_grant().is_some() && selection.projects.is_empty() {
                 return self.reject(Violation::ProjectRequired);
             }
-        } else if !body.declared_capabilities.contains(&ModelCapability::Chat)
-            || !body.declared_capabilities.contains(&ModelCapability::Tools)
-            || selection.projects.is_empty()
-        {
+        } else {
             return self.reject(Violation::InvalidValue(
                 "dispatch_selection",
-                "model-only workspace jobs require chat, tools and a project",
+                "select an Agent that lists this Model",
             ));
         }
         let mut projects = BTreeSet::new();

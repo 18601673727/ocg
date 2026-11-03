@@ -78,6 +78,7 @@ export function ChatInspector({
                   <ConversationContext
                     key={`context:${session.conversationId}`}
                     conversation={session.conversationId}
+                    agentProfile={session.agentProfile}
                   />
                 )}
               </dl>

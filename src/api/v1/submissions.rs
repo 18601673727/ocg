@@ -108,6 +108,11 @@ const PROFILE_NOT_FOUND: Refusal = Refusal::new(
     "llm_profile_not_found",
     "no such LLM Profile; nothing was submitted",
 );
+const AGENT_PROFILE_REQUIRED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "agent_profile_required",
+    "name an Agent that lists this Model",
+);
 const AGENT_PROFILE_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "agent_profile_not_found",
@@ -201,11 +206,11 @@ const ATTACHMENT_UNAVAILABLE: Refusal = Refusal::new(
 );
 
 /// A validated submission: an existing LLM Profile and Executor, by their
-/// persisted identities, an objective and, optionally, an Agent Profile
-/// that targets the LLM Profile, a Job name, a Project, and a completed
-/// predecessor Job. Nothing else can be submitted: the Provider, its
-/// credential and the model come from the Profile; Workspace tools come from
-/// the frozen Agent grant and the Project.
+/// persisted identities, an objective and an Agent Profile that targets the
+/// LLM Profile, a Job name, a Project, and a completed predecessor Job.
+/// Nothing else can be submitted: the Provider, its credential and the model
+/// come from the Profile; Workspace tools come from the frozen Agent grant and
+/// the Project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct JobRequest {
     reasoning_effort: Option<crate::db::entities::ReasoningEffort>,
@@ -229,6 +234,8 @@ pub(super) struct JobRequest {
 #[serde(deny_unknown_fields)]
 struct SubmissionInput {
     reasoning_effort: Option<String>,
+    /// The Agent that lists this Model. Every generative turn requires an
+    /// Agent.
     #[serde(default)]
     agent_profile: Option<String>,
     #[serde(default)]
@@ -1582,24 +1589,22 @@ pub(super) async fn check_configuration(
             "the selected model does not support the requested reasoning effort",
         ));
     }
-    let mut tool_grant = false;
-    if let Some(agent_profile) = request.agent_profile {
-        match database.config(agent_profile.into()).await? {
-            Some(ConfigRecord {
-                body: ConfigBody::Agent(agent),
-                ..
-            }) => {
-                if !agent.models.contains(&request.llm_profile.into())
-                    || !agent.supports_model(&ConfigBody::Model(llm.clone()))
-                    || (!agent.manages_jobs() && agent.workspace_grant().is_none())
-                {
-                    return Err(AGENT_TARGET_MISMATCH);
-                }
-                tool_grant = agent.workspace_grant().is_some();
+    let agent_profile = request.agent_profile.ok_or(AGENT_PROFILE_REQUIRED)?;
+    let tool_grant = match database.config(agent_profile.into()).await? {
+        Some(ConfigRecord {
+            body: ConfigBody::Agent(agent),
+            ..
+        }) => {
+            if !agent.models.contains(&request.llm_profile.into())
+                || !agent.supports_model(&ConfigBody::Model(llm.clone()))
+                || (!agent.manages_jobs() && agent.workspace_grant().is_none())
+            {
+                return Err(AGENT_TARGET_MISMATCH);
             }
-            _ => return Err(AGENT_PROFILE_NOT_FOUND),
+            agent.workspace_grant().is_some()
         }
-    }
+        _ => return Err(AGENT_PROFILE_NOT_FOUND),
+    };
     if database.executor(request.executor).await?.is_none() {
         return Err(EXECUTOR_NOT_FOUND);
     }
@@ -1799,6 +1804,10 @@ async fn normalize(database: &DatabaseHandle, request: &mut JobRequest) -> Resul
         }
         if row.children_closed_at.is_some() {
             return Err(conversation_refusal("conversation_closing"));
+        }
+        if agent.is_none() {
+            return Err(conversation_refusal("conversation_has_no_agent")
+                .with_message("this conversation has no Agent; start a new one"));
         }
         if request.agent_profile.is_some() && request.agent_profile.map(Into::into) != agent {
             return Err(conversation_refusal("agent_mismatch"));

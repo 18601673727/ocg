@@ -440,6 +440,31 @@ impl Batch {
         &mut self,
         configuration: ExecutionConfiguration,
     ) -> Result<FrozenConfiguration, BatchError> {
+        if configuration.agent_profile.is_none() {
+            return self.reject(Violation::InvalidValue(
+                "agent_profile_required",
+                "name an Agent that lists this Model",
+            ));
+        }
+        crate::service::jobs::ConfigurationResolver::new(|id| {
+            self.config(id).map(|row| row.map(reader::config_record))
+        })
+        .freeze_configuration(configuration)
+    }
+
+    /// Freezes a configuration without requiring an Agent.
+    ///
+    /// The only callers of this method are:
+    /// - the compaction summarizer (`job_records.rs:229-240`);
+    /// - CLI process turns, through `spec_of` (`db/mutations.rs:85`).
+    ///
+    /// Title jobs (`job_records.rs:2195-2257`) reuse the parent turn's Model
+    /// with the Agent stripped, and never freeze; they are a derivative the
+    /// Agent already validated.
+    pub(crate) fn freeze_system_configuration(
+        &mut self,
+        configuration: ExecutionConfiguration,
+    ) -> Result<FrozenConfiguration, BatchError> {
         crate::service::jobs::ConfigurationResolver::new(|id| {
             self.config(id).map(|row| row.map(reader::config_record))
         })

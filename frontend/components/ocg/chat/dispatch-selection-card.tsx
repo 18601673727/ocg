@@ -166,12 +166,6 @@ export function DispatchSelectionCard({
                 .map((capability) => t(`settings.agent.capability.${capability}`))
                 .join(" / ")}`,
             })),
-            ...models
-              .filter((model) => model.declared_capabilities.includes("tools"))
-              .map((model) => ({
-                value: `model:${model.id}`,
-                label: `${model.name} · ${model.model}`,
-              })),
           ]}
           disabled={disabled || !catalog}
           onValueChange={(next) => {
@@ -195,16 +189,6 @@ export function DispatchSelectionCard({
                     .join(" / ")}
                 </SelectItem>
               ))}
-            </SelectGroup>
-            <SelectGroup>
-              <SelectLabel>{t("chat.dispatch.modelOnly")}</SelectLabel>
-              {models
-                .filter((model) => model.declared_capabilities.includes("tools"))
-                .map((model) => (
-                  <SelectItem key={model.id} value={`model:${model.id}`}>
-                    {model.name} · {model.model}
-                  </SelectItem>
-                ))}
             </SelectGroup>
           </SelectContent>
         </Select>
