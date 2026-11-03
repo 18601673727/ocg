@@ -1700,11 +1700,27 @@ pub(crate) fn read_profile_page(
     let mut credentials = BTreeSet::new();
     if let Some(key) = key {
         let table = rx.open_table(CREDENTIALS)?;
-        for entry in table.iter()? {
-            let (reference, bytes) = entry?;
-            let reference = reference.value();
-            if key.decrypt(reference, bytes.value())?.is_some() {
-                credentials.insert(reference.to_owned());
+        let references: BTreeSet<&str> = connections
+            .values()
+            .filter_map(|(_, connection, _)| connection.credential_ref.as_deref())
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+            .collect();
+        let mut warned = false;
+        for reference in references {
+            let Some(bytes) = table.get(reference)? else {
+                continue;
+            };
+            match key.holds(reference, bytes.value()) {
+                Ok(true) => {
+                    credentials.insert(reference.to_owned());
+                }
+                Ok(false) => {}
+                Err(_) if warned => {}
+                Err(_) => {
+                    warned = true;
+                    log::warn!("credential record {reference} could not be decoded");
+                }
             }
         }
     }

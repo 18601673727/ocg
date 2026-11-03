@@ -3,8 +3,8 @@ use std::error::Error;
 use std::fs::{self, DirBuilder};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::DirBuilderExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -111,9 +111,89 @@ async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
     Ok(())
 }
 
+/// A release staged by the installer's `--stage` mode; removed on drop so
+/// every success and failure path cleans it up.
+struct StageDir(PathBuf);
+
+impl Drop for StageDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Download {
     version: String,
     installer: Vec<u8>,
+    stage: Option<StageDir>,
+}
+
+fn remove_stale_stages(prefix: &Path) {
+    let Ok(entries) = fs::read_dir(prefix) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("update-stage-")
+        {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+        let _ = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+    }
+}
+
+/// Downloads, verifies and extracts the release into a fresh stage directory
+/// using the target installer's `--stage` mode, so database writes stay enabled.
+async fn stage_release(install: &Install, version: &str, installer: &[u8]) -> Result<StageDir> {
+    let dir = install
+        .prefix
+        .join(format!("update-stage-{}", uuid::Uuid::now_v7()));
+    let guard = StageDir(dir.clone());
+    let prefix = install.prefix.clone();
+    let version = version.to_owned();
+    let installer = installer.to_vec();
+    ntex::rt::spawn_blocking(move || -> std::result::Result<(), String> {
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|error| error.to_string())?;
+        let scripts = std::env::temp_dir().join(format!("ocg-update-{}", uuid::Uuid::now_v7()));
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&scripts)
+            .map_err(|error| error.to_string())?;
+        let result = (|| -> Result<(ExitStatus, Option<String>)> {
+            let file = scripts.join("install.sh");
+            fs::write(&file, &installer)?;
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg(file)
+                .arg("--stage")
+                .arg(&dir)
+                .arg("--version")
+                .arg(&version)
+                .arg("--prefix")
+                .arg(&prefix);
+            run_collecting(command)
+        })();
+        let _ = fs::remove_dir_all(&scripts);
+        let (status, message) = result.map_err(|error| error.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(message.unwrap_or_else(|| "release staging failed".to_owned()))
+        }
+    })
+    .await
+    .map_err(|_| "release staging stopped")??;
+    Ok(guard)
 }
 async fn prepare(
     install: &Install,
@@ -159,12 +239,22 @@ async fn prepare(
     if actual != checksum {
         return Err("installer checksum mismatch".into());
     }
+    // Older installers have no staging mode: download after the pause as before.
+    let stage = if String::from_utf8_lossy(&installer).contains("--stage") {
+        Some(stage_release(install, &version, &installer).await?)
+    } else {
+        None
+    };
     if !yes && let Some(progress) = state.as_mut() {
         ntex::time::timeout(Duration::from_secs(300), wait_jobs(install, progress))
             .await
             .map_err(|_| "Jobs did not drain within five minutes; use --yes to override")??;
     }
-    Ok(Some(Download { version, installer }))
+    Ok(Some(Download {
+        version,
+        installer,
+        stage,
+    }))
 }
 
 pub(super) fn run(args: Vec<String>) -> Result<()> {
@@ -201,6 +291,9 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     };
+    if !check {
+        remove_stale_stages(&install.prefix);
+    }
     let mut state = if !check
         && version
             .as_deref()
@@ -318,9 +411,16 @@ fn run_installer(
         .arg(&download.version)
         .arg("--prefix")
         .arg(prefix);
+    if let Some(stage) = &download.stage {
+        command.arg("--from").arg(&stage.0);
+    }
     if !service.is_file() {
         command.arg("--no-service");
     }
+    run_collecting(command)
+}
+
+fn run_collecting(mut command: Command) -> Result<(ExitStatus, Option<String>)> {
     command.stderr(Stdio::piped());
     let mut child = command.spawn()?;
     let stderr = child.stderr.take().ok_or("installer stderr unavailable")?;

@@ -487,7 +487,10 @@ async fn resolve_direct_web_target(
 /// Checks a target before opening a CONNECT tunnel through the proxy. The
 /// proxy's own address is never checked (it is often 127.0.0.1), and local DNS
 /// is not required because proxy-only networks may not have working local
-/// resolution; DNS rebinding through the proxy is out of scope.
+/// resolution; DNS rebinding through the proxy is out of scope. Intranet-style
+/// names (no dot, or `.local`, `.corp`, ...) are refused by literal check even
+/// when local DNS cannot resolve them; other names that local DNS cannot
+/// resolve are still allowed through the proxy.
 async fn check_proxied_web_target(
     host: &str,
     port: u16,
@@ -515,15 +518,26 @@ fn is_non_public_host_literal(host: &str) -> bool {
     }
     let unzoned = bare.split_once('%').map_or(bare.as_str(), |(ip, _)| ip);
     if let Ok(ipv6) = unzoned.parse::<Ipv6Addr>() {
-        return !is_public_ipv6(ipv6);
+        return !is_public_ipv6(ipv6)
+            || embedded_ipv4(ipv6.segments()).is_some_and(is_fake_ip_ipv4);
     }
     if host.trim().starts_with('[') {
         return true;
     }
     if let Some(ipv4) = parse_inet_aton(&bare) {
-        return !is_public_ipv4(ipv4);
+        return !is_public_ipv4(ipv4) || is_fake_ip_ipv4(ipv4);
     }
-    false
+    !bare.contains('.')
+        || [
+            ".internal",
+            ".local",
+            ".lan",
+            ".home.arpa",
+            ".corp",
+            ".intranet",
+        ]
+        .iter()
+        .any(|suffix| bare.ends_with(suffix))
 }
 
 fn parse_inet_aton_part(part: &str) -> Option<u32> {
@@ -568,9 +582,10 @@ fn is_public_ip(ip: IpAddr) -> bool {
 }
 
 fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    // 198.18.0.0/15 is intentionally allowed: Clash/Surge fake-IP DNS hands out
-    // these addresses for every name, so refusing them would break web tools
-    // for those users.
+    // 198.18.0.0/15 is intentionally allowed for resolved names: Clash/Surge
+    // fake-IP DNS hands out these addresses for every name, so refusing them
+    // would break web tools for those users. Only URL host literals in that
+    // range are refused (see `is_non_public_host_literal`).
     let [a, b, c, d] = ip.octets();
     !(a == 0
         || a == 10
@@ -587,26 +602,38 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         || (a == 255 && b == 255 && c == 255 && d == 255))
 }
 
+fn embedded_ipv4(s: [u16; 8]) -> Option<Ipv4Addr> {
+    let from_tail = || Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    if s[0..6] == [0, 0, 0, 0, 0, 0xffff]
+        || s[0..6] == [0x0064, 0xff9b, 0, 0, 0, 0]
+        || s[0..6] == [0, 0, 0, 0, 0xffff, 0]
+        || s[0..6] == [0; 6]
+    {
+        Some(from_tail())
+    } else if s[0] == 0x2002 {
+        Some(Ipv4Addr::new(
+            (s[1] >> 8) as u8,
+            s[1] as u8,
+            (s[2] >> 8) as u8,
+            s[2] as u8,
+        ))
+    } else {
+        None
+    }
+}
+
+fn is_fake_ip_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 198 && (b & 0xfe) == 18
+}
+
 fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    let embedded_v4 =
-        if s[0..6] == [0, 0, 0, 0, 0, 0xffff] || s[0..6] == [0x0064, 0xff9b, 0, 0, 0, 0] {
-            Some(Ipv4Addr::new(
-                (s[6] >> 8) as u8,
-                s[6] as u8,
-                (s[7] >> 8) as u8,
-                s[7] as u8,
-            ))
-        } else if s[0] == 0x2002 {
-            Some(Ipv4Addr::new(
-                (s[1] >> 8) as u8,
-                s[1] as u8,
-                (s[2] >> 8) as u8,
-                s[2] as u8,
-            ))
-        } else {
-            None
-        };
+    // Local-use NAT64 64:ff9b:1::/48.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1 {
+        return false;
+    }
+    let embedded_v4 = embedded_ipv4(s);
     if let Some(v4) = embedded_v4 {
         return is_public_ipv4(v4);
     }

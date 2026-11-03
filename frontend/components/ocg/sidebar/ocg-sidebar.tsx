@@ -682,41 +682,42 @@ export function OcgSidebar({
             <DismissibleNotice message={projectError} className="mb-2 px-2 text-xs" />
           )}
           <ul className="space-y-3">
-            {groups.map((group) => (
-              <li key={group.id} className="min-w-0">
-                <button
-                  type="button"
-                  className="mb-1 flex h-8 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-[13px] text-muted-foreground hover:bg-sidebar-accent focus-visible:outline-ring"
-                  title={group.name}
-                  aria-expanded={!collapsedGroups[group.id]}
-                  onClick={() =>
-                    setCollapsedGroups((current) => ({
-                      ...current,
-                      [group.id]: !current[group.id],
-                    }))
-                  }
-                >
-                  <FolderOpen className="size-4 shrink-0" aria-hidden="true" />
-                  <span className="min-w-0 flex-1 truncate">{group.name}</span>
-                  <ChevronDown
-                    className={cn(
-                      "size-3.5 shrink-0 transition-transform",
-                      collapsedGroups[group.id] && "-rotate-90",
-                    )}
-                    aria-hidden="true"
-                  />
-                </button>
-                {!collapsedGroups[group.id] && (
-                  <ul className="space-y-0.5">
-                    {group.items
-                      .filter(
-                        (session, index) =>
-                          index < (groupLimits[group.id] ?? GROUP_PAGE_SIZE) ||
-                          session.id === activeSessionId ||
-                          session.conversationId === activeRoot ||
-                          session.id === activeRoot,
-                      )
-                      .map((session) => {
+            {groups.map((group) => {
+              const groupLimit = groupLimits[group.id] ?? GROUP_PAGE_SIZE;
+              const visibleItems = group.items.filter(
+                (session, index) =>
+                  index < groupLimit ||
+                  session.id === activeSessionId ||
+                  session.conversationId === activeRoot ||
+                  session.id === activeRoot,
+              );
+              return (
+                <li key={group.id} className="min-w-0">
+                  <button
+                    type="button"
+                    className="mb-1 flex h-8 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-[13px] text-muted-foreground hover:bg-sidebar-accent focus-visible:outline-ring"
+                    title={group.name}
+                    aria-expanded={!collapsedGroups[group.id]}
+                    onClick={() =>
+                      setCollapsedGroups((current) => ({
+                        ...current,
+                        [group.id]: !current[group.id],
+                      }))
+                    }
+                  >
+                    <FolderOpen className="size-4 shrink-0" aria-hidden="true" />
+                    <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                    <ChevronDown
+                      className={cn(
+                        "size-3.5 shrink-0 transition-transform",
+                        collapsedGroups[group.id] && "-rotate-90",
+                      )}
+                      aria-hidden="true"
+                    />
+                  </button>
+                  {!collapsedGroups[group.id] && (
+                    <ul className="space-y-0.5">
+                      {visibleItems.map((session) => {
                         const active =
                           session.id === activeSessionId ||
                           session.conversationId === activeRoot ||
@@ -910,26 +911,28 @@ export function OcgSidebar({
                           </li>
                         );
                       })}
-                    {group.items.length > (groupLimits[group.id] ?? GROUP_PAGE_SIZE) && (
-                      <li>
-                        <button
-                          type="button"
-                          className="ml-9 rounded py-1 text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:outline-ring"
-                          onClick={() =>
-                            setGroupLimits((current) => ({
-                              ...current,
-                              [group.id]: (current[group.id] ?? GROUP_PAGE_SIZE) + GROUP_PAGE_SIZE,
-                            }))
-                          }
-                        >
-                          {t("common.loadMore")}
-                        </button>
-                      </li>
-                    )}
-                  </ul>
-                )}
-              </li>
-            ))}
+                      {visibleItems.length < group.items.length && (
+                        <li>
+                          <button
+                            type="button"
+                            className="ml-9 rounded py-1 text-xs text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-foreground focus-visible:outline-ring"
+                            onClick={() =>
+                              setGroupLimits((current) => ({
+                                ...current,
+                                [group.id]:
+                                  (current[group.id] ?? GROUP_PAGE_SIZE) + GROUP_PAGE_SIZE,
+                              }))
+                            }
+                          >
+                            {t("common.loadMore")}
+                          </button>
+                        </li>
+                      )}
+                    </ul>
+                  )}
+                </li>
+              );
+            })}
           </ul>
           {conversationList === "loading" && (
             <ul aria-label={t("common.loading")} className="mt-2 space-y-1">

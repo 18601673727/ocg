@@ -151,7 +151,7 @@ finish_install() {
 }
 
 main() {
-    usage='Usage: install.sh [--version X.Y.Z] [--prefix DIR] [--port N] [--no-service] [--uninstall] [--help]
+    usage='Usage: install.sh [--version X.Y.Z] [--prefix DIR] [--port N] [--no-service] [--uninstall] [--stage DIR] [--from DIR] [--help]
 Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releases/latest/download/install.sh | sh -s -- --version X.Y.Z'
     version=
     version_set=false
@@ -160,15 +160,19 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     port_set=false
     service=true
     uninstall=false
+    stage_dir=
+    from_dir=
     while [ "$#" -gt 0 ]; do
         case $1 in
-            --version|--prefix|--port)
+            --version|--prefix|--port|--stage|--from)
                 option=$1
                 [ "$#" -ge 2 ] || { printf '%s\n' "$usage" >&2; exit 1; }
                 case $option in
                     --version) version=$2; version_set=true ;;
                     --prefix) prefix=$2 ;;
                     --port) port=$2; port_set=true ;;
+                    --stage) stage_dir=$2 ;;
+                    --from) from_dir=$2 ;;
                 esac
                 shift 2
                 ;;
@@ -179,6 +183,22 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         esac
     done
 
+    if [ -n "$stage_dir" ] && [ -n "$from_dir" ]; then
+        printf '%s\n' '--stage and --from cannot be combined.' >&2
+        exit 1
+    fi
+    if [ -n "$stage_dir$from_dir" ] && [ "$uninstall" = true ]; then
+        printf '%s\n' '--stage and --from cannot be used with --uninstall.' >&2
+        exit 1
+    fi
+    if [ -n "$stage_dir$from_dir" ] && [ "$version_set" = false ]; then
+        printf '%s\n' '--stage and --from require --version.' >&2
+        exit 1
+    fi
+    case $stage_dir$from_dir in
+        ''|/*) ;;
+        *) printf '%s\n' 'The --stage and --from directories must be absolute paths.' >&2; exit 1 ;;
+    esac
     for tool in curl tar uname mktemp od tr sed id awk cp mkdir rm ln sleep readlink chmod date mv; do
         command -v "$tool" >/dev/null 2>&1 || { printf 'Missing required tool: %s\n' "$tool" >&2; exit 1; }
     done
@@ -356,40 +376,56 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     else
         base=${release_root%/download}/latest/download
     fi
-    if ! curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" </dev/null; then
-        printf 'Failed to download release checksums from %s\n' "$base" >&2
-        exit 1
+    work=$tmp
+    if [ -n "$stage_dir" ]; then
+        if [ -L "$stage_dir" ] || [ ! -d "$stage_dir" ] || [ -n "$(ls -A "$stage_dir" </dev/null)" ]; then
+            printf '%s\n' 'The --stage directory must be an existing, empty, non-symlink directory.' >&2
+            exit 1
+        fi
+        work=$stage_dir
     fi
-    if [ "$version_set" = false ]; then
-        version=$(awk -v target="$target" '
-            { name=$2; sub(/^\*/, "", name); suffix="-" target ".tar.gz";
-              if (substr(name,1,5)=="ocg-v" && substr(name,length(name)-length(suffix)+1)==suffix) {
-                  print substr(name,6,length(name)-5-length(suffix)); count++
-              } }
-            END { if (count != 1) exit 1 }
-        ' "$tmp/SHA256SUMS" </dev/null) || { printf 'No unique archive for %s in SHA256SUMS.\n' "$target" >&2; exit 1; }
-        valid=$(printf '%s\n' "$version" | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[0-9A-Za-z][0-9A-Za-z.-]*\)\{0,1\}$/p')
-        [ "$valid" = "$version" ] || { printf 'Invalid release version: %s\n' "$version" >&2; exit 1; }
-    fi
-    name=ocg-v$version-$target
-    archive=$name.tar.gz
-    expected=$(awk -v name="$archive" '{ file=$2; sub(/^\*/, "", file); if (file==name) { print $1; count++ } } END { if (count != 1) exit 1 }' "$tmp/SHA256SUMS" </dev/null) || { printf 'Missing or duplicate checksum for %s\n' "$archive" >&2; exit 1; }
-    if ! curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$base/$archive" -o "$tmp/$archive" </dev/null; then
-        printf 'Failed to download %s\n' "$archive" >&2
-        exit 1
-    fi
-    if [ "$hash_tool" = sha256sum ]; then
-        actual=$(sha256sum "$tmp/$archive" </dev/null | awk '{print $1}')
+    if [ -n "$from_dir" ]; then
+        name=ocg-v$version-$target
+        [ -d "$from_dir/$name" ] && [ ! -L "$from_dir/$name" ] || { printf 'Missing staged release in %s\n' "$from_dir" >&2; exit 1; }
+        release_dir=$from_dir/$name
     else
-        actual=$(shasum -a 256 "$tmp/$archive" </dev/null | awk '{print $1}')
+        if ! curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$base/SHA256SUMS" -o "$work/SHA256SUMS" </dev/null; then
+            printf 'Failed to download release checksums from %s\n' "$base" >&2
+            exit 1
+        fi
+        if [ "$version_set" = false ]; then
+            version=$(awk -v target="$target" '
+                { name=$2; sub(/^\*/, "", name); suffix="-" target ".tar.gz";
+                  if (substr(name,1,5)=="ocg-v" && substr(name,length(name)-length(suffix)+1)==suffix) {
+                      print substr(name,6,length(name)-5-length(suffix)); count++
+                  } }
+                END { if (count != 1) exit 1 }
+            ' "$work/SHA256SUMS" </dev/null) || { printf 'No unique archive for %s in SHA256SUMS.\n' "$target" >&2; exit 1; }
+            valid=$(printf '%s\n' "$version" | sed -n '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[0-9A-Za-z][0-9A-Za-z.-]*\)\{0,1\}$/p')
+            [ "$valid" = "$version" ] || { printf 'Invalid release version: %s\n' "$version" >&2; exit 1; }
+        fi
+        name=ocg-v$version-$target
+        archive=$name.tar.gz
+        expected=$(awk -v name="$archive" '{ file=$2; sub(/^\*/, "", file); if (file==name) { print $1; count++ } } END { if (count != 1) exit 1 }' "$work/SHA256SUMS" </dev/null) || { printf 'Missing or duplicate checksum for %s\n' "$archive" >&2; exit 1; }
+        if ! curl -fsSL --connect-timeout 30 --speed-limit 1024 --speed-time 60 "$base/$archive" -o "$work/$archive" </dev/null; then
+            printf 'Failed to download %s\n' "$archive" >&2
+            exit 1
+        fi
+        if [ "$hash_tool" = sha256sum ]; then
+            actual=$(sha256sum "$work/$archive" </dev/null | awk '{print $1}')
+        else
+            actual=$(shasum -a 256 "$work/$archive" </dev/null | awk '{print $1}')
+        fi
+        [ "$actual" = "$expected" ] || { printf 'Checksum mismatch for %s\n' "$archive" >&2; exit 1; }
+        tar -xzf "$work/$archive" -C "$work" </dev/null
+        release_dir=$work/$name
     fi
-    [ "$actual" = "$expected" ] || { printf 'Checksum mismatch for %s\n' "$archive" >&2; exit 1; }
-    tar -xzf "$tmp/$archive" -C "$tmp" </dev/null
-    if ! binary_version=$("$tmp/$name/ocg" --version </dev/null 2>&1); then
+    if ! binary_version=$("$release_dir/ocg" --version </dev/null 2>&1); then
         if [ "$os" = Linux ]; then printf '%s\n' 'Unable to run OCG; this build needs glibc 2.34 or newer.' >&2; else printf '%s\n' 'Unable to run OCG.' >&2; fi
         exit 1
     fi
     [ "$binary_version" = "ocg $version" ] || { printf 'Unexpected binary version: %s\n' "$binary_version" >&2; exit 1; }
+    if [ -n "$stage_dir" ]; then exit 0; fi
 
     if [ -f "$settings" ]; then
         data=$(sed -n "s/^OCG_DATA_DIR='\(.*\)'$/\1/p" "$settings" </dev/null)
@@ -431,7 +467,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         exit 1
     fi
     staged=$(mktemp -d "$prefix/versions/$version-XXXXXX" </dev/null)
-    cp -R "$tmp/$name/." "$staged/" </dev/null
+    cp -R "$release_dir/." "$staged/" </dev/null
     staged_version=$("$staged/ocg" --version </dev/null)
     [ "$staged_version" = "ocg $version" ] || { printf '%s\n' 'Staged binary has the wrong version.' >&2; exit 1; }
     next_target=versions/${staged##*/}
@@ -514,7 +550,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     fi
     if [ -f "$data/ocg.redb" ]; then
         check_ok=false
-        if result=$(OCG_DATA_DIR="$data" "$tmp/$name/ocg" migrate --check </dev/null 2>&1); then check_ok=true; fi
+        if result=$(OCG_DATA_DIR="$data" "$release_dir/ocg" migrate --check </dev/null 2>&1); then check_ok=true; fi
         case $result in
             *'no migration required'*) if [ "$check_ok" = true ]; then result=; fi ;;
         esac

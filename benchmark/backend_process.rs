@@ -216,20 +216,29 @@ fn read_handshake(
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
+        // After the handshake the receiver is dropped; keep draining the pipe
+        // so the backend never blocks on a full stdout.
+        let mut receiving = true;
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => {
-                    let _ = sender.send(Err("backend standard output closed".to_owned()));
+                    if receiving {
+                        let _ = sender.send(Err("backend standard output closed".to_owned()));
+                    }
                     return;
                 }
                 Ok(_) => {
-                    if sender.send(Ok(line)).is_err() {
-                        return;
+                    if receiving && sender.send(Ok(line)).is_err() {
+                        receiving = false;
                     }
                 }
                 Err(error) => {
-                    let _ = sender.send(Err(error.to_string()));
+                    if receiving {
+                        let _ = sender.send(Err(error.to_string()));
+                    } else {
+                        eprintln!("backend {pid}: standard output read failed: {error}");
+                    }
                     return;
                 }
             }

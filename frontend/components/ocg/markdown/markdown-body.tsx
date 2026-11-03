@@ -111,7 +111,13 @@ function MermaidDiagram({
         aria-label={diagramLabel}
       />
       {svg && !error && (
-        <Dialog open={open} onOpenChange={setOpen}>
+        <Dialog
+          open={open}
+          onOpenChange={(next) => {
+            setOpen(next);
+            if (!next) setZoom(1);
+          }}
+        >
           <DialogTrigger
             render={
               <button
@@ -806,7 +812,9 @@ function jsonDocument(content: string): string | null {
     return null;
   try {
     const value: unknown = JSON.parse(code);
-    return typeof value === "object" && value !== null ? code : null;
+    if (typeof value !== "object" || value === null) return null;
+    // Only a compact answer is re-indented; anything else is shown as written.
+    return JSON.stringify(value) === code ? JSON.stringify(value, null, 2) : code;
   } catch {
     return null;
   }

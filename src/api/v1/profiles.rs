@@ -1180,11 +1180,7 @@ pub(crate) async fn save_profile(
                     instructions: normalized_instructions,
                     capabilities: selected_capabilities,
                     models: parsed_targets,
-                    compaction_policy: match compaction_policy {
-                        None => prior.compaction_policy,
-                        Some(None) => None,
-                        Some(Some(policy)) => Some(policy.into_policy()?),
-                    },
+                    compaction_policy: prior.compaction_policy,
                 }),
             })
         }

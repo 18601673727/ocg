@@ -1,7 +1,7 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -177,6 +177,8 @@ export function SettingsSurface({
   const [llmError, setLlmError] = useState<string | null>(null);
   const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
   const [availabilityId, setAvailabilityId] = useState<string | null>(null);
+  // Own availability toggles update the snapshot in place instead of re-reading every page.
+  const ownAvailabilityToggles = useRef(0);
 
   // Agent Profile form state
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -234,6 +236,7 @@ export function SettingsSurface({
   useEffect(
     () =>
       client?.onProfilesChanged(() => {
+        if (ownAvailabilityToggles.current > 0) return;
         void refreshProfiles();
       }),
     [client, refreshProfiles],
@@ -746,15 +749,35 @@ export function SettingsSurface({
                                 type="button"
                                 variant="outline"
                                 size="xs"
-                                disabled={availabilityId !== null}
+                                disabled={availabilityId === profile.id}
                                 onClick={() => {
-                                  setAvailabilityId(profile.id);
+                                  const profileId = profile.id;
+                                  const enabled = !profile.enabled;
+                                  setAvailabilityId(profileId);
                                   setLoadError(null);
+                                  ownAvailabilityToggles.current += 1;
                                   void client
-                                    .setModelEnabled(profile.id, !profile.enabled)
+                                    .setModelEnabled(profileId, enabled)
+                                    .then(() => {
+                                      setSnapshot((current) =>
+                                        current
+                                          ? {
+                                              ...current,
+                                              llm_profiles: current.llm_profiles.map((item) =>
+                                                item.id === profileId ? { ...item, enabled } : item,
+                                              ),
+                                            }
+                                          : current,
+                                      );
+                                    })
                                     .catch((error) => {
                                       setLoadError(describeError(error, t));
-                                      setAvailabilityId(null);
+                                    })
+                                    .finally(() => {
+                                      ownAvailabilityToggles.current -= 1;
+                                      setAvailabilityId((current) =>
+                                        current === profileId ? null : current,
+                                      );
                                     });
                                 }}
                               >

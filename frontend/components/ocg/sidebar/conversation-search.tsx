@@ -20,7 +20,7 @@
  * `listbox` / `option` markup for the selectable entries.
  */
 
-import { useEffect, useId, useMemo, useRef, useState, type ReactElement } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactElement } from "react";
 import { MessageSquare, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
@@ -88,6 +88,20 @@ export function ConversationSearch({
   const hintId = useId();
   const needle = query.trim();
 
+  const changeOpen = useCallback((next: boolean) => {
+    setOpen(next);
+    // A reopened dialog starts from the unfiltered list, like the sidebar.
+    if (!next) {
+      setQuery("");
+      setServerResults(null);
+      setNextBefore(null);
+      setLoading(false);
+      setFailed(false);
+      setBefore(undefined);
+      setHighlightedId(null);
+    }
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (
@@ -102,12 +116,11 @@ export function ConversationSearch({
         return;
       if (!open && document.querySelector('[role="dialog"]')) return;
       event.preventDefault();
-      setOpen(true);
-      inputRef.current?.focus();
+      changeOpen(!open);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open]);
+  }, [open, changeOpen]);
 
   useEffect(() => {
     if (!open || !control || !needle) return;
@@ -170,22 +183,7 @@ export function ConversationSearch({
   };
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(next) => {
-        setOpen(next);
-        // A reopened dialog starts from the unfiltered list, like the sidebar.
-        if (!next) {
-          setQuery("");
-          setServerResults(null);
-          setNextBefore(null);
-          setLoading(false);
-          setFailed(false);
-          setBefore(undefined);
-          setHighlightedId(null);
-        }
-      }}
-    >
+    <Dialog open={open} onOpenChange={changeOpen}>
       <DialogTrigger render={trigger} />
       <DialogContent
         initialFocus={inputRef}

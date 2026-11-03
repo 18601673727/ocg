@@ -1204,6 +1204,12 @@ impl CredentialKey {
         Ok(encoded)
     }
 
+    /// Whether the stored row was written with this key, judged by the key id
+    /// alone; the AEAD tag is not checked, so a tampered row still counts.
+    pub(super) fn holds(&self, reference: &str, bytes: &[u8]) -> DecodeResult<bool> {
+        Ok(decode_credential(reference, bytes)?.key_id == self.key_id)
+    }
+
     pub(super) fn decrypt(
         &self,
         reference: &str,
