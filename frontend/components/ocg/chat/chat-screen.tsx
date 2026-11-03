@@ -335,9 +335,17 @@ export const ChatScreen: FC<ChatScreenProps> = ({
   const { t } = useI18n();
   const [draft, setDraft] = useState("");
   const [submittingChat, setSubmittingChat] = useState(false);
-  const [selection, setSelection] = useState<ChatModelSelection | undefined>(() =>
-    readModelPreference(session.projectId, session.conversationId ?? session.id),
-  );
+  const [selection, setSelection] = useState<ChatModelSelection | undefined>(() => {
+    if (session.llmProfile) {
+      return {
+        model: session.model ?? "",
+        effort: session.reasoningEffort ?? null,
+        agentProfile: session.agentProfile,
+        llmProfile: session.llmProfile,
+      };
+    }
+    return readModelPreference(session.projectId, session.conversationId ?? session.id);
+  });
   useEffect(() => {
     if (session.conversationId && selection)
       writeModelPreference(session.projectId, session.conversationId, selection);

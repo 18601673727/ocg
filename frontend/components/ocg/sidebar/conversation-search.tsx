@@ -27,6 +27,7 @@ import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
   DialogClose,
@@ -58,6 +59,8 @@ export type ConversationSearchProps = {
   onOpenConversation?: (conversation: string) => void;
   /** This account's control client for full-text search; omitting it keeps title filtering. */
   control?: HttpCanonicalControlClient;
+  conversationList?: "loading" | "loaded" | "failed";
+  onRetryConversations?: () => void;
 };
 
 export function ConversationSearch({
@@ -67,6 +70,8 @@ export function ConversationSearch({
   onSelect,
   onOpenConversation,
   control,
+  conversationList,
+  onRetryConversations,
 }: ConversationSearchProps) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -326,19 +331,55 @@ export function ConversationSearch({
               );
             })}
           </ul>
-          {matches.length === 0 && !loading && !failed && (
-            <p
-              role="status"
-              className={cn(
-                "px-2 py-6 text-center text-muted-foreground",
-                TYPOGRAPHY_SCALE.caption,
-              )}
-            >
-              {sessions.length === 0
-                ? t("sidebar.searchNoConversations")
-                : t("sidebar.noSearchMatches")}
-            </p>
-          )}
+          {matches.length === 0 &&
+            !loading &&
+            !failed &&
+            (sessions.length === 0 ? (
+              conversationList === "loading" ? (
+                <div className="flex flex-col gap-1 py-2">
+                  {Array.from({ length: 5 }, (_, i) => (
+                    <Skeleton key={`search-skeleton-${i}`} className="h-8 w-full rounded-md" />
+                  ))}
+                </div>
+              ) : conversationList === "failed" ? (
+                <div
+                  role="alert"
+                  className="flex items-center justify-between gap-2 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                >
+                  <span className="truncate">{t("sidebar.loadFailed")}</span>
+                  {onRetryConversations && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 shrink-0 px-2 text-xs"
+                      onClick={onRetryConversations}
+                    >
+                      {t("common.retry")}
+                    </Button>
+                  )}
+                </div>
+              ) : (
+                <p
+                  role="status"
+                  className={cn(
+                    "px-2 py-6 text-center text-muted-foreground",
+                    TYPOGRAPHY_SCALE.caption,
+                  )}
+                >
+                  {t("sidebar.searchNoConversations")}
+                </p>
+              )
+            ) : (
+              <p
+                role="status"
+                className={cn(
+                  "px-2 py-6 text-center text-muted-foreground",
+                  TYPOGRAPHY_SCALE.caption,
+                )}
+              >
+                {t("sidebar.noSearchMatches")}
+              </p>
+            ))}
           {nextBefore && (
             <Button
               variant="outline"

@@ -100,7 +100,10 @@ export function ModelSelector({
     llm?.reasoning_efforts ??
     (llm?.declared_capabilities.includes("reasoning") ? WIRE_EFFORTS : []);
   const effort =
-    selection?.llmProfile === llmId && selection?.effort && efforts.includes(selection.effort)
+    selection?.llmProfile === llmId &&
+    selection?.effort &&
+    selection.effort !== llm?.default_effort &&
+    efforts.includes(selection.effort)
       ? selection.effort
       : null;
   const disabled = busy || !catalog || !llm || !executor;

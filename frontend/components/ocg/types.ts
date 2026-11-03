@@ -8,6 +8,9 @@ export type ChatSession = {
   projectId?: string;
   sessionId?: string;
   agentProfile?: string;
+  llmProfile?: string;
+  reasoningEffort?: string | null;
+  model?: string;
   conversationId?: string;
   jobState?: string;
   hasChildren?: boolean;
@@ -80,4 +83,5 @@ export type OcgRuntimeEvent =
   | { type: "conversation.history-loaded"; sessionId: string; messages: ChatMessage[] }
   | { type: "runtime.status-changed"; status: RuntimeStatus }
   | { type: "conversation.session-created"; session: ChatSession }
-  | { type: "conversation.session-updated"; session: ChatSession };
+  | { type: "conversation.session-updated"; session: ChatSession }
+  | { type: "conversation.list-state"; state: "loading" | "loaded" | "failed" };

@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus } from "../types";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
@@ -129,6 +130,8 @@ type OcgSidebarProps = {
   onNavigate?: (view: WorkspaceView) => void;
   /** Opens Settings from the account menu. Omitting it hides that item. */
   onSettingsClick?: () => void;
+  conversationList?: "loading" | "loaded" | "failed";
+  onRetryConversations?: () => void;
 };
 
 function RailButton({
@@ -190,6 +193,8 @@ export function OcgSidebar({
   attentionCount = 0,
   onNavigate,
   onSettingsClick,
+  conversationList,
+  onRetryConversations,
 }: OcgSidebarProps) {
   const { t, locale } = useI18n();
   const isApple = useSyncExternalStore(subscribePlatform, isApplePlatform, serverPlatform);
@@ -471,6 +476,8 @@ export function OcgSidebar({
             onSelect={onSelect}
             onOpenConversation={onOpenConversation}
             control={control}
+            conversationList={conversationList}
+            onRetryConversations={onRetryConversations}
             trigger={
               <button
                 type="button"
@@ -539,6 +546,10 @@ export function OcgSidebar({
                 </span>
               </RailButton>
             ))}
+            {conversationList === "loading" &&
+              Array.from({ length: 5 }, (_, i) => (
+                <Skeleton key={`rail-skeleton-${i}`} className="size-9 shrink-0 rounded-md" />
+              ))}
           </ScrollArea>
           {/*
             The collapsed rail keeps the account menu: same identity, same
@@ -591,6 +602,8 @@ export function OcgSidebar({
             onSelect={onSelect}
             onOpenConversation={onOpenConversation}
             control={control}
+            conversationList={conversationList}
+            onRetryConversations={onRetryConversations}
             trigger={
               <Button
                 variant="ghost"
@@ -918,6 +931,38 @@ export function OcgSidebar({
               </li>
             ))}
           </ul>
+          {conversationList === "loading" && (
+            <ul aria-label={t("common.loading")} className="mt-2 space-y-1">
+              {Array.from({ length: 5 }, (_, i) => (
+                <li key={`list-skeleton-${i}`}>
+                  <Skeleton className="h-8 w-full rounded-lg" />
+                </li>
+              ))}
+            </ul>
+          )}
+          {conversationList === "failed" && (
+            <div
+              role="alert"
+              className="mt-2 flex items-center justify-between gap-2 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+            >
+              <span className="truncate">{t("sidebar.loadFailed")}</span>
+              {onRetryConversations && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 shrink-0 px-2 text-xs"
+                  onClick={onRetryConversations}
+                >
+                  {t("common.retry")}
+                </Button>
+              )}
+            </div>
+          )}
+          {conversationList === "loaded" && sessions.length === 0 && (
+            <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+              {t("sidebar.searchNoConversations")}
+            </p>
+          )}
         </ScrollArea>
 
         {/*

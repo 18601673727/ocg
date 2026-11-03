@@ -8,6 +8,7 @@ export function emptyRuntimeSnapshot(): RuntimeSnapshot {
     sessions: [],
     messagesBySession: {},
     executionBySession: {},
+    conversationList: "loading",
   };
 }
 

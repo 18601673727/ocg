@@ -86,5 +86,8 @@ export function reconcileRuntimeEvent(
         sessions: snapshot.sessions.map((item) => (item.id === session.id ? session : item)),
       };
     }
+
+    case "conversation.list-state":
+      return { ...snapshot, conversationList: event.state };
   }
 }

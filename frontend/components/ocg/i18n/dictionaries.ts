@@ -578,6 +578,7 @@ export const en = {
   "sidebar.searchConversationsBody":
     'Searches all messages and replies. Use "quotes" for a phrase.',
   "sidebar.searchNoConversations": "This account has no conversations yet",
+  "sidebar.loadFailed": "Could not load conversations",
   "sidebar.searchFailed": "Full-text search failed. Results may be incomplete. Please retry.",
   "sidebar.searchMore": "Load more search results",
   "sidebar.account": "Account",
@@ -1645,6 +1646,7 @@ export const zh: Dictionary = {
   "sidebar.searchMore": "加载更多搜索结果",
   "sidebar.searchConversationsBody": "搜索全部消息和回复。使用英文双引号搜索完整短语。",
   "sidebar.searchNoConversations": "当前账户还没有对话",
+  "sidebar.loadFailed": "无法加载对话",
   "sidebar.account": "账户",
   "sidebar.localAccount": "本地操作员",
   "sidebar.logout": "退出登录",

@@ -1340,6 +1340,7 @@ pub(crate) struct ConfigurationView {
     llm_profile: String,
     model: String,
     context_window: Option<u32>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -1365,6 +1366,7 @@ fn configuration_view(submitted: crate::db::entities::SubmittedConfiguration) ->
         llm_profile: submitted.llm_profile.to_string(),
         model: submitted.frozen.llm.config.model,
         context_window: submitted.frozen.llm.config.context_window,
+        reasoning_effort: submitted.frozen.llm.config.parameters.reasoning_effort,
     }
 }
 

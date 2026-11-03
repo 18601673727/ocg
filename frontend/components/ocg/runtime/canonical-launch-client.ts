@@ -261,6 +261,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly earlier = new Map<string, string | null>();
   private readonly loadingEarlier = new Map<string, Promise<void>>();
   private readonly streams = new Map<string, StreamEntry>();
+  private conversationListLoaded = false;
   private unsubscribeConversations: (() => void) | null = null;
 
   constructor(readonly control: HttpCanonicalControlClient) {
@@ -271,14 +272,35 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const unsubscribe = super.subscribe(listener);
     if (!this.started) {
       this.started = true;
-      this.unsubscribeConversations = this.control.subscribeConversations(
-        (page) => {
-          void this.applyConversations(page).catch((error) => this.report(error));
-        },
-        (error) => this.report(error),
-      );
+      this.startConversationSubscription();
     }
     return unsubscribe;
+  }
+
+  retryConversations(): void {
+    this.conversationListLoaded = false;
+    this.emit({ type: "conversation.list-state", state: "loading" });
+    this.unsubscribeConversations?.();
+    this.startConversationSubscription();
+  }
+
+  private startConversationSubscription() {
+    this.unsubscribeConversations = this.control.subscribeConversations(
+      (page) => {
+        void this.applyConversations(page).catch((error) => {
+          if (!this.conversationListLoaded) {
+            this.emit({ type: "conversation.list-state", state: "failed" });
+          }
+          this.report(error);
+        });
+      },
+      (error) => {
+        if (!this.conversationListLoaded) {
+          this.emit({ type: "conversation.list-state", state: "failed" });
+        }
+        this.report(error);
+      },
+    );
   }
 
   private report(error: unknown, sessionId?: string) {
@@ -343,6 +365,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         sessionId: item.tip_job,
         title: item.title,
         agentProfile: item.agent ?? undefined,
+        llmProfile: current?.llmProfile,
+        reasoningEffort: current?.reasoningEffort,
+        model: current?.model,
         projectId: item.project ?? undefined,
         workType: "research",
         updatedAt: new Date(item.tip_created_at_us / 1000).toISOString(),
@@ -360,6 +385,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         );
       }
     }
+    this.conversationListLoaded = true;
+    this.emit({ type: "conversation.list-state", state: "loaded" });
     await Promise.all(updates);
     if (!this.disposed)
       this.emit({ type: "runtime.status-changed", status: { state: "connected" } });
@@ -572,13 +599,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.tips.set(id, job);
     const session = this.getSnapshot().sessions.find((session) => session.id === id);
     if (!session) return id;
+    const lastConfig = conversation.turns.at(-1)?.input.configuration;
     this.emit({
       type: "conversation.session-updated",
       session: {
         ...session,
         conversationId: root,
         sessionId: job,
-        agentProfile: conversation.turns.at(-1)?.input.configuration?.agent_profile ?? undefined,
+        agentProfile: lastConfig?.agent_profile ?? undefined,
+        llmProfile: lastConfig?.llm_profile ?? undefined,
+        reasoningEffort: lastConfig ? lastConfig.reasoning_effort : undefined,
+        model: lastConfig?.model,
       },
     });
     this.publish(id);
@@ -1356,6 +1387,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           conversationId: admitted.conversation ?? undefined,
           sessionId: job,
           agentProfile: selection.agentProfile,
+          llmProfile: selection.llmProfile,
+          reasoningEffort: selection.effort ?? null,
+          model: selection.model,
           projectId: conversation ? session.projectId : selection.project,
           title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation",
           updatedAt: new Date().toISOString(),

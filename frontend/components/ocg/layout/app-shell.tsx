@@ -333,6 +333,10 @@ function AppShellContent({
   );
   const sidebar = (
     <OcgSidebar
+      conversationList={runtime.snapshot.conversationList}
+      onRetryConversations={
+        runtime.client.retryConversations ? () => runtime.client.retryConversations!() : undefined
+      }
       sessions={runtime.snapshot.sessions
         .filter((session) => runtime.client.isListedConversation?.(session.id) ?? true)
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))}
