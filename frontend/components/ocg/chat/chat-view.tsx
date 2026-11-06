@@ -128,6 +128,11 @@ export function ChatComposer({
       modelImageSupport?.llmProfile === selection.llmProfile &&
       modelImageSupport.supported,
   );
+  const imagesUnsupported = Boolean(
+    selection?.llmProfile &&
+      modelImageSupport?.llmProfile === selection.llmProfile &&
+      !modelImageSupport.supported,
+  );
   const images = useImageAttachments(projectId, supportsImages);
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
@@ -310,6 +315,7 @@ export function ChatComposer({
           state={images}
           disabled={submitting || cancelling}
           uploadDisabled={imageInputDisabled}
+          unsupported={imagesUnsupported}
         />
         <ChatComposerInput
           textarea={{
@@ -428,6 +434,7 @@ export function ChatComposer({
             submitting,
             cancelling,
             attachDisabled: imageInputDisabled,
+            attachUnsupported: imagesUnsupported,
             sendDisabled:
               !canSend ||
               submitting ||

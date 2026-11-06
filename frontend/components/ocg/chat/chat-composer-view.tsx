@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { SELECTED_ROW, TEXT_TONE } from "@/components/ocg/primitives";
 import { runtimeStatusDetail, useI18n, type TranslateFn } from "../i18n";
 import type { RuntimeStatus } from "../types";
@@ -125,6 +126,7 @@ export function ChatComposerInput({
     submitting: boolean;
     cancelling: boolean;
     attachDisabled: boolean;
+    attachUnsupported?: boolean;
     sendDisabled: boolean;
     steerDisabled: boolean;
     steerTitle?: string;
@@ -135,6 +137,7 @@ export function ChatComposerInput({
 }) {
   const { t } = useI18n();
   const [preview, setPreview] = useState(false);
+  const [open, setOpen] = useState(false);
   const activeSuggestion = suggestions?.items[suggestions.activeIndex];
   const errorInHeader = useConversationError(error);
   return (
@@ -225,18 +228,43 @@ export function ChatComposerInput({
         <div className="flex w-full min-w-0 @xl/composer:w-auto @xl/composer:flex-1">
           {selectors}
         </div>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon-xs"
-          className="size-11 rounded-lg text-muted-foreground pointer-fine:size-9"
-          aria-label={t("chat.attachFile")}
-          title={t("chat.attachFile")}
-          disabled={actions.attachDisabled}
-          onClick={actions.onAttach}
-        >
-          <ImagePlus className="size-4" />
-        </Button>
+        {actions.attachUnsupported ? (
+          <Tooltip open={open && Boolean(actions.attachUnsupported)} onOpenChange={setOpen}>
+            <TooltipTrigger
+              closeOnClick={false}
+              render={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className={cn(
+                    "size-11 rounded-lg text-muted-foreground pointer-fine:size-9",
+                    actions.attachUnsupported && "opacity-50",
+                  )}
+                  aria-label={`${t("chat.attachFile")}: ${t("chat.imagesUnsupported")}`}
+                  aria-disabled="true"
+                  onClick={() => setOpen(true)}
+                >
+                  <ImagePlus className="size-4" />
+                </Button>
+              }
+            />
+            <TooltipContent>{t("chat.imagesUnsupported")}</TooltipContent>
+          </Tooltip>
+        ) : (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="size-11 rounded-lg text-muted-foreground pointer-fine:size-9"
+            aria-label={t("chat.attachFile")}
+            title={t("chat.attachFile")}
+            disabled={actions.attachDisabled}
+            onClick={actions.onAttach}
+          >
+            <ImagePlus className="size-4" />
+          </Button>
+        )}
         <Button
           type="button"
           variant={preview ? "selected" : "ghost"}

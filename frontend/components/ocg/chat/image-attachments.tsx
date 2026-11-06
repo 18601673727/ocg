@@ -5,6 +5,7 @@ import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronLeft, ChevronRight, Download, Loader2, RotateCcw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { ChatImage } from "../contracts";
@@ -207,10 +208,12 @@ export function AttachmentStaging({
   state,
   disabled,
   uploadDisabled,
+  unsupported,
 }: {
   state: ReturnType<typeof useImageAttachments>;
   disabled: boolean;
   uploadDisabled: boolean;
+  unsupported: boolean;
 }) {
   const { t } = useI18n();
   if (!state.attachments.length && !state.error) return null;
@@ -253,10 +256,15 @@ export function AttachmentStaging({
                     {item.file.name}
                   </p>
                   <p
-                    className="mt-1 flex items-center gap-1 text-xs text-muted-foreground"
+                    className={cn(
+                      "mt-1 flex items-center gap-1 text-xs",
+                      unsupported ? "text-destructive" : "text-muted-foreground",
+                    )}
                     role="status"
                   >
-                    {item.status === "uploading" ? (
+                    {unsupported ? (
+                      t("chat.imageModelUnsupported")
+                    ) : item.status === "uploading" ? (
                       <>
                         <Loader2 className="size-3 animate-spin" />
                         {t("chat.imageUploading")}
@@ -270,7 +278,7 @@ export function AttachmentStaging({
                       <span className="text-destructive">{t("chat.imageUploadFailed")}</span>
                     )}
                   </p>
-                  {item.status === "failed" && (
+                  {!unsupported && item.status === "failed" && (
                     <>
                       <AttachmentError message={item.error} />
                       <Button

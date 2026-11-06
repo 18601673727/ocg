@@ -269,8 +269,6 @@ export const en = {
   "chat.project": "Project",
   "chat.pureConversation": "Chat only",
   "chat.toolsWarning": "Tools: this model does not declare tool support.",
-  "chat.visionWarning":
-    "Vision: this model does not declare image support; images may be refused (vision_not_supported).",
 
   "nav.usage": "Usage",
   "usage.input": "Input",
@@ -717,6 +715,8 @@ export const en = {
   "chat.resetZoom": "Reset zoom",
   "chat.composerSuggestions": "Composer suggestions",
   "chat.attachFile": "Attach images",
+  "chat.imagesUnsupported": "This model doesn't take images.",
+  "chat.imageModelUnsupported": "Not supported by this model",
   "chat.hint": "Enter to send · Shift+Enter for newline",
   "chat.unavailable": "Chat unavailable",
   "chat.unavailableFallback": "the runtime cannot execute chat",
@@ -1409,7 +1409,6 @@ export const zh: Dictionary = {
   "chat.project": "项目",
   "chat.pureConversation": "纯对话",
   "chat.toolsWarning": "工具：此模型未声明工具支持。",
-  "chat.visionWarning": "视觉：此模型未声明图像支持；图像可能被拒绝（vision_not_supported）。",
 
   "nav.usage": "用量",
   "usage.input": "输入",
@@ -1824,6 +1823,8 @@ export const zh: Dictionary = {
   "chat.resetZoom": "重置缩放",
   "chat.composerSuggestions": "输入框建议",
   "chat.attachFile": "添加图片",
+  "chat.imagesUnsupported": "此模型不支持图像。",
+  "chat.imageModelUnsupported": "此模型不支持",
   "chat.hint": "回车发送 · Shift+回车换行",
   "chat.unavailable": "对话不可用",
   "chat.unavailableFallback": "运行时无法执行对话",
