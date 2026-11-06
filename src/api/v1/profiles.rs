@@ -356,19 +356,12 @@ fn bounded_provider_message(mut message: String) -> String {
     message
 }
 
-/// Whether some saved Connection names `reference`, so `/provider-models`
-/// cannot turn a `credential_ref` into an arbitrary environment lookup.
+/// Whether a live Model names a Connection with this credential reference.
 async fn saved_connection_credential(
     database: &DatabaseHandle,
     reference: &str,
 ) -> Result<bool, Refusal> {
-    Ok(database
-        .find_config(ConfigKind::Connection, |record| {
-            matches!(&record.body, ConfigBody::Connection(connection)
-                if connection.credential_ref.as_deref() == Some(reference))
-        })
-        .await?
-        .is_some())
+    Ok(database.credential_ref_in_use(reference).await?)
 }
 
 fn default_credential_ref(name: &str) -> String {

@@ -178,7 +178,7 @@ export function SettingsSurface({
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmError, setLlmError] = useState<string | null>(null);
   const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
-  const [availabilityId, setAvailabilityId] = useState<string | null>(null);
+  const [inFlight, setInFlight] = useState<Set<string>>(() => new Set());
   // Own availability toggles update the snapshot in place; other notices wait until toggles finish.
   const ownAvailabilityToggles = useRef(0);
   const missedProfileChange = useRef(false);
@@ -206,9 +206,6 @@ export function SettingsSurface({
         if (!signal?.aborted) {
           setLoadError(describeError(error, t));
         }
-      } finally {
-        // An availability change waits for the catalog it announced.
-        if (!signal?.aborted) setAvailabilityId(null);
       }
     },
     [client, t],
@@ -749,11 +746,11 @@ export function SettingsSurface({
                                 type="button"
                                 variant="outline"
                                 size="xs"
-                                disabled={availabilityId === profile.id}
+                                disabled={inFlight.has(profile.id)}
                                 onClick={() => {
                                   const profileId = profile.id;
                                   const enabled = !profile.enabled;
-                                  setAvailabilityId(profileId);
+                                  setInFlight((current) => new Set(current).add(profileId));
                                   setLoadError(null);
                                   ownAvailabilityToggles.current += 1;
                                   void client
@@ -782,9 +779,11 @@ export function SettingsSurface({
                                         missedProfileChange.current = false;
                                         void refreshProfiles();
                                       }
-                                      setAvailabilityId((current) =>
-                                        current === profileId ? null : current,
-                                      );
+                                      setInFlight((current) => {
+                                        const next = new Set(current);
+                                        next.delete(profileId);
+                                        return next;
+                                      });
                                     });
                                 }}
                               >

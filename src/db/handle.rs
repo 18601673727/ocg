@@ -1201,6 +1201,15 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) async fn credential_ref_in_use(
+        &self,
+        reference: &str,
+    ) -> Result<bool, DatabaseError> {
+        let reference = reference.to_owned();
+        self.read(move |database| redb::read_credential_ref_in_use(database, &reference))
+            .await
+    }
+
     /// Configs of `kind` (every kind when `None`), newest first, strictly
     /// before `before` when given; at most 1,000 rows are examined per call.
     /// Archived configs are included; an empty page can have a continuation.

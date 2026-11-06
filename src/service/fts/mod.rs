@@ -1211,6 +1211,10 @@ fn search_index(
     let mut size = 0;
     let mut suppressed_lines = false;
     for (rank, (document, score)) in candidates.iter().enumerate() {
+        if answer.hits.len() == limits.results {
+            answer.limit = Some(QueryLimit::Results);
+            break;
+        }
         if rank == limits.query_candidates {
             if answer.hits.is_empty() && !suppressed_lines {
                 for (remaining, _) in &candidates[rank..] {
@@ -1223,10 +1227,6 @@ fn search_index(
             } else {
                 answer.limit = Some(QueryLimit::Candidates);
             }
-            break;
-        }
-        if answer.hits.len() == limits.results {
-            answer.limit = Some(QueryLimit::Results);
             break;
         }
         query_checkpoint(stop, deadline)?;

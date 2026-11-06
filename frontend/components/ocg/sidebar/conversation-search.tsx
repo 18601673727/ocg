@@ -338,6 +338,7 @@ export function ConversationSearch({
           {matches.length === 0 &&
             !loading &&
             !failed &&
+            !nextBefore &&
             (sessions.length === 0 ? (
               conversationList === "loading" ? (
                 <div className="flex flex-col gap-1 py-2">

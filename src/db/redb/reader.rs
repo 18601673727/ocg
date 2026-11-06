@@ -557,11 +557,10 @@ pub(crate) fn read_job_search(
     let mut last_examined = None;
     let mut titles = BTreeMap::new();
     let mut has_more = false;
-    let mut budget_exhausted = false;
     for (examined, entry) in jobs.range(..end)?.rev().enumerate() {
         if examined == 5_000 {
             has_more = true;
-            budget_exhausted = records.len() < limit;
+            last_match = last_examined;
             break;
         }
         let (key, bytes) = entry?;
@@ -612,22 +611,17 @@ pub(crate) fn read_job_search(
             }
         }
         if unmatched.is_empty() {
+            last_match = Some(id);
+            records.push(job_record(&rx, row)?);
             if records.len() == limit {
                 has_more = true;
                 break;
             }
-            last_match = Some(id);
-            records.push(job_record(&rx, row)?);
         }
     }
     Ok(JobSearchPage {
         records,
-        next_before: if budget_exhausted {
-            last_examined
-        } else {
-            last_match
-        }
-        .filter(|_| has_more),
+        next_before: last_match.filter(|_| has_more),
         has_more,
     })
 }
@@ -1608,6 +1602,38 @@ fn config(rx: &ReadTransaction, id: ConfigId) -> Result<Option<ConfigRecord>, St
         .transpose()
 }
 
+pub(crate) fn read_credential_ref_in_use(
+    database: &Database,
+    reference: &str,
+) -> Result<bool, StorageError> {
+    let rx = read(database)?;
+    let mut matching_connections = std::collections::BTreeSet::new();
+    let mut live_connections = std::collections::BTreeSet::new();
+    for entry in rx.open_table(CONFIGS)?.iter()? {
+        let (key, bytes) = entry?;
+        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+        match &row.body {
+            ConfigBody::Connection(connection) => {
+                if connection.credential_ref.as_deref() == Some(reference) {
+                    matching_connections.insert(row.id);
+                }
+            }
+            ConfigBody::Model(model) if row.archived_at.is_none() => {
+                live_connections.insert(model.connection_id);
+            }
+            ConfigBody::DecisionModel(model) if row.archived_at.is_none() => {
+                live_connections.insert(model.connection_id);
+            }
+            ConfigBody::Model(_)
+            | ConfigBody::DecisionModel(_)
+            | ConfigBody::Agent(_)
+            | ConfigBody::DecisionAgent(_)
+            | ConfigBody::Pool(_) => {}
+        }
+    }
+    Ok(!matching_connections.is_disjoint(&live_connections))
+}
+
 /// Configs of `kind` (any kind when `None`), newest first, strictly before
 /// `before` when given. Archived configs are included.
 pub(crate) fn read_configs(
@@ -2192,6 +2218,38 @@ fn has_visible_child(rx: &ReadTransaction, conversation: JobId) -> Result<bool, 
     Ok(false)
 }
 
+fn conversation_title(
+    rx: &ReadTransaction,
+    conversation: JobId,
+    origin: &Origin,
+    metadata: &JobControl,
+) -> Result<String, StorageError> {
+    Ok(match &metadata.title {
+        Some(title) => title.clone(),
+        None => {
+            let first = rx
+                .open_table(CHILDREN)?
+                .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
+                .next()
+                .transpose()?
+                .map(|entry| entry.0.value().1);
+            match first {
+                Some(first) if matches!(origin, Origin::System) => {
+                    let first = JobId::new(first);
+                    match read_job_row(rx, first)?
+                        .and_then(|row| row.kind.name().map(str::to_owned))
+                    {
+                        Some(name) => name,
+                        None => first_entry_text(rx, first)?,
+                    }
+                }
+                Some(first) => first_entry_text(rx, JobId::new(first))?,
+                None => String::new(),
+            }
+        }
+    })
+}
+
 fn conversation_summary(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -2216,30 +2274,7 @@ fn conversation_summary(
         .map(|bytes| JobControl::decode(bytes.value()))
         .transpose()?
         .ok_or_else(|| StorageError::corrupted("missing conversation state"))?;
-    let title = match metadata.title {
-        Some(title) => title,
-        None => {
-            let first = rx
-                .open_table(CHILDREN)?
-                .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
-                .next()
-                .transpose()?
-                .map(|entry| entry.0.value().1);
-            match first {
-                Some(first) if matches!(origin, Origin::System) => {
-                    let first = JobId::new(first);
-                    match read_job_row(rx, first)?
-                        .and_then(|row| row.kind.name().map(str::to_owned))
-                    {
-                        Some(name) => name,
-                        None => first_entry_text(rx, first)?,
-                    }
-                }
-                Some(first) => first_entry_text(rx, JobId::new(first))?,
-                None => String::new(),
-            }
-        }
-    };
+    let title = conversation_title(rx, conversation, &origin, &metadata)?;
     let state = read_state(rx, conversation)?;
     let on_hold = metadata
         .on_hold
@@ -2363,21 +2398,46 @@ fn conversation_page(
     let limit = limit.clamp(1, 100);
     let mut conversations = Vec::new();
     let mut last = None;
+    let mut last_examined = None;
     let mut has_more = false;
-    for item in groups.range(..before.map_or(u128::MAX, JobId::get))?.rev() {
+    for (examined, item) in groups
+        .range(..before.map_or(u128::MAX, JobId::get))?
+        .rev()
+        .enumerate()
+    {
+        if !terms.is_empty() && examined == 5_000 {
+            has_more = true;
+            if conversations.len() < limit {
+                last = last_examined;
+            }
+            break;
+        }
         let conversation = JobId::new(item?.0.value());
+        last_examined = Some(conversation);
         let row = read_job_row(&rx, conversation)?
             .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
-        if !indexes::searchable_conversation(&row)
-            || read_job_control(&rx, conversation)?.hidden_at.is_some()
-        {
+        if !indexes::searchable_conversation(&row) {
+            continue;
+        }
+        let metadata = read_job_control(&rx, conversation)?;
+        if metadata.hidden_at.is_some() {
             continue;
         }
         let Some(tip) = turn_head(&rx.open_table(TURNS)?, conversation)? else {
             continue;
         };
-        let summary = conversation_summary(&rx, conversation, tip)?;
-        if terms.is_empty() || conversation_matches(&rx, conversation, &summary.title, terms)? {
+        let matches = if terms.is_empty() {
+            true
+        } else if let JobKind::Group { origin, .. } = &row.kind {
+            let title = conversation_title(&rx, conversation, origin, &metadata)?;
+            conversation_matches(&rx, conversation, &title, terms)?
+        } else {
+            return Err(StorageError::corrupted(
+                "recent entry is not a conversation",
+            ));
+        };
+        if matches {
+            let summary = conversation_summary(&rx, conversation, tip)?;
             if conversations.len() == limit {
                 has_more = true;
                 break;

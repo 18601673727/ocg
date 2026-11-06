@@ -93,7 +93,7 @@ export function OcgTopbar({
       {activeView !== "chat" && titleVisible && (
         <ChevronRight className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
       )}
-      {title && (activeView !== "chat" || session) && (activeView !== "chat" || session) && (
+      {title && (activeView !== "chat" || session) && (
         <h1
           aria-hidden={!titleVisible}
           className={cn(
