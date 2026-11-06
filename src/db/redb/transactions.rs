@@ -482,7 +482,9 @@ impl Batch {
                 execution: JobExecution::Decision(work),
                 ..
             } => Ok(decision_work_requirement(&work.frozen)),
-            _ => Ok(execution_requirement(&self.job_execution(row)?.0)),
+            JobKind::Group { .. } | JobKind::Execution { .. } => {
+                Ok(execution_requirement(&self.job_execution(row)?.0))
+            }
         }
     }
 

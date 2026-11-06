@@ -1139,7 +1139,10 @@ impl DatabaseHandle {
             Command::new(
                 (job,),
                 reply,
-                |(job,)| text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective)),
+                |(job,)| {
+                    text_bytes(job.name.as_deref())
+                        .saturating_add(text_bytes(job.input.objective.as_deref()))
+                },
                 OperationKind::CreateJobWithInput,
                 |(job,), batch| mutations::create_job(batch, job),
             )
@@ -1153,7 +1156,10 @@ impl DatabaseHandle {
             Command::new(
                 (job,),
                 reply,
-                |(job,)| text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective)),
+                |(job,)| {
+                    text_bytes(job.name.as_deref())
+                        .saturating_add(text_bytes(job.input.objective.as_deref()))
+                },
                 OperationKind::CreateJobWithInput,
                 |(job,), batch| mutations::bench_create_dependent_turn(batch, job),
             )
@@ -1170,7 +1176,10 @@ impl DatabaseHandle {
             Command::new(
                 (job, submission),
                 reply,
-                |(job, _)| text_bytes(&job.name).saturating_add(text_bytes(&job.input.objective)),
+                |(job, _)| {
+                    text_bytes(job.name.as_deref())
+                        .saturating_add(text_bytes(job.input.objective.as_deref()))
+                },
                 OperationKind::CreateJobWithInput,
                 |(job, submission), batch| mutations::create_submitted_job(batch, job, submission),
             )
@@ -1324,8 +1333,8 @@ impl DatabaseHandle {
                 (connection, models),
                 reply,
                 |(connection, models)| {
-                    text_bytes(&connection.endpoint)
-                        .saturating_add(text_bytes(&connection.credential_ref))
+                    text_bytes(connection.endpoint.as_deref())
+                        .saturating_add(text_bytes(connection.credential_ref.as_deref()))
                         .saturating_add(
                             models
                                 .iter()
@@ -1356,7 +1365,9 @@ impl DatabaseHandle {
                 |(save,)| {
                     let ref_bytes = match &save.credential_ref {
                         mutations::ProfileCredentialRef::Preserve => match &save.connection.body {
-                            ConfigBody::Connection(body) => text_bytes(&body.credential_ref),
+                            ConfigBody::Connection(body) => {
+                                text_bytes(body.credential_ref.as_deref())
+                            }
                             ConfigBody::Model(_)
                             | ConfigBody::Agent(_)
                             | ConfigBody::Pool(_)
@@ -1370,7 +1381,7 @@ impl DatabaseHandle {
                         }
                     };
                     let endpoint_bytes = match &save.connection.body {
-                        ConfigBody::Connection(body) => text_bytes(&body.endpoint),
+                        ConfigBody::Connection(body) => text_bytes(body.endpoint.as_deref()),
                         ConfigBody::Model(_)
                         | ConfigBody::Agent(_)
                         | ConfigBody::Pool(_)
@@ -1416,7 +1427,7 @@ impl DatabaseHandle {
             Command::new(
                 (settings,),
                 reply,
-                |(settings,)| compaction_bytes(&Some(settings.policy.clone())).saturating_add(64),
+                |(settings,)| compaction_bytes(Some(&settings.policy)).saturating_add(64),
                 OperationKind::UpdateProfile,
                 |(settings,), batch| batch.set_global_compaction_settings(settings),
             )
@@ -1601,7 +1612,7 @@ impl DatabaseHandle {
             Command::new(
                 (parent, spec, first, configuration, submission, format),
                 reply,
-                |(_, _, first, _, _, format)| entry_bytes(first, format),
+                |(_, _, first, _, _, format)| entry_bytes(first, format.as_ref()),
                 OperationKind::Open,
                 |(parent, spec, first, configuration, submission, format), batch| {
                     batch.open_group_with_format(
@@ -1752,7 +1763,7 @@ impl DatabaseHandle {
             Command::new(
                 (conversation, entry, freeze, submission, format),
                 reply,
-                |(_, first, _, _, format)| entry_bytes(first, format),
+                |(_, first, _, _, format)| entry_bytes(first, format.as_ref()),
                 OperationKind::Append,
                 |(conversation, entry, freeze, submission, format), batch| {
                     batch.require_agent_group(conversation)?;
@@ -1818,7 +1829,7 @@ impl DatabaseHandle {
             Command::new(
                 (conversation, entry, freeze, submission, format, automatic),
                 reply,
-                |(_, first, _, _, format, _)| entry_bytes(first, format),
+                |(_, first, _, _, format, _)| entry_bytes(first, format.as_ref()),
                 OperationKind::Append,
                 |(conversation, entry, freeze, submission, format, automatic), batch| {
                     batch.steer_with_format(
@@ -1913,7 +1924,13 @@ impl DatabaseHandle {
             Command::custom(
                 (job, output),
                 reply,
-                |(_, output)| output_bytes(&output.summary, &output.code, &output.value),
+                |(_, output)| {
+                    output_bytes(
+                        output.summary.as_deref(),
+                        output.code.as_deref(),
+                        output.value.as_ref(),
+                    )
+                },
                 |(job, output), reply, database, operation, commit| {
                     use OperationKind as Kind;
                     {
@@ -1992,20 +2009,24 @@ impl DatabaseHandle {
                         None => 0,
                         Some(ProviderSettlementEvidence::Answer(answer)) => {
                             byte_count(answer.response.byte_length())
-                                .saturating_add(json_bytes(&answer.measurements.usage.raw))
+                                .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()))
                         }
                         Some(ProviderSettlementEvidence::Observations(stats)) => {
                             stats.iter().fold(0u64, |bytes, stat| {
                                 let observation = &stat.observation;
                                 let failure = observation.failure.as_ref().map_or(0, |failure| {
                                     byte_count(failure.message.len())
-                                        .saturating_add(text_bytes(&failure.provider_code))
-                                        .saturating_add(text_bytes(&failure.response_body))
-                                        .saturating_add(text_bytes(&failure.request_id))
+                                        .saturating_add(text_bytes(
+                                            failure.provider_code.as_deref(),
+                                        ))
+                                        .saturating_add(text_bytes(
+                                            failure.response_body.as_deref(),
+                                        ))
+                                        .saturating_add(text_bytes(failure.request_id.as_deref()))
                                 });
-                                bytes
-                                    .saturating_add(failure)
-                                    .saturating_add(text_bytes(&observation.raw_finish_reason))
+                                bytes.saturating_add(failure).saturating_add(text_bytes(
+                                    observation.raw_finish_reason.as_deref(),
+                                ))
                             })
                         }
                     };
@@ -2019,9 +2040,13 @@ impl DatabaseHandle {
                                 .and_then(|value| value.get("text"))
                                 .and_then(serde_json::Value::as_str)
                                 .or(result.summary.as_deref());
-                            output_bytes(&result.summary, &result.code, &result.value)
-                                .saturating_add(64 * 1024)
-                                .saturating_add(text.map_or(0, search_index_bytes))
+                            output_bytes(
+                                result.summary.as_deref(),
+                                result.code.as_deref(),
+                                result.value.as_ref(),
+                            )
+                            .saturating_add(64 * 1024)
+                            .saturating_add(text.map_or(0, search_index_bytes))
                         }
                         JobFinalization::Unknown => 0,
                     })
@@ -2132,7 +2157,7 @@ impl DatabaseHandle {
                 reply,
                 |(project,)| {
                     byte_count(project.name.len())
-                        .saturating_add(text_bytes(&project.description))
+                        .saturating_add(text_bytes(project.description.as_deref()))
                         .saturating_add(byte_count(project.root.len()))
                         .saturating_add(command_bytes(&project.commands))
                 },
@@ -2194,7 +2219,7 @@ impl DatabaseHandle {
                 reply,
                 |(_, name, description, commands)| {
                     byte_count(name.len())
-                        .saturating_add(text_bytes(description))
+                        .saturating_add(text_bytes(description.as_deref()))
                         .saturating_add(command_bytes(commands))
                 },
                 OperationKind::UpdateProject,
@@ -2217,7 +2242,7 @@ impl DatabaseHandle {
                         byte_count(title.len())
                     }
                     JobEdit::Hide | JobEdit::Limits(_) => 16,
-                    JobEdit::CompactionPolicy(policy) => compaction_bytes(policy),
+                    JobEdit::CompactionPolicy(policy) => compaction_bytes(policy.as_ref()),
                 },
                 OperationKind::SetConversation,
                 |(root, edit), batch| mutations::set_conversation(batch, root, edit),
@@ -2334,7 +2359,7 @@ impl DatabaseHandle {
                     reply,
                     |(attachment,)| {
                         byte_count(attachment.mime.len())
-                            .saturating_add(text_bytes(&attachment.display_name))
+                            .saturating_add(text_bytes(attachment.display_name.as_deref()))
                     },
                     OperationKind::CreateAttachment,
                     |(attachment,), batch| mutations::create_attachment(batch, *attachment),
@@ -2525,7 +2550,7 @@ impl DatabaseHandle {
             Command::custom(
                 (Box::new(metrics),),
                 reply,
-                |(metrics,)| json_bytes(&metrics.measurements.usage.raw),
+                |(metrics,)| json_bytes(metrics.measurements.usage.raw.as_ref()),
                 |(metrics,), reply, database, operation, commit| {
                     use OperationKind as Kind;
                     {
@@ -2584,7 +2609,7 @@ impl DatabaseHandle {
                 reply,
                 |(answer,)| {
                     byte_count(answer.response.byte_length())
-                        .saturating_add(json_bytes(&answer.measurements.usage.raw))
+                        .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()))
                 },
                 |(answer,), reply, database, operation, commit| {
                     use OperationKind as Kind;
@@ -2655,11 +2680,11 @@ impl DatabaseHandle {
                     let observation = &stat.observation;
                     let failure = observation.failure.as_ref().map_or(0, |failure| {
                         byte_count(failure.message.len())
-                            .saturating_add(text_bytes(&failure.provider_code))
-                            .saturating_add(text_bytes(&failure.response_body))
-                            .saturating_add(text_bytes(&failure.request_id))
+                            .saturating_add(text_bytes(failure.provider_code.as_deref()))
+                            .saturating_add(text_bytes(failure.response_body.as_deref()))
+                            .saturating_add(text_bytes(failure.request_id.as_deref()))
                     });
-                    failure.saturating_add(text_bytes(&observation.raw_finish_reason))
+                    failure.saturating_add(text_bytes(observation.raw_finish_reason.as_deref()))
                 },
                 |(stat,), reply, database, operation, commit| {
                     use OperationKind as Kind;
@@ -2737,7 +2762,7 @@ impl DatabaseHandle {
                 |(_, outcome)| match outcome.as_ref() {
                     ToolOutcome::Completed { result } => byte_count(result.len()),
                     ToolOutcome::NotApplied { message } => byte_count(message.len()),
-                    ToolOutcome::Uncertain { message, .. } => text_bytes(message),
+                    ToolOutcome::Uncertain { message, .. } => text_bytes(message.as_deref()),
                     ToolOutcome::CompletedWithheld { .. } | ToolOutcome::NotInvoked { .. } => 0,
                 },
                 OperationKind::RecordToolOutcome,

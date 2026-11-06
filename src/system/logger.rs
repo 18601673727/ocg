@@ -717,7 +717,9 @@ impl Worker {
             Err(reason) => {
                 let (kind, os_error) = match &reason {
                     ProtectionReason::SpaceQueryFailed(failure) => (failure.kind, failure.os_error),
-                    _ => (io::ErrorKind::StorageFull, None),
+                    ProtectionReason::InsufficientSpace(_)
+                    | ProtectionReason::FilesystemWriteFailed { .. }
+                    | ProtectionReason::StorageUnavailable(_) => (io::ErrorKind::StorageFull, None),
                 };
                 self.failure(
                     LoggerFailure {

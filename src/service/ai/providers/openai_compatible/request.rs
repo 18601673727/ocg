@@ -680,7 +680,12 @@ impl ChatMessage {
                 image::ImageError::UnsupportedType | image::ImageError::NotDataUrl => {
                     TransportError::unsupported(field.clone(), error.to_string())
                 }
-                _ => TransportError::invalid(field.clone(), error.to_string()),
+                image::ImageError::MalformedBase64
+                | image::ImageError::Empty
+                | image::ImageError::TooLarge
+                | image::ImageError::Mismatch(_) => {
+                    TransportError::invalid(field.clone(), error.to_string())
+                }
             })?;
             images.count += 1;
             images.bytes = images.bytes.saturating_add(bytes);

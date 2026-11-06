@@ -2039,7 +2039,7 @@ impl Batch {
         if events.is_empty() {
             return Ok((None, events));
         }
-        let sample = observations::usage_sample_of(job, request, &target, &events);
+        let sample = observations::usage_sample_of(job, request, target.as_ref(), &events);
         Ok((sample, events))
     }
 
@@ -2075,7 +2075,7 @@ impl Batch {
         if events.is_empty() {
             return Ok(());
         }
-        let new_sample = observations::usage_sample_of(job, request, &target, &events);
+        let new_sample = observations::usage_sample_of(job, request, target.as_ref(), &events);
 
         if old_sample == new_sample {
             return Ok(());

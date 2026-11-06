@@ -869,7 +869,7 @@ fn rebuild_events(tx: &WriteTransaction) -> Result<(), StorageError> {
                 .insert((id, kind, event.id.get()), (request.get(), seq))?;
         }
         if !invalid
-            && let Some(record) = observations::metric_record(&table, &None, &event)?
+            && let Some(record) = observations::metric_record(&table, None, &event)?
             && let Some(observation) = crate::db::entities::TokenObservation::from_record(&record)
             && let Err(error) = evidence.add(observation)
         {

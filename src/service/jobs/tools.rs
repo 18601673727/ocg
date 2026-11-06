@@ -663,13 +663,25 @@ impl Batch {
                 )?;
                 json!({"conversation":conversation.to_string(), "turn":appended.turn.to_string()})
             }
-            tool => {
+            tool @ JobToolCall::JobStop { .. }
+            | tool @ JobToolCall::JobClose { .. }
+            | tool @ JobToolCall::JobHold { .. }
+            | tool @ JobToolCall::JobUnhold { .. } => {
                 let (conversation, action) = match tool {
                     JobToolCall::JobStop { conversation } => (conversation, "stop"),
                     JobToolCall::JobClose { conversation } => (conversation, "close"),
                     JobToolCall::JobHold { conversation } => (conversation, "hold"),
                     JobToolCall::JobUnhold { conversation } => (conversation, "unhold"),
-                    _ => return self.corrupted("unexpected management tool".into()),
+                    JobToolCall::JobPlan { .. }
+                    | JobToolCall::JobLimits { .. }
+                    | JobToolCall::JobAgents { .. }
+                    | JobToolCall::JobWorkers { .. }
+                    | JobToolCall::JobAssign { .. }
+                    | JobToolCall::JobDispatch { .. }
+                    | JobToolCall::JobMessage { .. }
+                    | JobToolCall::JobRetry { .. } => {
+                        return self.corrupted("unexpected management tool".into());
+                    }
                 };
                 let conversation = JobId::new(self.job_tool_id(&conversation, "job:")?);
                 self.job_tool_rights(caller, conversation)?;

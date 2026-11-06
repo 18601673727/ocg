@@ -66,7 +66,7 @@ impl Enc {
         self.u32(u32::try_from(v.len()).expect("strings above 4 GiB are refused by redb first"));
         self.0.extend_from_slice(v.as_bytes());
     }
-    pub(super) fn opt<T>(&mut self, v: &Option<T>, mut put: impl FnMut(&mut Self, &T)) {
+    pub(super) fn opt<T: ?Sized>(&mut self, v: Option<&T>, mut put: impl FnMut(&mut Self, &T)) {
         match v {
             None => self.u8(0),
             Some(v) => {
@@ -76,28 +76,28 @@ impl Enc {
         }
     }
     pub(super) fn ots(&mut self, v: Option<Timestamp>) {
-        self.opt(&v, |e, v| e.ts(*v));
+        self.opt(v.as_ref(), |e, v| e.ts(*v));
     }
-    pub(super) fn ostr(&mut self, v: &Option<String>) {
+    pub(super) fn ostr(&mut self, v: Option<&str>) {
         self.opt(v, |e, v| e.str(v));
     }
     pub(super) fn ou32(&mut self, v: Option<u32>) {
-        self.opt(&v, |e, v| e.u32(*v));
+        self.opt(v.as_ref(), |e, v| e.u32(*v));
     }
     pub(super) fn ou64(&mut self, v: Option<u64>) {
-        self.opt(&v, |e, v| e.u64(*v));
+        self.opt(v.as_ref(), |e, v| e.u64(*v));
     }
     pub(super) fn ou128(&mut self, v: Option<u128>) {
-        self.opt(&v, |e, v| e.u128(*v));
+        self.opt(v.as_ref(), |e, v| e.u128(*v));
     }
     pub(super) fn of64(&mut self, v: Option<f64>) {
-        self.opt(&v, |e, v| e.f64(*v));
+        self.opt(v.as_ref(), |e, v| e.f64(*v));
     }
-    pub(super) fn ojson(&mut self, v: &Option<serde_json::Value>) {
+    pub(super) fn ojson(&mut self, v: Option<&serde_json::Value>) {
         self.opt(v, |e, v| e.str(&v.to_string()));
     }
     pub(super) fn agent_config(&mut self, agent: &AgentConfig) {
-        self.ostr(&agent.instructions);
+        self.ostr(agent.instructions.as_deref());
         self.u32(agent.capabilities.len() as u32);
         for capability in &agent.capabilities {
             self.u8(capability.code());
@@ -107,7 +107,7 @@ impl Enc {
             self.u128(model.get());
         }
 
-        self.opt(&agent.compaction_policy, Enc::compaction_policy);
+        self.opt(agent.compaction_policy.as_ref(), Enc::compaction_policy);
     }
     pub(super) fn compaction_policy(&mut self, policy: &CompactionPolicy) {
         match policy.mode {
@@ -132,7 +132,7 @@ impl Enc {
             }
         }
         self.ou128(policy.summarization_model.map(ConfigId::get));
-        self.opt(&policy.predictive, |e, p| {
+        self.opt(policy.predictive.as_ref(), |e, p| {
             e.u128(p.decision_agent.get());
             e.u32(p.minimum_interval_seconds);
             e.u32(p.max_preparations);
@@ -142,7 +142,7 @@ impl Enc {
                 PredictionMode::Shadow => 0,
                 PredictionMode::Prepare => 1,
             });
-            e.opt(&p.acceptance, |e, acceptance| {
+            e.opt(p.acceptance.as_ref(), |e, acceptance| {
                 e.config_ref(&acceptance.model);
                 e.str(&acceptance.reported_model);
                 e.str(&acceptance.confidence_semantics);
@@ -172,7 +172,7 @@ impl Enc {
         }
     }
     pub(super) fn decision_agent(&mut self, agent: &DecisionAgentConfig) {
-        self.ostr(&agent.instructions);
+        self.ostr(agent.instructions.as_deref());
         self.u32(agent.models.len() as u32);
         for model in &agent.models {
             self.u128(model.get());
@@ -183,7 +183,7 @@ impl Enc {
         match &work.frozen {
             FrozenDecisionConfig::Native(frozen) => {
                 self.u8(0);
-                self.opt(&frozen.agent, |encoder, agent| match agent {
+                self.opt(frozen.agent.as_ref(), |encoder, agent| match agent {
                     FrozenDecisionAgent::Agent(agent) => {
                         encoder.u8(0);
                         encoder.agent_config(agent);
@@ -193,23 +193,23 @@ impl Enc {
                         encoder.decision_agent(agent);
                     }
                 });
-                self.opt(&frozen.agent_ref, Self::config_ref);
+                self.opt(frozen.agent_ref.as_ref(), Self::config_ref);
                 self.decision_model(&frozen.model);
                 self.config_ref(&frozen.model_ref);
                 self.config_ref(&frozen.connection_ref);
-                self.ostr(&frozen.endpoint);
-                self.ostr(&frozen.credential_ref);
+                self.ostr(frozen.endpoint.as_deref());
+                self.ostr(frozen.credential_ref.as_deref());
             }
             FrozenDecisionConfig::Generative(frozen, profile) => {
                 self.u8(1);
                 self.frozen_execution(frozen);
-                self.opt(profile, |encoder, (agent, reference)| {
+                self.opt(profile.as_ref(), |encoder, (agent, reference)| {
                     encoder.decision_agent(agent);
                     encoder.config_ref(reference);
                 });
             }
         }
-        self.opt(&work.assignment, |encoder, assignment| {
+        self.opt(work.assignment.as_ref(), |encoder, assignment| {
             encoder.u128(assignment.project.get());
             encoder.u64(assignment.revision);
         });
@@ -239,15 +239,15 @@ impl Enc {
                 }
             }
         }
-        self.opt(&work.prediction, |encoder, binding| {
+        self.opt(work.prediction.as_ref(), |encoder, binding| {
             encoder.u128(binding.conversation.get());
             encoder.u128(binding.activity_turn.get());
             encoder.u64(binding.policy_revision);
-            encoder.opt(&binding.policy_profile, Self::config_ref);
+            encoder.opt(binding.policy_profile.as_ref(), Self::config_ref);
             encoder.u32(binding.max_tokens);
             encoder.compaction_policy(&binding.policy);
         });
-        self.opt(&work.commands, |encoder, binding| {
+        self.opt(work.commands.as_ref(), |encoder, binding| {
             encoder.u128(binding.approval.job.get());
             encoder.u32(binding.approval.request.get());
             encoder.u32(binding.approval.index);
@@ -265,7 +265,7 @@ impl Enc {
         self.of64(parameters.temperature);
         self.of64(parameters.top_p);
         self.ou32(parameters.max_tokens);
-        self.ostr(&parameters.reasoning_effort);
+        self.ostr(parameters.reasoning_effort.as_deref());
         self.ou32(parameters.max_completion_tokens);
         self.of64(parameters.presence_penalty);
         self.of64(parameters.frequency_penalty);
@@ -282,20 +282,20 @@ impl Enc {
         self.u32(provider.edit_seq);
         self.str(&provider.name);
         self.u8(provider.transport.code());
-        self.ostr(&provider.endpoint);
-        self.ostr(&provider.credential_ref);
+        self.ostr(provider.endpoint.as_deref());
+        self.ostr(provider.credential_ref.as_deref());
     }
     pub(super) fn frozen_execution(&mut self, frozen: &FrozenExecutionConfig) {
-        self.opt(&frozen.agent, Enc::agent_config);
-        self.opt(&frozen.agent_ref, Enc::config_ref);
+        self.opt(frozen.agent.as_ref(), Enc::agent_config);
+        self.opt(frozen.agent_ref.as_ref(), Enc::config_ref);
         self.frozen_llm(&frozen.llm);
     }
     pub(super) fn provider_failure(&mut self, failure: &ProviderFailure) {
         self.str(&failure.message);
-        self.opt(&failure.status_code, |e, v| e.u16(*v));
-        self.ostr(&failure.provider_code);
-        self.ostr(&failure.response_body);
-        self.ostr(&failure.request_id);
+        self.opt(failure.status_code.as_ref(), |e, v| e.u16(*v));
+        self.ostr(failure.provider_code.as_deref());
+        self.ostr(failure.response_body.as_deref());
+        self.ostr(failure.request_id.as_deref());
         self.ou64(failure.retry_after_ms);
         self.bool(failure.retryable);
     }
@@ -309,7 +309,7 @@ impl Enc {
         ] {
             self.ou32(count);
         }
-        self.ojson(&usage.raw);
+        self.ojson(usage.raw.as_ref());
     }
 }
 
@@ -833,7 +833,7 @@ impl Enc {
                 plan_source,
             } => {
                 self.u8(1);
-                self.ostr(name);
+                self.ostr(name.as_deref());
                 match execution {
                     JobExecution::Frozen(frozen) => {
                         self.u8(0);
@@ -845,10 +845,10 @@ impl Enc {
                         self.0.extend_from_slice(work.source.as_bytes());
                         self.u32(work.target_tokens);
                         self.u32(work.minimum_savings_tokens);
-                        self.opt(&work.policy_revision, |encoder, revision| {
+                        self.opt(work.policy_revision.as_ref(), |encoder, revision| {
                             encoder.u64(*revision)
                         });
-                        self.opt(&work.policy_profile, Self::config_ref);
+                        self.opt(work.policy_profile.as_ref(), Self::config_ref);
                         match work.stage {
                             SummarizationStage::Direct => self.u8(0),
                             SummarizationStage::Chunk {
@@ -899,9 +899,9 @@ impl Enc {
                     } => {
                         self.u8(1);
                         self.ou128(project.map(ProjectId::get));
-                        self.ostr(grant);
+                        self.ostr(grant.as_deref());
                         self.ots(*eligible_at);
-                        self.ostr(objective);
+                        self.ostr(objective.as_deref());
                         self.u32(attachments.len() as u32);
                         for attachment in attachments {
                             self.u128(attachment.get());
@@ -945,7 +945,7 @@ impl Enc {
                 self.u8(1);
                 self.str(name);
                 self.str(&schema.to_string());
-                self.opt(strict, |e, v| e.bool(*v));
+                self.opt(strict.as_ref(), |e, v| e.bool(*v));
             }
         }
     }

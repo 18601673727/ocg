@@ -47,7 +47,7 @@ impl JobSpec {
         e.job_kind(&self.kind);
         e.ts(self.created_at);
         e.ou128(self.parent_id.map(JobId::get));
-        e.opt(&self.allocation, |e, allocation| {
+        e.opt(self.allocation.as_ref(), |e, allocation| {
             e.u128(allocation.owner.get());
             e.bool(allocation.synthesis);
         });
@@ -106,24 +106,24 @@ impl JobState {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB_STATE);
         e.u128(self.job_id.get());
-        e.opt(&self.claim, |e, c| {
+        e.opt(self.claim.as_ref(), |e, c| {
             e.ts(c.started_at);
             e.u128(c.pool_id.get());
             e.u32(c.pool_edit_seq);
             e.u32(c.capabilities.len() as u32);
             for (op, proto) in &c.capabilities {
                 e.u8(op.code());
-                e.opt(proto, |e, p| e.u8(p.code()));
+                e.opt(proto.as_ref(), |e, p| e.u8(p.code()));
             }
             e.u64(c.epoch);
-            e.ostr(&c.host_id);
-            e.ostr(&c.boot_id);
+            e.ostr(c.host_id.as_deref());
+            e.ostr(c.boot_id.as_deref());
             e.u32(c.notice_seq);
         });
-        e.opt(&self.outcome, |e, o| {
+        e.opt(self.outcome.as_ref(), |e, o| {
             e.u8(o.kind.code());
             e.ts(o.at);
-            e.opt(&o.cause, |e, cause| match cause {
+            e.opt(o.cause.as_ref(), |e, cause| match cause {
                 OutcomeCause::Code(c) => {
                     e.u8(1);
                     e.u8(*c);
@@ -144,7 +144,9 @@ impl JobState {
             });
         });
         e.ots(self.stop_confirmed_at);
-        e.opt(&self.stop_confirmed_by, |e, proof| e.u8(proof.code()));
+        e.opt(self.stop_confirmed_by.as_ref(), |e, proof| {
+            e.u8(proof.code())
+        });
         e.0
     }
 
@@ -248,15 +250,15 @@ impl ConfigRow {
             ConfigBody::Connection(c) => {
                 e.u8(1);
                 e.u8(c.protocol.code());
-                e.ostr(&c.endpoint);
-                e.ostr(&c.credential_ref);
+                e.ostr(c.endpoint.as_deref());
+                e.ostr(c.credential_ref.as_deref());
             }
             ConfigBody::Model(m) => {
                 e.u8(2);
                 e.u128(m.connection_id.get());
                 e.str(&m.model);
                 e.ou32(m.context_window);
-                e.opt(&m.reasoning_efforts, |e, values| {
+                e.opt(m.reasoning_efforts.as_ref(), |e, values| {
                     e.u32(values.len() as u32);
                     for value in values {
                         e.str(value);
@@ -266,7 +268,7 @@ impl ConfigRow {
                 e.of64(p.temperature);
                 e.of64(p.top_p);
                 e.ou32(p.max_tokens);
-                e.ostr(&p.reasoning_effort);
+                e.ostr(p.reasoning_effort.as_deref());
                 e.ou32(p.max_completion_tokens);
                 e.of64(p.presence_penalty);
                 e.of64(p.frequency_penalty);
@@ -284,7 +286,7 @@ impl ConfigRow {
                 e.u32(p.capabilities.len() as u32);
                 for (op, proto) in &p.capabilities {
                     e.u8(op.code());
-                    e.opt(proto, |e, pr| e.u8(pr.code()));
+                    e.opt(proto.as_ref(), |e, pr| e.u8(pr.code()));
                 }
                 e.u32(p.concurrency_limit);
                 e.bool(p.enabled);
@@ -423,10 +425,10 @@ pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_OUTPUT);
     e.u128(o.id.get());
     e.u8(o.kind.code());
-    e.ostr(&o.summary);
-    e.ostr(&o.code);
-    e.opt(&o.goal_reached, |e, v| e.bool(*v));
-    e.ojson(&o.value);
+    e.ostr(o.summary.as_deref());
+    e.ostr(o.code.as_deref());
+    e.opt(o.goal_reached.as_ref(), |e, v| e.bool(*v));
+    e.ojson(o.value.as_ref());
     e.ts(o.created_at);
     e.0
 }
@@ -496,10 +498,10 @@ pub(super) fn encode_attachment(a: &AttachmentRecord) -> Vec<u8> {
     e.0.extend_from_slice(a.sha256.as_bytes());
     e.u64(a.byte_length);
     e.str(&a.mime);
-    e.ostr(&a.display_name);
+    e.ostr(a.display_name.as_deref());
     e.u8(a.origin.code());
     e.ts(a.created_at);
-    e.opt(&a.cleanup, |e, cleanup| {
+    e.opt(a.cleanup.as_ref(), |e, cleanup| {
         e.u8(cleanup.kind.code());
         e.ts(cleanup.cleaned_at);
     });
@@ -532,7 +534,7 @@ pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
     let mut e = Enc::new(TAG_PROJECT);
     e.u128(p.id.get());
     e.str(&p.name);
-    e.ostr(&p.description);
+    e.ostr(p.description.as_deref());
     e.str(&p.root);
     e.u32(u32::try_from(p.commands.len()).unwrap_or(u32::MAX));
     for command in &p.commands {
@@ -543,9 +545,9 @@ pub(super) fn encode_project(p: &ProjectRecord) -> Vec<u8> {
         }
         e.u8(command.owner.code());
         e.u8(command.status.code());
-        e.opt(&command.proposal, |e, job| e.u128(job.get()));
+        e.opt(command.proposal.as_ref(), |e, job| e.u128(job.get()));
     }
-    e.opt(&p.decision, |e, policy| {
+    e.opt(p.decision.as_ref(), |e, policy| {
         e.bool(policy.enabled);
         e.ou128(policy.decision_profile.map(ConfigId::get));
         e.u32(u32::from(policy.minimum_confidence_millis));
@@ -625,21 +627,21 @@ pub(super) fn decode_project_root(key: u128, bytes: &[u8]) -> DecodeResult<(Proj
 impl JobControl {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB_CONTROL);
-        e.ostr(&self.title);
+        e.ostr(self.title.as_deref());
         e.ots(self.hidden_at);
         e.ou32(self.on_hold);
         e.u8(self.loop_count);
-        e.opt(&self.closing, |e, closing| {
+        e.opt(self.closing.as_ref(), |e, closing| {
             e.ts(closing.at);
             e.actor(&closing.by);
             e.bool(closing.running);
         });
-        e.opt(&self.limits, |e, limits| {
+        e.opt(self.limits.as_ref(), |e, limits| {
             e.u8(limits.max_depth);
             e.u8(limits.max_auto_turns);
             e.u32(limits.max_iterations);
         });
-        e.opt(&self.compaction_policy, Enc::compaction_policy);
+        e.opt(self.compaction_policy.as_ref(), Enc::compaction_policy);
         e.u64(self.compaction_revision);
         e.0
     }
@@ -678,7 +680,7 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
     e.str(&record.tool_call_id);
     e.str(&record.name);
     e.bool(record.spawns);
-    e.opt(&record.approval, |e, call| e.call_ref(call));
+    e.opt(record.approval.as_ref(), |e, call| e.call_ref(call));
     e.ts(record.decision.at);
     match &record.decision.fact {
         ToolDecision::Refused(refusal) => {
@@ -701,7 +703,7 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
             e.u8(admission.authorization.code());
         }
     }
-    e.opt(&record.outcome, |e, outcome| {
+    e.opt(record.outcome.as_ref(), |e, outcome| {
         e.ts(outcome.at);
         match &outcome.fact {
             ToolOutcome::Completed { result } => {
@@ -728,11 +730,11 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
             ToolOutcome::Uncertain { cause, message } => {
                 e.u8(5);
                 e.u8(cause.code());
-                e.ostr(message);
+                e.ostr(message.as_deref());
             }
         }
     });
-    e.opt(&record.reconciliation, |e, reconciliation| {
+    e.opt(record.reconciliation.as_ref(), |e, reconciliation| {
         e.ts(reconciliation.at);
         let fact = &reconciliation.fact;
         e.u8(fact.conclusion.code());
@@ -867,7 +869,9 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
             for digest in messages {
                 e.0.extend_from_slice(digest.as_bytes());
             }
-            e.opt(tools, |e, digest| e.0.extend_from_slice(digest.as_bytes()));
+            e.opt(tools.as_ref(), |e, digest| {
+                e.0.extend_from_slice(digest.as_bytes())
+            });
             e.0.extend_from_slice(parameters.as_bytes());
             e.ou32(*dropped_turns);
         }
@@ -894,10 +898,10 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
             failure,
         } => {
             e.u8(2);
-            e.opt(status_code, |e, v| e.u16(*v));
-            e.opt(finish_reason, |e, v| e.u8(v.code()));
-            e.ostr(raw_finish_reason);
-            e.opt(failure, Enc::provider_failure);
+            e.opt(status_code.as_ref(), |e, v| e.u16(*v));
+            e.opt(finish_reason.as_ref(), |e, v| e.u8(v.code()));
+            e.ostr(raw_finish_reason.as_deref());
+            e.opt(failure.as_ref(), Enc::provider_failure);
         }
         RequestPayload::Token {
             eligibility,

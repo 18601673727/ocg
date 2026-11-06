@@ -75,7 +75,7 @@ pub(super) fn observation_kind(
 
 pub(super) fn metric_record(
     table: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
-    target: &Option<LlmTarget>,
+    target: Option<&LlmTarget>,
     event: &RequestEventRecord,
 ) -> Result<Option<MetricsRecord>, StorageError> {
     let (measurements, token) = match &event.payload {
@@ -128,7 +128,7 @@ pub(super) fn metric_record(
         id: MetricsId::new(event.id.get()),
         job: event.job_id,
         request: event.request,
-        target: target.clone(),
+        target: target.cloned(),
         observed_at: event.observed_at,
         measurements,
         token,
@@ -193,7 +193,7 @@ pub(crate) fn read_job_metrics(
         let event = event_at_key(&events, job, request, seq)?
             .ok_or_else(|| StorageError::corrupted("observation event missing"))?;
         records.push(
-            metric_record(&events, &target, &event)?
+            metric_record(&events, target.as_ref(), &event)?
                 .ok_or_else(|| StorageError::corrupted("invalid metrics index"))?,
         );
     }
@@ -399,7 +399,7 @@ pub(crate) fn read_metrics(
             ) {
                 return Ok(None);
             }
-            metric_record(&rx.open_table(REQUEST_EVENTS)?, &Some(target), &event)
+            metric_record(&rx.open_table(REQUEST_EVENTS)?, Some(&target), &event)
         },
     )
 }
@@ -665,7 +665,10 @@ pub(crate) fn read_provider_request(
                 sent = Some((request_messages, request_tools, request_parameters));
             }
             RequestPayload::Received { digest } => response = Some(value(digest)?),
-            _ => {}
+            RequestPayload::ApprovedCalls
+            | RequestPayload::Measurement { .. }
+            | RequestPayload::Availability { .. }
+            | RequestPayload::Token { .. } => {}
         }
     }
     let Some((messages, tools, parameters)) = sent else {

@@ -91,7 +91,7 @@ pub struct MetricsRecord {
 /// own, without measurements.
 fn metrics_of(
     job: JobId,
-    target: &Option<LlmTarget>,
+    target: Option<&LlmTarget>,
     events: &[RequestEventRecord],
 ) -> Vec<MetricsRecord> {
     let mut records: Vec<MetricsRecord> = Vec::new();
@@ -109,7 +109,7 @@ fn metrics_of(
                     id: MetricsId::new(event.id.get()),
                     job,
                     request: event.request,
-                    target: target.clone(),
+                    target: target.cloned(),
                     observed_at: event.observed_at,
                     measurements: measurements.clone(),
                     token: None,
@@ -137,7 +137,7 @@ fn metrics_of(
                         id: MetricsId::new(event.id.get()),
                         job,
                         request: event.request,
-                        target: target.clone(),
+                        target: target.cloned(),
                         observed_at: event.observed_at,
                         measurements: Measurements::default(),
                         token: Some(annotation),
@@ -162,7 +162,7 @@ fn metrics_of(
 pub(in crate::db) fn usage_sample_of(
     job: JobId,
     request: RequestNumber,
-    target: &Option<LlmTarget>,
+    target: Option<&LlmTarget>,
     events: &[RequestEventRecord],
 ) -> Option<TokenRequestSample> {
     let records = metrics_of(job, target, events);

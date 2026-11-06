@@ -171,8 +171,8 @@ pub(super) fn search_index_bytes(text: &str) -> u64 {
         .saturating_mul(64)
 }
 
-pub(super) fn compaction_bytes(policy: &Option<crate::db::entities::CompactionPolicy>) -> u64 {
-    policy.as_ref().map_or(0, |policy| {
+pub(super) fn compaction_bytes(policy: Option<&crate::db::entities::CompactionPolicy>) -> u64 {
+    policy.map_or(0, |policy| {
         256u64.saturating_add(
             policy
                 .predictive
@@ -201,14 +201,12 @@ pub(super) fn byte_count(length: usize) -> u64 {
     u64::try_from(length).unwrap_or(u64::MAX)
 }
 
-pub(super) fn text_bytes(text: &Option<String>) -> u64 {
-    text.as_ref().map_or(0, |text| byte_count(text.len()))
+pub(super) fn text_bytes(text: Option<&str>) -> u64 {
+    text.map_or(0, |text| byte_count(text.len()))
 }
 
-pub(super) fn json_bytes(value: &Option<serde_json::Value>) -> u64 {
-    value
-        .as_ref()
-        .map_or(0, |value| counted_json_bytes(value, ByteCounter::default()))
+pub(super) fn json_bytes(value: Option<&serde_json::Value>) -> u64 {
+    value.map_or(0, |value| counted_json_bytes(value, ByteCounter::default()))
 }
 
 /// Measures the compact serialization of `value` on top of what `counter`
@@ -242,9 +240,9 @@ impl Write for ByteCounter {
 }
 
 pub(super) fn output_bytes(
-    summary: &Option<String>,
-    code: &Option<String>,
-    value: &Option<serde_json::Value>,
+    summary: Option<&str>,
+    code: Option<&str>,
+    value: Option<&serde_json::Value>,
 ) -> u64 {
     text_bytes(summary)
         .saturating_add(text_bytes(code))
@@ -253,7 +251,7 @@ pub(super) fn output_bytes(
 
 pub(super) fn entry_bytes(
     first: &Entry,
-    format: &Option<crate::db::entities::ResponseFormat>,
+    format: Option<&crate::db::entities::ResponseFormat>,
 ) -> u64 {
     byte_count(format!("{first:?}").len())
         .saturating_add(match first {
@@ -273,7 +271,7 @@ pub(super) fn entry_bytes(
             | Entry::ContextUse { .. }
             | Entry::ResponseFormat { .. } => 0,
         })
-        .saturating_add(format.as_ref().map_or(0, |format| {
+        .saturating_add(format.map_or(0, |format| {
             byte_count(redb::encode_response_format(format).len())
         }))
         .saturating_add(match first {
@@ -290,20 +288,19 @@ pub(super) fn entry_bytes(
 
 pub(super) fn config_bytes(config: &Config) -> u64 {
     byte_count(config.name.len()).saturating_add(match &config.body {
-        ConfigBody::Agent(agent) => text_bytes(&agent.instructions)
-            .saturating_add(compaction_bytes(&agent.compaction_policy))
+        ConfigBody::Agent(agent) => text_bytes(agent.instructions.as_deref())
+            .saturating_add(compaction_bytes(agent.compaction_policy.as_ref()))
             .saturating_add(byte_count(agent.models.len()).saturating_mul(8)),
         ConfigBody::Model(model) => byte_count(model.model.len()),
-        ConfigBody::Connection(connection) => {
-            text_bytes(&connection.endpoint).saturating_add(text_bytes(&connection.credential_ref))
-        }
+        ConfigBody::Connection(connection) => text_bytes(connection.endpoint.as_deref())
+            .saturating_add(text_bytes(connection.credential_ref.as_deref())),
         ConfigBody::Pool(_) => 32,
         ConfigBody::DecisionModel(dm) => byte_count(dm.model.len())
             .saturating_add(2048)
             .saturating_add(16)
             .saturating_add(byte_count(dm.declared_capabilities.len()))
             .saturating_add(32),
-        ConfigBody::DecisionAgent(da) => text_bytes(&da.instructions)
+        ConfigBody::DecisionAgent(da) => text_bytes(da.instructions.as_deref())
             .saturating_add(byte_count(da.models.len().saturating_mul(16)))
             .saturating_add(32),
     })

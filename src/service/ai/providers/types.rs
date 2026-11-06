@@ -268,7 +268,14 @@ impl ProviderExecutionError {
         match self {
             Self::Rejected { failure } => Some(failure),
             Self::OutputPersistence { stream, .. } => stream.failure(),
-            _ => None,
+            Self::Build { .. }
+            | Self::NotDelivered { .. }
+            | Self::Unknown { .. }
+            | Self::StreamFailure { .. }
+            | Self::Incomplete { .. }
+            | Self::Interrupted { .. }
+            | Self::Stopped { .. }
+            | Self::CompletionUnpersisted { .. } => None,
         }
     }
 }

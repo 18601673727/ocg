@@ -81,7 +81,7 @@ impl Batch {
         {
             let previous_due = match row.phase {
                 RecurrencePhase::WaitingDue { due } => Some(due),
-                _ => None,
+                RecurrencePhase::Active | RecurrencePhase::Halted { .. } => None,
             };
             row.phase = RecurrencePhase::Halted { reason };
             self.put_recurrence(conversation, &row, previous_due)?;

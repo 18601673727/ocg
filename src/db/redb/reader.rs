@@ -92,7 +92,7 @@ pub(super) fn job_execution(
                     execution: JobExecution::Frozen(execution),
                     ..
                 } if owner.parent_id == row.parent_id => execution,
-                _ => {
+                JobKind::Group { .. } | JobKind::Execution { .. } => {
                     return Err(StorageError::corrupted(
                         "execution reference must name a Frozen turn in this conversation",
                     ));
@@ -466,7 +466,9 @@ pub(crate) fn read_job_details(
             events.push(event);
             if seq == 1 {
                 events.reverse();
-                if let Some(sample) = observations::usage_sample_of(id, request, &target, &events) {
+                if let Some(sample) =
+                    observations::usage_sample_of(id, request, target.as_ref(), &events)
+                {
                     usage.add_sample(&sample);
                 }
                 events.clear();
@@ -1489,7 +1491,7 @@ pub(crate) fn read_decision_work(
             execution: JobExecution::Decision(work),
             ..
         } => Ok(Some(work)),
-        _ => Ok(None),
+        JobKind::Group { .. } | JobKind::Execution { .. } => Ok(None),
     }
 }
 
@@ -4529,7 +4531,7 @@ pub(super) fn preparation_charge(
         if let Some(sample) = observations::usage_sample_of(
             member.id,
             RequestNumber::FIRST,
-            &turn_target_of(jobs, &member)?,
+            turn_target_of(jobs, &member)?.as_ref(),
             &evidence,
         ) {
             total = total

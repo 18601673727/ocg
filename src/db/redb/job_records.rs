@@ -108,9 +108,13 @@ impl Batch {
                     ..
                 } => match self.require_config_kind(agent_id, ConfigKind::Agent)?.body {
                     ConfigBody::Agent(body) => body.models.contains(&model),
-                    _ => false,
+                    ConfigBody::Connection(_)
+                    | ConfigBody::Model(_)
+                    | ConfigBody::Pool(_)
+                    | ConfigBody::DecisionModel(_)
+                    | ConfigBody::DecisionAgent(_) => false,
                 },
-                _ => false,
+                JobKind::Group { .. } | JobKind::Execution { .. } => false,
             };
             if !allowed_by_policy && !allowed_by_agent {
                 return self.reject(Violation::InvalidValue(

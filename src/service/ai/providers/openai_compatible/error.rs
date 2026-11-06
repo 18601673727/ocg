@@ -73,7 +73,7 @@ impl TransportError {
     pub fn status_code(&self) -> Option<u16> {
         match self {
             Self::Provider(failure) => failure.status_code,
-            _ => None,
+            Self::InvalidRequest { .. } | Self::Unsupported { .. } | Self::Build { .. } => None,
         }
     }
 
@@ -82,7 +82,7 @@ impl TransportError {
     pub fn provider_code(&self) -> Option<&str> {
         match self {
             Self::Provider(failure) => failure.provider_code.as_deref(),
-            _ => None,
+            Self::InvalidRequest { .. } | Self::Unsupported { .. } | Self::Build { .. } => None,
         }
     }
 }

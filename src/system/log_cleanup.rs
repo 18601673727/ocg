@@ -335,7 +335,9 @@ fn check_database(database: &DatabaseHandle) -> Result<(), DatabaseError> {
             Some(lock) => Err(DatabaseError::DiskProtected(lock)),
             None => Err(DatabaseError::ShuttingDown),
         },
-        _ => Err(DatabaseError::ShuttingDown),
+        DatabaseStatus::ShuttingDown | DatabaseStatus::WorkerStopped | DatabaseStatus::Closed => {
+            Err(DatabaseError::ShuttingDown)
+        }
     }
 }
 

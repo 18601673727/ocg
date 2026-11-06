@@ -195,7 +195,9 @@ impl ProtectionLock {
     pub fn storage_failure(&self) -> Option<&StorageError> {
         self.reasons.iter().find_map(|reason| match reason {
             ProtectionReason::StorageUnavailable(error) => Some(error),
-            _ => None,
+            ProtectionReason::InsufficientSpace(_)
+            | ProtectionReason::SpaceQueryFailed(_)
+            | ProtectionReason::FilesystemWriteFailed { .. } => None,
         })
     }
 }
