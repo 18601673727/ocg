@@ -116,7 +116,7 @@ Then open the local URL above.
 
 Keep the OCG data directory separate from project workspaces. The [data layout](src/system/data_directory.rs) places `ocg.redb` and `credentials.json` in the data root, with logs in `ocg_logs/` and attachments in `ocg_attachments/`.
 
-> **Storage compatibility:** Current `main` uses database format **16**. With `OCG_DATA_DIR` set to the data directory, `ocg migrate --check` reports whether it needs migration, and `ocg migrate --to <directory>` writes a migrated copy. `install.sh` and `ocg update` run the check before switching versions and stop if migration is needed. Back up the data directory before upgrading.
+> **Storage compatibility:** Current `main` uses database format **18**. With `OCG_DATA_DIR` set to the data directory, `ocg migrate --check` reports whether it needs migration, and `ocg migrate --to <directory>` writes a migrated copy. `install.sh` and `ocg update` run the check before switching versions and stop if migration is needed. Back up the data directory before upgrading.
 
 ## Performance
 
