@@ -8,7 +8,7 @@ import { I18nProvider, LOCALE_BOOTSTRAP_SCRIPT } from "@/components/ocg/i18n";
 
 export const metadata: Metadata = {
   title: "OCG Workspace",
-  description: "OCG desktop AI engineering environment — application shell (mock state, Phase 1).",
+  description: "A self-hosted workspace for AI conversations, coding agents, and job history.",
 };
 
 export const viewport: Viewport = {

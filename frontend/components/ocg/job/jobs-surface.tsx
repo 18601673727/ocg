@@ -1,7 +1,8 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ListFilter, MessageSquare, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,10 +15,21 @@ import {
 } from "@/components/ui/select";
 import type { SettlementState } from "../contracts/api";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import { useI18n } from "../i18n";
+import { useI18n, type I18nKey } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { SELECTED_ROW } from "../primitives/selection";
 import { LoadMore } from "../primitives/load-more";
+import { ListStatus } from "../primitives/list-status";
+import { Pill } from "../primitives/pill";
+import type { Tone } from "../primitives/tone";
+
+const settlement = {
+  unsettled: { label: "job.state.unsettled", tone: "violet" },
+  completed: { label: "job.activity.completed", tone: "emerald" },
+  failed: { label: "job.activity.failed", tone: "red" },
+  cancelled: { label: "job.activity.cancelled", tone: "slate" },
+  unknown: { label: "job.activity.unknown", tone: "slate" },
+} as const satisfies Record<SettlementState, { label: I18nKey; tone: Tone }>;
 
 export function JobsSurface({
   client,
@@ -32,8 +44,13 @@ export function JobsSurface({
   onJob: (job: string | null) => void;
   onOpenChat?: (job: string) => void;
 }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const dateTime = useMemo(
+    () => new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }),
+    [locale],
+  );
   const [query, setQuery] = useState("");
+  const searchInput = useRef<HTMLInputElement>(null);
   const [status, setStatus] = useState<SettlementState | "all">("all");
   const [records, setRecords] = useState<Awaited<ReturnType<typeof client.readJobs>>["jobs"]>([]);
   const visibleRecords =
@@ -148,75 +165,104 @@ export function JobsSurface({
   const loadMore = useCallback(() => {
     loadMoreRef.current();
   }, []);
-  const select = useCallback(
-    (next: string) => {
-      onJob(next);
-    },
-    [onJob],
-  );
+  function updateQuery(value: string) {
+    if (query === value) return;
+    setRecords([]);
+    setReady(false);
+    setError(null);
+    setHasMore(false);
+    setLoadingMore(false);
+    setQuery(value);
+  }
+  const filtered = status !== "all" || query.length > 0;
+  const options = [
+    { value: "all" as const, label: t("jobs.statusAll") },
+    ...Object.entries(settlement).map(([value, { label }]) => ({
+      value: value as SettlementState,
+      label: t(label),
+    })),
+  ];
 
   return (
     <ContentContainer>
-      <ContentHeader
-        title={t("jobs.title")}
-        actions={
-          <div className="flex items-center gap-2">
-            <Select
-              value={status}
-              onValueChange={(value) => {
-                if (value !== null) setStatus(value as SettlementState | "all");
-              }}
-            >
-              <SelectTrigger aria-label={t("jobs.statusFilter")} className="w-40">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">{t("jobs.statusAll")}</SelectItem>
-                <SelectItem value="unsettled">{t("job.state.unsettled")}</SelectItem>
-                <SelectItem value="completed">{t("job.activity.completed")}</SelectItem>
-                <SelectItem value="failed">{t("job.activity.failed")}</SelectItem>
-                <SelectItem value="cancelled">{t("job.activity.cancelled")}</SelectItem>
-                <SelectItem value="unknown">{t("job.activity.unknown")}</SelectItem>
-              </SelectContent>
-            </Select>
+      <ContentHeader title={t("jobs.title")} description={t("jobs.description")} />
+      <section
+        aria-label={t("jobs.title")}
+        className="min-w-0 overflow-hidden rounded-xl border border-border bg-card"
+      >
+        <div className="flex flex-wrap items-center gap-2 border-b border-border p-3 sm:px-5 sm:py-4">
+          <div className="relative min-w-36 flex-1 sm:max-w-sm">
+            <Search
+              aria-hidden="true"
+              className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
+            />
             <Input
+              ref={searchInput}
+              type="search"
               aria-label={t("jobs.search")}
               placeholder={t("jobs.search")}
-              className="w-64"
+              className="h-9 bg-background pl-9"
               value={query}
-              onChange={(event) => {
-                setRecords([]);
-                setReady(false);
-                setHasMore(false);
-                setLoadingMore(false);
-                setQuery(event.target.value);
-              }}
+              onChange={(event) => updateQuery(event.target.value)}
             />
           </div>
-        }
-      />
-      <section className="rounded-lg border border-border bg-card p-5">
-        <p className="mb-4 text-sm text-muted-foreground">{t("jobs.description")}</p>
+          <Select<SettlementState | "all">
+            value={status}
+            items={options}
+            onValueChange={(value) => {
+              if (value !== null) setStatus(value);
+            }}
+          >
+            <SelectTrigger
+              aria-label={t("jobs.statusFilter")}
+              className="gap-2 border-input bg-background"
+            >
+              <ListFilter aria-hidden="true" className="size-4" />
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {options.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {filtered && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                updateQuery("");
+                setStatus("all");
+                searchInput.current?.focus();
+              }}
+            >
+              {t("common.reset")}
+            </Button>
+          )}
+        </div>
         {error ? (
-          <DismissibleNotice message={error} className="mb-3 text-sm text-destructive">
+          <DismissibleNotice message={error} className="m-4 text-sm text-destructive">
             {error}
           </DismissibleNotice>
         ) : null}
-        {!ready ? <p role="status">{t("jobs.loading")}</p> : null}
-        {ready && visibleRecords.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            {t(status === "all" ? "jobs.empty" : "jobs.statusEmpty")}
+        {status !== "all" && hasMore ? (
+          <p className="border-b border-border bg-muted/30 px-5 py-2 text-xs text-muted-foreground">
+            {t("jobs.filterNote")}
           </p>
         ) : null}
-        {status !== "all" && hasMore ? (
-          <p className="mb-3 text-xs text-muted-foreground">{t("jobs.filterNote")}</p>
+        {!ready && !error ? <ListStatus loading message={t("jobs.loading")} /> : null}
+        {ready && !error && visibleRecords.length === 0 ? (
+          <ListStatus message={t(filtered ? "jobs.statusEmpty" : "jobs.empty")} />
         ) : null}
         {visibleRecords.length > 0 ? (
-          <div className="overflow-x-auto rounded-lg border border-border">
+          <div className="overflow-x-auto">
             <table className="w-full text-sm">
-              <thead className="border-b border-border bg-muted/40 text-xs text-muted-foreground">
+              <thead className="border-b border-border bg-muted/50 text-xs text-muted-foreground [&_th]:font-medium">
                 <tr>
-                  <th scope="col" className="px-3 py-2 text-left">
+                  <th scope="col" className="py-2.5 pr-3 pl-5 text-left">
                     {t("jobs.columnJob")}
                   </th>
                   <th scope="col" className="px-3 py-2 text-left">
@@ -234,33 +280,36 @@ export function JobsSurface({
                 {visibleRecords.map((record) => (
                   <tr
                     key={record.id}
-                    className={cn(job === record.id ? SELECTED_ROW : "hover:bg-muted/30")}
+                    className={cn(
+                      "transition-colors",
+                      job === record.id ? SELECTED_ROW : "hover:bg-muted/30",
+                    )}
                   >
-                    <td className="px-3 py-3">
+                    <td className="py-3 pr-3 pl-5">
                       <button
                         type="button"
-                        onClick={() => select(record.id)}
+                        onClick={() => onJob(record.id)}
                         aria-current={job === record.id ? "true" : undefined}
-                        className="text-left focus-visible:outline-2 focus-visible:outline-ring"
+                        className="group block w-full rounded-sm text-left focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
                       >
-                        <span className="block font-medium break-words">
+                        <span className="block min-w-32 font-medium break-words decoration-primary underline-offset-4 group-hover:underline group-focus-visible:underline">
                           {record.kind === "turn" && record.conversation !== null && record.title
                             ? record.title
                             : (record.name ?? t("jobs.unnamed"))}
                         </span>
-                        <span className="block font-mono text-xs text-muted-foreground">
+                        <span className="mt-1 block font-mono text-xs text-muted-foreground">
                           {record.id}
                         </span>
                       </button>
                     </td>
                     <td className="whitespace-nowrap px-3 py-3">
-                      {record.settlement.state === "unsettled"
-                        ? t("job.state.unsettled")
-                        : t(`job.activity.${record.settlement.state}`)}
+                      <Pill tone={settlement[record.settlement.state].tone} dot>
+                        {t(settlement[record.settlement.state].label)}
+                      </Pill>
                     </td>
-                    <td className="whitespace-nowrap px-3 py-3 text-muted-foreground">
+                    <td className="whitespace-nowrap px-3 py-3 text-xs tabular-nums text-muted-foreground">
                       <time dateTime={new Date(record.created_at_us / 1000).toISOString()}>
-                        {new Date(record.created_at_us / 1000).toLocaleString()}
+                        {dateTime.format(record.created_at_us / 1000)}
                       </time>
                     </td>
                     <td className="px-3 py-3">
@@ -268,10 +317,11 @@ export function JobsSurface({
                         <Button
                           type="button"
                           variant="outline"
-                          size="xs"
+                          size="sm"
                           className="shrink-0"
                           onClick={() => onOpenChat(record.id)}
                         >
+                          <MessageSquare className="size-3.5" aria-hidden="true" />
                           {t("jobs.openInChat")}
                         </Button>
                       ) : null}

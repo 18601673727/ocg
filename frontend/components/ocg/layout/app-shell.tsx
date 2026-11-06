@@ -7,10 +7,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import { ArrowLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { FloatingIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
 import { cn } from "@/lib/utils";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
+import { WorkspaceHome } from "./workspace-home";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import type { ComposerIntent } from "../composer/domain";
@@ -128,6 +130,15 @@ function AppShellContent({
   const [ancestors, setAncestors] = useState<string[]>([]);
   const [collapsed, setCollapsed] = useState(false);
   const [mobile, setMobile] = useState(false);
+  useEffect(() => {
+    if (!mobile) return;
+    const desktop = window.matchMedia("(min-width: 48rem)");
+    const closeOnDesktop = () => {
+      if (desktop.matches) setMobile(false);
+    };
+    desktop.addEventListener("change", closeOnDesktop);
+    return () => desktop.removeEventListener("change", closeOnDesktop);
+  }, [mobile]);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [openingJob, setOpeningJob] = useState<string | null>(null);
   const opening = location.view === "chat" && location.job !== null && openingJob === location.job;
@@ -299,10 +310,13 @@ function AppShellContent({
   }
 
   const newChat = useCallback(async () => {
-    const session = await runtime.createSession({ workType: "research" });
+    const session = await runtime.createSession({
+      workType: "research",
+      title: t("sidebar.newChat"),
+    });
     setSessionId(session.id);
     go("chat", null, session.id);
-  }, [runtime, go]);
+  }, [runtime, go, t]);
 
   async function intent(intent: ComposerIntent) {
     if (intent.kind !== "chat") throw new Error(t("app.jobLaunchUnavailable"));
@@ -331,33 +345,37 @@ function AppShellContent({
       )
       .map((session) => session.id),
   );
+  const listedSessions = runtime.snapshot.sessions
+    .filter((session) => runtime.client.isListedConversation?.(session.id) ?? true)
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  function selectSession(id: string) {
+    const selected = runtime.snapshot.sessions.find((session) => session.id === id);
+    setSessionId(id);
+    go("chat", selected?.sessionId ?? null, id);
+  }
+  function goHome() {
+    setSessionId("");
+    setInspectorOpen(false);
+    go("chat");
+  }
   const sidebar = (
     <OcgSidebar
       conversationList={runtime.snapshot.conversationList}
       onRetryConversations={
         runtime.client.retryConversations ? () => runtime.client.retryConversations!() : undefined
       }
-      sessions={runtime.snapshot.sessions
-        .filter((session) => runtime.client.isListedConversation?.(session.id) ?? true)
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))}
+      sessions={listedSessions}
       runningSessionIds={runningSessionIds}
       control={client}
       activeAncestors={ancestors}
       onOpenConversation={(job) => void openNestedConversation(job)}
       activeSessionId={sessionId}
-      collapsed={collapsed}
-      onToggle={() => setCollapsed((value) => !value)}
-      onSelect={(id) => {
-        const selected = runtime.snapshot.sessions.find((session) => session.id === id);
-        setSessionId(id);
-        go("chat", selected?.sessionId ?? null);
-      }}
+      collapsed={!mobile && collapsed}
+      drawer={mobile}
+      onToggle={() => (mobile ? setMobile(false) : setCollapsed((value) => !value))}
+      onSelect={selectSession}
       onNewChat={() => void newChat()}
-      onHome={() => {
-        setSessionId("");
-        setInspectorOpen(false);
-        go("chat");
-      }}
+      onHome={goHome}
       onRename={
         runtime.client.renameSession
           ? (id, title) => runtime.client.renameSession!(id, title)
@@ -402,27 +420,25 @@ function AppShellContent({
               collapsed ? "w-16" : "w-72",
             )}
           >
-            {sidebar}
+            {!mobile && sidebar}
           </aside>
-          {mobile && (
-            <div className="fixed inset-0 z-50 flex md:hidden">
-              <button
-                type="button"
-                aria-label={t("app.closeNavigation")}
-                className="absolute inset-0 bg-black/40"
-                onClick={() => setMobile(false)}
-              />
-              <aside className="relative flex h-full w-72 max-w-[calc(100%-3rem)] bg-sidebar">
-                {sidebar}
-              </aside>
-            </div>
-          )}
+          <Dialog open={mobile} onOpenChange={setMobile}>
+            <DialogContent
+              showCloseButton={false}
+              finalFocus={() => document.getElementById("workspace-navigation-trigger")}
+              className="inset-y-0 left-0 flex h-dvh w-72 max-w-[calc(100%-1.5rem)] translate-x-0 translate-y-0 flex-col gap-0 rounded-none bg-sidebar p-0 sm:max-w-72"
+            >
+              <DialogTitle className="sr-only">{t("nav.workspaceNavigation")}</DialogTitle>
+              {mobile && sidebar}
+            </DialogContent>
+          </Dialog>
           <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
             <OcgTopbar
               session={location.view === "chat" ? session : undefined}
               activeView={location.view}
               titleVisible={location.view === "chat" || !pageTitleInView}
               onOpenMobileSidebar={() => setMobile(true)}
+              onHome={goHome}
               inspectorToggle={
                 location.view === "chat" && inspectorAvailable && !inspectorOpen ? (
                   <Button
@@ -497,16 +513,12 @@ function AppShellContent({
                         />
                       </div>
                     ) : (
-                      <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-4 p-6 text-center">
-                        <h1 className="text-2xl font-medium">{t("chat.newThread")}</h1>
-                        <button
-                          type="button"
-                          className="rounded-md border border-border px-4 py-2 text-sm"
-                          onClick={() => void newChat()}
-                        >
-                          {t("sidebar.newChat")}
-                        </button>
-                      </div>
+                      <WorkspaceHome
+                        sessions={listedSessions}
+                        onSelect={selectSession}
+                        onNewChat={() => void newChat()}
+                        onNavigate={go}
+                      />
                     )}
                   </>
                 ) : null}

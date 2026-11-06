@@ -16,6 +16,7 @@ import { OcgAssistantProvider } from "../runtime/assistant-ui-provider";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ChatComposer, ConversationChildrenStrip, ConversationCardStrip } from "./chat-view";
 import { ImageGallery } from "./image-attachments";
+import { WorkspaceToolFallback } from "./workspace-tool";
 import { TaskStatus } from "../job/task-status";
 import { ConversationArtifacts } from "./conversation-artifacts";
 import { FileChanges } from "./file-changes";
@@ -127,12 +128,9 @@ const ChatComposerSlot: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 const Welcome: FC = () => {
   const { t } = useI18n();
   return (
-    <div className="aui-thread-welcome-root mb-6 flex flex-col">
-      <p className="text-2xl font-medium tracking-tight">{t("chat.newThread")}</p>
-      <p className="mt-1 text-sm text-muted-foreground">
-        {t("chat.emptyPrefix")} {t("chat.emptySuffix")}
-      </p>
-    </div>
+    <header className="aui-thread-welcome-root mb-4 sm:mb-5">
+      <h2 className="text-3xl font-semibold tracking-tight sm:text-4xl">{t("chat.newThread")}</h2>
+    </header>
   );
 };
 
@@ -314,6 +312,7 @@ function MessageFileChanges() {
 const THREAD_COMPONENTS = {
   Composer: ChatComposerSlot,
   Welcome,
+  ToolFallback: WorkspaceToolFallback,
   MessageFooter: MessageFileChanges,
 };
 

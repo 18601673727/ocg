@@ -64,7 +64,7 @@ function metadataFor(message: ChatMessage, context: MessageContext): OcgMetadata
     toolMetrics: Object.fromEntries(
       (message.toolCalls ?? []).map((call) => [
         call.tool_call_id,
-        { durationMs: call.duration_ms, truncated: call.arguments_cut || call.result_cut },
+        { durationMs: call.duration_ms, truncated: call.arguments_cut || call.result_cut, call },
       ]),
     ),
     failureReason: message.failureReason,

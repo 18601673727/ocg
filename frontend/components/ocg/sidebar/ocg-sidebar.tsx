@@ -8,7 +8,6 @@ import {
   ChevronDown,
   Activity,
   BarChart3,
-  LayoutGrid,
   MessageSquare,
   Plus,
   Search,
@@ -20,6 +19,7 @@ import {
   Pin,
   PinOff,
   Archive,
+  X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
@@ -63,11 +63,11 @@ const serverPlatform = () => false;
 
 function ShortcutHint({ keys }: { keys: readonly string[] }) {
   return (
-    <span aria-hidden="true" className="flex shrink-0 items-center gap-1">
+    <span aria-hidden="true" className="flex shrink-0 items-center gap-0.5">
       {keys.map((key) => (
         <kbd
           key={key}
-          className="rounded border border-border px-1.5 py-0.5 font-sans text-[10px] leading-4 text-muted-foreground"
+          className="rounded border border-current/15 px-1 font-sans text-[10px] leading-4 font-medium"
         >
           {key}
         </kbd>
@@ -105,6 +105,7 @@ type OcgSidebarProps = {
   runningSessionIds?: ReadonlySet<string>;
   activeSessionId: string;
   collapsed: boolean;
+  drawer?: boolean;
   onToggle: () => void;
   onSelect: (id: string) => void;
   control?: HttpCanonicalControlClient;
@@ -156,8 +157,9 @@ function RailButton({
             aria-label={label}
             title={shortcut ? `${label} (${shortcut})` : label}
             onClick={onClick}
+            aria-current={active ? "page" : undefined}
             className={cn(
-              "flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+              "flex size-9 items-center justify-center rounded-lg border border-transparent text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring",
               active && cn(SELECTED_ROW, "font-medium"),
             )}
           >
@@ -178,6 +180,7 @@ export function OcgSidebar({
   runningSessionIds = new Set<string>(),
   activeSessionId,
   collapsed,
+  drawer = false,
   onToggle,
   onSelect,
   control,
@@ -347,7 +350,7 @@ export function OcgSidebar({
     }
   };
   const canonicalMode = runtimeAuthority === "canonical";
-  const workspaceNav = canonicalMode ? WORKSPACE_NAV : WORKSPACE_NAV;
+  const workspaceNav = WORKSPACE_NAV;
   // In canonical mode every non-Chat destination lives in the Workbench menu
   // while the conversation list and New chat serve Chat directly.
   const workbenchNav = canonicalMode ? workspaceNav.filter((item) => item.target !== "chat") : [];
@@ -367,7 +370,7 @@ export function OcgSidebar({
           onClick={() => onNavigate(item.target)}
           aria-current={active ? "page" : undefined}
           className={cn(
-            "group flex min-h-10 w-full items-center gap-2 rounded-md px-3 py-1.5 text-left",
+            "group flex min-h-9 w-full items-center gap-3 rounded-lg px-3 py-1.5 text-left focus-visible:outline-2 focus-visible:outline-ring",
             TYPOGRAPHY_SCALE.body_sm,
             "leading-5 transition-colors",
             active
@@ -375,7 +378,7 @@ export function OcgSidebar({
               : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
           )}
         >
-          <Icon className="size-4 shrink-0" aria-hidden="true" />
+          <Icon className={cn("size-4 shrink-0", active && "text-primary")} aria-hidden="true" />
           <span className="min-w-0 flex-1 truncate">{label}</span>
           {item.target === "attention" && attentionCount > 0 && (
             <span
@@ -393,56 +396,6 @@ export function OcgSidebar({
       </li>
     );
   };
-
-  // New chat and the Workbench menu sit below the header controls.
-  const primaryControls = (
-    <>
-      <div className="flex items-center gap-1 px-2 pb-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          className="group h-11 min-w-0 flex-1 justify-start gap-2 rounded-lg border-0 px-3 text-sm font-normal tracking-normal normal-case"
-          onClick={onNewChat}
-          aria-keyshortcuts={isApple ? "Meta+Alt+N" : "Control+Alt+N"}
-        >
-          <Plus className="size-4" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate text-left">{t("sidebar.newChat")}</span>
-          <span className="opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
-            <ShortcutHint keys={[modifier, alt, "N"]} />
-          </span>
-        </Button>
-      </div>
-
-      {hasNav && workbenchNav.length > 0 && (
-        /*
-          Canonical mode keeps Chat as the single primary destination and folds
-          every other destination into this compact Workbench menu. Each item
-          keeps its icon, label, attention badge and active state.
-        */
-        <details
-          className="group/workbench px-2 pb-2"
-          open={workbenchNav.some((item) => item.target === activeView) || undefined}
-          data-workbench-menu=""
-        >
-          <summary
-            className={cn(
-              "group flex min-h-11 cursor-pointer items-center gap-2 rounded-lg px-3 py-2 select-none",
-              TYPOGRAPHY_SCALE.body_sm,
-              "text-muted-foreground hover:bg-muted/60",
-            )}
-          >
-            <LayoutGrid className="size-4 shrink-0" aria-hidden="true" />
-            <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
-            <ChevronDown
-              className="size-3.5 shrink-0 -rotate-90 text-muted-foreground transition-transform duration-[180ms] group-open/workbench:rotate-0 motion-reduce:transition-none"
-              aria-hidden="true"
-            />
-          </summary>
-          <ul className="mt-1 flex flex-col gap-px">{workbenchNav.map(renderWorkspaceItem)}</ul>
-        </details>
-      )}
-    </>
-  );
 
   if (collapsed) {
     return (
@@ -535,9 +488,10 @@ export function OcgSidebar({
                 key={session.id}
                 label={session.title || t("sidebar.newChat")}
                 active={
-                  session.id === activeSessionId ||
-                  session.conversationId === activeRoot ||
-                  session.id === activeRoot
+                  activeView === "chat" &&
+                  (session.id === activeSessionId ||
+                    session.conversationId === activeRoot ||
+                    session.id === activeRoot)
                 }
                 onClick={() => onSelect(session.id)}
               >
@@ -579,7 +533,7 @@ export function OcgSidebar({
   return (
     <TooltipProvider delay={100}>
       <div className="flex h-full w-full flex-col bg-sidebar text-sidebar-foreground">
-        <div className="flex items-center gap-2 px-3 pt-3 pb-2">
+        <div className="flex h-16 shrink-0 items-center gap-2 px-5">
           <Link
             href="/"
             prefetch={false}
@@ -596,6 +550,41 @@ export function OcgSidebar({
           >
             <OcgLogo />
           </Link>
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  onClick={onToggle}
+                  aria-label={t(drawer ? "app.closeNavigation" : "sidebar.collapse")}
+                  aria-expanded="true"
+                  title={t(drawer ? "app.closeNavigation" : "sidebar.collapse")}
+                >
+                  {drawer ? <X className="size-4" /> : <ChevronsLeft className="size-4" />}
+                </Button>
+              }
+            />
+            <TooltipContent side="right">
+              {t(drawer ? "app.closeNavigation" : "sidebar.collapse")}
+            </TooltipContent>
+          </Tooltip>
+        </div>
+
+        <div className="space-y-1 border-b border-sidebar-border px-3 pb-3">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-10 w-full justify-start gap-2.5 rounded-lg bg-card px-3 text-sm font-medium tracking-normal normal-case shadow-xs"
+            onClick={onNewChat}
+            aria-keyshortcuts={isApple ? "Meta+Alt+N" : "Control+Alt+N"}
+          >
+            <Plus className="size-4 text-primary" aria-hidden="true" />
+            <span className="min-w-0 flex-1 truncate text-left">{t("sidebar.newChat")}</span>
+            <span className="text-muted-foreground">
+              <ShortcutHint keys={[modifier, alt, "N"]} />
+            </span>
+          </Button>
           <ConversationSearch
             sessions={sessions}
             activeSessionId={activeSessionId}
@@ -607,81 +596,75 @@ export function OcgSidebar({
             trigger={
               <Button
                 variant="ghost"
-                size="icon-xs"
+                size="sm"
                 aria-label={t("sidebar.searchConversations")}
                 title={`${t("sidebar.searchConversations")} (${searchShortcut})`}
                 aria-keyshortcuts={isApple ? "Meta+K" : "Control+K"}
-                className="group relative"
+                className="h-9 w-full justify-start gap-2.5 rounded-lg px-3 text-sm font-normal tracking-normal text-muted-foreground normal-case"
               >
                 <Search className="size-4" aria-hidden="true" />
-                <span
-                  aria-hidden="true"
-                  className="pointer-events-none absolute top-full right-0 z-10 hidden items-center gap-2 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 text-xs text-popover-foreground shadow-md group-hover:flex group-focus-visible:flex"
-                >
-                  {t("sidebar.searchConversations")} <ShortcutHint keys={[modifier, "K"]} />
+                <span className="min-w-0 flex-1 truncate text-left">
+                  {t("sidebar.searchConversations")}
                 </span>
+                <ShortcutHint keys={[modifier, "K"]} />
               </Button>
             }
           />
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={onToggle}
-                  aria-label={t("sidebar.collapse")}
-                  aria-expanded="true"
-                  title={t("sidebar.collapse")}
-                >
-                  <ChevronsLeft className="size-4" />
-                </Button>
-              }
-            />
-            <TooltipContent side="right">{t("sidebar.collapse")}</TooltipContent>
-          </Tooltip>
         </div>
-
-        {primaryControls}
-
-        {hasNav && !canonicalMode && (
-          <nav aria-label={t("nav.workspaceNavigation")} className="px-2 pb-2">
-            <ul className="flex flex-col gap-px">
-              {workspaceNav.slice(0, 4).map(renderWorkspaceItem)}
-            </ul>
-            {runtimeAuthority === "mock" && (
-              <details
-                open={workspaceNav.slice(4).some((item) => item.target === activeView) || undefined}
-                className="mt-1"
-              >
-                <summary
-                  className={cn(
-                    "cursor-pointer rounded-md px-2 py-1.5",
-                    TYPOGRAPHY_SCALE.caption,
-                    "text-muted-foreground hover:bg-muted/60",
-                  )}
-                >
-                  {t("nav.tools")}
-                </summary>
-                <ul className="flex flex-col gap-px pl-2">
-                  {workspaceNav.slice(4).map(renderWorkspaceItem)}
-                </ul>
-              </details>
-            )}
-          </nav>
-        )}
 
         <ScrollArea
           role="navigation"
-          aria-label={t("nav.chatSessions")}
+          aria-label={t("nav.workspaceNavigation")}
           className="min-h-0 flex-1"
           viewportProps={{ className: "ocg-subtle-scrollbar" }}
-          contentProps={{ className: "px-2 pb-2", style: { minWidth: 0, width: "100%" } }}
+          contentProps={{ className: "px-3 pb-3", style: { minWidth: 0, width: "100%" } }}
         >
+          {hasNav && workbenchNav.length > 0 && (
+            <div className="border-b border-sidebar-border py-3">
+              <details open className="group/workbench" data-workbench-menu="">
+                <summary className="flex h-8 cursor-pointer items-center gap-2 rounded-md px-3 text-xs font-semibold text-muted-foreground select-none hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
+                  <span className="min-w-0 flex-1 truncate">{t("nav.workbench")}</span>
+                  <ChevronDown
+                    className="size-3.5 -rotate-90 transition-transform group-open/workbench:rotate-0 motion-reduce:transition-none"
+                    aria-hidden="true"
+                  />
+                </summary>
+                <ul className="mt-0.5 space-y-px">{workbenchNav.map(renderWorkspaceItem)}</ul>
+              </details>
+            </div>
+          )}
+          {hasNav && !canonicalMode && (
+            <div className="px-2 pb-2">
+              <ul className="flex flex-col gap-px">
+                {workspaceNav.slice(0, 4).map(renderWorkspaceItem)}
+              </ul>
+              {runtimeAuthority === "mock" && (
+                <details
+                  open={
+                    workspaceNav.slice(4).some((item) => item.target === activeView) || undefined
+                  }
+                  className="mt-1"
+                >
+                  <summary
+                    className={cn(
+                      "cursor-pointer rounded-md px-2 py-1.5",
+                      TYPOGRAPHY_SCALE.caption,
+                      "text-muted-foreground hover:bg-muted/60",
+                    )}
+                  >
+                    {t("nav.tools")}
+                  </summary>
+                  <ul className="flex flex-col gap-px pl-2">
+                    {workspaceNav.slice(4).map(renderWorkspaceItem)}
+                  </ul>
+                </details>
+              )}
+            </div>
+          )}
           {projectError && (
             <DismissibleNotice message={projectError} className="mb-2 px-2 text-xs" />
           )}
-          <ul className="space-y-3">
+          <ul aria-label={t("nav.chatSessions")} className="mt-3 space-y-3">
             {groups.map((group) => {
               const groupLimit = groupLimits[group.id] ?? GROUP_PAGE_SIZE;
               const visibleItems = group.items.filter(
@@ -719,9 +702,10 @@ export function OcgSidebar({
                     <ul className="space-y-0.5">
                       {visibleItems.map((session) => {
                         const active =
-                          session.id === activeSessionId ||
-                          session.conversationId === activeRoot ||
-                          session.id === activeRoot;
+                          activeView === "chat" &&
+                          (session.id === activeSessionId ||
+                            session.conversationId === activeRoot ||
+                            session.id === activeRoot);
                         const isMenuOpen = openMenuId === session.id;
                         const expanded = expandedSessions[session.id] ?? active;
                         const canLoadChildren = Boolean(
@@ -742,8 +726,8 @@ export function OcgSidebar({
                           <li key={session.id} className="min-w-0" data-sidebar-level="1">
                             <div
                               className={cn(
-                                "group/session relative flex h-8 min-w-0 items-center rounded-lg text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent",
-                                active && "bg-sidebar-accent text-sidebar-accent-foreground",
+                                "group/session relative flex h-9 min-w-0 items-center rounded-lg text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent",
+                                active && cn(SELECTED_ROW, "font-medium"),
                               )}
                             >
                               <span className="flex w-9 shrink-0 items-center justify-center">
@@ -962,7 +946,7 @@ export function OcgSidebar({
             </div>
           )}
           {conversationList === "loaded" && sessions.length === 0 && (
-            <p className="px-3 py-4 text-center text-xs text-muted-foreground">
+            <p className="my-1 rounded-lg border border-dashed border-sidebar-border px-3 py-4 text-center text-xs leading-5 text-muted-foreground">
               {t("sidebar.searchNoConversations")}
             </p>
           )}

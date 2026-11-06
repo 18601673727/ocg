@@ -50,9 +50,13 @@ function SelectContent({
   sideOffset = 4,
   align = "center",
   alignOffset = 0,
+  alignItemWithTrigger = true,
   ...props
 }: SelectPrimitive.Popup.Props &
-  Pick<SelectPrimitive.Positioner.Props, "align" | "alignOffset" | "side" | "sideOffset">) {
+  Pick<
+    SelectPrimitive.Positioner.Props,
+    "align" | "alignOffset" | "alignItemWithTrigger" | "side" | "sideOffset"
+  >) {
   return (
     <SelectPrimitive.Portal>
       <SelectPrimitive.Positioner
@@ -60,18 +64,19 @@ function SelectContent({
         sideOffset={sideOffset}
         align={align}
         alignOffset={alignOffset}
+        alignItemWithTrigger={alignItemWithTrigger}
         className="isolate z-50"
       >
         <SelectPrimitive.Popup
           data-slot="select-content"
           className={cn(
-            "bg-popover text-popover-foreground ring-foreground/10 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:fade-in-0 data-open:zoom-in-95 data-closed:fade-out-0 data-closed:zoom-out-95 data-open:animate-in data-closed:animate-out relative z-50 max-h-[min(24rem,var(--available-height))] min-w-[max(8rem,var(--anchor-width))] origin-(--transform-origin) overflow-x-hidden overflow-y-auto rounded-[var(--radius-surface,var(--radius-lg))] ring-1 outline-none",
+            "bg-popover text-popover-foreground ring-foreground/10 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:fade-in-0 data-open:zoom-in-95 data-closed:fade-out-0 data-closed:zoom-out-95 data-open:animate-in data-closed:animate-out relative z-50 max-h-[min(24rem,var(--available-height))] min-w-[max(8rem,var(--anchor-width))] origin-(--transform-origin) overflow-hidden rounded-[var(--radius-surface,var(--radius-lg))] ring-1 outline-none",
             className,
           )}
           {...props}
         >
           <SelectScrollUpButton />
-          <SelectPrimitive.List className="flex scroll-my-1 flex-col gap-0.5 p-1">
+          <SelectPrimitive.List className="flex max-h-[min(24rem,var(--available-height))] min-h-0 scroll-my-1 flex-col gap-0.5 overflow-x-hidden overflow-y-auto overscroll-contain p-1">
             {children}
           </SelectPrimitive.List>
           <SelectScrollDownButton />
@@ -128,7 +133,10 @@ function SelectScrollUpButton({ className, ...props }: SelectPrimitive.ScrollUpA
   return (
     <SelectPrimitive.ScrollUpArrow
       data-slot="select-scroll-up-button"
-      className={cn("flex cursor-default items-center justify-center py-1", className)}
+      className={cn(
+        "inset-x-0 top-0 z-10 flex cursor-default items-center justify-center bg-popover py-1",
+        className,
+      )}
       {...props}
     >
       <ChevronUpIcon className="size-4" />
@@ -140,7 +148,10 @@ function SelectScrollDownButton({ className, ...props }: SelectPrimitive.ScrollD
   return (
     <SelectPrimitive.ScrollDownArrow
       data-slot="select-scroll-down-button"
-      className={cn("flex cursor-default items-center justify-center py-1", className)}
+      className={cn(
+        "inset-x-0 bottom-0 z-10 flex cursor-default items-center justify-center bg-popover py-1",
+        className,
+      )}
       {...props}
     >
       <ChevronDownIcon className="size-4" />

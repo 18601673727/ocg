@@ -12,6 +12,8 @@ import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 import { ToolActivityLabel } from "./tool-activity-label";
 import { formatToolJson, jobPlanTitles } from "./tool-activity-summary";
 import { MarkdownBody } from "../markdown/markdown-body";
+import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import { WorkspaceTool } from "./workspace-tool";
 import {
   ReasoningRoot,
   ReasoningTrigger,
@@ -31,7 +33,11 @@ function TurnRow({
   turn,
   userLabel,
   attachmentContentUrl,
+  jobId,
+  client,
 }: {
+  jobId?: string;
+  client?: HttpCanonicalControlClient;
   turn: TranscriptTurn;
   userLabel: string;
   attachmentContentUrl?: (id: string) => string;
@@ -59,6 +65,8 @@ function TurnRow({
     !isUser && turn.tools?.length ? (
       <TurnToolCalls
         tools={turn.tools}
+        jobId={jobId}
+        client={client}
         isLive={turn.status === "streaming" || turn.status === "pending"}
       />
     ) : null;
@@ -228,9 +236,20 @@ function outcomeText(
   }
 }
 
-function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; isLive: boolean }) {
+function TurnToolCalls({
+  tools,
+  isLive,
+  jobId,
+  client,
+}: {
+  tools: readonly ControlToolCall[];
+  isLive: boolean;
+  jobId?: string;
+  client?: HttpCanonicalControlClient;
+}) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   return (
     <details
       onToggle={(event) => {
@@ -256,6 +275,7 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
       <div className="flex flex-col gap-2 p-3 pt-0">
         {open &&
           tools.map((tool) => {
+            const key = `${tool.request}:${tool.index}`;
             const summary = argumentSummary(tool.name, tool.arguments);
             const outcome = outcomeLabel(tool.outcome_kind, tool.decision, isLive);
             const isCompleted = outcome === "completed";
@@ -266,7 +286,12 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
               outcome === "awaiting_answer";
             return (
               <details
-                key={`${tool.request}:${tool.index}`}
+                key={key}
+                onToggle={(event) => {
+                  if (event.target !== event.currentTarget) return;
+                  const value = event.currentTarget.open;
+                  setExpanded((previous) => ({ ...previous, [key]: value }));
+                }}
                 className="group rounded border border-border bg-card p-2 text-card-foreground"
               >
                 <summary className="flex cursor-pointer select-none flex-wrap items-center justify-between gap-2 text-xs">
@@ -296,39 +321,43 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
                     {outcomeText(t, tool.outcome_kind, tool.decision, isLive)}
                   </span>
                 </summary>
-                <div className="mt-2 space-y-2 border-t border-border pt-2 font-mono text-xs">
-                  {tool.decision !== "admitted" ? (
-                    <div className="font-sans text-xs text-destructive">
-                      {t("transcript.decision", { decision: tool.decision })}
-                    </div>
-                  ) : null}
-                  <div>
-                    <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
-                      <span>{t("transcript.arguments")}</span>
-                      {tool.arguments_cut ? (
-                        <span className="text-[10px] font-semibold text-amber-500">
-                          {t("transcript.cut")}
-                        </span>
-                      ) : null}
-                    </div>
-                    <pre className="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
-                      {tool.arguments === null ? "—" : formatToolJson(tool.arguments)}
-                    </pre>
+                {expanded[key] && (
+                  <div className="mt-2 space-y-2 border-t border-border pt-2 font-mono text-xs">
+                    {tool.decision !== "admitted" ? (
+                      <div className="font-sans text-xs text-destructive">
+                        {t("transcript.decision", { decision: tool.decision })}
+                      </div>
+                    ) : null}
+                    <WorkspaceTool call={tool} jobId={jobId} client={client}>
+                      <div>
+                        <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
+                          <span>{t("transcript.arguments")}</span>
+                          {tool.arguments_cut ? (
+                            <span className="text-[10px] font-semibold text-amber-500">
+                              {t("transcript.cut")}
+                            </span>
+                          ) : null}
+                        </div>
+                        <pre className="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
+                          {tool.arguments === null ? "—" : formatToolJson(tool.arguments)}
+                        </pre>
+                      </div>
+                      <div>
+                        <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
+                          <span>{t("transcript.result")}</span>
+                          {tool.result_cut ? (
+                            <span className="text-[10px] font-semibold text-amber-500">
+                              {t("transcript.cut")}
+                            </span>
+                          ) : null}
+                        </div>
+                        <pre className="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
+                          {tool.result === null ? "—" : formatToolJson(tool.result)}
+                        </pre>
+                      </div>
+                    </WorkspaceTool>
                   </div>
-                  <div>
-                    <div className="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
-                      <span>{t("transcript.result")}</span>
-                      {tool.result_cut ? (
-                        <span className="text-[10px] font-semibold text-amber-500">
-                          {t("transcript.cut")}
-                        </span>
-                      ) : null}
-                    </div>
-                    <pre className="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
-                      {tool.result === null ? "—" : formatToolJson(tool.result)}
-                    </pre>
-                  </div>
-                </div>
+                )}
               </details>
             );
           })}
@@ -340,10 +369,14 @@ function TurnToolCalls({ tools, isLive }: { tools: readonly ControlToolCall[]; i
 /** One Job as its objective and answer; see `jobTranscript` for what each is made of. */
 export function JobTranscript({
   turns,
+  jobId,
+  client,
   userLabel = "Objective",
   attachmentContentUrl,
 }: {
   turns: readonly TranscriptTurn[];
+  jobId?: string;
+  client?: HttpCanonicalControlClient;
   userLabel?: string;
   attachmentContentUrl?: (id: string) => string;
 }) {
@@ -353,6 +386,8 @@ export function JobTranscript({
         <TurnRow
           key={turn.id}
           turn={turn}
+          jobId={jobId}
+          client={client}
           userLabel={userLabel}
           attachmentContentUrl={attachmentContentUrl}
         />

@@ -3,11 +3,16 @@
 import type * as Api from "@/components/ocg/contracts/api";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Clock, FileText } from "lucide-react";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { LoadMore } from "../primitives/load-more";
+import { ListStatus } from "../primitives/list-status";
+import { StatusDot } from "../primitives/status-dot";
+import { Pill } from "../primitives/pill";
+import type { Tone } from "../primitives/tone";
 import {
   Select,
   SelectContent,
@@ -16,8 +21,13 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+const levelTone: Record<string, Tone> = {
+  ERROR: "red",
+  WARN: "amber",
+};
+
 export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [file, setFile] = useState("");
   const [timeZone, setTimeZone] = useState(() =>
     typeof window === "undefined"
@@ -139,17 +149,18 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
     };
   }, [client, file, t]);
   const loadMore = useCallback(() => loadMoreRef.current(), []);
+  const dateTime = useMemo(
+    () => new Intl.DateTimeFormat(locale, { timeZone, dateStyle: "medium", timeStyle: "medium" }),
+    [locale, timeZone],
+  );
   const formatEntry = (line: string) => {
     const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z) (\w+) (.*)$/.exec(line);
     if (!match) return null;
     const date = new Date(match[1]);
     if (Number.isNaN(date.getTime())) return null;
     return {
-      time: new Intl.DateTimeFormat(undefined, {
-        timeZone,
-        dateStyle: "medium",
-        timeStyle: "medium",
-      }).format(date),
+      time: dateTime.format(date),
+      dateTime: match[1],
       level: match[2],
       message: match[3],
     };
@@ -185,8 +196,9 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
               <SelectTrigger
                 id="runtime-log-time-zone"
                 aria-label={t("logs.timeZone")}
-                className="min-w-0 rounded-md border-input bg-background px-3 py-2 font-mono text-xs"
+                className="min-w-0 max-w-full border-input bg-card text-xs"
               >
+                <Clock aria-hidden="true" className="size-4" />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -217,8 +229,9 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
               <SelectTrigger
                 id="runtime-log-file"
                 aria-label={t("logs.runtimeLogFile")}
-                className="min-w-0 rounded-md border-input bg-background px-3 py-2 font-mono text-xs"
+                className="min-w-0 max-w-full border-input bg-card text-xs"
               >
+                <FileText aria-hidden="true" className="size-4" />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -238,15 +251,18 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
           {error}
         </DismissibleNotice>
       ) : null}
-      {!snapshot && loading ? <p role="status">{t("logs.loading")}</p> : null}
+      {!snapshot && loading ? <ListStatus loading message={t("logs.loading")} /> : null}
       {snapshot ? (
         <section
           aria-label={t("logs.output")}
-          className="min-w-0 rounded-lg border border-border bg-card p-5"
+          className="min-w-0 overflow-hidden rounded-xl border border-border bg-card"
         >
-          <div className="mb-3 flex flex-wrap justify-between gap-2 text-xs text-muted-foreground">
-            <span className="font-mono">{snapshot.file ?? t("logs.noFile")}</span>
-            <span>
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-border bg-muted/30 px-4 py-3 sm:px-5">
+            <h2 className="min-w-0 font-mono text-sm font-medium break-all">
+              {snapshot.file ?? t("logs.noFile")}
+            </h2>
+            <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+              <StatusDot tone={error ? "amber" : "emerald"} />
               {t("logs.status", {
                 count: snapshot.entries.length,
                 mode: error ? t("logs.disconnected") : t("logs.liveMode"),
@@ -260,22 +276,25 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
                 return (
                   <li
                     key={entry.offset}
-                    className="grid grid-cols-[minmax(8rem,auto)_auto_minmax(0,1fr)] items-start gap-x-3 gap-y-1 py-2.5 font-mono text-xs first:pt-1"
+                    className="grid grid-cols-[1fr_auto] items-baseline gap-x-3 gap-y-1 px-4 py-2.5 font-mono text-xs leading-5 even:bg-muted/20 sm:grid-cols-[13rem_4rem_minmax(0,1fr)] sm:px-5"
                   >
                     {parsed ? (
                       <>
-                        <time className="whitespace-nowrap text-muted-foreground">
+                        <time dateTime={parsed.dateTime} className="text-muted-foreground">
                           {parsed.time}
                         </time>
-                        <span className="rounded-sm bg-muted px-1.5 py-0.5 text-foreground">
+                        <Pill
+                          tone={levelTone[parsed.level.toUpperCase()] ?? "slate"}
+                          className="w-fit font-mono normal-case"
+                        >
                           {parsed.level}
-                        </span>
-                        <span className="min-w-0 break-words text-foreground">
+                        </Pill>
+                        <span className="col-span-full min-w-0 whitespace-pre-wrap wrap-anywhere text-foreground sm:col-span-1">
                           {parsed.message}
                         </span>
                       </>
                     ) : (
-                      <span className="col-span-3 min-w-0 whitespace-pre-wrap break-words text-foreground">
+                      <span className="col-span-full min-w-0 whitespace-pre-wrap wrap-anywhere text-foreground">
                         {entry.line}
                       </span>
                     )}
@@ -284,13 +303,15 @@ export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) 
               })}
             </ol>
           ) : (
-            <p className="text-sm text-muted-foreground">{t("logs.noRecords")}</p>
+            <ListStatus message={t("logs.noRecords")} />
           )}
           {snapshot.next_before !== null && (
             <LoadMore loading={loadingMore} onLoad={loadMore} auto={!error} />
           )}
           {snapshot.files_truncated ? (
-            <p className="mt-2 text-xs text-muted-foreground">{t("logs.filesTruncated")}</p>
+            <p className="border-t border-border px-4 py-3 text-xs text-muted-foreground">
+              {t("logs.filesTruncated")}
+            </p>
           ) : null}
         </section>
       ) : null}

@@ -12,7 +12,7 @@ export function ContentContainer({
   return (
     <div
       className={cn(
-        "mx-auto flex w-full max-w-7xl flex-col gap-5 px-4 py-6 sm:px-6 lg:px-8",
+        "mx-auto flex w-full max-w-7xl flex-col gap-6 px-5 pt-4 pb-8 sm:px-8 lg:px-10",
         className,
       )}
     >
@@ -21,10 +21,25 @@ export function ContentContainer({
   );
 }
 
-export function ContentHeader({ title, actions }: { title: ReactNode; actions?: ReactNode }) {
+export function ContentHeader({
+  title,
+  description,
+  actions,
+}: {
+  title: ReactNode;
+  description?: ReactNode;
+  actions?: ReactNode;
+}) {
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3">
-      <PageTitle className="font-heading text-xl">{title}</PageTitle>
+    <div className="flex flex-wrap items-end justify-between gap-4">
+      <div className="min-w-0 space-y-1.5">
+        <PageTitle className="font-heading text-3xl font-semibold tracking-tight">
+          {title}
+        </PageTitle>
+        {description && (
+          <p className="max-w-prose text-sm leading-6 text-muted-foreground">{description}</p>
+        )}
+      </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
     </div>
   );

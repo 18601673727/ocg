@@ -9,7 +9,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Popover } from "@base-ui/react/popover";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Cpu, Folder } from "lucide-react";
 import { useId } from "react";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
@@ -54,8 +54,12 @@ export function ModelSelectorView({
   const modelName = model.options.find((option) => option.value === model.value)?.label;
   const effortName =
     effort.value || `${t("chat.profileDefault")}${defaultEffort ? ` (${defaultEffort})` : ""}`;
+  const selectionLabel =
+    providerName && modelName
+      ? `${providerName} / ${modelName} / ${effortName}`
+      : t(loading ? "chat.modelsLoading" : "chat.noModels");
   const compactClass =
-    "h-9 min-w-0 rounded-md border border-transparent bg-muted/70 px-2 text-sm text-foreground hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60";
+    "h-11 min-w-0 rounded-lg border border-border/70 bg-card px-2.5 text-sm text-foreground transition-colors hover:border-ring/50 hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 pointer-fine:h-9";
   const selectClass =
     "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
@@ -70,7 +74,7 @@ export function ModelSelectorView({
         className="flex min-w-0 items-center gap-1.5"
       >
         <legend className="sr-only">{t("chat.executionSettings")}</legend>
-        <div className="min-w-0 shrink">
+        <div className="max-w-[45%] min-w-0 shrink">
           <Select
             value={project.value}
             items={[{ value: "", label: project.placeholder }, ...project.options]}
@@ -79,8 +83,12 @@ export function ModelSelectorView({
               if (next !== null) project.onChange(next);
             }}
           >
-            <SelectTrigger aria-label={t("chat.project")} className={`${compactClass} max-w-full`}>
-              <SelectValue />
+            <SelectTrigger
+              aria-label={t("chat.project")}
+              className={`${compactClass} max-w-full data-[size=default]:h-11 pointer-fine:data-[size=default]:h-9`}
+            >
+              <Folder className="size-3.5 text-muted-foreground" aria-hidden="true" />
+              <SelectValue className="min-w-0 truncate" />
             </SelectTrigger>
             <SelectContent side="top" align="start">
               <SelectItem value="">{project.placeholder}</SelectItem>
@@ -96,21 +104,27 @@ export function ModelSelectorView({
           <Popover.Root>
             <Popover.Trigger
               disabled={disabled}
-              aria-label={`${providerLabel ?? t("chat.provider")} / ${t("chat.model")} / ${t("chat.effort")}`}
+              aria-label={`${t("chat.executionSettings")} · ${selectionLabel}`}
+              title={selectionLabel}
               className={`${compactClass} flex max-w-full items-center justify-between gap-2 text-left`}
             >
+              <Cpu className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
               <span className="truncate">
-                {providerName && modelName
-                  ? `${providerName} / ${modelName} / ${effortName}`
-                  : loading
-                    ? t("chat.modelsLoading")
-                    : t("chat.noModels")}
+                {providerName && modelName ? (
+                  <>
+                    <span className="text-muted-foreground">{providerName} / </span>
+                    <span className="font-medium">{modelName}</span>
+                    <span className="text-muted-foreground"> / {effortName}</span>
+                  </>
+                ) : (
+                  selectionLabel
+                )}
               </span>
               <ChevronDown className="size-4 shrink-0 opacity-50" aria-hidden="true" />
             </Popover.Trigger>
             <Popover.Portal>
               <Popover.Positioner side="top" sideOffset={4} align="start" className="z-50">
-                <Popover.Popup className="grid w-72 max-w-[calc(100vw-2rem)] gap-3 rounded-md border border-border bg-popover p-3 text-popover-foreground shadow-md outline-none">
+                <Popover.Popup className="grid max-h-(--available-height) w-72 max-w-[calc(100vw-2rem)] gap-3 overflow-y-auto rounded-xl border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none">
                   <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
                     {providerLabel ?? t("chat.provider")}
                     <Select
@@ -136,7 +150,7 @@ export function ModelSelectorView({
                       >
                         <SelectValue />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent alignItemWithTrigger={false}>
                         {!provider.options.length && (
                           <SelectItem value="">
                             {loading ? t("chat.modelsLoading") : t("chat.noModels")}
@@ -176,7 +190,7 @@ export function ModelSelectorView({
                       >
                         <SelectValue />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent alignItemWithTrigger={false}>
                         {!model.options.length && (
                           <SelectItem value="">
                             {loading ? t("chat.modelsLoading") : t("chat.noModels")}
@@ -204,7 +218,7 @@ export function ModelSelectorView({
                         <SelectTrigger aria-label={t("chat.executor")} className={selectClass}>
                           <SelectValue />
                         </SelectTrigger>
-                        <SelectContent>
+                        <SelectContent alignItemWithTrigger={false}>
                           {executor.options.map((option) => (
                             <SelectItem key={option.value} value={option.value}>
                               {option.label}
@@ -233,7 +247,7 @@ export function ModelSelectorView({
                       <SelectTrigger aria-label={t("chat.effort")} className={selectClass}>
                         <SelectValue />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent alignItemWithTrigger={false}>
                         <SelectItem value="">
                           {t("chat.profileDefault")}
                           {defaultEffort ? ` (${defaultEffort})` : ""}

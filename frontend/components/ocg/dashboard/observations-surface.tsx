@@ -9,6 +9,7 @@ import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
 import { LoadMore } from "../primitives/load-more";
+import { ListStatus } from "../primitives/list-status";
 import {
   Select,
   SelectContent,
@@ -20,8 +21,6 @@ import {
 type Usage = Api.Usage["observations"][number];
 type Availability = Api.Availability["observations"][number];
 const cell = "px-3 py-3 align-top text-left";
-const select = "rounded-md border border-input bg-background px-3 py-2 text-sm";
-const number = (value: number | null) => (value === null ? "—" : value.toLocaleString());
 
 export function ObservationsSurface({
   client,
@@ -43,7 +42,13 @@ export function ObservationsSurface({
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const loadMoreRef = useRef<() => void>(() => {});
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
+  const numberFormat = useMemo(() => new Intl.NumberFormat(locale), [locale]);
+  const number = (value: number | null) => (value === null ? "—" : numberFormat.format(value));
+  const dateTime = useMemo(
+    () => new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "medium" }),
+    [locale],
+  );
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -163,60 +168,49 @@ export function ObservationsSurface({
     t("observations.finishReason"),
   ];
 
+  const timeRange = (
+    <Select
+      value={days}
+      items={[
+        { value: 1, label: t("observations.last24") },
+        { value: 7, label: t("observations.last7") },
+        { value: 30, label: t("observations.last30") },
+      ]}
+      onValueChange={(next) => {
+        if (next === null) return;
+        setDays(next);
+        setWindowEnd(Date.now() * 1000);
+        setChartEnd(Date.now() * 1000);
+        setItems([]);
+        setReady(false);
+        setHasMore(false);
+        setLoadingMore(false);
+      }}
+    >
+      <SelectTrigger aria-label={t("observations.timeRange")} className="border-input bg-card">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value={1}>{t("observations.last24")}</SelectItem>
+        <SelectItem value={7}>{t("observations.last7")}</SelectItem>
+        <SelectItem value={30}>{t("observations.last30")}</SelectItem>
+      </SelectContent>
+    </Select>
+  );
+
   return (
     <ContentContainer className={kind === "usage" ? "[overflow-anchor:none]" : undefined}>
       <ContentHeader
         title={kind === "usage" ? t("nav.usage") : t("observations.health")}
-        actions={
-          <>
-            <label className="sr-only" htmlFor="observation-period">
-              {t("observations.timeRange")}
-            </label>
-            <Select
-              value={days}
-              items={[
-                { value: 1, label: t("observations.last24") },
-                { value: 7, label: t("observations.last7") },
-                { value: 30, label: t("observations.last30") },
-              ]}
-              onValueChange={(next) => {
-                if (next === null) return;
-                setDays(next);
-                setWindowEnd(Date.now() * 1000);
-                setChartEnd(Date.now() * 1000);
-                setItems([]);
-                setReady(false);
-                setHasMore(false);
-                setLoadingMore(false);
-              }}
-            >
-              <SelectTrigger id="observation-period" className={select}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={1}>{t("observations.last24")}</SelectItem>
-                <SelectItem value={7}>{t("observations.last7")}</SelectItem>
-                <SelectItem value={30}>{t("observations.last30")}</SelectItem>
-              </SelectContent>
-            </Select>
-          </>
-        }
+        actions={kind === "health" ? timeRange : undefined}
       />
       {kind === "usage" ? <UsageChart client={client} reloadKey={chartEnd} /> : null}
       {kind === "usage" ? <ReliabilityChart client={client} reloadKey={chartEnd} /> : null}
       {kind === "health" ? (
-        <HealthChart
-          key={`${days}:${chartEnd}`}
-          client={client}
-          fromUs={chartEnd - days * 86400_000_000}
-          untilUs={chartEnd}
-        />
-      ) : null}
-      {kind === "health" ? (
         <>
-          <section
+          <dl
             aria-label={t("observations.runtimeHealth")}
-            className="grid gap-3 sm:grid-cols-4"
+            className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4"
           >
             {[
               [t("settings.control.host"), health?.host ?? t("settings.control.unreachable")],
@@ -238,23 +232,31 @@ export function ObservationsSurface({
                     : t("settings.control.notAccepting"),
               ],
             ].map(([label, value]) => (
-              <div className="rounded-lg border border-border bg-card p-4" key={label}>
-                <h3 className="text-xs text-muted-foreground">{label}</h3>
-                <p className="mt-2 text-lg font-medium">{value}</p>
+              <div className="min-w-0 bg-card p-4 sm:p-5" key={label}>
+                <dt className="text-xs font-medium text-muted-foreground">{label}</dt>
+                <dd className="mt-2 text-lg font-semibold tracking-tight wrap-anywhere">{value}</dd>
               </div>
             ))}
-          </section>
+          </dl>
+          <HealthChart
+            key={`${days}:${chartEnd}`}
+            client={client}
+            fromUs={chartEnd - days * 86400_000_000}
+            untilUs={chartEnd}
+          />
           <section
             aria-label={t("observations.quarantinedCapacity")}
-            className="min-w-0 rounded-lg border border-border bg-card p-4"
+            className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-5"
           >
-            <h3 className="font-medium">{t("observations.quarantinedCapacity")}</h3>
+            <h2 className="text-base font-semibold tracking-tight">
+              {t("observations.quarantinedCapacity")}
+            </h2>
             <p className="my-2 text-sm text-muted-foreground">
               {t("observations.quarantinedNote")}
             </p>
             {!health || health.quarantined.length === 0 ? (
               <p className="py-2 text-sm text-muted-foreground">
-                {t("observations.noQuarantined")}
+                {t(health ? "observations.noQuarantined" : "common.unknown")}
               </p>
             ) : (
               <div className="overflow-x-auto">
@@ -279,7 +281,7 @@ export function ObservationsSurface({
                         </td>
                         <td className={`${cell} font-mono`}>{item.pool ?? "—"}</td>
                         <td className={`${cell} whitespace-nowrap`}>
-                          {item.since ? new Date(item.since / 1000).toLocaleString() : "—"}
+                          {item.since ? dateTime.format(item.since / 1000) : "—"}
                         </td>
                       </tr>
                     ))}
@@ -290,28 +292,33 @@ export function ObservationsSurface({
           </section>
         </>
       ) : null}
-      <section className="min-w-0 rounded-lg border border-border bg-card p-4">
-        <h3 className="font-medium">
-          {kind === "usage" ? t("observations.usageTable") : t("observations.providerTable")}
-        </h3>
-        <p className="my-3 text-sm text-muted-foreground">
-          {kind === "usage" ? t("observations.usageNote") : t("observations.providerNote")}
-        </p>
+      <section className="min-w-0 overflow-hidden rounded-xl border border-border bg-card">
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border p-4 sm:p-5">
+          <div className="min-w-0 flex-1 basis-64">
+            <h2 className="text-base font-semibold tracking-tight">
+              {kind === "usage" ? t("observations.usageTable") : t("observations.providerTable")}
+            </h2>
+            <p className="mt-1 max-w-prose text-sm leading-relaxed text-muted-foreground">
+              {kind === "usage" ? t("observations.usageNote") : t("observations.providerNote")}
+            </p>
+          </div>
+          {kind === "usage" && timeRange}
+        </div>
         {error ? (
-          <DismissibleNotice message={error} className="mb-3 text-sm text-destructive">
+          <DismissibleNotice message={error} className="m-4 text-sm text-destructive">
             {error}
           </DismissibleNotice>
         ) : null}
-        {!ready ? <p role="status">{t("observations.loading")}</p> : null}
+        {!ready && !error ? <ListStatus loading message={t("observations.loading")} /> : null}
         {ready && items.length === 0 && !error ? (
-          <p className="py-4 text-sm text-muted-foreground">{t("observations.empty")}</p>
+          <ListStatus message={t("observations.empty")} />
         ) : null}
         {items.length > 0 ? (
-          <div className="overflow-x-auto rounded-lg border border-border">
+          <div className="overflow-x-auto">
             <table
               className={kind === "usage" ? "w-full min-w-[1200px] text-sm" : "w-full text-sm"}
             >
-              <thead className="border-b border-border bg-muted/40 text-xs text-muted-foreground">
+              <thead className="border-b border-border bg-muted/50 text-xs text-muted-foreground [&_th]:font-medium">
                 <tr>
                   <th className={`${cell} whitespace-nowrap`}>{t("observations.observed")}</th>
                   <th className={`${cell} whitespace-nowrap`}>{t("observations.jobRequest")}</th>
@@ -327,7 +334,7 @@ export function ObservationsSurface({
                 {newestFirst.map((row) => (
                   <tr key={`${row.job}:${row.id}`} className="transition-colors hover:bg-muted/30">
                     <td className={`${cell} whitespace-nowrap`}>
-                      {new Date(row.observed_at_us / 1000).toLocaleString()}
+                      {dateTime.format(row.observed_at_us / 1000)}
                     </td>
                     <td className={cell}>
                       <button

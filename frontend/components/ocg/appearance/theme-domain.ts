@@ -11,7 +11,7 @@ export const APPEARANCE_STORAGE_KEY = "ocg.appearance.v1";
 
 export const DEFAULT_APPEARANCE: AppearancePreferences = {
   theme: "system",
-  accent: "ochre",
+  accent: "teal",
 };
 
 export function resolveThemePreference(value: unknown): ThemePreference {

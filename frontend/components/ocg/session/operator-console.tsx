@@ -4,6 +4,9 @@ import type * as Api from "@/components/ocg/contracts/api";
 
 import { useEffect, useRef, useState } from "react";
 
+import { LoaderCircle, RotateCw } from "lucide-react";
+
+import { AccessScreen } from "../login/access-screen";
 import { Button } from "@/components/ui/button";
 import {
   ControlTransportError,
@@ -145,20 +148,26 @@ export function OperatorConsole() {
 
   if (phase === "checking") {
     return (
-      <main className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-        {t("session.checking")}
+      <main className="flex flex-1 items-center justify-center">
+        <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground">
+          <LoaderCircle
+            aria-hidden="true"
+            className="size-4 text-primary motion-safe:animate-spin"
+          />
+          {t("session.checking")}
+        </p>
       </main>
     );
   }
 
   if (phase === "unreachable") {
     return (
-      <main className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-4 px-6 py-16">
-        <p className="text-sm text-muted-foreground">{t("session.unreachable")}</p>
-        <Button variant="outline" onClick={() => window.location.reload()}>
+      <AccessScreen title={t("session.offlineTitle")} description={t("session.unreachable")}>
+        <Button className="self-start" onClick={() => window.location.reload()}>
+          <RotateCw aria-hidden="true" />
           {t("session.retry")}
         </Button>
-      </main>
+      </AccessScreen>
     );
   }
 

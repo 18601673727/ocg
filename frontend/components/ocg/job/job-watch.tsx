@@ -782,6 +782,8 @@ function JobWatchBody({
         </DismissibleNotice>
       )}
       <JobTranscript
+        jobId={jobId}
+        client={client}
         turns={turns}
         userLabel={presentation === "chat" ? t("job.you") : t("job.objective")}
         attachmentContentUrl={(id) => client.attachmentContentUrl(id)}

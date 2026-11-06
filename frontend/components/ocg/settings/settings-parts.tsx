@@ -17,16 +17,13 @@ export function Section({
   children: ReactNode;
 }) {
   return (
-    <section
-      aria-labelledby={id}
-      className="rounded-lg border border-border bg-background px-3 py-2.5 sm:px-4"
-    >
-      <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
-        <div className="min-w-0">
-          <h2 id={id} className="text-base font-semibold tracking-tight">
+    <section aria-labelledby={id} className="rounded-xl border border-border bg-card p-4 sm:p-6">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
+        <div className="min-w-0 flex-[1_1_15rem]">
+          <h2 id={id} className="text-lg font-semibold tracking-tight">
             {title}
           </h2>
-          <p className="mt-1 text-[13px] leading-5 text-muted-foreground">{description}</p>
+          <p className="mt-1 max-w-prose text-sm leading-6 text-muted-foreground">{description}</p>
         </div>
         {action}
       </div>

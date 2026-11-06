@@ -3,9 +3,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Pause, Play, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { useI18n, runtimeStatusDetail } from "../i18n";
+import { useI18n } from "../i18n";
 import type { RuntimeStatus } from "../types";
-import { ModelSelector } from "./model-selector";
+import { ModelSelector, type ModelImageSupport } from "./model-selector";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
 import type { ControlConversationCard } from "../contracts";
@@ -122,7 +122,13 @@ export function ChatComposer({
   }, [control, conversationId]);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  const images = useImageAttachments(projectId);
+  const [modelImageSupport, setModelImageSupport] = useState<ModelImageSupport | null>(null);
+  const supportsImages = Boolean(
+    selection?.llmProfile &&
+      modelImageSupport?.llmProfile === selection.llmProfile &&
+      modelImageSupport.supported,
+  );
+  const images = useImageAttachments(projectId, supportsImages);
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
   const { t } = useI18n();
@@ -146,6 +152,7 @@ export function ChatComposer({
     };
   }, []);
   const [cancelling, setCancelling] = useState(false);
+  const imageInputDisabled = !supportsImages || submitting || cancelling;
 
   useEffect(() => {
     const el = ref.current;
@@ -258,13 +265,14 @@ export function ChatComposer({
         onDragEnter: (event) => {
           if (!event.dataTransfer.types.includes("Files")) return;
           event.preventDefault();
+          if (imageInputDisabled) return;
           dragDepth.current += 1;
           setDragging(true);
         },
         onDragOver: (event) => {
           if (!event.dataTransfer.types.includes("Files")) return;
           event.preventDefault();
-          event.dataTransfer.dropEffect = submitting || cancelling ? "none" : "copy";
+          event.dataTransfer.dropEffect = imageInputDisabled ? "none" : "copy";
         },
         onDragLeave: (event) => {
           event.preventDefault();
@@ -276,10 +284,10 @@ export function ChatComposer({
           event.preventDefault();
           dragDepth.current = 0;
           setDragging(false);
-          if (!submitting && !cancelling) images.add(Array.from(event.dataTransfer.files));
+          if (!imageInputDisabled) images.add(Array.from(event.dataTransfer.files));
         },
       }}
-      dragging={dragging}
+      dragging={!imageInputDisabled && dragging}
       attachmentInput={
         <input
           ref={fileInput}
@@ -287,7 +295,7 @@ export function ChatComposer({
           accept="image/png,image/jpeg,image/gif,image/webp"
           multiple
           hidden
-          disabled={submitting || cancelling}
+          disabled={imageInputDisabled}
           aria-label={t("chat.attachFile")}
           onChange={(event) => {
             images.add(Array.from(event.target.files ?? []));
@@ -295,16 +303,14 @@ export function ChatComposer({
           }}
         />
       }
-      unavailableMessage={
-        chatReady
-          ? undefined
-          : runtimeStatus.state === "failed"
-            ? t("chat.unavailable")
-            : `${t("chat.unavailable")} · ${runtimeStatusDetail(t, runtimeStatus) ?? t("chat.unavailableFallback")}`
-      }
+      runtimeStatus={runtimeStatus}
     >
-      <div className="rounded-lg border border-border bg-card shadow-[0_8px_30px_-12px_rgba(0,0,0,0.25)] transition-colors focus-within:border-ring">
-        <AttachmentStaging state={images} disabled={submitting || cancelling} />
+      <div className="rounded-xl border border-border bg-card shadow-sm transition-shadow focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/15 motion-reduce:transition-none">
+        <AttachmentStaging
+          state={images}
+          disabled={submitting || cancelling}
+          uploadDisabled={imageInputDisabled}
+        />
         <ChatComposerInput
           textarea={{
             ref,
@@ -315,7 +321,7 @@ export function ChatComposer({
               onDraftChange(e.target.value);
             },
             onPaste: (e) => {
-              if (submitting || cancelling) return;
+              if (imageInputDisabled) return;
               const clipboard = e.clipboardData;
               if (!clipboard) return;
               // One image can arrive as both an item and a file. Collect once
@@ -379,7 +385,7 @@ export function ChatComposer({
                 void submit();
               }
             },
-            "aria-describedby": chatReady ? "composer-hint" : "composer-hint composer-status",
+            "aria-describedby": chatReady ? undefined : "composer-status",
           }}
           suggestions={
             suggestionsOpen
@@ -409,6 +415,7 @@ export function ChatComposer({
                 selection={selection}
                 onChange={onSelectionChange}
                 onPreference={onPreference}
+                onImageSupportChange={setModelImageSupport}
                 busy={busy || submitting || cancelling}
                 active={active}
                 activity={activity}
@@ -420,6 +427,7 @@ export function ChatComposer({
             queueing: defaultQueueing,
             submitting,
             cancelling,
+            attachDisabled: imageInputDisabled,
             sendDisabled:
               !canSend ||
               submitting ||

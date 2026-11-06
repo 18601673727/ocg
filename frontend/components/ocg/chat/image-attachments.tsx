@@ -52,7 +52,7 @@ function readImage(file: File, signal: AbortSignal): Promise<string> {
   });
 }
 
-export function useImageAttachments(projectId?: string) {
+export function useImageAttachments(projectId: string | undefined, enabled: boolean) {
   const { client } = useOcgRuntime();
   const { t } = useI18n();
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -124,6 +124,7 @@ export function useImageAttachments(projectId?: string) {
   }
 
   function add(files: File[]) {
+    if (!enabled) return;
     if (!client.uploadChatImage) {
       setError(t("chat.imageUploadUnavailable"));
       return;
@@ -185,10 +186,11 @@ export function useImageAttachments(projectId?: string) {
     clear,
     retry: (id: string) => {
       const item = current.current.find((item) => item.id === id);
-      if (item?.status === "failed") void upload(item);
+      if (enabled && item?.status === "failed") void upload(item);
     },
     images: attachments.flatMap((item) => (item.image ? [item.image] : [])),
-    ready: attachments.every((item) => item.status === "ready"),
+    ready:
+      (enabled || attachments.length === 0) && attachments.every((item) => item.status === "ready"),
   };
 }
 
@@ -204,9 +206,11 @@ function AttachmentError({ message }: { message?: string | null }) {
 export function AttachmentStaging({
   state,
   disabled,
+  uploadDisabled,
 }: {
   state: ReturnType<typeof useImageAttachments>;
   disabled: boolean;
+  uploadDisabled: boolean;
 }) {
   const { t } = useI18n();
   if (!state.attachments.length && !state.error) return null;
@@ -273,7 +277,7 @@ export function AttachmentStaging({
                         type="button"
                         variant="ghost"
                         size="xs"
-                        disabled={disabled}
+                        disabled={disabled || uploadDisabled}
                         onClick={() => state.retry(item.id)}
                       >
                         <RotateCcw className="size-3" />

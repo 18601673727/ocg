@@ -266,9 +266,15 @@ export function ConversationSearch({
         </div>
 
         <ScrollArea
-          className="min-h-0 flex-1"
-          viewportProps={{ className: "ocg-subtle-scrollbar" }}
-          contentProps={{ className: "px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6" }}
+          className="flex min-h-0 flex-1 flex-col"
+          viewportProps={{
+            className: "ocg-subtle-scrollbar min-h-0 flex-1",
+            style: { overflowX: "hidden" },
+          }}
+          contentProps={{
+            className: "px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6",
+            style: { minWidth: 0, width: "100%" },
+          }}
         >
           {loading && (
             <p role="status" className="px-2 py-2 text-sm text-muted-foreground">
@@ -321,7 +327,7 @@ export function ConversationSearch({
                     )}
                   >
                     <MessageSquare className="size-3.5 shrink-0" aria-hidden="true" />
-                    <span className="min-w-0 flex-1 truncate">
+                    <span className="line-clamp-2 min-w-0 flex-1 break-words">
                       {session.title || untitledLabel}
                     </span>
                   </button>

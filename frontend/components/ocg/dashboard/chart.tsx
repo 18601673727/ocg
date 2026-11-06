@@ -8,6 +8,8 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { summarize, type RankedUsage } from "./usage-chart-data";
 import { summarizeReliability, type ReliabilitySummary } from "./reliability-chart-data";
+import { HoverMarquee } from "../sidebar/hover-marquee";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -138,7 +140,7 @@ function CartesianBarPlot({
   mode?: "stacked" | "grouped";
   plotHeight?: number;
 }) {
-  const { locale } = useI18n();
+  const { t, locale } = useI18n();
   const [activeBar, setActiveBar] = useState<number | null>(null);
   const compact = new Intl.NumberFormat(locale, { notation: "compact", maximumFractionDigits: 1 });
   const percent = new Intl.NumberFormat(locale, {
@@ -264,24 +266,41 @@ function CartesianBarPlot({
           </div>
         ) : null}
       </div>
-      <ol className="min-w-0 space-y-3 text-sm">
-        {series.map((entry) => {
-          const value =
-            entry.legendValue ?? (entry.share === undefined ? null : percent.format(entry.share));
-          return (
-            <li key={entry.key} className="flex items-center gap-2">
-              <span
-                className="h-3 w-3 shrink-0 rounded-sm"
-                style={{ backgroundColor: entry.color }}
-              />
-              <span className="min-w-0 flex-1 break-words">{entry.label}</span>
-              {value === null ? null : (
-                <span className="shrink-0 tabular-nums text-muted-foreground">{value}</span>
-              )}
-            </li>
-          );
-        })}
-      </ol>
+      <div className="relative min-h-0 min-w-0">
+        {/* Beside the plot, the legend scrolls within the plot's height. */}
+        <div className="lg:absolute lg:inset-0">
+          <ScrollArea
+            className="max-h-64 lg:h-full lg:max-h-none"
+            viewportProps={{
+              role: "region",
+              "aria-label": t("observations.chartLegend"),
+              className: "rounded-sm focus-visible:outline-2 focus-visible:outline-ring",
+              style: { overflowX: "hidden" },
+            }}
+            contentProps={{ className: "pr-3", style: { minWidth: 0, width: "100%" } }}
+          >
+            <ol className="min-w-0 space-y-3 text-sm">
+              {series.map((entry) => {
+                const value =
+                  entry.legendValue ??
+                  (entry.share === undefined ? null : percent.format(entry.share));
+                return (
+                  <li key={entry.key} className="flex items-center gap-2">
+                    <span
+                      className="h-3 w-3 shrink-0 rounded-sm"
+                      style={{ backgroundColor: entry.color }}
+                    />
+                    <HoverMarquee className="flex-1">{entry.label}</HoverMarquee>
+                    {value === null ? null : (
+                      <span className="shrink-0 tabular-nums text-muted-foreground">{value}</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          </ScrollArea>
+        </div>
+      </div>
     </div>
   );
 }
@@ -308,13 +327,13 @@ export function UsageChart({
   const { t } = useI18n();
   return (
     <section
-      className="min-w-0 rounded-lg border border-border bg-card p-4"
+      className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-5"
       aria-labelledby={`${id}-title`}
     >
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <h3 id={`${id}-title`} className="font-medium">
+        <h2 id={`${id}-title`} className="text-base font-semibold tracking-tight">
           {t("observations.chartTitle")}
-        </h3>
+        </h2>
         <ChartControls
           id={id}
           days={days}
@@ -514,13 +533,13 @@ export function ReliabilityChart({
   const { t } = useI18n();
   return (
     <section
-      className="min-w-0 rounded-lg border border-border bg-card p-4"
+      className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-5"
       aria-labelledby={`${id}-title`}
     >
       <div className="mb-1 flex flex-wrap items-center justify-between gap-3">
-        <h3 id={`${id}-title`} className="font-medium">
+        <h2 id={`${id}-title`} className="text-base font-semibold tracking-tight">
           {t("observations.reliabilityTitle")}
-        </h3>
+        </h2>
         <ChartControls
           id={id}
           days={days}
@@ -764,7 +783,7 @@ function ReliabilityPlot({ data }: { data: ReliabilityData }) {
         ))}
       </dl>
       <div>
-        <h4 className="mb-3 text-sm font-medium">{t("observations.reliabilityErrors")}</h4>
+        <h3 className="mb-3 text-sm font-medium">{t("observations.reliabilityErrors")}</h3>
         <CartesianBarPlot
           integerTicks
           ariaLabel={t("observations.reliabilityErrorsAria", {
@@ -807,7 +826,7 @@ function ReliabilityPlot({ data }: { data: ReliabilityData }) {
         />
       </div>
       <div>
-        <h4 className="mb-3 text-sm font-medium">{t("observations.tokens")}</h4>
+        <h3 className="mb-3 text-sm font-medium">{t("observations.tokens")}</h3>
         <p className="mb-3 text-xs text-muted-foreground">
           {t("observations.reliabilityCacheNote")}
         </p>
@@ -848,7 +867,7 @@ function ReliabilityPlot({ data }: { data: ReliabilityData }) {
         />
       </div>
       <div>
-        <h4 className="mb-3 text-sm font-medium">{t("observations.firstByte")}</h4>
+        <h3 className="mb-3 text-sm font-medium">{t("observations.firstByte")}</h3>
         <LatencyBars data={data} />
       </div>
     </div>
@@ -987,10 +1006,13 @@ export function HealthChart({
   const number = new Intl.NumberFormat(locale);
   const data = result.data;
   return (
-    <section className="min-w-0 rounded-lg border border-border bg-card p-4" aria-labelledby={id}>
-      <h3 id={id} className="font-medium">
+    <section
+      className="min-w-0 rounded-xl border border-border bg-card p-4 sm:p-5"
+      aria-labelledby={id}
+    >
+      <h2 id={id} className="text-base font-semibold tracking-tight">
         {t("observations.healthChartTitle")}
-      </h3>
+      </h2>
       <p className="mt-1 mb-5 text-sm text-muted-foreground">
         {t("observations.healthChartDescription")}
       </p>

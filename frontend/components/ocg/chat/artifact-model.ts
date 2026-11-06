@@ -9,7 +9,7 @@ export type FileArtifact = {
   excerpt: boolean;
 };
 
-function object(text: string | null): Record<string, unknown> | null {
+export function toolObject(text: string | null): Record<string, unknown> | null {
   if (!text) return null;
   try {
     const value: unknown = JSON.parse(text);
@@ -31,7 +31,7 @@ export function isArtifactCall(call: ControlToolCall): boolean {
 
 export function fileArtifact(call: ControlToolCall): FileArtifact | null {
   if (call.outcome_kind !== "completed" || call.arguments_cut || call.result_cut) return null;
-  const args = object(call.arguments);
+  const args = toolObject(call.arguments);
   if (call.name === "workspace_write_file" && args && typeof args.path === "string") {
     const content = typeof args.content === "string" ? args.content : undefined;
     const expected = typeof args.expected_content === "string" ? args.expected_content : undefined;
@@ -54,7 +54,7 @@ export function fileArtifact(call: ControlToolCall): FileArtifact | null {
           : { path: args.path, before: expected, after: "", excerpt: false };
     }
   }
-  const result = object(call.result);
+  const result = toolObject(call.result);
   const patch = typeof result?.stdout === "string" ? result.stdout : call.result;
   return patch && /^(?:diff --git |--- |@@ )/m.test(patch)
     ? {
@@ -67,8 +67,8 @@ export function fileArtifact(call: ControlToolCall): FileArtifact | null {
 }
 
 export function artifactTitle(call: ControlToolCall): string {
-  const args = object(call.arguments);
-  const result = object(call.result);
+  const args = toolObject(call.arguments);
+  const result = toolObject(call.result);
   return typeof args?.path === "string"
     ? args.path
     : typeof result?.path === "string"

@@ -1,7 +1,7 @@
 export const SETTINGS_SECTIONS = [
   { id: "models", label: "settings.nav.models", group: "profiles" },
   { id: "agents", label: "settings.nav.agents", group: "profiles" },
-  { id: "decisions", label: "decision.title", group: "profiles" },
+  { id: "decisions", label: "settings.nav.decisions", group: "profiles" },
   { id: "projects", label: "settings.nav.projects", group: "workspace" },
   { id: "execution", label: "settings.nav.execution", group: "workspace" },
   { id: "appearance", label: "settings.section.appearance", group: "preferences" },

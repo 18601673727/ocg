@@ -7,8 +7,8 @@ export function OcgLogo({ compact = false, className }: { compact?: boolean; cla
       aria-label="OCG"
       data-ocg-logo=""
       className={cn(
-        "inline-block origin-left scale-y-75 font-sans leading-none font-black tracking-[-0.06em]",
-        compact ? "text-[18px]" : "text-[26px]",
+        "inline-block align-middle leading-none font-bold tracking-tight",
+        compact ? "text-lg" : "text-2xl",
         className,
       )}
     >

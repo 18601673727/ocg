@@ -58,6 +58,11 @@ const LANGUAGES: Record<string, string> = {
   html: "xml",
 };
 
+export function sourceLanguage(path: string): string {
+  const extension = path.split(".").at(-1)?.toLowerCase() ?? "";
+  return LANGUAGES[extension] ?? extension;
+}
+
 export function SourceLink({
   href,
   snapshots,
@@ -140,8 +145,7 @@ export function SourceLink({
       item.start_line <= ref.start &&
       item.end_line >= ref.start,
   );
-  const language =
-    LANGUAGES[ref.path.split(".").at(-1)?.toLowerCase() ?? ""] ?? ref.path.split(".").at(-1) ?? "";
+  const language = sourceLanguage(ref.path);
   const lines = snapshot?.content.split("\n") ?? [];
   if (lines.at(-1) === "") lines.pop();
   return (

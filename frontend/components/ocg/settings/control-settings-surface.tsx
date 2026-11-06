@@ -2,6 +2,7 @@
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Monitor, Moon, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -45,7 +46,7 @@ import { DecisionProfilesSection } from "./decision-profiles-section";
 import { PoolsSection } from "./pools-section";
 import { useTheme } from "../appearance/theme-provider";
 import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
-import { PageTitle } from "../layout/page-title";
+import { ContentHeader } from "../layout/content-container";
 import { SettingsNavigation } from "./settings-navigation";
 import type { SettingsSection } from "./settings-sections";
 
@@ -73,7 +74,7 @@ function ChoiceGroup<T extends string>({
 }: {
   label: string;
   value: T;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; preview: ReactNode }[];
   onChange: (value: T) => void;
 }) {
   return (
@@ -85,12 +86,13 @@ function ChoiceGroup<T extends string>({
           aria-pressed={value === option.value}
           onClick={() => onChange(option.value)}
           className={cn(
-            "min-h-11 rounded-md border px-3 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/30",
+            "inline-flex min-h-11 items-center gap-2 rounded-md border px-3 py-2 text-sm outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
             value === option.value
               ? cn(SELECTED_OPTION, "font-medium")
               : "border-border text-muted-foreground hover:bg-muted/50 hover:text-foreground",
           )}
         >
+          {option.preview}
           {option.label}
         </button>
       ))}
@@ -607,15 +609,8 @@ export function SettingsSurface({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <header className="mb-8 flex flex-wrap items-start justify-between gap-4">
-        <div className="min-w-0">
-          <PageTitle className="text-2xl font-semibold tracking-tight">
-            {t("settings.title")}
-          </PageTitle>
-          <p className="mt-2 max-w-xl text-sm leading-6 text-muted-foreground">
-            {t("settings.manage")}
-          </p>
-        </div>
+      <header className="mb-6">
+        <ContentHeader title={t("settings.title")} description={t("settings.manage")} />
       </header>
       <div className="grid min-w-0 gap-6 lg:grid-cols-[13rem_minmax(0,1fr)] lg:gap-8">
         <SettingsNavigation section={section} onNavigate={onNavigate} />
@@ -1500,9 +1495,21 @@ export function SettingsSurface({
                   value={theme.preferences.theme}
                   onChange={theme.setTheme}
                   options={[
-                    { value: "system", label: t("settings.theme.system") },
-                    { value: "light", label: t("settings.theme.light") },
-                    { value: "dark", label: t("settings.theme.dark") },
+                    {
+                      value: "system",
+                      label: t("settings.theme.system"),
+                      preview: <Monitor aria-hidden="true" className="size-4" />,
+                    },
+                    {
+                      value: "light",
+                      label: t("settings.theme.light"),
+                      preview: <Sun aria-hidden="true" className="size-4" />,
+                    },
+                    {
+                      value: "dark",
+                      label: t("settings.theme.dark"),
+                      preview: <Moon aria-hidden="true" className="size-4" />,
+                    },
                   ]}
                 />
               </SettingRow>
@@ -1516,9 +1523,36 @@ export function SettingsSurface({
                   value={theme.preferences.accent}
                   onChange={theme.setAccent}
                   options={[
-                    { value: "ochre", label: t("settings.accent.ochre") },
-                    { value: "slate", label: t("settings.accent.slate") },
-                    { value: "teal", label: t("settings.accent.teal") },
+                    {
+                      value: "ochre",
+                      label: t("settings.accent.ochre"),
+                      preview: (
+                        <span
+                          aria-hidden="true"
+                          className="size-3 rounded-full bg-(--accent-ochre)"
+                        />
+                      ),
+                    },
+                    {
+                      value: "slate",
+                      label: t("settings.accent.slate"),
+                      preview: (
+                        <span
+                          aria-hidden="true"
+                          className="size-3 rounded-full bg-(--accent-slate)"
+                        />
+                      ),
+                    },
+                    {
+                      value: "teal",
+                      label: t("settings.accent.teal"),
+                      preview: (
+                        <span
+                          aria-hidden="true"
+                          className="size-3 rounded-full bg-(--accent-teal)"
+                        />
+                      ),
+                    },
                   ]}
                 />
               </SettingRow>

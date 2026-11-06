@@ -1,28 +1,34 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import { ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ChatModelSelection, ControlAgentProfile, ControlProject } from "../contracts";
 import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
 import { ModelSelectorView } from "./model-selector-view";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
+import { settingsPath } from "../settings/settings-sections";
 
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 type Catalog = { agents: ControlAgentProfile[]; projects: ControlProject[] };
+
+export type ModelImageSupport = { llmProfile: string | undefined; supported: boolean };
 
 export function ModelSelector({
   sessionId,
   selection,
   onChange,
   onPreference,
+  onImageSupportChange,
   busy,
 }: {
   sessionId?: string;
   selection?: ChatModelSelection;
   onChange: (selection: ChatModelSelection) => void;
   onPreference?: (selection: ChatModelSelection) => void;
+  onImageSupportChange: (support: ModelImageSupport) => void;
   busy: boolean;
   active?: ActiveExecutionTarget | null;
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
@@ -95,6 +101,10 @@ export function ModelSelector({
       : llm?.executors[0];
   const agentId = agent?.id;
   const llmId = llm?.id;
+  const supportsImages = llm?.declared_capabilities.includes("vision") ?? false;
+  useEffect(() => {
+    onImageSupportChange({ llmProfile: llmId, supported: supportsImages });
+  }, [llmId, supportsImages, onImageSupportChange]);
   const model = llm?.model;
   const efforts =
     llm?.reasoning_efforts ??
@@ -107,6 +117,15 @@ export function ModelSelector({
       ? selection.effort
       : null;
   const disabled = busy || !catalog || !llm || !executor;
+  const needsSetup = Boolean(
+    session && !session.conversationId && !fixedAgent && !busy && catalog && !error && !agent,
+  );
+  useEffect(() => {
+    if (!needsSetup) return;
+    const refresh = () => setAttempt((value) => value + 1);
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [needsSetup]);
   // A conversation keeps the Project of its first turn, so only a new one chooses,
   // and only the owner chooses: no Project is picked for them.
   const projects = !fixedAgent ? (catalog?.projects ?? []) : [];
@@ -228,17 +247,24 @@ export function ModelSelector({
           },
         }}
       />
+      {needsSetup && (
+        <a
+          href={settingsPath("models")}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-2 inline-flex items-start gap-1.5 rounded-sm px-1 text-xs leading-5 text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        >
+          <ExternalLink className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <span>
+            {t("chat.setupModels")}
+            <span className="sr-only"> ({t("chat.setupNewTab")})</span>
+          </span>
+        </a>
+      )}
       {llm && !llm.declared_capabilities.includes("tools") && (
         <DismissibleNotice
           tone="warning"
           message={t("chat.toolsWarning")}
-          className="mt-1 px-1 text-xs text-muted-foreground"
-        />
-      )}
-      {llm && !llm.declared_capabilities.includes("vision") && (
-        <DismissibleNotice
-          tone="warning"
-          message={t("chat.visionWarning")}
           className="mt-1 px-1 text-xs text-muted-foreground"
         />
       )}

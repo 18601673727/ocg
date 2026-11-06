@@ -5,18 +5,20 @@ import { useState } from "react";
 import type { ComponentPropsWithRef, ComponentPropsWithoutRef, ReactNode } from "react";
 import {
   ArrowUp,
+  CircleAlert,
   Command,
   Eye,
+  ImagePlus,
   ListPlus,
   Loader2,
-  Paperclip,
   Sparkles,
   Square,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { SELECTED_ROW, TEXT_TONE } from "@/components/ocg/primitives";
-import { useI18n } from "../i18n";
+import { runtimeStatusDetail, useI18n, type TranslateFn } from "../i18n";
+import type { RuntimeStatus } from "../types";
 import { useConversationError } from "./conversation-errors";
 import { MarkdownBody } from "@/components/ocg/markdown/markdown-body";
 
@@ -25,40 +27,63 @@ type ComposerFormProps = Pick<
   "onSubmit" | "onDragEnter" | "onDragOver" | "onDragLeave" | "onDrop"
 >;
 
+function composerStatus(t: TranslateFn, status: RuntimeStatus): string | undefined {
+  switch (status.state) {
+    case "connected":
+      return undefined;
+    case "connecting":
+      return t("state.connecting");
+    case "failed":
+      return t("chat.unavailable");
+    case "disconnected":
+      return `${t("chat.unavailable")} · ${runtimeStatusDetail(t, status) ?? t("chat.unavailableFallback")}`;
+  }
+}
+
 export function ChatComposerView({
   form,
   dragging,
   attachmentInput,
   children,
-  unavailableMessage,
+  runtimeStatus,
 }: {
   form: ComposerFormProps;
   dragging: boolean;
   attachmentInput: ReactNode;
   children: ReactNode;
-  unavailableMessage?: string;
+  runtimeStatus: RuntimeStatus;
 }) {
   const { t } = useI18n();
+  const statusMessage = composerStatus(t, runtimeStatus);
   return (
-    <div className="shrink-0 bg-transparent pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-      <form {...form} className="relative mx-auto w-full">
+    <div className="shrink-0 bg-linear-to-b from-transparent to-background to-[1.5rem] pt-2 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+      <form {...form} className="@container/composer relative mx-auto w-full">
         {dragging && (
           <div
-            className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-background/95 text-sm font-medium"
+            className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-primary bg-background/95 text-sm font-medium text-primary"
             role="status"
           >
+            <ImagePlus className="size-5" aria-hidden="true" />
             {t("chat.dropImages")}
           </div>
         )}
         {attachmentInput}
         {children}
-        {unavailableMessage && (
+        {statusMessage && (
           <p
             id="composer-status"
             role="status"
-            className="mt-1.5 text-center text-xs text-muted-foreground"
+            className="mt-2 flex items-start gap-1.5 px-1 text-xs leading-5 text-muted-foreground"
           >
-            {unavailableMessage}
+            {runtimeStatus.state === "connecting" ? (
+              <Loader2
+                className="mt-0.5 size-4 shrink-0 motion-safe:animate-spin"
+                aria-hidden="true"
+              />
+            ) : (
+              <CircleAlert className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+            )}
+            {statusMessage}
           </p>
         )}
       </form>
@@ -99,6 +124,7 @@ export function ChatComposerInput({
     queueing: boolean;
     submitting: boolean;
     cancelling: boolean;
+    attachDisabled: boolean;
     sendDisabled: boolean;
     steerDisabled: boolean;
     steerTitle?: string;
@@ -174,7 +200,7 @@ export function ChatComposerInput({
             activeSuggestion ? `composer-suggestion-${activeSuggestion.id}` : undefined
           }
           aria-invalid={Boolean(error)}
-          className="relative z-10 max-h-[min(10rem,25dvh)] min-h-11 w-full resize-none bg-transparent px-3 pt-2.5 pb-1 text-base leading-6 text-foreground outline-none placeholder:text-muted-foreground sm:text-sm [@media(max-height:600px)]:max-h-[18dvh]"
+          className="relative z-10 block max-h-[min(10rem,25dvh)] min-h-14 w-full resize-none bg-transparent px-4 py-3 text-base leading-6 text-foreground outline-none placeholder:text-muted-foreground [@media(max-height:600px)]:max-h-[18dvh]"
         />
       </div>
       {preview && (
@@ -195,24 +221,27 @@ export function ChatComposerInput({
           {error}
         </DismissibleNotice>
       )}
-      <div className="flex flex-wrap items-center gap-1 px-2 pb-2">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-b-xl border-t border-border/70 bg-muted/30 p-2">
+        <div className="flex w-full min-w-0 @xl/composer:w-auto @xl/composer:flex-1">
+          {selectors}
+        </div>
         <Button
           type="button"
           variant="ghost"
           size="icon-xs"
-          className="size-11 rounded-md sm:size-9"
+          className="size-11 rounded-lg text-muted-foreground pointer-fine:size-9"
           aria-label={t("chat.attachFile")}
           title={t("chat.attachFile")}
-          disabled={actions.submitting || actions.cancelling}
+          disabled={actions.attachDisabled}
           onClick={actions.onAttach}
         >
-          <Paperclip className="size-4" />
+          <ImagePlus className="size-4" />
         </Button>
         <Button
           type="button"
           variant={preview ? "selected" : "ghost"}
           size="icon-xs"
-          className="size-11 rounded-md sm:size-9"
+          className="size-11 rounded-lg text-muted-foreground aria-pressed:text-primary pointer-fine:size-9"
           aria-label={t("chat.markdownPreview")}
           aria-pressed={preview}
           aria-controls={preview ? "composer-preview" : undefined}
@@ -221,20 +250,13 @@ export function ChatComposerInput({
         >
           <Eye className="size-4" />
         </Button>
-        {selectors}
-        <span id="composer-hint" className="sr-only">
-          <span className="hidden pointer-coarse:inline">{t("chat.touchHint")}</span>
-          <span className="pointer-coarse:hidden">
-            {actions.queueing ? t("chat.queueHint") : t("chat.hint")}
-          </span>
-        </span>
-        <div className="ml-auto flex flex-wrap items-center justify-end gap-1">
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-1 @xl/composer:border-l @xl/composer:border-border @xl/composer:pl-2">
           {actions.busy && actions.onCancel && (
             <Button
               type="button"
               variant="outline"
               size="xs"
-              className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9"
+              className="h-11 rounded-lg px-2 tracking-normal normal-case pointer-fine:h-9"
               disabled={actions.submitting || actions.cancelling}
               onClick={actions.onCancel}
               title={t("chat.cancel")}
@@ -253,7 +275,7 @@ export function ChatComposerInput({
               type="button"
               variant="outline"
               size="xs"
-              className="h-11 rounded-md px-2 tracking-normal normal-case sm:h-9"
+              className="h-11 rounded-lg px-2 tracking-normal normal-case pointer-fine:h-9"
               disabled={actions.steerDisabled}
               onClick={actions.onSteer}
               title={actions.steerTitle ?? t("chat.steer")}
@@ -266,8 +288,8 @@ export function ChatComposerInput({
             type="submit"
             size={actions.queueing ? "xs" : "icon-sm"}
             className={cn(
-              "h-11 rounded-md tracking-normal normal-case sm:h-9",
-              !actions.queueing && "w-11 sm:w-9",
+              "h-11 rounded-lg tracking-normal normal-case pointer-fine:h-9",
+              !actions.queueing && "w-11 pointer-fine:w-9",
             )}
             disabled={actions.sendDisabled}
             aria-label={t(actions.queueing ? "chat.queue" : "chat.send")}

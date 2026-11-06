@@ -19,7 +19,7 @@
  * stays anchored to the footer it belongs to.
  */
 
-import { LogOut, SlidersHorizontal, User } from "lucide-react";
+import { ChevronsUpDown, LogOut, SlidersHorizontal, User } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import {
@@ -73,17 +73,23 @@ export function AccountMenu({
             type="button"
             aria-label={t("sidebar.account")}
             title={label}
-            className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left outline-none transition-colors hover:bg-muted/60 focus-visible:ring-2 focus-visible:ring-ring/30"
+            className="flex w-full min-w-0 items-center gap-3 rounded-lg px-2 py-1.5 text-left outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring/50"
           >
-            <User className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-sidebar-border bg-card">
+              <User className="size-4 text-muted-foreground" aria-hidden="true" />
+            </span>
             <span
               className={cn(
-                "min-w-0 flex-1 truncate text-muted-foreground",
+                "min-w-0 flex-1 truncate font-medium text-sidebar-foreground",
                 TYPOGRAPHY_SCALE.body_sm,
               )}
             >
               {label}
             </span>
+            <ChevronsUpDown
+              className="size-3.5 shrink-0 text-muted-foreground"
+              aria-hidden="true"
+            />
           </button>
         )}
       </DropdownMenuTrigger>

@@ -114,7 +114,7 @@ function ToolFallbackDuration({ className, ...props }: React.ComponentProps<"spa
   );
 }
 
-function toolArgumentSummary(toolName: string, argsText: string): string {
+export function toolArgumentSummary(toolName: string, argsText: string): string {
   try {
     const args: unknown = JSON.parse(argsText);
     if (!args || typeof args !== "object") return "";
