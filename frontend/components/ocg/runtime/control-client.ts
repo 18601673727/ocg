@@ -1947,7 +1947,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     async saveGlobalCompactionSettings(settings: Api.GlobalCompactionSettings) {
       const answer = await send("POST", "/api/v1/settings/compaction", {
-        body: settings,
+        body: {
+          revision: settings.revision,
+          prediction_enabled: settings.prediction_enabled,
+          policy: settings.policy,
+        },
         sign: true,
       });
       return answer.input as Api.GlobalCompactionSettings;
