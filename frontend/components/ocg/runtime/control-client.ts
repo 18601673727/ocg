@@ -380,11 +380,23 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return undefined;
     }
   }
-  let snapshotBusy = false;
+  let snapshotBusy = 0;
+  let lockTurn = 0;
   const snapshotWaiters: Array<() => void> = [];
+  const holders = new Set<{ started: number; check(): void }>();
+
+  function checkWaiters() {
+    if (!snapshotWaiters.length) return;
+    let oldest: { started: number; check(): void } | undefined;
+    for (const holder of holders) {
+      if (!oldest || holder.started < oldest.started) oldest = holder;
+    }
+    oldest?.check();
+  }
+
   async function snapshotSlot(signal: AbortSignal): Promise<() => void> {
     signal.throwIfAborted();
-    if (snapshotBusy) {
+    if (snapshotBusy >= 3) {
       await new Promise<void>((resolve, reject) => {
         const wake = () => {
           signal.removeEventListener("abort", abort);
@@ -398,48 +410,170 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         snapshotWaiters.push(wake);
         signal.addEventListener("abort", abort, { once: true });
         if (signal.aborted) abort();
+        else checkWaiters();
       });
-    } else snapshotBusy = true;
+    } else snapshotBusy++;
     return () => {
       const next = snapshotWaiters.shift();
       if (next) next();
-      else snapshotBusy = false;
+      else snapshotBusy--;
+      checkWaiters();
     };
   }
 
-  // Browsers share a small HTTP/1 connection pool across tabs. Rotate event
-  // streams so ordinary requests can run even when several views are open.
-  function streamAttempt(parent: AbortSignal, completeBeforeRotation = false) {
+  function streamAttempt(parent: AbortSignal, lockName?: string) {
     const controller = new AbortController();
     let rotated = false;
-    let rotationDue = false;
-    let complete = !completeBeforeRotation;
+    let complete = programmatic;
+    let remoteWaiting = false;
+    const started = performance.now();
     const rotate = () => {
+      if (rotated || controller.signal.aborted) return;
       rotated = true;
       controller.abort();
+    };
+    const holder = {
+      started,
+      check() {
+        if (!complete || performance.now() - started < 5000) return;
+        if (remoteWaiting) rotate();
+        else if (snapshotWaiters.length) {
+          let oldest: typeof holder | undefined;
+          for (const other of holders) {
+            if (!oldest || other.started < oldest.started) oldest = other;
+          }
+          if (oldest === holder) rotate();
+        }
+      },
     };
     const abort = () => controller.abort();
     parent.addEventListener("abort", abort, { once: true });
     if (parent.aborted) abort();
-    const timer = programmatic
-      ? undefined
-      : setTimeout(() => {
-          rotationDue = true;
-          if (complete) rotate();
-        }, 5000);
+    if (!programmatic) holders.add(holder);
+    const timer = programmatic ? undefined : setTimeout(() => holder.check(), 5000);
+    const poll = lockName
+      ? setInterval(() => {
+          const locks = browserLocks();
+          if (!locks || typeof locks.query !== "function") return;
+          void locks
+            .query()
+            .then((state) => {
+              remoteWaiting = (state.pending ?? []).some((request) => request.name === lockName);
+              holder.check();
+            })
+            .catch(() => {});
+        }, 2000)
+      : undefined;
+    checkWaiters();
     return {
       signal: controller.signal,
       rotated: () => rotated,
       complete: () => {
         complete = true;
-        if (rotationDue) rotate();
+        holder.check();
       },
       abort: () => controller.abort(),
       dispose: () => {
         if (timer !== undefined) clearTimeout(timer);
+        if (poll !== undefined) clearInterval(poll);
+        holders.delete(holder);
         parent.removeEventListener("abort", abort);
       },
     };
+  }
+
+  async function withSnapshotLock<T>(
+    locks: LockManager,
+    signal: AbortSignal,
+    run: (name: string) => Promise<T>,
+  ): Promise<T> {
+    const names = Array.from({ length: 3 }, (_, index) => `ocg-snapshot-stream-${index}`);
+    let probingSupported = true;
+    for (const name of names) {
+      signal.throwIfAborted();
+      let entered = false;
+      try {
+        const result = await locks.request(name, { ifAvailable: true }, (lock) => {
+          if (!lock) return undefined;
+          entered = true;
+          return run(name);
+        });
+        if (entered) return result as T;
+      } catch (error) {
+        if (entered || !(error instanceof DOMException && error.name === "NotSupportedError"))
+          throw error;
+        probingSupported = false;
+        break;
+      }
+      signal.throwIfAborted();
+    }
+    signal.throwIfAborted();
+    const parked = new AbortController();
+    const name = names[lockTurn++ % names.length];
+    return new Promise<T>((resolve, reject) => {
+      let claimed = false;
+      let probing = false;
+      let timer: ReturnType<typeof setInterval> | undefined;
+      const cleanup = () => {
+        if (timer !== undefined) clearInterval(timer);
+        signal.removeEventListener("abort", abort);
+      };
+      const abort = () => {
+        parked.abort();
+        cleanup();
+        reject(signal.reason);
+      };
+      const enter = (lockName: string, fromProbe: boolean) => {
+        if (claimed || signal.aborted) return undefined;
+        claimed = true;
+        cleanup();
+        if (fromProbe) parked.abort();
+        const outcome = run(lockName);
+        outcome.then(resolve, reject);
+        return outcome;
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      void locks
+        .request(name, { signal: parked.signal }, () => enter(name, false))
+        .catch((error) => {
+          if (!claimed && !signal.aborted) {
+            cleanup();
+            reject(error);
+          }
+        });
+      if (probingSupported)
+        timer = setInterval(() => {
+          if (probing || claimed || signal.aborted) return;
+          probing = true;
+          void (async () => {
+            for (const candidate of names) {
+              if (claimed || signal.aborted) break;
+              try {
+                await locks.request(candidate, { ifAvailable: true }, (lock) =>
+                  lock ? enter(candidate, true) : undefined,
+                );
+              } catch (error) {
+                if (error instanceof DOMException && error.name === "NotSupportedError") {
+                  if (timer !== undefined) clearInterval(timer);
+                  break;
+                }
+                if (!claimed && !signal.aborted) {
+                  parked.abort();
+                  cleanup();
+                  reject(error);
+                }
+                break;
+              }
+              if (signal.aborted) break;
+            }
+            probing = false;
+          })();
+        }, 2000);
+    });
   }
 
   // The one credential this client sends: the bearer token of its caller,
@@ -588,8 +722,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     const signal = controller.signal;
     void (async () => {
       let delay = 250;
-      const runAttempt = async (): Promise<{ keepGoing: boolean; wait: number }> => {
-        const attempt = streamAttempt(signal, !programmatic);
+      const runAttempt = async (
+        lockName?: string,
+      ): Promise<{ keepGoing: boolean; wait: number }> => {
+        const attempt = streamAttempt(signal, lockName);
         const remaining = initialTopics ? new Set(initialTopics) : null;
         const started = new Set<string>();
         let initialComplete = false;
@@ -656,7 +792,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                 if (idle) clearTimeout(idle);
               }
               attempt.signal.throwIfAborted();
-              if (chunk.done) break;
+              if (chunk.done) {
+                if (initialComplete && !observationReady) {
+                  delay = 250;
+                  return { keepGoing: true, wait: 100 };
+                }
+                break;
+              }
               const text = decoder.decode(chunk.value, { stream: true });
               let advanced = false;
               for (const character of text) {
@@ -754,9 +896,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           if (locks) {
             let entered = false;
             try {
-              outcome = await locks.request("ocg-snapshot-stream", { signal }, () => {
+              outcome = await withSnapshotLock(locks, signal, (name) => {
                 entered = true;
-                return runAttempt();
+                return runAttempt(name);
               });
             } catch (error) {
               if (signal.aborted || entered) throw error;

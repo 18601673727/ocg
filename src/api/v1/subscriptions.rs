@@ -1,11 +1,12 @@
 use std::cell::Cell;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hasher};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ntex::http::header;
 use ntex::io::IoRef;
@@ -183,7 +184,13 @@ pub(super) fn open(
         page: topic.first(),
         topic,
         opened: now,
+        written: now,
         ended: false,
+        initial: true,
+        initial_hash: Some(DefaultHasher::new()),
+        initial_size: 0,
+        last_hash: None,
+        pending_frame: None,
         observation_cursor,
         observation_ready: false,
         _slot: slot,
@@ -209,7 +216,13 @@ struct Feed {
     topic: Topic,
     page: Page,
     opened: Instant,
+    written: Instant,
     ended: bool,
+    initial: bool,
+    initial_hash: Option<DefaultHasher>,
+    initial_size: usize,
+    last_hash: Option<u64>,
+    pending_frame: Option<Bytes>,
     observation_cursor: Option<JournalCursor>,
     observation_ready: bool,
     _slot: events::Slot,
@@ -438,6 +451,7 @@ impl Feed {
     }
 
     async fn next(mut self) -> Option<(Bytes, Self)> {
+        const ROUND_LIMIT: usize = 4 * 1024 * 1024;
         loop {
             if self.ended
                 || self.shared.closing.load(Ordering::SeqCst)
@@ -445,16 +459,71 @@ impl Feed {
             {
                 return None;
             }
+            if let Some(frame) = self.pending_frame.take() {
+                return self.send(frame);
+            }
             if matches!(self.page, Page::Wait) {
+                if self.initial {
+                    self.initial = false;
+                    self.last_hash = self.initial_hash.take().map(|hash| hash.finish());
+                }
                 match ntex::time::timeout(
                     self.shared.stream_limits.heartbeat,
                     self.changes.changed(),
                 )
                 .await
                 {
-                    Ok(Ok(())) => self.page = self.topic.first(),
+                    Ok(Ok(())) => {
+                        if !matches!(self.topic, Topic::ObservationChanges(_)) {
+                            ntex::time::sleep(Duration::from_millis(250)).await;
+                            self.changes.clear();
+                        }
+                        self.page = self.topic.first();
+                        if matches!(
+                            self.topic,
+                            Topic::Sidebar(_)
+                                | Topic::Jobs(_)
+                                | Topic::Usage(_)
+                                | Topic::Availability(_)
+                                | Topic::Logs(_)
+                        ) {
+                            let mut round = Vec::new();
+                            let mut hash = DefaultHasher::new();
+                            while !matches!(self.page, Page::Wait) {
+                                match self.snapshot().await {
+                                    Ok(Value::Null) => continue,
+                                    Ok(value) => {
+                                        let frame = match self.frame(&value) {
+                                            Ok(frame) => frame,
+                                            Err(refusal) => return self.fail(refusal),
+                                        };
+                                        if frame.len() > ROUND_LIMIT.saturating_sub(round.len()) {
+                                            self.last_hash = None;
+                                            if round.is_empty() {
+                                                return self.send(Bytes::from(frame));
+                                            }
+                                            self.pending_frame = Some(Bytes::from(frame));
+                                            return self.send(Bytes::from(round));
+                                        }
+                                        hash.write(&frame);
+                                        round.extend_from_slice(&frame);
+                                    }
+                                    Err(refusal) => return self.fail(refusal),
+                                }
+                            }
+                            let hash = hash.finish();
+                            if self.last_hash == Some(hash) {
+                                if self.written.elapsed() >= self.shared.stream_limits.heartbeat {
+                                    return self.send(Bytes::from_static(b": heartbeat\n\n"));
+                                }
+                                continue;
+                            }
+                            self.last_hash = Some(hash);
+                            return self.send(Bytes::from(round));
+                        }
+                    }
                     Ok(Err(_)) => return None,
-                    Err(_) => return Some((Bytes::from_static(b": heartbeat\n\n"), self)),
+                    Err(_) => return self.send(Bytes::from_static(b": heartbeat\n\n")),
                 }
             }
             match self.snapshot().await {
@@ -462,25 +531,41 @@ impl Feed {
                     if matches!(self.topic, Topic::ObservationChanges(_))
                         && matches!(self.page, Page::Wait)
                     {
-                        return Some((Bytes::from_static(b": caught-up\n\n"), self));
+                        return self.send(Bytes::from_static(b": caught-up\n\n"));
                     }
                     continue;
                 }
                 Ok(value) => {
-                    let bytes = match super::wire::bounded_json(&value, self.shared.response_bytes)
-                    {
-                        Ok(bytes) => bytes,
+                    let frame = match self.frame(&value) {
+                        Ok(frame) => frame,
                         Err(refusal) => return self.fail(refusal),
                     };
-                    let mut frame = Vec::with_capacity(bytes.len() + 24);
-                    frame.extend_from_slice(b"event: snapshot\ndata: ");
-                    frame.extend_from_slice(&bytes);
-                    frame.extend_from_slice(b"\n\n");
-                    return Some((Bytes::from(frame), self));
+                    if self.initial {
+                        self.initial_size = self.initial_size.saturating_add(frame.len());
+                        if self.initial_size > ROUND_LIMIT {
+                            self.initial_hash = None;
+                        } else if let Some(hash) = &mut self.initial_hash {
+                            hash.write(&frame);
+                        }
+                    }
+                    return self.send(Bytes::from(frame));
                 }
                 Err(refusal) => return self.fail(refusal),
             }
         }
+    }
+    fn frame(&self, value: &Value) -> Result<Vec<u8>, Refusal> {
+        let bytes = super::wire::bounded_json(value, self.shared.response_bytes)?;
+        let mut frame = Vec::with_capacity(bytes.len() + 24);
+        frame.extend_from_slice(b"event: snapshot\ndata: ");
+        frame.extend_from_slice(&bytes);
+        frame.extend_from_slice(b"\n\n");
+        Ok(frame)
+    }
+
+    fn send(mut self, bytes: Bytes) -> Option<(Bytes, Self)> {
+        self.written = Instant::now();
+        Some((bytes, self))
     }
     fn fail(mut self, refusal: Refusal) -> Option<(Bytes, Self)> {
         self.ended = true;

@@ -87,6 +87,10 @@ impl Subscription {
     pub(crate) async fn changed(&self) -> Result<(), flume::RecvError> {
         self.receiver.recv_async().await
     }
+
+    pub(crate) fn clear(&self) {
+        while self.receiver.try_recv().is_ok() {}
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
