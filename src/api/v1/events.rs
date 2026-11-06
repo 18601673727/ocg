@@ -234,12 +234,10 @@ pub(super) async fn open(
 pub(super) struct Slot(Arc<Shared>);
 
 impl Slot {
-    // fetch_update is deprecated on 1.99; its replacement is newer than our MSRV.
-    #[allow(deprecated)]
     pub(super) fn take(shared: &Arc<Shared>) -> Result<Self, Refusal> {
         shared
             .streams
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
                 (open < shared.stream_limits.streams).then_some(open + 1)
             })
             .map_err(|_| TOO_MANY_STREAMS)?;

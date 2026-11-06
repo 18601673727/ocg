@@ -2407,9 +2407,7 @@ fn conversation_page(
     {
         if !terms.is_empty() && examined == 5_000 {
             has_more = true;
-            if conversations.len() < limit {
-                last = last_examined;
-            }
+            last = last_examined;
             break;
         }
         let conversation = JobId::new(item?.0.value());
@@ -2437,13 +2435,16 @@ fn conversation_page(
             ));
         };
         if matches {
-            let summary = conversation_summary(&rx, conversation, tip)?;
             if conversations.len() == limit {
                 has_more = true;
                 break;
             }
             last = Some(conversation);
-            conversations.push(summary);
+            conversations.push(conversation_summary(&rx, conversation, tip)?);
+            if !terms.is_empty() && conversations.len() == limit {
+                has_more = true;
+                break;
+            }
         }
     }
     Ok(ConversationsPage {

@@ -59,7 +59,7 @@ For development, build and run OCG from source.
 
 #### Requirements
 
-- Rust 1.98 or newer and a native C/C++ build toolchain.
+- Rust 1.99 or newer and a native C/C++ build toolchain.
 - Node.js 24 and pnpm 12.15.0 to build the web interface.
 - Git and the OpenSSL CLI for the commands below.
 
