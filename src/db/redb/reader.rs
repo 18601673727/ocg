@@ -551,30 +551,81 @@ pub(crate) fn read_job_search(
     let end = before.map_or(u128::MAX, JobId::get);
     let limit = limit.clamp(1, 100);
     let mut records = Vec::new();
-    let mut last = None;
+    let mut last_match = None;
+    let mut last_examined = None;
+    let mut titles = BTreeMap::new();
     let mut has_more = false;
-    for entry in jobs.range(..end)?.rev() {
+    let mut budget_exhausted = false;
+    for (examined, entry) in jobs.range(..end)?.rev().enumerate() {
+        if examined == 5_000 {
+            has_more = true;
+            budget_exhausted = records.len() < limit;
+            break;
+        }
         let (key, bytes) = entry?;
         let id = JobId::new(key.value());
-        let record = job_record(&rx, JobSpec::decode_at(key.value(), bytes.value())?)?;
-        let identity = record.id.to_string().to_lowercase();
-        let name = record.name.as_deref().unwrap_or("").to_lowercase();
-        let objective = record.objective.as_deref().unwrap_or("").to_lowercase();
-        if terms
+        last_examined = Some(id);
+        let row = JobSpec::decode_at(key.value(), bytes.value())?;
+        let identity = id.to_string().to_lowercase();
+        let name = row.kind.name().unwrap_or("").to_lowercase();
+        let objective = row.kind.objective().unwrap_or("").to_lowercase();
+        let mut unmatched: Vec<_> = terms
             .iter()
-            .all(|term| identity.contains(term) || name.contains(term) || objective.contains(term))
-        {
+            .filter(|term| {
+                !identity.contains(term.as_str())
+                    && !name.contains(term.as_str())
+                    && !objective.contains(term.as_str())
+            })
+            .collect();
+        if !unmatched.is_empty() {
+            let title_id = if row.kind.is_group() {
+                Some(id)
+            } else if row.kind.is_persistent() {
+                row.parent_id
+            } else {
+                None
+            };
+            if let Some(title_id) = title_id {
+                if let std::collections::btree_map::Entry::Vacant(entry) = titles.entry(title_id) {
+                    entry.insert(
+                        read_job_control(&rx, title_id)?
+                            .title
+                            .map(|title| title.to_lowercase()),
+                    );
+                }
+                if let Some(Some(title)) = titles.get(&title_id) {
+                    unmatched.retain(|term| !title.contains(term.as_str()));
+                }
+            }
+        }
+        if !unmatched.is_empty() && row.kind.is_persistent() {
+            for (_, entry) in turn_entries(&rx, id)? {
+                if let Entry::UserMessage { text, .. } = entry.entry {
+                    let text = text.to_lowercase();
+                    unmatched.retain(|term| !text.contains(term.as_str()));
+                    if unmatched.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        if unmatched.is_empty() {
             if records.len() == limit {
                 has_more = true;
                 break;
             }
-            last = Some(id);
-            records.push(record);
+            last_match = Some(id);
+            records.push(job_record(&rx, row)?);
         }
     }
     Ok(JobSearchPage {
         records,
-        next_before: last.filter(|_| has_more),
+        next_before: if budget_exhausted {
+            last_examined
+        } else {
+            last_match
+        }
+        .filter(|_| has_more),
         has_more,
     })
 }
@@ -1545,7 +1596,10 @@ pub(crate) fn read_config(
     database: &Database,
     id: ConfigId,
 ) -> Result<Option<ConfigRecord>, StorageError> {
-    let rx = read(database)?;
+    config(&read(database)?, id)
+}
+
+fn config(rx: &ReadTransaction, id: ConfigId) -> Result<Option<ConfigRecord>, StorageError> {
     rx.open_table(CONFIGS)?
         .get(id.get())?
         .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()).map(config_record))
@@ -1882,7 +1936,13 @@ pub(crate) fn read_compatible_executors(
     database: &Database,
     llm_profile: ProfileId,
 ) -> Result<Vec<ExecutorId>, StorageError> {
-    let rx = read(database)?;
+    compatible_executors(&read(database)?, llm_profile)
+}
+
+fn compatible_executors(
+    rx: &ReadTransaction,
+    llm_profile: ProfileId,
+) -> Result<Vec<ExecutorId>, StorageError> {
     let configs = rx.open_table(CONFIGS)?;
     let Some(model) = configs
         .get(llm_profile.get())?
@@ -1904,7 +1964,37 @@ pub(crate) fn read_compatible_executors(
     let ConfigBody::Connection(connection) = connection.body else {
         return Ok(Vec::new());
     };
-    pools_offering(&rx, connection.protocol)
+    pools_offering(rx, connection.protocol)
+}
+
+pub(crate) struct AgentModelConfig {
+    pub config: Option<ConfigRecord>,
+    pub executors: Vec<ExecutorId>,
+}
+
+pub(crate) fn read_agent_model_configs(
+    database: &Database,
+    ids: &[ConfigId],
+) -> Result<Vec<AgentModelConfig>, StorageError> {
+    let rx = read(database)?;
+    ids.iter()
+        .map(|id| {
+            let record = config(&rx, *id)?;
+            let executors = if record.as_ref().is_some_and(|record| {
+                record.model_enabled
+                    && record.archived_at.is_none()
+                    && matches!(record.body, ConfigBody::Model(_))
+            }) {
+                compatible_executors(&rx, (*id).into())?
+            } else {
+                Vec::new()
+            };
+            Ok(AgentModelConfig {
+                config: record,
+                executors,
+            })
+        })
+        .collect()
 }
 
 /// The Pools that offer typed decision work, oldest first.

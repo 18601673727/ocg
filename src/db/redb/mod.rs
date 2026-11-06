@@ -104,22 +104,23 @@ use recovery::allocate;
 pub(crate) use recovery::{OpenedFile, database_file, open};
 
 pub(crate) use reader::{
-    ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage, read_approved_calls,
-    read_cards, read_conversation_children, read_has_decider, read_has_pending_approvals,
+    AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
+    read_approved_calls, read_cards, read_conversation_children, read_has_decider,
+    read_has_pending_approvals,
 };
 pub(crate) use reader::{
     ContextState, ContextWorkDetails, JobDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
     UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, queue_counts,
-    read_attachment, read_attachments, read_children, read_compatible_executors, read_config,
-    read_configs, read_context_state, read_conversation_search, read_conversations,
-    read_decision_executors, read_decision_work, read_effective_context_policy,
-    read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,
-    read_job_configuration, read_job_details, read_job_input, read_job_input_for_job,
-    read_job_search, read_job_tree, read_jobs, read_latest_output, read_occupancy, read_outputs,
-    read_pool_binding, read_prediction_current, read_preparation_current, read_profile_page,
-    read_project, read_projects, read_retries, read_submission, read_summarization_input,
-    read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_buckets,
-    read_usage_retries, read_usage_summary,
+    read_agent_model_configs, read_attachment, read_attachments, read_children,
+    read_compatible_executors, read_config, read_configs, read_context_state,
+    read_conversation_search, read_conversations, read_decision_executors, read_decision_work,
+    read_effective_context_policy, read_execution_pool, read_execution_pools, read_executor,
+    read_executors, read_job, read_job_configuration, read_job_details, read_job_input,
+    read_job_input_for_job, read_job_search, read_job_tree, read_jobs, read_latest_output,
+    read_occupancy, read_outputs, read_pool_binding, read_prediction_current,
+    read_preparation_current, read_profile_page, read_project, read_projects, read_retries,
+    read_submission, read_summarization_input, read_tool_evidence, read_tool_stats,
+    read_unresolved_executions, read_usage_buckets, read_usage_retries, read_usage_summary,
 };
 pub(crate) use reader::{
     ConversationTurnPage, TurnContext, read_conversation_limits, read_conversation_turn_page,

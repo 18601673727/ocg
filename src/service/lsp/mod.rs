@@ -225,8 +225,12 @@ impl Drop for Lease {
     }
 }
 type RootKey = (PathBuf, u64, u64);
+struct RegisteredIndex {
+    shared: Arc<Shared>,
+    registered: Instant,
+}
 fn shared(workspace: &Workspace) -> Result<Arc<Shared>, ToolFailure> {
-    static INDEXES: OnceLock<Mutex<BTreeMap<RootKey, Arc<Shared>>>> = OnceLock::new();
+    static INDEXES: OnceLock<Mutex<BTreeMap<RootKey, RegisteredIndex>>> = OnceLock::new();
     let metadata = workspace
         .open_root()
         .and_then(|root| root.metadata().map_err(|_| Refusal::Unreadable))
@@ -236,21 +240,41 @@ fn shared(workspace: &Workspace) -> Result<Arc<Shared>, ToolFailure> {
         .get_or_init(Mutex::default)
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    Ok(indexes
-        .entry(key)
-        .or_insert_with(|| {
-            let (release, available) = flume::bounded(1);
-            // The channel is new and empty, so the initial permit always fits.
-            if let Err(error) = release.try_send(()) {
-                log::error!("workspace_code initial permit: {error}");
-            }
-            Arc::new(Shared {
-                index: Mutex::default(),
-                available,
-                release,
-            })
-        })
-        .clone())
+    if let Some(entry) = indexes.get_mut(&key) {
+        entry.registered = Instant::now();
+        return Ok(entry.shared.clone());
+    }
+    if indexes.len() >= 8 {
+        let oldest = indexes
+            .iter()
+            .filter(|(_, entry)| Arc::strong_count(&entry.shared) == 1)
+            .min_by_key(|(_, entry)| entry.registered)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            indexes.remove(&oldest);
+        }
+    }
+    if indexes.len() >= 8 {
+        log::warn!("workspace_code index cache exceeds 8 workspaces");
+    }
+    let (release, available) = flume::bounded(1);
+    // The channel is new and empty, so the initial permit always fits.
+    if let Err(error) = release.try_send(()) {
+        log::error!("workspace_code initial permit: {error}");
+    }
+    let shared = Arc::new(Shared {
+        index: Mutex::default(),
+        available,
+        release,
+    });
+    indexes.insert(
+        key,
+        RegisteredIndex {
+            shared: shared.clone(),
+            registered: Instant::now(),
+        },
+    );
+    Ok(shared)
 }
 fn refused(error: impl std::fmt::Display) -> ToolFailure {
     ToolFailure::not_applied(error.to_string())

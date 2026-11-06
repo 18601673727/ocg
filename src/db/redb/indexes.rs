@@ -80,6 +80,9 @@ fn turn_search_grams(
         .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
     {
         let (key, bytes) = entry?;
+        if rows::output_kind(bytes.value())? != OutputKind::Result {
+            continue;
+        }
         let output = decode_output(key.value(), bytes.value())?;
         if let Some(text) = search_output_text(&output, completed) {
             grams.extend(search_grams(text));

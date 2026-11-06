@@ -1178,6 +1178,14 @@ impl DatabaseHandle {
         .await
     }
 
+    pub(crate) async fn agent_model_configs(
+        &self,
+        ids: Vec<ConfigId>,
+    ) -> Result<Vec<redb::AgentModelConfig>, DatabaseError> {
+        self.read(move |database| redb::read_agent_model_configs(database, &ids))
+            .await
+    }
+
     /// A config, whatever its kind.
     pub async fn config(&self, id: ConfigId) -> Result<Option<ConfigRecord>, DatabaseError> {
         self.read(move |database| redb::read_config(database, id))

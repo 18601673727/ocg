@@ -841,6 +841,17 @@ pub(super) async fn agent_profiles(
         .await?;
     let next_before = configs.next.map(|id| ProfileId::from(id).to_string());
     let records = configs.records;
+    let targets = records
+        .iter()
+        .filter_map(|record| match &record.body {
+            ConfigBody::Agent(agent) if record.archived_at.is_none() => {
+                Some(agent.models.iter().copied())
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let mut models = database.agent_model_configs(targets).await?.into_iter();
     let mut agent_profiles = Vec::new();
     for record in records {
         let ConfigBody::Agent(agent) = record.body else {
@@ -850,15 +861,16 @@ pub(super) async fn agent_profiles(
             continue;
         }
         let mut llm_targets = Vec::with_capacity(agent.models.len());
-        for target in &agent.models {
-            let llm = database.config(*target).await?.ok_or(INCONSISTENT_RECORD)?;
+        for _ in &agent.models {
+            let model_config = models.next().ok_or(INCONSISTENT_RECORD)?;
+            let llm = model_config.config.ok_or(INCONSISTENT_RECORD)?;
+            let executors = model_config.executors;
             if !llm.model_enabled || llm.archived_at.is_some() {
                 continue;
             }
             let ConfigBody::Model(model) = llm.body else {
                 continue;
             };
-            let executors = database.compatible_executors((*target).into()).await?;
             llm_targets.push(LlmTargetView {
                 id: ProfileId::from(llm.id).to_string(),
                 name: llm.name,
