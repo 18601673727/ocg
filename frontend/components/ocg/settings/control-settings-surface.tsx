@@ -179,8 +179,9 @@ export function SettingsSurface({
   const [llmError, setLlmError] = useState<string | null>(null);
   const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
   const [availabilityId, setAvailabilityId] = useState<string | null>(null);
-  // Own availability toggles update the snapshot in place instead of re-reading every page.
+  // Own availability toggles update the snapshot in place; other notices wait until toggles finish.
   const ownAvailabilityToggles = useRef(0);
+  const missedProfileChange = useRef(false);
 
   // Agent Profile form state
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -237,8 +238,12 @@ export function SettingsSurface({
 
   useEffect(
     () =>
-      client?.onProfilesChanged(() => {
-        if (ownAvailabilityToggles.current > 0) return;
+      client?.onProfilesChanged((change) => {
+        if (change?.availability) return;
+        if (ownAvailabilityToggles.current > 0) {
+          missedProfileChange.current = true;
+          return;
+        }
         void refreshProfiles();
       }),
     [client, refreshProfiles],
@@ -770,6 +775,13 @@ export function SettingsSurface({
                                     })
                                     .finally(() => {
                                       ownAvailabilityToggles.current -= 1;
+                                      if (
+                                        ownAvailabilityToggles.current === 0 &&
+                                        missedProfileChange.current
+                                      ) {
+                                        missedProfileChange.current = false;
+                                        void refreshProfiles();
+                                      }
                                       setAvailabilityId((current) =>
                                         current === profileId ? null : current,
                                       );

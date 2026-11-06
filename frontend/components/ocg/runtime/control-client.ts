@@ -367,7 +367,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   const fetchImpl = options.fetch.bind(globalThis);
   // Live subscriptions only; each owns its delivery acknowledgement.
   const active = new Set<AbortController>();
-  const profileListeners = new Set<() => void>();
+  const profileListeners = new Set<(change?: { availability: string }) => void>();
   const conversationListeners = new Set<() => void>();
   let closed = false;
   let locksUnavailable = false;
@@ -1424,7 +1424,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         stop?.();
       };
     },
-    onProfilesChanged(listener: () => void) {
+    onProfilesChanged(listener: (change?: { availability: string }) => void) {
       profileListeners.add(listener);
       return () => {
         profileListeners.delete(listener);
@@ -1971,7 +1971,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         body: { enabled },
         sign: true,
       });
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => listener({ availability: profileId }));
     },
 
     async removeProvider(providerId: string) {
