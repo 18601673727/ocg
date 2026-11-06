@@ -425,7 +425,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     const controller = new AbortController();
     let rotated = false;
     let complete = programmatic;
-    let remoteWaiting = false;
     const started = performance.now();
     const rotate = () => {
       if (rotated || controller.signal.aborted) return;
@@ -436,8 +435,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       started,
       check() {
         if (!complete || performance.now() - started < 5000) return;
-        if (remoteWaiting) rotate();
-        else if (snapshotWaiters.length) {
+        if (snapshotWaiters.length) {
           let oldest: typeof holder | undefined;
           for (const other of holders) {
             if (!oldest || other.started < oldest.started) oldest = other;
@@ -458,8 +456,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           void locks
             .query()
             .then((state) => {
-              remoteWaiting = (state.pending ?? []).some((request) => request.name === lockName);
-              holder.check();
+              if (
+                complete &&
+                performance.now() - started >= 5000 &&
+                (state.pending ?? []).some((request) => request.name === lockName)
+              )
+                rotate();
             })
             .catch(() => {});
         }, 2000)
