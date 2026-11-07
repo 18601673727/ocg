@@ -9,7 +9,35 @@ const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
 pub(super) async fn client(timeout: Duration) -> Result<Client, String> {
+    let connector = ntex::service::fn_factory_with_config(move |cfg: ntex::SharedCfg| async move {
+        Ok::<_, std::io::Error>(ntex::service::fn_service(
+            move |target: ntex::connect::Connect<ntex::http::Uri>| {
+                let cfg = cfg.clone();
+                async move {
+                    let ip = target
+                        .host()
+                        .parse()
+                        .map_err(|_| ntex::connect::ConnectError::InvalidInput)?;
+                    let address = std::net::SocketAddr::new(ip, target.port());
+                    if !address.ip().is_loopback() {
+                        return Err(ntex::connect::ConnectError::InvalidInput);
+                    }
+                    let stream = ntex::rt::spawn_blocking(move || {
+                        let stream = std::net::TcpStream::connect_timeout(&address, timeout)?;
+                        stream.set_nodelay(true)?;
+                        Ok::<_, std::io::Error>(stream)
+                    })
+                    .await
+                    .map_err(|error| {
+                        ntex::connect::ConnectError::Io(std::io::Error::other(error))
+                    })??;
+                    ntex::rt::from_tcp_stream(stream, cfg).map_err(ntex::connect::ConnectError::Io)
+                }
+            },
+        ))
+    });
     Client::builder()
+        .connector::<()>(ntex::client::Connector::new().connector(connector))
         .response_timeout(ntex::time::Millis(
             timeout.as_millis().min(u128::from(u32::MAX)) as u32,
         ))

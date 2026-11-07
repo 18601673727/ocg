@@ -73,6 +73,58 @@ impl OpenPool {
 }
 
 impl Batch {
+    pub(crate) fn with_admission_candidate<T>(
+        &mut self,
+        candidate: Option<crate::db::AdmissionCandidate>,
+        submission: Option<crate::db::entities::Submission>,
+        create: impl FnOnce(&mut Self) -> Result<T, BatchError>,
+    ) -> Result<T, BatchError> {
+        let replay = match (candidate, submission) {
+            (Some(_), Some(submission)) => match self.submission(submission.key)? {
+                Some(record) if record.fingerprint != submission.fingerprint => {
+                    return self.reject(Violation::SubmissionKeyUsed {
+                        job: record.job,
+                        same_request: false,
+                    });
+                }
+                Some(_) => true,
+                None => false,
+            },
+            (Some(_), None) | (None, _) => false,
+        };
+        let value = create(self)?;
+        if !replay && let Some(candidate) = candidate {
+            let (executor, model, decision) = match candidate {
+                crate::db::AdmissionCandidate::Model(executor, model) => (executor, model, false),
+                crate::db::AdmissionCandidate::Decision(executor, model) => (executor, model, true),
+            };
+            if !self
+                .config_record(executor.into())?
+                .is_some_and(|row| matches!(row.body, ConfigBody::Pool(_)))
+            {
+                return self.reject(Violation::NotFound(RecordRef::Executor(executor)));
+            }
+            let native = decision
+                && self
+                    .config_record(model.into())?
+                    .is_some_and(|row| matches!(row.body, ConfigBody::DecisionModel(_)));
+            let compatible = self.step(|tx| {
+                if native {
+                    reader::decision_executors(tx)
+                } else {
+                    reader::compatible_executors(tx, model)
+                }
+            })?;
+            if !compatible.contains(&executor) {
+                return self.reject(Violation::InvalidValue(
+                    "executor_incompatible",
+                    "the Executor cannot run this request",
+                ));
+            }
+        }
+        Ok(value)
+    }
+
     // ---- T1 submit (8.1) and chat continuation (8.2) -------------------------------
 
     /// T1_SUBMIT. `spec` is the immutable Job spec; its `id`, `created_at`

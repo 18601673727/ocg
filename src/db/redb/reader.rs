@@ -1923,26 +1923,26 @@ pub(crate) fn read_executors(
 
 /// The enabled Pools that offer an LLM request over `protocol`, oldest first.
 fn pools_offering(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     protocol: LlmTransport,
 ) -> Result<Vec<ExecutorId>, StorageError> {
     pools_offering_capability(rx, ExecutionOperation::LlmRequest, Some(protocol))
 }
 
 fn pools_offering_operation(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     operation: ExecutionOperation,
 ) -> Result<Vec<ExecutorId>, StorageError> {
     pools_offering_capability(rx, operation, None)
 }
 
 fn pools_offering_capability(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     operation: ExecutionOperation,
     protocol: Option<LlmTransport>,
 ) -> Result<Vec<ExecutorId>, StorageError> {
     let mut pools = Vec::new();
-    for entry in rx.open_table(CONFIGS)?.iter()? {
+    for entry in rx.table(CONFIGS)?.iter()? {
         let (key, bytes) = entry?;
         let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         if row.archived_at.is_none()
@@ -1967,11 +1967,11 @@ pub(crate) fn read_compatible_executors(
     compatible_executors(&read(database)?, llm_profile)
 }
 
-fn compatible_executors(
-    rx: &ReadTransaction,
+pub(super) fn compatible_executors(
+    rx: &impl TxRead,
     llm_profile: ProfileId,
 ) -> Result<Vec<ExecutorId>, StorageError> {
-    let configs = rx.open_table(CONFIGS)?;
+    let configs = rx.table(CONFIGS)?;
     let Some(model) = configs
         .get(llm_profile.get())?
         .map(|bytes| ConfigRow::decode_at(llm_profile.get(), bytes.value()))
@@ -1992,6 +1992,7 @@ fn compatible_executors(
     let ConfigBody::Connection(connection) = connection.body else {
         return Ok(Vec::new());
     };
+    drop(configs);
     pools_offering(rx, connection.protocol)
 }
 
@@ -2030,7 +2031,11 @@ pub(crate) fn read_decision_executors(
     database: &Database,
 ) -> Result<Vec<ExecutorId>, StorageError> {
     let rx = read(database)?;
-    pools_offering_operation(&rx, ExecutionOperation::Decision)
+    decision_executors(&rx)
+}
+
+pub(super) fn decision_executors(rx: &impl TxRead) -> Result<Vec<ExecutorId>, StorageError> {
+    pools_offering_operation(rx, ExecutionOperation::Decision)
 }
 
 // ---- claims and held slots ------------------------------------------------------------

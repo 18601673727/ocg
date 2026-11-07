@@ -1605,9 +1605,10 @@ impl DatabaseHandle {
         configuration: ExecutionConfiguration,
         submission: Option<Submission>,
     ) -> Result<(JobId, Appended), DatabaseError> {
-        self.open_group_with_format(parent, spec, first, configuration, submission, None)
+        self.open_group_with_format(parent, spec, first, configuration, submission, None, None)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_group_with_format(
         &self,
         parent: Option<JobId>,
@@ -1616,23 +1617,34 @@ impl DatabaseHandle {
         configuration: ExecutionConfiguration,
         submission: Option<Submission>,
         format: Option<crate::db::entities::ResponseFormat>,
+        candidate: Option<AdmissionCandidate>,
     ) -> Result<(JobId, Appended), DatabaseError> {
         self.submit(|reply| {
             Command::new(
-                (parent, spec, first, configuration, submission, format),
+                (
+                    parent,
+                    spec,
+                    first,
+                    configuration,
+                    submission,
+                    format,
+                    candidate,
+                ),
                 reply,
-                |(_, _, first, _, _, format)| entry_bytes(first, format.as_ref()),
+                |(_, _, first, _, _, format, _)| entry_bytes(first, format.as_ref()),
                 OperationKind::Open,
-                |(parent, spec, first, configuration, submission, format), batch| {
-                    batch.open_group_with_format(
-                        parent,
-                        spec,
-                        first,
-                        configuration,
-                        submission,
-                        Vec::new(),
-                        format,
-                    )
+                |(parent, spec, first, configuration, submission, format, candidate), batch| {
+                    batch.with_admission_candidate(candidate, submission, |batch| {
+                        batch.open_group_with_format(
+                            parent,
+                            spec,
+                            first,
+                            configuration,
+                            submission,
+                            Vec::new(),
+                            format,
+                        )
+                    })
                 },
             )
         })
@@ -1702,6 +1714,7 @@ impl DatabaseHandle {
     }
     /// Opens a system conversation with one typed decision turn and freezes
     /// its Decision Model and Profile in the same transaction.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_decision(
         &self,
         parent: Option<JobId>,
@@ -1710,18 +1723,29 @@ impl DatabaseHandle {
         configuration: ExecutionConfiguration,
         request: entities::DecisionRequest,
         submission: Option<Submission>,
+        candidate: AdmissionCandidate,
     ) -> Result<(JobId, Appended), DatabaseError> {
         self.submit(|reply| {
             Command::new(
-                (parent, spec, first, configuration, request, submission),
+                (
+                    parent,
+                    spec,
+                    first,
+                    configuration,
+                    request,
+                    submission,
+                    candidate,
+                ),
                 reply,
-                |(_, _, first, _, request, _)| {
+                |(_, _, first, _, request, _, _)| {
                     byte_count(format!("{first:?}").len())
                         .saturating_add(byte_count(format!("{request:?}").len()))
                 },
                 OperationKind::Open,
-                |(parent, spec, first, configuration, request, submission), batch| {
-                    batch.open_decision(parent, spec, first, configuration, request, submission)
+                |(parent, spec, first, configuration, request, submission, candidate), batch| {
+                    batch.with_admission_candidate(Some(candidate), submission, |batch| {
+                        batch.open_decision(parent, spec, first, configuration, request, submission)
+                    })
                 },
             )
         })
@@ -1757,7 +1781,7 @@ impl DatabaseHandle {
         freeze: Option<ExecutionConfiguration>,
         submission: Option<Submission>,
     ) -> Result<Appended, DatabaseError> {
-        self.append_with_format(conversation, entry, freeze, submission, None)
+        self.append_with_format(conversation, entry, freeze, submission, None, None)
             .await
     }
     pub(crate) async fn append_with_format(
@@ -1767,16 +1791,26 @@ impl DatabaseHandle {
         freeze: Option<ExecutionConfiguration>,
         submission: Option<Submission>,
         format: Option<crate::db::entities::ResponseFormat>,
+        candidate: Option<AdmissionCandidate>,
     ) -> Result<Appended, DatabaseError> {
         self.submit(|reply| {
             Command::new(
-                (conversation, entry, freeze, submission, format),
+                (conversation, entry, freeze, submission, format, candidate),
                 reply,
-                |(_, first, _, _, format)| entry_bytes(first, format.as_ref()),
+                |(_, first, _, _, format, _)| entry_bytes(first, format.as_ref()),
                 OperationKind::Append,
-                |(conversation, entry, freeze, submission, format), batch| {
-                    batch.require_agent_group(conversation)?;
-                    batch.append_with_format(conversation, entry, freeze, submission, false, format)
+                |(conversation, entry, freeze, submission, format, candidate), batch| {
+                    batch.with_admission_candidate(candidate, submission, |batch| {
+                        batch.require_agent_group(conversation)?;
+                        batch.append_with_format(
+                            conversation,
+                            entry,
+                            freeze,
+                            submission,
+                            false,
+                            format,
+                        )
+                    })
                 },
             )
         })
@@ -1825,6 +1859,7 @@ impl DatabaseHandle {
         })
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn steer_with_format(
         &self,
         conversation: JobId,
@@ -1833,22 +1868,33 @@ impl DatabaseHandle {
         submission: Option<Submission>,
         format: Option<crate::db::entities::ResponseFormat>,
         automatic: bool,
+        candidate: AdmissionCandidate,
     ) -> Result<(Appended, Vec<(JobId, crate::db::entities::StopCause)>), DatabaseError> {
         self.submit(|reply| {
             Command::new(
-                (conversation, entry, freeze, submission, format, automatic),
+                (
+                    conversation,
+                    entry,
+                    freeze,
+                    submission,
+                    format,
+                    automatic,
+                    candidate,
+                ),
                 reply,
-                |(_, first, _, _, format, _)| entry_bytes(first, format.as_ref()),
+                |(_, first, _, _, format, _, _)| entry_bytes(first, format.as_ref()),
                 OperationKind::Append,
-                |(conversation, entry, freeze, submission, format, automatic), batch| {
-                    batch.steer_with_format(
-                        conversation,
-                        entry,
-                        freeze,
-                        submission,
-                        format,
-                        automatic,
-                    )
+                |(conversation, entry, freeze, submission, format, automatic, candidate), batch| {
+                    batch.with_admission_candidate(Some(candidate), submission, |batch| {
+                        batch.steer_with_format(
+                            conversation,
+                            entry,
+                            freeze,
+                            submission,
+                            format,
+                            automatic,
+                        )
+                    })
                 },
             )
         })

@@ -45,10 +45,10 @@ use crate::db::attachments::{AttachmentImageError, attachment_images};
 use crate::db::entities::ResponseFormat;
 use crate::db::entities::{
     AttachmentId, AttachmentOrigin, ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration,
-    ExecutorId, JobId, ModelCapability, ProfileId, ProjectId, RequestFingerprint, Submission,
-    SubmissionKey, SubmissionRecord, Violation,
+    ExecutorId, JobId, ModelCapability, ProfileId, ProjectId, RecordRef, RequestFingerprint,
+    Submission, SubmissionKey, SubmissionRecord, Violation,
 };
-use crate::db::{DatabaseError, DatabaseHandle};
+use crate::db::{AdmissionCandidate, DatabaseError, DatabaseHandle};
 use crate::service::ai::providers::openai_compatible::ResponseFormatWire;
 use crate::service::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES;
 use crate::system::executor::execution_runtime::ExecutionRuntimeError;
@@ -1098,6 +1098,7 @@ async fn admit_job(
         attachments: request.attachments,
     };
     let submission = Some(Submission { key, fingerprint });
+    let candidate = AdmissionCandidate::Model(request.executor, request.llm_profile);
 
     let admitted = match request.conversation {
         Some(conversation) if request.steer != Some(false) => match shared
@@ -1109,6 +1110,7 @@ async fn admit_job(
                 submission,
                 request.response_format,
                 request.steer.is_none(),
+                candidate,
             )
             .await
         {
@@ -1128,6 +1130,7 @@ async fn admit_job(
                 Some(configuration),
                 submission,
                 request.response_format,
+                Some(candidate),
             )
             .await
             .map(|appended| appended.turn),
@@ -1146,6 +1149,7 @@ async fn admit_job(
                 configuration,
                 submission,
                 request.response_format,
+                Some(candidate),
             )
             .await
             .map(|(_, appended)| appended.turn),
@@ -1161,6 +1165,12 @@ async fn admit_job(
             } else {
                 Outcome::Conflict
             })
+        }
+        Err(DatabaseError::Rejected(Violation::NotFound(RecordRef::Executor(_)))) => {
+            finish(Outcome::Refused(EXECUTOR_NOT_FOUND))
+        }
+        Err(DatabaseError::Rejected(Violation::InvalidValue("executor_incompatible", _))) => {
+            finish(Outcome::Refused(EXECUTOR_INCOMPATIBLE))
         }
         Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
             shared
@@ -1436,6 +1446,7 @@ async fn admit_decision(
             configuration,
             request.request.clone(),
             submission,
+            AdmissionCandidate::Decision(request.executor, request.decision_model),
         )
         .await;
     match admitted {
@@ -1452,6 +1463,12 @@ async fn admit_decision(
             } else {
                 Outcome::Conflict
             })
+        }
+        Err(DatabaseError::Rejected(Violation::NotFound(RecordRef::Executor(_)))) => {
+            finish(Outcome::Refused(DECISION_EXECUTOR_NOT_FOUND))
+        }
+        Err(DatabaseError::Rejected(Violation::InvalidValue("executor_incompatible", _))) => {
+            finish(Outcome::Refused(DECISION_EXECUTOR_INCOMPATIBLE))
         }
         Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
             shared

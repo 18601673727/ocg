@@ -45,6 +45,12 @@ use crate::system::monitor::{
 };
 use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
+#[derive(Clone, Copy)]
+pub(crate) enum AdmissionCandidate {
+    Model(ExecutorId, entities::ProfileId),
+    Decision(ExecutorId, entities::ProfileId),
+}
+
 #[derive(Clone)]
 pub(crate) enum ProviderSettlementEvidence {
     Observations(Vec<AvailabilityStat>),

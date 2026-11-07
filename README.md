@@ -120,7 +120,7 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ## Performance
 
-Measured on **2026-11-01** from clean [`main` (`9a5a9be`)](https://github.com/18601673727/ocg/commit/9a5a9be02f0368bc2d5999259980078c3ff50670), using a native optimized Cargo benchmark build with Rust 1.99.1. All eight sections below used the same binary and source revision.
+Measured on **2026-11-07** (Singapore time) from the source in this commit, based on [`728aab5`](https://github.com/18601673727/ocg/commit/728aab570cbcc0a7096e652bd4a6badd0eb7a00f), using a native optimized Cargo benchmark build with Rust 1.99.1. All eight sections below used the same binary and source snapshot, including the 5 ms output flush and the `ntex-loopback-tcp-nodelay-v1` benchmark client.
 
 **Machine:** Debian Linux 6.12.113, ARM64 Neoverse-N1 (2 logical CPUs at 2.0 GHz), 11.66 GiB RAM, and **ext4** storage on `/dev/sda2`. The existing OCG service remained running and was not modified. The benchmark database was isolated on ext4, not tmpfs.
 
@@ -128,18 +128,18 @@ Runtime workloads use a deterministic local mock provider with the real backend,
 
 | Metric | Result | Workload |
 | --- | --- | --- |
-| Startup | **84.35 ms** median; 83.37–85.92 ms range | 10 launches; 1,000 completed-job database; warm OS cache; authenticated readiness |
-| Memory | **18.06 MiB** idle; **106.91 MiB** sampled loaded peak | Isolated backend; C8; 1,000 jobs/trial; nominal 20 ms RSS polling |
-| Job admission | **60.63 ms** p50; **77.32 ms** p95 | C8; 1,000 confirmed admissions/trial; completion drain excluded |
-| Job throughput | **37.47 jobs/s**; **213.50 ms** completion p50; **239.34 ms** p95 | Closed-loop C8; 1,000 validated reference jobs/trial |
-| Streaming delivery | **17.10 ms** p50; **27.89 ms** p95 | C8; 1,000 jobs / 3,000 markers per trial at 20 ms pacing; 5 ms output-flush interval; upstream emission to downstream SSE observation |
-| History read | **2.98 ms** p50; **8.04 ms** p95 | C8; 20-row first/cursor pages; 1,000-job fixture; 10,000 reads and 88–96 completed background jobs/trial |
-| Workspace search | **0.039 ms** p50; **0.650 ms** p95 | C8; warm index; 1,000 files / 3,968,000 indexed bytes; 11,200 queries/trial across seven classes |
-| Database footprint | **50.07 MiB** median; **51.18 KiB** incremental growth per completed job | 1,000 completed jobs/trial; cleanly closed `ocg.redb` |
+| Startup | **85.04 ms** median; 83.13–146.83 ms range | 10 launches; 1,000 completed-job database; warm OS cache; authenticated readiness |
+| Memory | **18.14 MiB** idle; **105.49 MiB** sampled loaded peak | Isolated backend; C8; 1,000 jobs/trial; nominal 20 ms RSS polling |
+| Job admission | **20.91 ms** p50; **37.09 ms** p95 | C8; 1,000 confirmed admissions/trial; completion drain excluded |
+| Job throughput | **38.10 jobs/s**; **209.43 ms** completion p50; **236.15 ms** p95 | Closed-loop C8; 1,000 validated reference jobs/trial |
+| Streaming delivery | **16.37 ms** p50; **26.49 ms** p95 | C8; 1,000 jobs / 3,000 markers per trial at 20 ms pacing; 5 ms output-flush interval; upstream emission to downstream SSE observation |
+| History read | **2.93 ms** p50; **8.52 ms** p95 | C8; 20-row first/cursor pages; 1,000-job fixture; 10,000 reads and 88–96 completed background jobs/trial |
+| Workspace search | **0.040 ms** p50; **0.608 ms** p95 | C8; warm index; 1,000 files / 3,968,000 indexed bytes; 11,200 queries/trial across seven classes |
+| Database footprint | **44.91 MiB** median; **45.90 KiB** apparent growth per completed job | 1,000 completed jobs/trial; cleanly closed `ocg.redb` |
 
-Except for startup, displayed results are medians of three trial statistics. Latency p50 and p95 are each the median of the corresponding per-trial percentile. The memory value is the median of the three sampled loaded peaks, which ranged from **106.07 to 107.18 MiB**.
+Except for startup, displayed results are medians of three trial statistics. Latency p50 and p95 are each the median of the corresponding per-trial percentile. The memory value is the median of the three sampled loaded peaks, which ranged from **105.03 to 106.30 MiB**.
 
-Database growth is relative to an equivalent empty baseline of **86,016 bytes** and excludes logs and attachments. Each fixture contained **1,000 validated completed jobs**, with execution configured at **C8**. Storage figures describe this measured workload and are not a fixed per-job storage cost.
+Database growth is relative to an equivalent empty baseline of **86,016 bytes** and excludes logs and attachments. Each fixture contained **1,000 validated completed jobs**, with execution configured at **C8**. These are apparent file lengths, not allocated disk bytes: sparse regions can make the two differ. Apparent growth ranged from **38.34 to 61.36 KiB per workload** across the three trials. Storage figures describe this workload and are not a fixed per-job cost.
 
 <details>
 <summary>Measurement details and search breakdown</summary>
@@ -158,19 +158,19 @@ The [benchmark harness](benchmark/) exercises the existing runtime and validates
 
 All required measured work completed successfully, with zero rejected, failed, timed-out, or unfinished operations. These are bounded 1,000-job measurements with a local mock provider; provider inference latency and maximum sustainable load are outside their scope.
 
-The memory trials reported a median of **0.71 core** of backend CPU utilization. The workspace index held **1,000 files**, **528,499 tokens**, and **3,968,000 content bytes**. Its estimated memory footprint was **9,185,237 bytes** (8.76 MiB). Median initial build and rebuild times were **103.39 ms** and **109.73 ms**, respectively.
+The memory trials reported a median of **0.70 core** of backend CPU utilization. The workspace index held **1,000 files**, **528,499 tokens**, and **3,968,000 content bytes**. Its estimated memory footprint was **9,185,237 bytes** (8.76 MiB). Median initial build and rebuild times were **104.20 ms** and **108.56 ms**, respectively.
 
 Search latency varies substantially by query class. The table below reports medians of the three corresponding per-trial statistics; the aggregate row above comes from the same mixed workload.
 
 | Query class | p50 | p95 |
 | --- | ---: | ---: |
-| `rare` | 0.036 ms | 0.046 ms |
-| `common` | 0.316 ms | 12.340 ms |
-| `and` | 0.035 ms | 0.046 ms |
-| `phrase` | 0.028 ms | 0.030 ms |
+| `rare` | 0.037 ms | 0.047 ms |
+| `common` | 0.320 ms | 12.343 ms |
+| `and` | 0.036 ms | 0.047 ms |
+| `phrase` | 0.029 ms | 0.031 ms |
 | `missing` | 0.016 ms | 0.018 ms |
-| `broad_phrase` | 0.334 ms | 12.373 ms |
-| `broad_phrase_zero` | 0.555 ms | 12.570 ms |
+| `broad_phrase` | 0.337 ms | 12.376 ms |
+| `broad_phrase_zero` | 0.545 ms | 12.565 ms |
 
 The positional phrase index avoids most candidate file scans for nonmatching phrases. Individual broad-query p95 values can still exceed the mixed-query p95 because each class contributes only part of the query mix. Phrase candidate, time, and index-coverage limits still apply.
 
@@ -179,30 +179,30 @@ The positional phrase index avoids most candidate file scans for nonmatching phr
 <details>
 <summary>Previous ext4 reference and observed changes</summary>
 
-The previous reference was measured on **2026-10-30** from clean [`6ac6023`](https://github.com/18601673727/ocg/commit/6ac6023c0a7b9c484922855910b6a80991ad19b2) on the same two-core ARM64/ext4 machine. Both runs used Rust 1.99.1 and the same C8 reference profile, including the 5 ms output-flush interval. The previous kernel was Linux 6.12.107; this run used Linux 6.12.113.
+The previous reference was measured on **2026-11-07** from clean [`728aab5`](https://github.com/18601673727/ocg/commit/728aab570cbcc0a7096e652bd4a6badd0eb7a00f) on the same two-core ARM64/ext4 machine. It used a **50 ms** output-flush interval and the default benchmark HTTP client; this run uses **5 ms** and `ntex-loopback-tcp-nodelay-v1`. The current source also contains the Executor admission consistency correction.
 
-| Metric | Previous `6ac6023` | Current `9a5a9be` | Observed change |
+| Metric | Previous clean `728aab5` | Current snapshot | Observed change |
 | --- | ---: | ---: | ---: |
-| Startup median | 85.18 ms | 84.35 ms | −1.0% |
-| Idle RSS | 18.66 MiB | 18.06 MiB | −3.2% |
-| Loaded peak RSS | 112.34 MiB | 106.91 MiB | −4.8% |
-| Admission p50 / p95 | 59.82 / 77.31 ms | 60.63 / 77.32 ms | +1.4% / +0.0% |
-| Throughput | 37.84 jobs/s | 37.47 jobs/s | −1.0% |
-| Completion p95 | 236.05 ms | 239.34 ms | +1.4% |
-| Streaming delivery p50 / p95 | 16.91 / 27.20 ms | 17.10 / 27.89 ms | +1.1% / +2.5% |
-| History read p50 / p95 | 3.37 / 9.31 ms | 2.98 / 8.04 ms | −11.3% / −13.6% |
-| Workspace search p50 / p95 | 0.039 / 0.651 ms | 0.039 / 0.650 ms | +0.5% / −0.2% |
-| Database file size | 60.00 MiB | 50.07 MiB | −16.6% |
-| Database growth/job | 61.36 KiB | 51.18 KiB | −16.6% |
+| Startup median | 85.00 ms | 85.04 ms | +0.0% |
+| Idle RSS | 18.02 MiB | 18.14 MiB | +0.7% |
+| Loaded peak RSS | 105.41 MiB | 105.49 MiB | +0.1% |
+| Admission p50 / p95 | 58.67 / 78.71 ms | 20.91 / 37.09 ms | −64.4% / −52.9% |
+| Throughput | 37.56 jobs/s | 38.10 jobs/s | +1.4% |
+| Completion p95 | 239.38 ms | 236.15 ms | −1.4% |
+| Streaming delivery p50 / p95 | 42.69 / 72.49 ms | 16.37 / 26.49 ms | −61.7% / −63.5% |
+| History read p50 / p95 | 2.95 / 8.23 ms | 2.93 / 8.52 ms | −0.5% / +3.5% |
+| Workspace search p50 / p95 | 0.040 / 0.608 ms | 0.040 / 0.608 ms | +0.2% / −0.0% |
+| Apparent database file size | 50.07 MiB | 44.91 MiB | −10.3% |
+| Apparent database growth/workload | 51.18 KiB | 45.90 KiB | −10.3% |
 
-These are separate runs with different source revisions, kernel versions, run times, and OS cache states. The table reports observed differences; it does not isolate the effect of a particular code change or establish changes in steady-state performance. The previous raw evidence remains on the benchmark host in `/srv/ocg-bench-20261030-220740/`.
+These are separate runs with different source snapshots, client behavior, run times, and OS cache states. The table reports observations and does not isolate a particular change or establish steady-state performance. Database file lengths may include sparse regions and do not establish allocated disk usage. Previous raw evidence remains on the benchmark host in `/srv/ocg-bench-20261107-728aab5.7UgXe3/`.
 
 </details>
 
 <details>
 <summary>Reproduce the reference profile</summary>
 
-Run from the repository root in Bash at commit `9a5a9be02f0368bc2d5999259980078c3ff50670`. The script creates a fresh result directory and runs all eight sections sequentially. To compare against the published numbers, run on a matching two-core ARM64 machine and set `OCG_BENCH_PARENT` to a directory on **ext4**. The published run used `/srv/ocg-bench-20261101-9a5a9be.MO1tF5`; do not reuse its data directory or the production OCG database.
+Run from the repository root in Bash at the commit containing this README. The script creates a fresh result directory and runs all eight sections sequentially. To compare against the published numbers, run on a matching two-core ARM64 machine and set `OCG_BENCH_PARENT` to a directory on **ext4**. The published run used `/srv/ocg-bench-current.zewYsE`; do not reuse its data directory or the production OCG database.
 
 ```bash
 set -euo pipefail
@@ -249,7 +249,7 @@ cargo bench --locked --features benchmarks --bench backend -- \
 printf 'Results: %s\n' "$OCG_BENCH_RESULTS"
 ```
 
-The published ext4 benchmark's binary SHA-256 was `1c5d88774e7f3712d27a481624c9eac1a235a31fb666ebabdaf9b2d0b513fb2d`. Its raw JSONL and stderr evidence is preserved on the benchmark host in `/srv/ocg-bench-20261101-9a5a9be.MO1tF5/`. These paths identify measurement artifacts on that host, not files included in the repository.
+The measured benchmark binary SHA-256 was `aaf91651c70cc64e04f19fe78788cc20556ad08ca0b4250c97eb026a206b193c`. Raw JSONL, stderr, the source snapshot, source manifest, patch, build records, and checksums are preserved on the benchmark host in `/srv/ocg-bench-current.zewYsE/`. Before the run, all **324 tracked non-README files** in that snapshot were verified byte for byte against the working tree. The manifest SHA-256 is `dee8390539e65b24354480af8748a3724fbc115ec6c8e35f2713a5951f58a142`; the source and benchmark patch against `728aab5` has SHA-256 `d0b3a38941db70734ddd066cb06191bf05ae2dbd7a2c24191bea9707af15befe`. The extracted snapshot has no Git metadata: its reported `dirty_tree: false` does not independently verify cleanliness. These paths identify artifacts on that host, not files included in the repository.
 
 The harness records environment, workload, trial statistics, and outcomes in JSONL, with Git metadata when available. Keep the exact source commit, binary identity, raw records, stderr, and filesystem details together. Keep results from different revisions and filesystems separate. The [summary implementation](benchmark/summary.rs) reports medians of per-trial statistics.
 
