@@ -115,7 +115,10 @@ impl Batch {
                     reader::compatible_executors(tx, model)
                 }
             })?;
-            if !compatible.contains(&executor) {
+            if !compatible.contains(&executor)
+                && (compatible.len() < MAX_PAGE
+                    || !self.step(|tx| reader::candidate_compatible(tx, candidate))?)
+            {
                 return self.reject(Violation::InvalidValue(
                     "executor_incompatible",
                     "the Executor cannot run this request",

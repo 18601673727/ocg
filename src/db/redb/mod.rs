@@ -111,8 +111,8 @@ pub(crate) use reader::{
 pub(crate) use reader::{
     ContextState, ContextWorkDetails, JobDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
     UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, queue_counts,
-    read_agent_model_configs, read_attachment, read_attachments, read_children,
-    read_compatible_executors, read_config, read_configs, read_context_state,
+    read_agent_model_configs, read_attachment, read_attachments, read_candidate_compatible,
+    read_children, read_compatible_executors, read_config, read_configs, read_context_state,
     read_conversation_search, read_conversations, read_credential_ref_in_use,
     read_decision_executors, read_decision_work, read_effective_context_policy,
     read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,

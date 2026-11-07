@@ -1569,7 +1569,15 @@ async fn check_decision_configuration(
     if database.executor(request.executor).await?.is_none() {
         return Err(DECISION_EXECUTOR_NOT_FOUND);
     }
-    if !executors.contains(&request.executor) {
+    if !executors.contains(&request.executor)
+        && (executors.len() < crate::db::redb::MAX_PAGE
+            || !database
+                .candidate_compatible(AdmissionCandidate::Decision(
+                    request.executor,
+                    request.decision_model,
+                ))
+                .await?)
+    {
         return Err(DECISION_EXECUTOR_INCOMPATIBLE);
     }
     Ok(())
@@ -1625,10 +1633,15 @@ pub(super) async fn check_configuration(
     if database.executor(request.executor).await?.is_none() {
         return Err(EXECUTOR_NOT_FOUND);
     }
-    if !database
-        .compatible_executors(request.llm_profile)
-        .await?
-        .contains(&request.executor)
+    let executors = database.compatible_executors(request.llm_profile).await?;
+    if !executors.contains(&request.executor)
+        && (executors.len() < crate::db::redb::MAX_PAGE
+            || !database
+                .candidate_compatible(AdmissionCandidate::Model(
+                    request.executor,
+                    request.llm_profile,
+                ))
+                .await?)
     {
         return Err(EXECUTOR_INCOMPATIBLE);
     }

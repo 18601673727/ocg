@@ -263,9 +263,7 @@ impl DecisionRequest {
         if !capabilities.contains(&self.question.capability()) {
             return Err("decision primitive is not supported by the model");
         }
-        if serde_json::to_vec(self)
-            .map_err(|_| "invalid decision request")?
-            .len()
+        if crate::db::serialized_len(self).map_err(|_| "invalid decision request")?
             > MAX_DECISION_REQUEST_BYTES
         {
             return Err("decision request exceeds 1 MiB");

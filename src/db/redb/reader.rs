@@ -434,10 +434,8 @@ pub(crate) fn read_job_details(
             .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
             .transpose()?
     };
-    let result = latest_output
-        .clone()
-        .filter(|output| output.kind == OutputKind::Result);
     let mut activity = ActivityProjection::new(&job, latest_output.as_ref());
+    let result = latest_output.filter(|output| output.kind == OutputKind::Result);
     let usage = if conversation {
         None
     } else {
@@ -1957,6 +1955,67 @@ fn pools_offering_capability(
         }
     }
     Ok(pools)
+}
+
+pub(crate) fn read_candidate_compatible(
+    database: &Database,
+    candidate: crate::db::AdmissionCandidate,
+) -> Result<bool, StorageError> {
+    candidate_compatible(&read(database)?, candidate)
+}
+
+pub(super) fn candidate_compatible(
+    rx: &impl TxRead,
+    candidate: crate::db::AdmissionCandidate,
+) -> Result<bool, StorageError> {
+    let (executor, model, decision) = match candidate {
+        crate::db::AdmissionCandidate::Model(executor, model) => (executor, model, false),
+        crate::db::AdmissionCandidate::Decision(executor, model) => (executor, model, true),
+    };
+    let configs = rx.table(CONFIGS)?;
+    let Some(pool) = configs
+        .get(executor.get())?
+        .map(|bytes| ConfigRow::decode_at(executor.get(), bytes.value()))
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    let Some(model_row) = configs
+        .get(model.get())?
+        .map(|bytes| ConfigRow::decode_at(model.get(), bytes.value()))
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    let capability = match model_row.body {
+        ConfigBody::DecisionModel(_) if decision => Some((ExecutionOperation::Decision, None)),
+        ConfigBody::Model(model) => {
+            let connection = configs
+                .get(model.connection_id.get())?
+                .map(|bytes| ConfigRow::decode_at(model.connection_id.get(), bytes.value()))
+                .transpose()?;
+            match connection.map(|row| row.body) {
+                Some(ConfigBody::Connection(connection)) => {
+                    Some((ExecutionOperation::LlmRequest, Some(connection.protocol)))
+                }
+                Some(
+                    ConfigBody::Model(_)
+                    | ConfigBody::Agent(_)
+                    | ConfigBody::Pool(_)
+                    | ConfigBody::DecisionModel(_)
+                    | ConfigBody::DecisionAgent(_),
+                )
+                | None => None,
+            }
+        }
+        ConfigBody::Connection(_)
+        | ConfigBody::Agent(_)
+        | ConfigBody::Pool(_)
+        | ConfigBody::DecisionModel(_)
+        | ConfigBody::DecisionAgent(_) => None,
+    };
+    Ok(pool.archived_at.is_none()
+        && matches!(pool.body, ConfigBody::Pool(body) if body.enabled && capability.is_some_and(|(operation, protocol)| body.offers(operation, protocol))))
 }
 
 /// The Pools that offer what a Model config's Connection speaks.
@@ -5086,7 +5145,8 @@ fn adopted_context(
         }
         reducible = reducible.saturating_add(source.reducible_tokens);
     }
-    let tokens = result.context_text().len().saturating_add(128).div_ceil(3);
+    let summary = result.context_text();
+    let tokens = summary.len().saturating_add(128).div_ceil(3);
     if tokens > work.target_tokens as usize
         || reducible.saturating_sub(tokens) < work.minimum_savings_tokens as usize
     {
@@ -5094,7 +5154,7 @@ fn adopted_context(
     }
     Ok(Some(AdoptedContext {
         source: manifest,
-        summary: result.context_text(),
+        summary,
     }))
 }
 pub(crate) fn read_turn_context(

@@ -308,18 +308,17 @@ fn native_request_body(
     });
     // Without the provider's tokenizer these are conservative UTF-8 byte
     // upper bounds, including framing, rather than calibrated token counts.
-    let request_bound = serde_json::to_vec(&body)
+    let request_bound = crate::db::serialized_len(&body)
         .map_err(|_| ProviderExecutionError::Build {
             message: "decision request could not be serialized".into(),
         })?
-        .len()
         .saturating_add(32);
-    let question_bound = serde_json::to_vec(&json!({ "state": input.state, "question": question }))
-        .map_err(|_| ProviderExecutionError::Build {
-            message: "decision question could not be serialized".into(),
-        })?
-        .len()
-        .saturating_add(32);
+    let question_bound =
+        crate::db::serialized_len(&json!({ "state": input.state, "question": question }))
+            .map_err(|_| ProviderExecutionError::Build {
+                message: "decision question could not be serialized".into(),
+            })?
+            .saturating_add(32);
     for (bound, limit) in [
         (
             request_bound,
@@ -336,12 +335,9 @@ fn native_request_body(
             });
         }
     }
-    if serde_json::to_vec(&body)
-        .map_err(|_| ProviderExecutionError::Build {
-            message: "decision request could not be serialized".to_owned(),
-        })?
-        .len()
-        > crate::db::entities::MAX_DECISION_REQUEST_BYTES
+    if crate::db::serialized_len(&body).map_err(|_| ProviderExecutionError::Build {
+        message: "decision request could not be serialized".to_owned(),
+    })? > crate::db::entities::MAX_DECISION_REQUEST_BYTES
     {
         return Err(ProviderExecutionError::Build {
             message: "decision request exceeds 1 MiB".to_owned(),

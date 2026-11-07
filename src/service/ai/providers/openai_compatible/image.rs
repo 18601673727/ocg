@@ -158,6 +158,11 @@ impl ImageInput {
         &self.bytes
     }
 
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
     /// The image as an `image_url` content part: a base64 `data:` URL.
     #[must_use]
     pub fn part(&self) -> ContentPartWire {

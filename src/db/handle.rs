@@ -1,6 +1,6 @@
 use super::commands::{
-    byte_count, command_bytes, compaction_bytes, config_bytes, entry_bytes, json_bytes,
-    output_bytes, search_index_bytes, text_bytes,
+    byte_count, command_bytes, compaction_bytes, config_bytes, debug_bytes, entry_bytes,
+    json_bytes, output_bytes, search_index_bytes, text_bytes,
 };
 use super::*;
 
@@ -947,6 +947,14 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) async fn candidate_compatible(
+        &self,
+        candidate: AdmissionCandidate,
+    ) -> Result<bool, DatabaseError> {
+        self.read(move |database| redb::read_candidate_compatible(database, candidate))
+            .await
+    }
+
     /// The Executors that offer typed decision work, oldest first, at most
     /// 1,000. These are the candidates for new decision Jobs; running on any
     /// of them never changes the Decision Model or its request.
@@ -1555,7 +1563,7 @@ impl DatabaseHandle {
                         | JobToolCall::JobUnhold { .. }
                         | JobToolCall::JobRetry { .. } => 0,
                     };
-                    byte_count(format!("{tool:?}").len())
+                    debug_bytes(tool)
                         .saturating_add(4096)
                         .saturating_add(search)
                         .saturating_add(match tool {
@@ -1738,8 +1746,7 @@ impl DatabaseHandle {
                 ),
                 reply,
                 |(_, _, first, _, request, _, _)| {
-                    byte_count(format!("{first:?}").len())
-                        .saturating_add(byte_count(format!("{request:?}").len()))
+                    debug_bytes(first).saturating_add(debug_bytes(request))
                 },
                 OperationKind::Open,
                 |(parent, spec, first, configuration, request, submission, candidate), batch| {
@@ -1827,7 +1834,7 @@ impl DatabaseHandle {
                 (conversation, turn, entry),
                 reply,
                 |(_, _, entry)| {
-                    byte_count(format!("{entry:?}").len())
+                    debug_bytes(entry)
                         .saturating_add(match entry {
                             Entry::UserMessageEdit {
                                 text, attachments, ..

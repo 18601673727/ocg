@@ -79,7 +79,7 @@ fn message_weights(message: &ChatMessage) -> (usize, usize) {
 }
 
 fn tool_bytes(tool: &ToolWire) -> usize {
-    serde_json::to_vec(tool).map_or(0, |v| v.len())
+    crate::db::serialized_len(tool).unwrap_or(0)
 }
 
 /// Estimates the token count of a conversation request under conservative assumptions:

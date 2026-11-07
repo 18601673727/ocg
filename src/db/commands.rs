@@ -201,6 +201,26 @@ pub(super) fn byte_count(length: usize) -> u64 {
     u64::try_from(length).unwrap_or(u64::MAX)
 }
 
+pub(super) fn debug_bytes(value: &impl std::fmt::Debug) -> u64 {
+    struct Counter(u64);
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(byte_count(text.len()));
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    std::fmt::write(&mut counter, format_args!("{value:?}")).map_or(u64::MAX, |()| counter.0)
+}
+
+pub(crate) fn serialized_len(value: &impl serde::Serialize) -> Result<usize, serde_json::Error> {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    usize::try_from(counter.bytes).map_err(|_| {
+        serde_json::Error::io(std::io::Error::other("serialized byte count overflowed"))
+    })
+}
+
 pub(super) fn text_bytes(text: Option<&str>) -> u64 {
     text.map_or(0, |text| byte_count(text.len()))
 }
@@ -253,7 +273,7 @@ pub(super) fn entry_bytes(
     first: &Entry,
     format: Option<&crate::db::entities::ResponseFormat>,
 ) -> u64 {
-    byte_count(format!("{first:?}").len())
+    debug_bytes(first)
         .saturating_add(match first {
             Entry::UserMessage { text, attachments } => {
                 search_index_bytes(text).saturating_add((attachments.len() as u64).saturating_mul(

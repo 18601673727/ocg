@@ -576,12 +576,18 @@ impl<'a> StreamOutput<'a> {
         if self.text.is_empty() {
             return Ok(());
         }
-        let text = std::mem::take(&mut self.text);
         self.started = None;
-        let Some(sink) = self.sink.as_deref_mut() else {
-            return Ok(());
-        };
-        sink.append(self.kind, &text).await
+        struct ClearOnDrop<'a>(&'a mut String);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.clear();
+            }
+        }
+        let text = ClearOnDrop(&mut self.text);
+        match self.sink.as_deref_mut() {
+            Some(sink) => sink.append(self.kind, text.0.as_str()).await,
+            None => Ok(()),
+        }
     }
 }
 

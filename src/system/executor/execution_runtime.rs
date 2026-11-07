@@ -2805,12 +2805,17 @@ async fn complete_provider_job(
     if result.text.len() <= 256 * 1024
         && let Some(workspace) = sink.snapshot_workspace.take()
     {
-        let snapshots = capture_file_snapshots(workspace, result.text.clone()).await;
+        let snapshots = if result.text.contains("](") {
+            capture_file_snapshots(workspace, result.text.clone()).await
+        } else {
+            drop(workspace);
+            Vec::new()
+        };
         if !snapshots.is_empty()
             && let Some(object) = value.as_object_mut()
         {
             object.insert("file_snapshots".into(), serde_json::Value::Array(snapshots));
-            if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > 512 * 1024)
+            if crate::db::serialized_len(&value).map_or(true, |bytes| bytes > 512 * 1024)
                 && let Some(object) = value.as_object_mut()
             {
                 object.remove("file_snapshots");
@@ -3135,7 +3140,10 @@ impl DatabaseOutputSink {
                     summary: None,
                     code: None,
                     goal_reached: None,
-                    value: Some(serde_json::json!({ "text": text })),
+                    value: Some(serde_json::Value::Object(serde_json::Map::from_iter([(
+                        "text".to_owned(),
+                        serde_json::Value::String(text),
+                    )]))),
                 },
             )
             .await

@@ -149,7 +149,7 @@ pub(super) async fn upload(database: &DatabaseHandle, body: &[u8]) -> Result<Rep
     let image = ImageInput::new(mime, bytes).map_err(image_refusal)?;
     let id = database
         .create_user_attachment(Attachment {
-            content: image.bytes().to_vec(),
+            content: image.into_bytes(),
             mime: mime.as_str().to_owned(),
             display_name: wire.display_name,
         })
@@ -205,7 +205,7 @@ pub(super) async fn content(
         .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_DISPOSITION, "inline")
-        .body(image.bytes().to_vec());
+        .body(image.into_bytes());
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(mime.as_str()),

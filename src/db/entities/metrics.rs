@@ -89,11 +89,7 @@ pub struct MetricsRecord {
 /// follows the Measurement event written with it, in the same transaction,
 /// is that record's annotation; any other Token event is a record of its
 /// own, without measurements.
-fn metrics_of(
-    job: JobId,
-    target: Option<&LlmTarget>,
-    events: &[RequestEventRecord],
-) -> Vec<MetricsRecord> {
+fn metrics_of(job: JobId, events: &[RequestEventRecord]) -> Vec<MetricsRecord> {
     let mut records: Vec<MetricsRecord> = Vec::new();
     let mut last_measurement: Option<(RequestNumber, u32, Timestamp, Timestamp)> = None;
     for event in events {
@@ -109,7 +105,7 @@ fn metrics_of(
                     id: MetricsId::new(event.id.get()),
                     job,
                     request: event.request,
-                    target: target.cloned(),
+                    target: None,
                     observed_at: event.observed_at,
                     measurements: measurements.clone(),
                     token: None,
@@ -137,7 +133,7 @@ fn metrics_of(
                         id: MetricsId::new(event.id.get()),
                         job,
                         request: event.request,
-                        target: target.cloned(),
+                        target: None,
                         observed_at: event.observed_at,
                         measurements: Measurements::default(),
                         token: Some(annotation),
@@ -162,10 +158,10 @@ fn metrics_of(
 pub(in crate::db) fn usage_sample_of(
     job: JobId,
     request: RequestNumber,
-    target: Option<&LlmTarget>,
+    _target: Option<&LlmTarget>,
     events: &[RequestEventRecord],
 ) -> Option<TokenRequestSample> {
-    let records = metrics_of(job, target, events);
+    let records = metrics_of(job, events);
     match TokenRequestSample::from_metrics(&records) {
         Ok(sample) => sample,
         Err(error) => {

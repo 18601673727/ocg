@@ -381,7 +381,7 @@ async fn prepare(
             );
             image = Some(Attachment {
                 mime: loaded.mime().as_str().to_owned(),
-                content: loaded.bytes().to_vec(),
+                content: loaded.into_bytes(),
                 display_name: Some(path.to_owned()),
             });
             None
