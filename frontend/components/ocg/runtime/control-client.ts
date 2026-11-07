@@ -1862,8 +1862,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     /** Every Pool. */
     async readPools(signal?: AbortSignal) {
-      const answer = await send("GET", "/api/v1/pools", { signal });
-      return answer.input as ControlPools;
+      const pools: ControlPools["pools"] = [];
+      let before: string | undefined;
+      for (;;) {
+        const query = before ? `?before=${encodeURIComponent(before)}` : "";
+        const answer = await send("GET", `/api/v1/pools${query}`, { signal });
+        const page = answer.input as Api.Pools;
+        pools.push(...(page.pools as ControlPools["pools"]));
+        if (!page.has_more) return { pools };
+        if (!page.next_before || (before !== undefined && page.next_before >= before)) {
+          throw new ContractError("next_before", "an advancing Pool cursor");
+        }
+        before = page.next_before;
+      }
     },
 
     /** Updates a Pool's concurrency limit or enabled state. */

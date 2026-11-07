@@ -13,9 +13,10 @@ use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
 
-use super::{INVALID_REQUEST, Refusal, Reply, profiles};
-use crate::db::entities::{ExecutionOperation, ExecutionPoolId, ExecutionPoolRecord, Violation};
-use crate::db::redb::MAX_PAGE;
+use super::{INVALID_REQUEST, Refusal, Reply, catalog, profiles};
+use crate::db::entities::{
+    ConfigBody, ConfigKind, ExecutionOperation, ExecutionPoolId, ExecutionPoolRecord, Violation,
+};
 use crate::db::{DatabaseError, DatabaseHandle};
 
 const POOL_NOT_FOUND: Refusal =
@@ -63,6 +64,8 @@ pub(crate) struct PoolView {
 #[ts(rename = "Pools")]
 pub(crate) struct PoolsView {
     pools: Vec<PoolView>,
+    has_more: bool,
+    next_before: Option<String>,
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -87,19 +90,45 @@ fn pool_json(pool: &ExecutionPoolRecord) -> PoolView {
     }
 }
 
-pub(super) async fn list(database: &DatabaseHandle) -> Result<Reply, Refusal> {
-    let mut pools = Vec::new();
-    let mut before = None;
-    loop {
-        let page = database.execution_pools(before, MAX_PAGE).await?;
-        before = page.last().map(|pool| pool.id);
-        let full = page.len() == MAX_PAGE;
-        pools.extend(page.iter().map(pool_json));
-        if !full {
-            break;
-        }
-    }
-    Ok(Reply::ok(envelope(serde_json::json!(PoolsView { pools }))))
+pub(super) fn pools_query(query: &str) -> Result<(Option<ExecutionPoolId>, usize), Refusal> {
+    catalog::page_query(query, pool_id)
+}
+
+pub(super) async fn list(
+    database: &DatabaseHandle,
+    before: Option<ExecutionPoolId>,
+    limit: usize,
+) -> Result<Reply, Refusal> {
+    let page = database
+        .configs(Some(ConfigKind::Pool), before.map(Into::into), limit)
+        .await?;
+    let next_before = page.next.map(|id| ExecutionPoolId::from(id).to_string());
+    let pools = page
+        .records
+        .into_iter()
+        .filter_map(|record| {
+            let ConfigBody::Pool(body) = record.body else {
+                return None;
+            };
+            Some(PoolView {
+                id: ExecutionPoolId::from(record.id).to_string(),
+                name: record.name,
+                concurrency_limit: NonZeroU32::new(body.concurrency_limit)?.get(),
+                enabled: body.enabled,
+                operations: body
+                    .capability_set()
+                    .operations
+                    .iter()
+                    .map(|operation| operation_str(*operation).to_owned())
+                    .collect(),
+            })
+        })
+        .collect();
+    Ok(Reply::ok(envelope(serde_json::json!(PoolsView {
+        pools,
+        has_more: next_before.is_some(),
+        next_before,
+    }))))
 }
 
 fn refusal(error: DatabaseError) -> Refusal {

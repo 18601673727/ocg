@@ -45,8 +45,8 @@ use crate::db::attachments::{AttachmentImageError, attachment_images};
 use crate::db::entities::ResponseFormat;
 use crate::db::entities::{
     AttachmentId, AttachmentOrigin, ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration,
-    ExecutorId, JobId, ModelCapability, ProfileId, ProjectId, RecordRef, RequestFingerprint,
-    Submission, SubmissionKey, SubmissionRecord, Violation,
+    ExecutorId, JobExecution, JobId, JobKind, ModelCapability, ProfileId, ProjectId, RecordRef,
+    RequestFingerprint, Submission, SubmissionKey, SubmissionRecord, Violation,
 };
 use crate::db::{AdmissionCandidate, DatabaseError, DatabaseHandle};
 use crate::service::ai::providers::openai_compatible::ResponseFormatWire;
@@ -986,7 +986,24 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
         None => shared.database.submission(key).await?,
     };
     Ok(Reply::ok(match found {
-        Some(record) => admitted_value(shared, key, record.job).await?,
+        Some(record) => {
+            let job = shared.database.job(record.job).await?.ok_or(INTERNAL)?;
+            match job.kind {
+                JobKind::Execution {
+                    execution: JobExecution::Decision(_),
+                    ..
+                } => admitted_decision_value(shared, key, record.job).await?,
+                JobKind::Execution {
+                    execution: JobExecution::Frozen(_) | JobExecution::Ref(_),
+                    ..
+                } => admitted_value(shared, key, record.job).await?,
+                JobKind::Group { .. }
+                | JobKind::Execution {
+                    execution: JobExecution::Summarization(_),
+                    ..
+                } => return Err(INTERNAL),
+            }
+        }
         None => admission(AdmissionView::NotFound { job: None }),
     }))
 }

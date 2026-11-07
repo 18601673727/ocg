@@ -82,7 +82,10 @@ pub(super) enum Route {
     ProjectCreate,
     ProjectUpdate(ProjectId),
     ProjectDecision(ProjectId),
-    Pools,
+    Pools {
+        before: Option<ExecutionPoolId>,
+        limit: usize,
+    },
     PoolUpdate(ExecutionPoolId),
     JobEdit(JobId),
     Outputs {
@@ -181,7 +184,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ProjectCreate
             | Route::ProjectUpdate(_)
             | Route::ProjectDecision(_)
-            | Route::Pools
+            | Route::Pools { .. }
             | Route::PoolUpdate(_)
             | Route::JobEdit(_)
             | Route::Outputs { .. }
@@ -356,7 +359,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["projects"] => {
             projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
         }
-        ["pools"] => no_query(query).map(|()| Route::Pools),
+        ["pools"] => {
+            pools::pools_query(query).map(|(before, limit)| Route::Pools { before, limit })
+        }
         ["attachments", attachment] => {
             let attachment = attachments::attachment_id(attachment)?;
             no_query(query).map(|()| Route::Attachment(attachment))
@@ -681,7 +686,7 @@ pub(super) async fn respond(
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             projects::update(database, project, &body).await
         }
-        Route::Pools => pools::list(database).await,
+        Route::Pools { before, limit } => pools::list(database, before, limit).await,
         Route::PoolUpdate(pool) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             pools::update(database, pool, &body).await
