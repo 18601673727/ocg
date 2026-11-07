@@ -4,7 +4,7 @@ export type ControlCapability = "chat" | "tools" | "vision" | "reasoning";
 export type ControlPool = Omit<Api.Pool, "operations"> & {
   operations: ("llm_request" | "decision")[] | undefined;
 };
-export type ControlPools = { pools: ControlPool[] };
+export type ControlPools = { pools: ControlPool[]; has_more: boolean; next_before: string | null };
 export type ControlProject = Omit<Api.Project, "commands"> & {
   commands: (Omit<Api.ProjectCommand, "owner" | "status"> & {
     owner: "user" | "decision";

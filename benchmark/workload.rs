@@ -1077,7 +1077,6 @@ async fn verify_fixture_identities(
             ],
         ),
         ("/api/v1/projects?limit=100", vec![&identity.project]),
-        ("/api/v1/pools", vec![&identity.pool]),
     ] {
         let value = client.get_json(route).await?;
         let text = value.to_string();
@@ -1089,7 +1088,51 @@ async fn verify_fixture_identities(
             }
         }
     }
-    Ok(())
+    let mut before: Option<String> = None;
+    loop {
+        let mut route = "/api/v2/pools?limit=100".to_owned();
+        if let Some(cursor) = &before {
+            route.push_str("&before=");
+            route.push_str(cursor);
+        }
+        let value = client.get_json(&route).await?;
+        if value["api_version"].as_u64() != Some(2) {
+            return Err(format!("{route}: invalid API version: {value}"));
+        }
+        let pools = value["pools"]
+            .as_array()
+            .ok_or_else(|| format!("{route}: missing Pool page: {value}"))?;
+        let has_more = value["has_more"]
+            .as_bool()
+            .ok_or_else(|| format!("{route}: invalid Pool continuation: {value}"))?;
+        let cursor = value
+            .get("next_before")
+            .ok_or_else(|| format!("{route}: missing Pool cursor field: {value}"))?;
+        let next = cursor.as_str();
+        if has_more {
+            let next = next.ok_or_else(|| format!("{route}: missing Pool cursor: {value}"))?;
+            if ocg::db::entities::parse_entity_id(next).is_none()
+                || before.as_deref().is_some_and(|previous| next >= previous)
+            {
+                return Err(format!("{route}: Pool cursor did not advance: {value}"));
+            }
+        } else if !cursor.is_null() {
+            return Err(format!("{route}: unexpected Pool cursor: {value}"));
+        }
+        if pools
+            .iter()
+            .any(|pool| pool["id"].as_str() == Some(&identity.pool))
+        {
+            return Ok(());
+        }
+        if !has_more {
+            return Err(format!(
+                "prepared identity {} missing from /api/v2/pools",
+                identity.pool
+            ));
+        }
+        before = next.map(str::to_owned);
+    }
 }
 
 fn overlap_check(result: &WorkResult, concurrency: usize) -> std::result::Result<(), String> {

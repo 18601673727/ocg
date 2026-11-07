@@ -1860,21 +1860,30 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).project as ControlProject;
     },
 
-    /** Every Pool. */
-    async readPools(signal?: AbortSignal) {
-      const pools: ControlPools["pools"] = [];
-      let before: string | undefined;
-      for (;;) {
-        const query = before ? `?before=${encodeURIComponent(before)}` : "";
-        const answer = await send("GET", `/api/v1/pools${query}`, { signal });
-        const page = answer.input as Api.Pools;
-        pools.push(...(page.pools as ControlPools["pools"]));
-        if (!page.has_more) return { pools };
-        if (!page.next_before || (before !== undefined && page.next_before >= before)) {
+    async readPools(settings: { before?: string; signal?: AbortSignal } = {}) {
+      const query = settings.before ? `?before=${encodeURIComponent(settings.before)}` : "";
+      const answer = await send("GET", `/api/v2/pools${query}`, { signal: settings.signal });
+      const page = answer.input as Api.Envelope<ControlPools>;
+      if (
+        page.api_version !== 2 ||
+        !Array.isArray(page.pools) ||
+        page.pools.length > 20 ||
+        typeof page.has_more !== "boolean"
+      ) {
+        throw new ContractError("pools", "a version 2 Pool page");
+      }
+      if (page.has_more) {
+        if (typeof page.next_before !== "string") {
           throw new ContractError("next_before", "an advancing Pool cursor");
         }
-        before = page.next_before;
+        identity(page.next_before, "next_before");
+        if (settings.before !== undefined && page.next_before >= settings.before) {
+          throw new ContractError("next_before", "an advancing Pool cursor");
+        }
+      } else if (page.next_before !== null) {
+        throw new ContractError("next_before", "a terminal Pool cursor");
       }
+      return page;
     },
 
     /** Updates a Pool's concurrency limit or enabled state. */

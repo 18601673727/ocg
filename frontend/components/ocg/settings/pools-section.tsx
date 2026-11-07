@@ -1,7 +1,7 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -128,28 +128,59 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [updatingPoolId, setUpdatingPoolId] = useState<string | null>(null);
+  const [before, setBefore] = useState<string | undefined>();
+  const [previous, setPrevious] = useState<(string | undefined)[]>([]);
+  const [nextBefore, setNextBefore] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [failedPage, setFailedPage] = useState<{
+    cursor: string | undefined;
+    history: (string | undefined)[];
+  } | null>(null);
+  const request = useRef<AbortController | null>(null);
 
   const loadPools = useCallback(
-    (signal?: AbortSignal) =>
-      client
-        .readPools(signal)
-        .then((loaded) => {
-          if (!signal?.aborted) {
-            setPools(loaded.pools);
-            setLoadError(null);
-          }
-        })
-        .catch((err: unknown) => {
-          if (!signal?.aborted) setLoadError(describeError(err, t));
-        }),
+    async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
+      try {
+        const page = await client.readPools({ before: cursor, signal });
+        if (!signal.aborted) {
+          setPools(page.pools);
+          setBefore(cursor);
+          setPrevious(history);
+          setNextBefore(page.next_before);
+          setLoadError(null);
+          setFailedPage(null);
+        }
+      } catch (err: unknown) {
+        if (!signal.aborted) {
+          setLoadError(describeError(err, t));
+          setFailedPage({ cursor, history });
+        }
+      } finally {
+        if (!signal.aborted) setLoading(false);
+      }
+    },
     [client, t],
   );
 
   useEffect(() => {
     const controller = new AbortController();
-    void loadPools(controller.signal);
-    return () => controller.abort();
+    request.current = controller;
+    void Promise.resolve().then(() => {
+      if (!controller.signal.aborted) {
+        setLoading(true);
+        return loadPools(undefined, [], controller.signal);
+      }
+    });
+    return () => request.current?.abort();
   }, [loadPools]);
+
+  function navigate(cursor: string | undefined, history: (string | undefined)[]) {
+    request.current?.abort();
+    const controller = new AbortController();
+    request.current = controller;
+    setLoading(true);
+    void loadPools(cursor, history, controller.signal);
+  }
 
   async function handleUpdate(poolId: string, update: ControlPoolUpdate) {
     setActionError(null);
@@ -175,6 +206,19 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
           {loadError}
         </DismissibleNotice>
       ) : null}
+      {loadError ? (
+        <Button
+          type="button"
+          variant="outline"
+          size="xs"
+          disabled={loading}
+          onClick={() => {
+            if (failedPage) navigate(failedPage.cursor, failedPage.history);
+          }}
+        >
+          {t("common.retry")}
+        </Button>
+      ) : null}
       {actionError ? (
         <DismissibleNotice message={actionError} className="py-2 text-sm text-destructive">
           {actionError}
@@ -183,7 +227,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
 
       <TooltipProvider delay={100}>
         <div className="divide-y divide-border/70 py-2">
-          {pools.length === 0 ? (
+          {pools.length === 0 && nextBefore === null && !loading && !loadError ? (
             <p className="py-2 text-sm text-muted-foreground">{t("settings.pools.empty")}</p>
           ) : (
             pools.map((pool) => (
@@ -197,6 +241,29 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
           )}
         </div>
       </TooltipProvider>
+
+      <div className="flex gap-2 py-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="xs"
+          disabled={loading || previous.length === 0}
+          onClick={() => navigate(previous[previous.length - 1], previous.slice(0, -1))}
+        >
+          {t("settings.pools.previousPage")}
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="xs"
+          disabled={loading || nextBefore === null}
+          onClick={() => {
+            if (nextBefore !== null) navigate(nextBefore, [...previous, before]);
+          }}
+        >
+          {loading ? t("common.loading") : t("settings.pools.nextPage")}
+        </Button>
+      </div>
 
       <p className="border-t border-border/70 py-2 text-xs text-muted-foreground">
         {t("settings.pools.note")}

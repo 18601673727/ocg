@@ -21,6 +21,7 @@ use crate::db::{DatabaseError, DatabaseHandle};
 
 const POOL_NOT_FOUND: Refusal =
     Refusal::new(StatusCode::NOT_FOUND, "pool_not_found", "no such Pool");
+pub(super) const POOL_API_VERSION: u32 = 2;
 
 /// Exactly one of the two fields.
 #[derive(Deserialize)]
@@ -124,11 +125,13 @@ pub(super) async fn list(
             })
         })
         .collect();
-    Ok(Reply::ok(envelope(serde_json::json!(PoolsView {
+    let mut body = envelope(serde_json::json!(PoolsView {
         pools,
         has_more: next_before.is_some(),
         next_before,
-    }))))
+    }));
+    body["api_version"] = serde_json::json!(POOL_API_VERSION);
+    Ok(Reply::ok(body))
 }
 
 fn refusal(error: DatabaseError) -> Refusal {

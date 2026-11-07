@@ -86,6 +86,7 @@ pub(super) enum Route {
         before: Option<ExecutionPoolId>,
         limit: usize,
     },
+    PoolsRetired,
     PoolUpdate(ExecutionPoolId),
     JobEdit(JobId),
     Outputs {
@@ -185,6 +186,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ProjectUpdate(_)
             | Route::ProjectDecision(_)
             | Route::Pools { .. }
+            | Route::PoolsRetired
             | Route::PoolUpdate(_)
             | Route::JobEdit(_)
             | Route::Outputs { .. }
@@ -212,6 +214,9 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
 pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     let path = request.path();
     let query = request.query_string();
+    if path == "/api/v2/pools" {
+        return pools::pools_query(query).map(|(before, limit)| Route::Pools { before, limit });
+    }
     let segments = path
         .strip_prefix("/api/v1/")
         .ok_or(NOT_FOUND)?
@@ -359,9 +364,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["projects"] => {
             projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
         }
-        ["pools"] => {
-            pools::pools_query(query).map(|(before, limit)| Route::Pools { before, limit })
-        }
+        ["pools"] => Ok(Route::PoolsRetired),
         ["attachments", attachment] => {
             let attachment = attachments::attachment_id(attachment)?;
             no_query(query).map(|()| Route::Attachment(attachment))
@@ -687,6 +690,11 @@ pub(super) async fn respond(
             projects::update(database, project, &body).await
         }
         Route::Pools { before, limit } => pools::list(database, before, limit).await,
+        Route::PoolsRetired => Err(Refusal::new(
+            StatusCode::GONE,
+            "pool_api_retired",
+            "use GET /api/v2/pools with cursor pagination",
+        )),
         Route::PoolUpdate(pool) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             pools::update(database, pool, &body).await

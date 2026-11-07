@@ -354,6 +354,8 @@ export const en = {
   "settings.pools.operationLlmRequest": "LLM requests",
   "settings.pools.operationDecision": "Typed decisions",
   "settings.pools.saveLimit": "Save limit",
+  "settings.pools.previousPage": "Previous page",
+  "settings.pools.nextPage": "Next page",
   "settings.pools.note":
     "Lowering the limit below the number of running Jobs stops new claims; the running Jobs continue.",
   "settings.pools.refusal.notFound": "This Pool no longer exists. Refresh the list.",
@@ -1493,6 +1495,8 @@ export const zh: Dictionary = {
   "settings.pools.operationLlmRequest": "LLM 请求",
   "settings.pools.operationDecision": "类型化决策",
   "settings.pools.saveLimit": "保存限制",
+  "settings.pools.previousPage": "上一页",
+  "settings.pools.nextPage": "下一页",
   "settings.pools.note":
     "将限制降低到正在运行的任务数以下会停止新的认领；正在运行的任务将继续执行。",
   "settings.pools.refusal.notFound": "此执行池已不存在。请刷新列表。",

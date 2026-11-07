@@ -38,16 +38,15 @@ impl Refusal {
         self
     }
 
-    fn response(&self) -> HttpResponse {
-        let mut response = json_response(
-            self.status,
-            &envelope(serde_json::json!({
-                "error": serde_json::json!({
-                    "code": self.code.to_owned(),
-                    "message": self.reason.as_deref().unwrap_or(self.message),
-                }),
-            })),
-        );
+    fn response(&self, version: u32) -> HttpResponse {
+        let mut body = envelope(serde_json::json!({
+            "error": serde_json::json!({
+                "code": self.code.to_owned(),
+                "message": self.reason.as_deref().unwrap_or(self.message),
+            }),
+        }));
+        body["api_version"] = serde_json::json!(version);
+        let mut response = json_response(self.status, &body);
         if self.status == StatusCode::UNAUTHORIZED {
             response
                 .headers_mut()
@@ -252,8 +251,13 @@ pub(super) async fn answer(
     payload: web::types::Payload,
     shared: web::types::State<Arc<Shared>>,
 ) -> HttpResponse {
+    let version = if request.path().starts_with("/api/v2/") {
+        pools::POOL_API_VERSION
+    } else {
+        API_VERSION
+    };
     match admit(&request, &shared) {
-        Err(refusal) => refusal.response(),
+        Err(refusal) => refusal.response(version),
         Ok(Destination::Asset) => {
             let served = match shared.assets.as_ref() {
                 Some(assets) => assets.serve(request.path()).await,
@@ -261,7 +265,7 @@ pub(super) async fn answer(
             };
             match served {
                 Ok(asset) => assets::response(asset),
-                Err(refusal) => refusal.response(),
+                Err(refusal) => refusal.response(version),
             }
         }
         Ok(Destination::Api(caller)) => {
@@ -269,22 +273,22 @@ pub(super) async fn answer(
                 Ok(Route::Events { job, after_seq }) => {
                     events::open(&shared, request.io().cloned(), job, after_seq)
                         .await
-                        .unwrap_or_else(|refusal| refusal.response())
+                        .unwrap_or_else(|refusal| refusal.response(version))
                 }
                 Ok(Route::Subscription(topic)) => {
                     subscriptions::open(&shared, request.io().cloned(), topic)
-                        .unwrap_or_else(|refusal| refusal.response())
+                        .unwrap_or_else(|refusal| refusal.response(version))
                 }
                 Ok(Route::AttachmentContent(attachment)) => {
                     attachments::content(&shared.database, attachment)
                         .await
-                        .unwrap_or_else(|refusal| refusal.response())
+                        .unwrap_or_else(|refusal| refusal.response(version))
                 }
                 Ok(route) => match respond(route, &caller, &request, payload, &shared).await {
                     Ok(reply) => {
                         let body = match bounded_json(&reply.body, shared.response_bytes) {
                             Ok(body) => body,
-                            Err(refusal) => return refusal.response(),
+                            Err(refusal) => return refusal.response(version),
                         };
                         let mut response = json_bytes_response(reply.status, body);
                         if let Some(cookie) = &reply.cookie {
@@ -292,14 +296,14 @@ pub(super) async fn answer(
                                 Ok(value) => {
                                     response.headers_mut().insert(header::SET_COOKIE, value);
                                 }
-                                Err(_) => return INTERNAL.response(),
+                                Err(_) => return INTERNAL.response(version),
                             }
                         }
                         response
                     }
-                    Err(refusal) => refusal.response(),
+                    Err(refusal) => refusal.response(version),
                 },
-                Err(refusal) => refusal.response(),
+                Err(refusal) => refusal.response(version),
             }
         }
     }
