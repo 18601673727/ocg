@@ -4,6 +4,8 @@ pub mod executor;
 pub mod http;
 pub mod log_cleanup;
 pub mod logger;
+pub(crate) mod manual_execution;
+pub(crate) mod manual_loopback;
 pub mod monitor;
 pub(crate) mod notification;
 pub mod policy;

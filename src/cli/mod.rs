@@ -3,9 +3,11 @@ use crate::system::data_directory::DataDirectory;
 
 mod inspect_held;
 mod llm_target;
+mod manual_host;
 #[cfg(unix)]
 mod reconcile_reserved;
 mod release_slot;
+mod run_loopback_job;
 pub mod typescript;
 #[cfg(unix)]
 mod update;
@@ -35,6 +37,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         if command == "reconcile-reserved" {
             return reconcile_reserved::run(arguments.collect());
+        }
+        if command == "run-loopback-job" {
+            return run_loopback_job::run(arguments.collect());
         }
         if command == "verify" {
             return verify::run(arguments.collect());
@@ -89,6 +94,8 @@ fn usage() -> &'static str {
      Commands:\n\
        update [--check] [--version X.Y.Z] [--yes]\n\
        release-slot <job> [--yes]\n\
+       run-loopback-job <job> --pool <id> --executor <id> --timeout-secs <n> --confirm-loopback-only\n\
+         (runs one named submitted Generative Job once against its own literal 127.0.0.1 endpoint; never an external Provider)\n\
        inspect-held <data-directory>            (read-only)\n\
        verify <data-directory> [--pages]        (offline integrity check; never writes the original)\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start\n\
