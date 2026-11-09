@@ -262,7 +262,6 @@ struct JobObservation {
     job_key: String,
     job_id: Option<String>,
     admission: Option<Duration>,
-    pending_lookups: usize,
     completion: Option<Duration>,
     first_content: Option<Duration>,
     content_span: Option<Duration>,
@@ -279,7 +278,6 @@ impl JobObservation {
             job_key,
             job_id: None,
             admission: None,
-            pending_lookups: 0,
             completion: None,
             first_content: None,
             content_span: None,
@@ -504,7 +502,6 @@ async fn execute_job(
         let submitted = Instant::now();
         let admission = client
             .submit_job(
-                &handshake.executor,
                 &handshake.llm_profile,
                 &handshake.agent_profile,
                 &handshake.project,
@@ -512,7 +509,6 @@ async fn execute_job(
             )
             .await?;
         observation.admission = Some(submitted.elapsed());
-        observation.pending_lookups = admission.pending_lookups;
         observation.job_id = Some(admission.job_id.clone());
         match mode {
             WorkMode::Admission => {
@@ -1239,7 +1235,7 @@ async fn measure_admission(context: &MeasurementContext, options: &Options) -> R
     let provider = Rc::new(MockProvider::start(provider_config(options))?);
     for &concurrency in &options.clients {
         let parameters = context.parameters(options, "admission", concurrency, options.jobs)
-            .with("observation_mechanism", json!("POST /api/v1/jobs; poll GET /api/v1/admissions with the same Idempotency-Key while pending"))
+            .with("observation_mechanism", json!("POST /api/v1/jobs then POST /api/v1/jobs/{job}/submit, each answered once committed"))
             .with("completion_drain", json!("outside admission timing window; reverse job-key order"))
             .with("units", json!({"latency": "ms"}));
         emit_begin(&parameters);
@@ -1310,13 +1306,6 @@ async fn measure_admission(context: &MeasurementContext, options: &Options) -> R
             );
             values["configured_concurrency"] = json!(concurrency);
             values["observed_max_overlap"] = json!(result.max_overlap);
-            values["pending_lookups"] = json!(
-                result
-                    .jobs
-                    .iter()
-                    .map(|job| job.pending_lookups)
-                    .sum::<usize>()
-            );
             values["drain_model_requests"] = json!(requests);
             values["drain_tool_calls"] = json!(tools);
             values["drain_validated_completions"] = json!(completions);

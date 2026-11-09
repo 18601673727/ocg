@@ -49,7 +49,6 @@ pub(super) async fn client(timeout: Duration) -> Result<Client, String> {
 #[derive(Clone, Debug)]
 pub(super) struct AdmissionConfirmation {
     pub job_id: String,
-    pub pending_lookups: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -224,9 +223,13 @@ impl BenchmarkClient {
         Ok(())
     }
 
+    /// Creates one native Job and submits it, the two steps that make a Job
+    /// admitted: `POST /api/v1/jobs` writes its mutable configuration and
+    /// `POST /api/v1/jobs/{job}/submit` freezes it. Both answer only once
+    /// committed, so there is no pending state to look up. The Job names no
+    /// Executor; the Pool that runs it reserves it later.
     pub(super) async fn submit_job(
         &self,
-        executor: &str,
         llm_profile: &str,
         agent_profile: &str,
         project: &str,
@@ -234,62 +237,63 @@ impl BenchmarkClient {
     ) -> Result<AdmissionConfirmation, String> {
         ntex::time::timeout(
             self.timeout,
-            self.submit_job_inner(executor, llm_profile, agent_profile, project, objective),
+            self.submit_job_inner(llm_profile, agent_profile, project, objective),
         )
         .await
         .map_err(|_| "/api/v1/jobs: admission deadline exceeded".to_owned())?
     }
 
+    async fn post_job_json(
+        &self,
+        route: &str,
+        context: &str,
+        body: &Value,
+    ) -> Result<Value, String> {
+        let response = self
+            .authorized(self.client.post(format!("{}{route}", self.address)))
+            .set_header("Idempotency-Key", uuid::Uuid::now_v7().to_string())
+            .set_header("X-OCG-Composer-Context", context)
+            .set_header("Content-Type", "application/json")
+            .send_json(body)
+            .await
+            .map_err(|error| format!("{route}: HTTP POST failed: {error}"))?;
+        self.response_json(route, response).await
+    }
+
     async fn submit_job_inner(
         &self,
-        executor: &str,
         llm_profile: &str,
         agent_profile: &str,
         project: &str,
         objective: &str,
     ) -> Result<AdmissionConfirmation, String> {
-        let idempotency_key = uuid::Uuid::now_v7().to_string();
-        let body = json!({
-            "executor": executor,
-            "llm_profile": llm_profile,
-            "agent_profile": agent_profile,
-            "project": project,
-            "objective": objective,
-            "name": "benchmark reference",
-        });
+        let context = uuid::Uuid::now_v7().to_string();
         let route = "/api/v1/jobs";
-        let response = self
-            .authorized(self.client.post(format!("{}{route}", self.address)))
-            .set_header("Idempotency-Key", &idempotency_key)
-            .set_header("Content-Type", "application/json")
-            .send_json(&body)
-            .await
-            .map_err(|error| format!("{route}: HTTP POST failed: {error}"))?;
-        let status = response.status();
-        let value = self.response_json(route, response).await?;
-        let mut admission = parse_admission(&value, status.as_u16())?;
-        let mut pending_lookups = 0;
-        let deadline = Instant::now() + self.timeout;
-        while admission.is_none() {
-            pending_lookups += 1;
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| format!("{route}: admission deadline exceeded"))?;
-            ntex::time::sleep(remaining.min(Duration::from_millis(5))).await;
-            let lookup_route = "/api/v1/admissions";
-            let response = self
-                .authorized(self.client.get(format!("{}{lookup_route}", self.address)))
-                .set_header("Idempotency-Key", &idempotency_key)
-                .send()
-                .await
-                .map_err(|error| format!("{lookup_route}: admission lookup failed: {error}"))?;
-            let value = self.response_json(lookup_route, response).await?;
-            admission = parse_admission(&value, 200)?;
+        let created = self
+            .post_job_json(
+                route,
+                &context,
+                &json!({
+                    "kind": "generative",
+                    "text": objective,
+                    "project": project,
+                    "configuration": {
+                        "llm_profile": llm_profile,
+                        "agent_profile": agent_profile,
+                    },
+                }),
+            )
+            .await?;
+        let (job_id, revision) = parse_mutable_job(&created, "unsubmitted")?;
+        let route = format!("/api/v1/jobs/{job_id}/submit");
+        let submitted = self
+            .post_job_json(&route, &context, &json!({ "revision": revision }))
+            .await?;
+        let (submitted_id, _) = parse_mutable_job(&submitted, "queued")?;
+        if submitted_id != job_id {
+            return Err(format!("{route}: submit answered another Job: {submitted}"));
         }
-        Ok(AdmissionConfirmation {
-            job_id: admission.ok_or("admission validation ended without a job")?,
-            pending_lookups,
-        })
+        Ok(AdmissionConfirmation { job_id })
     }
 
     async fn open_events(&self, job_id: &str) -> Result<ClientResponse, String> {
@@ -490,25 +494,21 @@ impl BenchmarkClient {
     }
 }
 
-fn parse_admission(value: &Value, http_status: u16) -> Result<Option<String>, String> {
-    let admission = value
-        .get("admission")
-        .ok_or_else(|| format!("response omitted top-level admission: {value}"))?;
-    let status = admission["status"]
-        .as_str()
-        .ok_or_else(|| format!("admission omitted status: {value}"))?;
-    match status {
-        "admitted" => admission["job"]
-            .as_str()
-            .filter(|job| !job.is_empty())
-            .map(|job| Some(job.to_owned()))
-            .ok_or_else(|| format!("admitted response omitted job ID: {value}")),
-        "pending" if http_status == 200 || http_status == 202 => Ok(None),
-        "pending" | "uncertain" | "not_found" => Err(format!(
-            "submission was not confirmed as durably admitted (HTTP {http_status}): {value}"
-        )),
-        other => Err(format!(
-            "unknown admission status {other} (HTTP {http_status}): {value}"
-        )),
+/// The Job and revision of a create or submit answer, which must report
+/// `phase`.
+fn parse_mutable_job(value: &Value, phase: &str) -> Result<(String, u64), String> {
+    let job = value
+        .get("job")
+        .ok_or_else(|| format!("response omitted the job: {value}"))?;
+    if job["phase"] != phase {
+        return Err(format!("the Job is not {phase}: {value}"));
     }
+    let id = job["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| format!("the Job omitted its ID: {value}"))?;
+    let revision = job["revision"]
+        .as_u64()
+        .ok_or_else(|| format!("the Job omitted its revision: {value}"))?;
+    Ok((id.to_owned(), revision))
 }
