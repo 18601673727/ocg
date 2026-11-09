@@ -18,6 +18,8 @@ import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { describeError } from "./settings-parts";
+import { HeadersEditor } from "./headers-editor";
+import { type HeaderDraft, type HeaderDraftError, draftsToInputs } from "./header-drafts";
 
 /** The backend saves a source as "<name> provider"; show the name it was given. */
 function sourceName(name: string) {
@@ -53,11 +55,16 @@ function ImportContent({
   const [newProtocol, setNewProtocol] = useState<LlmProtocol>("openai_chat_completions");
   const [newEndpoint, setNewEndpoint] = useState("");
   const [newSecret, setNewSecret] = useState("");
+  const [newHeaders, setNewHeaders] = useState<HeaderDraft[]>([]);
+  const newHeaderRequest = draftsToInputs(newHeaders);
+  const newHeaderError: HeaderDraftError | undefined =
+    "error" in newHeaderRequest ? newHeaderRequest.error : undefined;
+  const newHeaderInputs = "inputs" in newHeaderRequest ? newHeaderRequest.inputs : [];
   const [newReference] = useState(
     () => `OCG_IMPORT_${crypto.randomUUID().replaceAll("-", "").toUpperCase()}_API_KEY`,
   );
   const newConnection =
-    sourceId === "new" && newName.trim() && newEndpoint.trim()
+    sourceId === "new" && newName.trim() && newEndpoint.trim() && !newHeaderError
       ? {
           protocol: newProtocol,
           name: newName.trim(),
@@ -65,6 +72,7 @@ function ImportContent({
           ...(newSecret.trim()
             ? { credential: newSecret.trim(), credential_ref: newReference }
             : {}),
+          ...(newHeaderInputs.length > 0 ? { headers: newHeaderInputs } : {}),
         }
       : null;
   const provider = providers.find((entry) => entry.id === sourceId);
@@ -72,7 +80,7 @@ function ImportContent({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [revision, setRevision] = useState(0);
-  const [loading, setLoading] = useState(Boolean(provider));
+  const [loading, setLoading] = useState(Boolean(provider?.endpoint));
   const [saving, setSaving] = useState(false);
   const [removing, setRemoving] = useState<ControlProfilesSnapshot["providers"][number] | null>(
     null,
@@ -81,16 +89,14 @@ function ImportContent({
   const [removeError, setRemoveError] = useState<string | null>(null);
   // A committed import stays committed even when the following catalog refresh fails.
   const [result, setResult] = useState<string | null>(null);
-  const endpoint =
-    sourceId === "new"
-      ? newConnection?.endpoint
-      : (provider?.endpoint ??
-        (provider?.protocol === "anthropic_messages"
-          ? "https://api.anthropic.com/v1"
-          : "https://api.openai.com/v1"));
+  const endpoint = sourceId === "new" ? newConnection?.endpoint : provider?.endpoint;
   const protocol = sourceId === "new" ? newConnection?.protocol : provider?.protocol;
   const credentialRef = sourceId === "new" ? undefined : provider?.credential_ref;
   const credential = sourceId === "new" ? newConnection?.credential : undefined;
+  const headers = sourceId === "new" ? newConnection?.headers : undefined;
+  // A saved Provider is probed with the headers its Profile already stores.
+  const savedProfile = sourceId === "new" ? undefined : provider?.profile_ids[0];
+  const headersKey = JSON.stringify(headers ?? null);
   const canDiscover = sourceId !== "new" || newConnection !== null;
   useEffect(() => {
     if (!endpoint || !canDiscover) return;
@@ -101,7 +107,14 @@ function ImportContent({
         setLoading(true);
         void client
           .discoverProviderModels(
-            { endpoint, protocol, credential_ref: credentialRef, credential },
+            {
+              endpoint,
+              protocol,
+              credential_ref: credentialRef,
+              credential,
+              ...(headers ? { headers } : {}),
+              ...(savedProfile ? { profile_id: savedProfile } : {}),
+            },
             controller.signal,
           )
           .then((answer) => {
@@ -126,7 +139,21 @@ function ImportContent({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [canDiscover, client, credential, credentialRef, endpoint, protocol, revision, sourceId, t]);
+    // `headers` is keyed by its content so typing in another field does not re-probe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    canDiscover,
+    client,
+    credential,
+    credentialRef,
+    endpoint,
+    headersKey,
+    protocol,
+    revision,
+    savedProfile,
+    sourceId,
+    t,
+  ]);
   const existing = new Set(provider?.models ?? []);
   const importable = models.filter((model) => !existing.has(model.id));
   const matching = useMemo(
@@ -143,7 +170,7 @@ function ImportContent({
     setQuery("");
     setError(null);
     setResult(null);
-    setLoading(id !== "new");
+    setLoading(Boolean(providers.find((entry) => entry.id === id)?.endpoint));
     setRevision((value) => value + 1);
   }
   function refreshSource(id: string) {
@@ -179,6 +206,7 @@ function ImportContent({
         setNewName("");
         setNewEndpoint("");
         setNewSecret("");
+        setNewHeaders([]);
         setModels([]);
       }
     } catch (reason) {
@@ -246,13 +274,13 @@ function ImportContent({
             const id = entry.id;
             const refreshing = sourceId === id && loading;
             return (
-              <div key={id} className="relative">
+              <div key={id} className="flex min-w-0 items-center gap-1">
                 <Button
                   variant={entry === provider ? "selected" : "outline"}
                   size="sm"
                   aria-pressed={entry === provider}
                   disabled={saving}
-                  className="h-auto min-h-9 w-full max-w-full justify-start py-2 pr-16 whitespace-normal text-left"
+                  className="h-auto min-h-9 min-w-0 flex-1 justify-start py-2 whitespace-normal text-left"
                   onClick={() => {
                     setNewSecret("");
                     selectSource(id);
@@ -265,8 +293,7 @@ function ImportContent({
                   size="icon-xs"
                   aria-label={t("settings.llm.fetchModels")}
                   title={t("settings.llm.fetchModels")}
-                  disabled={saving || refreshing}
-                  className="absolute top-1/2 right-8 -translate-y-1/2"
+                  disabled={saving || refreshing || !entry.endpoint}
                   onClick={() => refreshSource(id)}
                 >
                   <RefreshCw className={refreshing ? "animate-spin" : undefined} />
@@ -277,7 +304,6 @@ function ImportContent({
                   aria-label={t("settings.llm.removeSource")}
                   title={t("settings.llm.removeSource")}
                   disabled={saving}
-                  className="absolute top-1/2 right-1 -translate-y-1/2"
                   onClick={() => {
                     setRemoveError(null);
                     setRemoving(entry);
@@ -340,8 +366,24 @@ function ImportContent({
                   spellCheck={false}
                 />
               </label>
+              <div className="sm:col-span-2">
+                <HeadersEditor
+                  legend={t("headers.title")}
+                  hint={t("headers.connectionHint")}
+                  value={newHeaders}
+                  onChange={(next) => changeNewConnection(() => setNewHeaders(next))}
+                  disabled={saving}
+                  allowSecret
+                  error={newHeaderError}
+                />
+              </div>
             </div>
           )}
+          {sourceId !== "new" && provider && !provider.endpoint ? (
+            <p className="text-sm text-muted-foreground">
+              {t("settings.llm.discoveryEndpointRequired")}
+            </p>
+          ) : null}
           <Input
             aria-label={t("settings.llm.searchModels")}
             placeholder={t("settings.llm.searchModels")}

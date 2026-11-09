@@ -91,9 +91,11 @@ function describeDecisionAnswer(
 export function ConversationContext({
   conversation,
   agentProfile,
+  actionsSupported = true,
 }: {
   conversation: string;
   agentProfile?: string;
+  actionsSupported?: boolean;
 }) {
   const { control } = useOcgRuntime();
   const { t } = useI18n();
@@ -210,7 +212,8 @@ export function ConversationContext({
           <button
             type="button"
             className="text-foreground underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:text-muted-foreground"
-            disabled={!control || !status || running}
+            disabled={!control || !status || running || !actionsSupported}
+            title={actionsSupported ? undefined : t("context.nativeUnsupported")}
             onClick={() => (model ? void compact() : setOpen(true))}
           >
             {t(running ? "context.running" : "context.manual")}
@@ -384,7 +387,8 @@ export function ConversationContext({
                         <Button
                           size="sm"
                           variant="ghost"
-                          disabled={busy}
+                          disabled={busy || !actionsSupported}
+                          title={actionsSupported ? undefined : t("context.nativeUnsupported")}
                           onClick={() =>
                             void act(async () => {
                               await control!.stopConversation(work.conversation);

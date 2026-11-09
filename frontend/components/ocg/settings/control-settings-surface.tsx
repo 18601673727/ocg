@@ -24,6 +24,7 @@ import type {
 import type { DecisionLimits as ControlDecisionLimits } from "@/components/ocg/contracts/api";
 import {
   ControlTransportError,
+  isProfileConflict,
   type ControlProfileWriteRequest,
   type HttpCanonicalControlClient,
 } from "@/components/ocg/runtime/control-client";
@@ -41,6 +42,14 @@ import {
 } from "@/components/ui/dialog";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { GlobalCompactionSection } from "./global-compaction-section";
+import { GlobalHeadersSection } from "./global-headers-section";
+import { HeadersEditor } from "./headers-editor";
+import {
+  type HeaderDraft,
+  type HeaderDraftError,
+  draftsToInputs,
+  headersToDrafts,
+} from "./header-drafts";
 import { UpdatesSection } from "./updates-section";
 import { DecisionProfilesSection } from "./decision-profiles-section";
 import { PoolsSection } from "./pools-section";
@@ -152,6 +161,8 @@ export function SettingsSurface({
 
   // Model form state
   const [editingLlmId, setEditingLlmId] = useState<string | null>(null);
+  // The revision the open form was made from; the server refuses an edit made from an older one.
+  const [editingEditSeq, setEditingEditSeq] = useState<number | null>(null);
   const [llmFormOpen, setLlmFormOpen] = useState(false);
   const [modelKind, setModelKind] = useState<ModelKind>("llm");
   const [llmName, setLlmName] = useState("");
@@ -161,6 +172,8 @@ export function SettingsSurface({
   const [llmCredentialRef, setLlmCredentialRef] = useState("");
   // Write-only secret input: never populated from server responses and cleared after save.
   const [llmSecret, setLlmSecret] = useState("");
+  const [llmHeaders, setLlmHeaders] = useState<HeaderDraft[]>([]);
+  const [llmHeaderError, setLlmHeaderError] = useState<HeaderDraftError>();
   const [llmCapabilities, setLlmCapabilities] = useState<ControlCapability[]>(["chat"]);
   const [decisionCapabilities, setDecisionCapabilities] = useState<string[]>(["choice"]);
   const [decisionLimits, setDecisionLimits] =
@@ -185,6 +198,8 @@ export function SettingsSurface({
 
   // Agent Profile form state
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
+  // The revision the open Agent form was made from; the server refuses an edit made from an older one.
+  const [editingAgentSeq, setEditingAgentSeq] = useState<number | null>(null);
   const [agentName, setAgentName] = useState("");
   const [agentInstructions, setAgentInstructions] = useState("");
   const [agentCapabilities, setAgentCapabilities] = useState<ControlAgentCapability[]>(["chat"]);
@@ -249,6 +264,7 @@ export function SettingsSurface({
   function resetLlmForm() {
     setLlmFormOpen(false);
     setEditingLlmId(null);
+    setEditingEditSeq(null);
     setModelKind("llm");
     setLlmName("");
     setLlmModel("");
@@ -256,6 +272,8 @@ export function SettingsSurface({
     setLlmEndpoint("");
     setLlmCredentialRef("");
     setLlmSecret("");
+    setLlmHeaders([]);
+    setLlmHeaderError(undefined);
     setLlmCapabilities(["chat"]);
     setDecisionCapabilities(["choice"]);
     setDecisionLimits(EMPTY_DECISION_LIMITS);
@@ -270,6 +288,7 @@ export function SettingsSurface({
   function startEditLlm(profile: ControlLlmProfile) {
     setModelKind("llm");
     setEditingLlmId(profile.id);
+    setEditingEditSeq(profile.edit_seq);
     setLlmContextWindow(profile.context_window === null ? "" : String(profile.context_window));
     setLlmName(profile.name);
     setLlmModel(profile.model);
@@ -278,6 +297,8 @@ export function SettingsSurface({
     setLlmCredentialRef(profile.credential_ref ?? "");
     // Never populate raw credentials back into the browser.
     setLlmSecret("");
+    setLlmHeaders(headersToDrafts(profile.headers));
+    setLlmHeaderError(undefined);
     setLlmCapabilities(
       profile.declared_capabilities.length > 0 ? [...profile.declared_capabilities] : ["chat"],
     );
@@ -297,10 +318,13 @@ export function SettingsSurface({
     resetLlmForm();
     setModelKind("decision_model");
     setEditingLlmId(profile.id);
+    setEditingEditSeq(profile.edit_seq);
     setLlmName(profile.name);
     setLlmModel(profile.model);
     setLlmEndpoint(profile.endpoint ?? "");
     setLlmCredentialRef(profile.credential_ref ?? "");
+    setLlmHeaders(headersToDrafts(profile.headers));
+    setLlmHeaderError(undefined);
     setDecisionCapabilities(profile.declared_capabilities);
     setDecisionLimits(profile.limits);
     setLlmFormOpen(true);
@@ -327,6 +351,21 @@ export function SettingsSurface({
       setLlmError(t("settings.llm.validation.model"));
       return;
     }
+    const headerRequest = draftsToInputs(llmHeaders);
+    if ("error" in headerRequest) {
+      setLlmHeaderError(headerRequest.error);
+      setLlmError(
+        t(
+          headerRequest.error.kind === "name"
+            ? "headers.invalidName"
+            : headerRequest.error.kind === "duplicate"
+              ? "headers.duplicate"
+              : "headers.invalidValue",
+        ),
+      );
+      return;
+    }
+    setLlmHeaderError(undefined);
     let payload: ControlProfileWriteRequest;
     if (modelKind === "decision_model") {
       if (decisionCapabilities.length === 0) {
@@ -343,6 +382,8 @@ export function SettingsSurface({
         ...(llmSecret.trim() ? { credential: llmSecret.trim() } : {}),
         declared_capabilities: decisionCapabilities,
         limits: decisionLimits,
+        headers: headerRequest.inputs,
+        ...(editingEditSeq === null ? {} : { expected_edit_seq: editingEditSeq }),
       };
     } else {
       if (llmCapabilities.length === 0) {
@@ -398,6 +439,8 @@ export function SettingsSurface({
         credential_ref: llmCredentialRef.trim() ? llmCredentialRef.trim() : null,
         credential: llmSecret.trim() ? llmSecret.trim() : null,
         declared_capabilities: llmCapabilities,
+        headers: headerRequest.inputs,
+        ...(editingEditSeq === null ? {} : { expected_edit_seq: editingEditSeq }),
         parameters: {
           ...priorParameters,
           max_completion_tokens:
@@ -424,6 +467,22 @@ export function SettingsSurface({
           : t("settings.notice.created", { id: savedId }),
       );
     } catch (error) {
+      if (isProfileConflict(error) && editingLlmId) {
+        // Keep the draft, show the latest version in the list, and rebase the form on it so a
+        // deliberate second save replaces the other edit instead of failing forever.
+        setLlmError(t("settings.llm.conflict"));
+        try {
+          const latest = await client.readProfiles();
+          setSnapshot(latest);
+          const current = [...latest.llm_profiles, ...(latest.decision_profiles ?? [])].find(
+            (profile) => profile.id === editingLlmId,
+          );
+          if (current) setEditingEditSeq(current.edit_seq);
+        } catch {
+          // The list is stale until the next refresh; the draft and the conflict notice stay.
+        }
+        return;
+      }
       setLlmError(describeError(error, t));
       if (error instanceof ControlTransportError && error.code === "credential_not_saved") {
         // The Profile was committed even though its key was not; refresh so
@@ -438,6 +497,7 @@ export function SettingsSurface({
 
   function resetAgentForm() {
     setEditingAgentId(null);
+    setEditingAgentSeq(null);
     setAgentName("");
     setAgentInstructions("");
     setAgentCapabilities(["chat"]);
@@ -447,6 +507,7 @@ export function SettingsSurface({
 
   function startEditAgent(agent: ControlManagedAgentProfile) {
     setEditingAgentId(agent.id);
+    setEditingAgentSeq(agent.edit_seq);
     setAgentName(agent.name);
     setAgentInstructions(agent.instructions ?? "");
     setAgentCapabilities([...agent.capabilities]);
@@ -531,6 +592,7 @@ export function SettingsSurface({
         instructions: agentInstructions.trim() ? agentInstructions.trim() : null,
         capabilities: agentCapabilities,
         llm_targets: assignedModels,
+        ...(editingAgentSeq === null ? {} : { expected_edit_seq: editingAgentSeq }),
       };
       const updated = editingAgentId
         ? await client.updateProfile(editingAgentId, payload)
@@ -545,7 +607,21 @@ export function SettingsSurface({
           : t("settings.notice.created", { id: savedId }),
       );
     } catch (error) {
-      setAgentError(describeError(error, t));
+      if (isProfileConflict(error) && editingAgentId) {
+        // Keep the draft, show the latest version in the list, and rebase the form on it so a
+        // deliberate second save replaces the other edit.
+        setAgentError(t("settings.agent.conflict"));
+        try {
+          const latest = await client.readProfiles();
+          setSnapshot(latest);
+          const current = latest.agent_profiles.find((profile) => profile.id === editingAgentId);
+          if (current) setEditingAgentSeq(current.edit_seq);
+        } catch {
+          // The list is stale until the next refresh; the draft and the conflict notice stay.
+        }
+      } else {
+        setAgentError(describeError(error, t));
+      }
     } finally {
       setAgentSaving(false);
     }
@@ -935,6 +1011,16 @@ export function SettingsSurface({
                             />
                           </label>
                         </div>
+
+                        <HeadersEditor
+                          legend={t("headers.title")}
+                          hint={t("headers.connectionHint")}
+                          value={llmHeaders}
+                          onChange={setLlmHeaders}
+                          disabled={llmSaving}
+                          allowSecret
+                          error={llmHeaderError}
+                        />
 
                         {modelKind === "llm" ? (
                           <>
@@ -1603,6 +1689,7 @@ export function SettingsSurface({
             <>
               <UpdatesSection client={client} />
               <GlobalCompactionSection client={client} profiles={snapshot} />
+              <GlobalHeadersSection client={client} />
             </>
           )}
         </div>

@@ -23,27 +23,14 @@ export function conversationPath(ids: readonly string[]) {
   return "/" + ids.map((id) => `jobs/${id}`).join("/");
 }
 
+/**
+ * The conversation chain of a Job or Conversation identity, root first. The backend owns the
+ * relation: `resolve` returns the Conversation an identity belongs to, and Conversations do not
+ * nest, so the chain is that single Conversation.
+ */
 export async function conversationAncestors(
-  readJob: (id: string) => Promise<{
-    id: string;
-    kind: "turn" | "conversation";
-    conversation: string | null;
-    parent?: string;
-  }>,
-  job: string,
+  resolve: (id: string) => Promise<string>,
+  id: string,
 ): Promise<string[]> {
-  const ids: string[] = [];
-  let current = await readJob(job);
-  if (current.kind === "turn") {
-    if (!current.conversation) throw new Error("The Job does not belong to a conversation.");
-    current = await readJob(current.conversation);
-  }
-  for (let depth = 0; depth <= 16; depth++) {
-    if (current.kind !== "conversation" || ids.includes(current.id))
-      throw new Error("Invalid conversation ancestry.");
-    ids.push(current.id);
-    if (!current.parent) return ids.reverse();
-    current = await readJob(current.parent);
-  }
-  throw new Error("Conversation ancestry exceeds the depth limit.");
+  return [await resolve(id)];
 }

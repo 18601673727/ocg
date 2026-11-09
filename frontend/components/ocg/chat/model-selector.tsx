@@ -23,6 +23,9 @@ export function ModelSelector({
   onPreference,
   onImageSupportChange,
   busy,
+  projectLocked = false,
+  lockedProject,
+  statusText,
 }: {
   sessionId?: string;
   selection?: ChatModelSelection;
@@ -30,6 +33,9 @@ export function ModelSelector({
   onPreference?: (selection: ChatModelSelection) => void;
   onImageSupportChange: (support: ModelImageSupport) => void;
   busy: boolean;
+  projectLocked?: boolean;
+  lockedProject?: string | null;
+  statusText?: string;
   active?: ActiveExecutionTarget | null;
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
 }) {
@@ -129,7 +135,9 @@ export function ModelSelector({
   // A conversation keeps the Project of its first turn, so only a new one chooses,
   // and only the owner chooses: no Project is picked for them.
   const projects = !fixedAgent ? (catalog?.projects ?? []) : [];
-  const projectId = projects.find((project) => project.id === selection?.project)?.id;
+  const projectId = projectLocked
+    ? (lockedProject ?? undefined)
+    : projects.find((project) => project.id === selection?.project)?.id;
 
   useEffect(() => {
     if (!agentId || !llmId || !executor || !model) return;
@@ -186,19 +194,25 @@ export function ModelSelector({
   return (
     <div className="min-w-0 flex-1">
       <ModelSelectorView
-        status={busy ? t("chat.settingsLocked") : t("chat.settingsNextTurn")}
+        status={statusText ?? (busy ? t("chat.settingsLocked") : t("chat.settingsNextTurn"))}
         disabled={disabled}
         loading={!catalog && !error}
         error={error ?? (catalog && fixedAgent && !agent ? t("chat.agentUnavailable") : undefined)}
         providerLabel={t("chat.agent")}
         defaultEffort={llm?.default_effort}
         project={{
-          value: fixedAgent ? (session?.projectId ?? "") : (projectId ?? ""),
-          options: (fixedAgent ? (catalog?.projects ?? []) : projects).map((project) => ({
-            value: project.id,
-            label: project.name,
-          })),
-          disabled: busy || !catalog || Boolean(fixedAgent),
+          value: projectLocked
+            ? (lockedProject ?? "")
+            : fixedAgent
+              ? (session?.projectId ?? "")
+              : (projectId ?? ""),
+          options: (fixedAgent || projectLocked ? (catalog?.projects ?? []) : projects).map(
+            (project) => ({
+              value: project.id,
+              label: project.name,
+            }),
+          ),
+          disabled: busy || !catalog || Boolean(fixedAgent) || projectLocked,
           placeholder: t("chat.pureConversation"),
           onChange: chooseProject,
         }}

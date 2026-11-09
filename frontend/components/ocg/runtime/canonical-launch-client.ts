@@ -27,7 +27,7 @@ import {
   type TranscriptTurn,
 } from "../chat/job-transcript-model";
 import { fileSnapshots } from "../markdown/source-snapshot";
-import { reconcileJob, taskPlanActive } from "./job-status";
+import { nativeExecutionStatus, reconcileJob, taskPlanActive } from "./job-status";
 import { ContractError, materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
 import {
@@ -190,6 +190,7 @@ async function readPartialToolBoundaries(
 }
 
 type Turn = {
+  native_decision?: ControlConversationTurn["native_decision"];
   compaction?: ControlConversationTurn["compaction"];
   details?: ControlJobDetails;
   entries?: ControlConversationTurn["entries"];
@@ -538,10 +539,29 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     return task;
   }
 
+  async presentMutableJob(
+    sessionId: string,
+    job: import("./control-client").MutableJob,
+  ): Promise<void> {
+    const session = this.getSnapshot().sessions.find((item) => item.id === sessionId);
+    if (!session) throw new Error("Conversation presentation is no longer available.");
+    if (session.conversationId && session.conversationId !== job.conversation)
+      throw new Error("The Job belongs to another conversation.");
+    this.claimConversation(job.conversation, sessionId);
+    this.emit({
+      type: "conversation.session-updated",
+      session: {
+        ...session,
+        conversationId: job.conversation,
+        projectId: job.project ?? undefined,
+        sessionId: job.id,
+      },
+    });
+    await this.openConversation(job.id);
+  }
+
   private async readConversation(job: string): Promise<string> {
-    const record = await this.control.readJob(job, this.lifetime.signal);
-    const root = record.kind === "conversation" ? record.id : record.conversation;
-    if (!root) throw new Error("This Job is a process turn with no conversation.");
+    const root = await this.control.resolveConversation(job, this.lifetime.signal);
     const page = await this.control.readConversationTurns(
       root,
       undefined,
@@ -615,8 +635,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.publish(id);
     for (const turn of conversation.turns)
       if (
-        turn.job.settlement.state === "unsettled" ||
-        taskPlanActive(this.turns.get(turn.job.id)?.details?.task_plan)
+        this.turns.get(turn.job.id)?.details?.mutable_phase !== "queued" &&
+        (turn.job.settlement.state === "unsettled" ||
+          taskPlanActive(this.turns.get(turn.job.id)?.details?.task_plan))
       )
         this.watch(turn.job.id);
     return id;
@@ -778,10 +799,20 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       outputs = mergeOutputHistory(previous.outputs, gap, window);
     }
     const complete = outputs.firstSeq === 1;
-    const evidence = await readTranscriptEvidence(this.control, turn.job.id, {
-      signal: this.lifetime.signal,
-      readReplies: complete,
-    });
+    const needsDetails =
+      turn.job.settlement.state === "unsettled" ||
+      turn.job.settlement.state === "unknown" ||
+      [...outputs].some((output) => output.code === "task_plan_scheduled");
+    const details = needsDetails
+      ? await this.control.readJobDetails(turn.job.id, this.lifetime.signal)
+      : undefined;
+    const evidence =
+      turn.native_decision || details?.mutable_phase === "queued"
+        ? { tools: [], responses: [], error: undefined }
+        : await readTranscriptEvidence(this.control, turn.job.id, {
+            signal: this.lifetime.signal,
+            readReplies: complete,
+          });
     if (!isCurrent()) return null;
     const state: Turn = {
       sessionId,
@@ -806,19 +837,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       );
       state.partialToolTimes = times;
     }
-    const needsDetails =
-      turn.job.settlement.state === "unsettled" ||
-      [...outputs].some((output) => output.code === "task_plan_scheduled");
-    if (turn.job.settlement.state === "unknown" && !needsDetails) {
-      const record = await this.control.readJob(turn.job.id, this.lifetime.signal);
-      if (!isCurrent()) return null;
-      state.unknownReason = record.unknown_reason ?? null;
-    }
-    if (needsDetails) {
-      state.details = await this.control.readJobDetails(turn.job.id, this.lifetime.signal);
+    if (details) {
+      state.details = details;
       if (turn.job.settlement.state === "unknown")
-        state.unknownReason = state.details.unknown_reason ?? null;
-      state.job = reconcileJob(state.job, state.details);
+        state.unknownReason = details.unknown_reason ?? null;
+      state.job = reconcileJob(state.job, details);
     }
     const images = await this.readImages(state);
     if (!isCurrent()) return null;
@@ -889,9 +912,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       turn.responses,
       turn.partialToolBoundaries,
       partial,
+      turn.details?.mutable_phase,
     ];
     if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
-      cached.transcript = jobTranscript(
+      const transcript = jobTranscript(
         turn.job.id,
         turn.entries && turn.entries.length > 0 ? null : turn.input.objective,
         turn.outputs,
@@ -905,6 +929,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         turn.partialToolBoundaries,
         cached.aggregate,
       );
+      cached.transcript =
+        turn.details?.mutable_phase === "queued"
+          ? transcript.filter(
+              (message) =>
+                !(message.role === "assistant" && message.status === "pending" && !message.content),
+            )
+          : transcript;
       cached.arguments = args;
     }
     return { transcript: cached.transcript ?? [], result: cached.aggregate.result };
@@ -932,9 +963,27 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const turns = [...this.turns.values()]
       .filter((turn) => turn.sessionId === sessionId)
       .sort(
-        (a, b) => a.job.created_at_us - b.job.created_at_us || a.job.id.localeCompare(b.job.id),
+        (a, b) =>
+          (a.input.submitted_at_us ?? a.job.created_at_us) -
+            (b.input.submitted_at_us ?? b.job.created_at_us) || a.job.id.localeCompare(b.job.id),
       );
     const messages: ChatMessage[] = turns.flatMap((turn) => {
+      if (turn.native_decision) {
+        const state = turn.job.settlement.state;
+        return [
+          {
+            id: `${turn.job.id}:decision`,
+            jobId: turn.job.id,
+            commandId: turn.job.id,
+            role: "assistant" as const,
+            content: "",
+            decision: turn.native_decision,
+            status: state === "unsettled" ? ("pending" as const) : state,
+            execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
+            createdAt: new Date(turn.job.created_at_us / 1000).toISOString(),
+          },
+        ];
+      }
       const partial = turn.outputs.firstSeq > 1;
       const entries = materializeUserEntries(turn.entries ?? []);
       const queued =
@@ -994,6 +1043,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           intermediate: message.intermediate,
           activity: turn.details?.activity,
           taskPlan: turn.details?.task_plan,
+          execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
           createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
           ...(message.role === "user"
             ? { images: turn.input.attachments.flatMap((id) => this.images.get(id) ?? []) }
@@ -1010,9 +1060,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
                     turn.toolError ??
                     message.detail ??
                     (message.status === "unknown"
-                      ? (turn.job.stop_confirmed_at_us === null
-                          ? "Outcome unknown; stop is not yet confirmed."
-                          : "Execution stopped; final outcome unknown.") +
+                      ? (turn.details?.allocation?.holds_capacity
+                          ? "Execution outcome uncertain; ownership is held and capacity is not released."
+                          : turn.job.stop_confirmed_at_us === null
+                            ? "Outcome unknown; stop is not yet confirmed."
+                            : "Execution stopped; final outcome unknown.") +
                         (turn.unknownReason ? ` ${turn.unknownReason}` : "")
                       : undefined)),
                 failureAt:
@@ -1428,10 +1480,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       );
       outputs = mergeOutputHistory(previous.outputs, gap, window.outputs);
     }
-    const evidence = await readTranscriptEvidence(this.control, job, {
-      signal: this.lifetime.signal,
-      readReplies: outputs.firstSeq === 1,
-    });
     const page = record.conversation
       ? await this.control.readConversationTurns(
           record.conversation,
@@ -1441,9 +1489,17 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         )
       : null;
     const stored = page?.turns.find((turn) => turn.job.id === job);
+    // A Decision Job has no provider responses or tools; do not request them.
+    const evidence = stored?.native_decision
+      ? { tools: [], responses: [], error: undefined }
+      : await readTranscriptEvidence(this.control, job, {
+          signal: this.lifetime.signal,
+          readReplies: outputs.firstSeq === 1,
+        });
     const turn: Turn = {
       compaction: stored?.compaction,
       entries: stored?.entries,
+      native_decision: stored?.native_decision,
       sessionId,
       job: record,
       input: stored?.input ?? frozen,
@@ -1526,6 +1582,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       (message) => message.id === messageId,
     );
     const turn = message?.jobId ? this.turns.get(message.jobId) : undefined;
+    if (turn?.details?.mutable_phase !== undefined)
+      throw new Error("Retry is not available for native Jobs; submit a new message instead.");
     if (
       !turn ||
       !turn.job.conversation ||
@@ -1559,6 +1617,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   override async cancel(sessionId: string): Promise<void> {
     const job = this.tips.get(sessionId);
     if (!job) throw new Error("No admitted turn to stop.");
+    if (this.turns.get(job)?.details?.mutable_phase !== undefined)
+      throw new Error(
+        "Stopping a running native Job is not supported; a Job that has started is never reported as stopped.",
+      );
     const result = await this.control.stopConversation(
       this.turns.get(job)?.job.conversation ?? job,
       this.lifetime.signal,

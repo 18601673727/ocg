@@ -7,6 +7,10 @@ import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Pill } from "@/components/ocg/primitives";
 import type { ControlPool } from "@/components/ocg/contracts";
+import {
+  configurationIdentity,
+  type NativeExecutor,
+} from "@/components/ocg/runtime/control-client";
 import type {
   ControlPoolUpdate,
   HttpCanonicalControlClient,
@@ -132,6 +136,26 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
   const [previous, setPrevious] = useState<(string | undefined)[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [native, setNative] = useState(false);
+  const [poolName, setPoolName] = useState("");
+  const [poolCapacity, setPoolCapacity] = useState("1");
+  const poolIdentity = useRef<string | null>(null);
+  const executorIdentity = useRef<string | null>(null);
+  const [executorName, setExecutorName] = useState("");
+  const [executorPool, setExecutorPool] = useState("");
+  const [capability, setCapability] = useState("openai_chat_completions");
+  const [executors, setExecutors] = useState<NativeExecutor[]>([]);
+  const [executorBefore, setExecutorBefore] = useState<string | undefined>();
+  const [executorPrevious, setExecutorPrevious] = useState<(string | undefined)[]>([]);
+  const [executorNext, setExecutorNext] = useState<string | null>(null);
+  const [executorLoading, setExecutorLoading] = useState(false);
+  const [executorError, setExecutorError] = useState<string | null>(null);
+  const [failedExecutorPage, setFailedExecutorPage] = useState<{
+    cursor: string | undefined;
+    history: (string | undefined)[];
+  } | null>(null);
+  const [creating, setCreating] = useState(false);
+  const executorRequest = useRef<AbortController | null>(null);
   const [failedPage, setFailedPage] = useState<{
     cursor: string | undefined;
     history: (string | undefined)[];
@@ -143,6 +167,9 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
       try {
         const page = await client.readPools({ before: cursor, signal });
         if (!signal.aborted) {
+          setNative(
+            (page as typeof page & { resource_model?: string }).resource_model === "independent",
+          );
           setPools(page.pools);
           setBefore(cursor);
           setPrevious(history);
@@ -173,6 +200,93 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     });
     return () => request.current?.abort();
   }, [loadPools]);
+
+  const loadExecutors = useCallback(
+    async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
+      try {
+        const page = await client.readNativeExecutors({ before: cursor, signal });
+        if (!signal.aborted) {
+          setExecutors(page.executors);
+          setExecutorBefore(cursor);
+          setExecutorPrevious(history);
+          setExecutorNext(page.next_before);
+          setExecutorError(null);
+          setFailedExecutorPage(null);
+        }
+      } catch (error) {
+        if (!signal.aborted) {
+          setExecutorError(describeError(error, t));
+          setFailedExecutorPage({ cursor, history });
+        }
+      } finally {
+        if (!signal.aborted) setExecutorLoading(false);
+      }
+    },
+    [client, t],
+  );
+
+  useEffect(() => {
+    if (!native) return;
+    const controller = new AbortController();
+    executorRequest.current = controller;
+    void Promise.resolve().then(() => {
+      if (!controller.signal.aborted) {
+        setExecutorLoading(true);
+        return loadExecutors(undefined, [], controller.signal);
+      }
+    });
+    return () => executorRequest.current?.abort();
+  }, [native, loadExecutors]);
+
+  function navigateExecutors(cursor: string | undefined, history: (string | undefined)[]) {
+    executorRequest.current?.abort();
+    const controller = new AbortController();
+    executorRequest.current = controller;
+    setExecutorLoading(true);
+    void loadExecutors(cursor, history, controller.signal);
+  }
+
+  async function createPool() {
+    setActionError(null);
+    setCreating(true);
+    try {
+      const id = poolIdentity.current ?? configurationIdentity();
+      poolIdentity.current = id;
+      await client.createNativePool(id, poolName.trim(), Number(poolCapacity));
+      poolIdentity.current = null;
+      setPoolName("");
+      setPoolCapacity("1");
+      navigate(undefined, []);
+    } catch (error) {
+      setActionError(describeError(error, t));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function createExecutor() {
+    setActionError(null);
+    setCreating(true);
+    try {
+      const id = executorIdentity.current ?? configurationIdentity();
+      executorIdentity.current = id;
+      await client.createNativeExecutor(
+        id,
+        executorPool,
+        executorName.trim(),
+        capability === "decision"
+          ? { operation: "decision", protocol: null }
+          : { operation: "llm_request", protocol: capability },
+      );
+      executorIdentity.current = null;
+      setExecutorName("");
+      navigateExecutors(undefined, []);
+    } catch (error) {
+      setActionError(describeError(error, t));
+    } finally {
+      setCreating(false);
+    }
+  }
 
   function navigate(cursor: string | undefined, history: (string | undefined)[]) {
     request.current?.abort();
@@ -225,6 +339,33 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
         </DismissibleNotice>
       ) : null}
 
+      {native ? (
+        <div className="flex flex-wrap items-end gap-2">
+          <label className="text-xs">
+            {t("settings.pools.nativeName")}
+            <Input value={poolName} onChange={(event) => setPoolName(event.target.value)} />
+          </label>
+          <label className="text-xs">
+            {t("settings.pools.concurrencyLimit")}
+            <Input
+              type="number"
+              min={1}
+              max={4294967295}
+              value={poolCapacity}
+              onChange={(event) => setPoolCapacity(event.target.value)}
+            />
+          </label>
+          <Button
+            type="button"
+            size="xs"
+            disabled={creating || !poolName.trim()}
+            onClick={() => void createPool()}
+          >
+            {t("settings.pools.nativeCreate")}
+          </Button>
+        </div>
+      ) : null}
+
       <TooltipProvider delay={100}>
         <div className="divide-y divide-border/70 py-2">
           {pools.length === 0 && nextBefore === null && !loading && !loadError ? (
@@ -264,6 +405,120 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
           {loading ? t("common.loading") : t("settings.pools.nextPage")}
         </Button>
       </div>
+
+      {native ? (
+        <div className="space-y-3 border-t border-border/70 pt-3">
+          <h3 className="font-semibold">{t("settings.pools.executors")}</h3>
+          {executorError ? (
+            <DismissibleNotice message={executorError} className="text-sm text-destructive">
+              {executorError}
+            </DismissibleNotice>
+          ) : null}
+          {executorError && failedExecutorPage ? (
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              onClick={() =>
+                navigateExecutors(failedExecutorPage.cursor, failedExecutorPage.history)
+              }
+            >
+              {t("common.retry")}
+            </Button>
+          ) : null}
+          <div className="divide-y divide-border/70">
+            {executors.map((executor) => (
+              <div key={executor.id} className="py-2 text-sm">
+                <strong>{executor.name}</strong>{" "}
+                <span className="text-muted-foreground">
+                  {executor.id} · {executor.pool} ·{" "}
+                  {t(executor.enabled ? "settings.pools.enabled" : "settings.pools.disabled")} ·{" "}
+                  {executor.capabilities.map((item) => item.protocol ?? item.operation).join(", ")}
+                </span>
+              </div>
+            ))}
+            {!executors.length && !executorLoading && !executorError ? (
+              <p className="text-sm text-muted-foreground">{t("settings.pools.executorEmpty")}</p>
+            ) : null}
+          </div>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={executorLoading || !executorPrevious.length}
+              onClick={() =>
+                navigateExecutors(
+                  executorPrevious[executorPrevious.length - 1],
+                  executorPrevious.slice(0, -1),
+                )
+              }
+            >
+              {t("settings.pools.previousPage")}
+            </Button>
+            <Button
+              type="button"
+              size="xs"
+              variant="outline"
+              disabled={executorLoading || executorNext === null}
+              onClick={() => {
+                if (executorNext !== null)
+                  navigateExecutors(executorNext, [...executorPrevious, executorBefore]);
+              }}
+            >
+              {t("settings.pools.nextPage")}
+            </Button>
+          </div>
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="text-xs">
+              {t("settings.pools.executorName")}
+              <Input
+                value={executorName}
+                onChange={(event) => setExecutorName(event.target.value)}
+              />
+            </label>
+            <label className="text-xs">
+              {t("settings.pools.executorPool")}
+              <select
+                className="block h-9 rounded border bg-background px-2"
+                value={executorPool}
+                onChange={(event) => setExecutorPool(event.target.value)}
+              >
+                <option value="">—</option>
+                {executorPool && !pools.some((pool) => pool.id === executorPool) ? (
+                  <option value={executorPool}>{executorPool}</option>
+                ) : null}
+                {pools.map((pool) => (
+                  <option key={pool.id} value={pool.id}>
+                    {pool.name} · {pool.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="text-xs">
+              {t("settings.pools.executorCapability")}
+              <select
+                className="block h-9 rounded border bg-background px-2"
+                value={capability}
+                onChange={(event) => setCapability(event.target.value)}
+              >
+                <option value="openai_chat_completions">OpenAI Chat</option>
+                <option value="openai_responses">OpenAI Responses</option>
+                <option value="anthropic_messages">Anthropic Messages</option>
+                <option value="decision">{t("settings.pools.operationDecision")}</option>
+              </select>
+            </label>
+            <Button
+              type="button"
+              size="xs"
+              disabled={creating || !executorName.trim() || !executorPool}
+              onClick={() => void createExecutor()}
+            >
+              {t("settings.pools.executorCreate")}
+            </Button>
+          </div>
+        </div>
+      ) : null}
 
       <p className="border-t border-border/70 py-2 text-xs text-muted-foreground">
         {t("settings.pools.note")}

@@ -5,7 +5,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { TaskStatus } from "./task-status";
-import { reconcileJob, taskPlanActive } from "../runtime/job-status";
+import {
+  EXECUTION_PHASE_KEYS,
+  executionDetail,
+  nativeExecutionStatus,
+  reconcileJob,
+} from "../runtime/job-status";
 import { JobTranscript } from "@/components/ocg/chat/job-transcript";
 import { jobTranscript, outputText } from "@/components/ocg/chat/job-transcript-model";
 import {
@@ -24,6 +29,7 @@ import {
 } from "@/components/ocg/runtime/control-client";
 import {
   ContractError,
+  type ControlExecutionPhase,
   type ControlJob,
   type ControlJobDetails,
   type ControlOutput,
@@ -92,14 +98,8 @@ function failureText(t: TranslateFn, failure: { code: string; scope: "read" | "s
     : t("job.failure.read", { code: failure.code });
 }
 
-const STATE_KEYS: Record<string, I18nKey> = {
+const STREAM_KEYS: Record<StreamState, I18nKey> = {
   loading: "job.state.loading",
-  unavailable: "job.state.unavailable",
-  unsettled: "job.state.unsettled",
-  completed: "state.completed",
-  failed: "state.failed",
-  cancelled: "state.cancelled",
-  unknown: "state.unknown",
   live: "job.stream.live",
   reconnecting: "job.stream.reconnecting",
   settled: "state.settled",
@@ -107,15 +107,19 @@ const STATE_KEYS: Record<string, I18nKey> = {
   closed: "job.stream.closed",
 };
 
-const TONE: Record<string, string> = {
-  loading: "bg-muted text-muted-foreground",
-  unavailable: "bg-muted text-muted-foreground",
-  unsettled: "bg-muted text-muted-foreground",
+const TONE = { loading: "bg-muted text-muted-foreground" };
+
+const PHASE_BADGE = {
+  unsubmitted: "bg-muted text-muted-foreground",
+  queued: "bg-muted text-muted-foreground",
+  reserved: "bg-primary/10 text-primary",
+  running: "bg-primary/10 text-primary",
+  stop_requested: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  unknown: "bg-destructive/10 text-destructive",
   completed: "bg-primary/10 text-primary",
   failed: "bg-destructive/10 text-destructive",
   cancelled: "bg-muted text-muted-foreground",
-  unknown: "bg-destructive/10 text-destructive",
-};
+} as const satisfies Record<ControlExecutionPhase, string>;
 
 /**
  * One Job as the Control Plane records it: its stored outputs, its actual
@@ -194,8 +198,6 @@ function JobWatchBody({
   const [input, setInput] = useState<
     { objective: string | null; attachments: string[] } | { error: string } | null
   >(null);
-  const [stop, setStop] = useState<string | null>(null);
-  const [stopBusy, setStopBusy] = useState(false);
   const unknownReason = details?.unknown_reason ?? null;
   const reloadRef = useRef<() => void>(() => {});
   const watchRef = useRef({
@@ -561,32 +563,18 @@ function JobWatchBody({
     };
   }, [client, jobId]);
 
-  async function requestStop() {
-    setStopBusy(true);
-    setStop(null);
-    try {
-      const result = await client.stopConversation(job?.conversation ?? jobId);
-      setStop(result.status === "requested" ? t("job.stop.requested") : t("job.stop.settled"));
-    } catch (error) {
-      if (error instanceof ControlTransportError) {
-        setStop(
-          error.code === "not_stoppable"
-            ? t("job.stop.notStoppable")
-            : t("job.stop.refused", { code: error.code }),
-        );
-      } else if (error instanceof ContractError) {
-        setStop(t("job.stop.contract"));
-      } else {
-        setStop(t("job.stop.unreachable"));
-      }
-    } finally {
-      setStopBusy(false);
-    }
-  }
-
   // Until the record is read there is no settlement to claim.
-  const state = settlement?.state ?? (job ? "unsettled" : null);
-  const badge = state ?? (failure ? "unavailable" : "loading");
+  // A settlement already read wins over the phase last announced with the record.
+  const phase: ControlExecutionPhase | null =
+    settlement && settlement.state !== "unsettled"
+      ? settlement.state
+      : (job?.execution_phase ?? null);
+  const execution = phase ? nativeExecutionStatus(phase, details ?? undefined) : null;
+  const phaseNote = execution ? executionDetail(t, execution) : undefined;
+  const badgeText = phase
+    ? t(EXECUTION_PHASE_KEYS[phase])
+    : t(failure ? "job.state.unavailable" : "job.state.loading");
+  const badgeClass = phase ? PHASE_BADGE[phase] : TONE.loading;
 
   // Earlier stored outputs are durable on the server, not in state. Loading
   // them is an explicit walk from the first stored sequence, merged by `seq`
@@ -814,21 +802,13 @@ function JobWatchBody({
         <h2 className="min-w-0 flex-1 break-all font-heading text-lg">{job?.name ?? jobId}</h2>
         <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
           <span
-            className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${TONE[badge] ?? TONE.unsettled}`}
+            className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${badgeClass}`}
           >
-            {t(STATE_KEYS[badge] ?? "state.unknown")}
+            {badgeText}
           </span>
           <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-            {t(STATE_KEYS[stream] ?? "state.unknown")}
+            {t(STREAM_KEYS[stream])}
           </span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => void requestStop()}
-            disabled={stopBusy || (state !== "unsettled" && !taskPlanActive(details?.task_plan))}
-          >
-            {stopBusy ? t("job.requestingStop") : t("job.requestStop")}
-          </Button>
         </div>
       </header>
       <div
@@ -847,7 +827,14 @@ function JobWatchBody({
         {statusFailure && (
           <p className="text-sm text-destructive">{t("job.activity.statusFailed")}</p>
         )}
-        {stop ? <p className="text-sm text-muted-foreground">{stop}</p> : null}
+        {phaseNote ? (
+          <p className="text-sm text-muted-foreground" role="status">
+            {phaseNote}
+          </p>
+        ) : null}
+        {phase === "reserved" || phase === "running" || phase === "stop_requested" ? (
+          <p className="text-sm text-muted-foreground">{t("job.stop.unavailable")}</p>
+        ) : null}
         {failure ? (
           <DismissibleNotice message={failureText(t, failure)} className="text-sm text-destructive">
             <p>{failureText(t, failure)}</p>

@@ -27,6 +27,7 @@ export type CreateSessionInput = {
 export interface OcgRuntimeClient {
   isListedConversation?(sessionId: string): boolean;
   openConversation?(job: string): Promise<string>;
+  presentMutableJob?(sessionId: string, job: import("./control-client").MutableJob): Promise<void>;
   hasEarlierHistory?(sessionId: string): boolean;
   loadEarlierHistory?(sessionId: string): Promise<void>;
   setChatSelection?(sessionId: string, selection: import("../contracts").ChatModelSelection): void;

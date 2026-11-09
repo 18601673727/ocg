@@ -48,6 +48,32 @@ export type ControlPoolUpdate =
   | { enabled: boolean; concurrency_limit?: never }
   | { decision: boolean; concurrency_limit?: never; enabled?: never };
 
+export type NativeExecutor = {
+  id: string;
+  pool: string;
+  name: string;
+  enabled: boolean;
+  archived: boolean;
+  revision: number;
+  capabilities: {
+    operation: "llm_request" | "decision";
+    protocol: string | null;
+  }[];
+};
+
+export function configurationIdentity(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let time = Date.now();
+  for (let i = 5; i >= 0; i--) {
+    bytes[i] = time % 256;
+    time = Math.floor(time / 256);
+  }
+  bytes[6] = (bytes[6] & 15) | 0x70;
+  bytes[8] = (bytes[8] & 63) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export type ControlConversationEdit =
   | { title: string; hidden?: never }
   | { hidden: true; title?: never }
@@ -59,7 +85,10 @@ export type ControlConversationEdit =
 
 export type JobStreamEvent = ControlJobEvent | { type: "heartbeat" };
 export type JobStreamEnd = "settled" | "stream_error" | "aborted";
-export type JobStreamSubscription = { closed: Promise<JobStreamEnd>; close(): void };
+export type JobStreamSubscription = {
+  closed: Promise<JobStreamEnd>;
+  close(): void;
+};
 
 export class ControlTransportError extends Error {
   constructor(
@@ -72,6 +101,14 @@ export class ControlTransportError extends Error {
     super(detail ? `${detail} (${code}, ${status})` : `OCG request: ${code} (${status})`);
     this.name = "ControlTransportError";
   }
+}
+
+/** Whether a Profile save was refused because the Profile changed since the edit began. */
+export function isProfileConflict(error: unknown): boolean {
+  return (
+    error instanceof ControlTransportError &&
+    (error.code === "profile_revision_changed" || error.code === "profile_changed")
+  );
 }
 
 export type HttpCanonicalControlClientOptions = {
@@ -104,6 +141,75 @@ export type ControlSubmission = {
   attachments?: string[];
 };
 
+export type MutableJobInput = {
+  text: string;
+  attachments: string[];
+  configuration: {
+    llm_profile: string;
+    agent_profile: string | null;
+    reasoning_effort: string | null;
+  } | null;
+  priority: "foreground" | "automatic" | "speculative";
+};
+
+export type MutableJob = {
+  id: string;
+  conversation: string;
+  previous: string | null;
+  project: string | null;
+  context: string;
+  revision: number;
+  phase: "unsubmitted" | "queued" | "executing" | "completed" | "failed" | "cancelled" | "unknown";
+  submitted_at: number | null;
+  unsupported_decision_history?: boolean;
+  input: MutableJobInput;
+};
+
+function mutableJob(value: unknown, context: string): MutableJob {
+  const envelope = value as { api_version?: number; job?: MutableJob } | null;
+  const job = envelope?.job;
+  if (
+    envelope?.api_version !== 1 ||
+    !job ||
+    job.context !== context ||
+    !Number.isSafeInteger(job.revision) ||
+    job.revision < 1 ||
+    !["unsubmitted", "queued", "executing", "completed", "failed", "cancelled", "unknown"].includes(
+      job.phase,
+    ) ||
+    !job.input ||
+    typeof job.input.text !== "string" ||
+    !Array.isArray(job.input.attachments) ||
+    !job.input.attachments.every((id) => typeof id === "string") ||
+    !["foreground", "automatic", "speculative"].includes(job.input.priority) ||
+    !(
+      job.unsupported_decision_history === undefined ||
+      typeof job.unsupported_decision_history === "boolean"
+    ) ||
+    !(job.submitted_at === null || Number.isSafeInteger(job.submitted_at))
+  ) {
+    throw new ContractError("job", "a valid mutable Job");
+  }
+  identity(job.id, "job");
+  identity(job.conversation, "conversation");
+  if (job.previous !== null) identity(job.previous, "previous");
+  if (job.project !== null) identity(job.project, "project");
+  for (const id of job.input.attachments) identity(id, "attachment");
+  if (job.input.configuration !== null) {
+    const config = job.input.configuration;
+    if (
+      !config ||
+      typeof config.llm_profile !== "string" ||
+      !(config.agent_profile === null || typeof config.agent_profile === "string") ||
+      !(config.reasoning_effort === null || typeof config.reasoning_effort === "string")
+    )
+      throw new ContractError("job.input.configuration", "a valid configuration");
+    identity(config.llm_profile, "llm_profile");
+    if (config.agent_profile) identity(config.agent_profile, "agent_profile");
+  }
+  return job;
+}
+
 export type ControlProfileWriteRequest =
   | {
       kind: "llm";
@@ -116,6 +222,10 @@ export type ControlProfileWriteRequest =
       credential?: string | null;
       clear_credential?: boolean;
       declared_capabilities: ControlCapability[];
+      /** Omitted keeps the stored headers; a list replaces them. */
+      headers?: Api.OutboundHeaderInput[];
+      /** The Profile's `edit_seq` when the form was opened; required to update one. */
+      expected_edit_seq?: number;
       parameters?: {
         temperature?: number | null;
         top_p?: number | null;
@@ -132,6 +242,7 @@ export type ControlProfileWriteRequest =
       instructions?: string | null;
       capabilities: ("chat" | "coding" | "decision")[];
       llm_targets: string[];
+      expected_edit_seq?: number;
     }
   | {
       kind: "decision_model";
@@ -144,6 +255,8 @@ export type ControlProfileWriteRequest =
       clear_credential?: boolean;
       declared_capabilities: string[];
       limits: Api.DecisionLimits;
+      headers?: Api.OutboundHeaderInput[];
+      expected_edit_seq?: number;
     }
   | {
       kind: "decision_agent";
@@ -151,6 +264,7 @@ export type ControlProfileWriteRequest =
       instructions?: string | null;
       models: string[];
       default_model?: string | null;
+      expected_edit_seq?: number;
     };
 
 export type ControlSubmissionResult = {
@@ -211,6 +325,34 @@ function identity(value: string, path: string): string {
   return value;
 }
 
+function nativePool(value: unknown): ControlPools["pools"][number] {
+  if (typeof value !== "object" || value === null) throw new ContractError("pool", "a native Pool");
+  const pool = value as Record<string, unknown>;
+  if (
+    typeof pool.id !== "string" ||
+    typeof pool.name !== "string" ||
+    typeof pool.enabled !== "boolean" ||
+    typeof pool.capacity !== "number" ||
+    !Number.isSafeInteger(pool.capacity) ||
+    pool.capacity < 1 ||
+    pool.capacity > 4294967295 ||
+    typeof pool.archived !== "boolean" ||
+    pool.archived ||
+    typeof pool.revision !== "number" ||
+    !Number.isSafeInteger(pool.revision) ||
+    pool.revision < 1
+  ) {
+    throw new ContractError("pool", "a valid native Pool");
+  }
+  return {
+    id: identity(pool.id, "pool"),
+    name: pool.name,
+    enabled: pool.enabled,
+    concurrency_limit: pool.capacity,
+    operations: undefined,
+  };
+}
+
 function submissionKey(value: string): string {
   if (!/^[A-Za-z0-9._~:+/=-]{16,128}$/.test(value)) {
     throw new ContractError("Idempotency-Key", "a well-formed idempotency key");
@@ -255,7 +397,15 @@ export async function readTranscriptEvidence(
   const [tools, replies] = await Promise.allSettled([
     client.readAllJobTools(job, signal),
     readReplies
-      ? client.readAllProviderResponses(job, signal, previous.at(-1)?.request)
+      ? client.readAllProviderResponses(job, signal, previous.at(-1)?.request).catch((error) => {
+          // A Decision Job has no reply text; the backend says so rather than failing.
+          if (
+            error instanceof ControlTransportError &&
+            error.code === "decision_response_unavailable"
+          )
+            return [];
+          throw error;
+        })
       : Promise.resolve([]),
   ]);
   signal.throwIfAborted();
@@ -746,7 +896,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         progress();
         try {
           const response = await fetchImpl(`${base}${typeof path === "string" ? path : path()}`, {
-            headers: { Accept: "text/event-stream", ...(await credentials()) },
+            headers: {
+              Accept: "text/event-stream",
+              ...(await credentials()),
+            },
             signal: attempt.signal,
             mode: "same-origin",
             credentials: programmatic ? "omit" : "same-origin",
@@ -926,7 +1079,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   type Conversations = Api.Conversations;
   type Projects = ControlProjects;
   type Children = ControlChildren;
-  type Observer<T> = { receive: (value: T) => void; error: (error: unknown) => void };
+  type Observer<T> = {
+    receive: (value: T) => void;
+    error: (error: unknown) => void;
+  };
   const catalogObservers = new Set<Observer<void>>();
   let stopCatalog: (() => void) | undefined;
   let catalogReady = false;
@@ -1160,11 +1316,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       // CSRF token in browser mode.
       sign?: boolean;
       signal?: AbortSignal;
+      context?: string;
+      revision?: number;
     },
   ): Promise<{ status: number; input: unknown }> {
     const headers: Record<string, string> = { ...(await credentials()) };
     if (settings.body !== undefined) headers["Content-Type"] = "application/json";
     if (settings.key !== undefined) headers["Idempotency-Key"] = settings.key;
+    if (settings.context !== undefined)
+      headers["X-OCG-Composer-Context"] = identity(settings.context, "context");
+    if (settings.revision !== undefined) headers["If-Match"] = String(sequence(settings.revision));
     if (settings.sign) {
       const csrf = await options.csrfToken?.();
       if (!csrf) throw new ControlTransportError("credential_unavailable", 0, false);
@@ -1247,16 +1408,22 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       query.push(`limit=${settings.limit}`);
     }
     const suffix = query.length ? `?${query.join("&")}` : "";
-    return (await send("GET", `/api/v1/projects${suffix}`, { signal: settings.signal }))
-      .input as ControlProjects;
+    return (
+      await send("GET", `/api/v1/projects${suffix}`, {
+        signal: settings.signal,
+      })
+    ).input as ControlProjects;
   }
 
   async function readProfilePage(settings: { before?: string; signal?: AbortSignal } = {}) {
     const suffix =
       settings.before === undefined ? "" : `?before=${identity(settings.before, "before")}`;
     return projectProfiles(
-      (await send("GET", `/api/v1/profiles${suffix}`, { signal: settings.signal }))
-        .input as Api.Profiles,
+      (
+        await send("GET", `/api/v1/profiles${suffix}`, {
+          signal: settings.signal,
+        })
+      ).input as Api.Profiles,
     );
   }
 
@@ -1272,7 +1439,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const page = await readProfilePage({ before, signal });
       pages.push(page);
       for (const executor of page.executor_protocols) {
-        executors.set(executor.id, executor);
+        const native =
+          (page as typeof page & { resource_model?: string }).resource_model === "independent";
+        executors.set(native ? `${executor.id}/${executor.protocol}` : executor.id, executor);
       }
       for (const provider of page.providers) {
         const key = provider.id;
@@ -1300,16 +1469,22 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       before = page.next_before;
     }
     const first = pages[0];
+    const native =
+      (first as (typeof first & { resource_model?: string }) | undefined)?.resource_model ===
+      "independent";
     return {
       profile_id: first?.profile_id ?? null,
       llm_profiles: pages
         .flatMap((page) => page.llm_profiles)
         .map((profile) => ({
           ...profile,
-          executors: [...executors.values()]
-            .filter((executor) => executor.protocol === profile.protocol)
-            .map((executor) => executor.id)
-            .sort(),
+          executors:
+            native && !profile.enabled
+              ? []
+              : [...executors.values()]
+                  .filter((executor) => executor.protocol === profile.protocol)
+                  .map((executor) => executor.id)
+                  .sort(),
         })),
       agent_profiles: pages.flatMap((page) => page.agent_profiles),
       decision_profiles: pages.flatMap((page) => page.decision_profiles),
@@ -1322,6 +1497,115 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   }
 
   return {
+    async currentMutableJob(context: string, signal?: AbortSignal): Promise<MutableJob | null> {
+      try {
+        return mutableJob(
+          (
+            await send("GET", "/api/v1/mutable-jobs/current", {
+              context,
+              signal,
+            })
+          ).input,
+          context,
+        );
+      } catch (error) {
+        if (
+          error instanceof ControlTransportError &&
+          error.status === 404 &&
+          error.code === "not_found"
+        )
+          return null;
+        throw error;
+      }
+    },
+    async readMutableJob(context: string, job: string, signal?: AbortSignal): Promise<MutableJob> {
+      return mutableJob(
+        (
+          await send("GET", `/api/v1/mutable-jobs/${jobIdentity(job)}`, {
+            context,
+            signal,
+          })
+        ).input,
+        context,
+      );
+    },
+    async createMutableJob(
+      context: string,
+      input: MutableJobInput,
+      key: string,
+      association: { conversation?: string; project?: string } = {},
+    ): Promise<MutableJob> {
+      return mutableJob(
+        (
+          await send("POST", "/api/v1/mutable-jobs", {
+            context,
+            body: { ...input, ...association },
+            key: submissionKey(key),
+            sign: !programmatic,
+          })
+        ).input,
+        context,
+      );
+    },
+    async updateMutableJob(
+      context: string,
+      job: string,
+      revision: number,
+      input: MutableJobInput,
+    ): Promise<MutableJob> {
+      return mutableJob(
+        (
+          await send("POST", `/api/v1/mutable-jobs/${jobIdentity(job)}`, {
+            context,
+            body: { revision: sequence(revision), input },
+            sign: !programmatic,
+          })
+        ).input,
+        context,
+      );
+    },
+    async submitMutableJob(
+      context: string,
+      job: string,
+      revision: number,
+      input: MutableJobInput,
+      key: string,
+    ): Promise<MutableJob> {
+      return mutableJob(
+        (
+          await send("POST", `/api/v1/mutable-jobs/${jobIdentity(job)}/submit`, {
+            context,
+            body: { revision: sequence(revision), input },
+            key: submissionKey(key),
+            sign: !programmatic,
+          })
+        ).input,
+        context,
+      );
+    },
+    async discardMutableJob(context: string, job: string, revision: number): Promise<void> {
+      await send("DELETE", `/api/v1/mutable-jobs/${jobIdentity(job)}`, {
+        context,
+        revision,
+        sign: !programmatic,
+      });
+    },
+    async cancelUnsupportedQueuedJob(
+      context: string,
+      job: string,
+      revision: number,
+    ): Promise<MutableJob> {
+      return mutableJob(
+        (
+          await send("POST", `/api/v1/mutable-jobs/${jobIdentity(job)}/cancel-unsupported`, {
+            context,
+            body: { revision: sequence(revision) },
+            sign: !programmatic,
+          })
+        ).input,
+        context,
+      );
+    },
     subscribeConversations(
       receive: Observer<Conversations>["receive"],
       error: Observer<Conversations>["error"],
@@ -1444,7 +1728,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const query = [`limit=${settings.limit ?? 50}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       return (
-        await send("GET", `/api/v1/conversations?${query.join("&")}`, { signal: settings.signal })
+        await send("GET", `/api/v1/conversations?${query.join("&")}`, {
+          signal: settings.signal,
+        })
       ).input as Api.Conversations;
     },
 
@@ -1511,8 +1797,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     async readConversationLimits(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
-      return (await send("GET", `/api/v1/conversations/${conversation}/limits`, { signal }))
-        .input as Api.ConversationLimits;
+      return (
+        await send("GET", `/api/v1/conversations/${conversation}/limits`, {
+          signal,
+        })
+      ).input as Api.ConversationLimits;
     },
 
     async readJobs(
@@ -1522,7 +1811,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       if (settings.query?.trim()) query.push(`query=${encodeURIComponent(settings.query.trim())}`);
       return (
-        await send("GET", `/api/v1/job-history?${query.join("&")}`, { signal: settings.signal })
+        await send("GET", `/api/v1/job-history?${query.join("&")}`, {
+          signal: settings.signal,
+        })
       ).input as Api.Jobs;
     },
 
@@ -1599,8 +1890,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         query.push(`file=${settings.file}`);
       }
       if (settings.before !== undefined) query.push(`before=${sequence(settings.before)}`);
-      return (await send("GET", `/api/v1/logs?${query.join("&")}`, { signal: settings.signal }))
-        .input as Api.Logs;
+      return (
+        await send("GET", `/api/v1/logs?${query.join("&")}`, {
+          signal: settings.signal,
+        })
+      ).input as Api.Logs;
     },
 
     /** What the host establishes about itself and its database, now. */
@@ -1609,8 +1903,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
 
     async readUpdate(latest: boolean, signal?: AbortSignal) {
-      return (await send("GET", `/api/v1/update${latest ? "?latest=1" : ""}`, { signal }))
-        .input as Api.Update;
+      return (
+        await send("GET", `/api/v1/update${latest ? "?latest=1" : ""}`, {
+          signal,
+        })
+      ).input as Api.Update;
     },
 
     async startUpdate(version: string) {
@@ -1624,6 +1921,36 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return projectJob(
         (await send("GET", `/api/v1/jobs/${job}`, { signal })).input as Api.JobDetails,
       );
+    },
+
+    /**
+     * The Conversation an identity belongs to. A Conversation identity is read as a
+     * Conversation and only an unknown one is then read as a Job: the two are different
+     * records. An identity that is neither is refused.
+     */
+    async resolveConversation(id: string, signal?: AbortSignal): Promise<string> {
+      jobIdentity(id);
+      // The UI addresses a Conversation by its own identity, so that is read first; only an
+      // identity the Conversation read does not know is looked up as a Job.
+      try {
+        await send("GET", `/api/v1/conversations/${id}/turns?limit=1`, { signal });
+        return id;
+      } catch (cause) {
+        if (
+          !(
+            cause instanceof ControlTransportError &&
+            cause.status === 404 &&
+            cause.code === "conversation_not_found"
+          )
+        )
+          throw cause;
+      }
+      const record = projectJob(
+        (await send("GET", `/api/v1/jobs/${id}`, { signal })).input as Api.JobDetails,
+      );
+      if (record.kind === "conversation") return record.id;
+      if (!record.conversation) throw new Error("This Job is a process turn with no conversation.");
+      return record.conversation;
     },
 
     async readJobDetails(job: string, signal?: AbortSignal) {
@@ -1668,7 +1995,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     /** The tree of the work below a Job: its ancestors, and the nodes below it. */
     async readJobTree(
       job: string,
-      settings: { after?: string; limit?: number; depth?: number; signal?: AbortSignal } = {},
+      settings: {
+        after?: string;
+        limit?: number;
+        depth?: number;
+        signal?: AbortSignal;
+      } = {},
     ) {
       jobIdentity(job);
       const limit = settings.limit ?? 50;
@@ -1688,8 +2020,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
     async readCards(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
-      return (await send("GET", `/api/v1/conversations/${conversation}/cards`, { signal }))
-        .input as Api.Cards;
+      return (
+        await send("GET", `/api/v1/conversations/${conversation}/cards`, {
+          signal,
+        })
+      ).input as Api.Cards;
     },
     async decideApproval(
       approval: ControlApproval,
@@ -1750,7 +2085,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     async amendQueuedMessage(
       conversation: string,
       amendment:
-        | { action: "edit"; turn: string; message: number; text: string; attachments: string[] }
+        | {
+            action: "edit";
+            turn: string;
+            message: number;
+            text: string;
+            attachments: string[];
+          }
         | { action: "withdraw"; turn: string; message: number },
       signal?: AbortSignal,
     ) {
@@ -1794,8 +2135,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
       const suffix = query.length ? `?${query.join("&")}` : "";
       return projectAgentProfiles(
-        (await send("GET", `/api/v1/agent-profiles${suffix}`, { signal: settings.signal }))
-          .input as Api.AgentProfiles,
+        (
+          await send("GET", `/api/v1/agent-profiles${suffix}`, {
+            signal: settings.signal,
+          })
+        ).input as Api.AgentProfiles,
       );
     },
 
@@ -1862,7 +2206,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     async readPools(settings: { before?: string; signal?: AbortSignal } = {}) {
       const query = settings.before ? `?before=${encodeURIComponent(settings.before)}` : "";
-      const answer = await send("GET", `/api/v2/pools${query}`, { signal: settings.signal });
+      const answer = await send("GET", `/api/v2/pools${query}`, {
+        signal: settings.signal,
+      });
       const page = answer.input as Api.Envelope<ControlPools>;
       if (
         page.api_version !== 2 ||
@@ -1883,7 +2229,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       } else if (page.next_before !== null) {
         throw new ContractError("next_before", "a terminal Pool cursor");
       }
-      return page;
+      return (answer.input as { resource_model?: string }).resource_model === "independent"
+        ? { ...page, pools: page.pools.map(nativePool) }
+        : page;
     },
 
     /** Updates a Pool's concurrency limit or enabled state. */
@@ -1903,7 +2251,120 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         sign: true,
         signal,
       });
-      return (answer.input as Api.PoolAnswer).pool as ControlPools["pools"][number];
+      const response = answer.input as Api.PoolAnswer & {
+        resource_model?: string;
+      };
+      return response.resource_model === "independent"
+        ? nativePool(response.pool)
+        : (response.pool as ControlPools["pools"][number]);
+    },
+
+    async createNativePool(id: string, name: string, capacity: number) {
+      identity(id, "pool");
+      if (!Number.isSafeInteger(capacity) || capacity < 1 || capacity > 4294967295)
+        throw new ContractError("capacity", "an integer from 1 to 4294967295");
+      const result = await send("POST", "/api/v1/pools", {
+        body: { id, name, capacity, enabled: true },
+        sign: true,
+      });
+      const response = result.input as {
+        api_version?: number;
+        resource_model?: string;
+        pool?: unknown;
+      };
+      if (response.api_version !== 1 || response.resource_model !== "independent")
+        throw new ContractError("pool", "a native Pool response");
+      return nativePool(response.pool);
+    },
+
+    async readNativeExecutors(settings: { before?: string; signal?: AbortSignal } = {}) {
+      const suffix =
+        settings.before === undefined ? "" : `?before=${identity(settings.before, "before")}`;
+      const result = await send("GET", `/api/v1/executors${suffix}`, {
+        signal: settings.signal,
+      });
+      const page = result.input as {
+        api_version?: number;
+        resource_model?: string;
+        executors?: NativeExecutor[];
+        has_more?: boolean;
+        next_before?: string | null;
+      };
+      if (
+        page.api_version !== 1 ||
+        page.resource_model !== "independent" ||
+        !Array.isArray(page.executors) ||
+        page.executors.length > 20 ||
+        typeof page.has_more !== "boolean"
+      )
+        throw new ContractError("executors", "a native Executor page");
+      for (const executor of page.executors) {
+        if (
+          !executor ||
+          typeof executor.id !== "string" ||
+          typeof executor.pool !== "string" ||
+          typeof executor.name !== "string" ||
+          typeof executor.enabled !== "boolean" ||
+          executor.archived !== false ||
+          !Number.isSafeInteger(executor.revision) ||
+          executor.revision < 1 ||
+          !Array.isArray(executor.capabilities)
+        )
+          throw new ContractError("executor", "a native Executor");
+        identity(executor.id, "executor");
+        identity(executor.pool, "pool");
+        if (
+          !executor.capabilities.every(
+            (capability) =>
+              capability &&
+              ((capability.operation === "decision" && capability.protocol === null) ||
+                (capability.operation === "llm_request" &&
+                  ["openai_chat_completions", "openai_responses", "anthropic_messages"].includes(
+                    capability.protocol ?? "",
+                  ))),
+          )
+        )
+          throw new ContractError("executor.capabilities", "supported Executor capabilities");
+      }
+      if (page.has_more) {
+        if (typeof page.next_before !== "string")
+          throw new ContractError("next_before", "an advancing Executor cursor");
+        identity(page.next_before, "next_before");
+        if (settings.before !== undefined && page.next_before >= settings.before)
+          throw new ContractError("next_before", "an advancing Executor cursor");
+      } else if (page.next_before !== null)
+        throw new ContractError("next_before", "a terminal Executor cursor");
+      return {
+        executors: page.executors,
+        has_more: page.has_more,
+        next_before: page.next_before ?? null,
+      };
+    },
+
+    async createNativeExecutor(
+      id: string,
+      pool: string,
+      name: string,
+      capability: NativeExecutor["capabilities"][number],
+    ) {
+      identity(id, "executor");
+      identity(pool, "pool");
+      const result = await send("POST", "/api/v1/executors", {
+        body: { id, pool, name, enabled: true, capabilities: [capability] },
+        sign: true,
+      });
+      const answer = result.input as {
+        api_version?: number;
+        executor?: NativeExecutor;
+      };
+      if (
+        answer.api_version !== 1 ||
+        !answer.executor ||
+        answer.executor.id !== id ||
+        answer.executor.pool !== pool
+      )
+        throw new ContractError("executor", "the registered Executor");
+      return answer.executor;
     },
 
     /** Every Profile (LLM Profiles, Agent Profiles) and the merged Provider projection. */
@@ -1917,6 +2378,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         endpoint: string;
         credential_ref?: string | null;
         credential?: string;
+        headers?: Api.OutboundHeaderInput[];
+        /** A saved Profile of this Provider, whose stored headers are probed. */
+        profile_id?: string;
       },
       signal?: AbortSignal,
     ) {
@@ -1939,6 +2403,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             endpoint: string;
             credential?: string;
             credential_ref?: string;
+            headers?: Api.OutboundHeaderInput[];
           },
       models: Api.ProviderModel[],
       capabilities: ControlCapability[],
@@ -1961,7 +2426,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
 
     async readGlobalCompactionSettings(signal?: AbortSignal) {
-      const answer = await send("GET", "/api/v1/settings/compaction", { signal });
+      const answer = await send("GET", "/api/v1/settings/compaction", {
+        signal,
+      });
       return answer.input as Api.GlobalCompactionSettings;
     },
 
@@ -1977,9 +2444,27 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.input as Api.GlobalCompactionSettings;
     },
 
+    async readGlobalOutboundHeaders(signal?: AbortSignal) {
+      const answer = await send("GET", "/api/v1/settings/outbound-headers", {
+        signal,
+      });
+      return answer.input as Api.GlobalOutboundHeaders;
+    },
+
+    /** Replaces the global headers; `revision` is the one last read. */
+    async saveGlobalOutboundHeaders(revision: number, headers: Api.OutboundHeaderInput[]) {
+      const answer = await send("POST", "/api/v1/settings/outbound-headers", {
+        body: { revision, headers },
+        sign: true,
+      });
+      return answer.input as Api.GlobalOutboundHeaders;
+    },
+
     async deleteLlmProfile(profileId: string) {
       identity(profileId, "profile");
-      const answer = await send("DELETE", `/api/v1/profiles/${profileId}`, { sign: true });
+      const answer = await send("DELETE", `/api/v1/profiles/${profileId}`, {
+        sign: true,
+      });
       projectProfiles(answer.input as Api.Profiles);
       profileListeners.forEach((listener) => listener());
       return readAllProfiles();
@@ -2034,7 +2519,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     /** One stored page of the Job's outputs, in `seq` order. */
     async readOutputs(
       job: string,
-      settings: { afterSeq?: number; limit?: number; signal?: AbortSignal } = {},
+      settings: {
+        afterSeq?: number;
+        limit?: number;
+        signal?: AbortSignal;
+      } = {},
     ) {
       jobIdentity(job);
       const query: string[] = [];
@@ -2054,7 +2543,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
 
     async readLatestOutput(job: string, signal?: AbortSignal): Promise<ControlOutput | null> {
       jobIdentity(job);
-      const answer = await send("GET", `/api/v1/jobs/${job}/outputs/latest`, { signal });
+      const answer = await send("GET", `/api/v1/jobs/${job}/outputs/latest`, {
+        signal,
+      });
       const page = answer.input as Api.Outputs;
       return page.outputs[0] ?? null;
     },
@@ -2162,7 +2653,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const tools: ControlToolCall[] = [];
       let cursor: string | undefined = undefined;
       for (let pageCount = 0; pageCount < 50; pageCount++) {
-        const page = await readJobToolsInternal(job, { after: cursor, limit: 100, signal });
+        const page = await readJobToolsInternal(job, {
+          after: cursor,
+          limit: 100,
+          signal,
+        });
         tools.push(...page.tools);
         if (!page.has_more || !page.next_after) {
           break;
@@ -2233,7 +2728,9 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     /** Reads metadata of an image Attachment. */
     async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
       identity(attachmentId, "attachment");
-      const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, { signal });
+      const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, {
+        signal,
+      });
       return (answer.input as { attachment: ControlAttachment }).attachment;
     },
 
@@ -2278,7 +2775,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       });
       const session = (answer.input as Api.SessionResponse).session;
       if (!session.authenticated) throw new ContractError("session", "a signed-in session");
-      return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
+      return {
+        csrfToken: session.csrf_token,
+        expiresAtUs: session.expires_at_us,
+      };
     },
 
     /** The session this browser holds, if it is still authorized. */
@@ -2286,7 +2786,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const answer = await send("GET", "/api/v1/session", { signal });
       const session = (answer.input as Api.SessionResponse).session;
       if (!session.authenticated) throw new ContractError("session", "a signed-in session");
-      return { csrfToken: session.csrf_token, expiresAtUs: session.expires_at_us };
+      return {
+        csrfToken: session.csrf_token,
+        expiresAtUs: session.expires_at_us,
+      };
     },
 
     /** Revokes this browser's session. */

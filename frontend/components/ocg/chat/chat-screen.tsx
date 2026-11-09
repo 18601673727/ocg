@@ -35,11 +35,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useI18n } from "../i18n";
+import { executionDetail, executionLabel } from "../runtime/job-status";
 import type { ChatSession, QueuedChatMessage, RuntimeStatus } from "../types";
 import type { ChatModelSelection } from "../contracts";
 import type { JobExecution } from "../execution/domain";
 import type { ComposerIntent } from "../composer/domain";
 import { ContextTranscript } from "./context-transcript";
+import { MutableComposer, contextForSession } from "./mutable-composer";
+import { ControlTransportError } from "../runtime/control-client";
 
 type QueueState = { queue: QueuedChatMessage[]; paused: boolean };
 
@@ -88,7 +91,64 @@ const ChatComposerContext = createContext<ChatComposerContextValue | null>(null)
 
 const ChatComposerSlot: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
   const value = useContext(ChatComposerContext);
+  const { control } = useOcgRuntime();
+  const [model, setModel] = useState<"checking" | "legacy" | "mutable" | "error">("checking");
+  const [probeError, setProbeError] = useState("");
+  const [composerContext, setComposerContext] = useState("");
+  const [probedSession, setProbedSession] = useState("");
+  const sessionId = value?.session.id;
+  const conversationId = value?.session.conversationId;
+  useEffect(() => {
+    if (!control || !sessionId) return;
+    const abort = new AbortController();
+    void Promise.resolve()
+      .then(() => {
+        setModel("checking");
+        return contextForSession(sessionId, conversationId);
+      })
+      .then((context) => {
+        if (!abort.signal.aborted) setComposerContext(context);
+        return control.currentMutableJob(context, abort.signal);
+      })
+      .then(() => {
+        if (!abort.signal.aborted) {
+          setProbedSession(sessionId);
+          setModel("mutable");
+        }
+      })
+      .catch((error: unknown) => {
+        if (abort.signal.aborted) return;
+        setProbedSession(sessionId);
+        if (error instanceof ControlTransportError && error.code === "mutable_jobs_unavailable")
+          setModel("legacy");
+        else {
+          setProbeError(error instanceof Error ? error.message : String(error));
+          setModel("error");
+        }
+      });
+    return () => abort.abort();
+    // A submitted new conversation keeps this Composer mounted; its context is
+    // rebound by the Composer after confirmation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [control, sessionId]);
   if (!value) return null;
+  if (model === "checking" || probedSession !== sessionId)
+    return <p role="status">Checking Composer availability…</p>;
+  if (model === "error") return <p role="alert">Composer unavailable: {probeError}</p>;
+  if (model === "mutable") {
+    return (
+      <MutableComposer
+        key={value.session.id}
+        sessionId={value.session.id}
+        conversation={value.session.conversationId}
+        project={value.session.projectId}
+        context={composerContext}
+        selection={value.selection}
+        onSelectionChange={value.setSelection}
+        onPreference={value.onPreference}
+      />
+    );
+  }
 
   return (
     <div className="flex w-full flex-col">
@@ -291,11 +351,68 @@ function QueuedMessageRow({
 }
 
 function MessageFileChanges() {
+  const { t } = useI18n();
   const value = useContext(ChatComposerContext);
   const id = useAuiState((state) => state.message.id);
   const { snapshot } = useOcgRuntime();
   const messages = value ? (snapshot.messagesBySession[value.session.id] ?? []) : [];
   const message = messages.find((message) => message.id === id);
+  if (message?.decision) {
+    const { request, result } = message.decision;
+    return (
+      <section className="my-3 rounded-lg border p-3" aria-label="Decision">
+        <strong>Decision · {request.question.kind.replaceAll("_", " ")}</strong>
+        <p className="mt-2 whitespace-pre-wrap">{request.question.prompt}</p>
+        {request.question.options?.map((option) => (
+          <p key={option.id}>
+            {option.id}: {option.description}
+          </p>
+        ))}
+        {request.question.levels?.map((level) => (
+          <p key={level.value}>
+            {level.value}: {level.description}
+          </p>
+        ))}
+        <details className="mt-2">
+          <summary>Caller state</summary>
+          <pre className="overflow-x-auto whitespace-pre-wrap">
+            {JSON.stringify(request.state, null, 2)}
+          </pre>
+        </details>
+        {result ? (
+          <>
+            <strong>Result</strong>
+            <pre className="overflow-x-auto whitespace-pre-wrap">
+              {JSON.stringify(result.outcome, null, 2)}
+            </pre>
+          </>
+        ) : (
+          <div className="mt-2" role="status">
+            <p>
+              <strong>
+                {message.execution
+                  ? executionLabel(t, message.execution)
+                  : message.status === "pending"
+                    ? "Pending"
+                    : `Job ${message.status}`}
+              </strong>
+              {message.decision.failure ? `: ${message.decision.failure}` : ""}
+            </p>
+            {message.execution && executionDetail(t, message.execution) && (
+              <p className="text-muted-foreground">{executionDetail(t, message.execution)}</p>
+            )}
+            {message.status === "unknown" &&
+              message.failureReason === undefined &&
+              !(message.execution && executionDetail(t, message.execution)) && (
+                <p className="text-muted-foreground">
+                  The outcome could not be established; it is not reported as stopped.
+                </p>
+              )}
+          </div>
+        )}
+      </section>
+    );
+  }
   if (
     !message?.jobId ||
     messages.findLast((item) => item.role === "assistant" && item.jobId === message.jobId)?.id !==

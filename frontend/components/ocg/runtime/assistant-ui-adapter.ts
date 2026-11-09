@@ -70,7 +70,7 @@ function metadataFor(message: ChatMessage, context: MessageContext): OcgMetadata
     failureReason: message.failureReason,
     failureAt: message.failureAt,
     failureCode: message.failureCode,
-    canRetry: message.id === context.retryId,
+    canRetry: message.id === context.retryId && message.execution?.actionsSupported !== false,
   };
 }
 

@@ -8,6 +8,7 @@ import type {
   HttpCanonicalControlClient,
   ControlProfileWriteRequest,
 } from "../runtime/control-client";
+import { isProfileConflict } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { Section, describeError, selectableLlmProfiles } from "./settings-parts";
 import { Button } from "@/components/ui/button";
@@ -29,6 +30,13 @@ import {
   DialogDescription,
   DialogFooter,
 } from "@/components/ui/dialog";
+import { HeadersEditor } from "./headers-editor";
+import {
+  type HeaderDraft,
+  type HeaderDraftError,
+  draftsToInputs,
+  headersToDrafts,
+} from "./header-drafts";
 
 const emptyLimits: ControlDecisionLimits = {
   max_input_tokens_per_request: null,
@@ -56,11 +64,15 @@ function ProfileEditor({
 }: ProfileEditorProps & { kind: "decision_model" | "decision_agent" }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState<string>();
+  // The revision the open form was made from; the server refuses an edit made from an older one.
+  const [editingSeq, setEditingSeq] = useState<number>();
   const [name, setName] = useState("");
   const [model, setModel] = useState("");
   const [endpoint, setEndpoint] = useState("");
   const [credential, setCredential] = useState("");
   const [credentialRef, setCredentialRef] = useState<string | null>(null);
+  const [headers, setHeaders] = useState<HeaderDraft[]>([]);
+  const [headerError, setHeaderError] = useState<HeaderDraftError>();
   const [capabilities, setCapabilities] = useState<string[]>(["choice"]);
   const [limits, setLimits] = useState<ControlDecisionLimits>(emptyLimits);
   const [instructions, setInstructions] = useState("");
@@ -71,11 +83,14 @@ function ProfileEditor({
   const [deleting, setDeleting] = useState<{ id: string; name: string }>();
   function reset() {
     setEditing(undefined);
+    setEditingSeq(undefined);
     setName("");
     setModel("");
     setEndpoint("");
     setCredential("");
     setCredentialRef(null);
+    setHeaders([]);
+    setHeaderError(undefined);
     setCapabilities(["choice"]);
     setLimits(emptyLimits);
     setInstructions("");
@@ -85,6 +100,12 @@ function ProfileEditor({
   }
   async function save(event: FormEvent) {
     event.preventDefault();
+    const headerRequest = draftsToInputs(headers);
+    if ("error" in headerRequest) {
+      setHeaderError(headerRequest.error);
+      return;
+    }
+    setHeaderError(undefined);
     setBusy(true);
     setError(undefined);
     const payload: ControlProfileWriteRequest =
@@ -98,6 +119,8 @@ function ProfileEditor({
             declared_capabilities: capabilities,
             limits,
             credential_ref: credentialRef,
+            headers: headerRequest.inputs,
+            ...(editingSeq === undefined ? {} : { expected_edit_seq: editingSeq }),
             ...(credential ? { credential } : {}),
           }
         : {
@@ -106,6 +129,7 @@ function ProfileEditor({
             instructions: instructions.trim() || null,
             models,
             default_model: defaultModel,
+            ...(editingSeq === undefined ? {} : { expected_edit_seq: editingSeq }),
           };
     try {
       const result = editing
@@ -114,7 +138,25 @@ function ProfileEditor({
       onSaved(result);
       reset();
     } catch (cause) {
-      setError(describeError(cause, t));
+      if (isProfileConflict(cause) && editing) {
+        // Keep the draft, show the latest version, and rebase the form on it so a deliberate
+        // second save replaces the other edit.
+        setError(
+          t(kind === "decision_agent" ? "settings.agent.conflict" : "settings.llm.conflict"),
+        );
+        try {
+          const latest = await client.readProfiles();
+          onSaved(latest);
+          const current = [...latest.decision_profiles, ...latest.decision_agent_profiles].find(
+            (profile) => profile.id === editing,
+          );
+          if (current) setEditingSeq(current.edit_seq);
+        } catch {
+          // The list is stale until the next refresh; the draft and the conflict notice stay.
+        }
+      } else {
+        setError(describeError(cause, t));
+      }
     } finally {
       setBusy(false);
       setCredential("");
@@ -212,6 +254,15 @@ function ProfileEditor({
                   onChange={(event) => setCredential(event.target.value)}
                 />
               </label>
+              <HeadersEditor
+                legend={t("headers.title")}
+                hint={t("headers.connectionHint")}
+                value={headers}
+                onChange={setHeaders}
+                disabled={busy}
+                allowSecret
+                error={headerError}
+              />
               <fieldset className="space-y-2">
                 <legend className="text-xs">{t("decision.capabilities")}</legend>
                 {(["choice", "binary_probability", "ordinal_score"] as const).map((capability) => (
@@ -389,10 +440,12 @@ function ProfileEditor({
                   onClick={() => {
                     reset();
                     setEditing(profile.id);
+                    setEditingSeq(profile.edit_seq);
                     setName(profile.name);
                     setModel(profile.model);
                     setEndpoint(profile.endpoint ?? "");
                     setCredentialRef(profile.credential_ref);
+                    setHeaders(headersToDrafts(profile.headers));
                     setCapabilities(profile.declared_capabilities);
                     setLimits(profile.limits);
                   }}
@@ -427,6 +480,7 @@ function ProfileEditor({
                   onClick={() => {
                     reset();
                     setEditing(profile.id);
+                    setEditingSeq(profile.edit_seq);
                     setName(profile.name);
                     setInstructions(profile.instructions ?? "");
                     setModels(profile.models);

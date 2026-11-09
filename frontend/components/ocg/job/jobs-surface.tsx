@@ -13,23 +13,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { SettlementState } from "../contracts/api";
+import type { ControlExecutionPhase } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import { useI18n, type I18nKey } from "../i18n";
+import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { SELECTED_ROW } from "../primitives/selection";
 import { LoadMore } from "../primitives/load-more";
 import { ListStatus } from "../primitives/list-status";
 import { Pill } from "../primitives/pill";
-import type { Tone } from "../primitives/tone";
-
-const settlement = {
-  unsettled: { label: "job.state.unsettled", tone: "violet" },
-  completed: { label: "job.activity.completed", tone: "emerald" },
-  failed: { label: "job.activity.failed", tone: "red" },
-  cancelled: { label: "job.activity.cancelled", tone: "slate" },
-  unknown: { label: "job.activity.unknown", tone: "slate" },
-} as const satisfies Record<SettlementState, { label: I18nKey; tone: Tone }>;
+import { EXECUTION_PHASE_KEYS, EXECUTION_PHASE_TONES } from "../runtime/job-status";
 
 export function JobsSurface({
   client,
@@ -51,10 +43,10 @@ export function JobsSurface({
   );
   const [query, setQuery] = useState("");
   const searchInput = useRef<HTMLInputElement>(null);
-  const [status, setStatus] = useState<SettlementState | "all">("all");
+  const [status, setStatus] = useState<ControlExecutionPhase | "all">("all");
   const [records, setRecords] = useState<Awaited<ReturnType<typeof client.readJobs>>["jobs"]>([]);
   const visibleRecords =
-    status === "all" ? records : records.filter((record) => record.settlement.state === status);
+    status === "all" ? records : records.filter((record) => record.execution_phase === status);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
@@ -177,9 +169,9 @@ export function JobsSurface({
   const filtered = status !== "all" || query.length > 0;
   const options = [
     { value: "all" as const, label: t("jobs.statusAll") },
-    ...Object.entries(settlement).map(([value, { label }]) => ({
-      value: value as SettlementState,
-      label: t(label),
+    ...(Object.keys(EXECUTION_PHASE_KEYS) as ControlExecutionPhase[]).map((value) => ({
+      value,
+      label: t(EXECUTION_PHASE_KEYS[value]),
     })),
   ];
 
@@ -206,7 +198,7 @@ export function JobsSurface({
               onChange={(event) => updateQuery(event.target.value)}
             />
           </div>
-          <Select<SettlementState | "all">
+          <Select<ControlExecutionPhase | "all">
             value={status}
             items={options}
             onValueChange={(value) => {
@@ -303,8 +295,8 @@ export function JobsSurface({
                       </button>
                     </td>
                     <td className="whitespace-nowrap px-3 py-3">
-                      <Pill tone={settlement[record.settlement.state].tone} dot>
-                        {t(settlement[record.settlement.state].label)}
+                      <Pill tone={EXECUTION_PHASE_TONES[record.execution_phase]} dot>
+                        {t(EXECUTION_PHASE_KEYS[record.execution_phase])}
                       </Pill>
                     </td>
                     <td className="whitespace-nowrap px-3 py-3 text-xs tabular-nums text-muted-foreground">
@@ -319,7 +311,9 @@ export function JobsSurface({
                           variant="outline"
                           size="sm"
                           className="shrink-0"
-                          onClick={() => onOpenChat(record.id)}
+                          onClick={() =>
+                            record.conversation !== null && onOpenChat(record.conversation)
+                          }
                         >
                           <MessageSquare className="size-3.5" aria-hidden="true" />
                           {t("jobs.openInChat")}

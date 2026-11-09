@@ -307,7 +307,8 @@ export function JobTree({
                   className="shrink-0"
                   onClick={(event) => {
                     event.stopPropagation();
-                    onOpenChat(node.id);
+                    const target = node.kind === "conversation" ? node.id : node.conversation;
+                    if (target !== null) onOpenChat(target);
                   }}
                 >
                   {t("jobs.openInChat")}

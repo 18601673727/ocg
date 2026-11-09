@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ChatMessage, ChatSession } from "../types";
 import { runtimeStateLabel, useI18n } from "../i18n";
+import { executionDetail, executionLabel } from "../runtime/job-status";
 import { ConversationContext } from "./conversation-context";
 import { ConversationLimitsEditor } from "./conversation-limits";
 
@@ -79,6 +80,9 @@ export function ChatInspector({
                     key={`context:${session.conversationId}`}
                     conversation={session.conversationId}
                     agentProfile={session.agentProfile}
+                    actionsSupported={
+                      !messages.some((m) => m.execution?.actionsSupported === false)
+                    }
                   />
                 )}
               </dl>
@@ -105,9 +109,16 @@ export function ChatInspector({
                           {t("usage.turns")} {index + 1}
                         </span>
                         <span className="text-muted-foreground">
-                          {runtimeStateLabel(t, message.status)}
+                          {message.execution
+                            ? executionLabel(t, message.execution)
+                            : runtimeStateLabel(t, message.status)}
                         </span>
                       </div>
+                      {message.execution && executionDetail(t, message.execution) && (
+                        <p className="text-muted-foreground">
+                          {executionDetail(t, message.execution)}
+                        </p>
+                      )}
                       {message.jobId && (
                         <button
                           type="button"

@@ -2,9 +2,12 @@ import type * as Api from "./api";
 import { ContractError } from "./decode";
 
 export type ControlJob = Api.Job;
+export type ControlExecutionPhase = Api.ExecutionPhase;
 export type ControlOutput = Api.Output;
 export type ControlJobDetails = Api.Job &
-  Pick<Api.JobDetails, "result" | "unknown_reason" | "activity" | "task_plan">;
+  Pick<Api.JobDetails, "result" | "unknown_reason" | "activity" | "task_plan" | "allocation"> & {
+    mutable_phase?: string;
+  };
 export type ControlJobActivity = ControlJobDetails["activity"];
 export type ControlTaskPlan = NonNullable<ControlJobDetails["task_plan"]>;
 export type ControlJobToolsPage = Api.Tools;
@@ -44,6 +47,8 @@ export function projectJobDetails(input: Api.JobDetails): ControlJobDetails {
     result: input.result,
     activity: input.activity,
     task_plan: input.task_plan,
+    allocation: input.allocation,
+    mutable_phase: (input as Api.JobDetails & { phase?: string }).phase,
   };
 }
 
