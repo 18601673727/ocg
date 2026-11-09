@@ -8,7 +8,10 @@
 //! reading the Job's standing, reserving exactly the named Job, the checked
 //! start, the bounded exchange and the report of what the database shows
 //! afterwards. It grants no authority of its own and is reached only through
-//! those two callers.
+//! those two callers. The native scheduler
+//! ([`crate::system::native_scheduler`]), which reserves through its own
+//! selection, borrows only [`within_deadline`] and the phase and outcome
+//! names.
 //!
 //! There is one reservation, one checked start and one exchange, and nothing
 //! here retries, reconciles or releases. An exchange that may have reached

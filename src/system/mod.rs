@@ -10,6 +10,7 @@ pub(crate) mod manual_execution;
 pub(crate) mod manual_external;
 pub(crate) mod manual_loopback;
 pub mod monitor;
+pub(crate) mod native_scheduler;
 pub(crate) mod notification;
 pub mod policy;
 pub mod runtime;

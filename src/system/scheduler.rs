@@ -602,9 +602,17 @@ impl ExecutionRuntime {
         database: DatabaseHandle,
         scope: ClaimScope,
     ) -> Result<Self, ExecutionRuntimeError> {
-        let wake = database
-            .take_scheduler_wake()
-            .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
+        // Only a runtime that schedules takes the database's scheduler wake;
+        // one that never schedules leaves it untouched.
+        let wake = if ExecutionControl::AutonomousScheduling.is_enabled() {
+            Some(
+                database
+                    .take_scheduler_wake()
+                    .ok_or(ExecutionRuntimeError::SchedulerStopped)?,
+            )
+        } else {
+            None
+        };
         let (messages, receiver) = flume::bounded(SCHEDULER_NOTIFICATIONS);
         let (wakeups, wakes) = flume::bounded(1);
         let sender = SchedulerNotifications::new(messages, wakeups);
@@ -667,7 +675,7 @@ impl Drop for ExecutionRuntime {
 async fn dispatch_runtime(
     database: DatabaseHandle,
     scope: ClaimScope,
-    wake: crate::db::SchedulerWakeSubscription,
+    wake: Option<crate::db::SchedulerWakeSubscription>,
     wakes: flume::Receiver<()>,
     sender: SchedulerNotifications,
     receiver: flume::Receiver<SchedulerMessage>,
@@ -675,13 +683,24 @@ async fn dispatch_runtime(
     state: SharedState,
     shutdown: CancellationToken,
 ) -> Result<(), ExecutionRuntimeError> {
-    if !ExecutionControl::AutonomousScheduling.is_enabled()
-        || !ExecutionControl::LegacyProviderExecution.is_enabled()
-    {
-        // Neither the legacy claim path nor any autonomous dispatch can run
-        // against the native storage model.
+    let Some(wake) = wake.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled()) else {
+        // No autonomous dispatch of any kind.
         drop(admissions);
         shutdown.cancelled().await;
+        return Ok(());
+    };
+    if !ExecutionControl::LegacyProviderExecution.is_enabled() {
+        // The legacy claim path cannot run against the native storage model.
+        // The native scheduler runs only in the host that serves stored Jobs,
+        // never inside a one-shot command's host, and admits no submission
+        // here.
+        drop(admissions);
+        match scope {
+            ClaimScope::Stored => {
+                crate::system::native_scheduler::run(database, wake, shutdown).await;
+            }
+            ClaimScope::Process => shutdown.cancelled().await,
+        }
         return Ok(());
     }
     let dispatcher = ntex::rt::spawn({

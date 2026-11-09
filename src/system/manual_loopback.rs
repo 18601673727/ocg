@@ -66,7 +66,9 @@ impl LoopbackRequest {
 
 /// Why the exact prepared request is not a tool-free loopback exchange. The
 /// same facts are asked before the reservation and again inside the start.
-fn check_prepared(prepared: &PreparedDevelopmentHandoff) -> Result<(), &'static str> {
+/// The native scheduler's loopback dispatch asks it inside its start too; see
+/// [`crate::system::native_scheduler`].
+pub(crate) fn check_prepared(prepared: &PreparedDevelopmentHandoff) -> Result<(), &'static str> {
     let Some(frozen) = prepared.generative_configuration() else {
         return Err("generative_required");
     };
