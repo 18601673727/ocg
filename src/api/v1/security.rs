@@ -36,10 +36,24 @@ fn approval_or_release(rest: &str) -> bool {
     }
 }
 
+fn mutable_job_write(rest: &str) -> bool {
+    let segments = rest.split('/').collect::<Vec<_>>();
+    matches!(
+        segments.as_slice(),
+        ["mutable-jobs"] | ["mutable-jobs", _] | ["mutable-jobs", _, "submit"]
+    ) || matches!(
+        segments.as_slice(),
+        ["mutable-jobs", _, "cancel-unsupported"]
+    )
+}
+
 /// Whether `path` names a route that is submitted to with `POST`: Job
 /// submission, a Job's stop, a Profile, Project, Pool or conversation
 /// change, or an image upload.
 fn takes_post(path: &str) -> bool {
+    if path == "/api/v1/executors" || path == "/api/v1/pools" {
+        return true;
+    }
     match path.strip_prefix("/api/v1/") {
         Some(
             "update"
@@ -49,10 +63,12 @@ fn takes_post(path: &str) -> bool {
             | "projects"
             | "provider-models"
             | "attachments"
-            | "settings/compaction",
+            | "settings/compaction"
+            | "settings/outbound-headers",
         ) => true,
         Some(rest) => {
-            conversation_action(rest)
+            mutable_job_write(rest)
+                || conversation_action(rest)
                 || decision(rest)
                 || profile_availability(rest)
                 || approval_or_release(rest)
@@ -67,13 +83,17 @@ fn takes_post(path: &str) -> bool {
 /// Whether `path` names a route that is removed with `DELETE`: one Profile
 /// member, whose LLM Profile is archived in place.
 fn takes_delete(path: &str) -> bool {
-    path.strip_prefix("/api/v1/")
-        .is_some_and(|rest| member(rest, "profiles") || member(rest, "providers"))
+    path.strip_prefix("/api/v1/").is_some_and(|rest| {
+        member(rest, "profiles") || member(rest, "providers") || member(rest, "mutable-jobs")
+    })
 }
 
 /// The largest JSON body `path` accepts with `POST`, or `None` when it
 /// accepts none.
 fn json_post_limit(path: &str) -> Option<usize> {
+    if path == "/api/v1/executors" || path == "/api/v1/pools" {
+        return Some(MAX_SUBMISSION_BYTES);
+    }
     match path.strip_prefix("/api/v1/") {
         Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
         Some("update") => Some(update::UPDATE_BODY_LIMIT),
@@ -83,9 +103,11 @@ fn json_post_limit(path: &str) -> Option<usize> {
             | "profiles"
             | "projects"
             | "provider-models"
-            | "settings/compaction",
+            | "settings/compaction"
+            | "settings/outbound-headers",
         ) => Some(MAX_SUBMISSION_BYTES),
-        Some(rest) => (decision(rest)
+        Some(rest) => (mutable_job_write(rest)
+            || decision(rest)
             || profile_availability(rest)
             || conversation_action(rest)
             || approval_or_release(rest)

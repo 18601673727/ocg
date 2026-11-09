@@ -88,6 +88,11 @@ const INVALID_ROUTE_BODY: Refusal = Refusal::new(
     "invalid_body",
     "the body is not a request this route accepts",
 );
+const NATIVE_ACTION_UNSUPPORTED: Refusal = Refusal::new(
+    StatusCode::CONFLICT,
+    "native_action_unsupported",
+    "this action is not available for native Jobs and conversations",
+);
 const KEY_CONFLICT: Refusal = Refusal::new(
     StatusCode::CONFLICT,
     "idempotency_key_conflict",
@@ -1639,7 +1644,7 @@ pub(super) async fn check_configuration(
         }) => {
             if !agent.models.contains(&request.llm_profile.into())
                 || !agent.supports_model(&ConfigBody::Model(llm.clone()))
-                || (!agent.manages_jobs() && agent.workspace_grant().is_none())
+                || !agent.runs_generative()
             {
                 return Err(AGENT_TARGET_MISMATCH);
             }
@@ -1907,6 +1912,7 @@ pub(super) async fn compact(
         .and_then(Value::as_str)
         .ok_or(INVALID_ROUTE_BODY)?;
     let model = identity(model, "profile:").ok_or(INVALID_ROUTE_BODY)?;
+    refuse_native(&shared.database, conversation).await?;
     let fingerprint = RequestFingerprint::from_digest({
         let mut context = Context::new(&SHA256);
         context.update(conversation.to_string().as_bytes());
@@ -1952,6 +1958,26 @@ pub(super) async fn compact(
     Ok(Reply::ok(envelope(serde_json::json!(wire))))
 }
 
+/// Refuses a legacy turn action aimed at a native Job or conversation. Those
+/// actions read the legacy Job row, and a native row is not one: reading it
+/// is a storage fault that stops the database, so the refusal must come
+/// before any command is queued.
+pub(super) async fn refuse_native(database: &DatabaseHandle, id: JobId) -> Result<(), Refusal> {
+    let turn = !matches!(
+        database.mutable_job_details(id, None).await?,
+        crate::db::redb::MutableJobDetailsLookup::NotMutable
+    );
+    if turn
+        || database
+            .mutable_conversation_turn_page(id, None, 1)
+            .await?
+            .is_some()
+    {
+        return Err(NATIVE_ACTION_UNSUPPORTED);
+    }
+    Ok(())
+}
+
 pub(super) async fn action(
     shared: &Shared,
     conversation: JobId,
@@ -1959,6 +1985,7 @@ pub(super) async fn action(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     use crate::db::entities::{Actor, StopCause};
+    refuse_native(&shared.database, conversation).await?;
     let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
     let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
     if action == "queue" {
@@ -2275,6 +2302,18 @@ pub(super) async fn release_slot(
             .is_some_and(|v| v != &Value::Bool(true))
     {
         return Err(INVALID_ROUTE_BODY);
+    }
+    if matches!(
+        database.mutable_job_details(job, None).await?,
+        crate::db::redb::MutableJobDetailsLookup::Found(_)
+    ) {
+        // A native Allocation is released only by confirmed termination
+        // evidence; the legacy slot release cannot prove or record it.
+        return Err(Refusal::new(
+            StatusCode::CONFLICT,
+            "native_allocation_not_releasable",
+            "a native Job's Allocation cannot be released through release-slot",
+        ));
     }
     let record = database.job(job).await?.ok_or(super::JOB_NOT_FOUND)?;
     if record.unknown_at.is_none() {

@@ -6,10 +6,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ntex::client::{Client, Connector};
+use ntex::client::{Client, ClientRequest, Connector};
 use ntex::connect::{Connect, ConnectError, Connector as TcpConnector};
 use ntex::http::Uri;
-use ntex::http::header::HeaderValue;
+use ntex::http::header::{HeaderName, HeaderValue};
 use ntex::io::{Io, IoBoxed};
 use ntex::service::apply_fn_factory;
 use ntex::time::{Millis, Seconds};
@@ -17,6 +17,42 @@ use ntex::time::{Millis, Seconds};
 use crate::service::ai::providers::ProviderExecutionError;
 
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
+
+/// Whether `endpoint` may receive a Provider request. Only a literal loopback
+/// endpoint is ever permitted: the external-transport control is disabled and
+/// no allow-listed external endpoint guard exists, so enabling the control
+/// would still refuse every endpoint rather than admit one unchecked.
+pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
+    use crate::system::execution_controls::{ControlState, ExecutionControl};
+    match ExecutionControl::ExternalProviderTransport.state() {
+        ControlState::Disabled => literal_direct_loopback(endpoint),
+        ControlState::Enabled => false,
+    }
+}
+
+/// Diagnostic execution must never tunnel a loopback request through a proxy.
+fn literal_direct_loopback(endpoint: &str) -> bool {
+    let Ok(uri) = endpoint.parse::<Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("http")
+        || uri.host() != Some("127.0.0.1")
+        || uri
+            .authority()
+            .is_none_or(|authority| authority.as_str().contains('@'))
+        || uri.query().is_some()
+    {
+        return false;
+    }
+    let Some(port) = uri.port_u16().filter(|port| *port != 0) else {
+        return false;
+    };
+    match PROXY.get_or_init(load) {
+        Ok(None) => true,
+        Ok(Some(proxy)) => proxy.bypasses("127.0.0.1", port),
+        Err(_) => false,
+    }
+}
 
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -34,7 +70,94 @@ pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExe
     Ok(value)
 }
 
-pub(crate) async fn provider_client(timeout: Duration) -> Result<Client, ProviderExecutionError> {
+/// The custom request fields of one Provider request, resolved from a frozen
+/// set. It is the only place configured fields become request headers: it
+/// revalidates the set, resolves each secret from the credential store through
+/// the caller's resolver (failing closed when one is missing), and marks secret
+/// values sensitive. Secret values are wiped when it is dropped, as far as
+/// the allocator allows.
+#[derive(Default)]
+pub(crate) struct RequestHeaders {
+    fields: Vec<(HeaderName, HeaderValue)>,
+    secrets: Vec<String>,
+}
+
+impl std::fmt::Debug for RequestHeaders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.fields.iter().map(|(name, _)| name.as_str()))
+            .finish()
+    }
+}
+
+impl Drop for RequestHeaders {
+    fn drop(&mut self) {
+        self.secrets
+            .iter_mut()
+            .for_each(crate::system::secrets::wipe_string);
+    }
+}
+
+impl RequestHeaders {
+    /// Sets each field on `request`, replacing a default of the same name,
+    /// such as OCG's `User-Agent`. OCG-managed fields are set after this, and
+    /// no configured field may name one.
+    pub(crate) fn apply(&self, mut request: ClientRequest) -> ClientRequest {
+        for (name, value) in &self.fields {
+            request = request.set_header(name.clone(), value.clone());
+        }
+        request
+    }
+
+    /// The resolved secret values, for redaction.
+    pub(crate) fn secrets(&self) -> &[String] {
+        &self.secrets
+    }
+}
+
+/// Resolves a frozen set into request headers; see [`RequestHeaders`].
+pub(crate) async fn resolve_request_headers(
+    frozen: &crate::db::entities::FrozenHeaders,
+    resolver: &dyn crate::service::ai::providers::CredentialResolver,
+) -> Result<RequestHeaders, ProviderExecutionError> {
+    use crate::db::entities::{HeaderScope, OutboundHeaderValue, validate_fields};
+    let invalid = || ProviderExecutionError::Build {
+        message: "the custom request headers are invalid".to_owned(),
+    };
+    validate_fields(&frozen.fields, HeaderScope::Connection).map_err(|_| invalid())?;
+    let mut resolved = RequestHeaders::default();
+    for field in &frozen.fields {
+        let name = HeaderName::try_from(field.name.as_str()).map_err(|_| invalid())?;
+        let (text, secret) = match &field.value {
+            OutboundHeaderValue::Plain(value) => (value.clone(), false),
+            OutboundHeaderValue::Secret(reference) => {
+                let value = resolver
+                    .resolve(Some(reference.as_str()))
+                    .await?
+                    .ok_or_else(|| ProviderExecutionError::Build {
+                        message: "a secret request header cannot be resolved".to_owned(),
+                    })?;
+                (value, true)
+            }
+        };
+        let value = HeaderValue::try_from(text.as_str()).map(|mut value| {
+            value.set_sensitive(secret);
+            value
+        });
+        if secret {
+            resolved.secrets.push(text);
+        }
+        resolved.fields.push((name, value.map_err(|_| invalid())?));
+    }
+    Ok(resolved)
+}
+
+/// The ordinary Provider client: ambient proxy, if one is configured. It is
+/// private on purpose. Every Provider request is built through
+/// [`provider_client_for`] or [`discovery_client`], which refuse a destination
+/// that the build's controls do not permit before any socket exists.
+async fn standard_client(timeout: Duration) -> Result<Client, ProviderExecutionError> {
     Client::builder()
         .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
         .connector::<()>(connector()?)
@@ -51,6 +174,96 @@ pub(crate) async fn provider_client(timeout: Duration) -> Result<Client, Provide
         .map_err(|_| ProviderExecutionError::Build {
             message: "provider HTTP client could not be initialized".to_owned(),
         })
+}
+
+/// The Provider client of one execution request to `endpoint`, the full
+/// request URL. The destination is checked here, not only by the callers, so
+/// no caller can reach an endpoint its build does not permit:
+///
+/// - [`DestinationPolicy::Standard`] reaches a literal loopback endpoint only
+///   (see [`direct_diagnostic_loopback`]);
+/// - [`DestinationPolicy::ApprovedHttps`] requires
+///   [`ExecutionControl::ManualExternalTrial`] and gets a connector that
+///   connects nowhere but the approved host and port; see
+///   [`approved_connector`].
+///
+/// A refusal is a `Build` error: nothing was sent.
+pub(crate) async fn provider_client_for(
+    timeout: Duration,
+    destination: &crate::service::ai::providers::DestinationPolicy,
+    endpoint: &str,
+) -> Result<Client, ProviderExecutionError> {
+    use crate::service::ai::providers::DestinationPolicy;
+    use crate::system::execution_controls::ExecutionControl;
+    match destination {
+        DestinationPolicy::Standard => {
+            if !direct_diagnostic_loopback(endpoint) {
+                return Err(ProviderExecutionError::Build {
+                    message:
+                        "this build sends Provider requests to a literal loopback endpoint only"
+                            .to_owned(),
+                });
+            }
+            standard_client(timeout).await
+        }
+        DestinationPolicy::ApprovedHttps { host, port, route } => {
+            if !ExecutionControl::ManualExternalTrial.is_enabled() {
+                return Err(ProviderExecutionError::Build {
+                    message: ExecutionControl::ManualExternalTrial.refusal(),
+                });
+            }
+            Client::builder()
+                .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
+                .connector::<()>(approved_connector(host, *port, route)?)
+                .disable_redirects()
+                .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
+                .response_payload_timeout(Millis::ZERO)
+                .build(
+                    ntex::SharedCfg::new("provider-approved")
+                        .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
+                )
+                .await
+                .map_err(|_| ProviderExecutionError::Build {
+                    message: "provider HTTP client could not be initialized".to_owned(),
+                })
+        }
+    }
+}
+
+/// Why a discovery client was not built.
+pub(crate) enum DiscoveryClientError {
+    /// The build does not permit model discovery against this endpoint.
+    NotAuthorized,
+    Unavailable,
+}
+
+/// Whether a model-list request may be sent to `endpoint`. Discovery is a
+/// Provider egress that carries the stored or supplied credential to a
+/// caller-named endpoint, so it has its own control,
+/// [`ExecutionControl::ProviderDiscovery`], separate from execution. While
+/// that control is disabled only a literal loopback endpoint is permitted.
+/// Enabling a manual external trial does not enable discovery.
+pub(crate) fn discovery_permitted(endpoint: &str) -> bool {
+    use crate::system::execution_controls::{ControlState, ExecutionControl};
+    match ExecutionControl::ProviderDiscovery.state() {
+        ControlState::Enabled => true,
+        ControlState::Disabled => literal_direct_loopback(endpoint),
+    }
+}
+
+/// The client of one model-list request to `endpoint`, the endpoint as the
+/// caller named it. Refused before any socket exists unless
+/// [`discovery_permitted`].
+pub(crate) async fn discovery_client(
+    timeout: Duration,
+    endpoint: &str,
+) -> Result<Client, DiscoveryClientError> {
+    if !discovery_permitted(endpoint) {
+        return Err(DiscoveryClientError::NotAuthorized);
+    }
+    standard_client(timeout)
+        .await
+        .map_err(|_| DiscoveryClientError::Unavailable)
 }
 
 pub(crate) async fn release_client() -> Result<Client, ProviderExecutionError> {
@@ -195,7 +408,7 @@ fn parse_exclusion(value: &str) -> Option<Exclusion> {
     })
 }
 
-fn bare_host(host: &str) -> String {
+pub(crate) fn bare_host(host: &str) -> String {
     let host = host.trim();
     let host = host
         .strip_prefix('[')
@@ -298,6 +511,12 @@ pub(crate) fn initialize() -> Result<(), String> {
     }
 }
 
+/// Whether an HTTPS proxy is configured in the environment or the system.
+/// The approved external-trial connection ignores it either way.
+pub(crate) fn ambient_proxy_configured() -> bool {
+    !matches!(PROXY.get_or_init(load), Ok(None))
+}
+
 pub(crate) fn log_configuration() {
     if let Some(Ok(Some(proxy))) = PROXY.get() {
         log::info!(
@@ -384,6 +603,153 @@ fn connector() -> Result<Connector, ProviderExecutionError> {
         )))
 }
 
+/// A connector for one approved HTTPS destination and no other, always
+/// direct. It refuses: plain HTTP; any host or port but the approved ones
+/// (case-insensitively for the host), which also stops a redirect target,
+/// though redirects are off; a literal or resolved address that is not public
+/// (loopback, private, link-local and the like), so a name cannot be pointed
+/// at an internal service; and a certificate that does not verify, against
+/// the bundled public roots, for exactly the approved host.
+///
+/// The name is resolved here, every address is checked, and the connection
+/// is pinned to exactly the addresses that were checked, so the checked and
+/// the used destination cannot differ. The ambient proxy (`HTTPS_PROXY`,
+/// `ALL_PROXY`, the macOS system proxy) is deliberately not consulted: a proxy
+/// resolves the name itself, so OCG could not validate the destination
+/// address, and silently inheriting one would change the network trust
+/// boundary the operator approved. A trusted proxy would have to be named by
+/// the approval itself; see [`trusted_proxy_connector`].
+fn approved_connector(
+    host: &str,
+    port: u16,
+    route: &crate::service::ai::providers::ApprovedRoute,
+) -> Result<Connector, ProviderExecutionError> {
+    use crate::service::ai::providers::ApprovedRoute;
+    match route {
+        ApprovedRoute::Direct => direct_approved_connector(host, port),
+        ApprovedRoute::TrustedProxy(proxy) => trusted_proxy_connector(host, port, proxy.address()),
+    }
+}
+
+/// A connector for one approved HTTPS destination through one named loopback
+/// proxy and no other path. It connects to the proxy address it was given
+/// (a literal, never looked up), asks it with HTTP CONNECT for exactly the
+/// approved `host:port` (no credential or other field in that request), and
+/// only after a 2xx answer negotiates TLS inside the tunnel with the approved
+/// name, verified against the bundled public roots. Nothing here consults the
+/// environment or the system proxy, looks the Provider name up locally, or
+/// falls back to another route when the proxy refuses or fails.
+///
+/// The proxy, not OCG, resolves the name and picks the outbound route, so the
+/// address reached is not validated. What OCG establishes is that the peer
+/// answering the TLS handshake holds a public-root certificate for the
+/// approved name.
+fn trusted_proxy_connector(
+    host: &str,
+    port: u16,
+    proxy: SocketAddr,
+) -> Result<Connector, ProviderExecutionError> {
+    let tls = tunnel_tls();
+    let approved = Arc::new((bare_host(host), port));
+    let proxy_uri: Uri =
+        format!("http://{proxy}")
+            .parse()
+            .map_err(|_| ProviderExecutionError::Build {
+                message: "the trusted proxy address is not usable".to_owned(),
+            })?;
+    Ok(Connector::default()
+        .connector(apply_fn_factory(
+            TcpConnector::<Uri>::new(),
+            async move |_request: Connect<Uri>, _service| {
+                Err::<Io, ConnectError>(ConnectError::InvalidInput)
+            },
+        ))
+        .secure_connector(apply_fn_factory(
+            TcpConnector::<Uri>::new(),
+            async move |request: Connect<Uri>, service| {
+                let target = request.get_ref().clone();
+                let host = target.host().ok_or(ConnectError::InvalidInput)?;
+                let port = target.port_u16().unwrap_or(443);
+                if bare_host(host) != approved.0 || port != approved.1 {
+                    return Err(ConnectError::InvalidInput);
+                }
+                let io = service
+                    .call(Connect::new(proxy_uri.clone()).set_addrs(vec![proxy]))
+                    .await?;
+                connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
+                let name = rustls::pki_types::ServerName::try_from(
+                    host.trim_matches(['[', ']']).to_owned(),
+                )
+                .map_err(|_| ConnectError::InvalidInput)?;
+                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
+                    .await
+                    .map(IoBoxed::from)
+                    .map_err(ConnectError::from)
+            },
+        )))
+}
+
+fn direct_approved_connector(host: &str, port: u16) -> Result<Connector, ProviderExecutionError> {
+    let tls = tunnel_tls();
+    let approved = Arc::new((bare_host(host), port));
+    Ok(Connector::default()
+        .connector(apply_fn_factory(
+            TcpConnector::<Uri>::new(),
+            async move |_request: Connect<Uri>, _service| {
+                // An approved destination is https only.
+                Err::<Io, ConnectError>(ConnectError::InvalidInput)
+            },
+        ))
+        .secure_connector(apply_fn_factory(
+            TcpConnector::<Uri>::new(),
+            async move |request: Connect<Uri>, service| {
+                let target = request.get_ref().clone();
+                let host = target.host().ok_or(ConnectError::InvalidInput)?;
+                let port = target.port_u16().unwrap_or(443);
+                if bare_host(host) != approved.0 || port != approved.1 {
+                    return Err(ConnectError::InvalidInput);
+                }
+                let refused = Arc::new(AtomicBool::new(false));
+                let addrs = resolve_approved_target(host, port, &refused).await?;
+                let io = service.call(request.set_addrs(addrs)).await?;
+                let name = rustls::pki_types::ServerName::try_from(
+                    host.trim_matches(['[', ']']).to_owned(),
+                )
+                .map_err(|_| ConnectError::InvalidInput)?;
+                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
+                    .await
+                    .map(IoBoxed::from)
+                    .map_err(ConnectError::from)
+            },
+        )))
+}
+
+/// Why an approved destination cannot be reached by a direct connection.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DestinationFault {
+    /// The name does not resolve here.
+    Unresolvable,
+    /// The name, or an address it resolves to, is not public.
+    NonPublic,
+}
+
+/// Resolves `host` exactly as the approved connector will and checks every
+/// address. It sends nothing to the destination: only the name lookup runs,
+/// which the local resolver may forward. A name that passes can still fail at
+/// connect or TLS time, and may resolve differently later; the connector
+/// checks again at connect time and uses only the addresses it checked.
+pub(crate) async fn check_direct_destination(
+    host: &str,
+    port: u16,
+) -> Result<usize, DestinationFault> {
+    let refused = Arc::new(AtomicBool::new(false));
+    match resolve_approved_target(host, port, &refused).await {
+        Ok(addrs) => Ok(addrs.len()),
+        Err(_) if refused.load(Ordering::SeqCst) => Err(DestinationFault::NonPublic),
+        Err(_) => Err(DestinationFault::Unresolvable),
+    }
+}
+
 fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecutionError> {
     let proxy =
         PROXY
@@ -459,6 +825,29 @@ fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecu
         )))
 }
 
+/// The direct resolution an approved destination gets: the web tools' checks,
+/// plus a refusal of fake-IP answers (198.18.0.0/15). Web tools accept those
+/// for resolved names because Clash/Surge-style resolvers hand them out for
+/// every name and a proxy then carries the traffic. For an approved
+/// destination that answer means something else resolved the name and will
+/// route the connection, so OCG did not validate the address it connects to.
+async fn resolve_approved_target(
+    host: &str,
+    port: u16,
+    non_public: &Arc<AtomicBool>,
+) -> Result<Vec<SocketAddr>, ConnectError> {
+    let addrs = resolve_direct_web_target(host, port, non_public).await?;
+    let substituted = addrs.iter().any(|addr| match addr.ip() {
+        IpAddr::V4(v4) => is_fake_ip_ipv4(v4),
+        IpAddr::V6(v6) => embedded_ipv4(v6.segments()).is_some_and(is_fake_ip_ipv4),
+    });
+    if substituted {
+        non_public.store(true, Ordering::SeqCst);
+        return Err(ConnectError::Unresolved);
+    }
+    Ok(addrs)
+}
+
 async fn resolve_direct_web_target(
     host: &str,
     port: u16,
@@ -509,6 +898,13 @@ async fn check_proxied_web_target(
         return Err(ConnectError::Unresolved);
     }
     Ok(())
+}
+
+/// Whether `host`, as written in a URL, may name an approved external
+/// destination: not `localhost`, an intranet-style name, or a non-public
+/// address literal.
+pub(crate) fn host_may_be_external(host: &str) -> bool {
+    !is_non_public_host_literal(host)
 }
 
 fn is_non_public_host_literal(host: &str) -> bool {

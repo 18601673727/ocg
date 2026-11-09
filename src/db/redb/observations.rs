@@ -12,10 +12,118 @@ use crate::db::entities::{
     ObservationFilter, ObservationPage, RequestEventRecord, RequestPayload, TokenAnnotation,
 };
 
+/// Native Decision availability is not an LLM target. Its attribution is
+/// projected from the frozen Job and retained Allocation, not copied to rows.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct DecisionAvailabilityRecord {
+    pub id: AvailabilityStatId,
+    pub job: JobId,
+    pub executor: ExecutorId,
+    pub pool: ExecutionPoolId,
+    pub provider: ConfigRef,
+    pub model: ConfigRef,
+    pub model_name: String,
+    pub request: RequestNumber,
+    pub observed_at: Timestamp,
+    pub recorded_at: Timestamp,
+    pub observation: AvailabilityObservation,
+}
+
+pub(crate) fn read_decision_availability(
+    database: &Database,
+    job: JobId,
+    after: Option<AvailabilityStatId>,
+    limit: usize,
+) -> Result<Vec<DecisionAvailabilityRecord>, StorageError> {
+    let rx = read(database)?;
+    let jobs = rx.open_table(JOBS)?;
+    let bytes = jobs
+        .get(job.get())?
+        .ok_or_else(|| StorageError::corrupted("Decision Job missing"))?;
+    let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
+    let Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) = row.frozen else {
+        return Err(StorageError::corrupted(
+            "native Decision configuration required",
+        ));
+    };
+    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
+    let allocation = allocations
+        .get(job.get())?
+        .ok_or_else(|| StorageError::corrupted("Decision Allocation missing"))?;
+    let allocation = transactions::decode_pool_allocation(job.get(), allocation.value())?;
+    let events = rx.open_table(REQUEST_EVENTS)?;
+    let index = rx.open_table(JOB_OBSERVATIONS)?;
+    let mut records = Vec::new();
+    for entry in index
+        .range((
+            Bound::Excluded((job.get(), 2, after.map_or(0, AvailabilityStatId::get))),
+            Bound::Included((job.get(), 2, u128::MAX)),
+        ))?
+        .take(limit.min(MAX_PAGE))
+    {
+        let (_, position) = entry?;
+        let (request, seq) = position.value();
+        let request = RequestNumber::new(request)
+            .ok_or_else(|| StorageError::corrupted("invalid observation request"))?;
+        let event = event_at_key(&events, job, request, seq)?
+            .ok_or_else(|| StorageError::corrupted("observation event missing"))?;
+        let RequestPayload::Availability {
+            status_code,
+            finish_reason,
+            raw_finish_reason,
+            failure,
+        } = event.payload
+        else {
+            return Err(StorageError::corrupted(
+                "invalid Decision availability index",
+            ));
+        };
+        records.push(DecisionAvailabilityRecord {
+            id: AvailabilityStatId::new(event.id.get()),
+            job,
+            executor: allocation.token.executor,
+            pool: allocation.token.pool,
+            provider: frozen.connection_ref,
+            model: frozen.model_ref,
+            model_name: frozen.model.model.clone(),
+            request,
+            observed_at: event.observed_at,
+            recorded_at: event.recorded_at,
+            observation: AvailabilityObservation {
+                status_code,
+                finish_reason,
+                raw_finish_reason,
+                failure,
+            },
+        });
+    }
+    Ok(records)
+}
+
 pub(super) fn frozen_llm_target(
     rx: &ReadTransaction,
     job: JobId,
 ) -> Result<Option<LlmTarget>, StorageError> {
+    {
+        let jobs = rx.open_table(JOBS)?;
+        if let Some(bytes) = jobs.get(job.get())?
+            && matches!(bytes.value(), [TAG_JOB, codec::RECORD_VERSION, ..])
+        {
+            let job = transactions::decode_mutable_job(job.get(), bytes.value())?;
+            return match job.frozen {
+                Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
+                    Ok(Some(LlmTarget {
+                        llm_profile: frozen.llm.model.id.into(),
+                        frozen: frozen.llm,
+                    }))
+                }
+                Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) | None => {
+                    Ok(None)
+                }
+            };
+        }
+    }
     let Some(row) = rx
         .open_table(JOBS)?
         .get(job.get())?

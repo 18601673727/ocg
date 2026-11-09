@@ -80,11 +80,13 @@ macro_rules! record_id_type {
 }
 
 record_id_type!(JobId, "job");
+record_id_type!(ComposerContextId, "composer_context");
 record_id_type!(JobInputId, "job_input");
 record_id_type!(JobOutputId, "job_output");
 record_id_type!(ConfigId, "config");
 record_id_type!(ExecutorId, "executor");
 record_id_type!(ExecutionPoolId, "execution_pool");
+record_id_type!(ReservationRequestId, "reservation_request");
 record_id_type!(ProjectId, "project");
 record_id_type!(ProfileId, "profile");
 record_id_type!(LlmProviderId, "llm_provider");

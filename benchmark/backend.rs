@@ -357,6 +357,7 @@ fn executor(handle: &DatabaseHandle) -> Result<Target> {
             protocol: LlmTransport::OpenAiChatCompletions,
             endpoint: None,
             credential_ref: None,
+            headers: Vec::new(),
         }),
     }))?;
     let model = block_on(handle.create_config(Config {
@@ -559,6 +560,7 @@ fn setup_scheduler_pools(handle: &DatabaseHandle) -> Result<Target> {
             protocol: LlmTransport::OpenAiChatCompletions,
             endpoint: None,
             credential_ref: None,
+            headers: Vec::new(),
         }),
     }))?;
     let model = block_on(handle.create_config(Config {
@@ -2957,6 +2959,7 @@ fn run_server() -> Result<()> {
                     protocol: LlmTransport::OpenAiChatCompletions,
                     endpoint: Some(provider_endpoint),
                     credential_ref: None,
+                    headers: Vec::new(),
                 }),
             }))?,
         };

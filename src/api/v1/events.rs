@@ -12,7 +12,7 @@
 //!
 //! Events, each one complete JSON object on one `data` line:
 //!
-//! - `job`, without an `id`: the Job's record as [`super::jobs::job_view`]
+//! - `job`, without an `id`: the Job's record as [`super::jobs::mutable_job_view`]
 //!   describes it, when the stream opens and again whenever its lifecycle
 //!   changes without concluding. It is an observation, not an output.
 //! - `output`, with the output's stored `seq` as its `id`: `{"api_version",
@@ -58,7 +58,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use super::contracts::*;
-use super::jobs::{job_view, settlement_view};
+use super::jobs::{JobView, mutable_job_view};
 use super::outputs::output_view;
 use ntex::http::StatusCode;
 use ntex::http::header::{self, HeaderMap};
@@ -70,7 +70,8 @@ use serde_json::Value;
 use super::{
     INVALID_REQUEST, JOB_NOT_FOUND, OUTPUT_TOO_LARGE, Refusal, SHUTTING_DOWN, Shared, decimal,
 };
-use crate::db::entities::{JobId, JobOutputRecord, JobRecord, Timestamp};
+use crate::db::entities::{JobId, JobOutputRecord};
+use crate::db::redb::NativeJobItem;
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "JobEvent")]
@@ -192,8 +193,7 @@ pub(super) async fn open(
     let database = &shared.database;
     let changes = database.subscribe_catalog();
     let outputs = database.subscribe_outputs(job);
-    let record = database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
-    job_view(&record)?;
+    let record = database.native_job(job).await?.ok_or(JOB_NOT_FOUND)?;
     let page = database.job_outputs(job, after_seq, PAGE).await?;
 
     if let Some(first) = page.first() {
@@ -340,7 +340,7 @@ struct Feed {
     /// The `seq` of the last output sent, or the client's cursor.
     cursor: Option<i64>,
     /// The Job as last read, before every output in `pending` was read.
-    record: JobRecord,
+    record: NativeJobItem,
     /// Outputs read but not yet sent, in `seq` order.
     pending: VecDeque<JobOutputRecord>,
     /// Whether a page read after `record` came back short: every output
@@ -356,27 +356,7 @@ struct Feed {
 }
 
 /// What a `job` event is sent again for.
-type Lifecycle = [Option<Timestamp>; 6];
-
-fn lifecycle(record: &JobRecord) -> Lifecycle {
-    [
-        record.started_at,
-        record.completed_at,
-        record.failed_at,
-        record.cancelled_at,
-        record.unknown_at,
-        record.stop_confirmed_at,
-    ]
-}
-
-/// Whether the record shows the Job concluded: an outcome that is final,
-/// or an unknown one whose local execution was confirmed stopped.
-fn concluded(record: &JobRecord) -> bool {
-    record.completed_at.is_some()
-        || record.failed_at.is_some()
-        || record.cancelled_at.is_some()
-        || (record.unknown_at.is_some() && record.stop_confirmed_at.is_some())
-}
+type Lifecycle = [Option<i64>; 4];
 
 impl Feed {
     /// The next event, and the feed past it; `None` once the stream ends.
@@ -412,9 +392,9 @@ impl Feed {
                     }
                     Err(error) => return self.fail(Refusal::from(error)),
                 }
-            } else if concluded(&self.record) {
+            } else if self.view().concluded() {
                 return self.settle();
-            } else if self.announced != Some(lifecycle(&self.record)) {
+            } else if self.announced != Some(self.view().lifecycle()) {
                 return self.announce();
             }
             if self.written.elapsed() >= limits.heartbeat {
@@ -432,7 +412,7 @@ impl Feed {
                 }
                 Err(_) => return self.send(Bytes::from_static(b": heartbeat\n\n")),
             }
-            match database.job(self.job).await {
+            match database.native_job(self.job).await {
                 Ok(Some(record)) => {
                     self.record = record;
                     self.drained = false;
@@ -448,33 +428,31 @@ impl Feed {
         Some((event, self))
     }
 
+    /// The Job as the route describes it, from the record last read.
+    fn view(&self) -> JobView {
+        mutable_job_view(
+            &self.record.record,
+            self.record.allocation.as_ref(),
+            self.record.updated_at_us,
+        )
+    }
+
     fn announce(mut self) -> Option<(Bytes, Self)> {
-        match job_view(&self.record) {
-            Ok(described) => {
-                self.announced = Some(lifecycle(&self.record));
-                let data = envelope(serde_json::json!(JobEventView { job: described }));
-                self.send(event("job", &data))
-            }
-            Err(refusal) => self.fail(refusal),
-        }
+        let described = self.view();
+        self.announced = Some(described.lifecycle());
+        let data = envelope(serde_json::json!(JobEventView { job: described }));
+        self.send(event("job", &data))
     }
 
     fn settle(mut self) -> Option<(Bytes, Self)> {
-        match settlement_view(&self.record) {
-            Ok(settlement) => {
-                self.ended = true;
-                let data = envelope(serde_json::json!(SettlementEventView {
-                    job: self.job.to_string(),
-                    settlement,
-                    stop_confirmed_at_us: self
-                        .record
-                        .stop_confirmed_at
-                        .map(|at| at.as_unix_micros()),
-                }));
-                self.send(event("settlement", &data))
-            }
-            Err(refusal) => self.fail(refusal),
-        }
+        let described = self.view();
+        self.ended = true;
+        let data = envelope(serde_json::json!(SettlementEventView {
+            job: self.job.to_string(),
+            settlement: described.settlement(),
+            stop_confirmed_at_us: described.stop_confirmed_at_us(),
+        }));
+        self.send(event("settlement", &data))
     }
 
     fn fail(mut self, refusal: Refusal) -> Option<(Bytes, Self)> {

@@ -1127,6 +1127,13 @@ fn workspace_tools_configured(
     timeout: Duration,
     managed: bool,
 ) -> Result<ToolExecution, ToolRegistryError> {
+    let mutation = crate::system::execution_controls::ExecutionControl::WorkspaceMutation;
+    if matches!(grant, Grant::Edit | Grant::Code) && !mutation.is_enabled() {
+        return Err(ToolRegistryError::Disabled(
+            "workspace".to_owned(),
+            mutation.refusal(),
+        ));
+    }
     let registry = ToolRegistry::default();
     let limits = coding_limits(timeout);
 

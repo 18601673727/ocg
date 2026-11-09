@@ -24,6 +24,21 @@ pub(crate) struct OutputsView {
     has_more: bool,
 }
 
+pub(super) async fn require_output_job(
+    database: &DatabaseHandle,
+    job: JobId,
+) -> Result<(), Refusal> {
+    match database.mutable_job_details(job, None).await? {
+        crate::db::redb::MutableJobDetailsLookup::Found(_) => return Ok(()),
+        crate::db::redb::MutableJobDetailsLookup::Inaccessible => return Err(JOB_NOT_FOUND),
+        crate::db::redb::MutableJobDetailsLookup::NotMutable => {}
+    }
+    if database.job(job).await?.is_none() {
+        return Err(JOB_NOT_FOUND);
+    }
+    Ok(())
+}
+
 pub(super) fn output_view(record: &JobOutputRecord) -> OutputView {
     OutputView {
         id: record.id.to_string(),
@@ -49,9 +64,7 @@ pub(super) async fn outputs(
     limit: usize,
 ) -> Result<Value, Refusal> {
     let database = &shared.database;
-    if database.job(job).await?.is_none() {
-        return Err(JOB_NOT_FOUND);
-    }
+    require_output_job(database, job).await?;
     let records = database.job_outputs(job, after_seq, limit + 1).await?;
     let envelope = |outputs: Vec<OutputView>, next: Option<i64>, more: bool| {
         envelope(serde_json::json!(OutputsView {
@@ -84,9 +97,7 @@ pub(super) async fn outputs(
 }
 
 pub(super) async fn latest_output(shared: &Shared, job: JobId) -> Result<Value, Refusal> {
-    if shared.database.job(job).await?.is_none() {
-        return Err(JOB_NOT_FOUND);
-    }
+    require_output_job(&shared.database, job).await?;
     let output = shared.database.latest_output(job).await?;
     let body = envelope(serde_json::json!(OutputsView {
         job: job.to_string(),

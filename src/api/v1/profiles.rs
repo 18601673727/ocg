@@ -27,11 +27,19 @@ use crate::db::entities::{
     ExecutionOperation, LlmParameters, LlmTransport, ModelCapability, ProfileId, RecordRef,
     Violation,
 };
+use crate::db::entities::{
+    FrozenHeaders, HeaderError, HeaderScope, OutboundHeader, OutboundHeaderValue, canonical_name,
+    merge, validate_fields, validate_value,
+};
 use crate::db::mutations::{
-    ImportModelsSave, ModelProfileDefinition, ModelProfileSave, ProfileCredentialRef,
+    HeaderChange, HeaderEdit, HeaderEditValue, ImportModelsSave, ModelProfileDefinition,
+    ModelProfileSave, ProfileCredentialRef,
 };
 use crate::db::redb::CredentialSecret;
 use crate::db::{DatabaseError, DatabaseHandle};
+use crate::service::ai::providers::CredentialResolver;
+use crate::system::http::{RequestHeaders, resolve_request_headers};
+use std::sync::Arc;
 
 const MAX_PROFILE_NAME_BYTES: usize = 128;
 const MAX_MODEL_BYTES: usize = 256;
@@ -141,10 +149,25 @@ const WRONG_PROFILE_KIND: Refusal = Refusal::new(
     "wrong_profile_kind",
     "a Profile's kind cannot be changed after creation",
 );
+const PROVIDER_DISCOVERY_DISABLED: Refusal = Refusal::new(
+    StatusCode::FORBIDDEN,
+    "provider_discovery_disabled",
+    "model discovery against this endpoint is disabled in this build; only a literal loopback endpoint is permitted",
+);
 const PROFILE_CHANGED: Refusal = Refusal::new(
     StatusCode::CONFLICT,
     "profile_changed",
     "the Profile changed while it was being validated; reload and retry",
+);
+const PROFILE_REVISION_REQUIRED: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "profile_revision_required",
+    "an update must name the revision it was made from (expected_edit_seq)",
+);
+const PROFILE_REVISION_CHANGED: Refusal = Refusal::new(
+    StatusCode::CONFLICT,
+    "profile_revision_changed",
+    "the Profile was changed elsewhere; reload it and apply the edit again",
 );
 const STORAGE_REFUSED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
@@ -235,6 +258,13 @@ enum ProfileRequest {
         declared_capabilities: Vec<String>,
         #[serde(default)]
         parameters: ParametersInput,
+        /// `None` keeps the Connection's headers; a list replaces them all.
+        #[serde(default)]
+        headers: Option<Vec<OutboundHeaderInput>>,
+        /// The `edit_seq` of the Profile this edit was made from; required to
+        /// update one and refused when the Profile has changed since.
+        #[serde(default)]
+        expected_edit_seq: Option<u32>,
     },
     Agent {
         name: String,
@@ -246,6 +276,9 @@ enum ProfileRequest {
         llm_targets: Vec<String>,
         #[serde(default, deserialize_with = "optional_value")]
         compaction_policy: Option<Option<CompactionPolicyInput>>,
+        /// See the Generative Model request.
+        #[serde(default)]
+        expected_edit_seq: Option<u32>,
     },
     /// A Decision Model: a typed model reached over a decision protocol.
     DecisionModel {
@@ -265,6 +298,11 @@ enum ProfileRequest {
         declared_capabilities: Vec<String>,
         #[serde(default)]
         limits: DecisionLimitInput,
+        #[serde(default)]
+        headers: Option<Vec<OutboundHeaderInput>>,
+        /// See the Generative Model request.
+        #[serde(default)]
+        expected_edit_seq: Option<u32>,
     },
     /// A Decision Profile: an Agent whose models are Decision Models.
     DecisionAgent {
@@ -275,6 +313,9 @@ enum ProfileRequest {
         models: Vec<String>,
         #[serde(default, deserialize_with = "optional_value")]
         default_model: Option<Option<String>>,
+        /// See the Generative Model request.
+        #[serde(default)]
+        expected_edit_seq: Option<u32>,
     },
 }
 
@@ -388,6 +429,14 @@ fn default_credential_ref(name: &str) -> String {
 
 pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
     match error {
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "executor",
+            "no enabled native Executor supports this operation and protocol",
+        )) => Refusal::new(
+            StatusCode::CONFLICT,
+            "executor_unavailable",
+            "no enabled Executor supports this operation and protocol",
+        ),
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
         DatabaseError::Rejected(Violation::ProfileChanged) => PROFILE_CHANGED,
@@ -455,6 +504,34 @@ async fn previous_model_connection(
     )))
 }
 
+/// The revision an Agent edit is made from: required, and refused when the
+/// stored Profile has moved on. The writer checks it again atomically.
+fn config_revision(current: u32, expected_edit_seq: Option<u32>) -> Result<Option<u32>, Refusal> {
+    match expected_edit_seq {
+        None => Err(PROFILE_REVISION_REQUIRED),
+        Some(expected) if expected != current => Err(PROFILE_REVISION_CHANGED),
+        Some(expected) => Ok(Some(expected)),
+    }
+}
+
+/// The save guard for an update made from `expected_edit_seq`. The Profile
+/// must still be at that revision now, and the writer checks the same
+/// revisions again inside its transaction, so an edit made from a stale form
+/// can neither overwrite nor resurrect what another edit changed.
+fn revision_guard(
+    previous: Option<crate::db::mutations::ProfileSaveGuard>,
+    expected_edit_seq: Option<u32>,
+) -> Result<Option<crate::db::mutations::ProfileSaveGuard>, Refusal> {
+    let Some(guard) = previous else {
+        return Ok(None);
+    };
+    match expected_edit_seq {
+        None => Err(PROFILE_REVISION_REQUIRED),
+        Some(expected) if expected != guard.profile_edit_seq => Err(PROFILE_REVISION_CHANGED),
+        Some(_) => Ok(Some(guard)),
+    }
+}
+
 /// The credential reference a Profile names, and the secret to write, if
 /// any. An update keeps the reference it had when none is supplied, and an
 /// explicit clear removes it.
@@ -509,6 +586,161 @@ fn resolve_credential_input(
     }
 }
 
+const INVALID_HEADERS: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "invalid_headers",
+    "invalid custom request headers",
+);
+
+fn invalid_headers(error: &HeaderError) -> Refusal {
+    INVALID_HEADERS.with_reason(error.to_string())
+}
+
+/// Answers a stored secret by reference, and a new one by the placeholder it
+/// was given for a probe that precedes the save.
+struct ProbeResolver {
+    stored: Arc<dyn CredentialResolver>,
+    supplied: BTreeMap<String, String>,
+}
+
+impl CredentialResolver for ProbeResolver {
+    fn resolve<'a>(
+        &'a self,
+        reference: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<String>,
+                        crate::service::ai::providers::ProviderExecutionError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        match reference.and_then(|reference| self.supplied.get(reference)) {
+            Some(value) => {
+                let value = value.clone();
+                Box::pin(async move { Ok(Some(value)) })
+            }
+            None => self.stored.resolve(reference),
+        }
+    }
+}
+
+/// A save's header edits, checked, with the headers a probe request sent
+/// before the save would carry.
+struct HeaderPlan {
+    change: HeaderChange,
+    probe: RequestHeaders,
+}
+
+/// Checks `inputs` against `previous`, the Connection's stored headers, and
+/// returns the change to store and the headers a probe should send. `None`
+/// keeps `previous`. Every refusal names a header, never a value.
+async fn plan_headers(
+    database: &DatabaseHandle,
+    inputs: Option<Vec<OutboundHeaderInput>>,
+    previous: &[OutboundHeader],
+) -> Result<HeaderPlan, Refusal> {
+    let global = database.global_outbound_headers().await?;
+    let mut supplied = BTreeMap::new();
+    let (change, connection) = match inputs {
+        None => (HeaderChange::Preserve, previous.to_vec()),
+        Some(inputs) => {
+            let mut edits = Vec::with_capacity(inputs.len());
+            let mut fields = Vec::with_capacity(inputs.len());
+            for (index, input) in inputs.into_iter().enumerate() {
+                let name = canonical_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
+                let value = input.value.filter(|value| !value.is_empty());
+                if let Some(value) = &value {
+                    validate_value(value).map_err(|e| invalid_headers(&e))?;
+                }
+                let (edit, field) = match (input.secret, value) {
+                    (false, Some(value)) => (
+                        HeaderEditValue::Plain(value.clone()),
+                        OutboundHeaderValue::Plain(value),
+                    ),
+                    (false, None) => return Err(invalid_headers(&HeaderError::InvalidValue)),
+                    (true, None) => {
+                        let kept = previous.iter().find_map(|field| match &field.value {
+                            OutboundHeaderValue::Secret(reference) if field.name == name => {
+                                Some(reference.clone())
+                            }
+                            OutboundHeaderValue::Secret(_) | OutboundHeaderValue::Plain(_) => None,
+                        });
+                        let Some(reference) = kept else {
+                            return Err(INVALID_HEADERS.with_reason(format!(
+                                "header `{name}` has no stored secret; supply its value"
+                            )));
+                        };
+                        (
+                            HeaderEditValue::Secret(None),
+                            OutboundHeaderValue::Secret(reference),
+                        )
+                    }
+                    (true, Some(value)) => {
+                        let placeholder = format!("probe-{index}");
+                        supplied.insert(placeholder.clone(), value.clone());
+                        let secret =
+                            CredentialSecret::new(value).map_err(|_| INVALID_CREDENTIAL)?;
+                        let payload = database.credential_payload(secret).await?;
+                        (
+                            HeaderEditValue::Secret(Some(payload)),
+                            OutboundHeaderValue::Secret(placeholder),
+                        )
+                    }
+                };
+                edits.push(HeaderEdit {
+                    name: name.clone(),
+                    value: edit,
+                });
+                fields.push(OutboundHeader { name, value: field });
+            }
+            fields.sort_by(|left, right| left.name.cmp(&right.name));
+            validate_fields(&fields, HeaderScope::Connection).map_err(|e| invalid_headers(&e))?;
+            (HeaderChange::Replace(edits), fields)
+        }
+    };
+    let probe = resolve_request_headers(
+        &FrozenHeaders {
+            global_revision: global.revision,
+            fields: merge(&global.fields, &connection),
+        },
+        &ProbeResolver {
+            stored: database.credential_resolver(),
+            supplied,
+        },
+    )
+    .await
+    .map_err(|_| INVALID_HEADERS)?;
+    Ok(HeaderPlan { change, probe })
+}
+
+/// A header as read back: a plain value is shown, a secret only as present.
+fn header_views(
+    fields: &[OutboundHeader],
+    credentials: &BTreeSet<String>,
+) -> Vec<OutboundHeaderView> {
+    fields
+        .iter()
+        .map(|field| match &field.value {
+            OutboundHeaderValue::Plain(value) => OutboundHeaderView {
+                name: field.name.clone(),
+                secret: false,
+                value: Some(value.clone()),
+                has_secret: false,
+            },
+            OutboundHeaderValue::Secret(reference) => OutboundHeaderView {
+                name: field.name.clone(),
+                secret: true,
+                value: None,
+                has_secret: credentials.contains(reference.trim()),
+            },
+        })
+        .collect()
+}
+
 async fn validate_decision_model(
     database: &DatabaseHandle,
     protocol: DecisionProtocol,
@@ -516,7 +748,13 @@ async fn validate_decision_model(
     model: &str,
     credential_ref: Option<&str>,
     credential: Option<&str>,
+    headers: &RequestHeaders,
 ) -> Result<(), Refusal> {
+    if !crate::system::http::discovery_permitted(
+        endpoint.unwrap_or(crate::service::ai::decisive_model::DEFAULT_ENDPOINT),
+    ) {
+        return Err(PROVIDER_DISCOVERY_DISABLED);
+    }
     let resolved_credential;
     let credential = match credential {
         Some(secret) => Some(secret),
@@ -535,12 +773,14 @@ async fn validate_decision_model(
             crate::service::ai::decisive_model::list_models(
                 endpoint.unwrap_or(crate::service::ai::decisive_model::DEFAULT_ENDPOINT),
                 credential,
+                headers,
             )
             .await
         }
     }
     .map_err(|error| {
         let (code, message) = match error {
+            ModelListError::NotAuthorized => return PROVIDER_DISCOVERY_DISABLED,
             ModelListError::Unreachable => (
                 "provider_unreachable",
                 "could not connect to the provider".to_owned(),
@@ -584,6 +824,7 @@ const MAX_PROFILE_PAGE_BYTES: usize = 512 * 1024;
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "LlmProfile")]
 pub(crate) struct LlmProfileView {
+    edit_seq: u32,
     enabled: bool,
     reasoning_efforts: Option<Vec<String>>,
     id: String,
@@ -597,6 +838,7 @@ pub(crate) struct LlmProfileView {
     endpoint: Option<String>,
     credential_ref: Option<String>,
     has_credential: bool,
+    headers: Vec<OutboundHeaderView>,
     declared_capabilities: Vec<String>,
     parameters: LlmParameters,
     editable: bool,
@@ -610,6 +852,7 @@ pub(crate) struct LlmProfileView {
 #[ts(rename = "ManagedAgent")]
 pub(crate) struct ManagedAgentView {
     id: String,
+    edit_seq: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     profile_type: Option<String>,
@@ -647,6 +890,7 @@ pub(crate) struct DecisionProfileView {
     endpoint: Option<String>,
     credential_ref: Option<String>,
     has_credential: bool,
+    headers: Vec<OutboundHeaderView>,
     declared_capabilities: Vec<String>,
     limits: DecisionLimitsView,
     editable: bool,
@@ -658,6 +902,7 @@ pub(crate) struct DecisionProfileView {
 #[ts(rename = "DecisionAgentProfile")]
 pub(crate) struct DecisionAgentProfileView {
     id: String,
+    edit_seq: u32,
     name: String,
     instructions: Option<String>,
     models: Vec<String>,
@@ -683,6 +928,7 @@ pub(crate) struct ProviderView {
     endpoint: Option<String>,
     credential_ref: Option<String>,
     has_credential: bool,
+    headers: Vec<OutboundHeaderView>,
     profile_ids: Vec<String>,
     models: Vec<String>,
 }
@@ -767,6 +1013,7 @@ fn build_profiles_page(
         endpoint: Option<String>,
         credential_ref: Option<String>,
         has_credential: bool,
+        headers: Vec<OutboundHeaderView>,
         profile_ids: Vec<String>,
         models: BTreeSet<String>,
     }
@@ -776,6 +1023,33 @@ fn build_profiles_page(
     let mut next_before = next_before;
 
     for record in records {
+        let record = match record {
+            crate::db::redb::ProfilePageRecord::Config(record) => record,
+            crate::db::redb::ProfilePageRecord::Executor(executor) => {
+                let offered: Vec<_> = executor
+                    .capabilities
+                    .iter()
+                    .filter_map(|(operation, protocol)| match (operation, protocol) {
+                        (ExecutionOperation::LlmRequest, Some(protocol)) => {
+                            Some(ProfileExecutorView {
+                                id: executor.id.to_string(),
+                                protocol: protocol.as_str().to_owned(),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !offered.is_empty() {
+                    if !fits_profile_page(&offered, &mut page_bytes)? {
+                        next_before = last_emitted;
+                        break;
+                    }
+                    executor_protocols.extend(offered);
+                    last_emitted = Some(ConfigId::new(executor.id.get()));
+                }
+                continue;
+            }
+        };
         let id = ProfileId::from(record.id);
         match record.body {
             ConfigBody::Model(model) => {
@@ -796,6 +1070,7 @@ fn build_profiles_page(
                     .collect::<Vec<_>>();
                 let id_str = id.to_string();
                 let profile = LlmProfileView {
+                    edit_seq: record.edit_seq,
                     enabled: record.model_enabled,
                     reasoning_efforts: model.reasoning_efforts,
                     id: id_str.clone(),
@@ -807,6 +1082,7 @@ fn build_profiles_page(
                     endpoint: connection.endpoint.clone(),
                     credential_ref: connection.credential_ref.clone(),
                     has_credential,
+                    headers: header_views(&connection.headers, &credentials),
                     declared_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
                     parameters: model.parameters,
                     editable: true,
@@ -828,6 +1104,7 @@ fn build_profiles_page(
                             endpoint: connection.endpoint,
                             credential_ref: connection.credential_ref,
                             has_credential,
+                            headers: header_views(&connection.headers, &credentials),
                             profile_ids: Vec::new(),
                             models: BTreeSet::new(),
                         });
@@ -840,6 +1117,7 @@ fn build_profiles_page(
             ConfigBody::Agent(agent) => {
                 let profile = ManagedAgentView {
                     id: id.to_string(),
+                    edit_seq: record.edit_seq,
                     profile_type: Some("agent".to_owned()),
                     name: record.name,
                     instructions: agent.instructions,
@@ -863,30 +1141,7 @@ fn build_profiles_page(
                 agent_profiles.push(profile);
                 last_emitted = Some(record.id);
             }
-            ConfigBody::Pool(pool) => {
-                let offered: Vec<_> = [
-                    LlmTransport::OpenAiChatCompletions,
-                    LlmTransport::OpenAiResponses,
-                    LlmTransport::AnthropicMessages,
-                ]
-                .into_iter()
-                .filter(|protocol| {
-                    pool.enabled && pool.offers(ExecutionOperation::LlmRequest, Some(*protocol))
-                })
-                .map(|protocol| ProfileExecutorView {
-                    id: record.id.to_string(),
-                    protocol: protocol.as_str().to_owned(),
-                })
-                .collect();
-                if !offered.is_empty() {
-                    if !fits_profile_page(&offered, &mut page_bytes)? {
-                        next_before = last_emitted;
-                        break;
-                    }
-                    executor_protocols.extend(offered);
-                    last_emitted = Some(record.id);
-                }
-            }
+            ConfigBody::Pool(_) => return Err(INCONSISTENT_RECORD),
             ConfigBody::Connection(_) => {}
             ConfigBody::DecisionModel(model) => {
                 let Some((_, connection, _)) = connections.get(&model.connection_id).cloned()
@@ -906,6 +1161,7 @@ fn build_profiles_page(
                     endpoint: connection.endpoint.clone(),
                     credential_ref: connection.credential_ref.clone(),
                     has_credential,
+                    headers: header_views(&connection.headers, &credentials),
                     declared_capabilities: model
                         .declared_capabilities
                         .iter()
@@ -931,6 +1187,7 @@ fn build_profiles_page(
             ConfigBody::DecisionAgent(agent) => {
                 let profile = DecisionAgentProfileView {
                     id: id.to_string(),
+                    edit_seq: record.edit_seq,
                     name: record.name,
                     instructions: agent.instructions,
                     models: agent
@@ -971,12 +1228,13 @@ fn build_profiles_page(
             endpoint: group.endpoint,
             credential_ref: group.credential_ref,
             has_credential: group.has_credential,
+            headers: group.headers,
             profile_ids: group.profile_ids,
             models: group.models.into_iter().collect(),
         })
         .collect();
 
-    Ok(envelope(serde_json::json!(ProfilesView {
+    let result = envelope(serde_json::json!(ProfilesView {
         llm_profiles,
         agent_profiles,
         decision_profiles: (!decision_profiles.is_empty()).then_some(decision_profiles),
@@ -987,7 +1245,15 @@ fn build_profiles_page(
         has_more: next_before.is_some(),
         next_before: next_before.map(|id| ProfileId::from(id).to_string()),
         profile_id: saved_profile.map(|id| id.to_string()),
-    })))
+    }));
+    let result = {
+        let mut result = result;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("resource_model".into(), "independent".into());
+        }
+        result
+    };
+    Ok(result)
 }
 
 /// Whether `entry` fits the page budget. The first entry always does, so a
@@ -1002,7 +1268,8 @@ fn fits_profile_page(entry: &impl serde::Serialize, bytes: &mut usize) -> Result
 }
 
 enum PreparedProfileSave {
-    Config(Config),
+    /// A config body and, for an update, the revision it was edited from.
+    Config(Config, Option<u32>),
     Model(ModelProfileSave),
 }
 
@@ -1024,6 +1291,8 @@ pub(crate) async fn save_profile(
             clear_credential,
             declared_capabilities,
             parameters,
+            headers,
+            expected_edit_seq,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
@@ -1081,7 +1350,15 @@ pub(crate) async fn save_profile(
                 credential.as_deref(),
                 clear_credential,
             )?;
+            let (previous_headers, guard) =
+                match previous_model_connection(database, existing_id, ConfigKind::Model).await? {
+                    Some((_, connection, guard)) => (connection.headers, Some(guard)),
+                    None => (Vec::new(), None),
+                };
+            let guard = revision_guard(guard, expected_edit_seq)?;
+            let plan = plan_headers(database, headers, &previous_headers).await?;
             PreparedProfileSave::Model(ModelProfileSave {
+                headers: plan.change,
                 existing_id,
                 name: name.trim().to_owned(),
                 connection_name: format!("{} provider", name.trim()),
@@ -1089,7 +1366,7 @@ pub(crate) async fn save_profile(
                 credential_ref,
                 secret,
                 credential: None,
-                guard: None,
+                guard,
                 definition: ModelProfileDefinition::Llm {
                     protocol,
                     model: model.trim().to_owned(),
@@ -1113,6 +1390,7 @@ pub(crate) async fn save_profile(
             capabilities,
             llm_targets,
             compaction_policy,
+            expected_edit_seq,
         } => {
             if compaction_policy.is_some() {
                 return Err(Refusal::new(
@@ -1158,24 +1436,28 @@ pub(crate) async fn save_profile(
                     _ => return Err(INVALID_LLM_TARGET),
                 }
             }
-            let prior = if let Some(id) = existing_id {
+            let (prior, expected) = if let Some(id) = existing_id {
                 let record = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
+                let expected = config_revision(record.edit_seq, expected_edit_seq)?;
                 let ConfigBody::Agent(agent) = record.body else {
                     return Err(WRONG_PROFILE_KIND);
                 };
-                agent
+                (agent, expected)
             } else {
-                AgentConfig::default()
+                (AgentConfig::default(), None)
             };
-            PreparedProfileSave::Config(Config {
-                name: name.trim().to_owned(),
-                body: ConfigBody::Agent(AgentConfig {
-                    instructions: normalized_instructions,
-                    capabilities: selected_capabilities,
-                    models: parsed_targets,
-                    compaction_policy: prior.compaction_policy,
-                }),
-            })
+            PreparedProfileSave::Config(
+                Config {
+                    name: name.trim().to_owned(),
+                    body: ConfigBody::Agent(AgentConfig {
+                        instructions: normalized_instructions,
+                        capabilities: selected_capabilities,
+                        models: parsed_targets,
+                        compaction_policy: prior.compaction_policy,
+                    }),
+                },
+                expected,
+            )
         }
         ProfileRequest::DecisionModel {
             name,
@@ -1187,6 +1469,8 @@ pub(crate) async fn save_profile(
             clear_credential,
             declared_capabilities,
             limits,
+            headers,
+            expected_edit_seq,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
@@ -1251,7 +1535,12 @@ pub(crate) async fn save_profile(
             let prior_credential_ref = previous
                 .as_ref()
                 .and_then(|(_, connection, _)| connection.credential_ref.clone());
-            let guard = previous.map(|(_, _, guard)| guard);
+            let previous_headers = previous
+                .as_ref()
+                .map(|(_, connection, _)| connection.headers.clone())
+                .unwrap_or_default();
+            let guard = revision_guard(previous.map(|(_, _, guard)| guard), expected_edit_seq)?;
+            let plan = plan_headers(database, headers, &previous_headers).await?;
             let (credential_ref, secret) = resolve_credential_input(
                 name.trim(),
                 credential_ref.as_deref(),
@@ -1272,9 +1561,11 @@ pub(crate) async fn save_profile(
                 model.trim(),
                 validation_ref.as_deref(),
                 secret.as_ref().map(CredentialSecret::as_str),
+                &plan.probe,
             )
             .await?;
             PreparedProfileSave::Model(ModelProfileSave {
+                headers: plan.change,
                 existing_id,
                 name: name.trim().to_owned(),
                 connection_name: format!("{} decision provider", name.trim()),
@@ -1296,6 +1587,7 @@ pub(crate) async fn save_profile(
             instructions,
             models,
             default_model,
+            expected_edit_seq,
         } => {
             if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
                 return Err(INVALID_PROFILE_NAME);
@@ -1343,19 +1635,32 @@ pub(crate) async fn save_profile(
             // Workspace reads are not implemented. A Decision Profile that
             // names metadata or full access would advertise a permission it
             // cannot use, so only none is accepted.
-            PreparedProfileSave::Config(Config {
-                name: name.trim().to_owned(),
-                body: ConfigBody::DecisionAgent(DecisionAgentConfig {
-                    instructions: normalized_instructions,
-                    models: parsed_models,
-                    default_model,
-                }),
-            })
+            let expected = match existing_id {
+                Some(id) => {
+                    let record = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
+                    if record.kind != ConfigKind::DecisionAgent {
+                        return Err(WRONG_PROFILE_KIND);
+                    }
+                    config_revision(record.edit_seq, expected_edit_seq)?
+                }
+                None => None,
+            };
+            PreparedProfileSave::Config(
+                Config {
+                    name: name.trim().to_owned(),
+                    body: ConfigBody::DecisionAgent(DecisionAgentConfig {
+                        instructions: normalized_instructions,
+                        models: parsed_models,
+                        default_model,
+                    }),
+                },
+                expected,
+            )
         }
     };
 
     let (status, profile_id) = match prepared {
-        PreparedProfileSave::Config(new_config) => {
+        PreparedProfileSave::Config(new_config, expected) => {
             let profile_id = match existing_id {
                 None => ProfileId::from(
                     database
@@ -1365,7 +1670,11 @@ pub(crate) async fn save_profile(
                 ),
                 Some(id) => {
                     database
-                        .update_config(id.into(), new_config)
+                        .update_config(
+                            id.into(),
+                            new_config,
+                            expected.ok_or(PROFILE_REVISION_REQUIRED)?,
+                        )
                         .await
                         .map_err(map_mutation_error)?;
                     id
@@ -1426,6 +1735,8 @@ struct ImportProvider {
     endpoint: String,
     credential_ref: Option<String>,
     credential: Option<String>,
+    #[serde(default)]
+    headers: Option<Vec<OutboundHeaderInput>>,
 }
 
 pub(crate) async fn import_models(
@@ -1451,8 +1762,10 @@ pub(crate) async fn import_models(
     if capabilities.is_empty() {
         return Err(INVALID_CAPABILITIES);
     }
+    let headers;
     let (connection, credential_ref, secret) = match (request.source_profile_id, request.provider) {
         (Some(id), None) => {
+            headers = HeaderChange::Preserve;
             let id = profile_id(&id)?;
             let source = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
             if source.archived_at.is_some() {
@@ -1506,6 +1819,7 @@ pub(crate) async fn import_models(
             }) {
                 return Err(INVALID_CREDENTIAL);
             }
+            headers = plan_headers(database, provider.headers, &[]).await?.change;
             let (credential_ref, secret) = match credential {
                 Some(secret) => {
                     let credential_ref = match reference {
@@ -1536,6 +1850,7 @@ pub(crate) async fn import_models(
                             .ok_or(UNSUPPORTED_PROTOCOL)?,
                         endpoint: Some(endpoint.to_owned()),
                         credential_ref: None,
+                        headers: Vec::new(),
                     }),
                 },
                 credential_ref,
@@ -1549,6 +1864,7 @@ pub(crate) async fn import_models(
     }
     let (ids, created) = database
         .import_models(ImportModelsSave {
+            headers,
             connection,
             credential_ref,
             secret,
@@ -1625,6 +1941,12 @@ struct ProviderModelsRequest {
     protocol: Option<String>,
     credential: Option<String>,
     credential_ref: Option<String>,
+    /// A saved Profile of the Connection being probed. Its stored headers are
+    /// sent unless `headers` replaces them, and name the secrets `headers` keeps.
+    #[serde(default)]
+    profile_id: Option<String>,
+    #[serde(default)]
+    headers: Option<Vec<OutboundHeaderInput>>,
 }
 
 /// Which protocol a discovery request names: a generative transport, or a
@@ -1659,6 +1981,10 @@ pub(crate) async fn provider_models(
     if request.credential.is_some() && request.credential_ref.is_some() {
         return Err(INVALID_PROFILE_BODY);
     }
+    // Before any stored credential is read: a refused endpoint never sees one.
+    if !crate::system::http::discovery_permitted(&request.endpoint) {
+        return Err(PROVIDER_DISCOVERY_DISABLED);
+    }
     let saved_connection = request.credential.is_none();
     let credential = match request.credential {
         Some(credential) => Some(credential),
@@ -1686,12 +2012,27 @@ pub(crate) async fn provider_models(
         return Err(INVALID_CREDENTIAL);
     }
     use crate::service::ai::providers::ModelListError;
+    let saved_headers = match request.profile_id.as_deref() {
+        None => Vec::new(),
+        Some(id) => {
+            let kind = match protocol {
+                DiscoveryProtocol::Generative(_) => ConfigKind::Model,
+                DiscoveryProtocol::Decision(_) => ConfigKind::DecisionModel,
+            };
+            match previous_model_connection(database, Some(profile_id(id)?), kind).await? {
+                Some((_, connection, _)) => connection.headers,
+                None => Vec::new(),
+            }
+        }
+    };
+    let plan = plan_headers(database, request.headers, &saved_headers).await?;
     let listed = match protocol {
         DiscoveryProtocol::Generative(protocol) => {
             crate::service::ai::providers::list_models(
                 &request.endpoint,
                 credential.as_deref(),
                 protocol,
+                &plan.probe,
             )
             .await
         }
@@ -1700,6 +2041,7 @@ pub(crate) async fn provider_models(
             crate::service::ai::decisive_model::list_models(
                 &request.endpoint,
                 credential.as_deref(),
+                &plan.probe,
             )
             .await
         }
@@ -1713,6 +2055,7 @@ pub(crate) async fn provider_models(
                             protocol,
                             endpoint: Some(request.endpoint.clone()),
                             credential_ref: request.credential_ref.clone(),
+                            headers: Vec::new(),
                         },
                         models.clone(),
                     )
@@ -1722,6 +2065,7 @@ pub(crate) async fn provider_models(
                 models
             }))));
         }
+        Err(ModelListError::NotAuthorized) => return Err(PROVIDER_DISCOVERY_DISABLED),
         Err(ModelListError::Unreachable) => (
             "provider_unreachable",
             "could not connect to the provider".to_owned(),
@@ -1750,6 +2094,53 @@ pub(crate) async fn provider_models(
             }); if let Some(value) = status_code { object["status_code"] = serde_json::json!(value); } object }),
         })),
     ))
+}
+
+pub(super) async fn global_outbound_headers(
+    database: &DatabaseHandle,
+    body: Option<&[u8]>,
+) -> Result<Reply, Refusal> {
+    if let Some(body) = body {
+        let wire: GlobalOutboundHeadersInput =
+            serde_json::from_slice(body).map_err(|_| INVALID_PROFILE_BODY)?;
+        let mut fields = Vec::with_capacity(wire.headers.len());
+        for input in wire.headers {
+            if input.secret {
+                return Err(invalid_headers(&HeaderError::GlobalSecret));
+            }
+            let name = canonical_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
+            let value = input
+                .value
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_headers(&HeaderError::InvalidValue))?;
+            validate_value(&value).map_err(|e| invalid_headers(&e))?;
+            fields.push(OutboundHeader {
+                name,
+                value: OutboundHeaderValue::Plain(value),
+            });
+        }
+        fields.sort_by(|left, right| left.name.cmp(&right.name));
+        validate_fields(&fields, HeaderScope::Global).map_err(|e| invalid_headers(&e))?;
+        database
+            .set_global_outbound_headers(wire.revision, fields)
+            .await
+            .map_err(|error| match error {
+                DatabaseError::Rejected(Violation::InvalidValue("revision", _)) => Refusal::new(
+                    StatusCode::CONFLICT,
+                    "headers_revision_changed",
+                    "global headers changed; reload before saving",
+                ),
+                error => map_mutation_error(error),
+            })?;
+    }
+    let headers = database.global_outbound_headers().await?;
+    Ok(Reply::ok(envelope(serde_json::json!(
+        GlobalOutboundHeadersView {
+            revision: headers.revision,
+            headers: header_views(&headers.fields, &BTreeSet::new()),
+            default_user_agent: concat!("ocg/", env!("CARGO_PKG_VERSION")).to_owned(),
+        }
+    ))))
 }
 
 pub(super) async fn global_compaction_settings(

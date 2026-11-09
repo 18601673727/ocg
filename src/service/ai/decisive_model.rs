@@ -12,7 +12,9 @@ use super::providers::{
     CredentialResolver, MAX_PROVIDER_ERROR_BYTES, ModelListError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderModel, ResponseFacts,
 };
-use crate::system::http::{authorization, provider_client};
+use crate::system::http::{
+    DiscoveryClientError, authorization, discovery_client, provider_client_for,
+};
 
 use crate::db::entities::{
     DecisionAnswer, DecisionConfidence, DecisionOutcome, DecisionQuestion, DecisionRequest,
@@ -49,6 +51,7 @@ async fn execute_native(
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     reference: RequestRef,
+    sink: Option<&mut dyn super::providers::ProviderOutputSink>,
 ) -> Result<DecisionExecution, ProviderExecutionError> {
     input
         .validate(&frozen.model.declared_capabilities)
@@ -68,21 +71,29 @@ async fn execute_native(
         "systemone",
     )?;
     let credential = resolver.resolve(frozen.credential_ref.as_deref()).await?;
-    let redactor = Redactor::new(credential.as_deref());
+    let headers = crate::system::http::resolve_request_headers(&frozen.headers, resolver).await?;
+    let redactor = Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
     let authorization = credential.as_deref().map(authorization).transpose()?;
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
             message: "decision execution was cancelled before sending".to_owned(),
         });
     }
-    let client = provider_client(config.timeout).await?;
-    let request = client
-        .post(endpoint)
+    let client = provider_client_for(config.timeout, &config.destination, &endpoint).await?;
+    let request = headers
+        .apply(client.post(endpoint))
         .set_header(CONTENT_TYPE, "application/json")
         .set_header(ACCEPT, "application/json")
         .if_some(authorization, |authorization, request| {
             request.set_header("authorization", authorization)
         });
+    if let Some(sink) = sink {
+        sink.sending(body)
+            .await
+            .map_err(|error| ProviderExecutionError::NotDelivered {
+                message: error.message,
+            })?;
+    }
     let started = Instant::now();
     let sent = select(
         config.cancellation.cancelled(),
@@ -191,6 +202,27 @@ async fn execute_native(
         &redactor,
         finished_in,
     )
+}
+
+pub(crate) async fn execute_native_with_sink(
+    frozen: &NativeDecisionConfig,
+    input: &DecisionRequest,
+    body: &Value,
+    resolver: &dyn CredentialResolver,
+    config: &ProviderExecutionConfig,
+    reference: RequestRef,
+    sink: &mut dyn super::providers::ProviderOutputSink,
+) -> Result<DecisionExecution, ProviderExecutionError> {
+    if frozen
+        .endpoint
+        .as_deref()
+        .is_none_or(|endpoint| !crate::system::http::direct_diagnostic_loopback(endpoint))
+    {
+        return Err(ProviderExecutionError::Build {
+            message: "direct loopback endpoint required".into(),
+        });
+    }
+    execute_native(frozen, input, body, resolver, config, reference, Some(sink)).await
 }
 
 /// The answer of one accepted decision response: the typed result, the
@@ -567,7 +599,11 @@ fn decode_usage(usage: Option<&Value>) -> NormalizedUsage {
 pub(crate) async fn list_models(
     endpoint: &str,
     credential: Option<&str>,
+    headers: &crate::system::http::RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
+    if !crate::system::http::discovery_permitted(endpoint) {
+        return Err(ModelListError::NotAuthorized);
+    }
     let base =
         super::providers::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
     let authorization = credential
@@ -575,13 +611,16 @@ pub(crate) async fn list_models(
         .transpose()
         .map_err(|_| ModelListError::Unreachable)?;
     ntex::time::timeout(Duration::from_secs(30), async {
-        let client = provider_client(Duration::from_secs(30))
+        let client = discovery_client(Duration::from_secs(30), endpoint)
             .await
-            .map_err(|_| ModelListError::Unreachable)?;
+            .map_err(|error| match error {
+                DiscoveryClientError::NotAuthorized => ModelListError::NotAuthorized,
+                DiscoveryClientError::Unavailable => ModelListError::Unreachable,
+            })?;
 
         let (status, body) = {
-            let request = client
-                .get(&base)
+            let request = headers
+                .apply(client.get(&base))
                 .set_header(ACCEPT, "application/json")
                 .if_some(authorization.clone(), |authorization, request| {
                     request.set_header("authorization", authorization)
@@ -615,6 +654,13 @@ pub(crate) async fn list_models(
                 || message.clone(),
                 |secret| message.replace(secret, "[redacted]"),
             );
+            let message = headers
+                .secrets()
+                .iter()
+                .filter(|secret| !secret.is_empty())
+                .fold(message, |message, secret| {
+                    message.replace(secret.as_str(), "[redacted]")
+                });
             return Err(ModelListError::Rejected {
                 status_code: status,
                 message,
@@ -724,7 +770,7 @@ pub(crate) async fn execute_decision(
 ) -> Result<DecisionExecution, ProviderExecutionError> {
     match frozen {
         FrozenDecisionConfig::Native(native) => {
-            execute_native(native, input, body, resolver, config, reference).await
+            execute_native(native, input, body, resolver, config, reference, None).await
         }
         FrozenDecisionConfig::Generative(generative, profile) => {
             request_body(frozen, input)?;

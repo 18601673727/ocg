@@ -10,6 +10,7 @@
 //! endpoint or credential.
 
 use super::contracts::*;
+use ntex::web::HttpRequest;
 use serde_json::Value;
 
 use super::{
@@ -223,26 +224,75 @@ pub(super) fn agent_profile_query(query: &str) -> Result<(Option<ProfileId>, usi
 /// The Job's frozen input: its objective as text, its Attachments by
 /// identity, and the configuration it was frozen with, named by Profile and
 /// model alone.
-pub(super) async fn job_input(database: &DatabaseHandle, job: JobId) -> Result<Reply, Refusal> {
-    database.job(job).await?.ok_or(JOB_NOT_FOUND)?;
-    let input = database
-        .job_input_for_job(job)
-        .await?
-        .ok_or(INCONSISTENT_RECORD)?;
-    let configuration = database
-        .job_configuration(job)
-        .await?
-        .map(configuration_view);
-    Ok(Reply::ok(envelope(serde_json::json!(JobInputView {
-        job: job.to_string(),
-        input: InputView {
-            id: input.id.to_string(),
-            objective: input.objective,
-            submitted_at_us: input.submitted_at.map(|at| at.as_unix_micros()),
-            attachments: input.attachments.iter().map(ToString::to_string).collect(),
-            configuration,
-        },
-    }))))
+pub(super) async fn job_input(
+    database: &DatabaseHandle,
+    job: JobId,
+    request: &HttpRequest,
+) -> Result<Reply, Refusal> {
+    {
+        let context = super::mutable_jobs::optional_context(request)?;
+        match database.mutable_job_details(job, context).await? {
+            crate::db::redb::MutableJobDetailsLookup::Found(details) => {
+                let record = details.record;
+                let configuration = details
+                    .configuration
+                    .map(|configuration| ConfigurationView {
+                        agent_profile: configuration
+                            .selection
+                            .agent_profile
+                            .map(|id| id.to_string()),
+                        llm_profile: configuration.selection.llm_profile.to_string(),
+                        model: configuration.model,
+                        context_window: configuration.context_window,
+                        reasoning_effort: configuration
+                            .selection
+                            .reasoning_effort
+                            .map(|effort| effort.as_str().to_owned()),
+                    });
+                let mut body = envelope(serde_json::json!(JobInputView {
+                    job: job.to_string(),
+                    input: InputView {
+                        id: job.to_string(),
+                        objective: match &record.job.input.content {
+                            crate::db::entities::MutableJobContent::Generative { text, .. } =>
+                                Some(text.clone()),
+                            crate::db::entities::MutableJobContent::Decision { .. } => None,
+                        },
+                        submitted_at_us: record.job.submitted_at.map(|time| time.as_unix_micros()),
+                        attachments: record
+                            .job
+                            .input
+                            .attachments()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        configuration,
+                    },
+                }));
+                body["input"]["revision"] = serde_json::json!(record.job.revision);
+                if let crate::db::entities::MutableJobContent::Decision {
+                    request, profile, ..
+                } = &record.job.input.content
+                {
+                    body["input"]["kind"] = serde_json::json!("decision");
+                    body["input"]["decision_request"] = serde_json::json!(request);
+                    body["input"]["decision_profile"] = serde_json::json!(profile.to_string());
+                }
+                body["input"]["project"] =
+                    serde_json::json!(record.project.map(|project| project.to_string()));
+                body["input"]["execution_requirements"] = serde_json::json!(
+                    record.job.input.configuration().map(|selection| serde_json::json!({
+                        "llm_profile": selection.llm_profile.to_string(),
+                        "agent_profile": selection.agent_profile.map(|id| id.to_string()),
+                        "reasoning_effort": selection.reasoning_effort.map(|effort| effort.as_str()),
+                    }))
+                );
+                Ok(Reply::ok(body))
+            }
+            crate::db::redb::MutableJobDetailsLookup::Inaccessible
+            | crate::db::redb::MutableJobDetailsLookup::NotMutable => Err(JOB_NOT_FOUND),
+        }
+    }
 }
 
 pub(super) fn actor_view(actor: &crate::db::entities::Actor) -> ActorView {
@@ -257,6 +307,9 @@ pub(super) fn actor_view(actor: &crate::db::entities::Actor) -> ActorView {
     }
 }
 
+// The generated wire contract keeps every entry kind; native turns emit only
+// `user_message`, so the other kinds are never constructed by the backend.
+#[allow(dead_code)]
 #[derive(serde::Serialize, ts_rs::TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(rename = "ResponseFormat")]
@@ -265,6 +318,7 @@ pub(crate) enum ResponseFormatView {
     JsonSchema { name: String },
 }
 
+#[allow(dead_code)]
 #[derive(serde::Serialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(rename = "TurnEntryKind")]
@@ -322,71 +376,6 @@ pub(crate) struct TurnEntryView {
     entry: TurnEntryKindView,
 }
 
-pub(super) fn entry_json(seq: u32, entry: &crate::db::entities::JobInputEntry) -> TurnEntryView {
-    use crate::db::entities::Entry;
-    let kind = match &entry.entry {
-        Entry::UserMessage { text, attachments } => TurnEntryKindView::UserMessage {
-            text: text.clone(),
-            attachments: attachments.iter().map(ToString::to_string).collect(),
-        },
-        Entry::UserMessageEdit {
-            message,
-            text,
-            attachments,
-        } => TurnEntryKindView::UserMessageEdit {
-            message: *message,
-            text: text.clone(),
-            attachments: attachments.iter().map(ToString::to_string).collect(),
-        },
-        Entry::UserMessageWithdraw { message } => {
-            TurnEntryKindView::UserMessageWithdraw { message: *message }
-        }
-        Entry::AgentMessage { text, call } => TurnEntryKindView::AgentMessage {
-            text: text.clone(),
-            call: format!("{}:{}/{}", call.job, call.request.get(), call.index),
-        },
-        Entry::Notice {
-            child,
-            event,
-            reference,
-        } => TurnEntryKindView::Notice {
-            child: child.to_string(),
-            event: format!("{event:?}"),
-            reference: reference.to_string(),
-        },
-        Entry::Decision { approval } => TurnEntryKindView::Decision {
-            approval: (approval.0.to_string(), approval.1, approval.2),
-        },
-        Entry::RetryOf { turn, by } => TurnEntryKindView::RetryOf {
-            turn: turn.to_string(),
-            by: actor_view(by),
-        },
-        Entry::ContextPreparation {
-            job,
-            policy_revision,
-        } => TurnEntryKindView::ContextPreparation {
-            job: job.to_string(),
-            policy_revision: policy_revision.to_string(),
-        },
-        Entry::ContextUse { artifact } => TurnEntryKindView::ContextUse {
-            artifact: artifact.map(|job| job.to_string()),
-        },
-        Entry::Iteration { n } => TurnEntryKindView::Iteration { n: *n },
-        Entry::ResponseFormat { format } => TurnEntryKindView::ResponseFormat {
-            format: match format {
-                crate::db::entities::ResponseFormat::JsonObject => ResponseFormatView::JsonObject,
-                crate::db::entities::ResponseFormat::JsonSchema { name, .. } => {
-                    ResponseFormatView::JsonSchema { name: name.clone() }
-                }
-            },
-        },
-    };
-    TurnEntryView {
-        seq,
-        at_us: entry.at.as_unix_micros(),
-        entry: kind,
-    }
-}
 pub(super) async fn conversation_children(
     database: &DatabaseHandle,
     conversation: JobId,
@@ -552,6 +541,11 @@ pub(super) async fn job_tree(
     limit: usize,
     depth: u8,
 ) -> Result<Reply, Refusal> {
+    if let crate::db::redb::MutableJobDetailsLookup::Found(details) =
+        shared.database.mutable_job_details(job, None).await?
+    {
+        return dashboard::bounded(shared, envelope(serde_json::json!(native_tree(&details))));
+    }
     let tree = shared
         .database
         .job_tree(job, after, limit, depth)
@@ -566,6 +560,51 @@ pub(super) async fn job_tree(
             root,
         })),
     )
+}
+
+/// A submitted native Job is a leaf: it has no children, no dependencies and
+/// no Agent run of its own, so its tree is the Job alone below its
+/// conversation.
+fn native_tree(details: &crate::db::redb::MutableJobDetails) -> TreeView {
+    let record = &details.record;
+    let job = &record.job;
+    let title = super::jobs::mutable_title(job);
+    let state = match super::mutable_jobs::phase(record) {
+        "executing" => "running",
+        other => other,
+    };
+    TreeView {
+        job: job.id.to_string(),
+        ancestors: vec![job.parent_id.to_string()],
+        root: TreeNodeView {
+            id: job.id.to_string(),
+            kind: super::jobs::JobKindView::Turn,
+            parent: Some(job.parent_id.to_string()),
+            title,
+            state: state.to_owned(),
+            created_at_us: job.created_at.as_unix_micros(),
+            agent: None,
+            agent_name: None,
+            model: details
+                .configuration
+                .as_ref()
+                .map(|configuration| ModelView {
+                    llm_profile: configuration.selection.llm_profile.to_string(),
+                    model: configuration.model.clone(),
+                }),
+            on_hold: None,
+            origin: None,
+            keep_open: None,
+            active_turn: None,
+            recurrence: None,
+            conversation: Some(job.parent_id.to_string()),
+            previous: job.previous.map(|id| id.to_string()),
+            depends_on: Vec::new(),
+            children: Some(Vec::new()),
+            has_more_children: false,
+            next_after: None,
+        },
+    }
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -586,11 +625,28 @@ pub(crate) struct CompactionUseView {
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "TurnContentKind")]
+enum TurnContentKind {
+    Generative,
+    Decision,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Turn")]
 pub(crate) struct TurnView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     compaction: Option<CompactionUseView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    native_decision: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    content_kind: Option<TurnContentKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    submitted_at_us: Option<i64>,
     job: super::jobs::JobView,
     entries: Vec<TurnEntryView>,
     configuration: Option<ConfigurationView>,
@@ -614,69 +670,121 @@ pub(super) async fn conversation_turns(
     before: Option<JobId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    let page = database
-        .conversation_turn_page(conversation, before, limit)
-        .await?
-        .ok_or(Refusal::new(
-            ntex::http::StatusCode::NOT_FOUND,
-            "conversation_not_found",
-            "conversation does not exist",
-        ))?;
-    let next_before = page
-        .turns
-        .last()
-        .filter(|_| page.has_more)
-        .map(|turn| turn.record.id.to_string());
-    let mut turns = Vec::with_capacity(page.turns.len());
-    for turn in page.turns {
-        let mut uncertain = Vec::new();
-        for call in turn.evidence {
-            if let Some(admission) = call.admission()
-                && call.outcome.as_ref().is_none_or(|outcome| {
-                    matches!(
-                        outcome.fact,
-                        crate::db::entities::ToolOutcome::Uncertain { .. }
-                    )
+    {
+        let page = database
+            .mutable_conversation_turn_page(conversation, before, limit)
+            .await?
+            .ok_or(Refusal::new(
+                ntex::http::StatusCode::NOT_FOUND,
+                "conversation_not_found",
+                "conversation does not exist",
+            ))?;
+        let next_before = page
+            .turns
+            .last()
+            .filter(|_| page.has_more)
+            .map(|turn| turn.details.record.job.id.to_string());
+        let turns = page
+            .turns
+            .into_iter()
+            .map(|item| {
+                let turn = &item.details.record;
+                let at = turn
+                    .job
+                    .submitted_at
+                    .ok_or(INCONSISTENT_RECORD)?
+                    .as_unix_micros();
+                let decision = match &turn.job.input.content {
+                    crate::db::entities::MutableJobContent::Generative { .. } => None,
+                    crate::db::entities::MutableJobContent::Decision { request, .. } => {
+                        let result = item.details.result.as_ref().and_then(|output| output.value.as_ref()).and_then(|value| value.get("decision")).cloned().map(|value| {
+                            let result: crate::db::entities::DecisionResult = serde_json::from_value(value).map_err(|_| INCONSISTENT_RECORD)?;
+                            let Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) = &turn.job.frozen else { return Err(INCONSISTENT_RECORD) };
+                            result.validate(request, &crate::db::entities::FrozenDecisionConfig::Native(frozen.clone()), crate::db::entities::RequestRef { job: turn.job.id, request: crate::db::entities::RequestNumber::FIRST }).map_err(|_| INCONSISTENT_RECORD)?;
+                            Ok::<_, Refusal>(result)
+                        }).transpose()?;
+                        if turn.outcome.as_ref().is_some_and(|outcome| outcome.kind == crate::db::entities::OutcomeKind::Completed) && result.is_none() { return Err(INCONSISTENT_RECORD); }
+                        let failure = turn.outcome.as_ref().filter(|outcome| outcome.kind == crate::db::entities::OutcomeKind::Failed).and(item.details.result.as_ref()).and_then(|output| output.summary.as_deref());
+                        Some(serde_json::json!({"kind": "decision", "request": request, "result": result, "failure": failure}))
+                    }
+                };
+                let entry = TurnEntryView {
+                    seq: 1,
+                    at_us: at,
+                    entry: TurnEntryKindView::UserMessage {
+                        text: turn.job.input.text().to_owned(),
+                        attachments: turn
+                            .job
+                            .input
+                            .attachments()
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                    },
+                };
+                Ok(TurnView {
+                    compaction: None,
+                    content_kind: Some(if decision.is_some() { TurnContentKind::Decision } else { TurnContentKind::Generative }),
+                    submitted_at_us: turn.job.submitted_at.map(|at| at.as_unix_micros()),
+                    native_decision: decision.clone(),
+                    job: super::jobs::mutable_job_view(
+                        turn,
+                        item.details.allocation.as_ref(),
+                        item.details.activity.last_activity_at_us(),
+                    ),
+                    entries: if decision.is_some() { Vec::new() } else { vec![entry] },
+                    configuration: item.details.configuration.map(|configuration| {
+                        ConfigurationView {
+                            agent_profile: configuration
+                                .selection
+                                .agent_profile
+                                .map(|id| id.to_string()),
+                            llm_profile: configuration.selection.llm_profile.to_string(),
+                            model: configuration.model,
+                            context_window: configuration.context_window,
+                            reasoning_effort: configuration
+                                .selection
+                                .reasoning_effort
+                                .map(|effort| effort.as_str().to_owned()),
+                        }
+                    }),
+                    outputs: item
+                        .outputs
+                        .iter()
+                        .map(super::outputs::output_view)
+                        .collect(),
+                    uncertain_calls: item
+                        .evidence
+                        .into_iter()
+                        .filter_map(|call| {
+                            let admission = call.admission()?;
+                            if call.outcome.as_ref().is_some_and(|outcome| {
+                                !matches!(
+                                    outcome.fact,
+                                    crate::db::entities::ToolOutcome::Uncertain { .. }
+                                )
+                            }) {
+                                return None;
+                            }
+                            Some(UncertainCallView {
+                                request: call.call.request.get(),
+                                index: call.call.index,
+                                tool: call.name.clone(),
+                                argv: admission.arguments.as_str().to_owned(),
+                            })
+                        })
+                        .collect(),
+                    outputs_truncated: item.outputs_truncated,
                 })
-            {
-                uncertain.push(UncertainCallView {
-                    request: call.call.request.get(),
-                    index: call.call.index,
-                    tool: call.name.clone(),
-                    argv: admission.arguments.as_str().to_owned(),
-                });
-            }
-        }
-        turns.push(TurnView {
-            compaction: turn
-                .compaction
-                .map(|(artifact, kind, at)| CompactionUseView {
-                    artifact: artifact.to_string(),
-                    kind: kind.to_owned(),
-                    at_us: at.as_unix_micros(),
-                }),
-            job: super::jobs::job_view(&turn.record)?,
-            entries: turn
-                .entries
-                .iter()
-                .map(|(seq, entry)| entry_json(*seq, entry))
-                .collect(),
-            configuration: turn.configuration.map(configuration_view),
-            outputs: turn
-                .outputs
-                .iter()
-                .map(super::outputs::output_view)
-                .collect(),
-            uncertain_calls: uncertain,
-            outputs_truncated: turn.outputs_truncated,
-        });
+            })
+            .collect::<Result<Vec<_>, Refusal>>()?;
+        Ok(Reply::ok(envelope(serde_json::json!(TurnsView {
+            conversation: conversation.to_string(),
+            turns,
+            has_more: page.has_more,
+            next_before,
+        }))))
     }
-    Ok(Reply::ok(envelope(serde_json::json!(TurnsView {
-        conversation: conversation.to_string(),
-        turns,
-        has_more: page.has_more,
-        next_before,
-    }))))
 }
 pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Result<Reply, Refusal> {
     let mut has_more = body["has_more"].as_bool().ok_or(INCONSISTENT_RECORD)?;
@@ -1370,16 +1478,6 @@ pub(crate) struct InputView {
 pub(crate) struct JobInputView {
     job: String,
     input: InputView,
-}
-
-fn configuration_view(submitted: crate::db::entities::SubmittedConfiguration) -> ConfigurationView {
-    ConfigurationView {
-        agent_profile: submitted.agent_profile.map(|id| id.to_string()),
-        llm_profile: submitted.llm_profile.to_string(),
-        model: submitted.frozen.llm.config.model,
-        context_window: submitted.frozen.llm.config.context_window,
-        reasoning_effort: submitted.frozen.llm.config.parameters.reasoning_effort,
-    }
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]

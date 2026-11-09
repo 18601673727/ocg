@@ -443,6 +443,57 @@ impl ContextSourceManifest {
     }
 }
 
+/// A native source boundary binds a frozen Job revision and every output
+/// through the inclusive final sequence, rather than a legacy input journal.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSummaryBoundary {
+    pub job: JobId,
+    pub revision: u64,
+    pub output_through: u32,
+    pub content: ContentDigest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSummaryManifest {
+    pub schema_version: u32,
+    pub conversation: JobId,
+    pub through_job: JobId,
+    pub sources: Vec<NativeSummaryBoundary>,
+}
+
+/// The final output of an authorized producer links its source manifest and
+/// the immutable content-addressed summary payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSummaryResultLink {
+    pub source: ContentDigest,
+    pub payload: ContentDigest,
+    pub producer_job: ContentDigest,
+}
+
+impl NativeSummaryManifest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.schema_version != 2
+            || self.sources.is_empty()
+            || self.sources.len() > 4096
+            || self.sources.last().map(|source| source.job) != Some(self.through_job)
+            || self
+                .sources
+                .iter()
+                .any(|source| source.revision == 0 || source.output_through == 0)
+            || self
+                .sources
+                .windows(2)
+                .any(|pair| pair[0].job >= pair[1].job)
+        {
+            return Err("invalid native summary manifest");
+        }
+        Ok(())
+    }
+}
+
 /// What a manual compaction request did. A repeated key returns the same
 /// outcome. No eligible source is a no-op, not a failure; a source that
 /// cannot fit the summarizer is an explicit refusal, never a truncated job.

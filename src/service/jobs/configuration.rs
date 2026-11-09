@@ -3,6 +3,7 @@ use crate::db::{BatchError, Failure, StorageError};
 
 pub(crate) struct ConfigurationResolver<F> {
     read: F,
+    global_headers: GlobalHeaders,
 }
 
 impl<F> ConfigurationResolver<F>
@@ -10,7 +11,24 @@ where
     F: FnMut(ConfigId) -> Result<Option<ConfigRecord>, BatchError>,
 {
     pub(crate) fn new(read: F) -> Self {
-        Self { read }
+        Self {
+            read,
+            global_headers: GlobalHeaders::default(),
+        }
+    }
+
+    /// The global request fields frozen into the configurations this resolver
+    /// builds; without them a configuration carries only its Connection's.
+    pub(crate) fn with_global_headers(mut self, global_headers: GlobalHeaders) -> Self {
+        self.global_headers = global_headers;
+        self
+    }
+
+    fn frozen_headers(&self, connection: &ConnectionConfig) -> FrozenHeaders {
+        FrozenHeaders {
+            global_revision: self.global_headers.revision,
+            fields: merge(&self.global_headers.fields, &connection.headers),
+        }
     }
 
     fn require_config(&mut self, id: ConfigId) -> Result<ConfigRecord, BatchError> {
@@ -122,6 +140,7 @@ where
         let ConfigBody::Connection(connection_body) = connection.body else {
             return self.corrupted(format!("{} has a mismatched body", connection.id));
         };
+        let headers = self.frozen_headers(&connection_body);
         let decision_profile = if let Some(id) = configuration.agent_profile {
             let row = self.require_config(id.into())?;
             if row.archived_at.is_some() {
@@ -191,6 +210,7 @@ where
                     transport: connection_body.protocol,
                     endpoint: connection_body.endpoint,
                     credential_ref: connection_body.credential_ref,
+                    headers,
                 },
                 model: ConfigRef {
                     id: model.id,
@@ -275,6 +295,7 @@ where
         let ConfigBody::Connection(connection_body) = connection.body else {
             return self.corrupted("mismatched connection".into());
         };
+        let headers = self.frozen_headers(&connection_body);
         Ok(FrozenDecisionConfig::Native(NativeDecisionConfig {
             agent: agent_body,
             agent_ref,
@@ -289,6 +310,7 @@ where
             },
             endpoint: connection_body.endpoint,
             credential_ref: connection_body.credential_ref,
+            headers,
         }))
     }
 

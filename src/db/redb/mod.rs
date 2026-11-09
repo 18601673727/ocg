@@ -55,26 +55,23 @@ mod indexes;
 mod job_records;
 mod notices;
 mod observations;
+pub(crate) use observations::{DecisionAvailabilityRecord, read_decision_availability};
 mod reader;
 mod recovery;
 pub(crate) use recovery::reclaim_pending;
-pub(crate) use recovery::{
-    MigrationFormat, migration_apply, migration_credentials_digest, migration_inspect,
-    migration_snapshot, migration_source, migration_verify_credentials,
-    parse_migration_credentials,
-};
 mod recurrences;
 mod rows;
 mod schema;
 mod transactions;
 mod writer;
+pub(crate) use transactions::valid_reservation_request_id;
 
 use crate::db::entities::AvailabilityStatId;
 pub(crate) use codec::encode_response_format;
 use codec::{
-    Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_GLOBAL_COMPACTION, TAG_JOB,
-    TAG_JOB_CONTROL, TAG_JOB_STATE, TAG_OUTPUT, TAG_PROJECT, TAG_REQUEST_EVENT, TAG_SUBMISSION,
-    TAG_TOOL_CALL,
+    Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_GLOBAL_COMPACTION,
+    TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_CONTROL, TAG_JOB_STATE, TAG_OUTPUT, TAG_PROJECT,
+    TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
 };
 pub(crate) use writer::Failure;
 pub(crate) use writer::{
@@ -83,7 +80,20 @@ pub(crate) use writer::{
 };
 
 pub(crate) use reader::{
-    JobScope, read_delegated_workspace, read_global_compaction_settings, read_job_scope,
+    DevelopmentCandidate, DevelopmentResolvedCandidate, DevelopmentResolvedContext,
+    read_development_execution_context, read_development_execution_preview,
+};
+pub(crate) use reader::{
+    JobScope, ProfilePageRecord, read_delegated_workspace, read_global_compaction_settings,
+    read_job_scope,
+};
+pub(crate) use reader::{NativeResource, NativeResourceKind, read_native_resources};
+pub(crate) use reader::{VerifiedNativeSummary, verify_native_summary};
+pub(crate) use reader::{
+    inspect_held_allocations_offline, reconcile_development_reservation_offline, verify_offline,
+};
+pub(crate) use recovery::{
+    ReservedRefusal, reconcile_reserved_apply, reconcile_reserved_preflight,
 };
 /// The bytes `character` costs inside a JSON string. Projection chunks text
 /// by this cost so every serialized page fits the response budget.
@@ -103,29 +113,33 @@ use reader::read;
 use recovery::allocate;
 pub(crate) use recovery::{OpenedFile, database_file, open};
 
+pub(crate) use reader::read_global_outbound_headers;
+pub(crate) use reader::read_handoff_credential;
+pub(crate) use reader::read_trial_job;
 pub(crate) use reader::{
     AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
-    read_approved_calls, read_cards, read_conversation_children, read_has_decider,
+    NativeJobItem, read_approved_calls, read_cards, read_conversation_children, read_has_decider,
     read_has_pending_approvals,
 };
 pub(crate) use reader::{
-    ContextState, ContextWorkDetails, JobDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
+    ContextState, ContextWorkDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
     UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, queue_counts,
     read_agent_model_configs, read_attachment, read_attachments, read_candidate_compatible,
     read_children, read_compatible_executors, read_config, read_configs, read_context_state,
     read_conversation_search, read_conversations, read_credential_ref_in_use,
     read_decision_executors, read_decision_work, read_effective_context_policy,
     read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,
-    read_job_configuration, read_job_details, read_job_input, read_job_input_for_job,
-    read_job_search, read_job_tree, read_jobs, read_latest_output, read_occupancy, read_outputs,
+    read_job_configuration, read_job_input, read_job_input_for_job, read_job_search, read_job_tree,
+    read_jobs, read_latest_output, read_native_job, read_occupancy, read_outputs,
     read_pool_binding, read_prediction_current, read_preparation_current, read_profile_page,
     read_project, read_projects, read_retries, read_submission, read_summarization_input,
     read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_buckets,
     read_usage_retries, read_usage_summary,
 };
 pub(crate) use reader::{
-    ConversationTurnPage, TurnContext, read_conversation_limits, read_conversation_turn_page,
-    read_conversation_turns, read_notices, read_turn_context, read_turn_execution,
+    MutableConversationPage, MutableJobDetails, MutableJobDetailsLookup, TurnContext,
+    read_conversation_limits, read_conversation_turns, read_mutable_conversation_turn_page,
+    read_mutable_job_details, read_notices, read_turn_context, read_turn_execution,
 };
 pub(crate) use reader::{ProfilePageRecords, StoredCredential, credential_count, read_credential};
 
@@ -347,6 +361,4 @@ pub(crate) fn stop_standings(
     Ok(standings)
 }
 
-pub(crate) use crate::db::entities::{
-    JobActivity, JobActivityPhase, JobPlanStepView, JobPlanView, JobUsage,
-};
+pub(crate) use crate::db::entities::{JobActivity, JobUsage};

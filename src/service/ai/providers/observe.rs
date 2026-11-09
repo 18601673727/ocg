@@ -62,37 +62,35 @@ const REDACTED: &str = "[redacted]";
 /// Removes a resolved credential from provider-controlled values before they
 /// can leave provider execution. One is built in `exchange`, while the
 /// credential is still known, and every failure that can reach persistence,
-/// an API response, a log or `Display` passes through it. Both the credential
-/// as sent and its JSON-escaped spelling are covered, so a secret echoed
-/// inside a JSON error body cannot survive as the parsed message either.
+/// an API response, a log or `Display` passes through it. The credential as
+/// sent and its common encodings (JSON-escaped, percent-encoded, hexadecimal
+/// and Base64 at any alignment) are covered, so a secret echoed inside a JSON
+/// error body cannot survive as the parsed message either. A secret split or
+/// otherwise transformed is not found; see `system::secrets`.
 #[derive(Debug, Default)]
 pub(crate) struct Redactor {
-    secrets: Vec<String>,
+    secrets: crate::system::secrets::Spellings,
 }
 
 impl Redactor {
     pub(crate) fn new(credential: Option<&str>) -> Self {
-        let mut secrets = Vec::new();
-        if let Some(secret) = credential.filter(|secret| !secret.is_empty()) {
-            let escaped = serde_json::to_string(secret)
-                .ok()
-                .and_then(|quoted| {
-                    quoted
-                        .strip_prefix('"')
-                        .and_then(|quoted| quoted.strip_suffix('"'))
-                        .map(str::to_owned)
-                })
-                .filter(|escaped| escaped != secret);
-            secrets.push(secret.to_owned());
-            secrets.extend(escaped);
+        Self {
+            secrets: crate::system::secrets::Spellings::new(credential.unwrap_or_default()),
         }
-        Self { secrets }
+    }
+
+    /// Also removes each of `extra`, such as the secret request headers.
+    pub(crate) fn with_secrets(mut self, extra: &[String]) -> Self {
+        for secret in extra {
+            self.secrets.extend(secret);
+        }
+        self
     }
 
     pub(crate) fn text(&self, text: &str) -> String {
         let mut text = text.to_owned();
-        for secret in &self.secrets {
-            text = text.replace(secret.as_str(), REDACTED);
+        for secret in self.secrets.iter() {
+            text = text.replace(secret, REDACTED);
         }
         text
     }

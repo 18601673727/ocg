@@ -15,7 +15,9 @@ impl Batch {
             .as_ref()
             .map(ProjectRecord::decision_policy)
             .unwrap_or_default();
+        let global = self.global_headers()?;
         let Some(frozen) = ConfigurationResolver::new(|id| self.config_record(id))
+            .with_global_headers(global)
             .project_decision(&policy, active)?
         else {
             return Ok(None);
@@ -36,7 +38,10 @@ impl Batch {
         &mut self,
         profile: ConfigId,
     ) -> Result<FrozenDecisionConfig, BatchError> {
-        ConfigurationResolver::new(|id| self.config_record(id)).freeze_decision_profile(profile)
+        let global = self.global_headers()?;
+        ConfigurationResolver::new(|id| self.config_record(id))
+            .with_global_headers(global)
+            .freeze_decision_profile(profile)
     }
 
     pub(crate) fn decision_assignment_current(

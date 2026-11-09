@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::system::http::{authorization, provider_client};
+use crate::system::http::{DiscoveryClientError, authorization, discovery_client};
 
 pub(crate) use crate::db::entities::DiscoveredModel as ProviderModel;
 
 pub(crate) enum ModelListError {
+    /// The build does not permit model discovery against this endpoint; no
+    /// request was made. See [`crate::system::http::discovery_permitted`].
+    NotAuthorized,
     Unreachable,
-    Rejected { status_code: u16, message: String },
+    Rejected {
+        status_code: u16,
+        message: String,
+    },
     NotListed,
 }
 
@@ -15,7 +21,11 @@ pub(crate) async fn list_models(
     endpoint: &str,
     credential: Option<&str>,
     protocol: crate::db::entities::LlmTransport,
+    headers: &crate::system::http::RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
+    if !crate::system::http::discovery_permitted(endpoint) {
+        return Err(ModelListError::NotAuthorized);
+    }
     let base = super::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
     let anthropic = protocol == crate::db::entities::LlmTransport::AnthropicMessages;
     let authorization = credential
@@ -27,9 +37,12 @@ pub(crate) async fn list_models(
         .transpose()
         .map_err(|_| ModelListError::Unreachable)?;
     ntex::time::timeout(Duration::from_secs(30), async {
-        let client = provider_client(Duration::from_secs(30))
+        let client = discovery_client(Duration::from_secs(30), endpoint)
             .await
-            .map_err(|_| ModelListError::Unreachable)?;
+            .map_err(|error| match error {
+                DiscoveryClientError::NotAuthorized => ModelListError::NotAuthorized,
+                DiscoveryClientError::Unavailable => ModelListError::Unreachable,
+            })?;
         let mut endpoint = if anthropic {
             format!("{base}?limit=1000")
         } else {
@@ -39,8 +52,8 @@ pub(crate) async fn list_models(
         let mut cursors = std::collections::BTreeSet::new();
         for _ in 0..100 {
             let (status, body) = {
-                let request = client
-                    .get(&endpoint)
+                let request = headers
+                    .apply(client.get(&endpoint))
                     .set_header(ACCEPT, "application/json")
                     .if_some(authorization.clone(), |authorization, request| {
                         request.set_header(
@@ -77,7 +90,7 @@ pub(crate) async fn list_models(
                 };
                 (status, body)
             };
-            for model in parse_models(status, &body, credential)? {
+            for model in parse_models(status, &body, credential, headers)? {
                 models.insert(model.id.clone(), model);
             }
             let value =
@@ -117,6 +130,7 @@ fn parse_models(
     status: u16,
     body: &[u8],
     credential: Option<&str>,
+    headers: &crate::system::http::RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
     if status == 404 {
         return Err(ModelListError::NotListed);
@@ -141,6 +155,13 @@ fn parse_models(
             || message.clone(),
             |secret| message.replace(secret, "[redacted]"),
         );
+        let message = headers
+            .secrets()
+            .iter()
+            .filter(|secret| !secret.is_empty())
+            .fold(message, |message, secret| {
+                message.replace(secret.as_str(), "[redacted]")
+            });
         return Err(ModelListError::Rejected {
             status_code: status,
             message,

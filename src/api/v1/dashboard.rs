@@ -64,39 +64,10 @@ pub(super) async fn jobs(
     limit: usize,
     terms: Vec<String>,
 ) -> Result<Reply, Refusal> {
-    if !terms.is_empty() {
-        let page = shared.database.search_jobs(terms, before, limit).await?;
-        let jobs = page
-            .records
-            .iter()
-            .map(super::jobs::job_view)
-            .collect::<Result<Vec<_>, _>>()?;
-        return bounded(
-            shared,
-            envelope(serde_json::json!(super::jobs::JobsView {
-                jobs,
-                next_before: page.next_before.map(|id| id.to_string()),
-                has_more: page.has_more,
-            })),
-        );
-    }
-    let records = shared.database.jobs(before, limit + 1).await?;
-    let page = records
-        .iter()
-        .take(limit)
-        .map(super::jobs::job_view)
-        .collect::<Result<Vec<_>, _>>()?;
-    let more = records.len() > limit;
-    let next = more
-        .then(|| records.get(limit - 1).map(|record| record.id.to_string()))
-        .flatten();
+    let page = shared.database.search_jobs(terms, before, limit).await?;
     bounded(
         shared,
-        envelope(serde_json::json!(super::jobs::JobsView {
-            jobs: page,
-            next_before: next,
-            has_more: more,
-        })),
+        envelope(serde_json::json!(super::jobs::jobs_page_view(&page))),
     )
 }
 

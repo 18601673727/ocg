@@ -320,16 +320,7 @@ impl Feed {
                     .search_jobs(query.terms.clone(), before, query.limit)
                     .await?;
                 let next = page.next_before;
-                let jobs = page
-                    .records
-                    .iter()
-                    .map(super::jobs::job_view)
-                    .collect::<Result<Vec<_>, _>>()?;
-                let body = super::contracts::envelope(json!({
-                    "jobs": jobs,
-                    "next_before": next.map(|id| id.to_string()),
-                    "has_more": page.has_more,
-                }));
+                let body = super::contracts::envelope(json!(super::jobs::jobs_page_view(&page)));
                 self.page = match next {
                     Some(id) => Page::Jobs { before: Some(id) },
                     None => Page::Wait,

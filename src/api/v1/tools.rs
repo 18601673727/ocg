@@ -160,9 +160,7 @@ pub(super) async fn tool(
     request: RequestNumber,
     index: u32,
 ) -> Result<Reply, Refusal> {
-    if shared.database.job(job).await?.is_none() {
-        return Err(JOB_NOT_FOUND);
-    }
+    super::outputs::require_output_job(&shared.database, job).await?;
     let after = index
         .checked_sub(1)
         .map(|index| (request, index))
@@ -191,9 +189,7 @@ pub(super) async fn tools(
     limit: usize,
 ) -> Result<Value, Refusal> {
     let database = &shared.database;
-    if database.job(job).await?.is_none() {
-        return Err(JOB_NOT_FOUND);
-    }
+    super::outputs::require_output_job(database, job).await?;
     let records = database.tool_evidence(job, after, limit + 1).await?;
     let after_cursor = after.map(|(req, idx)| format!("{}:{}", req.get(), idx));
     let envelope = |page: Vec<ToolCallView>, next: Option<(RequestNumber, u32)>, more: bool| {

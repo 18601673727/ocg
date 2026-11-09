@@ -9,6 +9,7 @@ use crate::service::ai::providers::openai_compatible::{
 
 mod approvals;
 mod attachments;
+mod headers;
 mod identity;
 mod job_context;
 mod jobs;
@@ -30,18 +31,20 @@ pub use approvals::{
     is_handler_version,
 };
 pub use attachments::*;
+pub use headers::*;
 pub use identity::{
-    AttachmentId, AvailabilityStatId, ConfigId, ExecutionPoolId, ExecutorId, JobId, JobInputId,
-    JobOutputId, LlmProviderId, MetricsId, ProfileId, ProjectId, RecordRef, RequestEventId,
-    RequestNumber, RequestRef, Timestamp, parse_entity_id,
+    AttachmentId, AvailabilityStatId, ComposerContextId, ConfigId, ExecutionPoolId, ExecutorId,
+    JobId, JobInputId, JobOutputId, LlmProviderId, MetricsId, ProfileId, ProjectId, RecordRef,
+    RequestEventId, RequestNumber, RequestRef, ReservationRequestId, Timestamp, parse_entity_id,
 };
 pub(crate) use job_context::parse_suggested_title;
 pub use job_context::{
     Actor, Appended, COMPACTION_JOB_NAME, CompactionMode, CompactionPolicy, CompactionPreset,
     CompactionRequest, ContextSourceManifest, CustomPolicy, Entry, EntryKind,
     GlobalCompactionSettings, JobAction, JobEdit, JobGroup, JobInputEntry, JobLimits,
-    MAX_JOB_DEPTH, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin, PredictionAcceptance,
-    PredictionMode, PredictiveCompaction, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
+    MAX_JOB_DEPTH, NativeSummaryBoundary, NativeSummaryManifest, NativeSummaryResultLink, Notice,
+    NoticeBody, NoticeClass, NoticeEvent, Origin, PredictionAcceptance, PredictionMode,
+    PredictiveCompaction, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
     ResolvedCompaction, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause,
     StopProof, SummarizationResult, SummarizationStage, SummarizationWork, SummaryFragment,
     TITLE_JOB_NAME, title_prompt,

@@ -197,6 +197,14 @@ impl DatabaseWorker {
                         .ok();
                     return Ok(());
                 }
+                let _database_lock = match crate::system::data_directory::lock_database(&directory)
+                {
+                    Ok(lock) => lock,
+                    Err(error) => {
+                        ready_sender.send(Err(DatabaseError::Startup(error))).ok();
+                        return Ok(());
+                    }
+                };
                 let OpenedFile {
                     database,
                     epoch,

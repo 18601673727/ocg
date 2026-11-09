@@ -30,9 +30,20 @@ pub(super) async fn provider_responses(
     limit: usize,
     text_offset: u32,
 ) -> Result<Value, Refusal> {
-    if shared.database.job(job).await?.is_none() {
-        return Err(JOB_NOT_FOUND);
+    if let crate::db::redb::MutableJobDetailsLookup::Found(details) =
+        shared.database.mutable_job_details(job, None).await?
+        && matches!(
+            details.record.job.input.content,
+            crate::db::entities::MutableJobContent::Decision { .. }
+        )
+    {
+        return Err(Refusal::new(
+            ntex::http::StatusCode::SERVICE_UNAVAILABLE,
+            "decision_response_unavailable",
+            "Decision evidence is available through typed history",
+        ));
     }
+    super::outputs::require_output_job(&shared.database, job).await?;
     let read_after = if text_offset > 0 {
         after.and_then(|request| RequestNumber::new(request.get() - 1))
     } else {

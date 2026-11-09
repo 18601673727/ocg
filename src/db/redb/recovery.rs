@@ -3,9 +3,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
-use crate::db::entities::GLOBAL_EXECUTION_LIMIT;
-use crate::db::entities::{JobId, OutcomeCause, OutcomeKind, OutcomeRecord, Timestamp};
-use ::redb::ReadableTableMetadata;
+use crate::db::entities::{JobId, OutcomeKind, Timestamp};
+use crate::system::execution_controls::ExecutionControl;
 
 // ---- open ----------------------------------------------------------------------
 
@@ -120,11 +119,64 @@ pub(crate) struct OpenedFile {
 
 pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
     let path = database_file(directory);
-    prepare_private_file(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut verification = Verification::Full;
+    let (file, fresh) = match options.open(&path) {
+        Ok(file) => (file, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut create = std::fs::OpenOptions::new();
+            create.read(true).write(true).create_new(true);
+            let file = crate::system::data_directory::private_file(&mut create)
+                .open(&path)
+                .map_err(io_storage_error)?;
+            (file, true)
+        }
+        Err(error) => return Err(io_storage_error(error)),
+    };
+    let metadata = file.metadata().map_err(io_storage_error)?;
+    if !metadata.is_file() {
+        return Err(StorageError::corrupted("database is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err(StorageError::corrupted(
+                "database must not have multiple hard links",
+            ));
+        }
+    }
+    if !fresh {
+        if metadata.len() == 0 {
+            return Err(unsupported_format(
+                "existing database is empty; refusing initialization",
+            ));
+        }
+        check_database_identity(&file, &path)?;
+        verification = preflight(&file, &path, directory)?;
+        check_database_identity(&file, &path)?;
+        if file.metadata().map_err(io_storage_error)?.len() == 0 {
+            return Err(StorageError::corrupted(
+                "database became empty during preflight",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(io_storage_error)?;
+        }
+    }
     let mut builder = Database::builder();
     builder.set_cache_size(CACHE_BYTES);
-    let database = builder.create(&path).map_err(StorageError::from)?;
-    let (epoch, genesis, abandoned) = initialize(&database)?;
+    let database = builder.create_file(file).map_err(StorageError::from)?;
+    let (epoch, genesis, abandoned) = initialize(&database, verification)?;
     Ok(OpenedFile {
         database,
         epoch,
@@ -133,26 +185,407 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
     })
 }
 
-pub(super) fn prepare_private_file(path: &Path) -> Result<(), StorageError> {
-    let io_error = |error: std::io::Error| StorageError {
+fn io_storage_error(error: std::io::Error) -> StorageError {
+    StorageError {
         kind: StorageErrorKind::Io(error.kind()),
         os_error: error.raw_os_error(),
-        detail: format!("cannot make {} private: {error}", path.display()),
-    };
-    match crate::system::data_directory::private_file(&mut std::fs::OpenOptions::new())
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            crate::system::data_directory::restrict_file(path).map_err(io_error)
-        }
-        Err(error) => Err(io_error(error)),
+        detail: error.to_string(),
     }
 }
 
-pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>), StorageError> {
+fn check_database_identity(file: &std::fs::File, path: &Path) -> Result<(), StorageError> {
+    let actual = file.metadata().map_err(io_storage_error)?;
+    let named = std::fs::symlink_metadata(path).map_err(io_storage_error)?;
+    if !named.is_file() || !same_file_identity(&actual, &named) {
+        return Err(StorageError::corrupted("database pathname changed"));
+    }
+    Ok(())
+}
+
+fn same_file_identity(actual: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        actual.dev() == named.dev() && actual.ino() == named.ino()
+    }
+    #[cfg(windows)]
+    {
+        // The cooperative lock excludes OCG pathname replacement; stable
+        // Windows metadata APIs do not expose a file identity here.
+        let _ = (actual, named);
+        true
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (actual, named);
+        false
+    }
+}
+
+/// Refuses any database whose declared identity is not this build's, with a
+/// message that names what was found. No migration exists: an older or newer
+/// database is archived and replaced, never reinterpreted.
+pub(super) fn check_identity(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<(), StorageError> {
+    let found = match meta.get(DATABASE_FORMAT_KEY)? {
+        None => {
+            return Err(unsupported_format(&format!(
+                "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION} and no migration exists"
+            )));
+        }
+        Some(value) => <[u8; 8]>::try_from(value.value())
+            .map(u64::from_le_bytes)
+            .map_err(|_| unsupported_format("database format marker is malformed"))?,
+    };
+    if found != DATABASE_FORMAT_VERSION {
+        return Err(unsupported_format(&format!(
+            "database format {found} is not supported; this build opens only format {DATABASE_FORMAT_VERSION} and no migration exists"
+        )));
+    }
+    if !meta
+        .get(SCHEMA_FINGERPRINT_KEY)?
+        .is_some_and(|value| value.value() == SCHEMA_FINGERPRINT)
+    {
+        return Err(unsupported_format(&format!(
+            "database format {found} has a different schema fingerprint; no migration exists"
+        )));
+    }
+    Ok(())
+}
+
+/// How much of the database `open` verified before it opened the file for
+/// writing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verification {
+    /// The file opened without repair, shut down cleanly, and holds no
+    /// capacity-holding Allocation: only its identity was read.
+    Quick,
+    /// Every record header, derived index and ownership row was checked.
+    Full,
+}
+
+/// Set `OCG_VERIFY_STARTUP=full` to make every open do the full verification
+/// and rebuild, as a database that did not shut down cleanly always does.
+fn full_verification_requested() -> bool {
+    std::env::var_os("OCG_VERIFY_STARTUP").is_some_and(|value| value == "full")
+}
+
+fn validate_preflight(
+    database: &impl ::redb::ReadableDatabase,
+) -> Result<Verification, StorageError> {
+    startup_checks(database, full_verification_requested())
+}
+
+/// The full startup checks on a database nothing will open for writing.
+pub(crate) fn verify_full(
+    database: &impl ::redb::ReadableDatabase,
+) -> Result<Verification, StorageError> {
+    startup_checks(database, true)
+}
+
+fn startup_checks(
+    database: &impl ::redb::ReadableDatabase,
+    force_full: bool,
+) -> Result<Verification, StorageError> {
+    let tx = database.begin_read()?;
+    let meta = match tx.open_table(META) {
+        Ok(meta) => meta,
+        Err(TableError::TableDoesNotExist(_)) => {
+            return Err(unsupported_format(
+                "not an OCG database: it has no metadata table",
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    check_identity(&meta)?;
+    let epoch = meta
+        .get("open_epoch")?
+        .ok_or_else(|| StorageError::corrupted("missing open epoch"))?;
+    let shutdown = meta
+        .get("clean_shutdown")?
+        .ok_or_else(|| StorageError::corrupted("missing shutdown marker"))?;
+    if epoch.value().len() != 8 || !matches!(shutdown.value(), [0] | [1]) {
+        return Err(StorageError::corrupted("invalid startup metadata"));
+    }
+    let settings = meta
+        .get("compaction_settings")?
+        .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
+    check_preflight_header(settings.value(), &[TAG_GLOBAL_COMPACTION])?;
+    reader::global_compaction_settings(&meta)?;
+    if matches!(shutdown.value(), [1]) && !force_full && allocations_are_quiet(&tx)? {
+        return Ok(Verification::Quick);
+    }
+    check_records(&tx)?;
+    refuse_unresolved_ownership(&tx)?;
+    Ok(Verification::Full)
+}
+
+/// Every record header and the native invariants, without any judgement of
+/// who owns capacity.
+fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
+    macro_rules! headers {
+        ($($table:ident => $tags:expr),+ $(,)?) => { $(check_preflight_table(tx, $table, $tags)?;)+ };
+    }
+    headers!(CONFIGS => &[1,40,41], JOBS => &[2,53], JOB_STATES => &[3], JOB_INPUTS => &[11,52], POOL_ALLOCATIONS => &[42]);
+    headers!(JOB_OUTPUTS => &[4], SUBMISSIONS => &[5], ATTACHMENTS => &[6], TOOL_CALLS => &[7],
+        REQUEST_EVENTS => &[8], PROJECTS => &[9], JOB_CONTROLS => &[10], NOTICES => &[12],
+        RECURRENCES => &[13], APPROVALS => &[15]);
+    check_preflight_table(tx, CREDENTIALS, &[16])?;
+    check_native_invariants(tx)
+}
+
+/// Whether the Allocation rows, the source of ownership, hold no capacity and
+/// the stored indexes equal what they compute. This reads the Allocation rows
+/// (one small row per Allocation ever made) and the Pool configurations they
+/// name, never the large Job tables. A missing index, a legacy slot table, a
+/// corrupt row or any difference is not a quick-path database: the full checks
+/// then run and report it.
+fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
+    if tx.list_tables()?.any(|table| {
+        use ::redb::TableHandle;
+        table.name() == HELD_SLOTS.name()
+    }) {
+        return Ok(false);
+    }
+    let (allocations, configs, active, requests) = match (
+        tx.open_table(POOL_ALLOCATIONS),
+        tx.open_table(CONFIGS),
+        tx.open_table(ACTIVE_ALLOCATIONS),
+        tx.open_table(ALLOCATION_REQUESTS),
+    ) {
+        (Ok(allocations), Ok(configs), Ok(active), Ok(requests)) => {
+            (allocations, configs, active, requests)
+        }
+        _ => return Ok(false),
+    };
+    let Ok(computed) = indexes::compute_allocation_indexes(&allocations, &configs) else {
+        return Ok(false);
+    };
+    Ok(computed.active.is_empty()
+        && computed == indexes::stored_allocation_indexes(&active, &requests)?)
+}
+
+/// Read-only fail-closed checks of the facts the native model relies on: the
+/// Allocation indexes equal what their source computes, and no Job state
+/// carries a legacy claim (a claim is a lease nothing in this build honors).
+fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
+    let (allocations, configs, active, requests) = match (
+        tx.open_table(POOL_ALLOCATIONS),
+        tx.open_table(CONFIGS),
+        tx.open_table(ACTIVE_ALLOCATIONS),
+        tx.open_table(ALLOCATION_REQUESTS),
+    ) {
+        (Ok(allocations), Ok(configs), Ok(active), Ok(requests)) => {
+            (allocations, configs, active, requests)
+        }
+        _ => {
+            return Err(StorageError::corrupted(
+                "an Allocation table or index is missing",
+            ));
+        }
+    };
+    if !indexes::allocation_indexes_agree(&allocations, &configs, &active, &requests)? {
+        return Err(StorageError::corrupted(
+            "the Allocation indexes differ from their source rows",
+        ));
+    }
+    if let Ok(states) = tx.open_table(JOB_STATES) {
+        for entry in states.iter()? {
+            let (key, value) = entry?;
+            if JobState::decode_at(key.value(), value.value())?
+                .claim
+                .is_some()
+            {
+                return Err(StorageError::corrupted(
+                    "a Job state carries a legacy claim",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses, before anything is opened for writing, a database in which an
+/// Allocation still holds capacity or a Job's outcome is Unknown. A restart
+/// is not evidence that the work stopped, so neither is adopted, retried or
+/// released here; `ocg inspect-held` reports them without changing the file.
+fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError> {
+    if !ExecutionControl::RecoveryAndRedispatch.is_enabled() {
+        let mut held = 0u64;
+        match tx.open_table(POOL_ALLOCATIONS) {
+            Ok(table) => {
+                for entry in table.iter()? {
+                    let (key, value) = entry?;
+                    if transactions::decode_pool_allocation(key.value(), value.value())?
+                        .holds_capacity()
+                    {
+                        held += 1;
+                    }
+                }
+            }
+            Err(TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut unknown = 0u64;
+        match tx.open_table(JOB_STATES) {
+            Ok(table) => {
+                for entry in table.iter()? {
+                    let (key, value) = entry?;
+                    if JobState::decode_at(key.value(), value.value())?
+                        .outcome
+                        .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+                    {
+                        unknown += 1;
+                    }
+                }
+            }
+            Err(TableError::TableDoesNotExist(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if held > 0 || unknown > 0 {
+            return Err(held_ownership(held, unknown));
+        }
+    }
+    Ok(())
+}
+
+fn held_ownership(held: u64, unknown: u64) -> StorageError {
+    StorageError {
+        kind: StorageErrorKind::Other,
+        os_error: None,
+        detail: format!(
+            "refusing to start: {held} Allocation(s) still hold capacity and {unknown} Job outcome(s) are Unknown; a restart does not prove the work stopped, and recovery is disabled. Inspect with `ocg inspect-held <data-directory>`"
+        ),
+    }
+}
+
+fn check_preflight_header(bytes: &[u8], tags: &[u8]) -> Result<(), StorageError> {
+    let valid = match bytes {
+        [tag, version, ..] if tags.contains(tag) => *version == codec::RECORD_VERSION,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(unsupported_format(
+            "unsupported or malformed record encoding",
+        ))
+    }
+}
+
+fn check_preflight_table<K: Key + 'static>(
+    tx: &ReadTransaction,
+    definition: TableDefinition<K, &'static [u8]>,
+    tags: &[u8],
+) -> Result<(), StorageError> {
+    let table = match tx.open_table(definition) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for row in table.iter()? {
+        let (_, value) = row?;
+        check_preflight_header(value.value(), tags)?;
+    }
+    Ok(())
+}
+
+struct PreflightDirectory {
+    path: PathBuf,
+    identity: std::fs::Metadata,
+    copy_identity: Option<std::fs::Metadata>,
+}
+impl Drop for PreflightDirectory {
+    fn drop(&mut self) {
+        let Ok(directory) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if !directory.is_dir() || !same_file_identity(&self.identity, &directory) {
+            return;
+        }
+        let copy = self.path.join("copy.redb");
+        if let (Some(expected), Ok(actual)) =
+            (&self.copy_identity, std::fs::symlink_metadata(&copy))
+            && actual.is_file()
+            && same_file_identity(expected, &actual)
+        {
+            let _ = std::fs::remove_file(copy);
+        }
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+fn preflight(
+    file: &std::fs::File,
+    path: &Path,
+    directory: &Path,
+) -> Result<Verification, StorageError> {
+    match ::redb::ReadOnlyDatabase::open(path) {
+        Ok(database) => validate_preflight(&database),
+        Err(::redb::DatabaseError::RepairAborted) => {
+            use std::io::{Seek, SeekFrom};
+            let scratch = directory.join(format!(".ocg-preflight-{}", uuid::Uuid::now_v7()));
+            let mut mkdir = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                mkdir.mode(0o700);
+            }
+            mkdir.create(&scratch).map_err(io_storage_error)?;
+            let identity = std::fs::symlink_metadata(&scratch).map_err(io_storage_error)?;
+            let mut cleanup = PreflightDirectory {
+                path: scratch,
+                identity,
+                copy_identity: None,
+            };
+            let copy_path = cleanup.path.join("copy.redb");
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const GENERIC_READ: u32 = 0x8000_0000;
+                const GENERIC_WRITE: u32 = 0x4000_0000;
+                const DELETE: u32 = 0x0001_0000;
+                const DELETE_ON_CLOSE: u32 = 0x0400_0000;
+                options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
+                options.custom_flags(DELETE_ON_CLOSE);
+            }
+            let mut copy = crate::system::data_directory::private_file(&mut options)
+                .open(&copy_path)
+                .map_err(io_storage_error)?;
+            cleanup.copy_identity = Some(copy.metadata().map_err(io_storage_error)?);
+            #[cfg(windows)]
+            {
+                cleanup.copy_identity = None;
+            }
+            #[cfg(unix)]
+            {
+                std::fs::remove_file(&copy_path).map_err(io_storage_error)?;
+                cleanup.copy_identity = None;
+            }
+            let mut original = file.try_clone().map_err(io_storage_error)?;
+            original
+                .seek(SeekFrom::Start(0))
+                .map_err(io_storage_error)?;
+            let copied = std::io::copy(&mut original, &mut copy).map_err(io_storage_error)?;
+            if copied != file.metadata().map_err(io_storage_error)?.len() || copied == 0 {
+                return Err(StorageError::corrupted(
+                    "database changed during preflight copy",
+                ));
+            }
+            let database = Database::builder().create_file(copy)?;
+            validate_preflight(&database).map(|_| Verification::Full)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(super) fn initialize(
+    database: &Database,
+    verification: Verification,
+) -> Result<(u64, JobId, Vec<JobId>), StorageError> {
     let mut tx = database.begin_write().map_err(StorageError::from)?;
     tx.set_durability(Durability::Immediate)
         .map_err(StorageError::from)?;
@@ -181,6 +614,7 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>)
                 DATABASE_FORMAT_KEY,
                 DATABASE_FORMAT_VERSION.to_le_bytes().as_slice(),
             )?;
+            meta.insert(SCHEMA_FINGERPRINT_KEY, SCHEMA_FINGERPRINT)?;
             let settings = crate::db::entities::GlobalCompactionSettings::default();
             let mut encoded = Enc::new(TAG_GLOBAL_COMPACTION);
             encoded.u64(settings.revision);
@@ -193,11 +627,12 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>)
             meta.insert("clean_shutdown", [1u8].as_slice())
                 .map_err(StorageError::from)?;
         } else {
-            match meta.get(DATABASE_FORMAT_KEY)? {
-                Some(version) if version.value() == DATABASE_FORMAT_VERSION.to_le_bytes() => {}
-                Some(_) => return Err(unsupported_format("unsupported database format")),
-                None => return Err(unsupported_format("unmarked database; run ocg migrate")),
-            }
+            check_identity(&meta)?;
+        }
+        if existing.iter().any(|name| name == HELD_SLOTS.name()) {
+            return Err(StorageError::corrupted(
+                "legacy slot table in a native database",
+            ));
         }
         let epoch = meta
             .get("open_epoch")
@@ -219,22 +654,93 @@ pub(super) fn initialize(database: &Database) -> Result<(u64, JobId, Vec<JobId>)
         (epoch, clean_shutdown)
     };
     create_tables(&tx)?;
-    if !clean_shutdown || indexes_missing {
-        indexes::rebuild(&tx, promotion_clock())?;
-    }
     let mut batch = Batch::new(tx, epoch);
-    let abandoned = match reconcile(&mut batch) {
-        Ok(abandoned) => abandoned,
-        Err(BatchError(failure)) => {
-            let error = match failure {
+    if empty {
+        use crate::db::entities::{AllocationExecutor, AllocationPool};
+        let pool_id =
+            ExecutionPoolId::new(
+                batch
+                    .next_id()
+                    .map_err(|BatchError(failure)| match failure {
+                        Failure::Storage(error) => error,
+                        Failure::Rejected(violation) => {
+                            StorageError::corrupted(format!("default Pool ID refused: {violation}"))
+                        }
+                    })?,
+            );
+        let executor_id =
+            ExecutorId::new(
+                batch
+                    .next_id()
+                    .map_err(|BatchError(failure)| match failure {
+                        Failure::Storage(error) => error,
+                        Failure::Rejected(violation) => StorageError::corrupted(format!(
+                            "default Executor ID refused: {violation}"
+                        )),
+                    })?,
+            );
+        let pool = AllocationPool {
+            id: pool_id,
+            name: "Default".to_owned(),
+            capacity: std::num::NonZeroU32::MIN,
+            enabled: true,
+            archived: false,
+            revision: 1,
+        };
+        let executor = AllocationExecutor {
+            id: executor_id,
+            pool: pool_id,
+            name: "Local Executor".to_owned(),
+            enabled: true,
+            archived: false,
+            revision: 1,
+            capabilities: [
+                LlmTransport::OpenAiChatCompletions,
+                LlmTransport::OpenAiResponses,
+                LlmTransport::AnthropicMessages,
+            ]
+            .into_iter()
+            .map(|protocol| (ExecutionOperation::LlmRequest, Some(protocol)))
+            .collect(),
+        };
+        batch
+            .step(|tx| {
+                let mut configs = tx.open_table(CONFIGS)?;
+                configs.insert(
+                    pool_id.get(),
+                    transactions::encode_allocation_pool(&pool).as_slice(),
+                )?;
+                configs.insert(
+                    executor_id.get(),
+                    transactions::encode_allocation_executor(&executor).as_slice(),
+                )?;
+                Ok(())
+            })
+            .map_err(|BatchError(failure)| match failure {
+                Failure::Storage(error) => error,
+                Failure::Rejected(violation) => StorageError::corrupted(format!(
+                    "default execution resources refused: {violation}"
+                )),
+            })?;
+    }
+    let abandoned = {
+        // Derived tables are committed in the same transaction as the rows
+        // they derive from, so a database that shut down cleanly and passed
+        // the quick checks needs no rebuild. Every other state rebuilds them
+        // from their source rows and verifies the result.
+        let rebuild = match verification {
+            Verification::Full => true,
+            Verification::Quick => !clean_shutdown || indexes_missing,
+        };
+        if rebuild {
+            rebuild_mutable_jobs(&mut batch).map_err(|BatchError(failure)| match failure {
                 Failure::Storage(error) => error,
                 Failure::Rejected(violation) => {
-                    StorageError::corrupted(format!("open reconcile refused: {violation}"))
+                    StorageError::corrupted(format!("new-model recovery refused: {violation}"))
                 }
-            };
-            batch.tx.abort().map_err(StorageError::from)?;
-            return Err(error);
+            })?;
         }
+        Vec::new()
     };
     batch.tx.commit().map_err(StorageError::from)?;
     Ok((epoch, JobId::new(0), abandoned))
@@ -262,11 +768,14 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(PROJECTS)?;
     tx.open_table(JOB_CONTROLS)?;
     tx.open_table(PENDING)?;
-    tx.open_table(READY)?;
+    tx.open_table(MUTABLE_READY)?;
     tx.open_table(DELAYED)?;
     tx.open_table(DEPENDENCY_WAITERS)?;
     tx.open_table(UNSETTLED)?;
-    tx.open_table(HELD_SLOTS)?;
+    tx.open_table(POOL_ALLOCATIONS)?;
+    tx.open_table(ACTIVE_ALLOCATIONS)?;
+    tx.open_table(ALLOCATION_REQUESTS)?;
+    tx.open_table(DRAFT_CONTEXTS)?;
     tx.open_table(CHILDREN)?;
     tx.open_table(SUCCESSORS)?;
     tx.open_table(JOB_INPUTS)?;
@@ -289,6 +798,301 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(RECURRENCE_DUE)?;
     tx.open_table(USAGE_MODEL)?;
     tx.open_table(REQUEST_TIMELINE)?;
+    Ok(())
+}
+
+fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
+    use crate::db::entities::MutableJobPhase;
+    batch.step(|tx| {
+        indexes::rebuild_allocation_indexes(tx)?;
+        tx.delete_table(DRAFT_CONTEXTS)?;
+        tx.open_table(DRAFT_CONTEXTS)?;
+        for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+            let (key, value) = entry?;
+            if transactions::decode_pool_allocation(key.value(), value.value())?.holds_capacity() {
+                return Err(StorageError::corrupted(
+                    "recovery is disabled and this database holds Allocations; run `ocg inspect-held`",
+                ));
+            }
+        }
+        tx.delete_table(MUTABLE_READY)?;
+        tx.delete_table(PENDING)?;
+        tx.delete_table(CONVERSATIONS)?;
+        tx.delete_table(TURNS)?;
+        tx.delete_table(CHILDREN)?;
+        tx.delete_table(SUCCESSORS)?;
+        tx.delete_table(UNSETTLED)?;
+        tx.delete_table(CONVERSATION_SEARCH)?;
+        tx.delete_table(GROUP_RESULTS)?;
+        tx.open_table(MUTABLE_READY)?;
+        tx.open_table(PENDING)?;
+        tx.open_table(CONVERSATIONS)?;
+        tx.open_table(TURNS)?;
+        tx.open_table(CHILDREN)?;
+        tx.open_table(SUCCESSORS)?;
+        tx.open_table(UNSETTLED)?;
+        tx.open_table(CONVERSATION_SEARCH)?;
+        tx.open_table(GROUP_RESULTS)?;
+        Ok(())
+    })?;
+    let mut after = None;
+    loop {
+        let next = batch.step(|tx| {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let jobs = tx.open_table(JOBS)?;
+            let mut range = jobs.range((after.map_or(Unbounded, Excluded), Unbounded))?;
+            let Some(entry) = range.next() else {
+                return Ok(None);
+            };
+            let (key, value) = entry?;
+            if value.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
+                JobSpec::decode_at(key.value(), value.value())?;
+                let state = tx
+                    .open_table(JOB_STATES)?
+                    .get(key.value())?
+                    .map(|row| JobState::decode_at(key.value(), row.value()))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        StorageError::corrupted("mutable conversation state is missing")
+                    })?;
+                if state.claim.is_some()
+                    || state.outcome.is_some()
+                    || state.stop_confirmed_at.is_some()
+                    || state.stop_confirmed_by.is_some()
+                {
+                    return Err(StorageError::corrupted(
+                        "mutable conversation recovery does not support this state",
+                    ));
+                }
+                tx.open_table(JOB_CONTROLS)?
+                    .get(key.value())?
+                    .map(|row| JobControl::decode(row.value()))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        StorageError::corrupted("mutable conversation control is missing")
+                    })?;
+                return Ok(Some((key.value(), None)));
+            }
+            let job = transactions::decode_mutable_job(key.value(), value.value())?;
+            let state_bytes = tx
+                .open_table(JOB_STATES)?
+                .get(key.value())?
+                .map(|v| v.value().to_vec())
+                .ok_or_else(|| StorageError::corrupted("mutable Job state is missing"))?;
+            if !matches!(
+                state_bytes.as_slice(),
+                [TAG_JOB_STATE, codec::RECORD_VERSION, ..]
+            ) {
+                return Err(StorageError::corrupted("invalid mutable Job state header"));
+            }
+            let state = JobState::decode_at(key.value(), &state_bytes)?;
+            if state.claim.is_some() {
+                return Err(StorageError::corrupted(
+                    "a Job state carries a legacy claim",
+                ));
+            }
+            Ok(Some((key.value(), Some((job, state)))))
+        })?;
+        let Some((id, row)) = next else {
+            break;
+        };
+        after = Some(id);
+        let Some((job, state)) = row else {
+            batch.insert(CONVERSATIONS, id, ())?;
+            batch.insert(CHILDREN, (0, id), ())?;
+            batch.insert(UNSETTLED, id, (0, 0))?;
+            continue;
+        };
+        if !batch.mutable_context_valid(&job, job.context_selection)? {
+            return batch.corrupted("summary provenance is invalid or unavailable".to_owned());
+        }
+        let parent = batch.require_job(job.parent_id)?;
+        if !parent.kind.is_group() {
+            return batch.corrupted("mutable Job has invalid conversation".to_owned());
+        }
+        if job.summary_source.is_some() {
+            let allocation = batch.pool_allocation(job.id)?;
+            if job.phase != MutableJobPhase::Executing
+                || !state
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+                || !allocation.is_some_and(|allocation| {
+                    allocation.phase == crate::db::entities::AllocationPhase::Released
+                        && allocation.token.job == job.id
+                        && allocation.job_revision == job.revision
+                })
+            {
+                return batch.corrupted("invalid native summary producer state".to_owned());
+            }
+            // Summary producer Jobs are not conversation turns. The verifier
+            // checks their source and output when an artifact is requested.
+            continue;
+        }
+        if job.phase != MutableJobPhase::Unsubmitted {
+            let JobKind::Group { agent, .. } = parent.kind else {
+                return batch.corrupted("mutable Job has invalid conversation".to_owned());
+            };
+            let compatible = match &job.input.content {
+                crate::db::entities::MutableJobContent::Generative { configuration, .. } => {
+                    configuration.and_then(|config| config.agent_profile.map(Into::into)) == agent
+                }
+                crate::db::entities::MutableJobContent::Decision { profile, .. } => {
+                    agent.is_none() || Some(*profile) == agent
+                }
+            };
+            if !compatible {
+                return batch
+                    .corrupted("mutable Job Agent differs from its conversation".to_owned());
+            }
+            if batch.group_head(job.parent_id)? != job.previous {
+                return batch.corrupted("mutable conversation predecessor mismatch".to_owned());
+            }
+            batch.insert(TURNS, (job.parent_id.get(), job.id.get()), ())?;
+            batch.step(|tx| {
+                indexes::update_mutable_turn_search(tx, job.parent_id, job.id, None, &job.input)
+            })?;
+            if let Some(outcome) = &state.outcome {
+                batch.step(|tx| {
+                    let outputs = tx.open_table(JOB_OUTPUTS)?;
+                    let mut result = None;
+                    for entry in outputs.range((job.id.get(), 0)..=(job.id.get(), u32::MAX))? {
+                        let (key, value) = entry?;
+                        if rows::output_kind(value.value())? == OutputKind::Result {
+                            if result.is_some() {
+                                return Err(StorageError::corrupted(
+                                    "multiple native final results",
+                                ));
+                            }
+                            result = Some(decode_output(key.value(), value.value())?);
+                        }
+                    }
+                    if let Some(result) = result {
+                        indexes::append_output_search_index(
+                            tx,
+                            job.parent_id,
+                            job.id,
+                            &result,
+                            outcome.kind == OutcomeKind::Completed,
+                        )?;
+                        let mut results = tx.open_table(GROUP_RESULTS)?;
+                        let old = results
+                            .get(job.parent_id.get())?
+                            .map_or((0, 0), |v| v.value());
+                        let latest = if outcome.kind == OutcomeKind::Cancelled {
+                            old.0
+                        } else {
+                            old.0.max(job.id.get())
+                        };
+                        results.insert(job.parent_id.get(), (latest, old.1.max(job.id.get())))?;
+                    }
+                    Ok(())
+                })?;
+            }
+            batch.insert(CHILDREN, (job.parent_id.get(), job.id.get()), ())?;
+            if let Some(previous) = job.previous {
+                batch.insert(SUCCESSORS, previous.get(), ())?;
+            }
+            if state.outcome.is_none() {
+                batch.insert(UNSETTLED, job.id.get(), (0, 0))?;
+                batch.step(|tx| {
+                    let mut unsettled = tx.open_table(UNSETTLED)?;
+                    let (dependencies, children) = unsettled
+                        .get(job.parent_id.get())?
+                        .map(|v| v.value())
+                        .ok_or_else(|| {
+                            StorageError::corrupted("conversation unsettled row missing")
+                        })?;
+                    let count = children.checked_add(1).ok_or_else(|| {
+                        StorageError::corrupted("conversation child count overflow")
+                    })?;
+                    unsettled.insert(job.parent_id.get(), (dependencies, count))?;
+                    Ok(())
+                })?;
+            }
+        }
+        if state
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+        {
+            return batch.corrupted(
+                "recovery is disabled and this database holds Unknown execution outcomes; run `ocg inspect-held`"
+                    .to_owned(),
+            );
+        }
+        if state.outcome.is_some() {
+            continue;
+        }
+        match job.phase {
+            MutableJobPhase::Unsubmitted => {
+                let duplicate = batch.step(|tx| {
+                    Ok(tx
+                        .open_table(DRAFT_CONTEXTS)?
+                        .insert(job.composer_context.get(), job.id.get())?
+                        .is_some())
+                })?;
+                if duplicate {
+                    return batch.corrupted("duplicate unsubmitted Composer context".to_owned());
+                }
+            }
+            MutableJobPhase::Queued => {
+                if matches!(
+                    &job.input.content,
+                    crate::db::entities::MutableJobContent::Generative { .. }
+                ) {
+                    match batch.require_generative_predecessors(&job) {
+                        Err(BatchError(Failure::Rejected(
+                            crate::db::entities::Violation::InvalidValue(
+                                "execution_context",
+                                "Generative Jobs cannot follow Decision history",
+                            ),
+                        ))) => {
+                            batch.insert(PENDING, job.id.get(), ())?;
+                            continue;
+                        }
+                        Err(BatchError(Failure::Rejected(_))) | Ok(()) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                // A submitted Job's requirement comes from the configuration it
+                // froze, never from settings edited since.
+                let requirement = match &job.frozen {
+                    Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) => {
+                        transactions::decision_requirement()
+                    }
+                    Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
+                        transactions::execution_requirement(frozen)
+                    }
+                    None => {
+                        return batch
+                            .corrupted("queued Job has no frozen configuration".to_owned());
+                    }
+                };
+                let submitted = job.submitted_at.ok_or_else(|| {
+                    BatchError(Failure::Storage(StorageError::corrupted(
+                        "queued Job missing submission time",
+                    )))
+                })?;
+                batch.step(|tx| {
+                    tx.open_table(MUTABLE_READY)?.insert(
+                        (
+                            transactions::mutable_priority(job.input.priority),
+                            submitted.as_unix_micros(),
+                            job.id.get(),
+                            requirement,
+                        ),
+                        (),
+                    )?;
+                    tx.open_table(PENDING)?.insert(job.id.get(), ())?;
+                    Ok(())
+                })?;
+            }
+            MutableJobPhase::Executing => {
+                return batch.corrupted("executing Job requires allocation recovery".to_owned());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -318,198 +1122,6 @@ pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {
     };
     table.insert("entity", next)?;
     Ok(next)
-}
-
-/// Whether a claim made under `claim_host` and `claim_boot` was made before a
-/// reboot of this host. A file opened on another host, or with either
-/// identifier unreadable, never counts as rebooted.
-fn rebooted(
-    claim_host: Option<&str>,
-    claim_boot: Option<&str>,
-    host: Option<&str>,
-    boot: Option<&str>,
-) -> bool {
-    matches!(
-        (claim_host, host, claim_boot, boot),
-        (Some(claim_host), Some(host), Some(claim_boot), Some(boot))
-            if claim_host == host && claim_boot != boot
-    )
-}
-
-/// OPEN (section 8.8): every Job running or suspended at the crash takes an
-/// Unknown outcome; its stop is confirmed and its slot freed when no OS
-/// process of it can remain or the host has rebooted since its claim, and its
-/// slot is quarantined otherwise. Returns the Jobs that were abandoned.
-fn reconcile(batch: &mut Batch) -> Result<Vec<JobId>, BatchError> {
-    let epoch = batch.epoch;
-    let now = batch.now;
-    let states = batch.step(|tx| {
-        let slots = tx.open_table(HELD_SLOTS)?;
-        if slots.len()? > u64::from(GLOBAL_EXECUTION_LIMIT) {
-            return Err(StorageError::corrupted(
-                "held slot count exceeds execution limit",
-            ));
-        }
-        let mut states = Vec::new();
-        for entry in slots.iter()? {
-            let job = entry?.0.value().1;
-            let state = tx
-                .open_table(JOB_STATES)?
-                .get(job)?
-                .map(|bytes| JobState::decode_at(job, bytes.value()))
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted("held slot has no job state"))?;
-            states.push(state);
-        }
-        Ok(states)
-    })?;
-    let mut abandoned = Vec::new();
-    let mut unconfirmed = Vec::new();
-    for mut state in states {
-        let is_unknown = state
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown);
-        if state.outcome.is_none()
-            && state
-                .claim
-                .as_ref()
-                .is_some_and(|claim| claim.epoch != epoch)
-        {
-            state.outcome = Some(OutcomeRecord {
-                kind: OutcomeKind::Unknown,
-                at: now,
-                cause: Some(OutcomeCause::Abandoned),
-            });
-            batch.put_job_state(state.job_id, &state)?;
-            abandoned.push(state.job_id);
-            unconfirmed.push(state);
-        } else if is_unknown && state.stop_confirmed_at.is_none() {
-            unconfirmed.push(state);
-        }
-    }
-    // Newer waiters cancel first, so all receive Abandoned rather than a dependency failure.
-    let mut before = u128::MAX;
-    loop {
-        let pending = batch.step(|tx| {
-            tx.open_table(PENDING)?
-                .range(..before)?
-                .rev()
-                .take(256)
-                .map(|entry| {
-                    entry
-                        .map(|(key, _)| JobId::new(key.value()))
-                        .map_err(StorageError::from)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })?;
-        if pending.is_empty() {
-            break;
-        }
-        for job in pending {
-            before = job.get();
-            if matches!(
-                batch.require_job(job)?.kind,
-                JobKind::Execution {
-                    plan_source: PlanSource::Process { .. },
-                    ..
-                }
-            ) && batch.require_job_state(job)?.outcome.is_none()
-            {
-                batch.finalize(
-                    job,
-                    OutcomeKind::Cancelled,
-                    Some(OutcomeCause::Abandoned),
-                    None,
-                    false,
-                )?;
-            }
-        }
-    }
-    let (host, boot) = (batch.host_id.clone(), batch.boot_id.clone());
-    for mut state in unconfirmed {
-        let job = state.job_id;
-        let confirmed = batch.no_live_process(job)?
-            || state.claim.as_ref().is_some_and(|claim| {
-                rebooted(
-                    claim.host_id.as_deref(),
-                    claim.boot_id.as_deref(),
-                    host.as_deref(),
-                    boot.as_deref(),
-                )
-            });
-        if let Some(claim) = state.claim.clone() {
-            let pool = claim.pool_id.get();
-            if confirmed {
-                batch.step(|tx| {
-                    tx.open_table(HELD_SLOTS)?.remove((pool, job.get()))?;
-                    Ok(())
-                })?;
-            } else {
-                batch.step(|tx| {
-                    tx.open_table(HELD_SLOTS)?
-                        .insert((pool, job.get()), (claim.epoch, true))?;
-                    Ok(())
-                })?;
-            }
-        }
-        if confirmed {
-            state.stop_confirmed_at = Some(now);
-            state.stop_confirmed_by = Some(if batch.no_live_process(job)? {
-                StopProof::Proof
-            } else {
-                StopProof::Reboot
-            });
-            batch.put_job_state(job, &state)?;
-            let row = batch.require_job(job)?;
-            if row.kind.is_persistent()
-                && let Some(conversation) = row.parent_id
-            {
-                batch.step(|tx| {
-                    tx.open_table(ACTIVE_JOBS)?.remove(conversation.get())?;
-                    Ok(())
-                })?;
-            }
-        }
-        let row = batch.require_job(job)?;
-        batch.index_answer(&row, OutcomeKind::Unknown, false)?;
-        let unresolved = batch.step(|tx| {
-            let mut calls = Vec::new();
-            for entry in tx
-                .open_table(TOOL_CALLS)?
-                .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
-            {
-                let (key, bytes) = entry?;
-                let record = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
-                if record
-                    .admission()
-                    .is_some_and(|admission| admission.handler_version.starts_with("job_"))
-                    && record.outcome.is_none()
-                    && record.reconciliation.is_none()
-                {
-                    calls.push(record);
-                }
-            }
-            Ok(calls)
-        })?;
-        for mut record in unresolved {
-            record.reconciliation = Some(crate::db::entities::Recorded {
-                fact: crate::db::entities::ToolReconciliation {
-                    conclusion: EffectConclusion::NotApplied,
-                    reconciler: "open".into(),
-                    evidence: "effect commits only with its outcome".into(),
-                    explanation: "the host stopped before the call's transaction".into(),
-                },
-                at: batch.now(),
-            });
-            batch.put_tool_evidence(&record)?;
-        }
-        batch.settle(job)?;
-        if abandoned.contains(&job) {
-            batch.turn_ended(job)?;
-        }
-    }
-    Ok(abandoned)
 }
 
 pub(crate) struct ReclamationReport {
@@ -582,18 +1194,6 @@ pub(crate) fn reclaim_pending(
     Ok(report)
 }
 
-const LEGACY_CONVERSATION_SEARCH: TableDefinition<(u128, u128, u128, u8, u32), ()> =
-    TableDefinition::new("conversation_search");
-
-// Tables of formats before 17, read only by the offline migration.
-const F16_HEAD_TABLE: TableDefinition<u128, u128> = TableDefinition::new("job_group_head");
-const F16_ATTACHMENT_USE: TableDefinition<(u128, u128), ()> =
-    TableDefinition::new("attachment_ref");
-type F16ScopeKey = (u128, [u8; 32], i64, u128, u32, u32);
-const F16_SCOPE_TABLE: TableDefinition<F16ScopeKey, ()> = TableDefinition::new("request_scope");
-const F16_SUCCESSOR: TableDefinition<u128, u128> = TableDefinition::new("successor");
-const F16_USER_INPUT: TableDefinition<u128, i64> = TableDefinition::new("user_input_at");
-
 fn unsupported_format(detail: &str) -> StorageError {
     StorageError {
         kind: StorageErrorKind::Other,
@@ -602,579 +1202,409 @@ fn unsupported_format(detail: &str) -> StorageError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MigrationFormat {
-    Legacy,
-    UnmarkedCurrent,
-    Format15,
-    Format16,
-    Format17,
-    Current,
+// ---- offline reconciliation of a crash-surviving Reserved Allocation -------------
+
+/// Why an offline reconciliation refused. Nothing was changed: the only file
+/// it ever wrote was a private copy.
+#[derive(Debug)]
+pub(crate) struct ReservedRefusal {
+    pub(crate) code: &'static str,
+    pub(crate) detail: String,
 }
 
-impl MigrationFormat {
-    /// Whether configuration rows already use the current record encoding.
-    fn has_current_configs(self) -> bool {
-        match self {
-            Self::Format16 | Self::Format17 | Self::Current => true,
-            Self::Legacy | Self::UnmarkedCurrent | Self::Format15 => false,
-        }
-    }
-
-    /// The format whose configuration comparison applies to the migrated
-    /// database: Format 16 and Format 17 rows are copied verbatim, older ones
-    /// are upgraded with default flags.
-    pub(crate) fn migrated_snapshot_format(self) -> Self {
-        match self {
-            Self::Format16 => Self::Format16,
-            Self::Format17 => Self::Format17,
-            Self::Legacy | Self::UnmarkedCurrent | Self::Format15 | Self::Current => Self::Current,
+impl ReservedRefusal {
+    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
         }
     }
 }
 
-pub(crate) struct MigrationSource(::redb::ReadOnlyDatabase);
-
-pub(crate) fn migration_source(path: &Path) -> Result<MigrationSource, StorageError> {
-    if std::fs::metadata(path)
-        .map_err(|error| StorageError::from(::redb::Error::Io(error)))?
-        .len()
-        == 0
-    {
-        return Err(unsupported_format(
-            "database is empty/uninitialized; start OCG to initialize it",
-        ));
+impl From<StorageError> for ReservedRefusal {
+    fn from(error: StorageError) -> Self {
+        let code = match error.kind {
+            StorageErrorKind::Corrupted => "inconsistent_or_corrupt",
+            StorageErrorKind::Io(_)
+            | StorageErrorKind::PreviousIo
+            | StorageErrorKind::AlreadyOpen
+            | StorageErrorKind::Closed
+            | StorageErrorKind::ValueTooLarge
+            | StorageErrorKind::Other => "unverifiable",
+        };
+        Self::new(code, error.detail)
     }
-    Ok(MigrationSource(::redb::ReadOnlyDatabase::open(path)?))
 }
 
-fn check_record_headers<K: Key + 'static>(
-    tx: &ReadTransaction,
-    definition: TableDefinition<K, &'static [u8]>,
-    tag: u8,
-    format: MigrationFormat,
-) -> Result<(), StorageError> {
-    for row in tx.open_table(definition)?.iter()? {
-        let (_, value) = row?;
-        match value.value() {
-            [actual, version, ..]
-                if *actual == tag
-                    && (matches!(*version, 11 | 13)
-                        || (*version == 14 && format != MigrationFormat::Legacy)
-                        || (*version == 15 && format.has_current_configs())) => {}
-            _ => return Err(unsupported_format("unsupported record encoding")),
-        }
+impl From<::redb::DatabaseError> for ReservedRefusal {
+    fn from(error: ::redb::DatabaseError) -> Self {
+        StorageError::from(error).into()
     }
-    Ok(())
 }
 
-pub(crate) fn migration_inspect(source: &MigrationSource) -> Result<MigrationFormat, StorageError> {
-    use ::redb::TableHandle;
-    let tx = source.0.begin_read()?;
-    if tx.list_tables()?.next().is_none() && tx.list_multimap_tables()?.next().is_none() {
-        return Err(unsupported_format(
-            "database is empty/uninitialized; start OCG to initialize it",
-        ));
-    }
-    let meta = tx.open_table(META)?;
-    let marker = meta.get(DATABASE_FORMAT_KEY)?;
-    let legacy = tx.open_table(LEGACY_CONVERSATION_SEARCH).is_ok();
-    let format = match marker.as_ref().map(|value| value.value()) {
-        Some(value) if value == DATABASE_FORMAT_VERSION.to_le_bytes() && !legacy => {
-            MigrationFormat::Current
-        }
-        Some(value) if value == 17u64.to_le_bytes() && !legacy => MigrationFormat::Format17,
-        Some(value) if value == 16u64.to_le_bytes() && !legacy => MigrationFormat::Format16,
-        Some(value) if value == 15u64.to_le_bytes() && !legacy => MigrationFormat::Format15,
-        None if legacy => MigrationFormat::Legacy,
-        None => MigrationFormat::UnmarkedCurrent,
-        Some(_) => {
-            return Err(unsupported_format("unsupported database format marker"));
-        }
-    };
-    let mut known = BTreeSet::new();
-    macro_rules! check_tables {
-        ($($table:ident),+ $(,)?) => { $(
-            known.insert($table.name().to_owned());
-            drop(tx.open_table($table)?);
-        )+ };
-    }
-    check_tables!(
-        META,
-        SEQUENCES,
-        CONFIGS,
-        JOBS,
-        JOB_STATES,
-        JOB_OUTPUTS,
-        SUBMISSIONS,
-        ATTACHMENTS,
-        TOOL_CALLS,
-        MESSAGES,
-        REQUEST_EVENTS,
-        PROJECTS,
-        JOB_CONTROLS,
-        JOB_INPUTS,
-        NOTICES,
-        APPROVALS,
-        RECURRENCES,
-        JOB_OBSERVATIONS,
-        CONTENT_REFERENCES,
-        CONTENT_RECLAIM,
-        JOB_ALLOCATIONS,
-        CONVERSATIONS,
-        TURNS,
-        PENDING,
-        READY,
-        DELAYED,
-        DEPENDENCY_WAITERS,
-        UNSETTLED,
-        HELD_SLOTS,
-        CHILDREN,
-        CHILD_GROUPS,
-        LIVE_CHILDREN,
-        ACTIVE_JOBS,
-        GROUP_RESULTS,
-        NOTICE_READ,
-        TOOL_CALL_IDS,
-        TOOL_STATS,
-        USAGE_TOTALS,
-        RETRIES,
-        REQUEST_TIMELINE,
-        OPEN_APPROVALS,
-        APPROVAL_CALLS,
-        RECURRENCE_DUE
-    );
-    match format {
-        MigrationFormat::Current => {
-            check_tables!(CREDENTIALS, SUCCESSORS, USER_INPUT_AT, USAGE_MODEL);
-        }
-        MigrationFormat::Format17 => {
-            check_tables!(SUCCESSORS, USER_INPUT_AT, USAGE_MODEL);
-        }
-        MigrationFormat::Format16
-        | MigrationFormat::Format15
-        | MigrationFormat::UnmarkedCurrent
-        | MigrationFormat::Legacy => {
-            check_tables!(
-                F16_SUCCESSOR,
-                F16_USER_INPUT,
-                F16_HEAD_TABLE,
-                F16_ATTACHMENT_USE,
-                F16_SCOPE_TABLE
-            );
-        }
-    }
-    known.insert(CONVERSATION_SEARCH.name().to_owned());
-    if format != MigrationFormat::Legacy {
-        drop(tx.open_table(CONVERSATION_SEARCH)?);
-    }
-    let actual: BTreeSet<String> = tx
-        .list_tables()?
-        .map(|table| table.name().to_owned())
-        .collect();
-    if actual != known || tx.list_multimap_tables()?.next().is_some() {
-        return Err(unsupported_format("unsupported set of database tables"));
-    }
-    for key in ["clean_shutdown", "open_epoch", "compaction_settings"] {
-        if meta.get(key)?.is_none() {
-            return Err(StorageError::corrupted("missing required metadata"));
-        }
-    }
-    let shutdown = meta
-        .get("clean_shutdown")?
-        .ok_or_else(|| StorageError::corrupted("missing shutdown flag"))?;
+/// Reads the facts that decide whether `job` is a Reserved Allocation that
+/// never started, from a database nothing is writing.
+///
+/// The epoch rule: a Reservation is minted in the epoch of the process that
+/// opened the database, and an open that finds a held Allocation refuses
+/// before it increments the epoch. So the Allocation's epoch equals the
+/// stored `open_epoch` exactly when no process has opened the database since
+/// the one that made it. That is necessary (a different epoch means history
+/// this build cannot see) but not sufficient: the owner may still be running.
+/// Its absence is established by the exclusive host lock the caller holds.
+fn reserved_preflight_in(
+    database: &impl ReadableDatabase,
+    job: JobId,
+) -> Result<(crate::db::entities::AllocationToken, serde_json::Value), ReservedRefusal> {
+    use crate::db::entities::{AllocationPhase, MutableJobPhase};
+    use serde_json::json;
+
+    let tx = database.begin_read().map_err(StorageError::from)?;
+    let meta = tx.open_table(META).map_err(StorageError::from)?;
+    check_identity(&meta)?;
     let epoch = meta
-        .get("open_epoch")?
-        .ok_or_else(|| StorageError::corrupted("missing open epoch"))?;
-    if !matches!(shutdown.value(), [0] | [1]) || epoch.value().len() != 8 {
-        return Err(unsupported_format("unsupported metadata encoding"));
+        .get("open_epoch")
+        .map_err(StorageError::from)?
+        .and_then(|value| <[u8; 8]>::try_from(value.value()).ok())
+        .map(u64::from_le_bytes)
+        .ok_or_else(|| ReservedRefusal::new("inconsistent_or_corrupt", "missing open epoch"))?;
+    let clean_shutdown = meta
+        .get("clean_shutdown")
+        .map_err(StorageError::from)?
+        .map(|value| value.value() == [1]);
+    drop(meta);
+    check_records(&tx)?;
+
+    let allocations = tx
+        .open_table(POOL_ALLOCATIONS)
+        .map_err(StorageError::from)?;
+    let row = allocations
+        .get(job.get())
+        .map_err(StorageError::from)?
+        .ok_or_else(|| ReservedRefusal::new("allocation_not_found", "the Job has no Allocation"))?;
+    let allocation = transactions::decode_pool_allocation(job.get(), row.value())?;
+    drop(row);
+    match allocation.phase {
+        AllocationPhase::Reserved => {}
+        AllocationPhase::Released => {
+            return Err(ReservedRefusal::new(
+                "already_released",
+                "the Allocation is already released; there is nothing to reconcile",
+            ));
+        }
+        AllocationPhase::Running => {
+            return Err(ReservedRefusal::new(
+                "running",
+                "the Allocation is Running: the Job started, and a restart is not evidence its work stopped",
+            ));
+        }
+        AllocationPhase::StopRequested => {
+            return Err(ReservedRefusal::new(
+                "stop_requested",
+                "a stop was requested of a started Job; its stop is not confirmed",
+            ));
+        }
+        AllocationPhase::Uncertain => {
+            return Err(ReservedRefusal::new(
+                "uncertain",
+                "the Allocation is Uncertain; its outcome is unknown, not unstarted",
+            ));
+        }
     }
-    macro_rules! headers { ($($table:ident => $tag:expr),+ $(,)?) => { $(check_record_headers(&tx, $table, $tag, format)?;)+ }; }
-    headers!(CONFIGS => 1, JOBS => 2, JOB_STATES => 3, JOB_OUTPUTS => 4, SUBMISSIONS => 5,
-        ATTACHMENTS => 6, TOOL_CALLS => 7, REQUEST_EVENTS => 8, PROJECTS => 9,
-        JOB_CONTROLS => 10, JOB_INPUTS => 11, NOTICES => 12, RECURRENCES => 13, APPROVALS => 15);
-    if format == MigrationFormat::Current {
-        headers!(CREDENTIALS => codec::TAG_CREDENTIAL);
+    if allocation.started_at.is_some() {
+        return Err(ReservedRefusal::new(
+            "started",
+            "a start was committed for this Allocation",
+        ));
     }
-    let settings = meta
-        .get("compaction_settings")?
-        .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
-    if !matches!(settings.value(), [14, 11 | 13 | 14, ..])
-        && !(format.has_current_configs() && matches!(settings.value(), [14, 15, ..]))
+    if allocation.stop_confirmed_at.is_some() || allocation.stop_proof.is_some() {
+        return Err(ReservedRefusal::new(
+            "stop_evidence",
+            "the Allocation carries stop evidence, so it is not an untouched reservation",
+        ));
+    }
+    let token = allocation.token;
+    if token.epoch != epoch {
+        return Err(ReservedRefusal::new(
+            "epoch_mismatch",
+            format!(
+                "the Allocation was made in epoch {} but the database was last opened in epoch {epoch}; the intervening history is not visible",
+                token.epoch
+            ),
+        ));
+    }
+    let current_host = current_host_id();
+    if current_host.is_none() || allocation.host_id != current_host {
+        return Err(ReservedRefusal::new(
+            "other_host",
+            "the Allocation was not claimed by this host, or this host cannot be identified; a lock here says nothing about another machine",
+        ));
+    }
+    let same_boot = allocation.boot_id.is_some() && allocation.boot_id == current_boot_id();
+
+    // Capacity ownership elsewhere is not this command's to resolve, and the
+    // result could not pass the startup verification with it.
+    let (mut held, mut unknown) = (0u64, 0u64);
+    for entry in allocations.iter().map_err(StorageError::from)? {
+        let (key, value) = entry.map_err(StorageError::from)?;
+        if transactions::decode_pool_allocation(key.value(), value.value())?.holds_capacity() {
+            held += 1;
+        }
+    }
+    drop(allocations);
+    let states = tx.open_table(JOB_STATES).map_err(StorageError::from)?;
+    for entry in states.iter().map_err(StorageError::from)? {
+        let (key, value) = entry.map_err(StorageError::from)?;
+        if JobState::decode_at(key.value(), value.value())?
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+        {
+            unknown += 1;
+        }
+    }
+    drop(states);
+    if held != 1 || unknown != 0 {
+        return Err(ReservedRefusal::new(
+            "other_unresolved_ownership",
+            format!(
+                "{held} Allocation(s) hold capacity and {unknown} Job outcome(s) are Unknown; only a database whose single held Allocation is this one is reconciled"
+            ),
+        ));
+    }
+
+    let record = reader::mutable_job_record_in(&tx, job)?
+        .ok_or_else(|| ReservedRefusal::new("job_missing", "the reserved Job does not exist"))?;
+    if let Some(outcome) = &record.outcome {
+        return Err(ReservedRefusal::new(
+            if outcome.kind == OutcomeKind::Unknown {
+                "outcome_unknown"
+            } else {
+                "job_has_outcome"
+            },
+            "the Job already has an outcome",
+        ));
+    }
+    if record.job.phase != MutableJobPhase::Queued
+        || record.job.revision != allocation.job_revision
+        || record.job.frozen.is_none()
     {
-        return Err(unsupported_format(
-            "unsupported compaction settings encoding",
+        return Err(ReservedRefusal::new(
+            "job_not_prestart",
+            "the Job is not the frozen, queued revision that was reserved",
         ));
     }
-    reader::global_compaction_settings(&meta)?;
-    macro_rules! decode_rows {
-        ($table:ident, |$key:ident, $bytes:ident| $body:expr) => {
-            for row in tx.open_table($table)?.iter()? {
-                let (key, value) = row?;
-                let $key = key.value();
-                let $bytes = value.value();
-                $body?;
-            }
-        };
-    }
-    for row in tx.open_table(CONFIGS)?.iter()? {
-        let (key, value) = row?;
-        if format.has_current_configs() {
-            ConfigRow::decode_at(key.value(), value.value())?;
-        } else {
-            migration_upgrade_config(key.value(), value.value())?;
-        }
-    }
-    decode_rows!(JOBS, |key, bytes| JobSpec::decode_at(key, bytes));
-    decode_rows!(JOB_STATES, |key, bytes| JobState::decode_at(key, bytes));
-    decode_rows!(JOB_OUTPUTS, |key, bytes| rows::decode_output(key, bytes));
-    decode_rows!(SUBMISSIONS, |key, bytes| rows::decode_submission(
-        key, bytes
-    ));
-    decode_rows!(ATTACHMENTS, |key, bytes| rows::decode_attachment(
-        key, bytes
-    ));
-    decode_rows!(TOOL_CALLS, |key, bytes| rows::decode_tool_evidence(
-        rows::tool_call_ref(key)?,
-        bytes
-    ));
-    decode_rows!(REQUEST_EVENTS, |key, bytes| rows::decode_request_event(
-        JobId::new(key.0),
-        RequestNumber::new(key.1)
-            .ok_or_else(|| StorageError::corrupted("invalid request number"))?,
-        key.2,
-        bytes
-    ));
-    decode_rows!(PROJECTS, |key, bytes| rows::decode_project(key, bytes));
-    decode_rows!(JOB_CONTROLS, |_key, bytes| JobControl::decode(bytes));
-    decode_rows!(JOB_INPUTS, |_key, bytes| JobInputEntry::decode(bytes));
-    decode_rows!(NOTICES, |_key, bytes| Notice::decode(bytes));
-    decode_rows!(APPROVALS, |_key, bytes| ApprovalRecord::decode(bytes));
-    decode_rows!(RECURRENCES, |_key, bytes| Recurrence::decode(bytes));
-    if format == MigrationFormat::Current {
-        decode_rows!(CREDENTIALS, |key, bytes| rows::decode_credential(
-            key, bytes
-        ));
-    }
-    Ok(format)
-}
 
-fn migration_fingerprint<K: Key + 'static, V: Value + 'static>(
-    tx: &impl TxRead,
-    definition: TableDefinition<K, V>,
-) -> Result<[u8; 32], StorageError> {
-    let table = tx.table(definition)?;
-    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    for row in table.iter()? {
-        let (key, value) = row?;
-        let key = key.value();
-        let value = value.value();
-        let kb = K::as_bytes(&key);
-        let vb = V::as_bytes(&value);
-        for bytes in [kb.as_ref(), vb.as_ref()] {
-            hash.update(&(bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
-        }
-    }
-    hash.finish()
-        .as_ref()
-        .try_into()
-        .map_err(|_| StorageError::corrupted("invalid digest"))
-}
-
-fn migration_upgrade_config(key: u128, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
-    let mut upgraded = bytes.to_vec();
-    match upgraded.get(18) {
-        Some(1 | 2) => {
-            upgraded[1] = codec::RECORD_VERSION;
-            upgraded.push(1);
-        }
-        Some(_) => {}
-        None => return Err(StorageError::corrupted("short config record")),
-    }
-    ConfigRow::decode_at(key, &upgraded)?;
-    Ok(upgraded)
-}
-
-fn zero_config_version(mut bytes: Vec<u8>) -> Result<Vec<u8>, StorageError> {
-    *bytes
-        .get_mut(1)
-        .ok_or_else(|| StorageError::corrupted("short config record"))? = 0;
-    Ok(bytes)
-}
-
-fn migration_config_fingerprint(
-    tx: &impl TxRead,
-    format: MigrationFormat,
-) -> Result<[u8; 32], StorageError> {
-    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    for row in tx.table(CONFIGS)?.iter()? {
-        let (key, value) = row?;
-        let id = key.value();
-        let bytes = match format {
-            // Format 16 and Format 17 rows already carry their flag byte; every
-            // value is authoritative, so the row is compared exactly as stored.
-            MigrationFormat::Format16 | MigrationFormat::Format17 => value.value().to_vec(),
-            MigrationFormat::Current => {
-                let mut bytes = value.value().to_vec();
-                if matches!(bytes.get(18), Some(1 | 2)) && bytes.pop() != Some(1) {
-                    return Err(StorageError::corrupted("migrated config default differs"));
-                }
-                zero_config_version(bytes)?
-            }
-            MigrationFormat::Legacy
-            | MigrationFormat::UnmarkedCurrent
-            | MigrationFormat::Format15 => {
-                let mut bytes = migration_upgrade_config(id, value.value())?;
-                if matches!(bytes.get(18), Some(1 | 2)) {
-                    bytes.pop();
-                }
-                zero_config_version(bytes)?
-            }
-        };
-        let key = u128::as_bytes(&id);
-        for data in [key.as_ref(), bytes.as_slice()] {
-            hash.update(&(data.len() as u64).to_le_bytes());
-            hash.update(data);
-        }
-    }
-    hash.finish()
-        .as_ref()
-        .try_into()
-        .map_err(|_| StorageError::corrupted("invalid digest"))
-}
-
-fn authoritative_snapshot(
-    tx: &impl TxRead,
-    format: MigrationFormat,
-) -> Result<Vec<[u8; 32]>, StorageError> {
-    let meta = tx.table(META)?;
-    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    for row in meta.iter()? {
-        let (key, value) = row?;
-        if key.value() == DATABASE_FORMAT_KEY {
-            continue;
-        }
-        for bytes in [key.value().as_bytes(), value.value()] {
-            hash.update(&(bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
-        }
-    }
-    let metadata: [u8; 32] = hash
-        .finish()
-        .as_ref()
-        .try_into()
-        .map_err(|_| StorageError::corrupted("invalid digest"))?;
-    Ok(vec![
-        metadata,
-        migration_fingerprint(tx, SEQUENCES)?,
-        migration_config_fingerprint(tx, format)?,
-        migration_fingerprint(tx, JOBS)?,
-        migration_fingerprint(tx, JOB_STATES)?,
-        migration_fingerprint(tx, JOB_OUTPUTS)?,
-        migration_fingerprint(tx, SUBMISSIONS)?,
-        migration_fingerprint(tx, ATTACHMENTS)?,
-        migration_fingerprint(tx, TOOL_CALLS)?,
-        migration_fingerprint(tx, MESSAGES)?,
-        migration_fingerprint(tx, REQUEST_EVENTS)?,
-        migration_fingerprint(tx, PROJECTS)?,
-        migration_fingerprint(tx, JOB_CONTROLS)?,
-        migration_fingerprint(tx, JOB_INPUTS)?,
-        migration_fingerprint(tx, NOTICES)?,
-        migration_fingerprint(tx, APPROVALS)?,
-        migration_fingerprint(tx, RECURRENCES)?,
-    ])
-}
-
-pub(crate) fn migration_snapshot(
-    source: &MigrationSource,
-    format: MigrationFormat,
-) -> Result<Vec<[u8; 32]>, StorageError> {
-    authoritative_snapshot(&source.0.begin_read()?, format)
-}
-
-pub(crate) fn parse_migration_credentials(
-    path: &Path,
-) -> Result<Option<BTreeMap<String, CredentialSecret>>, StorageError> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(StorageError::from(::redb::Error::Io(error))),
+    let configs = tx.open_table(CONFIGS).map_err(StorageError::from)?;
+    let pool = match configs.get(token.pool.get()).map_err(StorageError::from)? {
+        Some(bytes) => Some(transactions::decode_allocation_pool(
+            token.pool.get(),
+            bytes.value(),
+        )?),
+        None => None,
     };
-    if !metadata.file_type().is_file() {
-        return Err(StorageError::corrupted(
-            "credentials.json is not a regular file",
-        ));
-    }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|error| StorageError::from(::redb::Error::Io(error)))?;
-    let parsed: BTreeMap<String, String> = serde_json::from_str(&raw)
-        .map_err(|_| StorageError::corrupted("invalid credentials.json"))?;
-    let mut entries = BTreeMap::new();
-    for (reference, secret) in parsed {
-        let secret = secret.trim();
-        if !rows::valid_credential_ref(&reference) {
-            return Err(StorageError::corrupted("invalid credentials.json"));
-        }
-        let secret = CredentialSecret::new(secret.to_owned())
-            .map_err(|_| StorageError::corrupted("invalid credentials.json"))?;
-        entries.insert(reference, secret);
-    }
-    Ok(Some(entries))
-}
-
-pub(crate) fn migration_credentials_digest(
-    entries: Option<&BTreeMap<String, CredentialSecret>>,
-) -> Result<[u8; 32], StorageError> {
-    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    if let Some(entries) = entries {
-        for (reference, secret) in entries {
-            for bytes in [reference.as_bytes(), secret.as_str().as_bytes()] {
-                hash.update(&(bytes.len() as u64).to_le_bytes());
-                hash.update(bytes);
-            }
-        }
-    }
-    hash.finish()
-        .as_ref()
-        .try_into()
-        .map_err(|_| StorageError::corrupted("invalid digest"))
-}
-
-fn decrypted_credentials_digest(
-    tx: &impl TxRead,
-    key: Option<&CredentialKey>,
-) -> Result<[u8; 32], StorageError> {
-    let table = tx.table(CREDENTIALS)?;
-    let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-    for row in table.iter()? {
-        let (reference, value) = row?;
-        let reference = reference.value();
-        let key =
-            key.ok_or_else(|| StorageError::corrupted("missing credential encryption key"))?;
-        let secret = key
-            .decrypt(reference, value.value())?
-            .ok_or_else(|| StorageError::corrupted("migrated credential key id mismatch"))?;
-        for bytes in [reference.as_bytes(), secret.as_str().as_bytes()] {
-            hash.update(&(bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
-        }
-    }
-    hash.finish()
-        .as_ref()
-        .try_into()
-        .map_err(|_| StorageError::corrupted("invalid digest"))
-}
-
-pub(crate) fn migration_verify_credentials(
-    source: &MigrationSource,
-    key: Option<&CredentialKey>,
-    expected: &[u8; 32],
-) -> Result<bool, StorageError> {
-    Ok(&decrypted_credentials_digest(&source.0.begin_read()?, key)? == expected)
-}
-
-pub(crate) fn migration_apply(
-    path: &Path,
-    format: MigrationFormat,
-    expected: &[[u8; 32]],
-    credentials: Option<&BTreeMap<String, CredentialSecret>>,
-    credential_key: Option<&CredentialKey>,
-    expected_credentials: &[u8; 32],
-) -> Result<(), StorageError> {
-    let db = Database::open(path)?;
-    let mut tx = db.begin_write()?;
-    tx.set_durability(Durability::Immediate)?;
-    if authoritative_snapshot(&tx, format)? != expected {
-        return Err(StorageError::corrupted(
-            "copied authoritative records differ",
-        ));
-    }
-    if credentials.is_some() != credential_key.is_some() {
-        return Err(StorageError::corrupted("credential migration key mismatch"));
-    }
-    match format {
-        MigrationFormat::Legacy => {
-            if !tx.delete_table(LEGACY_CONVERSATION_SEARCH)? {
-                return Err(StorageError::corrupted("legacy search index missing"));
-            }
-            drop(tx.open_table(CONVERSATION_SEARCH)?);
-        }
-        MigrationFormat::UnmarkedCurrent
-        | MigrationFormat::Format15
-        | MigrationFormat::Format16
-        | MigrationFormat::Format17 => {}
-        MigrationFormat::Current => return Err(unsupported_format("database is already current")),
-    }
-    if !format.has_current_configs() {
-        use ::redb::ReadableTable;
-        let mut table = tx.open_table(CONFIGS)?;
-        let mut after = None;
-        loop {
-            let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
-            let rows = table
-                .range((start, std::ops::Bound::Unbounded))?
-                .take(256)
-                .map(|entry| {
-                    let (key, value) = entry?;
-                    Ok((
-                        key.value(),
-                        migration_upgrade_config(key.value(), value.value())?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, StorageError>>()?;
-            if rows.is_empty() {
-                break;
-            }
-            for (key, value) in rows {
-                table.insert(key, value.as_slice())?;
-                after = Some(key);
-            }
-        }
-    }
-    if format != MigrationFormat::Format17 {
-        for removed in [
-            tx.delete_table(F16_HEAD_TABLE)?,
-            tx.delete_table(F16_ATTACHMENT_USE)?,
-            tx.delete_table(F16_SCOPE_TABLE)?,
-            tx.delete_table(F16_SUCCESSOR)?,
-            tx.delete_table(F16_USER_INPUT)?,
-        ] {
-            if !removed {
-                return Err(StorageError::corrupted("replaced derived table missing"));
-            }
-        }
-    }
+    let executor = match configs
+        .get(token.executor.get())
+        .map_err(StorageError::from)?
     {
-        let mut table = tx.open_table(CREDENTIALS)?;
-        if let (Some(entries), Some(key)) = (credentials, credential_key) {
-            for (reference, secret) in entries {
-                let encrypted = key.encrypt(reference, secret)?;
-                table.insert(reference.as_str(), encrypted.as_slice())?;
-            }
-        }
-    }
-    indexes::rebuild(&tx, promotion_clock())?;
-    if format == MigrationFormat::Legacy {
-        indexes::verify_search_index(&tx)?;
-    }
-    if authoritative_snapshot(&tx, format.migrated_snapshot_format())? != expected {
-        return Err(StorageError::corrupted(
-            "authoritative records changed during migration",
-        ));
-    }
-    if &decrypted_credentials_digest(&tx, credential_key)? != expected_credentials {
-        return Err(StorageError::corrupted(
-            "migrated credentials differ from source",
-        ));
-    }
+        Some(bytes) => Some(transactions::decode_allocation_executor(
+            token.executor.get(),
+            bytes.value(),
+        )?),
+        None => None,
+    };
+    if pool.as_ref().is_none_or(|pool| pool.id != token.pool)
+        || executor
+            .as_ref()
+            .is_none_or(|executor| executor.id != token.executor || executor.pool != token.pool)
     {
-        let mut meta = tx.open_table(META)?;
-        meta.insert(
-            DATABASE_FORMAT_KEY,
-            DATABASE_FORMAT_VERSION.to_le_bytes().as_slice(),
-        )?;
+        return Err(ReservedRefusal::new(
+            "binding_inconsistent",
+            "the reserved Pool or Executor is missing or no longer bound to the Allocation",
+        ));
     }
-    tx.commit()?;
-    Ok(())
+
+    let id = job.get();
+    let mut evidence = Vec::new();
+    if tx
+        .open_table(JOB_OUTPUTS)
+        .map_err(StorageError::from)?
+        .range((id, 0)..=(id, u32::MAX))
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        evidence.push("output");
+    }
+    if tx
+        .open_table(REQUEST_EVENTS)
+        .map_err(StorageError::from)?
+        .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        evidence.push("request");
+    }
+    if tx
+        .open_table(TOOL_CALLS)
+        .map_err(StorageError::from)?
+        .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        evidence.push("tool");
+    }
+    if tx
+        .open_table(APPROVALS)
+        .map_err(StorageError::from)?
+        .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        evidence.push("approval");
+    }
+    if tx
+        .open_table(JOB_OBSERVATIONS)
+        .map_err(StorageError::from)?
+        .range((id, 0, 0)..=(id, u8::MAX, u128::MAX))
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        evidence.push("observation");
+    }
+    if tx
+        .open_table(LIVE_CHILDREN)
+        .map_err(StorageError::from)?
+        .range((id, 0)..=(id, u128::MAX))
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        evidence.push("child");
+    }
+    if !evidence.is_empty() {
+        return Err(ReservedRefusal::new(
+            "evidence_present",
+            format!(
+                "the Job has {} evidence; an unstarted reservation has none",
+                evidence.join(", ")
+            ),
+        ));
+    }
+
+    let facts = json!({
+        "job": job.to_string(),
+        "pool": token.pool.to_string(),
+        "executor": token.executor.to_string(),
+        "generation": token.generation.get(),
+        "allocation_epoch": token.epoch,
+        "open_epoch": epoch,
+        "clean_shutdown": clean_shutdown,
+        "claimed_at_unix_micros": allocation.claimed_at.as_unix_micros(),
+        "job_revision": allocation.job_revision,
+        "claimed_by_this_host": true,
+        "claimed_in_this_boot": same_boot,
+        "held_allocations": held,
+        "unknown_outcomes": unknown,
+    });
+    Ok((token, facts))
+}
+
+/// Runs `body` on the database the file holds. The file is a private copy:
+/// redb may repair it on open, and a damaged page is reported as a refusal
+/// instead of aborting the process.
+fn with_reconciliation_copy<T>(
+    file: std::fs::File,
+    body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
+) -> Result<T, ReservedRefusal> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut database = Database::builder().create_file(file)?;
+        body(&mut database)
+    }))
+    .unwrap_or_else(|_| {
+        Err(ReservedRefusal::new(
+            "inconsistent_or_corrupt",
+            "redb aborted while reading a damaged page",
+        ))
+    })
+}
+
+/// Decides, on a private copy, whether `job` is an unstarted Reservation.
+/// Writes nothing the caller keeps.
+pub(crate) fn reconcile_reserved_preflight(
+    file: std::fs::File,
+    job: JobId,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    with_reconciliation_copy(file, |database| {
+        reserved_preflight_in(&*database, job).map(|(_, facts)| facts)
+    })
+}
+
+/// Ends the unstarted Reservation on a private copy with the one transaction
+/// the runtime uses for it, then verifies the copy completely: every page
+/// checksum, every record and every derived index. The returned report is
+/// what was verified.
+pub(crate) fn reconcile_reserved_apply(
+    file: std::fs::File,
+    job: JobId,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    use crate::db::entities::{AllocationPhase, UnstartedCause};
+    with_reconciliation_copy(file, |database| {
+        let (token, mut facts) = reserved_preflight_in(&*database, job)?;
+        let outcome =
+            writer::run_batch_with(database, token.epoch, writer::Commit::Durable, |batch| {
+                batch.fail_unstarted_reservation(token, UnstartedCause::OfflineReconciled)
+            });
+        match outcome.result {
+            Ok(_) => {}
+            Err(writer::BatchFailure::Rejected(violation)) => {
+                return Err(ReservedRefusal::new("rejected", violation.to_string()));
+            }
+            Err(
+                writer::BatchFailure::NotCommitted(error)
+                | writer::BatchFailure::OutcomeUnknown(error),
+            ) => return Err(error.into()),
+        }
+        if !database.check_integrity().map_err(StorageError::from)? {
+            return Err(ReservedRefusal::new(
+                "page_integrity",
+                "redb found damage in the reconciled copy and had to repair it",
+            ));
+        }
+        // Every record and derived index, and no held Allocation or Unknown outcome left.
+        verify_full(&*database)?;
+        let tx = database.begin_read().map_err(StorageError::from)?;
+        let allocations = tx
+            .open_table(POOL_ALLOCATIONS)
+            .map_err(StorageError::from)?;
+        let row = allocations
+            .get(job.get())
+            .map_err(StorageError::from)?
+            .ok_or_else(|| {
+                ReservedRefusal::new("inconsistent_or_corrupt", "Allocation vanished")
+            })?;
+        let released = transactions::decode_pool_allocation(job.get(), row.value())?;
+        let record = reader::mutable_job_record_in(&tx, job)?;
+        let failed = record
+            .as_ref()
+            .and_then(|record| record.outcome.as_ref())
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Failed);
+        if released.phase != AllocationPhase::Released || released.started_at.is_some() || !failed {
+            return Err(ReservedRefusal::new(
+                "inconsistent_or_corrupt",
+                "the reconciled copy does not show a Released Allocation and a Failed Job",
+            ));
+        }
+        facts["result"] = serde_json::json!({
+            "allocation_phase": "released",
+            "job_outcome": "failed",
+            "failure_code": UnstartedCause::OfflineReconciled.code(),
+            "page_checksums": "every page checksum verified",
+            "logical_checks": "every record header, derived index and ownership row verified",
+        });
+        Ok(facts)
+    })
 }

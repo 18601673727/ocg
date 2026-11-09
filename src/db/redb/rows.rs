@@ -41,6 +41,14 @@ pub(crate) fn usage_agent(row: &JobSpec, parent: Option<&JobSpec>) -> u128 {
 }
 
 impl JobSpec {
+    pub(super) const MUTABLE_CONVERSATION_TAG: u8 = 53;
+
+    pub(super) fn encode_mutable_conversation(&self) -> Vec<u8> {
+        let mut encoded = self.encode();
+        encoded[0] = Self::MUTABLE_CONVERSATION_TAG;
+        encoded
+    }
+
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB);
         e.u128(self.id.get());
@@ -55,6 +63,45 @@ impl JobSpec {
     }
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        if bytes.first() == Some(&Self::MUTABLE_CONVERSATION_TAG) {
+            let mut d = Dec::new(bytes, Self::MUTABLE_CONVERSATION_TAG)?;
+            let id = JobId::new(d.u128()?);
+            let kind = d.job_kind()?;
+            let created_at = d.ts()?;
+            let parent_id = d.ou128()?.map(JobId::new);
+            let allocation = d.opt(|d| {
+                Ok(crate::db::entities::JobAllocation {
+                    owner: JobId::new(d.u128()?),
+                    synthesis: d.bool()?,
+                })
+            })?;
+            d.end()?;
+            if !matches!(
+                &kind,
+                JobKind::Group {
+                    origin: Origin::User,
+                    keep_open: true,
+                    ..
+                }
+            ) || parent_id.is_some()
+                || allocation.is_some()
+                || id.get() == 0
+            {
+                return Err(StorageError::corrupted("invalid mutable conversation"));
+            }
+            return Ok(JobSpec {
+                id,
+                created_at,
+                parent_id,
+                kind,
+                allocation,
+            });
+        }
+        if bytes.get(1) == Some(&codec::RECORD_VERSION) {
+            return Err(StorageError::corrupted(
+                "mutable Job requires the new-model reader",
+            ));
+        }
         let mut d = Dec::new(bytes, TAG_JOB)?;
         let id = JobId::new(d.u128()?);
         let kind = d.job_kind()?;
@@ -141,6 +188,10 @@ impl JobState {
                     e.u32(*record);
                 }
                 OutcomeCause::Closed => e.u8(6),
+                OutcomeCause::Uncertain(reason) => {
+                    e.u8(7);
+                    e.u8(reason.code());
+                }
             });
         });
         e.ots(self.stop_confirmed_at);
@@ -191,6 +242,14 @@ impl JobState {
                 4 => Ok(OutcomeCause::DependencyImpossible),
                 5 => Ok(OutcomeCause::Stopped { record: d.u32()? }),
                 6 => Ok(OutcomeCause::Closed),
+                7 => {
+                    let code = d.u8()?;
+                    crate::db::entities::UncertaintyReason::from_code(code)
+                        .map(OutcomeCause::Uncertain)
+                        .ok_or_else(|| {
+                            StorageError::corrupted(format!("invalid uncertainty reason {code}"))
+                        })
+                }
                 code => Err(StorageError::corrupted(format!(
                     "invalid outcome cause {code}"
                 ))),
@@ -236,6 +295,24 @@ pub(crate) struct ConfigRow {
 }
 
 impl ConfigRow {
+    /// Decode ordinary configurations during a shared-table scan. The
+    /// development allocation records have their own encodings and must be
+    /// fully validated before they can be excluded from a configuration scan.
+    pub(super) fn scan_at(key: u128, bytes: &[u8]) -> DecodeResult<Option<Self>> {
+        match bytes.first() {
+            Some(&super::transactions::TAG_ALLOCATION_POOL) => {
+                super::transactions::decode_allocation_pool(key, bytes)?;
+                return Ok(None);
+            }
+            Some(&super::transactions::TAG_ALLOCATION_EXECUTOR) => {
+                super::transactions::decode_allocation_executor(key, bytes)?;
+                return Ok(None);
+            }
+            _ => {}
+        }
+        Self::decode_at(key, bytes).map(Some)
+    }
+
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_CONFIG);
         e.u128(self.id.get());
@@ -252,6 +329,7 @@ impl ConfigRow {
                 e.u8(c.protocol.code());
                 e.ostr(c.endpoint.as_deref());
                 e.ostr(c.credential_ref.as_deref());
+                e.outbound_headers(&c.headers);
             }
             ConfigBody::Model(m) => {
                 e.u8(2);
@@ -333,10 +411,12 @@ impl ConfigRow {
                 let protocol = d.code(LlmTransport::from_code)?;
                 let endpoint = d.ostr()?;
                 let credential_ref = d.ostr()?;
+                let headers = d.outbound_headers()?;
                 ConfigBody::Connection(ConnectionConfig {
                     protocol,
                     endpoint,
                     credential_ref,
+                    headers,
                 })
             }
             ConfigKind::Model => {
@@ -1087,11 +1167,16 @@ pub(crate) struct CredentialSecret(String);
 
 impl CredentialSecret {
     pub(crate) fn new(secret: impl Into<String>) -> Result<Self, &'static str> {
-        let secret = secret.into();
+        let mut secret = secret.into();
         if secret.is_empty() || secret.len() > 4096 {
+            crate::system::secrets::wipe_string(&mut secret);
             return Err("credential secret must be 1..=4096 bytes");
         }
-        if ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err() {
+        let mut header = format!("Bearer {secret}");
+        let valid = ntex::http::header::HeaderValue::try_from(header.as_str()).is_ok();
+        crate::system::secrets::wipe_string(&mut header);
+        if !valid {
+            crate::system::secrets::wipe_string(&mut secret);
             return Err("credential secret is not a valid HTTP Bearer token");
         }
         Ok(Self(secret))
@@ -1101,8 +1186,19 @@ impl CredentialSecret {
         &self.0
     }
 
-    pub(crate) fn into_inner(self) -> String {
-        self.0
+    /// The secret's text, moved out. The wrapper is left empty and its drop
+    /// wipes nothing further; the caller owns the only remaining copy.
+    pub(crate) fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for CredentialSecret {
+    /// Overwrites the buffer when the secret is dropped. Best effort only: a
+    /// clone, a moved-out copy or a copy inside a client library is not
+    /// reached (see `system::secrets`).
+    fn drop(&mut self) {
+        crate::system::secrets::wipe_string(&mut self.0);
     }
 }
 
@@ -1192,13 +1288,19 @@ impl CredentialKey {
             .map_err(|_| StorageError::corrupted("system random source unavailable"))?;
         let aad = credential_aad(reference);
         let mut ciphertext = secret.as_str().as_bytes().to_vec();
-        self.key
+        if self
+            .key
             .seal_in_place_append_tag(
                 aws_lc_rs::aead::Nonce::assume_unique_for_key(nonce),
                 aws_lc_rs::aead::Aad::from(&aad),
                 &mut ciphertext,
             )
-            .map_err(|_| StorageError::corrupted("credential encryption failed"))?;
+            .is_err()
+        {
+            // The buffer still holds the plaintext on failure.
+            crate::system::secrets::wipe_vec(&mut ciphertext);
+            return Err(StorageError::corrupted("credential encryption failed"));
+        }
         let mut encoded = Vec::with_capacity(2 + 8 + 12 + ciphertext.len());
         encoded.push(codec::TAG_CREDENTIAL);
         encoded.push(codec::RECORD_VERSION);
@@ -1230,10 +1332,20 @@ impl CredentialKey {
             aws_lc_rs::aead::Aad::from(&aad),
             &mut buffer,
         ) else {
+            crate::system::secrets::wipe_vec(&mut buffer);
             return Ok(None);
         };
-        let secret = String::from_utf8(plaintext.to_vec())
-            .map_err(|_| StorageError::corrupted("decrypted credential is not UTF-8"))?;
+        // The one copy that becomes the secret; the decryption buffer is
+        // wiped whichever way this ends.
+        let copy = plaintext.to_vec();
+        crate::system::secrets::wipe_vec(&mut buffer);
+        let secret = match String::from_utf8(copy) {
+            Ok(secret) => secret,
+            Err(error) => {
+                crate::system::secrets::wipe_vec(&mut error.into_bytes());
+                return Err(StorageError::corrupted("decrypted credential is not UTF-8"));
+            }
+        };
         CredentialSecret::new(secret)
             .map(Some)
             .map_err(StorageError::corrupted)

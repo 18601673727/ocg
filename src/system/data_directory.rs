@@ -4,6 +4,29 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub const DATA_DIRECTORY_VARIABLE: &str = "OCG_DATA_DIR";
+pub(crate) const DATABASE_LOCK_FILE: &str = ".ocg-database.lock";
+
+pub(crate) fn lock_database(directory: &Path) -> io::Result<std::fs::File> {
+    let path = directory.join(DATABASE_LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    private_file(&mut options);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != 0 {
+        return Err(io::Error::other(
+            "database lock must be an empty regular file",
+        ));
+    }
+    file.try_lock()
+        .map_err(|error| io::Error::other(format!("database lock unavailable: {error}")))?;
+    Ok(file)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DataDirectoryError {

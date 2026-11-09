@@ -2,24 +2,14 @@ use crate::api::v1::ControlPlaneConfig;
 use crate::system::data_directory::DataDirectory;
 
 mod llm_target;
-mod migrate;
-mod pool;
 mod release_slot;
 pub mod typescript;
 #[cfg(unix)]
 mod update;
-#[cfg(unix)]
-mod workspace_job;
 
 /// Without arguments, runs until a graceful shutdown signal (SIGINT,
 /// SIGTERM, SIGQUIT or SIGHUP), then stops in the reverse order of starting;
-/// see [`crate::system::runtime`]. `workspace-read <objective>` instead runs one Job that
-/// may read the authorized Workspace, `workspace-edit <objective>` one
-/// that may also create and conditionally update its files,
-/// `workspace-code <objective>` one that may also run its build and tests,
-/// and `workspace-vision <image-path> <objective>` one that stores an image
-/// of it as an Attachment and sends it with the objective, see
-/// `workspace_job`. `register-llm` registers the LLM target that Control
+/// see [`crate::system::runtime`]. `register-llm` registers the LLM target that Control
 /// Plane submissions name, prints its identities and exits, see
 /// `llm_target`. Without arguments, the local Control Plane is served too
 /// when it is configured, see [`crate::api::v1`].
@@ -35,13 +25,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", usage());
             return Ok(());
         }
-        if command == "pool" {
-            let directory = DataDirectory::from_environment()?;
-            return pool::run(&directory, arguments.collect());
-        }
-        if command == "migrate" {
-            return migrate::run(arguments.collect());
-        }
         #[cfg(unix)]
         if command == "update" {
             return update::run(arguments.collect());
@@ -49,29 +32,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "release-slot" {
             let directory = DataDirectory::from_environment()?;
             return release_slot::run(&directory, arguments.collect());
-        }
-        #[cfg(unix)]
-        if let Some(mode) = workspace_job::Mode::of(command) {
-            let image = if mode.takes_image() {
-                arguments.next()
-            } else {
-                None
-            };
-            let objective = arguments.next();
-            if arguments.next().is_some() {
-                return Err(mode.usage().into());
-            }
-            let config = workspace_job::Config::from_environment(mode, image, objective)?;
-            let data_directory = DataDirectory::from_environment()?;
-            eprintln!("OCG data directory: {}", data_directory.root().display());
-            return Ok(workspace_job::run(&data_directory, config)?);
-        }
-        #[cfg(not(unix))]
-        if matches!(
-            command,
-            "workspace-read" | "workspace-edit" | "workspace-code" | "workspace-vision"
-        ) {
-            return Err(format!("command `{command}` is supported only on Unix").into());
         }
         if command == llm_target::COMMAND {
             if arguments.next().is_some() {
@@ -113,14 +73,8 @@ fn usage() -> &'static str {
      Without command: run the OCG host (reads OCG_DATA_DIR, OCG_CONTROL_PORT, OCG_CONTROL_TOKEN, OCG_UI_DIR)\n\
      \n\
      Commands:\n\
-       migrate [--check | --to <directory>]\n\
        update [--check] [--version X.Y.Z] [--yes]\n\
-       pool list | create <name> [nonzero-concurrency] | enable <pool> | disable <pool> | set-limit <pool> <nonzero-concurrency>\n\
        release-slot <job> [--yes]\n\
-       workspace-read <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
-       workspace-edit <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
-       workspace-code <objective>               (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
-       workspace-vision <image-path> <objective> (unix; OCG_PROJECT, OCG_PROVIDER_*)\n\
        register-llm\n\
        help, --help, -h\n\
        --version, -V"

@@ -11,7 +11,7 @@ use crate::db::entities::{
 // ---- explicit versioned encoding ----------------------------------------------
 
 // Per-record encoding marker; the database format version is stored in meta.
-pub(super) const RECORD_VERSION: u8 = 15;
+pub(super) const RECORD_VERSION: u8 = 24;
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
 pub(super) const TAG_JOB_STATE: u8 = 3;
@@ -28,6 +28,7 @@ pub(super) const TAG_RECURRENCE: u8 = 13;
 pub(super) const TAG_GLOBAL_COMPACTION: u8 = 14;
 pub(super) const TAG_APPROVAL: u8 = 15;
 pub(super) const TAG_CREDENTIAL: u8 = 16;
+pub(super) const TAG_GLOBAL_HEADERS: u8 = 17;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 
@@ -179,6 +180,25 @@ impl Enc {
         }
         self.ou128(agent.default_model.map(ConfigId::get));
     }
+    pub(super) fn native_decision(&mut self, frozen: &NativeDecisionConfig) {
+        self.opt(frozen.agent.as_ref(), |encoder, agent| match agent {
+            FrozenDecisionAgent::Agent(agent) => {
+                encoder.u8(0);
+                encoder.agent_config(agent);
+            }
+            FrozenDecisionAgent::Profile(agent) => {
+                encoder.u8(1);
+                encoder.decision_agent(agent);
+            }
+        });
+        self.opt(frozen.agent_ref.as_ref(), Self::config_ref);
+        self.decision_model(&frozen.model);
+        self.config_ref(&frozen.model_ref);
+        self.config_ref(&frozen.connection_ref);
+        self.ostr(frozen.endpoint.as_deref());
+        self.ostr(frozen.credential_ref.as_deref());
+        self.frozen_headers(&frozen.headers);
+    }
     fn decision_work(&mut self, work: &DecisionWork) {
         match &work.frozen {
             FrozenDecisionConfig::Native(frozen) => {
@@ -199,6 +219,7 @@ impl Enc {
                 self.config_ref(&frozen.connection_ref);
                 self.ostr(frozen.endpoint.as_deref());
                 self.ostr(frozen.credential_ref.as_deref());
+                self.frozen_headers(&frozen.headers);
             }
             FrozenDecisionConfig::Generative(frozen, profile) => {
                 self.u8(1);
@@ -284,6 +305,7 @@ impl Enc {
         self.u8(provider.transport.code());
         self.ostr(provider.endpoint.as_deref());
         self.ostr(provider.credential_ref.as_deref());
+        self.frozen_headers(&provider.headers);
     }
     pub(super) fn frozen_execution(&mut self, frozen: &FrozenExecutionConfig) {
         self.opt(frozen.agent.as_ref(), Enc::agent_config);
@@ -323,7 +345,9 @@ pub(super) type DecodeResult<T> = Result<T, StorageError>;
 impl<'a> Dec<'a> {
     pub(super) fn new(bytes: &'a [u8], tag: u8) -> DecodeResult<Self> {
         match bytes {
-            [found, _, ..] if *found == tag => Ok(Dec { bytes, at: 2 }),
+            [found, version, ..] if *found == tag && *version == RECORD_VERSION => {
+                Ok(Dec { bytes, at: 2 })
+            }
             _ => Err(StorageError::corrupted(format!(
                 "expected a record of type {tag}"
             ))),
@@ -546,6 +570,24 @@ impl<'a> Dec<'a> {
             default_model: self.ou128()?.map(ConfigId::new),
         })
     }
+    pub(super) fn native_decision(&mut self) -> DecodeResult<NativeDecisionConfig> {
+        Ok(NativeDecisionConfig {
+            agent: self.opt(|decoder| match decoder.u8()? {
+                0 => decoder
+                    .agent_config()
+                    .map(|agent| FrozenDecisionAgent::Agent(Box::new(agent))),
+                1 => decoder.decision_agent().map(FrozenDecisionAgent::Profile),
+                _ => Err(StorageError::corrupted("invalid decision Agent kind")),
+            })?,
+            agent_ref: self.opt(Self::config_ref)?,
+            model: self.decision_model()?,
+            model_ref: self.config_ref()?,
+            connection_ref: self.config_ref()?,
+            endpoint: self.ostr()?,
+            credential_ref: self.ostr()?,
+            headers: self.frozen_headers()?,
+        })
+    }
     fn decision_work(&mut self) -> DecodeResult<DecisionWork> {
         let frozen = match self.u8()? {
             0 => FrozenDecisionConfig::Native(NativeDecisionConfig {
@@ -562,6 +604,7 @@ impl<'a> Dec<'a> {
                 connection_ref: self.config_ref()?,
                 endpoint: self.ostr()?,
                 credential_ref: self.ostr()?,
+                headers: self.frozen_headers()?,
             }),
             1 => FrozenDecisionConfig::Generative(
                 self.frozen_execution()?,
@@ -690,6 +733,7 @@ impl<'a> Dec<'a> {
             transport: self.code(LlmTransport::from_code)?,
             endpoint: self.ostr()?,
             credential_ref: self.ostr()?,
+            headers: self.frozen_headers()?,
         };
         Ok(FrozenLlmConfig {
             config,
@@ -1236,6 +1280,63 @@ impl Dec<'_> {
                 format: self.response_format()?,
             },
             _ => return Err(StorageError::corrupted("invalid entry")),
+        })
+    }
+}
+
+impl Enc {
+    pub(super) fn outbound_headers(&mut self, fields: &[crate::db::entities::OutboundHeader]) {
+        use crate::db::entities::OutboundHeaderValue;
+        self.u32(u32::try_from(fields.len()).unwrap_or(u32::MAX));
+        for field in fields {
+            self.str(&field.name);
+            match &field.value {
+                OutboundHeaderValue::Plain(value) => {
+                    self.u8(0);
+                    self.str(value);
+                }
+                OutboundHeaderValue::Secret(reference) => {
+                    self.u8(1);
+                    self.str(reference);
+                }
+            }
+        }
+    }
+    pub(super) fn frozen_headers(&mut self, headers: &crate::db::entities::FrozenHeaders) {
+        self.u32(headers.global_revision);
+        self.outbound_headers(&headers.fields);
+    }
+}
+
+impl Dec<'_> {
+    pub(super) fn outbound_headers(
+        &mut self,
+    ) -> DecodeResult<Vec<crate::db::entities::OutboundHeader>> {
+        use crate::db::entities::{MAX_HEADER_FIELDS, OutboundHeader, OutboundHeaderValue};
+        let count = self.u32()? as usize;
+        if count > MAX_HEADER_FIELDS {
+            return Err(StorageError::corrupted("too many outbound headers"));
+        }
+        let mut fields = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name = self.str()?;
+            let value = match self.u8()? {
+                0 => OutboundHeaderValue::Plain(self.str()?),
+                1 => OutboundHeaderValue::Secret(self.str()?),
+                _ => {
+                    return Err(StorageError::corrupted(
+                        "invalid outbound header value kind",
+                    ));
+                }
+            };
+            fields.push(OutboundHeader { name, value });
+        }
+        Ok(fields)
+    }
+    pub(super) fn frozen_headers(&mut self) -> DecodeResult<crate::db::entities::FrozenHeaders> {
+        Ok(crate::db::entities::FrozenHeaders {
+            global_revision: self.u32()?,
+            fields: self.outbound_headers()?,
         })
     }
 }

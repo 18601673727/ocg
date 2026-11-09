@@ -4,6 +4,7 @@ use super::*;
 /// A request's route, once admitted.
 pub(super) enum Route {
     Health,
+    MutableJob(mutable_jobs::Action),
     Update(bool),
     StartUpdate,
     Jobs {
@@ -68,6 +69,8 @@ pub(super) enum Route {
     ActiveSystemSettings,
     GlobalCompactionSettings,
     SaveGlobalCompactionSettings,
+    GlobalOutboundHeaders,
+    SaveGlobalOutboundHeaders,
     ProfileCreate,
     ProfileImport,
     ProfileDelete(ProfileId),
@@ -88,6 +91,12 @@ pub(super) enum Route {
     },
     PoolsRetired,
     PoolUpdate(ExecutionPoolId),
+    NativePoolCreate,
+    NativeExecutors {
+        before: Option<ProfileId>,
+        limit: usize,
+    },
+    NativeExecutorCreate,
     JobEdit(JobId),
     Outputs {
         job: JobId,
@@ -136,6 +145,10 @@ pub(super) enum Route {
 /// The session routes are the browser's alone.
 pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal> {
     let allowed = match (caller, &route) {
+        (
+            Caller::Operator(_),
+            Route::NativeExecutors { .. } | Route::NativeExecutorCreate | Route::NativePoolCreate,
+        ) => true,
         (Caller::Anonymous, Route::SessionCreate | Route::SessionStatus) => true,
         (
             Caller::Programmatic,
@@ -145,6 +158,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
         (
             Caller::Operator(_),
             Route::Health
+            | Route::MutableJob(_)
             | Route::Update(_)
             | Route::StartUpdate
             | Route::Jobs { .. }
@@ -179,6 +193,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ActiveSystemSettings
             | Route::GlobalCompactionSettings
             | Route::SaveGlobalCompactionSettings
+            | Route::GlobalOutboundHeaders
+            | Route::SaveGlobalOutboundHeaders
             | Route::ProfileCreate
             | Route::ProfileUpdate(_)
             | Route::Projects { .. }
@@ -215,6 +231,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     let path = request.path();
     let query = request.query_string();
     if path == "/api/v2/pools" {
+        if request.method() != Method::GET {
+            return Err(NOT_FOUND);
+        }
         return pools::pools_query(query).map(|(before, limit)| Route::Pools { before, limit });
     }
     let segments = path
@@ -224,7 +243,19 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         .collect::<Vec<_>>();
     if request.method() == Method::POST {
         return match segments.as_slice() {
+            ["mutable-jobs", job, "cancel-unsupported"] => no_query(query).and_then(|()| {
+                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::CancelQueued(id)))
+            }),
             ["update"] => no_query(query).map(|()| Route::StartUpdate),
+            ["mutable-jobs"] => {
+                no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Create))
+            }
+            ["mutable-jobs", job] => no_query(query).and_then(|()| {
+                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Edit(id)))
+            }),
+            ["mutable-jobs", job, "submit"] => no_query(query).and_then(|()| {
+                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Submit(id)))
+            }),
             ["jobs"] => no_query(query).map(|()| Route::Submit),
             ["decisions"] => no_query(query).map(|()| Route::DecisionSubmit),
             ["jobs", job, "release-slot"] => {
@@ -264,7 +295,12 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             ["settings", "compaction"] => {
                 no_query(query).map(|()| Route::SaveGlobalCompactionSettings)
             }
+            ["settings", "outbound-headers"] => {
+                no_query(query).map(|()| Route::SaveGlobalOutboundHeaders)
+            }
             ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
+            ["pools"] => no_query(query).map(|()| Route::NativePoolCreate),
+            ["executors"] => no_query(query).map(|()| Route::NativeExecutorCreate),
             ["profiles", "import"] => no_query(query).map(|()| Route::ProfileImport),
             ["profiles", profile, "availability"] => {
                 let id = profiles::profile_id(profile)?;
@@ -299,6 +335,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     }
     if request.method() == Method::DELETE {
         return match segments.as_slice() {
+            ["mutable-jobs", job] => no_query(query).and_then(|()| {
+                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Discard(id)))
+            }),
             ["providers", id] => {
                 let id = profiles::profile_id(id)?;
                 no_query(query).map(|()| Route::ProviderDelete(id))
@@ -312,6 +351,11 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         };
     }
     match segments.as_slice() {
+        ["mutable-jobs", "current"] => {
+            no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Current))
+        }
+        ["mutable-jobs", job] => no_query(query)
+            .and_then(|()| job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Read(id)))),
         ["update"] => match query {
             "" => Ok(Route::Update(false)),
             "latest=1" => Ok(Route::Update(true)),
@@ -359,12 +403,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["session"] => no_query(query).map(|()| Route::SessionStatus),
         ["settings", "system"] => no_query(query).map(|()| Route::ActiveSystemSettings),
         ["settings", "compaction"] => no_query(query).map(|()| Route::GlobalCompactionSettings),
+        ["settings", "outbound-headers"] => no_query(query).map(|()| Route::GlobalOutboundHeaders),
         ["profiles"] => catalog::agent_profile_query(query)
             .map(|(before, limit)| Route::Profiles { before, limit }),
         ["projects"] => {
             projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
         }
         ["pools"] => Ok(Route::PoolsRetired),
+        ["executors"] => catalog::page_query(query, profiles::profile_id)
+            .map(|(before, limit)| Route::NativeExecutors { before, limit }),
         ["attachments", attachment] => {
             let attachment = attachments::attachment_id(attachment)?;
             no_query(query).map(|()| Route::Attachment(attachment))
@@ -548,6 +595,9 @@ pub(super) async fn respond(
     let database = &shared.database;
     match route {
         Route::Health => Ok(Reply::ok(health(database).await)),
+        Route::MutableJob(action) => {
+            mutable_jobs::respond(action, request, payload, database).await
+        }
         Route::Update(latest) => update::get(latest).await,
         Route::StartUpdate => {
             let body = read_body(payload, update::UPDATE_BODY_LIMIT).await?;
@@ -573,19 +623,35 @@ pub(super) async fn respond(
         Route::Availability(query) => dashboard::availability(shared, query).await,
         Route::Logs(query) => dashboard::logs(shared, query).await,
         Route::Job(job) => {
-            let details = database.job_details(job).await?.ok_or(JOB_NOT_FOUND)?;
-            Ok(Reply::ok(envelope(serde_json::json!(
-                jobs::JobDetailsView {
-                    job: jobs::job_view(&details.job)?,
-                    result: details.result.as_ref().map(outputs::output_view),
-                    usage: details.usage,
-                    activity: details.activity,
-                    task_plan: details.task_plan,
-                    unknown_reason: details.unknown_reason,
+            let context = mutable_jobs::optional_context(request)?;
+            match database.mutable_job_details(job, context).await? {
+                crate::db::redb::MutableJobDetailsLookup::Found(details) => {
+                    let job_view = jobs::mutable_job_view(
+                        &details.record,
+                        details.allocation.as_ref(),
+                        details.activity.last_activity_at_us(),
+                    );
+                    let mut body = envelope(serde_json::json!(jobs::JobDetailsView {
+                        job: job_view,
+                        result: details.result.as_ref().map(outputs::output_view),
+                        usage: details.usage,
+                        activity: details.activity,
+                        task_plan: None,
+                        unknown_reason: details.unknown_reason,
+                        allocation: details.allocation.as_ref().map(jobs::allocation_view),
+                    }));
+                    body["revision"] = serde_json::json!(details.record.job.revision);
+                    body["phase"] = serde_json::json!(mutable_jobs::phase(&details.record));
+                    body["project"] = serde_json::json!(
+                        details.record.project.map(|project| project.to_string())
+                    );
+                    Ok(Reply::ok(body))
                 }
-            ))))
+                crate::db::redb::MutableJobDetailsLookup::Inaccessible
+                | crate::db::redb::MutableJobDetailsLookup::NotMutable => Err(JOB_NOT_FOUND),
+            }
         }
-        Route::JobInput(job) => catalog::job_input(database, job).await,
+        Route::JobInput(job) => catalog::job_input(database, job, request).await,
         Route::ConversationChildren {
             conversation,
             before,
@@ -662,6 +728,11 @@ pub(super) async fn respond(
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             profiles::global_compaction_settings(database, Some(&body)).await
         }
+        Route::GlobalOutboundHeaders => profiles::global_outbound_headers(database, None).await,
+        Route::SaveGlobalOutboundHeaders => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            profiles::global_outbound_headers(database, Some(&body)).await
+        }
         Route::ProfileDelete(id) => profiles::delete_model(database, id).await,
         Route::ProviderDelete(id) => profiles::remove_provider(database, id).await,
         Route::ProfileAvailability(id) => {
@@ -695,9 +766,20 @@ pub(super) async fn respond(
             "pool_api_retired",
             "use GET /api/v2/pools with cursor pagination",
         )),
+        Route::NativePoolCreate => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            pools::create_pool(database, &body).await
+        }
         Route::PoolUpdate(pool) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             pools::update(database, pool, &body).await
+        }
+        Route::NativeExecutors { before, limit } => {
+            pools::list_executors(database, before.map(Into::into), limit).await
+        }
+        Route::NativeExecutorCreate => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            pools::create_executor(database, &body).await
         }
         Route::JobEdit(job) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

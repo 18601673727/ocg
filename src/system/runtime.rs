@@ -288,6 +288,13 @@ where
         Ok(()) => {
             log::set_max_level(log_handle.active_config().level.filter());
             log::info!("OCG foundation initialized; storage is ready");
+            for control in crate::system::execution_controls::ExecutionControl::ALL {
+                log::info!(
+                    "execution control {}: {:?}",
+                    control.name(),
+                    control.state()
+                );
+            }
             handle.log_open_warnings();
             if std::env::var_os(REMOVED_WORKSPACE_ROOT_VARIABLE).is_some() {
                 log::warn!(

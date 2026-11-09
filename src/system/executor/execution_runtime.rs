@@ -36,6 +36,662 @@ use crate::service::ai::providers::{
 };
 use crate::system::scheduler::{StartedJob, StopHandle};
 
+/// Evidence that this module observed the supervised in-process operation
+/// return. This is not an OS-level stop proof and cannot be constructed by a
+/// database or API caller. It is consumed by one finalization call.
+pub(crate) struct DevelopmentExecutionReturn<'a> {
+    handoff: &'a crate::db::DevelopmentHandoff,
+}
+
+impl<'a> DevelopmentExecutionReturn<'a> {
+    pub(crate) fn handoff(&self) -> &'a crate::db::DevelopmentHandoff {
+        self.handoff
+    }
+}
+
+/// Which endpoints a development execution may send to.
+#[derive(Clone, Copy)]
+pub(crate) enum EndpointPolicy {
+    /// A literal loopback endpoint only.
+    Loopback,
+}
+
+impl EndpointPolicy {
+    fn permits(self, endpoint: &str, _config: &ProviderExecutionConfig) -> bool {
+        match self {
+            EndpointPolicy::Loopback => crate::system::http::direct_diagnostic_loopback(endpoint),
+        }
+    }
+
+    fn refusal(self) -> &'static str {
+        match self {
+            EndpointPolicy::Loopback => "direct loopback endpoint required",
+        }
+    }
+}
+
+/// An internal, loopback-only execution path. No scheduler or HTTP route can
+/// create its checked handoff. Unknown write or transport outcomes retain the
+/// allocation; only a returned successful exchange is finalized here.
+#[allow(dead_code)]
+pub(crate) async fn supervise_development_loopback(
+    database: &DatabaseHandle,
+    handoff: crate::db::DevelopmentHandoff,
+    config: &ProviderExecutionConfig,
+) -> Result<AppendedOutput, DatabaseError> {
+    supervise_development_generative(database, handoff, config, EndpointPolicy::Loopback).await
+}
+
+/// The one Generative exchange of a checked handoff, to the endpoints
+/// `policy` permits.
+pub(crate) async fn supervise_development_generative(
+    database: &DatabaseHandle,
+    handoff: crate::db::DevelopmentHandoff,
+    config: &ProviderExecutionConfig,
+    policy: EndpointPolicy,
+) -> Result<AppendedOutput, DatabaseError> {
+    let (frozen, conversation, prepared, token) =
+        handoff
+            .generative_inputs()
+            .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "generative handoff required",
+            )))?;
+    let local_rejection =
+        if config.max_output_bytes == 0 || config.max_output_bytes > 16 * 1024 * 1024 {
+            Some("loopback output limit is invalid")
+        } else {
+            match frozen.llm.provider.endpoint.as_deref() {
+                None => Some("explicit endpoint required"),
+                Some(endpoint) if !policy.permits(endpoint, config) => Some(policy.refusal()),
+                Some(_) => None,
+            }
+        };
+    if let Some(message) = local_rejection {
+        return settle_development_unsent(database, &handoff, 1, config, NOT_SENT, message).await;
+    }
+    let mut sink = DevelopmentLoopbackSink {
+        database,
+        handoff: &handoff,
+        prepared,
+        output_seq: 1,
+        sent: false,
+        observations: Vec::new(),
+        observation_overflow: false,
+        streamed: String::new(),
+    };
+    let result = crate::service::ai::generative_model::execute_conversation(
+        frozen,
+        conversation,
+        &handoff,
+        config,
+        Some(&mut sink),
+    )
+    .await;
+    let result = match result.and_then(ProviderExecutionResult::admitted) {
+        Ok(result) if !result.requests_tools() => result,
+        Ok(_) => {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "the response requested tools, which this execution does not run; ownership remains held",
+            )));
+        }
+        Err(error) => {
+            return settle_development_error(
+                database,
+                &handoff,
+                sink.output_seq,
+                config,
+                sink.sent,
+                error,
+            )
+            .await;
+        }
+    };
+    if !sink.sent || sink.observation_overflow {
+        return Err(DatabaseError::Rejected(Violation::InvalidValue(
+            "execution",
+            "incomplete execution evidence; ownership remains held",
+        )));
+    }
+    let message = assistant_message(&result);
+    let response = MessageBody::new(&serde_json::to_value(message).map_err(|_| {
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "response",
+            "response cannot be serialized",
+        ))
+    })?)
+    .map_err(|_| {
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "response",
+            "response cannot be recorded",
+        ))
+    })?;
+    database
+        .record_development_provider_answer(
+            &handoff,
+            crate::db::entities::ProviderAnswer {
+                stat: AvailabilityStat {
+                    job: token.job,
+                    request: RequestNumber::FIRST,
+                    observed_at: Timestamp::now(),
+                    observation: providers::success_observation(&result),
+                },
+                measurements: providers::metrics(&result),
+                response,
+            },
+        )
+        .await?;
+    let mut usage_seq = 5u32;
+    for observation in &sink.observations {
+        if let ProviderFact::Usage { usage, finality } = &observation.fact {
+            if [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.reasoning_tokens,
+            ]
+            .iter()
+            .all(Option::is_none)
+            {
+                continue;
+            }
+            database
+                .record_development_usage(
+                    &handoff,
+                    usage_seq,
+                    Metrics {
+                        job: token.job,
+                        request: RequestNumber::FIRST,
+                        observed_at: observation.observed_at,
+                        measurements: Measurements {
+                            usage: usage.clone(),
+                            ..Measurements::default()
+                        },
+                        token: Some(TokenAnnotation::eligible(*finality)),
+                    },
+                )
+                .await?;
+            usage_seq = usage_seq
+                .checked_add(2)
+                .ok_or(DatabaseError::Rejected(Violation::ValueOutOfRange("usage")))?;
+        }
+    }
+    let seq = sink.output_seq;
+    let finalization = JobFinalization::Completed(FinalResult {
+        summary: Some(result.text.clone()),
+        code: None,
+        goal_reached: None,
+        value: Some(providers::result_value(&result)),
+    });
+    let returned = DevelopmentExecutionReturn { handoff: &handoff };
+    database
+        .finalize_development_job(returned, seq, finalization)
+        .await
+}
+
+/// The native Decision protocol is distinct from Generative chat. A failed or
+/// interrupted exchange retains ownership until a safe recovery protocol exists.
+#[allow(dead_code)]
+pub(crate) async fn supervise_development_decision_loopback(
+    database: &DatabaseHandle,
+    handoff: crate::db::DevelopmentHandoff,
+    config: &ProviderExecutionConfig,
+) -> Result<AppendedOutput, DatabaseError> {
+    let (native, request, body, token) =
+        handoff
+            .decision_inputs()
+            .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "Decision handoff required",
+            )))?;
+    let frozen = crate::db::entities::FrozenDecisionConfig::Native(native.clone());
+    let local_rejection = match native.endpoint.as_deref() {
+        None => Some((NOT_SENT, "explicit loopback endpoint required")),
+        Some(endpoint) if !crate::system::http::direct_diagnostic_loopback(endpoint) => {
+            Some((NOT_SENT, "direct loopback endpoint required"))
+        }
+        Some(_) => {
+            if crate::service::ai::decisive_model::request_body(&frozen, request)
+                .ok()
+                .as_ref()
+                == Some(body)
+            {
+                None
+            } else {
+                Some((BUILD_FAILED, "prepared Decision request mismatch"))
+            }
+        }
+    };
+    if let Some((code, message)) = local_rejection {
+        return settle_development_unsent(database, &handoff, 1, config, code, message).await;
+    }
+    if config.cancellation.is_cancelled() {
+        return settle_development_unsent(
+            database,
+            &handoff,
+            1,
+            config,
+            NOT_SENT,
+            "Execution was cancelled before the provider request.",
+        )
+        .await;
+    }
+    let mut sink = DevelopmentLoopbackSink {
+        database,
+        handoff: &handoff,
+        prepared: body,
+        output_seq: 1,
+        sent: false,
+        observations: Vec::new(),
+        observation_overflow: false,
+        streamed: String::new(),
+    };
+    let result = crate::service::ai::decisive_model::execute_native_with_sink(
+        native,
+        request,
+        body,
+        &handoff,
+        config,
+        crate::db::entities::RequestRef {
+            job: token.job,
+            request: RequestNumber::FIRST,
+        },
+        &mut sink,
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            return settle_development_error(database, &handoff, 1, config, sink.sent, error).await;
+        }
+    };
+    if !sink.sent {
+        return Err(DatabaseError::Rejected(Violation::InvalidValue(
+            "execution",
+            "Decision request evidence missing; ownership remains held",
+        )));
+    }
+    let response = MessageBody::new(&result.raw).map_err(|_| {
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "response",
+            "Decision response cannot be recorded",
+        ))
+    })?;
+    database
+        .record_development_provider_answer(
+            &handoff,
+            crate::db::entities::ProviderAnswer {
+                stat: AvailabilityStat {
+                    job: token.job,
+                    request: RequestNumber::FIRST,
+                    observed_at: Timestamp::now(),
+                    observation: crate::db::entities::AvailabilityObservation {
+                        status_code: Some(result.status_code),
+                        finish_reason: None,
+                        raw_finish_reason: None,
+                        failure: None,
+                    },
+                },
+                measurements: Measurements {
+                    request_finished_in_ms: Some(
+                        result.finished_in.as_millis().min(u128::from(u64::MAX)) as u64,
+                    ),
+                    ..Measurements::default()
+                },
+                response,
+            },
+        )
+        .await?;
+    let returned = DevelopmentExecutionReturn { handoff: &handoff };
+    database
+        .finalize_development_decision(returned, 1, result.result)
+        .await
+}
+
+/// What a development exchange that produced no answer may be settled as.
+/// Only facts this process observed qualify: a request that never left it, or
+/// a Provider response that definitely refused the request. Anything else may
+/// have escaped or may still be running remotely and keeps its ownership.
+enum DevelopmentSettlement {
+    Unsent {
+        code: &'static str,
+        message: String,
+    },
+    Refused {
+        failure: Box<crate::service::ai::providers::openai_compatible::ProviderFailure>,
+        observation: crate::db::entities::AvailabilityObservation,
+    },
+    /// Ownership stays held; the reason is what this process could not establish.
+    Held(crate::db::entities::UncertaintyReason),
+}
+
+fn development_settlement(error: &ProviderExecutionError, sent: bool) -> DevelopmentSettlement {
+    use crate::db::entities::{AvailabilityClassification, UncertaintyReason};
+    match error {
+        ProviderExecutionError::Build { .. } if !sent => DevelopmentSettlement::Unsent {
+            code: BUILD_FAILED,
+            message: error.to_string(),
+        },
+        ProviderExecutionError::NotDelivered { .. } if !sent => DevelopmentSettlement::Unsent {
+            code: NOT_DELIVERED,
+            message: error.to_string(),
+        },
+        ProviderExecutionError::Rejected { failure } if sent => {
+            let observation = providers::error_observations(error).into_iter().next();
+            match observation {
+                Some(observation)
+                    if matches!(
+                        observation.classification(),
+                        AvailabilityClassification::Rejected(_)
+                    ) =>
+                {
+                    DevelopmentSettlement::Refused {
+                        failure: Box::new(failure.clone()),
+                        observation,
+                    }
+                }
+                _ => DevelopmentSettlement::Held(UncertaintyReason::ResponseIncompleteOrInvalid),
+            }
+        }
+        // Every other outcome is uncertain or incomplete: the request may
+        // have been delivered, the response may be partial, or the status
+        // does not prove a refusal. No retry, release or redispatch follows.
+        other => DevelopmentSettlement::Held(uncertainty_reason(other)),
+    }
+}
+
+/// The local reason an exchange error leaves the outcome uncertain. Each
+/// reason states what this process could not establish, never that the
+/// remote work ended.
+fn uncertainty_reason(error: &ProviderExecutionError) -> crate::db::entities::UncertaintyReason {
+    use crate::db::entities::UncertaintyReason;
+    match error {
+        // A Build or NotDelivered error reaches here only after the Sent
+        // evidence was written, so delivery cannot be ruled out whatever the
+        // transport reported.
+        ProviderExecutionError::Build { .. }
+        | ProviderExecutionError::NotDelivered { .. }
+        | ProviderExecutionError::Unknown { facts: None, .. }
+        | ProviderExecutionError::Interrupted { .. } => UncertaintyReason::RequestPossiblySent,
+        ProviderExecutionError::Unknown { facts: Some(_), .. }
+        | ProviderExecutionError::StreamFailure { .. } => UncertaintyReason::ConnectionInterrupted,
+        ProviderExecutionError::Rejected { .. }
+        | ProviderExecutionError::Incomplete { .. }
+        | ProviderExecutionError::CompletionUnpersisted { .. } => {
+            UncertaintyReason::ResponseIncompleteOrInvalid
+        }
+        ProviderExecutionError::Stopped { .. } => {
+            UncertaintyReason::StopRequestedWithoutConfirmedTermination
+        }
+        ProviderExecutionError::OutputPersistence { stream, .. } => uncertainty_reason(stream),
+    }
+}
+
+/// Settles a supervised exchange that returned an error. The in-process return
+/// is observed here, so a local rejection is finalized; an uncertain remote
+/// outcome is never turned into Failed or Cancelled.
+async fn settle_development_error(
+    database: &DatabaseHandle,
+    handoff: &crate::db::DevelopmentHandoff,
+    expected_seq: u32,
+    config: &ProviderExecutionConfig,
+    sent: bool,
+    error: ProviderExecutionError,
+) -> Result<AppendedOutput, DatabaseError> {
+    match development_settlement(&error, sent) {
+        DevelopmentSettlement::Unsent { code, message } => {
+            settle_development_unsent(database, handoff, expected_seq, config, code, &message).await
+        }
+        DevelopmentSettlement::Refused {
+            failure,
+            observation,
+        } => {
+            // A received refusal proves the exchange ended, not that no
+            // provider-side work or charge occurred, so the text says so.
+            let result = FinalResult {
+                summary: Some(format!(
+                    "{error}. A complete HTTP response was received; OCG cannot prove that the provider or an intermediary performed no work or incurred no charge."
+                )),
+                code: Some(PROVIDER_REJECTED.to_owned()),
+                goal_reached: Some(false),
+                value: Some(serde_json::json!({
+                    "status_code": failure.status_code,
+                    "provider_code": failure.provider_code,
+                    "request_id": failure.request_id,
+                    "retryable": failure.retryable,
+                })),
+            };
+            database
+                .finalize_development_failure(
+                    DevelopmentExecutionReturn { handoff },
+                    expected_seq,
+                    JobFinalization::Failed(result),
+                    Some((Timestamp::now(), observation)),
+                )
+                .await
+        }
+        DevelopmentSettlement::Held(reason) => {
+            // The Allocation stays held. Recording the reason is what lets
+            // an operator tell why; if the write fails the Allocation simply
+            // stays Running, which is held all the same.
+            database
+                .record_development_uncertain(DevelopmentExecutionReturn { handoff }, reason)
+                .await?;
+            Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "provider exchange did not return a supported result; ownership remains held as Uncertain",
+            )))
+        }
+    }
+}
+
+/// Settles an exchange whose request never left this process. Cancellation
+/// before the request is Cancelled; every other local refusal is Failed. The
+/// message is withheld if it would contain credential material.
+async fn settle_development_unsent(
+    database: &DatabaseHandle,
+    handoff: &crate::db::DevelopmentHandoff,
+    expected_seq: u32,
+    config: &ProviderExecutionConfig,
+    code: &'static str,
+    message: &str,
+) -> Result<AppendedOutput, DatabaseError> {
+    let cancelled = config.cancellation.is_cancelled();
+    let summary = if handoff.contains_secret(message) {
+        "Execution could not start the provider request.".to_owned()
+    } else {
+        message.to_owned()
+    };
+    let result = FinalResult {
+        summary: Some(summary),
+        code: Some(code.to_owned()),
+        goal_reached: Some(false),
+        value: None,
+    };
+    database
+        .finalize_development_failure(
+            DevelopmentExecutionReturn { handoff },
+            expected_seq,
+            if cancelled {
+                JobFinalization::Cancelled(result)
+            } else {
+                JobFinalization::Failed(result)
+            },
+            None,
+        )
+        .await
+}
+
+struct DevelopmentLoopbackSink<'a> {
+    database: &'a DatabaseHandle,
+    handoff: &'a crate::db::DevelopmentHandoff,
+    prepared: &'a serde_json::Value,
+    output_seq: u32,
+    sent: bool,
+    observations: Vec<ProviderObservation>,
+    observation_overflow: bool,
+    streamed: String,
+}
+
+impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
+    fn sending<'a>(
+        &'a mut self,
+        body: &'a serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+        Box::pin(async move {
+            if self.sent || body != self.prepared {
+                return Err(OutputSinkError {
+                    message: "prepared request mismatch".into(),
+                });
+            }
+            self.database
+                .record_development_sent_request(self.handoff, Timestamp::now())
+                .await
+                .map_err(|_| OutputSinkError {
+                    message: "request evidence unavailable".into(),
+                })?;
+            self.sent = true;
+            Ok(())
+        })
+    }
+    fn append<'a>(
+        &'a mut self,
+        kind: IntermediateOutputKind,
+        text: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
+        Box::pin(async move {
+            self.streamed.push_str(text);
+            if self.handoff.contains_secret(&self.streamed) {
+                return Err(OutputSinkError {
+                    message: "output contains credential material".into(),
+                });
+            }
+            self.database
+                .append_development_output(
+                    self.handoff,
+                    self.output_seq,
+                    JobOutput {
+                        kind,
+                        summary: Some(text.to_owned()),
+                        code: None,
+                        goal_reached: None,
+                        value: None,
+                    },
+                )
+                .await
+                .map_err(|_| OutputSinkError {
+                    message: "output evidence unavailable".into(),
+                })?;
+            self.output_seq = self.output_seq.checked_add(1).ok_or(OutputSinkError {
+                message: "output sequence exhausted".into(),
+            })?;
+            Ok(())
+        })
+    }
+    fn observe<'a>(
+        &'a mut self,
+        observation: ProviderObservation,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            if self.observations.len() >= 1024 {
+                self.observation_overflow = true;
+            } else {
+                self.observations.push(observation);
+            }
+        })
+    }
+}
+
+/// A controlled local fixture. No variant invokes a provider, tool, or child
+/// execution. It is available only to trusted development-build components.
+#[allow(dead_code)]
+pub(crate) enum DevelopmentSyntheticExecution {
+    Generative {
+        observed_at: Timestamp,
+        sent: bool,
+        answer: Option<crate::db::entities::ProviderAnswer>,
+        usage: Option<Metrics>,
+        finalization: JobFinalization,
+    },
+    Decision {
+        observed_at: Timestamp,
+        answer: crate::db::entities::ProviderAnswer,
+        result: crate::db::entities::DecisionResult,
+    },
+}
+
+/// Exercise the native Worker path without dispatch or external effects. The
+/// handoff is owned until the operation returns; a dropped future cannot issue
+/// a return proof. A failed or uncertain evidence write leaves ownership held.
+#[allow(dead_code)]
+pub(crate) async fn supervise_development_synthetic(
+    database: &DatabaseHandle,
+    handoff: crate::db::DevelopmentHandoff,
+    execution: DevelopmentSyntheticExecution,
+) -> Result<AppendedOutput, DatabaseError> {
+    enum Returned {
+        Generative(JobFinalization),
+        Decision(Box<crate::db::entities::DecisionResult>),
+    }
+    let result = async {
+        match execution {
+            DevelopmentSyntheticExecution::Generative {
+                observed_at,
+                sent,
+                answer,
+                usage,
+                finalization,
+            } => {
+                if sent {
+                    database
+                        .record_development_sent_request(&handoff, observed_at)
+                        .await?;
+                }
+                if let Some(answer) = answer {
+                    database
+                        .record_development_provider_answer(&handoff, answer)
+                        .await?;
+                }
+                if let Some(usage) = usage {
+                    database
+                        .record_development_usage(&handoff, 5, usage)
+                        .await?;
+                }
+                Ok::<_, DatabaseError>(Returned::Generative(finalization))
+            }
+            DevelopmentSyntheticExecution::Decision {
+                observed_at,
+                answer,
+                result,
+            } => {
+                database
+                    .record_development_sent_request(&handoff, observed_at)
+                    .await?;
+                database
+                    .record_development_provider_answer(&handoff, answer)
+                    .await?;
+                Ok(Returned::Decision(Box::new(result)))
+            }
+        }
+    }
+    .await?;
+    let returned = DevelopmentExecutionReturn { handoff: &handoff };
+    match result {
+        Returned::Generative(finalization) => {
+            database
+                .finalize_development_job(returned, 1, finalization)
+                .await
+        }
+        Returned::Decision(result) => {
+            database
+                .finalize_development_decision(returned, 1, *result)
+                .await
+        }
+    }
+}
+
 /// Work admitted as a pending Job and finalized by a task after a committed
 /// claim batch grants it capacity.
 #[derive(Debug)]

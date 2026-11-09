@@ -4,7 +4,11 @@ pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 // Database format is independent of the per-record encoding version.
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const DATABASE_FORMAT_VERSION: u64 = 18;
+/// Names the exact table set and record encodings of the format. A database
+/// whose fingerprint differs is incompatible even when its format number matches.
+pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v3";
+pub(super) const DATABASE_FORMAT_VERSION: u64 = 22;
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -18,6 +22,9 @@ pub(super) const CONFIGS: TableDefinition<u128, &[u8]> = TableDefinition::new("c
 pub(super) const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credential");
 pub(super) const JOBS: TableDefinition<u128, &[u8]> = TableDefinition::new("job");
 pub(super) const JOB_STATES: TableDefinition<u128, &[u8]> = TableDefinition::new("job_state");
+/// One row per Job, keyed by Job: the Allocation of a Pool and an Executor to it.
+pub(super) const POOL_ALLOCATIONS: TableDefinition<u128, &[u8]> =
+    TableDefinition::new("pool_allocation");
 pub(super) const JOB_OUTPUTS: TableDefinition<(u128, u32), &[u8]> =
     TableDefinition::new("job_output");
 pub(super) const SUBMISSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("submission");
@@ -45,6 +52,23 @@ pub(super) const CONTENT_REFERENCES: TableDefinition<&[u8], (u64, u64)> =
 pub(super) const CONTENT_RECLAIM: TableDefinition<&[u8], u64> =
     TableDefinition::new("content_reclaim");
 
+/// (pool, executor, job) for every Allocation that still holds capacity, that
+/// is, every `POOL_ALLOCATIONS` row whose phase is not Released. It is written
+/// in the same transaction as the phase change that adds or removes the row,
+/// so Pool and Executor occupancy is a bounded range read rather than a scan
+/// of every Allocation ever made.
+pub(super) const ACTIVE_ALLOCATIONS: TableDefinition<(u128, u128, u128), ()> =
+    TableDefinition::new("active_allocation");
+/// Reservation request identity -> the Job whose single Allocation it made.
+/// Source: `POOL_ALLOCATIONS`. A request identity is never reused, so a row
+/// is added with its Allocation and never removed.
+pub(super) const ALLOCATION_REQUESTS: TableDefinition<u128, u128> =
+    TableDefinition::new("allocation_request");
+/// Composer context -> the one unsubmitted, unsettled Job drafted there.
+/// Source: `JOBS` rows in the Unsubmitted phase whose state has no outcome.
+pub(super) const DRAFT_CONTEXTS: TableDefinition<u128, u128> =
+    TableDefinition::new("draft_context");
+
 pub(super) const JOB_ALLOCATIONS: TableDefinition<(u128, u128), ()> =
     TableDefinition::new("job_allocation");
 pub(super) const CONVERSATIONS: TableDefinition<u128, ()> = TableDefinition::new("conversation");
@@ -52,6 +76,9 @@ pub(super) const TURNS: TableDefinition<(u128, u128), ()> = TableDefinition::new
 
 pub(super) const PENDING: TableDefinition<u128, ()> = TableDefinition::new("pending");
 pub(super) const READY: TableDefinition<(u16, u128), ()> = TableDefinition::new("ready");
+/// The ready queue orders high priority first, then submission time and Job ID.
+pub(super) const MUTABLE_READY: TableDefinition<(u8, i64, u128, u16), ()> =
+    TableDefinition::new("ready");
 pub(super) const DELAYED: TableDefinition<(i64, u128), ()> = TableDefinition::new("delayed");
 pub(super) const DEPENDENCY_WAITERS: TableDefinition<(u128, u128), u8> =
     TableDefinition::new("dependency_waiter");

@@ -4,6 +4,540 @@ use super::commands::{
 };
 use super::*;
 
+/// An owned request prepared before start. Only this module constructs it;
+/// database checks still have to succeed in the start transaction.
+pub(crate) struct PreparedDevelopmentHandoff {
+    candidate: redb::DevelopmentCandidate,
+    images: Vec<(
+        AttachmentId,
+        crate::service::ai::providers::openai_compatible::ImageInput,
+    )>,
+    request: serde_json::Value,
+    conversation: Option<crate::service::ai::providers::openai_compatible::ChatConversation>,
+    system_policy: SystemPolicy,
+    tool_policy: DevelopmentToolPolicy,
+    credentials: DevelopmentHandoffCredentials,
+}
+
+/// The credentials a Job's requests use: the Provider credential and the
+/// secret values of its custom headers. Each is read once, with the stored row
+/// kept as change evidence for the start transaction.
+#[derive(Default)]
+struct DevelopmentHandoffCredentials {
+    items: Vec<DevelopmentHandoffCredential>,
+    /// The encodings of every secret, built once, that leak checks look for.
+    spellings: Option<crate::system::secrets::Spellings>,
+}
+
+struct DevelopmentHandoffCredential {
+    reference: String,
+    encrypted_row: Vec<u8>,
+    // CredentialSecret redacts Debug; never include it in the request body.
+    secret: redb::CredentialSecret,
+}
+
+impl DevelopmentHandoffCredentials {
+    fn push(&mut self, reference: String, encrypted_row: Vec<u8>, secret: redb::CredentialSecret) {
+        match &mut self.spellings {
+            Some(spellings) => spellings.extend(secret.as_str()),
+            None => self.spellings = Some(crate::system::secrets::Spellings::new(secret.as_str())),
+        }
+        self.items.push(DevelopmentHandoffCredential {
+            reference,
+            encrypted_row,
+            secret,
+        });
+    }
+}
+
+enum DevelopmentToolPolicy {
+    NoToolsOrWorkspace,
+}
+
+impl PreparedDevelopmentHandoff {
+    /// The exact request body the first Provider request will carry.
+    pub(crate) fn request(&self) -> &serde_json::Value {
+        &self.request
+    }
+
+    /// The frozen Generative configuration this handoff executes, if it is one.
+    pub(crate) fn generative_configuration(&self) -> Option<&entities::FrozenExecutionConfig> {
+        match &self.candidate {
+            redb::DevelopmentCandidate::Generative(context) => Some(&context.configuration),
+            redb::DevelopmentCandidate::Decision(_) => None,
+        }
+    }
+
+    /// Every credential the frozen configuration names; see the private reader.
+    pub(crate) fn credential_references(&self) -> Vec<&str> {
+        self.expected_credential_references()
+    }
+
+    pub(super) fn candidate(&self) -> &redb::DevelopmentCandidate {
+        &self.candidate
+    }
+
+    /// The stored credential rows read for this handoff.
+    pub(super) fn credential_evidence(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.credentials
+            .items
+            .iter()
+            .map(|item| (item.reference.as_str(), item.encrypted_row.as_slice()))
+    }
+
+    fn provider_credential_reference(&self) -> Option<&str> {
+        match &self.candidate {
+            redb::DevelopmentCandidate::Generative(context) => {
+                context.configuration.llm.provider.credential_ref.as_deref()
+            }
+            redb::DevelopmentCandidate::Decision(context) => {
+                context.configuration.credential_ref.as_deref()
+            }
+        }
+    }
+
+    fn header_secret_references(&self) -> Vec<&str> {
+        let headers = match &self.candidate {
+            redb::DevelopmentCandidate::Generative(context) => {
+                &context.configuration.llm.provider.headers
+            }
+            redb::DevelopmentCandidate::Decision(context) => &context.configuration.headers,
+        };
+        headers.secret_refs().collect()
+    }
+
+    /// Every credential the frozen configuration names, each once: the
+    /// Provider credential, then the secret header values.
+    pub(super) fn expected_credential_references(&self) -> Vec<&str> {
+        let mut references: Vec<&str> = self.provider_credential_reference().into_iter().collect();
+        for reference in self.header_secret_references() {
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+        references
+    }
+
+    pub(super) fn has_bounded_tool_free_inputs(&self) -> bool {
+        if !matches!(self.tool_policy, DevelopmentToolPolicy::NoToolsOrWorkspace)
+            || !self.request.is_object()
+        {
+            return false;
+        }
+        match &self.candidate {
+            redb::DevelopmentCandidate::Decision(_) => self.images.is_empty(),
+            redb::DevelopmentCandidate::Generative(context) => {
+                let expected = context
+                    .covered_inputs
+                    .iter()
+                    .flat_map(|turn| &turn.attachments)
+                    .chain(context.history.iter().flat_map(|turn| &turn.attachments))
+                    .chain(&context.attachments)
+                    .map(|attachment| attachment.id);
+                expected.eq(self.images.iter().map(|(id, _)| *id))
+            }
+        }
+    }
+}
+
+/// A single-use, in-memory result returned only after durable start commit.
+#[allow(dead_code)]
+pub(crate) struct DevelopmentHandoff {
+    prepared: PreparedDevelopmentHandoff,
+    started: entities::MutableJob,
+    owner: Arc<Shared>,
+    output_busy: AtomicBool,
+    output_uncertain: AtomicBool,
+    usage_checkpoint: std::sync::Mutex<DevelopmentUsageCheckpoint>,
+}
+
+impl DevelopmentHandoff {
+    pub(crate) fn contains_secret(&self, value: &str) -> bool {
+        self.prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|spellings| spellings.found_in(value))
+    }
+    pub(crate) fn generative_inputs(
+        &self,
+    ) -> Option<(
+        &entities::FrozenExecutionConfig,
+        &crate::service::ai::providers::openai_compatible::ChatConversation,
+        &serde_json::Value,
+        entities::AllocationToken,
+    )> {
+        let redb::DevelopmentCandidate::Generative(context) = &self.prepared.candidate else {
+            return None;
+        };
+        Some((
+            &context.configuration,
+            self.prepared.conversation.as_ref()?,
+            &self.prepared.request,
+            context.allocation.token,
+        ))
+    }
+
+    pub(crate) fn decision_inputs(
+        &self,
+    ) -> Option<(
+        &entities::NativeDecisionConfig,
+        &entities::DecisionRequest,
+        &serde_json::Value,
+        entities::AllocationToken,
+    )> {
+        let redb::DevelopmentCandidate::Decision(context) = &self.prepared.candidate else {
+            return None;
+        };
+        let entities::MutableJobContent::Decision { request, .. } = &context.job.input.content
+        else {
+            return None;
+        };
+        Some((
+            &context.configuration,
+            request,
+            &self.prepared.request,
+            context.allocation.token,
+        ))
+    }
+}
+
+impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
+    fn resolve<'a>(
+        &'a self,
+        reference: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<String>,
+                        crate::service::ai::providers::ProviderExecutionError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            let found = reference.and_then(|reference| {
+                self.prepared
+                    .credentials
+                    .items
+                    .iter()
+                    .find(|item| item.reference == reference)
+            });
+            match (reference, found) {
+                (None, _) if self.prepared.provider_credential_reference().is_none() => Ok(None),
+                (Some(_), Some(credential)) => Ok(Some(credential.secret.as_str().to_owned())),
+                _ => Err(
+                    crate::service::ai::providers::ProviderExecutionError::Build {
+                        message: "handoff credential reference mismatch".to_owned(),
+                    },
+                ),
+            }
+        })
+    }
+}
+
+/// Derived only from confirmed writes belonging to this handoff. The start
+/// transaction refuses existing evidence and the writer checks the durable
+/// sequence before using it; an uncertain write makes the handoff unusable.
+#[derive(Clone, Default)]
+pub(super) struct DevelopmentUsageCheckpoint {
+    last_sequence: u32,
+    evidence: entities::TokenEvidence,
+}
+
+impl DevelopmentUsageCheckpoint {
+    pub(super) fn last_sequence(&self) -> u32 {
+        self.last_sequence
+    }
+
+    pub(super) fn evidence(&self) -> entities::TokenEvidence {
+        self.evidence.clone()
+    }
+
+    pub(super) fn advanced(last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
+        Self {
+            last_sequence,
+            evidence,
+        }
+    }
+}
+
+struct DevelopmentOutputGuard<'a> {
+    handoff: &'a DevelopmentHandoff,
+    known: bool,
+}
+
+impl Drop for DevelopmentOutputGuard<'_> {
+    fn drop(&mut self) {
+        if !self.known {
+            self.handoff.output_uncertain.store(true, Ordering::SeqCst);
+        }
+        self.handoff.output_busy.store(false, Ordering::SeqCst);
+    }
+}
+
+fn development_contains_secret(
+    value: &serde_json::Value,
+    secret: &crate::system::secrets::Spellings,
+) -> bool {
+    match value {
+        serde_json::Value::String(text) => secret.found_in(text),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| development_contains_secret(value, secret)),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .any(|(key, value)| secret.found_in(key) || development_contains_secret(value, secret)),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+/// Only a committed handoff can create this in-process write proof.
+pub(crate) struct DevelopmentWriteProof {
+    token: entities::AllocationToken,
+    revision: u64,
+}
+
+impl DevelopmentWriteProof {
+    pub(super) fn token(&self) -> entities::AllocationToken {
+        self.token
+    }
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum DevelopmentHandoffError {
+    /// The handoff failed before any start was submitted, or the checked
+    /// start definitely refused it. No execution authority exists and nothing
+    /// was sent; the Allocation is still only Reserved and may be ended with
+    /// [`DatabaseHandle::fail_unstarted_development_reservation`].
+    NotStarted {
+        cause: entities::UnstartedCause,
+        error: Box<DatabaseError>,
+    },
+    /// The failure does not prove that nothing started or that the failure is
+    /// permanent (storage, shutdown, queue pressure); ownership stays held.
+    Database(Box<DatabaseError>),
+    /// Reconciliation is evidence only: no in-memory permit is returned.
+    OutcomeUnknown {
+        error: Box<DatabaseError>,
+        reconciliation: Result<OperationStatus, Box<DatabaseError>>,
+    },
+}
+
+/// Why a preview of a start did not complete. Neither case changed anything.
+#[derive(Debug)]
+pub(crate) enum DevelopmentPreviewError {
+    /// The caller's guard refused the exact prepared request.
+    Refused(&'static str),
+    /// The request could not be prepared: the Job, its context or a stored
+    /// credential is unavailable, or the read failed.
+    Unavailable(DatabaseError),
+}
+
+/// A handoff failure that a retry cannot change and that happened before any
+/// start was committed, with the reason to record. Storage, shutdown and queue
+/// failures are not decisions about the Job, so they are not classified.
+fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffError {
+    let cause = match &error {
+        DatabaseError::Rejected(Violation::InvalidValue(field, reason))
+            if *field == "credential" || reason.contains("credential") =>
+        {
+            Some(entities::UnstartedCause::FrozenSecretUnavailable)
+        }
+        DatabaseError::Rejected(_) => Some(entities::UnstartedCause::StartRefused),
+        DatabaseError::Read(storage)
+            if storage.kind == StorageErrorKind::Other && storage.os_error.is_none() =>
+        {
+            Some(entities::UnstartedCause::InputUnavailable)
+        }
+        _ => None,
+    };
+    match cause {
+        Some(cause) => DevelopmentHandoffError::NotStarted {
+            cause,
+            error: Box::new(error),
+        },
+        None => DevelopmentHandoffError::Database(Box::new(error)),
+    }
+}
+
+fn prepare_development_handoff(
+    resolved: redb::DevelopmentResolvedCandidate,
+    system_policy: SystemPolicy,
+) -> Result<PreparedDevelopmentHandoff, DatabaseError> {
+    use crate::service::ai::compact::{
+        ContextLimits, ContextNotices, estimate_request_tokens, fit_with_notices,
+    };
+    use crate::service::ai::providers::openai_compatible::image::ImageInput;
+    let unavailable = || {
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "handoff",
+            "execution context or policy cannot be safely prepared",
+        ))
+    };
+    match resolved {
+        redb::DevelopmentResolvedCandidate::Decision(context) => {
+            if context.conversation.parent_id.is_some() {
+                return Err(unavailable());
+            }
+            let entities::MutableJobContent::Decision { request, .. } = &context.job.input.content
+            else {
+                return Err(unavailable());
+            };
+            let request = crate::service::ai::decisive_model::request_body(
+                &entities::FrozenDecisionConfig::Native(context.configuration.clone()),
+                request,
+            )
+            .map_err(|_| unavailable())?;
+            Ok(PreparedDevelopmentHandoff {
+                candidate: redb::DevelopmentCandidate::Decision(context),
+                images: Vec::new(),
+                request,
+                conversation: None,
+                system_policy,
+                tool_policy: DevelopmentToolPolicy::NoToolsOrWorkspace,
+                credentials: DevelopmentHandoffCredentials::default(),
+            })
+        }
+        redb::DevelopmentResolvedCandidate::Generative(context) => {
+            let snapshot = &context.snapshot;
+            let frozen = &snapshot.configuration;
+            if snapshot.conversation.parent_id.is_some()
+                || frozen.single_request_refusal().is_some()
+            {
+                return Err(unavailable());
+            }
+            let mut image_cursor = context.images.iter();
+            let mut images_for =
+                |records: &[entities::AttachmentRecord]| -> Result<Vec<ImageInput>, DatabaseError> {
+                    records
+                        .iter()
+                        .map(|record| {
+                            let (id, image) = image_cursor.next().ok_or_else(unavailable)?;
+                            if *id != record.id {
+                                return Err(unavailable());
+                            }
+                            Ok(image.clone())
+                        })
+                        .collect()
+                };
+            let mut prior = Vec::new();
+            if let Some(summary) = &snapshot.adopted_summary {
+                prior.push((Some(format!("Generated context summary (advisory, not an original user instruction). Originals remain available:\n{}", summary.summary.context_text())), Vec::new(), None));
+            }
+            for input in &snapshot.covered_inputs {
+                prior.push((
+                    Some(input.text.clone()),
+                    images_for(&input.attachments)?,
+                    None,
+                ));
+            }
+            for turn in &snapshot.history {
+                let answer = if turn
+                    .record
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.kind == entities::OutcomeKind::Cancelled)
+                {
+                    None
+                } else {
+                    turn.outputs
+                        .last()
+                        .and_then(entities::JobOutputRecord::display_text)
+                };
+                prior.push((
+                    Some(turn.record.job.input.text().to_owned()),
+                    images_for(&turn.attachments)?,
+                    answer,
+                ));
+            }
+            let current_images = images_for(&snapshot.attachments)?;
+            if image_cursor.next().is_some() {
+                return Err(unavailable());
+            }
+            let limits = ContextLimits::for_profile(&frozen.llm.config);
+            let mut conversation = fit_with_notices(
+                frozen,
+                prior,
+                Some(snapshot.job.input.text()),
+                &current_images,
+                snapshot.project.as_ref(),
+                None,
+                None,
+                Vec::new(),
+                limits,
+                ContextNotices::default(),
+            )
+            .ok_or_else(unavailable)?;
+            if let Some(project) = &snapshot.project {
+                let first = conversation.messages.first_mut().ok_or_else(unavailable)?;
+                *first = crate::service::ai::providers::openai_compatible::ChatMessage::system(
+                    format!(
+                        "You work in the Project {:?}. Its workspace root is {}. No workspace access or tools are available for this execution; do not claim to read or change project files.",
+                        project.name, project.root
+                    ),
+                );
+            }
+            if conversation.dropped_turns != 0
+                || !conversation.tools.is_empty()
+                || estimate_request_tokens(&conversation, limits.max_tokens)
+                    > u64::from(limits.context_window.ok_or_else(unavailable)?)
+            {
+                return Err(unavailable());
+            }
+            conversation.validate().map_err(|_| unavailable())?;
+            let request = crate::service::ai::generative_model::request_body(
+                &frozen.llm.config.model,
+                &frozen.llm.config.parameters,
+                &conversation,
+            )
+            .map_err(|_| unavailable())?;
+            let mut verified = context.images.iter();
+            let messages = request
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(unavailable)?;
+            for (index, message) in messages.iter().enumerate() {
+                let mut ids = Vec::new();
+                if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
+                    for part in parts.iter().filter(|part| {
+                        part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
+                    }) {
+                        let (id, image) = verified.next().ok_or_else(unavailable)?;
+                        if serde_json::to_value(image.part()).map_err(|_| unavailable())? != *part {
+                            return Err(unavailable());
+                        }
+                        ids.push(*id);
+                    }
+                }
+                if !ids.is_empty() {
+                    conversation.image_attachments.insert(index, ids);
+                }
+            }
+            if verified.next().is_some() {
+                return Err(unavailable());
+            }
+            Ok(PreparedDevelopmentHandoff {
+                candidate: redb::DevelopmentCandidate::Generative(context.snapshot),
+                images: context.images,
+                request,
+                conversation: Some(conversation),
+                system_policy,
+                tool_policy: DevelopmentToolPolicy::NoToolsOrWorkspace,
+                credentials: DevelopmentHandoffCredentials::default(),
+            })
+        }
+    }
+}
+
 struct AttachmentPermit(flume::Sender<()>);
 
 pub(crate) struct UpdatePause(Arc<Shared>);
@@ -89,8 +623,28 @@ fn model_profile_save_bytes(save: &mutations::ModelProfileSave) -> u64 {
         )
         .saturating_add(credential_ref_bytes)
         .saturating_add(secret_bytes)
+        .saturating_add(header_change_bytes(&save.headers))
         .saturating_add(definition_bytes)
         .saturating_add(4096)
+}
+
+/// What the header fields of a save add to its command size.
+fn header_change_bytes(change: &mutations::HeaderChange) -> u64 {
+    match change {
+        mutations::HeaderChange::Preserve => 0,
+        mutations::HeaderChange::Replace(edits) => edits.iter().fold(0, |bytes, edit| {
+            let value = match &edit.value {
+                mutations::HeaderEditValue::Plain(value) => value.len(),
+                mutations::HeaderEditValue::Secret(payload) => payload
+                    .as_ref()
+                    .map_or(0, |payload| payload.secret.as_str().len()),
+            };
+            bytes
+                .saturating_add(byte_count(edit.name.len()))
+                .saturating_add(byte_count(value))
+                .saturating_add(256)
+        }),
+    }
 }
 
 /// Reads [`filesystem_vitals`] on a blocking worker, so a slow filesystem
@@ -144,6 +698,16 @@ fn process_memory() -> (Option<u64>, Option<u64>) {
 }
 
 impl DatabaseHandle {
+    #[allow(dead_code)]
+    pub(crate) async fn decision_availability(
+        &self,
+        job: JobId,
+        after: Option<AvailabilityStatId>,
+        limit: usize,
+    ) -> Result<Vec<redb::DecisionAvailabilityRecord>, DatabaseError> {
+        self.read(move |database| redb::read_decision_availability(database, job, after, limit))
+            .await
+    }
     async fn attachment_permit(&self) -> Result<AttachmentPermit, DatabaseError> {
         self.shared
             .attachment_slots
@@ -688,18 +1252,25 @@ impl DatabaseHandle {
         })
         .await
     }
-    /// One page of a conversation's Turns with everything each one shows,
-    /// read in a single snapshot; `None` when it is not a conversation.
-    pub(crate) async fn conversation_turn_page(
+    pub(crate) async fn mutable_conversation_turn_page(
         &self,
         conversation: JobId,
         before: Option<JobId>,
         limit: usize,
-    ) -> Result<Option<redb::ConversationTurnPage>, DatabaseError> {
+    ) -> Result<Option<redb::MutableConversationPage>, DatabaseError> {
         self.read(move |database| {
-            redb::read_conversation_turn_page(database, conversation, before, limit)
+            redb::read_mutable_conversation_turn_page(database, conversation, before, limit)
         })
         .await
+    }
+
+    pub(crate) async fn mutable_job_details(
+        &self,
+        job: JobId,
+        context: Option<entities::ComposerContextId>,
+    ) -> Result<redb::MutableJobDetailsLookup, DatabaseError> {
+        self.read(move |database| redb::read_mutable_job_details(database, job, context))
+            .await
     }
     pub async fn notices(
         &self,
@@ -708,14 +1279,6 @@ impl DatabaseHandle {
         limit: usize,
     ) -> Result<Vec<(u32, crate::db::entities::Notice)>, DatabaseError> {
         self.read(move |database| redb::read_notices(database, conversation, after, limit))
-            .await
-    }
-
-    pub(crate) async fn job_details(
-        &self,
-        job: JobId,
-    ) -> Result<Option<redb::JobDetails>, DatabaseError> {
-        self.read(move |database| redb::read_job_details(database, job))
             .await
     }
 
@@ -735,7 +1298,16 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Newest Jobs whose identity, name or objective contains every term,
+    /// One submitted Job with its Allocation evidence, or none.
+    pub(crate) async fn native_job(
+        &self,
+        job: JobId,
+    ) -> Result<Option<redb::NativeJobItem>, DatabaseError> {
+        self.read(move |database| redb::read_native_job(database, job))
+            .await
+    }
+
+    /// Newest submitted Jobs whose identity or input text contains every term,
     /// with cursor pagination.
     pub(crate) async fn search_jobs(
         &self,
@@ -1139,6 +1711,1546 @@ impl DatabaseHandle {
         .await
     }
 
+    /// Manually select and reserve one development-model Job. This does not
+    /// start execution. `New` is only for an identity never attempted before.
+    /// After an unknown outcome, callers must use `Replay`, which never creates
+    /// an Allocation when attribution is unresolved. Request IDs are not
+    /// authorization credentials; this interface is restricted to the trusted
+    /// internal allocator.
+    #[allow(dead_code)]
+    pub(crate) async fn reserve_next_development_job(
+        &self,
+        request: entities::DevelopmentReservationRequest,
+        attempt: entities::DevelopmentReservationAttempt,
+    ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
+        self.reserve_development_job(request, attempt, None).await
+    }
+
+    /// Like [`Self::reserve_next_development_job`]; with `only`, a ready entry
+    /// of any other Job is never reserved, so a manual trial reserves the one
+    /// Job it names or none. The selection is not stored: the Allocation is
+    /// the same row either way.
+    #[allow(dead_code)]
+    pub(crate) async fn reserve_development_job(
+        &self,
+        request: entities::DevelopmentReservationRequest,
+        attempt: entities::DevelopmentReservationAttempt,
+        only: Option<entities::JobId>,
+    ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
+        let fresh = match attempt {
+            entities::DevelopmentReservationAttempt::New(fresh) => {
+                if !fresh.matches(request) {
+                    return Err(DevelopmentReservationError::DefinitelyNotCommitted {
+                        error: Box::new(DatabaseError::Rejected(Violation::InvalidValue(
+                            "reservation_request",
+                            "first-attempt permit has different parameters",
+                        ))),
+                        fresh,
+                    });
+                }
+                Some(fresh)
+            }
+            entities::DevelopmentReservationAttempt::Replay => None,
+        };
+        let is_new = fresh.is_some();
+        let result = self
+            .submit(|reply| {
+                Command::new(
+                    (request, is_new, only),
+                    reply,
+                    |_| 4096,
+                    OperationKind::AssignJobExecutor,
+                    |(request, is_new, only), batch| {
+                        batch.reserve_next_development_job(request, is_new, only)
+                    },
+                )
+            })
+            .await;
+        match (result, fresh) {
+            (Ok(result), _) => Ok(result),
+            (Err(error), Some(fresh))
+                if matches!(
+                    error.command_outcome(),
+                    Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted)
+                ) =>
+            {
+                Err(DevelopmentReservationError::DefinitelyNotCommitted {
+                    error: Box::new(error),
+                    fresh,
+                })
+            }
+            (Err(error), _) => Err(DevelopmentReservationError::Other(error)),
+        }
+    }
+
+    /// Read the Executor's durable owner after a lost reply. This is a writer
+    /// barrier for commands already enqueued; concurrent callers can still own
+    /// the returned allocation. Use operation reconciliation when an operation
+    /// ID is available. If storage is unavailable, do not retry until resolved.
+    #[allow(dead_code)]
+    pub(crate) async fn development_executor_allocation(
+        &self,
+        executor: entities::ExecutorId,
+    ) -> Result<Option<entities::PoolAllocation>, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (executor,),
+                reply,
+                |_| 0,
+                OperationKind::Open,
+                |(executor,), batch| batch.development_executor_allocation(executor),
+            )
+        })
+        .await
+    }
+
+    /// The stored Job a manual trial names and the Allocation it already has,
+    /// if any. Evidence only.
+    #[allow(dead_code)]
+    pub(crate) async fn development_trial_job(
+        &self,
+        job: entities::JobId,
+    ) -> Result<Option<(entities::MutableJobRecord, Option<entities::PoolAllocation>)>, DatabaseError>
+    {
+        self.read(move |database| redb::read_trial_job(database, job))
+            .await
+    }
+
+    /// Builds the request of a resolved candidate and reads the stored
+    /// credential rows it names, each once. Reads only.
+    async fn prepare_with_credentials(
+        &self,
+        resolved: redb::DevelopmentResolvedCandidate,
+    ) -> Result<PreparedDevelopmentHandoff, DevelopmentHandoffError> {
+        let mut prepared = prepare_development_handoff(resolved, self.shared.active_policy)
+            .map_err(classify_unstarted)?;
+        let references: Vec<String> = prepared
+            .expected_credential_references()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for reference in references {
+            if !redb::valid_credential_ref(&reference) {
+                return Err(classify_unstarted(DatabaseError::Rejected(
+                    Violation::InvalidValue("credential", "invalid credential reference"),
+                )));
+            }
+            let key = self.shared.credential_key();
+            let lookup = reference.clone();
+            let resolved = self
+                .read(move |database| {
+                    redb::read_handoff_credential(database, &lookup, key.as_deref())
+                })
+                .await
+                .map_err(|error| match &error {
+                    // A stored secret that cannot be read or decrypted is the
+                    // same fact to the Job as one that was deleted.
+                    DatabaseError::Read(storage)
+                        if storage.kind == StorageErrorKind::Other
+                            && storage.os_error.is_none() =>
+                    {
+                        DevelopmentHandoffError::NotStarted {
+                            cause: entities::UnstartedCause::FrozenSecretUnavailable,
+                            error: Box::new(error),
+                        }
+                    }
+                    _ => classify_unstarted(error),
+                })?;
+            let Some((secret, encrypted_row)) = resolved else {
+                return Err(classify_unstarted(DatabaseError::Rejected(
+                    Violation::InvalidValue("credential", "stored credential is unavailable"),
+                )));
+            };
+            prepared.credentials.push(reference, encrypted_row, secret);
+        }
+        if prepared.system_policy != self.shared.active_policy {
+            return Err(classify_unstarted(DatabaseError::Rejected(
+                Violation::InvalidValue("handoff", "system policy changed"),
+            )));
+        }
+        Ok(prepared)
+    }
+
+    /// Builds, without reserving anything, the exact request a start of `job`
+    /// on `executor` would prepare, and lets `guard` look at it. Reads only:
+    /// nothing is reserved, started, recorded or sent, and the prepared request
+    /// and the credential values it read are dropped when this returns, so a
+    /// refusal leaves the Job exactly as submitted.
+    ///
+    /// This is a preflight, not an authorization. The start transaction
+    /// revalidates every fact against the real reservation, and a Job that
+    /// changes in between is refused there.
+    #[allow(dead_code)]
+    pub(crate) async fn preview_development_handoff(
+        &self,
+        job: entities::JobId,
+        pool: entities::ExecutionPoolId,
+        executor: entities::ExecutorId,
+        guard: impl FnOnce(&PreparedDevelopmentHandoff) -> Result<(), &'static str>,
+    ) -> Result<(), DevelopmentPreviewError> {
+        let snapshot = self
+            .read(move |database| {
+                redb::read_development_execution_preview(database, job, pool, executor)
+            })
+            .await
+            .map_err(DevelopmentPreviewError::Unavailable)?;
+        let resolved = self
+            .resolve_development_candidate(snapshot)
+            .await
+            .map_err(DevelopmentPreviewError::Unavailable)?;
+        let prepared =
+            self.prepare_with_credentials(resolved)
+                .await
+                .map_err(|error| match error {
+                    DevelopmentHandoffError::NotStarted { error, .. } => {
+                        DevelopmentPreviewError::Unavailable(*error)
+                    }
+                    DevelopmentHandoffError::Database(error) => {
+                        DevelopmentPreviewError::Unavailable(*error)
+                    }
+                    DevelopmentHandoffError::OutcomeUnknown { error, .. } => {
+                        DevelopmentPreviewError::Unavailable(*error)
+                    }
+                })?;
+        guard(&prepared).map_err(DevelopmentPreviewError::Refused)
+    }
+
+    /// Prepare locally, then return the single-use result only after the Worker
+    /// confirms the checked start transaction is durable. This does not dispatch.
+    #[allow(dead_code)]
+    pub(crate) async fn checked_development_handoff(
+        &self,
+        token: entities::AllocationToken,
+    ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
+        self.checked_development_handoff_guarded(token, |_| Ok(()))
+            .await
+    }
+
+    /// Like [`Self::checked_development_handoff`], and `guard` sees the exact
+    /// prepared request before any start is submitted. A refusal is a
+    /// definite pre-start failure: no authority exists and the Allocation is
+    /// still only Reserved.
+    #[allow(dead_code)]
+    pub(crate) async fn checked_development_handoff_guarded(
+        &self,
+        token: entities::AllocationToken,
+        guard: impl FnOnce(&PreparedDevelopmentHandoff) -> Result<(), &'static str>,
+    ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
+        let resolved = self
+            .development_execution_context(token)
+            .await
+            .map_err(classify_unstarted)?;
+        let prepared = self.prepare_with_credentials(resolved).await?;
+        if let Err(reason) = guard(&prepared) {
+            return Err(classify_unstarted(DatabaseError::Rejected(
+                Violation::InvalidValue("handoff", reason),
+            )));
+        }
+        let owner = self.shared.clone();
+        let result = self
+            .submit(|reply| {
+                Command::new(
+                    (prepared, owner),
+                    reply,
+                    |(prepared, _)| {
+                        byte_count(
+                            crate::db::serialized_len(&prepared.request).unwrap_or(usize::MAX),
+                        )
+                        .saturating_add(64 * 1024)
+                    },
+                    OperationKind::ClaimExecution,
+                    |(prepared, owner), batch| {
+                        let started = batch.start_mutable_job(&prepared)?;
+                        Ok(DevelopmentHandoff {
+                            prepared,
+                            started,
+                            owner,
+                            output_busy: AtomicBool::new(false),
+                            output_uncertain: AtomicBool::new(false),
+                            usage_checkpoint: std::sync::Mutex::new(
+                                DevelopmentUsageCheckpoint::default(),
+                            ),
+                        })
+                    },
+                )
+            })
+            .await;
+        match result {
+            Ok(handoff) => Ok(handoff),
+            Err(error) => match &error {
+                DatabaseError::OutcomeUnknown { operation, .. } => {
+                    let reconciliation =
+                        self.reconcile_operation(*operation).await.map_err(Box::new);
+                    Err(DevelopmentHandoffError::OutcomeUnknown {
+                        error: Box::new(error),
+                        reconciliation,
+                    })
+                }
+                _ => Err(classify_unstarted(error)),
+            },
+        }
+    }
+
+    /// A sequence is a caller-supplied output identity, not execution authority.
+    /// An uncertain result requires read-only reconciliation; do not retry blindly.
+    #[allow(dead_code)]
+    pub(crate) async fn append_development_output(
+        &self,
+        handoff: &DevelopmentHandoff,
+        expected_seq: u32,
+        output: JobOutput,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "output",
+                "output write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "output",
+                "output write requires reconciliation",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(_) => {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "handoff",
+                    "generative handoff required",
+                )));
+            }
+        };
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, expected_seq, output),
+                    reply,
+                    |(_, _, output)| {
+                        output_bytes(
+                            output.summary.as_deref(),
+                            output.code.as_deref(),
+                            output.value.as_ref(),
+                        )
+                    },
+                    |(proof, expected_seq, output), reply, database, operation, commit| {
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::AppendJobOutput,
+                            reply,
+                            |batch| batch.append_development_output(&proof, expected_seq, output),
+                        );
+                        if result.committed {
+                            result.output_changed = Some(proof.token.job);
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Record evidence of the first provider request, using the exact body
+    /// prepared by the checked handoff. This method does not send a request.
+    #[allow(dead_code)]
+    pub(crate) async fn record_development_sent_request(
+        &self,
+        handoff: &DevelopmentHandoff,
+        observed_at: entities::Timestamp,
+    ) -> Result<(), DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let (token, decision) = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => (context.allocation.token, false),
+            redb::DevelopmentCandidate::Decision(context) => (context.allocation.token, true),
+        };
+        if handoff
+            .prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|secret| development_contains_secret(&handoff.prepared.request, secret))
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "request",
+                "request evidence contains credential material",
+            )));
+        }
+        let mut sent = if decision {
+            let body = entities::MessageBody::new(
+                &serde_json::json!({"decision": &handoff.prepared.request}),
+            )
+            .map_err(|_| {
+                DatabaseError::Rejected(Violation::InvalidValue(
+                    "request",
+                    "prepared decision cannot be recorded",
+                ))
+            })?;
+            let digest = body.digest();
+            entities::SentRequest {
+                job: token.job,
+                request: RequestNumber::FIRST,
+                observed_at,
+                messages: vec![digest],
+                tools: None,
+                parameters: digest,
+                dropped_turns: None,
+                bodies: vec![body],
+                required_messages: Vec::new(),
+            }
+        } else {
+            let mut recorder = crate::service::ai::providers::RequestRecorder::default();
+            recorder.image_attachments = handoff
+                .prepared
+                .conversation
+                .as_ref()
+                .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
+                    "request",
+                    "prepared conversation missing",
+                )))?
+                .image_attachments
+                .clone();
+            recorder
+                .prepare(
+                    token.job,
+                    RequestNumber::FIRST,
+                    &handoff.prepared.request,
+                    0,
+                )
+                .map_err(|_| {
+                    DatabaseError::Rejected(Violation::InvalidValue(
+                        "request",
+                        "prepared request cannot be recorded",
+                    ))
+                })?
+                .0
+        };
+        sent.observed_at = observed_at;
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write requires reconciliation",
+            )));
+        }
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let attachments = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context
+                .covered_inputs
+                .iter()
+                .flat_map(|input| input.attachments.iter())
+                .chain(
+                    context
+                        .history
+                        .iter()
+                        .flat_map(|turn| turn.attachments.iter()),
+                )
+                .chain(context.attachments.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            redb::DevelopmentCandidate::Decision(_) => Vec::new(),
+        };
+        let result = self
+            .submit(|reply| {
+                Command::new(
+                    (proof, sent, attachments),
+                    reply,
+                    |(_, sent, _)| {
+                        sent.bodies.iter().fold(0u64, |size, body| {
+                            size.saturating_add(byte_count(body.byte_length()))
+                        })
+                    },
+                    OperationKind::RecordSentRequest,
+                    |(proof, sent, attachments), batch| {
+                        batch.record_development_sent_request(&proof, sent, &attachments)
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Records an observed answer; this operation does not contact a provider.
+    #[allow(dead_code)]
+    pub(crate) async fn record_development_provider_answer(
+        &self,
+        handoff: &DevelopmentHandoff,
+        answer: ProviderAnswer,
+    ) -> Result<(), DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
+        };
+        let response: serde_json::Value =
+            serde_json::from_slice(&answer.response.bytes).map_err(|_| {
+                DatabaseError::Rejected(Violation::InvalidValue(
+                    "response",
+                    "invalid response JSON",
+                ))
+            })?;
+        if let Some(secret) = &handoff.prepared.credentials.spellings {
+            let observation = &answer.stat.observation;
+            let failure_contains_secret = observation.failure.as_ref().is_some_and(|failure| {
+                secret.found_in(&failure.message)
+                    || failure
+                        .provider_code
+                        .as_deref()
+                        .is_some_and(|s| secret.found_in(s))
+                    || failure
+                        .response_body
+                        .as_deref()
+                        .is_some_and(|s| secret.found_in(s))
+                    || failure
+                        .request_id
+                        .as_deref()
+                        .is_some_and(|s| secret.found_in(s))
+            });
+            if development_contains_secret(&response, secret)
+                || answer
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|value| development_contains_secret(value, secret))
+                || observation
+                    .raw_finish_reason
+                    .as_deref()
+                    .is_some_and(|s| secret.found_in(s))
+                || failure_contains_secret
+            {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "answer",
+                    "answer evidence contains credential material",
+                )));
+            }
+        }
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write requires reconciliation",
+            )));
+        }
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, answer),
+                    reply,
+                    |(_, answer)| {
+                        byte_count(answer.response.byte_length())
+                            .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()))
+                    },
+                    |(proof, answer), reply, database, operation, commit| {
+                        let ids = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::RecordProviderAnswer,
+                            reply,
+                            |batch| {
+                                let value =
+                                    batch.record_development_provider_answer(&proof, answer)?;
+                                ids.set(Some(value));
+                                Ok(())
+                            },
+                        );
+                        if result.committed
+                            && let Some((metrics, availability)) = ids.get()
+                        {
+                            result
+                                .observations
+                                .push(ObservationChange::Metrics(proof.token.job, metrics));
+                            result.observations.push(ObservationChange::Availability(
+                                proof.token.job,
+                                availability,
+                            ));
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Records one explicitly annotated Token observation. `expected_seq` is
+    /// the existing request-event key retained by the caller for replay.
+    #[allow(dead_code)]
+    pub(crate) async fn record_development_usage(
+        &self,
+        handoff: &DevelopmentHandoff,
+        expected_seq: u32,
+        metrics: Metrics,
+    ) -> Result<MetricsId, DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(_) => {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "handoff",
+                    "generative handoff required",
+                )));
+            }
+        };
+        if handoff
+            .prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|secret| {
+                metrics
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| development_contains_secret(raw, secret))
+            })
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "usage",
+                "usage evidence contains credential material",
+            )));
+        }
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write requires reconciliation",
+            )));
+        }
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let checkpoint = handoff
+            .usage_checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, expected_seq, metrics, checkpoint),
+                    reply,
+                    |(_, _, metrics, _)| json_bytes(metrics.measurements.usage.raw.as_ref()),
+                    |(proof, expected_seq, metrics, checkpoint),
+                     reply,
+                     database,
+                     operation,
+                     commit| {
+                        let id = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::RecordMetrics,
+                            reply,
+                            |batch| {
+                                let value = batch.record_development_usage(
+                                    &proof,
+                                    expected_seq,
+                                    metrics,
+                                    checkpoint,
+                                )?;
+                                id.set(Some(value.0));
+                                Ok(value)
+                            },
+                        );
+                        if result.committed
+                            && let Some(id) = id.get()
+                        {
+                            result
+                                .observations
+                                .push(ObservationChange::Metrics(proof.token.job, id));
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result.map(|(id, checkpoint)| {
+            *handoff
+                .usage_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = checkpoint;
+            id
+        })
+    }
+
+    /// Finalizes only after the supervising runtime observed an in-process return.
+    #[allow(dead_code)]
+    pub(crate) async fn finalize_development_job(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        expected_seq: u32,
+        finalization: JobFinalization,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let handoff = returned.handoff();
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(_) => {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "handoff",
+                    "generative handoff required",
+                )));
+            }
+        };
+        if let Some(secret) = &handoff.prepared.credentials.spellings {
+            let result = match &finalization {
+                JobFinalization::Completed(result)
+                | JobFinalization::Failed(result)
+                | JobFinalization::Cancelled(result) => Some(result),
+                JobFinalization::Unknown => None,
+            };
+            if result.is_some_and(|result| {
+                result
+                    .summary
+                    .as_deref()
+                    .is_some_and(|s| secret.found_in(s))
+                    || result.code.as_deref().is_some_and(|s| secret.found_in(s))
+                    || result
+                        .value
+                        .as_ref()
+                        .is_some_and(|v| development_contains_secret(v, secret))
+            }) {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "outcome",
+                    "result contains credential material",
+                )));
+            }
+        }
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write requires reconciliation",
+            )));
+        }
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, expected_seq, finalization),
+                    reply,
+                    |(_, _, value)| match value {
+                        JobFinalization::Completed(result)
+                        | JobFinalization::Failed(result)
+                        | JobFinalization::Cancelled(result) => output_bytes(
+                            result.summary.as_deref(),
+                            result.code.as_deref(),
+                            result.value.as_ref(),
+                        ),
+                        JobFinalization::Unknown => 0,
+                    },
+                    |(proof, expected_seq, finalization), reply, database, operation, commit| {
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::FinalizeJob,
+                            reply,
+                            |batch| {
+                                batch.finalize_development_job(&proof, expected_seq, finalization)
+                            },
+                        );
+                        if result.committed {
+                            result.output_changed = Some(proof.token.job);
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Finalizes a typed native Decision after the local executor has returned.
+    #[allow(dead_code)]
+    pub(crate) async fn finalize_development_decision(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        expected_seq: u32,
+        result: entities::DecisionResult,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let handoff = returned.handoff();
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Generative(_) => {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "handoff",
+                    "Decision handoff required",
+                )));
+            }
+        };
+        let value = serde_json::to_value(&result).map_err(|_| {
+            DatabaseError::Rejected(Violation::InvalidValue(
+                "decision",
+                "result cannot be serialized",
+            ))
+        })?;
+        if handoff
+            .prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|secret| development_contains_secret(&value, secret))
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "decision",
+                "result contains credential material",
+            )));
+        }
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write requires reconciliation",
+            )));
+        }
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, expected_seq, result),
+                    reply,
+                    |(_, _, result)| debug_bytes(result),
+                    |(proof, expected_seq, decision), reply, database, operation, commit| {
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::FinalizeJob,
+                            reply,
+                            |batch| {
+                                batch.finalize_development_decision(&proof, expected_seq, decision)
+                            },
+                        );
+                        if result.committed {
+                            result.output_changed = Some(proof.token.job);
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Settles a Job Failed or Cancelled without an answer, for either typed
+    /// handoff. A Failed settlement may carry the observation of a Provider
+    /// response that rejected the request; it is committed with the terminal
+    /// transition. Only the supervising runtime, having observed the exchange
+    /// return, can provide the proof. Success evidence is never supplied here.
+    #[allow(dead_code)]
+    pub(crate) async fn finalize_development_failure(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        expected_seq: u32,
+        finalization: JobFinalization,
+        rejection: Option<(entities::Timestamp, entities::AvailabilityObservation)>,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let handoff = returned.handoff();
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
+        };
+        if let Some(secret) = &handoff.prepared.credentials.spellings {
+            let (JobFinalization::Completed(result)
+            | JobFinalization::Failed(result)
+            | JobFinalization::Cancelled(result)) = &finalization
+            else {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "outcome",
+                    "an unanswered failure needs a result",
+                )));
+            };
+            let failure = rejection
+                .as_ref()
+                .and_then(|(_, observation)| observation.failure.as_ref());
+            if [
+                result.summary.as_deref(),
+                result.code.as_deref(),
+                failure.map(|failure| failure.message.as_str()),
+                failure.and_then(|failure| failure.provider_code.as_deref()),
+                failure.and_then(|failure| failure.response_body.as_deref()),
+                failure.and_then(|failure| failure.request_id.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|text| secret.found_in(text))
+                || result
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| development_contains_secret(value, secret))
+            {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "outcome",
+                    "failure evidence contains credential material",
+                )));
+            }
+        }
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write requires reconciliation",
+            )));
+        }
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let rejection = rejection.map(|(observed_at, observation)| entities::AvailabilityStat {
+            job: token.job,
+            request: entities::RequestNumber::FIRST,
+            observed_at,
+            observation,
+        });
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, expected_seq, finalization, rejection),
+                    reply,
+                    |(_, _, finalization, rejection)| {
+                        let result = match finalization {
+                            JobFinalization::Completed(result)
+                            | JobFinalization::Failed(result)
+                            | JobFinalization::Cancelled(result) => output_bytes(
+                                result.summary.as_deref(),
+                                result.code.as_deref(),
+                                result.value.as_ref(),
+                            ),
+                            JobFinalization::Unknown => 0,
+                        };
+                        result.saturating_add(
+                            rejection
+                                .as_ref()
+                                .map_or(0, |stat| debug_bytes(&stat.observation)),
+                        )
+                    },
+                    |(proof, expected_seq, finalization, rejection),
+                     reply,
+                     database,
+                     operation,
+                     commit| {
+                        let mut outcome = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::FinalizeJob,
+                            reply,
+                            |batch| {
+                                batch.finalize_development_failure(
+                                    &proof,
+                                    expected_seq,
+                                    finalization,
+                                    rejection,
+                                )
+                            },
+                        );
+                        if outcome.committed {
+                            outcome.output_changed = Some(proof.token.job);
+                        }
+                        outcome
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Ends the Job and releases the capacity of a Reserved Allocation whose
+    /// checked start never committed, after [`DevelopmentHandoffError::NotStarted`].
+    /// The writer re-proves in one transaction that the reservation is
+    /// untouched and holds no execution authority; anything else is refused
+    /// and the Allocation stays held. Repeating the call is refused because
+    /// the first one releases the Allocation.
+    #[allow(dead_code)]
+    pub(crate) async fn fail_unstarted_development_reservation(
+        &self,
+        token: entities::AllocationToken,
+        cause: entities::UnstartedCause,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        self.submit(|reply| {
+            Command::custom(
+                (token, cause),
+                reply,
+                |(_, cause)| output_bytes(Some(cause.summary()), Some(cause.code()), None),
+                |(token, cause), reply, database, operation, commit| {
+                    let mut outcome = run(
+                        database,
+                        operation,
+                        commit,
+                        OperationKind::FinalizeJob,
+                        reply,
+                        |batch| batch.fail_unstarted_reservation(token, cause),
+                    );
+                    if outcome.committed {
+                        outcome.output_changed = Some(token.job);
+                    }
+                    outcome
+                },
+            )
+        })
+        .await
+    }
+
+    /// Records, with a typed reason, that a supervised exchange returned
+    /// without an outcome this process can classify. The Job becomes Unknown
+    /// and the Allocation Uncertain and still held; nothing is released or
+    /// retried. Only the supervising runtime, having observed the exchange
+    /// return, can provide the proof.
+    #[allow(dead_code)]
+    pub(crate) async fn record_development_uncertain(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        reason: entities::UncertaintyReason,
+    ) -> Result<(), DatabaseError> {
+        let handoff = returned.handoff();
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let mut guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, reason),
+                    reply,
+                    |_| 0,
+                    |(proof, reason), reply, database, operation, commit| {
+                        run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::FinalizeJob,
+                            reply,
+                            |batch| batch.record_development_uncertain(&proof, reason),
+                        )
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    /// Snapshot evidence only; this neither grants dispatch authority nor adopts ownership.
+    #[allow(dead_code)]
+    pub(crate) async fn development_execution_context(
+        &self,
+        token: entities::AllocationToken,
+    ) -> Result<redb::DevelopmentResolvedCandidate, DatabaseError> {
+        let snapshot = self
+            .read(move |database| redb::read_development_execution_context(database, token))
+            .await?;
+        self.resolve_development_candidate(snapshot).await
+    }
+
+    /// Reads the image content a snapshot names and checks it is the content
+    /// the snapshot saw.
+    async fn resolve_development_candidate(
+        &self,
+        snapshot: redb::DevelopmentCandidate,
+    ) -> Result<redb::DevelopmentResolvedCandidate, DatabaseError> {
+        use crate::service::ai::providers::openai_compatible::image::{
+            ImageInput, ImageMime, MAX_IMAGE_BYTES, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES,
+        };
+        let snapshot = match snapshot {
+            redb::DevelopmentCandidate::Generative(snapshot) => snapshot,
+            redb::DevelopmentCandidate::Decision(snapshot) => {
+                return Ok(redb::DevelopmentResolvedCandidate::Decision(snapshot));
+            }
+        };
+        let unavailable = |detail: &str| {
+            DatabaseError::Read(StorageError {
+                kind: StorageErrorKind::Other,
+                os_error: None,
+                detail: detail.to_owned(),
+            })
+        };
+        let records: Vec<_> = snapshot
+            .covered_inputs
+            .iter()
+            .flat_map(|turn| turn.attachments.iter())
+            .chain(
+                snapshot
+                    .history
+                    .iter()
+                    .flat_map(|turn| turn.attachments.iter()),
+            )
+            .chain(snapshot.attachments.iter())
+            .collect();
+        if records.len() > MAX_REQUEST_IMAGES {
+            return Err(unavailable("context has too many images"));
+        }
+        let mut total = 0u64;
+        let mut images = Vec::with_capacity(records.len());
+        for record in records {
+            let mime = ImageMime::from_mime(&record.mime)
+                .ok_or_else(|| unavailable("context Attachment is not a supported image"))?;
+            if record.byte_length > MAX_IMAGE_BYTES as u64 {
+                return Err(unavailable("context image exceeds the per-image limit"));
+            }
+            total = total.saturating_add(record.byte_length);
+            if total > MAX_REQUEST_IMAGE_BYTES as u64 {
+                return Err(unavailable("context images exceed the request limit"));
+            }
+            let content =
+                self.attachment_content(record.id)
+                    .await
+                    .map_err(|error| match error {
+                        AttachmentError::Database(error) => error,
+                        _ => unavailable("context Attachment content is unavailable"),
+                    })?;
+            if content.record != *record {
+                return Err(unavailable("context Attachment changed after the snapshot"));
+            }
+            let image = ImageInput::new(mime, content.bytes)
+                .map_err(|_| unavailable("context Attachment content is not a valid image"))?;
+            images.push((record.id, image));
+        }
+        Ok(redb::DevelopmentResolvedCandidate::Generative(
+            redb::DevelopmentResolvedContext { snapshot, images },
+        ))
+    }
+
+    /// Read-only provenance evidence; it does not authorize adoption or dispatch.
+    #[allow(dead_code)]
+    pub(crate) async fn verify_native_summary(
+        &self,
+        conversation: JobId,
+        consumer: JobId,
+        producer: JobId,
+        source: entities::ContentDigest,
+    ) -> Result<redb::VerifiedNativeSummary, DatabaseError> {
+        self.read(move |database| {
+            redb::verify_native_summary(database, conversation, consumer, producer, source)
+        })
+        .await
+    }
+
+    // These commands are not yet connected to the HTTP API. Their storage
+    // gate refuses the current format, and their replies remain tentative
+    // until the write worker has completed its durable group commit.
+    #[allow(dead_code)]
+    pub(crate) async fn create_mutable_job(
+        &self,
+        context: entities::ComposerContextId,
+        input: entities::MutableJobInput,
+        creation: Submission,
+        conversation: Option<JobId>,
+        project: Option<entities::ProjectId>,
+    ) -> Result<entities::MutableJobRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, input, creation, conversation, project),
+                reply,
+                |(_, input, _, _, _)| byte_count(input.size_hint()).saturating_add(8192),
+                OperationKind::CreateJobWithInput,
+                |(context, input, creation, conversation, project), batch| {
+                    let id = batch.create_unsubmitted_job(
+                        context,
+                        input,
+                        creation,
+                        conversation,
+                        project,
+                    )?;
+                    match batch.read_mutable_job(id)? {
+                        Some(job) => Ok(job),
+                        None => batch.corrupted("created mutable Job is missing".to_owned()),
+                    }
+                },
+            )
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn mutable_job_for_context(
+        &self,
+        context: entities::ComposerContextId,
+    ) -> Result<Option<entities::MutableJobRecord>, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context,),
+                reply,
+                |_| 0,
+                OperationKind::Open,
+                |(context,), batch| batch.mutable_job_for_context(context),
+            )
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn mutable_job_in_context(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+    ) -> Result<Option<entities::MutableJobRecord>, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id),
+                reply,
+                |_| 0,
+                OperationKind::Open,
+                |(context, id), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    batch.read_mutable_job(id)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn mutable_job_with_support(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+    ) -> Result<(entities::MutableJobRecord, bool), DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id),
+                reply,
+                |_| 0,
+                OperationKind::Open,
+                |(context, id), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    let Some(record) = batch.read_mutable_job(id)? else {
+                        return batch.corrupted("mutable Job is missing".to_owned());
+                    };
+                    let blocked = batch.unsupported_queued_context(&record.job)?;
+                    Ok((record, blocked))
+                },
+            )
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn update_mutable_job(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+        revision: u64,
+        input: entities::MutableJobInput,
+    ) -> Result<entities::MutableJobRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id, revision, input),
+                reply,
+                |(_, _, _, input)| byte_count(input.size_hint()).saturating_add(40 * 1024),
+                OperationKind::SaveJobInput,
+                |(context, id, revision, input), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    batch.update_mutable_job(id, revision, input)?;
+                    match batch.read_mutable_job(id)? {
+                        Some(job) => Ok(job),
+                        None => batch.corrupted("updated mutable Job is missing".to_owned()),
+                    }
+                },
+            )
+        })
+        .await
+    }
+
+    /// Update the context selection of a Job in its authenticated Composer
+    /// context. A successful reply follows durable transaction commit.
+    pub async fn set_mutable_context_selection(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+        revision: u64,
+        selection: entities::MutableContextSelection,
+    ) -> Result<entities::MutableJobRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id, revision, selection),
+                reply,
+                |_| 40 * 1024,
+                OperationKind::SaveJobInput,
+                |(context, id, revision, selection), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    batch.set_mutable_context_selection(id, revision, selection)?;
+                    match batch.read_mutable_job(id)? {
+                        Some(job) => Ok(job),
+                        None => batch.corrupted("updated mutable Job is missing".to_owned()),
+                    }
+                },
+            )
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn submit_mutable_job(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+        revision: u64,
+        input: Option<entities::MutableJobInput>,
+        submission: Submission,
+    ) -> Result<entities::MutableJobRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id, revision, input, submission),
+                reply,
+                |(_, _, _, input, _)| {
+                    input.as_ref().map_or(8192, |input| {
+                        byte_count(input.size_hint()).saturating_add(40 * 1024)
+                    })
+                },
+                OperationKind::Open,
+                |(context, id, revision, input, submission), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    match input {
+                        Some(input) => {
+                            batch.submit_mutable_job_with_input(id, revision, input, submission)
+                        }
+                        None => batch.submit_mutable_job(id, revision, submission),
+                    }?;
+                    match batch.read_mutable_job(id)? {
+                        Some(job) => Ok(job),
+                        None => batch.corrupted("submitted mutable Job is missing".to_owned()),
+                    }
+                },
+            )
+        })
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn discard_mutable_job(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+        revision: u64,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id, revision),
+                reply,
+                |_| 8192,
+                OperationKind::StopTurn,
+                |(context, id, revision), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    batch.discard_unsubmitted_job(id, revision)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn cancel_unsupported_queued_job(
+        &self,
+        context: entities::ComposerContextId,
+        id: JobId,
+        revision: u64,
+    ) -> Result<entities::MutableJobRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (context, id, revision),
+                reply,
+                |_| 8192,
+                OperationKind::StopTurn,
+                |(context, id, revision), batch| {
+                    batch.require_mutable_job_context(context, id)?;
+                    batch.cancel_unsupported_queued_job(id, revision)?;
+                    match batch.read_mutable_job(id)? {
+                        Some(job) => Ok(job),
+                        None => batch.corrupted("cancelled Job is missing".to_owned()),
+                    }
+                },
+            )
+        })
+        .await
+    }
+
     /// T1: submits a Job, or the next turn of a conversation when it names a
     /// predecessor in `previous`. The Job is pending; the claim batch grants
     /// it when a compatible Pool has room.
@@ -1229,6 +3341,66 @@ impl DatabaseHandle {
     ) -> Result<redb::CursorPage<ConfigRecord, ConfigId>, DatabaseError> {
         self.read(move |database| redb::read_configs(database, kind, before, limit))
             .await
+    }
+
+    pub(crate) async fn native_resources(
+        &self,
+        before: Option<ConfigId>,
+        limit: usize,
+        kind: redb::NativeResourceKind,
+    ) -> Result<redb::CursorPage<redb::NativeResource, ConfigId>, DatabaseError> {
+        self.read(move |database| redb::read_native_resources(database, before, limit, kind))
+            .await
+    }
+
+    pub(crate) async fn register_native_pool(
+        &self,
+        pool: entities::AllocationPool,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (pool,),
+                reply,
+                |_| 4096,
+                OperationKind::CreateExecutionPool,
+                |(pool,), batch| batch.register_allocation_pool(pool),
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn register_native_executor(
+        &self,
+        executor: entities::AllocationExecutor,
+    ) -> Result<(), DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (executor,),
+                reply,
+                |_| 4096,
+                OperationKind::CreateExecutor,
+                |(executor,), batch| batch.register_allocation_executor(executor),
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn update_native_pool(
+        &self,
+        id: ExecutionPoolId,
+        capacity: Option<std::num::NonZeroU32>,
+        enabled: Option<bool>,
+    ) -> Result<entities::AllocationPool, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, capacity, enabled),
+                reply,
+                |_| 4096,
+                OperationKind::SetExecutionPoolProfile,
+                |(id, capacity, enabled), batch| batch.update_native_pool(id, capacity, enabled),
+            )
+        })
+        .await
     }
 
     pub(crate) async fn find_config(
@@ -1411,6 +3583,7 @@ impl DatabaseHandle {
                         .map_or(0, |secret| byte_count(secret.as_str().len()));
                     let base = endpoint_bytes
                         .saturating_add(ref_bytes)
+                        .saturating_add(header_change_bytes(&save.headers))
                         .saturating_add(secret_bytes);
                     save.models.iter().fold(
                         base.saturating_add(byte_count(save.connection.name.len())),
@@ -1430,6 +3603,47 @@ impl DatabaseHandle {
     }
 
     /// Archives a model and removes it from Agent choices, preserving frozen Jobs.
+    /// The global custom request headers.
+    pub async fn global_outbound_headers(
+        &self,
+    ) -> Result<crate::db::entities::GlobalHeaders, DatabaseError> {
+        self.read(redb::read_global_outbound_headers).await
+    }
+
+    /// Replaces the global custom request headers if `expected_revision` is
+    /// still current.
+    pub async fn set_global_outbound_headers(
+        &self,
+        expected_revision: u32,
+        fields: Vec<crate::db::entities::OutboundHeader>,
+    ) -> Result<crate::db::entities::GlobalHeaders, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (expected_revision, fields),
+                reply,
+                |(_, fields)| {
+                    byte_count(fields.len())
+                        .saturating_mul(512)
+                        .saturating_add(4096)
+                },
+                OperationKind::UpdateProfile,
+                |(expected_revision, fields), batch| {
+                    batch.save_global_headers(expected_revision, fields)
+                },
+            )
+        })
+        .await
+    }
+
+    /// A secret wrapped with the credential key, for a save to store.
+    pub(crate) async fn credential_payload(
+        &self,
+        secret: redb::CredentialSecret,
+    ) -> Result<mutations::CredentialPayload, DatabaseError> {
+        let key = self.ensure_credential_key().await?;
+        Ok(mutations::CredentialPayload { secret, key })
+    }
+
     pub async fn global_compaction_settings(
         &self,
     ) -> Result<crate::db::entities::GlobalCompactionSettings, DatabaseError> {
@@ -1465,17 +3679,25 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Edits a config in place: a new name and body of the same kind. Every
-    /// edit is allowed and raises the edit counter; Jobs that froze the old
-    /// values keep them.
-    pub async fn update_config(&self, id: ConfigId, config: Config) -> Result<(), DatabaseError> {
+    /// Edits a config in place: a new name and body of the same kind, made
+    /// from `expected_edit_seq`. It raises the edit counter and is refused
+    /// (`ProfileChanged`, nothing written) when the stored counter differs;
+    /// Jobs that froze the old values keep them.
+    pub async fn update_config(
+        &self,
+        id: ConfigId,
+        config: Config,
+        expected_edit_seq: u32,
+    ) -> Result<(), DatabaseError> {
         self.submit(|reply| {
             Command::new(
-                (id, config),
+                (id, config, expected_edit_seq),
                 reply,
-                |(_, config)| config_bytes(config),
+                |(_, config, _)| config_bytes(config),
                 OperationKind::UpdateProfile,
-                |(id, config), batch| mutations::update_config(batch, id, config),
+                |(id, config, expected), batch| {
+                    mutations::update_config(batch, id, config, expected)
+                },
             )
         })
         .await

@@ -47,9 +47,9 @@ pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecution
 pub(crate) use models::{ModelListError, ProviderModel, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
 pub use types::{
-    CredentialResolver, EnvironmentCredentialResolver, OutputSinkError, ProviderExecutionConfig,
-    ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
-    ProviderOutputSink, ResponseFacts,
+    ApprovedRoute, CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver,
+    LoopbackProxy, OutputSinkError, ProviderExecutionConfig, ProviderExecutionError,
+    ProviderExecutionResult, ProviderFact, ProviderObservation, ProviderOutputSink, ResponseFacts,
 };
 
 pub(crate) use types::incomplete_tool_calls;

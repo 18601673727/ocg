@@ -207,6 +207,10 @@ pub enum ToolRegistryError {
     SelectedTwice(String),
     #[error("tool `{0}` was registered again after it was offered")]
     Changed(String),
+    /// A control that decides tool, child-Job or Workspace-write activation
+    /// is disabled in this build; nothing is granted.
+    #[error("tool `{0}` cannot be granted: {1}")]
+    Disabled(String, String),
 }
 
 struct Registration {
@@ -310,6 +314,13 @@ impl ToolRegistry {
 
     /// Grants the execution of a registered tool.
     pub(crate) fn authorize(&self, name: &str) -> Result<(), ToolRegistryError> {
+        let control = crate::system::execution_controls::ExecutionControl::ToolsAndChildJobs;
+        if !control.is_enabled() {
+            return Err(ToolRegistryError::Disabled(
+                name.to_owned(),
+                control.refusal(),
+            ));
+        }
         self.set_authorized(name, true)
     }
 

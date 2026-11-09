@@ -6,12 +6,11 @@
 //! This module belongs to the executable, not to the library.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU32;
 
 use crate::db::entities::{
-    AgentCapability, AgentConfig, CapabilitySet, Config, ConfigBody, ConfigKind, ConnectionConfig,
-    ExecutionOperation, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId, ExecutorId,
-    LlmParameters, LlmTransport, ModelCapability, ModelConfig, ProfileId,
+    AgentCapability, AgentConfig, Config, ConfigBody, ConfigKind, ConnectionConfig,
+    ExecutionOperation, ExecutionPoolId, ExecutorId, LlmParameters, LlmTransport, ModelCapability,
+    ModelConfig, ProfileId,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
 use crate::system::data_directory::DataDirectory;
@@ -103,11 +102,12 @@ pub async fn targets(
     target: &Target,
 ) -> Result<(ExecutorId, ProfileId, ExecutionPoolId), DatabaseError> {
     let transport = target.protocol;
-    let pool = provision_pool(database, &target.name, transport, None).await?;
+    let (executor, pool) = native_executor(database, transport).await?;
     let connection = ConnectionConfig {
         protocol: transport,
         endpoint: Some(target.endpoint.clone()),
         credential_ref: Some(target.credential_ref.clone()),
+        headers: Vec::new(),
     };
     let connection_id = match database
         .find_config(
@@ -151,7 +151,60 @@ pub async fn targets(
                 .await?
         }
     };
-    Ok((pool.into(), profile.into(), pool))
+    Ok((executor, profile.into(), pool))
+}
+
+async fn native_executor(
+    database: &DatabaseHandle,
+    protocol: LlmTransport,
+) -> Result<(ExecutorId, ExecutionPoolId), DatabaseError> {
+    use crate::db::redb::{NativeResource, NativeResourceKind};
+    let mut before = None;
+    loop {
+        let page = database
+            .native_resources(before, 100, NativeResourceKind::Executor)
+            .await?;
+        for resource in page.records {
+            let NativeResource::Executor(executor) = resource else {
+                continue;
+            };
+            if !executor.enabled
+                || !executor
+                    .capabilities
+                    .contains(&(ExecutionOperation::LlmRequest, Some(protocol)))
+            {
+                continue;
+            }
+            let mut pool_before = None;
+            loop {
+                let pools = database
+                    .native_resources(pool_before, 100, NativeResourceKind::Pool)
+                    .await?;
+                for pool in pools.records {
+                    if let NativeResource::Pool(pool) = pool
+                        && pool.id == executor.pool
+                        && pool.enabled
+                    {
+                        return Ok((executor.id, pool.id));
+                    }
+                }
+                match pools.next {
+                    Some(next) => pool_before = Some(next),
+                    None => break,
+                }
+            }
+        }
+        match page.next {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+    Err(DatabaseError::Rejected(
+        crate::db::entities::Violation::InvalidValue(
+            "executor",
+            "no enabled native Executor supports this operation and protocol",
+        ),
+    ))
 }
 
 /// The Agent that has Chat behavior and targets `llm_profile` with no
@@ -218,50 +271,6 @@ pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Er
 /// `control-plane` Executor.
 pub fn control_plane_target() -> Result<Target, Error> {
     Target::from_environment(CONTROL_PLANE, BTreeSet::from([ModelCapability::Chat]))
-}
-
-pub async fn provision_pool(
-    database: &DatabaseHandle,
-    name: &str,
-    protocol: LlmTransport,
-    concurrency: Option<NonZeroU32>,
-) -> Result<ExecutionPoolId, DatabaseError> {
-    let mut before = None;
-    loop {
-        let page = database.execution_pools(before, 1_000).await?;
-        for pool in &page {
-            if pool.enabled
-                && pool
-                    .config
-                    .capabilities
-                    .supports(ExecutionOperation::LlmRequest, Some(protocol))
-                && concurrency.is_none_or(|limit| pool.config.concurrency_limit == limit)
-            {
-                return Ok(pool.id);
-            }
-        }
-        if page.len() < 1_000 {
-            break;
-        }
-        before = page.last().map(|pool| pool.id);
-    }
-    database
-        .create_execution_pool(ExecutionPool {
-            name: name.to_owned(),
-            config: pool_config(protocol, concurrency),
-            enabled: true,
-        })
-        .await
-}
-
-pub fn pool_config(protocol: LlmTransport, concurrency: Option<NonZeroU32>) -> ExecutionPoolConfig {
-    ExecutionPoolConfig {
-        concurrency_limit: concurrency.unwrap_or(NonZeroU32::new(16).expect("nonzero default")),
-        capabilities: CapabilitySet {
-            operations: BTreeSet::from([ExecutionOperation::LlmRequest]),
-            llm_protocols: BTreeSet::from([protocol]),
-        },
-    }
 }
 
 pub(crate) fn protocol_from_environment() -> Result<LlmTransport, Error> {

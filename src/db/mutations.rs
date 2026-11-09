@@ -41,7 +41,28 @@ pub(crate) struct CredentialPayload {
     pub(crate) key: std::sync::Arc<crate::db::redb::CredentialKey>,
 }
 
+/// One request field a save sets. A secret carries its new value; `None`
+/// keeps the secret the Connection already holds for that name.
+pub(crate) enum HeaderEditValue {
+    Plain(String),
+    Secret(Option<CredentialPayload>),
+}
+
+pub(crate) struct HeaderEdit {
+    /// Canonical (lower case) name.
+    pub(crate) name: String,
+    pub(crate) value: HeaderEditValue,
+}
+
+/// How a save treats a Connection's request fields: keep them, or replace the
+/// whole set, so a field left out is deleted.
+pub(crate) enum HeaderChange {
+    Preserve,
+    Replace(Vec<HeaderEdit>),
+}
+
 pub(crate) struct ModelProfileSave {
+    pub(crate) headers: HeaderChange,
     pub(crate) existing_id: Option<ProfileId>,
     pub(crate) name: String,
     pub(crate) connection_name: String,
@@ -54,6 +75,7 @@ pub(crate) struct ModelProfileSave {
 }
 
 pub(crate) struct ImportModelsSave {
+    pub(crate) headers: HeaderChange,
     pub(crate) connection: Config,
     pub(crate) credential_ref: ProfileCredentialRef,
     pub(crate) secret: Option<crate::db::redb::CredentialSecret>,
@@ -223,6 +245,7 @@ pub(crate) fn append_job_output(
     if state.outcome.is_some() {
         return batch.reject(Violation::JobHasTerminalOutcome(job));
     }
+    batch.require_executing_here(job)?;
     let (seq, output_id) = batch.append_output(
         job,
         output.kind.into(),
@@ -250,6 +273,7 @@ pub(crate) fn finalize_job(
     cause: Option<OutcomeCause>,
     ignore_stop_cause: bool,
 ) -> OpResult<Option<AppendedOutput>> {
+    batch.require_legacy_evidence_job(job)?;
     let (kind, result) = match finalization {
         JobFinalization::Unknown => (OutcomeKind::Unknown, None),
         JobFinalization::Completed(result) => (OutcomeKind::Completed, Some(result)),
@@ -371,8 +395,13 @@ pub(crate) fn archive_model(batch: &mut Batch, id: ConfigId) -> OpResult<()> {
 
 /// Edits a config in place: its name and body, with the same kind. The edit
 /// counter rises by one; Jobs that froze the old values keep them.
-pub(crate) fn update_config(batch: &mut Batch, id: ConfigId, config: Config) -> OpResult<()> {
-    batch.update_config(id, config.name, config.body)
+pub(crate) fn update_config(
+    batch: &mut Batch,
+    id: ConfigId,
+    config: Config,
+    expected_edit_seq: u32,
+) -> OpResult<()> {
+    batch.update_config_from(id, config.name, config.body, Some(expected_edit_seq))
 }
 
 /// Registers an Executor: a Pool that offers `LlmRequest` over each of the
@@ -711,6 +740,7 @@ pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) ->
 // ---- request events -------------------------------------------------------------------------
 
 pub(crate) fn record_sent_request(batch: &mut Batch, sent: SentRequest) -> OpResult<()> {
+    batch.require_legacy_evidence_job(sent.job)?;
     if batch.require_job(sent.job)?.kind.is_group() {
         return batch.reject(Violation::NotAnLlmExecution(sent.job));
     }
@@ -773,6 +803,7 @@ pub(crate) fn record_provider_answer(
 /// committed annotations state, so contradictory evidence is refused here, in
 /// the transaction that would write it, rather than met later by a reader.
 pub(crate) fn record_metrics(batch: &mut Batch, metrics: Metrics) -> OpResult<MetricsId> {
+    batch.require_legacy_evidence_job(metrics.job)?;
     let job = batch.require_job(metrics.job)?;
     if metrics.measurements.is_empty() && metrics.token.is_none() {
         return batch.reject(Violation::InvalidValue(
@@ -843,6 +874,7 @@ pub(crate) fn record_availability_stat(
     batch: &mut Batch,
     stat: AvailabilityStat,
 ) -> OpResult<AvailabilityStatId> {
+    batch.require_legacy_evidence_job(stat.job)?;
     let job = batch.require_job(stat.job)?;
     if job.kind.is_group() {
         return batch.reject(Violation::NotAnLlmExecution(stat.job));

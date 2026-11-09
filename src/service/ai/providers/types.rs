@@ -98,6 +98,55 @@ impl CredentialResolver for EnvironmentCredentialResolver {
     }
 }
 
+/// Where a Provider request may be connected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DestinationPolicy {
+    /// The ordinary connector: the destination is whatever the frozen
+    /// endpoint names. Every path that reaches it has already refused an
+    /// endpoint that is not a literal loopback, see
+    /// [`crate::system::http::direct_diagnostic_loopback`].
+    #[default]
+    Standard,
+    /// One operator-approved HTTPS destination, for a manual external trial.
+    /// The connector refuses any other host or port, any address that is not
+    /// public, any scheme but https, and any certificate that does not verify
+    /// for exactly this host.
+    ApprovedHttps {
+        host: String,
+        port: u16,
+        route: ApprovedRoute,
+    },
+}
+
+/// How the connection to an approved destination is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovedRoute {
+    /// OCG resolves the name itself, requires every address to be public,
+    /// and connects to exactly those addresses.
+    Direct,
+    /// An HTTP CONNECT tunnel through one explicitly named loopback proxy.
+    /// The proxy resolves the name and chooses the route: OCG does not look
+    /// the name up and cannot prove the address the proxy reaches. There is
+    /// no fallback to a direct connection.
+    TrustedProxy(LoopbackProxy),
+}
+
+/// The address of a proxy on this machine. It can only be built from a
+/// loopback address, so no remote proxy can be named by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackProxy(std::net::SocketAddr);
+
+impl LoopbackProxy {
+    /// `None` unless `address` is a loopback address with a nonzero port.
+    pub fn new(address: std::net::SocketAddr) -> Option<Self> {
+        (address.ip().is_loopback() && address.port() != 0).then_some(Self(address))
+    }
+
+    pub fn address(self) -> std::net::SocketAddr {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionConfig {
     pub transport: crate::db::entities::LlmTransport,
@@ -106,6 +155,7 @@ pub struct ProviderExecutionConfig {
     pub first_delta_timeout: Option<Duration>,
     pub max_output_bytes: usize,
     pub cancellation: CancellationToken,
+    pub destination: DestinationPolicy,
 }
 
 impl ProviderExecutionConfig {
@@ -133,6 +183,7 @@ impl Default for ProviderExecutionConfig {
             first_delta_timeout: None,
             max_output_bytes: MAX_OUTPUT_BYTES,
             cancellation: CancellationToken::default(),
+            destination: DestinationPolicy::Standard,
         }
     }
 }

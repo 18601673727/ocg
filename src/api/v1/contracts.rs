@@ -235,3 +235,44 @@ pub(crate) fn compaction_policy_view(
         predictive,
     }
 }
+
+/// One custom request header in a save. A plain header carries its value. A
+/// secret header carries a new value, or none to keep the stored one.
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "OutboundHeaderInput")]
+pub(crate) struct OutboundHeaderInput {
+    pub name: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret: bool,
+}
+
+/// A configured custom request header as read back. A secret's value is never
+/// returned: only whether one is stored.
+#[derive(Clone, serde::Serialize, ts_rs::TS)]
+#[ts(rename = "OutboundHeader")]
+pub(crate) struct OutboundHeaderView {
+    pub name: String,
+    pub secret: bool,
+    pub value: Option<String>,
+    pub has_secret: bool,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(rename = "GlobalOutboundHeadersInput")]
+pub(crate) struct GlobalOutboundHeadersInput {
+    pub revision: u32,
+    pub headers: Vec<OutboundHeaderInput>,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "GlobalOutboundHeaders")]
+pub(crate) struct GlobalOutboundHeadersView {
+    pub revision: u32,
+    pub headers: Vec<OutboundHeaderView>,
+    /// The `User-Agent` OCG sends unless a header replaces it.
+    pub default_user_agent: String,
+}

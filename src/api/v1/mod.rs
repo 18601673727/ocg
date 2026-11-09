@@ -61,8 +61,10 @@
 //! - `GET /api/v1/projects`, `POST /api/v1/projects` and
 //!   `POST /api/v1/projects/{project}`: Projects, each a root and the commands
 //!   an Agent may run in it. See [`projects`].
-//! - `GET /api/v1/pools` and `POST /api/v1/pools/{execution_pool}`: every
-//!   Pool, and its concurrency limit or enabled state. See [`pools`].
+//! - `GET /api/v2/pools?before=<pool-uuid>&limit=M` and
+//!   `POST /api/v1/pools/{execution_pool}`: Pools newest first with a cursor
+//!   (`GET /api/v1/pools` is retired and answers 410), and a Pool's capacity or
+//!   enabled state. See [`pools`].
 //! - `POST /api/v1/conversations/{job}`: renames or hides a conversation
 //!   whose root Job is `job`. See [`catalog`].
 //! - `GET /api/v1/jobs/{job}/outputs?after_seq=N&limit=M`: the Job's
@@ -128,9 +130,9 @@ use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
 use serde_json::{Value, json};
 
 use crate::db::entities::{
-    AttachmentId, ExecutionPoolId, JobId, JobOutputRecord, JobRecord, NotInvokedReason, OutputKind,
-    ProfileId, ProjectId, RequestNumber, ToolDecision, ToolEvidenceRecord, ToolOutcome,
-    ToolOutcomeKind, UncertainCause, WithheldReason,
+    AttachmentId, ExecutionPoolId, JobId, JobOutputRecord, NotInvokedReason, OutputKind, ProfileId,
+    ProjectId, RequestNumber, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind,
+    UncertainCause, WithheldReason,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::system::scheduler::SchedulerHandle;
@@ -145,6 +147,7 @@ mod dashboard;
 mod events;
 mod jobs;
 mod listener;
+mod mutable_jobs;
 mod outputs;
 mod pools;
 mod profiles;

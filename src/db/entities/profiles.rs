@@ -271,6 +271,19 @@ impl AgentConfig {
     pub fn manages_jobs(&self) -> bool {
         self.capabilities.contains(&AgentCapability::Chat)
     }
+    /// Whether this Agent may run a Generative Job at all: it chats or codes.
+    /// An Agent with only the Decision capability runs typed Decision work.
+    pub fn runs_generative(&self) -> bool {
+        self.manages_jobs() || self.workspace_grant().is_some()
+    }
+    /// Whether the checked single-request execution may run a Job for this
+    /// Agent. Chat capability is a permission the full runtime exercises by
+    /// offering Job tools; the single-request execution offers no tool, so
+    /// holding it grants nothing there. A Workspace grant is refused because
+    /// that execution has no Workspace.
+    pub fn permits_single_request(&self) -> bool {
+        self.manages_jobs() && self.workspace_grant().is_none()
+    }
     pub fn supports_model(&self, body: &ConfigBody) -> bool {
         !self.capabilities.is_empty()
             && self.capabilities.iter().all(|capability| match body {
@@ -347,11 +360,27 @@ pub enum ConfigKind {
     DecisionAgent = 6,
 }
 
+impl ConnectionConfig {
+    /// Every credential this Connection names: its own, and those holding its
+    /// secret header values.
+    pub fn credential_refs(&self) -> impl Iterator<Item = &str> {
+        self.credential_ref
+            .as_deref()
+            .into_iter()
+            .chain(self.headers.iter().filter_map(|field| match &field.value {
+                OutboundHeaderValue::Secret(reference) => Some(reference.as_str()),
+                OutboundHeaderValue::Plain(_) => None,
+            }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionConfig {
     pub protocol: LlmTransport,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
+    /// Custom request fields, in name order; see [`super::headers`].
+    pub headers: Vec<OutboundHeader>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -426,6 +455,7 @@ pub struct ProviderSnapshot {
     pub transport: LlmTransport,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
+    pub headers: FrozenHeaders,
 }
 
 /// A config row and the edit counter it had when a Job froze its values.
@@ -453,6 +483,31 @@ pub struct FrozenExecutionConfig {
     /// The Agent config `agent` came from.
     pub agent_ref: Option<ConfigRef>,
     pub llm: FrozenLlmConfig,
+}
+
+impl FrozenExecutionConfig {
+    /// Why this configuration can never run as the checked single-request
+    /// Generative execution, or `None` when it can. Every fact here is frozen
+    /// with the Job, so admission, handoff and the start transaction all ask
+    /// this one question and cannot disagree.
+    pub fn single_request_refusal(&self) -> Option<&'static str> {
+        match &self.agent {
+            None => return Some("an Agent is required"),
+            Some(agent) if !agent.permits_single_request() => {
+                return Some(
+                    "the Agent must have the chat capability and no Workspace grant for a Generative Job",
+                );
+            }
+            Some(_) => {}
+        }
+        if self.llm.provider.transport != LlmTransport::OpenAiChatCompletions {
+            return Some("single-request execution requires the OpenAI Chat Completions protocol");
+        }
+        if self.llm.config.context_window.is_none() {
+            return Some("single-request execution requires the Model to declare a context window");
+        }
+        None
+    }
 }
 
 /// A submitted Job's configuration: the Agent and Model configs it was
@@ -602,6 +657,7 @@ pub struct NativeDecisionConfig {
     pub connection_ref: ConfigRef,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
+    pub headers: FrozenHeaders,
 }
 
 #[derive(Clone, Debug, PartialEq)]

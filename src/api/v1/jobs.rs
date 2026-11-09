@@ -1,6 +1,4 @@
-use super::*;
-
-#[derive(serde::Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename = "SettlementState")]
 pub(crate) enum SettlementState {
@@ -11,7 +9,7 @@ pub(crate) enum SettlementState {
     Unknown,
 }
 
-#[derive(serde::Serialize, ts_rs::TS)]
+#[derive(Clone, serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Settlement")]
 pub(crate) struct SettlementView {
     state: SettlementState,
@@ -24,6 +22,24 @@ pub(crate) struct SettlementView {
 pub(crate) enum JobKindView {
     Conversation,
     Turn,
+}
+
+/// Where a native Job is in its execution, derived from its outcome, its
+/// phase and its Allocation. `stop_requested` and `unknown` are not stopped:
+/// only a confirmed stop is.
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "ExecutionPhase")]
+pub(crate) enum ExecutionPhaseView {
+    Unsubmitted,
+    Queued,
+    Reserved,
+    Running,
+    StopRequested,
+    Unknown,
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -48,6 +64,7 @@ pub(crate) struct JobView {
     paused_at_us: Option<i64>,
     sterilized_at_us: Option<i64>,
     settlement: SettlementView,
+    execution_phase: ExecutionPhaseView,
     stop_confirmed_at_us: Option<i64>,
 }
 
@@ -68,57 +85,190 @@ pub(crate) struct JobDetailsView {
     pub(super) activity: crate::db::entities::JobActivity,
     pub(super) task_plan: Option<crate::db::entities::JobPlanView>,
     pub(super) unknown_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub(super) allocation: Option<AllocationView>,
 }
 
-/// The Job's settlement: the one outcome its record holds, or none yet; a
-/// record holding more than one is not described at all.
-pub(super) fn settlement_view(record: &JobRecord) -> Result<SettlementView, Refusal> {
-    let outcomes = [
-        (SettlementState::Completed, record.completed_at),
-        (SettlementState::Failed, record.failed_at),
-        (SettlementState::Cancelled, record.cancelled_at),
-        (SettlementState::Unknown, record.unknown_at),
-    ]
-    .into_iter()
-    .filter_map(|(state, at)| at.map(|at| (state, at)))
-    .collect::<Vec<_>>();
-    let mut outcomes = outcomes.into_iter();
-    let (state, settled_at_us) = match outcomes.next() {
-        None => (SettlementState::Unsettled, None),
-        Some((state, at)) => (state, Some(at.as_unix_micros())),
-    };
-    if outcomes.next().is_some() {
-        return Err(INCONSISTENT_RECORD);
-    }
-    Ok(SettlementView {
-        state,
-        settled_at_us,
-    })
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "AllocationPhase")]
+enum AllocationPhaseView {
+    Reserved,
+    Running,
+    StopRequested,
+    Uncertain,
+    Released,
 }
 
-pub(super) fn job_view(record: &JobRecord) -> Result<JobView, Refusal> {
-    Ok(JobView {
-        id: record.id.to_string(),
-        parent: record.parent_id.map(|id| id.to_string()),
-        name: record.name.clone(),
-        title: record.objective.clone(),
-        is_chat: record.group.is_some(),
-        execution_mode: "once".to_owned(),
-        input: record.input.to_string(),
-        previous: record.previous.map(|id| id.to_string()),
-        kind: if record.kind.is_group() {
-            JobKindView::Conversation
-        } else {
-            JobKindView::Turn
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "Allocation")]
+pub(super) struct AllocationView {
+    pool: String,
+    executor: String,
+    generation: u32,
+    job_revision: u64,
+    phase: AllocationPhaseView,
+    holds_capacity: bool,
+}
+
+pub(super) fn allocation_view(allocation: &crate::db::entities::PoolAllocation) -> AllocationView {
+    use crate::db::entities::AllocationPhase;
+    AllocationView {
+        pool: allocation.token.pool.to_string(),
+        executor: allocation.token.executor.to_string(),
+        generation: allocation.token.generation.get(),
+        job_revision: allocation.job_revision,
+        phase: match allocation.phase {
+            AllocationPhase::Reserved => AllocationPhaseView::Reserved,
+            AllocationPhase::Running => AllocationPhaseView::Running,
+            AllocationPhase::StopRequested => AllocationPhaseView::StopRequested,
+            AllocationPhase::Uncertain => AllocationPhaseView::Uncertain,
+            AllocationPhase::Released => AllocationPhaseView::Released,
         },
-        conversation: record.group.map(|id| id.to_string()),
-        assigned_executor: record.assigned_executor.map(|id| id.to_string()),
-        created_at_us: record.created_at.as_unix_micros(),
-        updated_at_us: record.updated_at.as_unix_micros(),
-        started_at_us: record.started_at.map(|at| at.as_unix_micros()),
+        holds_capacity: allocation.holds_capacity(),
+    }
+}
+
+impl JobView {
+    /// What an events stream announces the Job again for: its settlement and
+    /// its confirmed stop.
+    pub(super) fn lifecycle(&self) -> [Option<i64>; 4] {
+        [
+            Some(self.execution_phase as i64),
+            Some(self.settlement.state as i64),
+            self.settlement.settled_at_us,
+            self.stop_confirmed_at_us,
+        ]
+    }
+
+    /// Whether the Job concluded: an outcome that is final, or an unknown
+    /// one whose local execution was confirmed stopped.
+    pub(super) fn concluded(&self) -> bool {
+        match self.settlement.state {
+            SettlementState::Completed | SettlementState::Failed | SettlementState::Cancelled => {
+                true
+            }
+            SettlementState::Unknown => self.stop_confirmed_at_us.is_some(),
+            SettlementState::Unsettled => false,
+        }
+    }
+
+    pub(super) fn settlement(&self) -> SettlementView {
+        self.settlement.clone()
+    }
+
+    pub(super) fn stop_confirmed_at_us(&self) -> Option<i64> {
+        self.stop_confirmed_at_us
+    }
+}
+
+pub(super) fn jobs_page_view(page: &crate::db::redb::JobSearchPage) -> JobsView {
+    JobsView {
+        jobs: page
+            .items
+            .iter()
+            .map(|item| {
+                mutable_job_view(&item.record, item.allocation.as_ref(), item.updated_at_us)
+            })
+            .collect(),
+        next_before: page.next_before.map(|id| id.to_string()),
+        has_more: page.has_more,
+    }
+}
+
+/// The display title of a native Job: the first 80 characters of its
+/// Generative text, or of its Decision question prompt.
+pub(super) fn mutable_title(job: &crate::db::entities::MutableJob) -> String {
+    match &job.input.content {
+        crate::db::entities::MutableJobContent::Generative { text, .. } => text.as_str(),
+        crate::db::entities::MutableJobContent::Decision { request, .. } => {
+            request.question.prompt()
+        }
+    }
+    .chars()
+    .take(80)
+    .collect()
+}
+
+/// Derives the execution phase. A settled outcome wins; otherwise a live
+/// Allocation says how far execution got, and a Job without one is where its
+/// own phase says.
+fn execution_phase(
+    record: &crate::db::entities::MutableJobRecord,
+    allocation: Option<&crate::db::entities::PoolAllocation>,
+) -> ExecutionPhaseView {
+    use crate::db::entities::{AllocationPhase, MutableJobPhase, OutcomeKind};
+    if let Some(outcome) = &record.outcome {
+        return match outcome.kind {
+            OutcomeKind::Completed => ExecutionPhaseView::Completed,
+            OutcomeKind::Failed => ExecutionPhaseView::Failed,
+            OutcomeKind::Cancelled => ExecutionPhaseView::Cancelled,
+            OutcomeKind::Unknown => ExecutionPhaseView::Unknown,
+        };
+    }
+    match allocation.map(|allocation| allocation.phase) {
+        Some(AllocationPhase::Reserved) => ExecutionPhaseView::Reserved,
+        Some(AllocationPhase::Running) => ExecutionPhaseView::Running,
+        Some(AllocationPhase::StopRequested) => ExecutionPhaseView::StopRequested,
+        Some(AllocationPhase::Uncertain) => ExecutionPhaseView::Unknown,
+        Some(AllocationPhase::Released) | None => match record.job.phase {
+            MutableJobPhase::Unsubmitted => ExecutionPhaseView::Unsubmitted,
+            MutableJobPhase::Queued => ExecutionPhaseView::Queued,
+            MutableJobPhase::Executing => ExecutionPhaseView::Running,
+        },
+    }
+}
+
+pub(super) fn mutable_job_view(
+    record: &crate::db::entities::MutableJobRecord,
+    allocation: Option<&crate::db::entities::PoolAllocation>,
+    updated_at_us: i64,
+) -> JobView {
+    use crate::db::entities::OutcomeKind;
+    let job = &record.job;
+    let settlement = match &record.outcome {
+        None => SettlementView {
+            state: SettlementState::Unsettled,
+            settled_at_us: None,
+        },
+        Some(outcome) => SettlementView {
+            state: match outcome.kind {
+                OutcomeKind::Completed => SettlementState::Completed,
+                OutcomeKind::Failed => SettlementState::Failed,
+                OutcomeKind::Cancelled => SettlementState::Cancelled,
+                OutcomeKind::Unknown => SettlementState::Unknown,
+            },
+            settled_at_us: Some(outcome.at.as_unix_micros()),
+        },
+    };
+    JobView {
+        id: job.id.to_string(),
+        parent: Some(job.parent_id.to_string()),
+        name: None,
+        title: Some(mutable_title(job)).filter(|title| !title.is_empty()),
+        is_chat: true,
+        execution_mode: "once".to_owned(),
+        input: job.id.to_string(),
+        previous: job.previous.map(|id| id.to_string()),
+        kind: JobKindView::Turn,
+        conversation: Some(job.parent_id.to_string()),
+        assigned_executor: None,
+        created_at_us: job.created_at.as_unix_micros(),
+        updated_at_us,
+        // Only a committed start is a start; a reservation or a queue time is not.
+        started_at_us: allocation
+            .and_then(|allocation| allocation.started_at)
+            .map(|time| time.as_unix_micros()),
         paused_at_us: None,
-        sterilized_at_us: record.children_closed_at.map(|at| at.as_unix_micros()),
-        settlement: settlement_view(record)?,
-        stop_confirmed_at_us: record.stop_confirmed_at.map(|at| at.as_unix_micros()),
-    })
+        sterilized_at_us: record
+            .outcome
+            .as_ref()
+            .map(|outcome| outcome.at.as_unix_micros()),
+        settlement,
+        execution_phase: execution_phase(record, allocation),
+        stop_confirmed_at_us: allocation
+            .and_then(|allocation| allocation.stop_confirmed_at)
+            .map(|time| time.as_unix_micros()),
+    }
 }

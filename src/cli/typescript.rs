@@ -106,6 +106,8 @@ pub fn typescript() -> String {
     declarations.visit::<crate::api::v1::OutputEventView>();
     declarations.visit::<crate::api::v1::SettlementEventView>();
     declarations.visit::<crate::api::v1::contracts::GlobalCompactionSettingsInput>();
+    declarations.visit::<crate::api::v1::contracts::GlobalOutboundHeadersInput>();
+    declarations.visit::<crate::api::v1::contracts::GlobalOutboundHeadersView>();
     declarations
         .output
         .remove(&Value::ident(&declarations.config));

@@ -58,6 +58,76 @@ pub(crate) enum ProviderSettlementEvidence {
 }
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
+
+/// A first-attempt permit is returned only when the worker proves no commit.
+#[allow(dead_code)]
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum DevelopmentReservationError {
+    #[error("reservation was not committed: {error}")]
+    DefinitelyNotCommitted {
+        error: Box<DatabaseError>,
+        fresh: entities::DevelopmentFreshReservation,
+    },
+    #[error(transparent)]
+    Other(DatabaseError),
+}
+
+/// Reconcile a reservation request against a stopped database without opening a worker.
+/// Access is restricted to trusted internal components and filesystem access.
+#[allow(dead_code)]
+pub(crate) async fn reconcile_development_reservation_offline(
+    directory: PathBuf,
+    request: entities::DevelopmentReservationRequest,
+) -> Result<entities::DevelopmentReservationReconciliation, DatabaseError> {
+    if !redb::valid_reservation_request_id(request.id) {
+        return Err(DatabaseError::Rejected(entities::Violation::InvalidValue(
+            "reservation_request",
+            "expected a UUIDv7 request identity",
+        )));
+    }
+    ntex::rt::spawn_blocking(move || {
+        redb::reconcile_development_reservation_offline(&redb::database_file(&directory), request)
+    })
+    .await
+    .map_err(|_| DatabaseError::ReadInterrupted)?
+    .map_err(DatabaseError::Read)
+}
+/// Read-only inspection of the Allocations a stopped database still holds; see `redb::inspect_held_allocations_offline`.
+pub(crate) fn inspect_held_allocations_offline(
+    directory: &std::path::Path,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::inspect_held_allocations_offline(directory).map_err(DatabaseError::Read)
+}
+
+/// Offline integrity check of a stopped database that never opens it for
+/// writing; see `redb::verify_offline`.
+pub(crate) fn verify_offline(
+    directory: &std::path::Path,
+    pages: bool,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::verify_offline(directory, pages).map_err(DatabaseError::Read)
+}
+
+pub(crate) use redb::{DATABASE_FILE_NAME, ReservedRefusal};
+
+/// Decides on a private copy whether a Job is a Reserved Allocation that
+/// never started; see `redb::reconcile_reserved_preflight`.
+pub(crate) fn reconcile_reserved_preflight(
+    copy: std::fs::File,
+    job: entities::JobId,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    redb::reconcile_reserved_preflight(copy, job)
+}
+
+/// Ends an unstarted Reservation on a private copy and verifies the copy
+/// completely; see `redb::reconcile_reserved_apply`.
+pub(crate) fn reconcile_reserved_apply(
+    copy: std::fs::File,
+    job: entities::JobId,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    redb::reconcile_reserved_apply(copy, job)
+}
+
 /// The most queued commands one group commit covers. Commands that queue up
 /// while the worker is busy form a group without any waiting, so a lone
 /// command is never delayed. A group is also the most commands whose outcome
@@ -105,6 +175,10 @@ mod commands;
 pub(crate) use commands::serialized_len;
 mod errors;
 mod handle;
+pub(crate) use handle::{
+    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentPreviewError,
+    PreparedDevelopmentHandoff,
+};
 mod scheduler_wake;
 mod shared;
 

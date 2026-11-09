@@ -37,7 +37,7 @@ impl Batch {
             };
             if !agent.models.contains(&model)
                 || !agent.supports_model(&record.body)
-                || (!agent.manages_jobs() && agent.workspace_grant().is_none())
+                || !agent.runs_generative()
             {
                 return self.reject(Violation::InvalidValue(
                     "dispatch_selection",

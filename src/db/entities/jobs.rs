@@ -94,6 +94,126 @@ pub struct ExecutionConfiguration {
     pub llm_profile: ProfileId,
 }
 
+/// The user-authored input owned by a mutable Job in the new storage model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MutableJobInput {
+    pub priority: JobQueuePriority,
+    pub content: MutableJobContent,
+}
+
+/// The request belongs to the Job; its operation is never inferred from text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MutableJobContent {
+    Generative {
+        text: String,
+        attachments: Vec<AttachmentId>,
+        configuration: Option<ExecutionConfiguration>,
+    },
+    Decision {
+        request: DecisionRequest,
+        profile: ConfigId,
+        /// Configuration revisions observed when this Job input was accepted.
+        references: Vec<ConfigRef>,
+    },
+}
+
+impl MutableJobInput {
+    pub fn size_hint(&self) -> usize {
+        match &self.content {
+            MutableJobContent::Generative {
+                text, attachments, ..
+            } => text
+                .len()
+                .saturating_add(attachments.len().saturating_mul(16)),
+            MutableJobContent::Decision { request, .. } => {
+                crate::db::serialized_len(request).unwrap_or(usize::MAX)
+            }
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        match &self.content {
+            MutableJobContent::Generative { text, .. } => text,
+            MutableJobContent::Decision { .. } => "",
+        }
+    }
+
+    pub fn attachments(&self) -> &[AttachmentId] {
+        match &self.content {
+            MutableJobContent::Generative { attachments, .. } => attachments,
+            MutableJobContent::Decision { .. } => &[],
+        }
+    }
+
+    pub fn configuration(&self) -> Option<ExecutionConfiguration> {
+        match &self.content {
+            MutableJobContent::Generative { configuration, .. } => *configuration,
+            MutableJobContent::Decision { .. } => None,
+        }
+    }
+}
+
+/// The context requested by the Job. An adopted summary is not execution
+/// authority: its producer and sealed source still require validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutableContextSelection {
+    FullHistory,
+    AdoptedSummary {
+        producer: JobId,
+        source: super::ContentDigest,
+    },
+}
+
+/// Matches the existing foreground, automatic and speculative priority classes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobQueuePriority {
+    Foreground,
+    Automatic,
+    Speculative,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutableJobPhase {
+    Unsubmitted,
+    Queued,
+    Executing,
+}
+
+/// Configuration frozen at the checked execution-start boundary.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum MutableFrozenConfiguration {
+    Generative(FrozenExecutionConfig),
+    Decision(NativeDecisionConfig),
+}
+
+/// The Job row is the sole owner of editable input and its revision.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MutableJob {
+    pub id: JobId,
+    pub parent_id: JobId,
+    pub previous: Option<JobId>,
+    pub composer_context: ComposerContextId,
+    pub created_at: Timestamp,
+    pub submitted_at: Option<Timestamp>,
+    pub revision: u64,
+    pub phase: MutableJobPhase,
+    pub input: MutableJobInput,
+    pub context_selection: MutableContextSelection,
+    /// A summary-producing Job is authorized for exactly this sealed source.
+    /// Ordinary mutable Jobs have no summary-producing role.
+    pub summary_source: Option<super::ContentDigest>,
+    pub frozen: Option<MutableFrozenConfiguration>,
+}
+
+/// The terminal outcome remains owned by Job state and is read with the Job.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MutableJobRecord {
+    pub job: MutableJob,
+    pub outcome: Option<OutcomeRecord>,
+    pub project: Option<ProjectId>,
+}
+
 /// `value` carries a machine-readable payload, such as the conclusion of a
 /// capability check. It is published as given and never changes the Job's
 /// outcome.
@@ -234,6 +354,15 @@ pub enum DecisionQuestion {
 }
 
 impl DecisionQuestion {
+    /// The question as the asker worded it.
+    pub fn prompt(&self) -> &str {
+        match self {
+            Self::Choice { prompt, .. }
+            | Self::BinaryProbability { prompt }
+            | Self::OrdinalScore { prompt, .. } => prompt,
+        }
+    }
+
     pub fn capability(&self) -> DecisionCapability {
         match self {
             Self::Choice { .. } => DecisionCapability::Choice,
@@ -666,8 +795,102 @@ pub enum OutcomeCause {
     Text(String),
     Abandoned,
     DependencyImpossible,
-    Stopped { record: u32 },
+    Stopped {
+        record: u32,
+    },
     Closed,
+    /// Why an execution is Unknown. It records what this process could not
+    /// establish; it never says the remote work stopped.
+    Uncertain(UncertaintyReason),
+}
+
+/// The local reason an execution's outcome is uncertain. Every reason keeps
+/// the Allocation: none of them is evidence that remote work ended, was
+/// refused, or incurred no charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)] // Reasons are recorded only where this process observes them.
+pub enum UncertaintyReason {
+    /// The local execution task was dropped or lost before it returned.
+    LocalExecutionDropped,
+    /// The request may have left this process; no response head was seen.
+    RequestPossiblySent,
+    /// The connection or stream failed after the request may have been delivered.
+    ConnectionInterrupted,
+    /// A response arrived but was incomplete, refused, or not provably a refusal.
+    ResponseIncompleteOrInvalid,
+    /// A worker acknowledgement is pending or its outcome is ambiguous.
+    WorkerAckPendingOrAmbiguous,
+    /// A stop was requested locally; termination was never confirmed.
+    StopRequestedWithoutConfirmedTermination,
+    /// None of the above could be established.
+    Unclassified,
+}
+
+impl UncertaintyReason {
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::LocalExecutionDropped => 1,
+            Self::RequestPossiblySent => 2,
+            Self::ConnectionInterrupted => 3,
+            Self::ResponseIncompleteOrInvalid => 4,
+            Self::WorkerAckPendingOrAmbiguous => 5,
+            Self::StopRequestedWithoutConfirmedTermination => 6,
+            Self::Unclassified => 7,
+        }
+    }
+
+    pub const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::LocalExecutionDropped),
+            2 => Some(Self::RequestPossiblySent),
+            3 => Some(Self::ConnectionInterrupted),
+            4 => Some(Self::ResponseIncompleteOrInvalid),
+            5 => Some(Self::WorkerAckPendingOrAmbiguous),
+            6 => Some(Self::StopRequestedWithoutConfirmedTermination),
+            7 => Some(Self::Unclassified),
+            _ => None,
+        }
+    }
+
+    /// What is known, for display. No reason says the remote work stopped,
+    /// was refused, or incurred no charge.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::LocalExecutionDropped => {
+                "The local execution task was lost before it returned; whether the Provider received the request is unknown."
+            }
+            Self::RequestPossiblySent => {
+                "The request may have reached the Provider and no response was seen; the Provider may still be working or may have charged."
+            }
+            Self::ConnectionInterrupted => {
+                "The connection failed after the request may have been delivered; the Provider may still be working or may have charged."
+            }
+            Self::ResponseIncompleteOrInvalid => {
+                "A response arrived but was incomplete or not provably a refusal; the Provider may have done work or charged."
+            }
+            Self::WorkerAckPendingOrAmbiguous => {
+                "A worker acknowledgement is pending or ambiguous; whether the work stopped is unknown."
+            }
+            Self::StopRequestedWithoutConfirmedTermination => {
+                "A stop was requested locally but termination was never confirmed."
+            }
+            Self::Unclassified => "The reason the outcome is uncertain could not be established.",
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalExecutionDropped => "local_execution_dropped",
+            Self::RequestPossiblySent => "request_possibly_sent",
+            Self::ConnectionInterrupted => "connection_interrupted",
+            Self::ResponseIncompleteOrInvalid => "response_incomplete_or_invalid",
+            Self::WorkerAckPendingOrAmbiguous => "worker_ack_pending_or_ambiguous",
+            Self::StopRequestedWithoutConfirmedTermination => {
+                "stop_requested_without_confirmed_termination"
+            }
+            Self::Unclassified => "unclassified",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

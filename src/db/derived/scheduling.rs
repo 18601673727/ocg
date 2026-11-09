@@ -1,18 +1,22 @@
 use crate::db::entities::{
-    JobOutputRecord, JobRecord, OutcomeKind, RequestEventRecord, RequestNumber, RequestPayload,
-    ToolDecision, ToolEvidenceRecord,
+    JobOutputRecord, MutableJobPhase, MutableJobRecord, OutcomeKind, PoolAllocation,
+    RequestEventRecord, RequestNumber, RequestPayload, ToolDecision, ToolEvidenceRecord,
 };
 
 #[derive(serde::Serialize, ts_rs::TS, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum JobActivityPhase {
+    Unsubmitted,
     Queued,
     Starting,
     WaitingForProvider,
     RunningTools,
     WaitingForUser,
     RateLimited,
+    // Part of the generated wire contract; native Jobs never plan tasks.
+    #[allow(dead_code)]
     RunningTasks,
+    #[allow(dead_code)]
     Synthesizing,
     Completed,
     Failed,
@@ -30,6 +34,12 @@ pub(crate) struct JobActivity {
     pub(in crate::db) last_output_seq: i64,
     pub(in crate::db) provider_status: Option<u16>,
     pub(in crate::db) tool: Option<String>,
+}
+
+impl JobActivity {
+    pub(crate) fn last_activity_at_us(&self) -> i64 {
+        self.last_activity_at_us
+    }
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -51,19 +61,6 @@ pub(crate) struct JobPlanView {
     pub(in crate::db) steps: Vec<JobPlanStepView>,
 }
 
-impl JobActivityPhase {
-    pub(in crate::db) fn for_plan(job: &JobRecord) -> Self {
-        match job.outcome.as_ref().map(|outcome| outcome.kind) {
-            Some(OutcomeKind::Completed) => Self::Completed,
-            Some(OutcomeKind::Failed) => Self::Failed,
-            Some(OutcomeKind::Cancelled) => Self::Cancelled,
-            Some(OutcomeKind::Unknown) => Self::Unknown,
-            None if job.started_at.is_some() => Self::RunningTools,
-            None => Self::Queued,
-        }
-    }
-}
-
 pub(in crate::db) struct ActivityProjection {
     activity: JobActivity,
     received: bool,
@@ -75,15 +72,29 @@ pub(in crate::db) struct ActivityProjection {
 }
 
 impl ActivityProjection {
-    pub(in crate::db) fn new(job: &JobRecord, latest_output: Option<&JobOutputRecord>) -> Self {
+    pub(in crate::db) fn new_mutable(
+        record: &MutableJobRecord,
+        allocation: Option<&PoolAllocation>,
+        latest_output: Option<&JobOutputRecord>,
+    ) -> Self {
+        let updated = [
+            Some(record.job.created_at),
+            record.job.submitted_at,
+            record.outcome.as_ref().map(|outcome| outcome.at),
+            allocation.map(|allocation| allocation.claimed_at),
+            allocation.and_then(|allocation| allocation.stop_confirmed_at),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|time| time.as_unix_micros())
+        .max()
+        .unwrap_or(0);
         Self {
             activity: JobActivity {
                 phase: JobActivityPhase::Starting,
                 request: None,
                 request_started_at_us: None,
-                last_activity_at_us: job
-                    .updated_at
-                    .as_unix_micros()
+                last_activity_at_us: updated
                     .max(latest_output.map_or(0, |output| output.created_at.as_unix_micros())),
                 last_output_at_us: latest_output.map(|output| output.created_at.as_unix_micros()),
                 last_output_seq: latest_output.map_or(0, |output| output.seq),
@@ -94,7 +105,10 @@ impl ActivityProjection {
             rate_limited: false,
             waiting_user: false,
             latest_request: None,
-            unknown_done: job.unknown_at.is_none(),
+            unknown_done: !record
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown),
             unknown_reason: None,
         }
     }
@@ -174,14 +188,34 @@ impl ActivityProjection {
         }
     }
 
-    pub(in crate::db) fn finish(mut self, job: &JobRecord) -> (JobActivity, Option<String>) {
-        self.activity.phase = match job.outcome.as_ref().map(|outcome| outcome.kind) {
+    pub(in crate::db) fn finish_mutable(
+        self,
+        job: &MutableJobRecord,
+    ) -> (JobActivity, Option<String>) {
+        let result = self.finish_state(
+            job.outcome.as_ref().map(|outcome| outcome.kind),
+            job.job.phase == MutableJobPhase::Executing,
+        );
+        if job.job.phase == MutableJobPhase::Unsubmitted && job.outcome.is_none() {
+            let (mut activity, reason) = result;
+            activity.phase = JobActivityPhase::Unsubmitted;
+            return (activity, reason);
+        }
+        result
+    }
+
+    fn finish_state(
+        mut self,
+        outcome: Option<OutcomeKind>,
+        started: bool,
+    ) -> (JobActivity, Option<String>) {
+        self.activity.phase = match outcome {
             Some(OutcomeKind::Completed) if self.waiting_user => JobActivityPhase::WaitingForUser,
             Some(OutcomeKind::Completed) => JobActivityPhase::Completed,
             Some(OutcomeKind::Failed) => JobActivityPhase::Failed,
             Some(OutcomeKind::Cancelled) => JobActivityPhase::Cancelled,
             Some(OutcomeKind::Unknown) => JobActivityPhase::Unknown,
-            None if job.started_at.is_none() => JobActivityPhase::Queued,
+            None if !started => JobActivityPhase::Queued,
             None if self.activity.tool.is_some() => JobActivityPhase::RunningTools,
             None if self.rate_limited => JobActivityPhase::RateLimited,
             None if self.activity.request_started_at_us.is_some() && !self.received => {

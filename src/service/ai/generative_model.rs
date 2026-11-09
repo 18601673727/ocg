@@ -20,7 +20,7 @@ use super::providers::{
     unannounced_fact,
 };
 use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters};
-use crate::system::http::{authorization, provider_client};
+use crate::system::http::{authorization, provider_client_for};
 
 const STREAM_OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
 const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
@@ -232,7 +232,8 @@ async fn exchange(
     )?;
 
     let credential = resolver.resolve(provider.credential_ref.as_deref()).await?;
-    let redactor = Redactor::new(credential.as_deref());
+    let headers = crate::system::http::resolve_request_headers(&provider.headers, resolver).await?;
+    let redactor = Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
     let authorization = credential
         .as_deref()
         .map(if anthropic {
@@ -261,7 +262,7 @@ async fn exchange(
         }
     };
     let head_timeout = config.first_delta_timeout.unwrap_or(config.timeout);
-    let client = provider_client(head_timeout).await?;
+    let client = provider_client_for(head_timeout, &config.destination, &endpoint).await?;
     let session = endpoint
         .parse::<ntex::http::Uri>()
         .ok()
@@ -272,8 +273,8 @@ async fn exchange(
         .and(config.session_id)
         .map(|id| format!("ocg-{}", id.get()));
 
-    let request = client
-        .post(endpoint)
+    let request = headers
+        .apply(client.post(endpoint))
         .set_header(CONTENT_TYPE, "application/json")
         .set_header(ACCEPT, "text/event-stream")
         .set_header("Cache-Control", "no-cache")
