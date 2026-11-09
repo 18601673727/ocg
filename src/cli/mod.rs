@@ -1,11 +1,15 @@
 use crate::api::v1::ControlPlaneConfig;
 use crate::system::data_directory::DataDirectory;
 
+mod inspect_held;
 mod llm_target;
+#[cfg(unix)]
+mod reconcile_reserved;
 mod release_slot;
 pub mod typescript;
 #[cfg(unix)]
 mod update;
+mod verify;
 
 /// Without arguments, runs until a graceful shutdown signal (SIGINT,
 /// SIGTERM, SIGQUIT or SIGHUP), then stops in the reverse order of starting;
@@ -24,6 +28,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "help" || command == "--help" || command == "-h" {
             println!("{}", usage());
             return Ok(());
+        }
+        if command == "inspect-held" {
+            return inspect_held::run(arguments.collect());
+        }
+        #[cfg(unix)]
+        if command == "reconcile-reserved" {
+            return reconcile_reserved::run(arguments.collect());
+        }
+        if command == "verify" {
+            return verify::run(arguments.collect());
         }
         #[cfg(unix)]
         if command == "update" {
@@ -75,6 +89,10 @@ fn usage() -> &'static str {
      Commands:\n\
        update [--check] [--version X.Y.Z] [--yes]\n\
        release-slot <job> [--yes]\n\
+       inspect-held <data-directory>            (read-only)\n\
+       verify <data-directory> [--pages]        (offline integrity check; never writes the original)\n\
+       reconcile-reserved <data-directory> <job> --confirm-no-start\n\
+         (offline: ends one crash-surviving Reserved Allocation that never started; works on a copy, keeps a rollback artifact)\n\
        register-llm\n\
        help, --help, -h\n\
        --version, -V"
