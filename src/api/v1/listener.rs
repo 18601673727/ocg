@@ -167,10 +167,17 @@ impl ControlPlane {
     ///
     /// Returns [`StopError::Panicked`] when the listener's thread panicked.
     pub async fn stop(self) -> Result<(), StopError> {
+        use ntex::util::{Either, select};
         self.shared.closing.store(true, Ordering::SeqCst);
-        self.server.stop(true).await;
-        self.finished
-            .await
+        // A server with signals also stops itself on the signal that stops
+        // the host. When it has finished first, the stop asked for here is
+        // never answered, so the server's own end is what is waited for.
+        let mut finished = std::pin::pin!(self.finished);
+        let joined = match select(self.server.stop(true), finished.as_mut()).await {
+            Either::Left(()) => finished.await,
+            Either::Right(joined) => joined,
+        };
+        joined
             .map_err(|_| StopError::Panicked)?
             .map_err(StopError::Serve)
     }
