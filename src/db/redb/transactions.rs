@@ -1944,14 +1944,16 @@ impl Batch {
 
     /// Select and reserve in one writer transaction. The cursor limits work per
     /// request; a new traversal starts at the head of the authoritative index.
+    /// `selection` says which ready Jobs this pass may take; see
+    /// [`crate::db::entities::ReadySelection`].
     pub(crate) fn reserve_next_development_job(
         &mut self,
         request: crate::db::entities::DevelopmentReservationRequest,
         is_new: bool,
-        only: Option<JobId>,
+        selection: crate::db::entities::ReadySelection,
     ) -> Result<crate::db::entities::DevelopmentReservation, BatchError> {
         use crate::db::entities::{
-            DevelopmentReadyCursor, DevelopmentReservation, MutableJobPhase,
+            DevelopmentReadyCursor, DevelopmentReservation, MutableJobPhase, ReadySelection,
         };
         use std::ops::Bound::{Excluded, Unbounded};
 
@@ -2013,6 +2015,33 @@ impl Batch {
                 "Executor is not eligible",
             ));
         }
+        if matches!(selection, ReadySelection::SingleRequestGenerative { .. }) {
+            // The scheduler never waits on capacity inside a transaction and
+            // never scans for an Executor that could not take a Job: a busy
+            // Executor, a full Pool or the global limit refuses the pass
+            // here, before any ready entry is read. A refusal, unlike
+            // `Exhausted`, says nothing about the ready index.
+            let room = self.step(|tx| {
+                let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
+                if active.len()? >= u64::from(GLOBAL_EXECUTION_LIMIT) {
+                    return Ok(false);
+                }
+                let held = active_allocations(&active, pool_id.get(), None)?;
+                if held.len() as u64 > u64::from(pool.capacity.get()) {
+                    return Err(StorageError::corrupted("Pool occupancy exceeds capacity"));
+                }
+                Ok((held.len() as u64) < u64::from(pool.capacity.get())
+                    && !held
+                        .iter()
+                        .any(|(executor, _)| *executor == executor_id.get()))
+            })?;
+            if !room {
+                return self.reject(Violation::InvalidValue(
+                    "allocation",
+                    "the Executor, its Pool or the global limit has no room",
+                ));
+            }
+        }
 
         let keys = self.step(|tx| {
             let ready = tx.open_table(MUTABLE_READY)?;
@@ -2027,7 +2056,9 @@ impl Batch {
             let id = JobId::new(key.2);
             // A manual trial names its one Job: any other ready entry is
             // passed over untouched, never reserved.
-            if only.is_some_and(|only| only != id) {
+            if let ReadySelection::Only(only) = selection
+                && only != id
+            {
                 continue;
             }
             let Some(job) =
@@ -2067,7 +2098,12 @@ impl Batch {
                         "execution_context",
                         "Generative Jobs cannot follow Decision history",
                     )))) => {
-                        self.remove(MUTABLE_READY, *key)?;
+                        // The scheduler's pass writes nothing unless it
+                        // reserves; the entry stays for a manual pass to
+                        // retire, and the Job reports the blocked history.
+                        if !matches!(selection, ReadySelection::SingleRequestGenerative { .. }) {
+                            self.remove(MUTABLE_READY, *key)?;
+                        }
                         continue;
                     }
                     Err(BatchError(Failure::Rejected(_))) => continue,
@@ -2095,6 +2131,25 @@ impl Batch {
                 continue;
             }
             let frozen = self.frozen_configuration(&job)?;
+            if let ReadySelection::SingleRequestGenerative { endpoint } = selection {
+                // Only the frozen facts decide, so the pass and the checked
+                // start cannot disagree; a Decision, a Job that needs tools,
+                // a Workspace or another protocol, and an endpoint the
+                // scheduler may not reach are left queued, never reserved.
+                let FrozenConfiguration::Generative(frozen) = &frozen else {
+                    continue;
+                };
+                if frozen.single_request_refusal().is_some()
+                    || !frozen
+                        .llm
+                        .provider
+                        .endpoint
+                        .as_deref()
+                        .is_some_and(endpoint)
+                {
+                    continue;
+                }
+            }
             let (operation, protocol) = match &frozen {
                 FrozenConfiguration::Generative(frozen) => (
                     ExecutionOperation::LlmRequest,

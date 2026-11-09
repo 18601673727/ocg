@@ -174,6 +174,24 @@ impl DevelopmentFreshReservation {
     }
 }
 
+/// Which ready Jobs one reservation pass may take. The selection is not
+/// stored: the Allocation a pass makes is the same row whichever selected it.
+#[derive(Clone, Copy, Debug)]
+pub enum ReadySelection {
+    /// The first ready Job the Executor can run.
+    Any,
+    /// Only this Job: an invocation that names its Job reserves it or none,
+    /// and a ready entry of any other Job is never reserved.
+    Only(JobId),
+    /// The native scheduler's selection: the first ready Generative Job whose
+    /// frozen configuration can run as the checked single tool-free request
+    /// and whose frozen endpoint `endpoint` admits. Every other ready entry is
+    /// passed over untouched, and a pass that reserves nothing writes
+    /// nothing. The pass also needs a free Executor, room in its Pool and
+    /// room under [`GLOBAL_EXECUTION_LIMIT`].
+    SingleRequestGenerative { endpoint: fn(&str) -> bool },
+}
+
 /// A caller must use `Replay` after any uncertain reservation result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DevelopmentReservationAttempt {

@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::db::entities::{
     AllocationPhase, AllocationToken, AppendedOutput, DevelopmentFreshReservation,
     DevelopmentReservation, DevelopmentReservationAttempt, ExecutionPoolId, ExecutorId, JobId,
-    MutableJobPhase, MutableJobRecord, OutcomeKind, PoolAllocation,
+    MutableJobPhase, MutableJobRecord, OutcomeKind, PoolAllocation, ReadySelection,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DevelopmentHandoff, PreparedDevelopmentHandoff};
 use crate::service::ai::providers::CancellationToken;
@@ -150,7 +150,7 @@ pub(crate) async fn reserve_named_job(
             .reserve_development_job(
                 fresh.request(),
                 DevelopmentReservationAttempt::New(fresh),
-                Some(target.job),
+                ReadySelection::Only(target.job),
             )
             .await;
         match reservation {

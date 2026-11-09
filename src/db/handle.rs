@@ -1723,19 +1723,21 @@ impl DatabaseHandle {
         request: entities::DevelopmentReservationRequest,
         attempt: entities::DevelopmentReservationAttempt,
     ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
-        self.reserve_development_job(request, attempt, None).await
+        self.reserve_development_job(request, attempt, entities::ReadySelection::Any)
+            .await
     }
 
-    /// Like [`Self::reserve_next_development_job`]; with `only`, a ready entry
-    /// of any other Job is never reserved, so a manual trial reserves the one
-    /// Job it names or none. The selection is not stored: the Allocation is
-    /// the same row either way.
+    /// Like [`Self::reserve_next_development_job`]; with
+    /// [`entities::ReadySelection::Only`], a ready entry of any other Job is
+    /// never reserved, so a manual trial reserves the one Job it names or
+    /// none. The selection is not stored: the Allocation is the same row
+    /// either way.
     #[allow(dead_code)]
     pub(crate) async fn reserve_development_job(
         &self,
         request: entities::DevelopmentReservationRequest,
         attempt: entities::DevelopmentReservationAttempt,
-        only: Option<entities::JobId>,
+        selection: entities::ReadySelection,
     ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
         let fresh = match attempt {
             entities::DevelopmentReservationAttempt::New(fresh) => {
@@ -1756,12 +1758,12 @@ impl DatabaseHandle {
         let result = self
             .submit(|reply| {
                 Command::new(
-                    (request, is_new, only),
+                    (request, is_new, selection),
                     reply,
                     |_| 4096,
                     OperationKind::AssignJobExecutor,
-                    |(request, is_new, only), batch| {
-                        batch.reserve_next_development_job(request, is_new, only)
+                    |(request, is_new, selection), batch| {
+                        batch.reserve_next_development_job(request, is_new, selection)
                     },
                 )
             })
@@ -1780,6 +1782,84 @@ impl DatabaseHandle {
                 })
             }
             (Err(error), _) => Err(DevelopmentReservationError::Other(error)),
+        }
+    }
+
+    /// One reservation pass of the native scheduler, under
+    /// [`entities::ReadySelection::SingleRequestGenerative`]: the selection
+    /// and the reservation are one writer transaction, as for every other
+    /// pass. A pass that reserves nothing declines to commit, so it neither
+    /// writes nor wakes the scheduler that asked for it; only a reservation
+    /// commits. A first attempt only: a scheduler never replays a request to
+    /// adopt the Allocation an uncertain reply may have left.
+    pub(crate) async fn reserve_scheduled_job(
+        &self,
+        fresh: entities::DevelopmentFreshReservation,
+        endpoint: fn(&str) -> bool,
+    ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
+        let request = fresh.request();
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (request, endpoint),
+                    reply,
+                    |_| 4096,
+                    |(request, endpoint), reply, database, operation, commit| {
+                        let mut passed = entities::DevelopmentReservation::Exhausted;
+                        let outcome = redb::run_batch_declinable(
+                            database,
+                            operation.epoch,
+                            commit,
+                            |batch| match batch.reserve_next_development_job(
+                                request,
+                                true,
+                                entities::ReadySelection::SingleRequestGenerative { endpoint },
+                            )? {
+                                reserved @ entities::DevelopmentReservation::Reserved(_) => {
+                                    Ok(Some(reserved))
+                                }
+                                other => {
+                                    passed = other;
+                                    Ok(None)
+                                }
+                            },
+                        );
+                        let declined = matches!(outcome.result, Ok(None));
+                        let outcome = redb::BatchOutcome {
+                            result: outcome.result.map(|reserved| reserved.unwrap_or(passed)),
+                            storage_failure: outcome.storage_failure,
+                            durable_commit_us: outcome.durable_commit_us,
+                            scheduling_wake: outcome.scheduling_wake,
+                            capacity_freed: outcome.capacity_freed,
+                            catalog_changed: outcome.catalog_changed,
+                            probe: outcome.probe,
+                        };
+                        settle(
+                            operation,
+                            commit,
+                            OperationKind::AssignJobExecutor,
+                            reply,
+                            outcome,
+                            declined,
+                        )
+                    },
+                )
+            })
+            .await;
+        match result {
+            Ok(result) => Ok(result),
+            Err(error)
+                if matches!(
+                    error.command_outcome(),
+                    Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted)
+                ) =>
+            {
+                Err(DevelopmentReservationError::DefinitelyNotCommitted {
+                    error: Box::new(error),
+                    fresh,
+                })
+            }
+            Err(error) => Err(DevelopmentReservationError::Other(error)),
         }
     }
 
