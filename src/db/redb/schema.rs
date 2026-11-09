@@ -7,8 +7,8 @@ pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
 /// Names the exact table set and record encodings of the format. A database
 /// whose fingerprint differs is incompatible even when its format number matches.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
-pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v3";
-pub(super) const DATABASE_FORMAT_VERSION: u64 = 22;
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v4";
+pub(super) const DATABASE_FORMAT_VERSION: u64 = 23;
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -42,6 +42,17 @@ pub(super) const NOTICES: TableDefinition<(u128, u32), &[u8]> = TableDefinition:
 pub(super) const APPROVALS: TableDefinition<(u128, u32, u32), &[u8]> =
     TableDefinition::new("approval");
 pub(super) const RECURRENCES: TableDefinition<u128, &[u8]> = TableDefinition::new("recurrence");
+/// Stable policy identity -> the exact endpoint, credential reference, Model,
+/// proxy and limits one scheduled external transport may use. A row is created
+/// disabled; it never enables the build's control.
+pub(super) const SCHEDULED_EXTERNAL_POLICY: TableDefinition<u128, &[u8]> =
+    TableDefinition::new("scheduled_external_policy");
+/// Job -> the policy identity and revision its current Allocation was
+/// authorized under, with the Allocation generation. Source of the policy
+/// check in the start and send transactions; absent for every non-scheduled
+/// execution.
+pub(super) const SCHEDULED_EXTERNAL_BINDING: TableDefinition<u128, &[u8]> =
+    TableDefinition::new("scheduled_external_binding");
 
 // ---- Derived tables ----------------------------------------------------------------
 

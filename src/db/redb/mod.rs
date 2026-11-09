@@ -53,6 +53,8 @@ mod approvals;
 mod codec;
 mod indexes;
 mod job_records;
+mod migrate;
+pub(crate) use migrate::{MigrationInspection, apply, inspect};
 mod notices;
 mod observations;
 pub(crate) use observations::{DecisionAvailabilityRecord, read_decision_availability};
@@ -71,7 +73,9 @@ pub(crate) use codec::encode_response_format;
 use codec::{
     Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_GLOBAL_COMPACTION,
     TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_CONTROL, TAG_JOB_STATE, TAG_OUTPUT, TAG_PROJECT,
-    TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
+    TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL, decode_scheduled_external_binding,
+    decode_scheduled_external_policy, encode_scheduled_external_binding,
+    encode_scheduled_external_policy,
 };
 pub(crate) use writer::Failure;
 pub(crate) use writer::{
@@ -142,6 +146,10 @@ pub(crate) use reader::{
     read_mutable_job_details, read_notices, read_turn_context, read_turn_execution,
 };
 pub(crate) use reader::{ProfilePageRecords, StoredCredential, credential_count, read_credential};
+pub(crate) use reader::{
+    read_scheduled_external_binding_with_policy, read_scheduled_external_policies,
+    read_scheduled_external_policy,
+};
 
 pub(crate) use crate::db::entities::{JobControl, JobSpec, JobState};
 pub(crate) use rows::{

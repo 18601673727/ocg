@@ -58,6 +58,11 @@ pub(crate) enum EndpointPolicy<'a> {
     /// own authority and control (the external trial or ordinary manual
     /// external execution); see [`crate::system::external_approval`].
     ApprovedExternal(&'a crate::system::external_approval::ExternalApproval),
+    /// The one endpoint a durable scheduled external policy names for this
+    /// Job's scheduled exchange, under
+    /// [`crate::system::execution_controls::ExecutionControl::ScheduledExternalTransport`].
+    /// It is never formed from a manual approval.
+    ScheduledExternal(&'a crate::system::scheduled_external::ScheduledExternalGrant),
 }
 
 impl EndpointPolicy<'_> {
@@ -67,6 +72,9 @@ impl EndpointPolicy<'_> {
             EndpointPolicy::ApprovedExternal(approval) => {
                 approval.permits_endpoint(endpoint) && config.destination == approval.destination()
             }
+            EndpointPolicy::ScheduledExternal(grant) => {
+                grant.permits_endpoint(endpoint) && config.destination == grant.destination()
+            }
         }
     }
 
@@ -74,6 +82,9 @@ impl EndpointPolicy<'_> {
         match self {
             EndpointPolicy::Loopback => "direct loopback endpoint required",
             EndpointPolicy::ApprovedExternal(_) => "the approved external endpoint is required",
+            EndpointPolicy::ScheduledExternal(_) => {
+                "the durable scheduled external endpoint is required"
+            }
         }
     }
 }

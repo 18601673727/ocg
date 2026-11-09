@@ -32,6 +32,7 @@ import {
   type ControlExecutionPhase,
   type ControlJob,
   type ControlJobDetails,
+  type ControlNativeStopRequest,
   type ControlOutput,
   type ControlProviderResponse,
   type ControlToolCall,
@@ -108,6 +109,51 @@ const STREAM_KEYS: Record<StreamState, I18nKey> = {
 };
 
 const TONE = { loading: "bg-muted text-muted-foreground" };
+
+type StopState = "idle" | "sending" | "locked";
+type StopNotice = { message: string; tone: "status" | "warning" | "error" };
+
+/**
+ * Why a stop request did not become an answer. A lost connection, an uncertain
+ * commit and a malformed success answer may all have changed the Job, so the
+ * control stays locked until the Job's own record shows another phase.
+ */
+function classifyStopFailure(t: TranslateFn, cause: unknown): StopNotice & { locked: boolean } {
+  if (cause instanceof ContractError) {
+    return { message: t("job.stop.contract"), tone: "error", locked: true };
+  }
+  if (cause instanceof ControlTransportError) {
+    if (cause.code === "connection_lost") {
+      return { message: t("job.stop.uncertainCommit"), tone: "warning", locked: true };
+    }
+    switch (cause.status) {
+      case 400:
+        return { message: t("job.stop.invalid"), tone: "warning", locked: false };
+      case 401:
+      case 403:
+        return { message: t("job.stop.unauthorized"), tone: "warning", locked: false };
+      case 404:
+        return { message: t("job.stop.notFound"), tone: "warning", locked: false };
+      case 409:
+        if (cause.code === "job_not_running")
+          return { message: t("job.stop.notRunning"), tone: "warning", locked: false };
+        if (cause.code === "job_already_ended")
+          return { message: t("job.stop.alreadyEnded"), tone: "warning", locked: false };
+        return { message: t("job.stop.conflict"), tone: "warning", locked: false };
+      case 503:
+        if (cause.code === "mutable_job_outcome_unknown")
+          return { message: t("job.stop.uncertainCommit"), tone: "warning", locked: true };
+        return { message: t("job.stop.transient"), tone: "warning", locked: false };
+      default:
+        return {
+          message: t("job.stop.failed", { code: cause.code }),
+          tone: "error",
+          locked: false,
+        };
+    }
+  }
+  return { message: t("job.stop.failed", { code: "unreachable" }), tone: "error", locked: false };
+}
 
 const PHASE_BADGE = {
   unsubmitted: "bg-muted text-muted-foreground",
@@ -200,6 +246,16 @@ function JobWatchBody({
   >(null);
   const unknownReason = details?.unknown_reason ?? null;
   const reloadRef = useRef<() => void>(() => {});
+  const refreshRef = useRef<() => void>(() => {});
+  const stopRequest = useRef<AbortController | null>(null);
+  const [stopState, setStopState] = useState<StopState>("idle");
+  const [stopOutcome, setStopOutcome] = useState<ControlNativeStopRequest | null>(null);
+  const [stopNotice, setStopNotice] = useState<StopNotice | null>(null);
+  // Successful reads of the Job's own record. A stop whose answer was lost is
+  // retriable only after a later read, never merely because time passed.
+  const statusReads = useRef(0);
+  const [readCount, setReadCount] = useState(0);
+  const [stopLockedAt, setStopLockedAt] = useState<number | null>(null);
   const watchRef = useRef({
     evidenceRevision: 0,
     processed: 0,
@@ -213,6 +269,8 @@ function JobWatchBody({
     () => () => {
       earlierLoad.current?.abort();
       earlierLoad.current = null;
+      stopRequest.current?.abort();
+      stopRequest.current = null;
     },
     [client, jobId],
   );
@@ -352,6 +410,8 @@ function JobWatchBody({
         }
         setJob(currentJob);
         setStatusFailure(false);
+        statusReads.current += 1;
+        setReadCount(statusReads.current);
         watch.completed = currentJob?.settlement.state === "completed";
         if (record.activity.last_output_seq > watch.processed) {
           const window = await readOutputWindow(client, jobId, {
@@ -393,6 +453,10 @@ function JobWatchBody({
       } finally {
         finishStatus();
       }
+    };
+
+    refreshRef.current = () => {
+      void refreshStatus();
     };
 
     const finishStatus = () => {
@@ -557,6 +621,7 @@ function JobWatchBody({
       if (retryTimer !== undefined) clearTimeout(retryTimer);
       if (typeof window !== "undefined") window.removeEventListener("online", onOnline);
       if (reloadRef.current === requestReload) reloadRef.current = () => {};
+      refreshRef.current = () => {};
       unsubscribeCatalog();
       subscription?.close();
       evidenceController.abort();
@@ -575,6 +640,71 @@ function JobWatchBody({
     ? t(EXECUTION_PHASE_KEYS[phase])
     : t(failure ? "job.state.unavailable" : "job.state.loading");
   const badgeClass = phase ? PHASE_BADGE[phase] : TONE.loading;
+  const stopPhase = phase === "reserved" || phase === "running";
+  const stopAvailable = Boolean(details?.context);
+  // Fail closed, not unusable. An accepted stop is never sent twice. A stop
+  // whose answer was lost, uncertain or unreadable stays locked until a later
+  // read of the Job's own record still shows it reserved or running: that read
+  // is the evidence that no stop took effect, and the server's stop is
+  // idempotent (`already_requested`), so a manual retry then is safe. Nothing
+  // retries on its own, and a Job the record shows as settled offers no stop.
+  const stopRetry =
+    stopState === "locked" &&
+    stopOutcome === null &&
+    stopLockedAt !== null &&
+    readCount > stopLockedAt;
+
+  async function requestStop() {
+    const context = details?.context;
+    if (!context || stopRequest.current) return;
+    const controller = new AbortController();
+    stopRequest.current = controller;
+    setStopState("sending");
+    setStopOutcome(null);
+    setStopNotice(null);
+    try {
+      const stop = await client.stopNativeJob(context, jobId, controller.signal);
+      if (controller.signal.aborted) return;
+      setStopOutcome(stop.request);
+      setStopState("locked");
+    } catch (cause) {
+      if (controller.signal.aborted) return;
+      const failure = classifyStopFailure(t, cause);
+      setStopNotice(failure);
+      setStopLockedAt(failure.locked ? statusReads.current : null);
+      setStopState(failure.locked ? "locked" : "idle");
+    } finally {
+      if (stopRequest.current === controller) stopRequest.current = null;
+    }
+    if (!controller.signal.aborted) refreshRef.current();
+  }
+
+  // The authoritative phase decides what a requested stop means now: a
+  // completion may have been recorded before the stop took effect, and a
+  // stop_requested phase is never presented as a cancelled Job.
+  const stopMessage = (() => {
+    if (stopNotice) return stopNotice;
+    if (!stopOutcome) return null;
+    if (phase === "completed")
+      return { message: t("job.stop.completedFirst"), tone: "warning" as const };
+    if (phase === "failed") return { message: t("job.stop.failedFirst"), tone: "warning" as const };
+    if (phase === "unknown")
+      return { message: t("job.stop.outcomeUnknown"), tone: "warning" as const };
+    if (phase === "cancelled")
+      return {
+        message:
+          stopOutcome === "ended_before_start"
+            ? t("job.stop.endedBeforeStart")
+            : t("job.stop.cancelledOutcome"),
+        tone: "status" as const,
+      };
+    if (stopOutcome === "ended_before_start")
+      return { message: t("job.stop.endedBeforeStart"), tone: "status" as const };
+    return {
+      message: t(stopOutcome === "requested" ? "job.stop.requested" : "job.stop.alreadyRequested"),
+      tone: "warning" as const,
+    };
+  })();
 
   // Earlier stored outputs are durable on the server, not in state. Loading
   // them is an explicit walk from the first stored sequence, merged by `seq`
@@ -832,8 +962,28 @@ function JobWatchBody({
             {phaseNote}
           </p>
         ) : null}
-        {phase === "reserved" || phase === "running" || phase === "stop_requested" ? (
+        {stopPhase && stopAvailable && (stopState !== "locked" || stopRetry) ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void requestStop()}
+              disabled={stopState === "sending"}
+            >
+              {stopState === "sending" ? t("job.stop.stopping") : t("job.stop.action")}
+            </Button>
+          </div>
+        ) : null}
+        {stopPhase && !stopAvailable ? (
           <p className="text-sm text-muted-foreground">{t("job.stop.unavailable")}</p>
+        ) : null}
+        {stopMessage ? (
+          <DismissibleNotice
+            message={stopMessage.message}
+            tone={stopMessage.tone === "error" ? "error" : "warning"}
+          >
+            <p>{stopMessage.message}</p>
+          </DismissibleNotice>
         ) : null}
         {failure ? (
           <DismissibleNotice message={failureText(t, failure)} className="text-sm text-destructive">

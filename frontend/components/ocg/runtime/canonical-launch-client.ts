@@ -249,6 +249,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly tips = new Map<string, string>();
   private readonly selections = new Map<string, ChatModelSelection>();
   private readonly sending = new Set<string>();
+  private readonly stopping = new Set<string>();
+  // Jobs whose stop answer was accepted; one accepted answer is the request,
+  // so a later click sends nothing more.
+  private readonly stopAccepted = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
   private readonly earlier = new Map<string, string | null>();
   private readonly loadingEarlier = new Map<string, Promise<void>>();
@@ -1494,10 +1498,33 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   override async cancel(sessionId: string): Promise<void> {
     const job = this.tips.get(sessionId);
     if (!job) throw new Error("No admitted turn to stop.");
-    if (this.turns.get(job)?.details?.mutable_phase !== undefined)
-      throw new Error(
-        "Stopping a running native Job is not supported; a Job that has started is never reported as stopped.",
-      );
+    const native = this.turns.get(job)?.details;
+    if (native?.mutable_phase !== undefined) {
+      if (this.stopAccepted.has(job)) return;
+      if (this.stopping.has(sessionId))
+        throw new Error("Wait for this conversation's current stop request to finish.");
+      const context = native.context;
+      if (!context)
+        throw new Error("This Job's Composer context is unavailable; the stop was not sent.");
+      this.stopping.add(sessionId);
+      try {
+        const stop = await this.control.stopNativeJob(context, job, this.lifetime.signal);
+        this.stopAccepted.add(job);
+        const turn = this.turns.get(job);
+        if (turn) {
+          turn.error =
+            stop.request === "ended_before_start"
+              ? "Stopped before it started; the Job is Cancelled and nothing was sent to the Provider."
+              : stop.request === "already_requested"
+                ? "A stop was already requested; the execution is not confirmed stopped."
+                : "Stop requested; the execution is not confirmed stopped.";
+          this.publish(sessionId);
+        }
+      } finally {
+        this.stopping.delete(sessionId);
+      }
+      return;
+    }
     const result = await this.control.stopConversation(
       this.turns.get(job)?.job.conversation ?? job,
       this.lifetime.signal,

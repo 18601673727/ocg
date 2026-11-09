@@ -16,6 +16,7 @@ use crate::db::entities::{
     OutcomeRecord, PoolConfig, Recorded, RequestFingerprint, SubmissionKey, SubmissionRecord,
     ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
 };
+use crate::system::execution_controls::ExecutionControl;
 
 pub(super) const TAG_ALLOCATION_POOL: u8 = 40;
 pub(super) const TAG_ALLOCATION_EXECUTOR: u8 = 41;
@@ -2131,24 +2132,32 @@ impl Batch {
                 continue;
             }
             let frozen = self.frozen_configuration(&job)?;
-            if let ReadySelection::SingleRequestGenerative { endpoint } = selection {
+            let mut scheduled_external = None;
+            if let ReadySelection::SingleRequestGenerative { policy } = selection {
                 // Only the frozen facts decide, so the pass and the checked
                 // start cannot disagree; a Decision, a Job that needs tools,
-                // a Workspace or another protocol, and an endpoint the
-                // scheduler may not reach are left queued, never reserved.
+                // a Workspace or another protocol, and any configuration the
+                // scheduled policy does not admit are left queued, never
+                // reserved. The durable scheduled external policy is read in
+                // this same transaction; its identity and revision become the
+                // binding the start and send transactions revalidate.
                 let FrozenConfiguration::Generative(frozen) = &frozen else {
                     continue;
                 };
-                if frozen.single_request_refusal().is_some()
-                    || !frozen
-                        .llm
-                        .provider
-                        .endpoint
-                        .as_deref()
-                        .is_some_and(endpoint)
-                {
+                if frozen.single_request_refusal().is_some() || !policy(frozen) {
                     continue;
                 }
+                let loopback = frozen
+                    .llm
+                    .provider
+                    .endpoint
+                    .as_deref()
+                    .is_some_and(crate::system::http::direct_diagnostic_loopback);
+                scheduled_external = match self.scheduled_external_policy_for(frozen)? {
+                    Some(record) => Some((record.id, record.revision)),
+                    None if !loopback => continue,
+                    None => None,
+                };
             }
             let (operation, protocol) = match &frozen {
                 FrozenConfiguration::Generative(frozen) => (
@@ -2166,7 +2175,14 @@ impl Batch {
                 continue;
             }
             return self
-                .reserve_pool_allocation(id, job.revision, request, operation, protocol)
+                .reserve_pool_allocation(
+                    id,
+                    job.revision,
+                    request,
+                    operation,
+                    protocol,
+                    scheduled_external,
+                )
                 .map(DevelopmentReservation::Reserved);
         }
         if keys.len() == SCAN_BUDGET
@@ -2228,6 +2244,7 @@ impl Batch {
         request: crate::db::entities::DevelopmentReservationRequest,
         operation: ExecutionOperation,
         protocol: Option<LlmTransport>,
+        scheduled_external: Option<(crate::db::entities::ScheduledExternalPolicyId, u32)>,
     ) -> Result<crate::db::entities::PoolAllocation, BatchError> {
         use crate::db::entities::{AllocationPhase, AllocationToken, PoolAllocation};
         self.allocation_format_gate()?;
@@ -2380,6 +2397,25 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(MUTABLE_READY)?.remove(ready_key)?;
             tx.open_table(PENDING)?.remove(job.get())?;
+            let mut bindings = tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
+            match scheduled_external {
+                Some((policy, policy_revision)) => {
+                    let binding = crate::db::entities::ScheduledExternalBinding {
+                        job,
+                        policy,
+                        policy_revision,
+                        allocation_epoch: allocation.token.epoch,
+                        allocation_generation: allocation.token.generation,
+                    };
+                    bindings.insert(
+                        job.get(),
+                        encode_scheduled_external_binding(&binding).as_slice(),
+                    )?;
+                }
+                None => {
+                    bindings.remove(job.get())?;
+                }
+            }
             Ok(())
         })?;
         self.probe = Some(Probe::PoolAllocation(allocation.token));
@@ -2764,6 +2800,15 @@ impl Batch {
         }
         let candidate = prepared.candidate();
         self.revalidate_development_snapshot(candidate)?;
+        // A Job reserved under a durable scheduled external policy may start
+        // only while that same policy revision is still live and still binds
+        // the Job's frozen configuration. This transaction is the start's
+        // linearization point; the send revalidates again atomically.
+        let job = match candidate {
+            reader::DevelopmentCandidate::Generative(context) => context.job.id,
+            reader::DevelopmentCandidate::Decision(context) => context.job.id,
+        };
+        self.scheduled_external_authorization(job)?;
         let (snapshot, allocation, conversation) = match candidate {
             reader::DevelopmentCandidate::Generative(context) => {
                 if context.configuration.single_request_refusal().is_some() {
@@ -5574,5 +5619,314 @@ impl Batch {
         frozen: &FrozenDecisionConfig,
     ) -> Result<bool, BatchError> {
         self.step(|tx| reader::decision_executor_available(&tx.open_table(CONFIGS)?, frozen))
+    }
+}
+
+/// The durable scheduled external policy and its binding to one Allocation.
+/// Creation takes an already validated draft; the store never infers authorization
+/// from a Job's frozen configuration or from another authority. Every mutation
+/// bumps the policy revision (except a no-op enable/disable), so a binding made
+/// under an older revision can never authorize a start or a send.
+impl Batch {
+    fn scheduled_external_policy_by_id(
+        &mut self,
+        id: crate::db::entities::ScheduledExternalPolicyId,
+    ) -> Result<Option<crate::db::entities::ScheduledExternalPolicyRecord>, BatchError> {
+        self.step(|tx| {
+            let table = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+            table
+                .get(id.get())?
+                .map(|row| decode_scheduled_external_policy(id.get(), row.value()))
+                .transpose()
+        })
+    }
+
+    fn scheduled_external_binding_by_job(
+        &mut self,
+        job: JobId,
+    ) -> Result<Option<crate::db::entities::ScheduledExternalBinding>, BatchError> {
+        self.step(|tx| {
+            let table = tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
+            table
+                .get(job.get())?
+                .map(|row| decode_scheduled_external_binding(job.get(), row.value()))
+                .transpose()
+        })
+    }
+
+    pub(crate) fn create_scheduled_external_policy(
+        &mut self,
+        draft: &crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+    ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
+        use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord};
+        let id = ScheduledExternalPolicyId::new(self.next_id()?);
+        let now = self.now;
+        let record = ScheduledExternalPolicyRecord {
+            id,
+            endpoint: draft.endpoint().to_owned(),
+            credential_ref: draft.credential_ref().to_owned(),
+            model: draft.model().to_owned(),
+            proxy: draft.proxy().to_owned(),
+            max_request_bytes: u32::try_from(draft.limits().max_request_bytes)
+                .map_err(|_| self.invalid("scheduled_external_policy"))?,
+            max_output_tokens: draft.limits().max_output_tokens,
+            timeout_secs: u32::try_from(draft.limits().timeout.as_secs())
+                .map_err(|_| self.invalid("scheduled_external_policy"))?,
+            enabled: false,
+            revoked: false,
+            revision: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        let bytes = encode_scheduled_external_policy(&record);
+        self.step(|tx| {
+            tx.open_table(SCHEDULED_EXTERNAL_POLICY)?
+                .insert(id.get(), bytes.as_slice())?;
+            Ok(())
+        })?;
+        Ok(record)
+    }
+
+    pub(crate) fn update_scheduled_external_policy(
+        &mut self,
+        id: crate::db::entities::ScheduledExternalPolicyId,
+        expected_revision: u32,
+        draft: &crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+    ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
+        use crate::db::entities::ScheduledExternalPolicyRecord;
+        let Some(mut record) = self.scheduled_external_policy_by_id(id)? else {
+            return self.reject(Violation::NotFound(
+                crate::db::entities::RecordRef::ScheduledExternalPolicy(id),
+            ));
+        };
+        if record.revoked {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "a revoked policy is immutable; create a new one",
+            ));
+        }
+        if record.revision != expected_revision {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the policy revision changed; reload before saving",
+            ));
+        }
+        let revision = record.revision.checked_add(1).ok_or_else(|| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "scheduled external policy revision exhausted",
+            )))
+        })?;
+        record = ScheduledExternalPolicyRecord {
+            endpoint: draft.endpoint().to_owned(),
+            credential_ref: draft.credential_ref().to_owned(),
+            model: draft.model().to_owned(),
+            proxy: draft.proxy().to_owned(),
+            max_request_bytes: u32::try_from(draft.limits().max_request_bytes)
+                .map_err(|_| self.invalid("scheduled_external_policy"))?,
+            max_output_tokens: draft.limits().max_output_tokens,
+            timeout_secs: u32::try_from(draft.limits().timeout.as_secs())
+                .map_err(|_| self.invalid("scheduled_external_policy"))?,
+            revision,
+            updated_at: self.now,
+            ..record
+        };
+        let bytes = encode_scheduled_external_policy(&record);
+        self.step(|tx| {
+            tx.open_table(SCHEDULED_EXTERNAL_POLICY)?
+                .insert(id.get(), bytes.as_slice())?;
+            Ok(())
+        })?;
+        Ok(record)
+    }
+
+    pub(crate) fn set_scheduled_external_policy_enabled(
+        &mut self,
+        id: crate::db::entities::ScheduledExternalPolicyId,
+        expected_revision: u32,
+        enabled: bool,
+    ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
+        let Some(record) = self.scheduled_external_policy_by_id(id)? else {
+            return self.reject(Violation::NotFound(
+                crate::db::entities::RecordRef::ScheduledExternalPolicy(id),
+            ));
+        };
+        if record.revoked {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "a revoked policy cannot be enabled",
+            ));
+        }
+        if record.revision != expected_revision {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the policy revision changed; reload before saving",
+            ));
+        }
+        if record.enabled == enabled {
+            return Ok(record);
+        }
+        let revision = record.revision.checked_add(1).ok_or_else(|| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "scheduled external policy revision exhausted",
+            )))
+        })?;
+        let updated = crate::db::entities::ScheduledExternalPolicyRecord {
+            enabled,
+            revision,
+            updated_at: self.now,
+            ..record
+        };
+        let bytes = encode_scheduled_external_policy(&updated);
+        self.step(|tx| {
+            tx.open_table(SCHEDULED_EXTERNAL_POLICY)?
+                .insert(id.get(), bytes.as_slice())?;
+            Ok(())
+        })?;
+        Ok(updated)
+    }
+
+    pub(crate) fn revoke_scheduled_external_policy(
+        &mut self,
+        id: crate::db::entities::ScheduledExternalPolicyId,
+        expected_revision: u32,
+    ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
+        let Some(record) = self.scheduled_external_policy_by_id(id)? else {
+            return self.reject(Violation::NotFound(
+                crate::db::entities::RecordRef::ScheduledExternalPolicy(id),
+            ));
+        };
+        if record.revision != expected_revision {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the policy revision changed; reload before revoking",
+            ));
+        }
+        if record.revoked {
+            return Ok(record);
+        }
+        let revision = record.revision.checked_add(1).ok_or_else(|| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "scheduled external policy revision exhausted",
+            )))
+        })?;
+        let updated = crate::db::entities::ScheduledExternalPolicyRecord {
+            enabled: false,
+            revoked: true,
+            revision,
+            updated_at: self.now,
+            ..record
+        };
+        let bytes = encode_scheduled_external_policy(&updated);
+        self.step(|tx| {
+            tx.open_table(SCHEDULED_EXTERNAL_POLICY)?
+                .insert(id.get(), bytes.as_slice())?;
+            Ok(())
+        })?;
+        Ok(updated)
+    }
+
+    /// The one live policy that binds this frozen configuration, if any. It
+    /// refuses when the build's control is disabled, and when more than one
+    /// live policy would bind the same Job: choosing between them is not the
+    /// transaction's to make.
+    fn scheduled_external_policy_for(
+        &mut self,
+        frozen: &FrozenExecutionConfig,
+    ) -> Result<Option<crate::db::entities::ScheduledExternalPolicyRecord>, BatchError> {
+        if !ExecutionControl::ScheduledExternalTransport.is_enabled() {
+            return Ok(None);
+        }
+        let candidates = self.step(|tx| {
+            let table = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+            table
+                .iter()?
+                .map(|entry| {
+                    let (key, row) = entry?;
+                    decode_scheduled_external_policy(key.value(), row.value())
+                })
+                .collect::<Result<Vec<_>, StorageError>>()
+        })?;
+        let matching: Vec<_> = candidates
+            .into_iter()
+            .filter(|record| {
+                record.is_live() && crate::system::scheduled_external::record_admits(record, frozen)
+            })
+            .collect();
+        match matching.len() {
+            0 => Ok(None),
+            1 => Ok(matching.into_iter().next()),
+            _ => self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "more than one live policy binds this Job; refuse rather than choose",
+            )),
+        }
+    }
+
+    /// The policy authorizing this Job's current Allocation, revalidated in
+    /// this write transaction. `Ok(None)` means no scheduled binding exists,
+    /// which is every loopback and manual execution. Any binding that no longer
+    /// matches its live policy, the Allocation, or the Job's frozen
+    /// configuration is a refusal, never a warning.
+    pub(crate) fn scheduled_external_authorization(
+        &mut self,
+        job: JobId,
+    ) -> Result<Option<crate::db::entities::ScheduledExternalPolicyRecord>, BatchError> {
+        let Some(binding) = self.scheduled_external_binding_by_job(job)? else {
+            return Ok(None);
+        };
+        if !ExecutionControl::ScheduledExternalTransport.is_enabled() {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the scheduled external transport control is disabled",
+            ));
+        }
+        let Some(record) = self.scheduled_external_policy_by_id(binding.policy)? else {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the bound policy no longer exists",
+            ));
+        };
+        if !record.is_live() || record.revision != binding.policy_revision {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the bound policy is revoked, disabled or changed since reservation",
+            ));
+        }
+        let allocation = self.pool_allocation(job)?;
+        if allocation.is_none_or(|allocation| {
+            allocation.token.epoch != binding.allocation_epoch
+                || allocation.token.generation != binding.allocation_generation
+        }) {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the binding does not name this Allocation",
+            ));
+        }
+        let Some(row) = self.mutable_job(job)? else {
+            return self.reject(Violation::NotFound(crate::db::entities::RecordRef::Job(
+                job,
+            )));
+        };
+        let frozen = self.frozen_configuration(&row)?;
+        let FrozenConfiguration::Generative(frozen) = &frozen else {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "a scheduled external Job must be Generative",
+            ));
+        };
+        if !crate::system::scheduled_external::record_admits(&record, frozen) {
+            return self.reject(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the Job's frozen configuration no longer matches the bound policy",
+            ));
+        }
+        Ok(Some(record))
+    }
+
+    fn invalid(&self, field: &'static str) -> BatchError {
+        BatchError(Failure::Rejected(Violation::InvalidValue(
+            field,
+            "value out of range",
+        )))
     }
 }

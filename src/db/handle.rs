@@ -1795,16 +1795,16 @@ impl DatabaseHandle {
     pub(crate) async fn reserve_scheduled_job(
         &self,
         fresh: entities::DevelopmentFreshReservation,
-        endpoint: fn(&str) -> bool,
+        policy: fn(&entities::FrozenExecutionConfig) -> bool,
     ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
         let request = fresh.request();
         let result = self
             .submit(|reply| {
                 Command::custom(
-                    (request, endpoint),
+                    (request, policy),
                     reply,
                     |_| 4096,
-                    |(request, endpoint), reply, database, operation, commit| {
+                    |(request, policy), reply, database, operation, commit| {
                         let mut passed = entities::DevelopmentReservation::Exhausted;
                         let outcome = redb::run_batch_declinable(
                             database,
@@ -1813,7 +1813,7 @@ impl DatabaseHandle {
                             |batch| match batch.reserve_next_development_job(
                                 request,
                                 true,
-                                entities::ReadySelection::SingleRequestGenerative { endpoint },
+                                entities::ReadySelection::SingleRequestGenerative { policy },
                             )? {
                                 reserved @ entities::DevelopmentReservation::Reserved(_) => {
                                     Ok(Some(reserved))
@@ -5342,5 +5342,141 @@ impl crate::service::ai::providers::CredentialResolver for LocalCredentialResolv
             };
             self.database.resolve_credential(name).await
         })
+    }
+}
+
+/// The durable scheduled external policy: created disabled, updated, enabled,
+/// disabled or revoked under its own operation. None of these methods can
+/// enable the build's control, and a policy row alone never authorizes a
+/// dispatch.
+impl DatabaseHandle {
+    pub(crate) async fn create_scheduled_external_policy(
+        &self,
+        draft: crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+    ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (draft,),
+                reply,
+                |_| 8192,
+                OperationKind::SetScheduledExternalPolicy,
+                |(draft,), batch| batch.create_scheduled_external_policy(&draft),
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn update_scheduled_external_policy(
+        &self,
+        id: entities::ScheduledExternalPolicyId,
+        expected_revision: u32,
+        draft: crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+    ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, expected_revision, draft),
+                reply,
+                |_| 8192,
+                OperationKind::SetScheduledExternalPolicy,
+                |(id, expected_revision, draft), batch| {
+                    batch.update_scheduled_external_policy(id, expected_revision, &draft)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn set_scheduled_external_policy_enabled(
+        &self,
+        id: entities::ScheduledExternalPolicyId,
+        expected_revision: u32,
+        enabled: bool,
+    ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, expected_revision, enabled),
+                reply,
+                |_| 4096,
+                OperationKind::SetScheduledExternalPolicy,
+                |(id, expected_revision, enabled), batch| {
+                    batch.set_scheduled_external_policy_enabled(id, expected_revision, enabled)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn revoke_scheduled_external_policy(
+        &self,
+        id: entities::ScheduledExternalPolicyId,
+        expected_revision: u32,
+    ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, expected_revision),
+                reply,
+                |_| 4096,
+                OperationKind::SetScheduledExternalPolicy,
+                |(id, expected_revision), batch| {
+                    batch.revoke_scheduled_external_policy(id, expected_revision)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn scheduled_external_policy(
+        &self,
+        id: entities::ScheduledExternalPolicyId,
+    ) -> Result<Option<entities::ScheduledExternalPolicyRecord>, DatabaseError> {
+        self.read(move |database| redb::read_scheduled_external_policy(database, id))
+            .await
+    }
+
+    pub(crate) async fn scheduled_external_policies(
+        &self,
+        after: Option<entities::ScheduledExternalPolicyId>,
+        limit: usize,
+    ) -> Result<
+        redb::CursorPage<
+            entities::ScheduledExternalPolicyRecord,
+            entities::ScheduledExternalPolicyId,
+        >,
+        DatabaseError,
+    > {
+        self.read(move |database| redb::read_scheduled_external_policies(database, after, limit))
+            .await
+    }
+
+    /// The runtime authorization of one Job's current Allocation: the policy
+    /// its binding names, at the revision the binding recorded. `Ok(None)` is
+    /// every execution that is not a scheduled external one. A binding that
+    /// names a missing, changed or refused policy is an error, never a
+    /// fallback to the loopback path.
+    pub(crate) async fn scheduled_external_grant(
+        &self,
+        job: entities::JobId,
+    ) -> Result<Option<crate::system::scheduled_external::ScheduledExternalGrant>, DatabaseError>
+    {
+        let pair = self
+            .read(move |database| redb::read_scheduled_external_binding_with_policy(database, job))
+            .await?;
+        let Some((binding, policy)) = pair else {
+            return Ok(None);
+        };
+        if policy.revision != binding.policy_revision {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the bound policy revision changed since reservation",
+            )));
+        }
+        crate::system::scheduled_external::ScheduledExternalGrant::from_record(&policy)
+            .map(Some)
+            .map_err(|refusal| {
+                DatabaseError::Rejected(Violation::InvalidValue(
+                    "scheduled_external_policy",
+                    refusal.code,
+                ))
+            })
     }
 }

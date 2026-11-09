@@ -94,6 +94,7 @@ record_id_type!(MetricsId, "metrics");
 record_id_type!(AvailabilityStatId, "availability_stat");
 record_id_type!(AttachmentId, "attachment");
 record_id_type!(RequestEventId, "request_event");
+record_id_type!(ScheduledExternalPolicyId, "scheduled_external_policy");
 
 impl From<ConfigId> for ProfileId {
     fn from(c: ConfigId) -> Self {
@@ -227,6 +228,7 @@ pub enum RecordRef {
     Metrics(MetricsId),
     AvailabilityStat(AvailabilityStatId),
     Attachment(AttachmentId),
+    ScheduledExternalPolicy(ScheduledExternalPolicyId),
 }
 
 impl fmt::Display for RecordRef {
@@ -243,6 +245,7 @@ impl fmt::Display for RecordRef {
             Self::Metrics(id) => id.fmt(f),
             Self::AvailabilityStat(id) => id.fmt(f),
             Self::Attachment(id) => id.fmt(f),
+            Self::ScheduledExternalPolicy(id) => id.fmt(f),
         }
     }
 }

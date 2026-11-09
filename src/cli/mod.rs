@@ -5,11 +5,13 @@ mod external_trial;
 mod inspect_held;
 mod llm_target;
 mod manual_host;
+mod migrate;
 #[cfg(unix)]
 mod reconcile_reserved;
 mod release_slot;
 mod run_external_job;
 mod run_loopback_job;
+mod scheduled_external_policy;
 pub mod typescript;
 #[cfg(unix)]
 mod update;
@@ -59,6 +61,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "release-slot" {
             let directory = DataDirectory::from_environment()?;
             return release_slot::run(&directory, arguments.collect());
+        }
+        if command == "migrate" {
+            return migrate::run(arguments.collect());
+        }
+        if command == scheduled_external_policy::COMMAND {
+            let directory = DataDirectory::from_environment()?;
+            return scheduled_external_policy::run(&directory, arguments.collect());
         }
         if command == llm_target::COMMAND {
             if arguments.next().is_some() {
@@ -113,6 +122,10 @@ fn usage() -> &'static str {
        verify <data-directory> [--pages]        (offline integrity check; never writes the original)\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start\n\
          (offline: ends one crash-surviving Reserved Allocation that never started; works on a copy, keeps a rollback artifact)\n\
+       migrate [--check | --to <directory>]\n\
+         (offline: migrates one stopped format 22 database to format 23 on a private copy; the source is never written)\n\
+       scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\
+         (durable scheduled external policy management; creating a policy never enables scheduled_external_transport or autonomous_scheduling)\n\
        register-llm\n\
        help, --help, -h\n\
        --version, -V"

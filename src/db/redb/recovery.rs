@@ -231,7 +231,7 @@ pub(super) fn check_identity(
     let found = match meta.get(DATABASE_FORMAT_KEY)? {
         None => {
             return Err(unsupported_format(&format!(
-                "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION} and no migration exists"
+                "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION}; run `ocg migrate --check` against a format 22 database"
             )));
         }
         Some(value) => <[u8; 8]>::try_from(value.value())
@@ -240,7 +240,7 @@ pub(super) fn check_identity(
     };
     if found != DATABASE_FORMAT_VERSION {
         return Err(unsupported_format(&format!(
-            "database format {found} is not supported; this build opens only format {DATABASE_FORMAT_VERSION} and no migration exists"
+            "database format {found} is not supported; this build opens only format {DATABASE_FORMAT_VERSION}; run `ocg migrate --check`"
         )));
     }
     if !meta
@@ -248,7 +248,7 @@ pub(super) fn check_identity(
         .is_some_and(|value| value.value() == SCHEMA_FINGERPRINT)
     {
         return Err(unsupported_format(&format!(
-            "database format {found} has a different schema fingerprint; no migration exists"
+            "database format {found} has a different schema fingerprint; run `ocg migrate --check`"
         )));
     }
     Ok(())
@@ -299,6 +299,7 @@ fn startup_checks(
         Err(error) => return Err(error.into()),
     };
     check_identity(&meta)?;
+    check_required_tables(&tx)?;
     let epoch = meta
         .get("open_epoch")?
         .ok_or_else(|| StorageError::corrupted("missing open epoch"))?;
@@ -321,9 +322,39 @@ fn startup_checks(
     Ok(Verification::Full)
 }
 
+/// A format this build accepts names the tables of that format. A database
+/// that claims the current format but lacks a required table is a partial
+/// migration, not an old one: it is refused rather than silently extended.
+fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
+    use ::redb::TableHandle;
+    let present: Vec<String> = tx
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect();
+    for required in [
+        SCHEDULED_EXTERNAL_POLICY.name(),
+        SCHEDULED_EXTERNAL_BINDING.name(),
+    ] {
+        if !present.iter().any(|table| table == required) {
+            return Err(StorageError::corrupted(format!(
+                "database is marked format {DATABASE_FORMAT_VERSION} but lacks the {required} table; it is a partial migration, not a supported database"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Every record header and the native invariants, without any judgement of
 /// who owns capacity.
 fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
+    migration_check_headers(tx)?;
+    check_native_invariants(tx)
+}
+
+/// The record-header checks of every authoritative table, shared with the
+/// offline migration's inspection of the preceding format. Those tables that
+/// the preceding format does not have are simply absent and checked as empty.
+pub(super) fn migration_check_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
     macro_rules! headers {
         ($($table:ident => $tags:expr),+ $(,)?) => { $(check_preflight_table(tx, $table, $tags)?;)+ };
     }
@@ -332,7 +363,9 @@ fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
         REQUEST_EVENTS => &[8], PROJECTS => &[9], JOB_CONTROLS => &[10], NOTICES => &[12],
         RECURRENCES => &[13], APPROVALS => &[15]);
     check_preflight_table(tx, CREDENTIALS, &[16])?;
-    check_native_invariants(tx)
+    check_preflight_table(tx, SCHEDULED_EXTERNAL_POLICY, &[18])?;
+    check_preflight_table(tx, SCHEDULED_EXTERNAL_BINDING, &[19])?;
+    Ok(())
 }
 
 /// Whether the Allocation rows, the source of ownership, hold no capacity and
@@ -460,7 +493,7 @@ fn held_ownership(held: u64, unknown: u64) -> StorageError {
     }
 }
 
-fn check_preflight_header(bytes: &[u8], tags: &[u8]) -> Result<(), StorageError> {
+pub(super) fn check_preflight_header(bytes: &[u8], tags: &[u8]) -> Result<(), StorageError> {
     let valid = match bytes {
         [tag, version, ..] if tags.contains(tag) => *version == codec::RECORD_VERSION,
         _ => false,
@@ -798,6 +831,8 @@ pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(RECURRENCE_DUE)?;
     tx.open_table(USAGE_MODEL)?;
     tx.open_table(REQUEST_TIMELINE)?;
+    tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+    tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
     Ok(())
 }
 

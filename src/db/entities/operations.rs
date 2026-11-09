@@ -84,6 +84,9 @@ pub enum OperationKind {
     CreateExecutionPool,
     SetExecutionPoolEnabled,
     SetExecutionPoolProfile,
+    /// A create, update, enable, disable or revoke of one durable scheduled
+    /// external policy. It never enables the build's control.
+    SetScheduledExternalPolicy,
 }
 
 /// A business rule refused the command; nothing it did was committed.

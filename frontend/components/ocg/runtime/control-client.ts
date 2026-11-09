@@ -8,6 +8,7 @@ import {
   projectAgentProfiles,
   type ControlApproval,
   projectJobDetails,
+  projectNativeStop,
   projectConversation,
   projectJobEvent,
   projectProfiles,
@@ -1962,6 +1963,27 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return projectJobDetails(
         (await send("GET", `/api/v1/jobs/${job}`, { signal })).input as Api.JobDetails,
       );
+    },
+
+    /**
+     * Requests the stop of one native Job, in the Composer context the Job's
+     * record names. The body is exactly `{}`; the answer is checked against
+     * both the status and the stop's own phase so a 202 is never projected as
+     * a confirmed stop.
+     */
+    async stopNativeJob(context: string, job: string, signal?: AbortSignal) {
+      const identity = jobIdentity(job);
+      const answer = await send("POST", `/api/v1/jobs/${identity}/stop`, {
+        context,
+        body: {},
+        sign: !programmatic,
+        signal,
+      });
+      const stop = projectNativeStop(answer.status, answer.input);
+      // The answer must name the Job this request stopped, not another one.
+      if (stop.job !== identity)
+        throw new ContractError("stop.job", "the stop answer names the requested Job");
+      return stop;
     },
 
     /** The Job's frozen input: its objective as text, never inferred from its identity. */

@@ -19,11 +19,15 @@
 //! ([`crate::db::entities::ReadySelection::SingleRequestGenerative`]): the
 //! first ready Job in the ready index's order (priority, then submission time,
 //! then Job) whose frozen configuration can run as the checked single
-//! tool-free request and whose frozen endpoint this scheduler may reach.
-//! Everything else is passed over untouched and stays queued: Decisions, Jobs
-//! whose Agent needs tools or a Workspace, other protocols, and every endpoint
-//! that is not a literal loopback one, because the only transport this
-//! scheduler holds is [`EndpointPolicy::Loopback`]. A busy Executor, a full
+//! tool-free request and whose whole frozen configuration this scheduler's
+//! policy admits. Everything else is passed over untouched and stays queued:
+//! Decisions, Jobs whose Agent needs tools or a Workspace, other protocols, and
+//! every endpoint that is neither a literal loopback one nor bound to a live
+//! durable scheduled external policy. A literal loopback endpoint remains
+//! [`EndpointPolicy::Loopback`]. An external configuration is admitted only by
+//! the separate scheduled external policy, under its own disabled control and
+//! its own durable binding; this module never infers it from the frozen
+//! configuration. A busy Executor, a full
 //! Pool and the global limit are refused before any ready entry is read, and a
 //! pass that reserves nothing writes nothing, so it wakes nobody.
 //!
@@ -59,8 +63,8 @@ use std::time::Duration;
 
 use crate::db::entities::{
     AllocationPhase, AllocationToken, DevelopmentFreshReservation, DevelopmentReadyCursor,
-    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, JobId, LlmTransport,
-    OutcomeKind, PoolAllocation, UnstartedCause,
+    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, FrozenExecutionConfig,
+    JobId, LlmTransport, OutcomeKind, PoolAllocation, UnstartedCause,
 };
 use crate::db::redb::{NativeResource, NativeResourceKind};
 use crate::db::{
@@ -99,8 +103,8 @@ const CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
 
 /// The authority of one autonomous scheduling run. [`Self::autonomous`] is
 /// the only way to make one, and it makes none unless the build enables
-/// [`ExecutionControl::AutonomousScheduling`]. It grants no transport: the
-/// scheduler's own endpoint policy is loopback only.
+/// [`ExecutionControl::AutonomousScheduling`]. It grants no transport: each
+/// dispatch takes the endpoint policy its reservation's durable binding names.
 pub(crate) struct SchedulingAuthority(());
 
 impl SchedulingAuthority {
@@ -111,13 +115,22 @@ impl SchedulingAuthority {
     }
 }
 
-/// The endpoints this scheduler may send to: a literal loopback endpoint the
-/// configured proxy does not intercept, exactly what
-/// [`EndpointPolicy::Loopback`] admits at the exchange. An external endpoint
-/// would need an external transport authority, which this scheduler does not
-/// hold.
-fn scheduled_endpoint(endpoint: &str) -> bool {
-    crate::system::http::direct_diagnostic_loopback(endpoint)
+/// Whether this scheduler may select `frozen`: the whole frozen configuration
+/// is offered, not just an endpoint. A literal loopback endpoint the configured
+/// proxy does not intercept is admitted exactly as before, and an external
+/// configuration is admitted only by the separate scheduled external policy,
+/// which is unconfigured and whose control is disabled in this build. This
+/// predicate only opens the door; the reservation transaction reads the live
+/// policy and records the binding the start and send transactions revalidate,
+/// and dispatch takes its endpoint policy from that binding.
+fn scheduled_policy(frozen: &FrozenExecutionConfig) -> bool {
+    frozen
+        .llm
+        .provider
+        .endpoint
+        .as_deref()
+        .is_some_and(crate::system::http::direct_diagnostic_loopback)
+        || ExecutionControl::ScheduledExternalTransport.is_enabled()
 }
 
 /// The cancellations of the executions this host's native scheduler runs, by
@@ -379,7 +392,7 @@ impl NativeScheduler {
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
             match self
                 .database
-                .reserve_scheduled_job(fresh, scheduled_endpoint)
+                .reserve_scheduled_job(fresh, scheduled_policy)
                 .await
             {
                 Ok(DevelopmentReservation::Reserved(allocation)) => {
@@ -509,6 +522,13 @@ impl Dispatched {
 /// database shows. A reservation whose start a cancellation overtook is ended
 /// rather than started, unless a stop already ended it: it never reached a
 /// Provider.
+///
+/// The endpoint policy comes from the reservation's durable binding, never
+/// from the Job's frozen configuration alone. No binding means the loopback
+/// path exactly as before. A binding that cannot be read, whose policy is no
+/// longer live at the recorded revision, or that the disabled
+/// [`ExecutionControl::ScheduledExternalTransport`] refuses ends the
+/// reservation unsent: this dispatch does not fall back to loopback.
 pub(crate) async fn dispatch(
     database: &DatabaseHandle,
     allocation: PoolAllocation,
@@ -527,11 +547,8 @@ pub(crate) async fn dispatch(
             }
         }
     } else {
-        match database
-            .checked_development_handoff_guarded(token, check_prepared)
-            .await
-        {
-            Ok(handoff) => {
+        match database.scheduled_external_grant(token.job).await {
+            Ok(None) => {
                 let config = ProviderExecutionConfig {
                     timeout: DISPATCH_TIMEOUT,
                     first_delta_timeout: Some(DISPATCH_TIMEOUT),
@@ -539,38 +556,102 @@ pub(crate) async fn dispatch(
                     cancellation: cancellation.clone(),
                     ..ProviderExecutionConfig::default()
                 };
-                let exchange = within_deadline(
+                start_and_exchange(
+                    database,
+                    token,
                     cancellation,
-                    DISPATCH_TIMEOUT,
-                    supervise_development_generative(
-                        database,
-                        handoff,
-                        &config,
-                        EndpointPolicy::Loopback,
-                    ),
+                    &config,
+                    EndpointPolicy::Loopback,
+                    check_prepared,
                 )
-                .await;
-                match exchange {
-                    Ok(_) => "the exchange returned and was recorded".to_owned(),
-                    Err(error) => error.to_string(),
-                }
+                .await
             }
-            Err(DevelopmentHandoffError::NotStarted { cause, error }) => {
+            Ok(Some(grant)) => {
+                let config = grant.provider_config(cancellation.clone());
+                let guard = |prepared: &crate::db::PreparedDevelopmentHandoff| {
+                    grant.check_prepared(prepared).map_err(|refusal| {
+                        log::warn!(
+                            "native scheduler: Job {} scheduled external start refused ({}): {}",
+                            token.job,
+                            refusal.code,
+                            refusal.detail
+                        );
+                        refusal.code
+                    })
+                };
+                start_and_exchange(
+                    database,
+                    token,
+                    cancellation,
+                    &config,
+                    EndpointPolicy::ScheduledExternal(&grant),
+                    guard,
+                )
+                .await
+            }
+            Err(error) => {
+                let prefix = format!(
+                    "the scheduled external authorization was refused before the start ({error})"
+                );
                 match database
-                    .fail_unstarted_development_reservation(token, cause)
+                    .fail_unstarted_development_reservation(token, UnstartedCause::StartRefused)
                     .await
                 {
-                    Ok(_) => format!(
-                        "the start was refused before any request ({error}); the reservation was ended"
-                    ),
-                    Err(settle) => format!(
-                        "the start was refused before any request ({error}); the reservation was not ended here ({settle})"
-                    ),
+                    Ok(_) => format!("{prefix}; the reservation was ended and nothing was sent"),
+                    Err(settle) => {
+                        format!("{prefix}; the reservation was not ended here ({settle})")
+                    }
                 }
             }
-            Err(error) => format!("the start may have committed without a reply ({error:?})"),
         }
     };
+    reported(database, token, detail).await
+}
+
+/// The checked start of one reservation and the one exchange it authorizes.
+async fn start_and_exchange(
+    database: &DatabaseHandle,
+    token: AllocationToken,
+    cancellation: &CancellationToken,
+    config: &ProviderExecutionConfig,
+    policy: EndpointPolicy<'_>,
+    guard: impl FnOnce(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
+) -> String {
+    match database
+        .checked_development_handoff_guarded(token, guard)
+        .await
+    {
+        Ok(handoff) => {
+            let exchange = within_deadline(
+                cancellation,
+                DISPATCH_TIMEOUT,
+                supervise_development_generative(database, handoff, config, policy),
+            )
+            .await;
+            match exchange {
+                Ok(_) => "the exchange returned and was recorded".to_owned(),
+                Err(error) => error.to_string(),
+            }
+        }
+        Err(DevelopmentHandoffError::NotStarted { cause, error }) => {
+            match database
+                .fail_unstarted_development_reservation(token, cause)
+                .await
+            {
+                Ok(_) => format!(
+                    "the start was refused before any request ({error}); the reservation was ended"
+                ),
+                Err(settle) => format!(
+                    "the start was refused before any request ({error}); the reservation was not ended here ({settle})"
+                ),
+            }
+        }
+        Err(error) => format!("the start may have committed without a reply ({error:?})"),
+    }
+}
+
+/// What the database shows after one scheduled dispatch returned.
+async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: String) -> Dispatched {
     match database.development_trial_job(token.job).await {
         Ok(Some((record, Some(allocation)))) if allocation.token == token => Dispatched {
             job: token.job,

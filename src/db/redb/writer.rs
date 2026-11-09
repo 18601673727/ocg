@@ -1879,6 +1879,12 @@ impl Batch {
                 crate::db::entities::STOPPED_BEFORE_SEND,
             ));
         }
+        // A scheduled external exchange may be recorded as sent only while
+        // the policy that authorized the reservation is still live at the
+        // revision the binding names, and still binds this Job. This runs in
+        // the send-evidence transaction, so a revocation commits before the
+        // request can leave the process.
+        self.scheduled_external_authorization(proof.token().job)?;
         self.require_development_write_any(proof)?;
         if sent.job != proof.token().job || sent.request != RequestNumber::FIRST {
             return self.reject(Violation::InvalidValue(

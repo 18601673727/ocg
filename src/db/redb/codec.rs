@@ -29,6 +29,8 @@ pub(super) const TAG_GLOBAL_COMPACTION: u8 = 14;
 pub(super) const TAG_APPROVAL: u8 = 15;
 pub(super) const TAG_CREDENTIAL: u8 = 16;
 pub(super) const TAG_GLOBAL_HEADERS: u8 = 17;
+pub(super) const TAG_SCHEDULED_EXTERNAL_POLICY: u8 = 18;
+pub(super) const TAG_SCHEDULED_EXTERNAL_BINDING: u8 = 19;
 
 pub(super) struct Enc(pub(super) Vec<u8>);
 
@@ -1339,4 +1341,117 @@ impl Dec<'_> {
             fields: self.outbound_headers()?,
         })
     }
+}
+
+pub(super) fn encode_scheduled_external_policy(
+    policy: &crate::db::entities::ScheduledExternalPolicyRecord,
+) -> Vec<u8> {
+    let mut e = Enc::new(TAG_SCHEDULED_EXTERNAL_POLICY);
+    e.u128(policy.id.get());
+    e.str(&policy.endpoint);
+    e.str(&policy.credential_ref);
+    e.str(&policy.model);
+    e.str(&policy.proxy);
+    e.u32(policy.max_request_bytes);
+    e.u32(policy.max_output_tokens);
+    e.u32(policy.timeout_secs);
+    e.bool(policy.enabled);
+    e.bool(policy.revoked);
+    e.u32(policy.revision);
+    e.ts(policy.created_at);
+    e.ts(policy.updated_at);
+    e.0
+}
+
+pub(super) fn decode_scheduled_external_policy(
+    key: u128,
+    bytes: &[u8],
+) -> DecodeResult<crate::db::entities::ScheduledExternalPolicyRecord> {
+    use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord};
+    let mut d = Dec::new(bytes, TAG_SCHEDULED_EXTERNAL_POLICY)?;
+    let id = ScheduledExternalPolicyId::new(d.u128()?);
+    let endpoint = d.str()?;
+    let credential_ref = d.str()?;
+    let model = d.str()?;
+    let proxy = d.str()?;
+    let max_request_bytes = d.u32()?;
+    let max_output_tokens = d.u32()?;
+    let timeout_secs = d.u32()?;
+    let enabled = d.bool()?;
+    let revoked = d.bool()?;
+    let revision = d.u32()?;
+    let created_at = d.ts()?;
+    let updated_at = d.ts()?;
+    d.end()?;
+    if id.get() != key
+        || endpoint.is_empty()
+        || endpoint.len() > 2048
+        || credential_ref.is_empty()
+        || credential_ref.len() > 128
+        || model.is_empty()
+        || model.len() > 128
+        || proxy.is_empty()
+        || proxy.len() > 64
+        || max_request_bytes == 0
+        || max_output_tokens == 0
+        || timeout_secs == 0
+        || revision == 0
+        || updated_at < created_at
+    {
+        return Err(StorageError::corrupted("invalid scheduled external policy"));
+    }
+    Ok(ScheduledExternalPolicyRecord {
+        id,
+        endpoint,
+        credential_ref,
+        model,
+        proxy,
+        max_request_bytes,
+        max_output_tokens,
+        timeout_secs,
+        enabled,
+        revoked,
+        revision,
+        created_at,
+        updated_at,
+    })
+}
+
+pub(super) fn encode_scheduled_external_binding(
+    binding: &crate::db::entities::ScheduledExternalBinding,
+) -> Vec<u8> {
+    let mut e = Enc::new(TAG_SCHEDULED_EXTERNAL_BINDING);
+    e.u128(binding.job.get());
+    e.u128(binding.policy.get());
+    e.u32(binding.policy_revision);
+    e.u64(binding.allocation_epoch);
+    e.u32(binding.allocation_generation.get());
+    e.0
+}
+
+pub(super) fn decode_scheduled_external_binding(
+    key: u128,
+    bytes: &[u8],
+) -> DecodeResult<crate::db::entities::ScheduledExternalBinding> {
+    use crate::db::entities::{JobId, ScheduledExternalBinding, ScheduledExternalPolicyId};
+    let mut d = Dec::new(bytes, TAG_SCHEDULED_EXTERNAL_BINDING)?;
+    let job = JobId::new(d.u128()?);
+    let policy = ScheduledExternalPolicyId::new(d.u128()?);
+    let policy_revision = d.u32()?;
+    let allocation_epoch = d.u64()?;
+    let generation = std::num::NonZeroU32::new(d.u32()?)
+        .ok_or_else(|| StorageError::corrupted("zero Allocation generation"))?;
+    d.end()?;
+    if job.get() != key || policy_revision == 0 {
+        return Err(StorageError::corrupted(
+            "invalid scheduled external binding",
+        ));
+    }
+    Ok(ScheduledExternalBinding {
+        job,
+        policy,
+        policy_revision,
+        allocation_epoch,
+        allocation_generation: generation,
+    })
 }

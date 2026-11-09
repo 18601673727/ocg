@@ -193,6 +193,11 @@ impl ApprovedEndpoint {
         &self.host
     }
 
+    /// The one canonical request URL this endpoint names.
+    pub(crate) fn request_url(&self) -> &str {
+        &self.request_url
+    }
+
     pub(crate) fn port(&self) -> u16 {
         self.port
     }
@@ -370,6 +375,30 @@ impl ExternalApproval {
         })
     }
 
+    /// The approval one durable scheduled external policy derives: every
+    /// identity is already canonical, the route is the named trusted proxy,
+    /// and the Model is exact. It is formed under
+    /// [`ExternalAuthority::ScheduledExternalTransport`], so neither manual
+    /// authority can stand in for it.
+    pub(crate) fn scheduled_external(
+        endpoint: &str,
+        credential_ref: &str,
+        model: &str,
+        proxy: LoopbackProxy,
+        limits: ApprovalLimits,
+    ) -> Result<Self, ApprovalRefusal> {
+        let credential_ref = approved_credential_ref(credential_ref)?;
+        valid_model_id(model)?;
+        Ok(Self {
+            authority: ExternalAuthority::ScheduledExternalTransport,
+            endpoint: ApprovedEndpoint::parse(endpoint)?,
+            credential_ref,
+            limits,
+            route: ApprovedRoute::TrustedProxy(proxy),
+            model: Some(model.to_owned()),
+        })
+    }
+
     /// Connects through the named loopback proxy instead of directly.
     pub(crate) fn with_trusted_proxy(mut self, proxy: LoopbackProxy) -> Self {
         self.route = ApprovedRoute::TrustedProxy(proxy);
@@ -402,6 +431,15 @@ impl ExternalApproval {
 
     pub(crate) fn limits(&self) -> ApprovalLimits {
         self.limits
+    }
+
+    pub(crate) fn credential_ref(&self) -> &str {
+        &self.credential_ref
+    }
+
+    /// Whether this approval names exactly `model`.
+    pub(crate) fn names_model(&self, model: &str) -> bool {
+        self.model.as_deref() == Some(model)
     }
 
     pub(crate) fn destination(&self) -> DestinationPolicy {

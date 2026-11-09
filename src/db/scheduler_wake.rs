@@ -40,6 +40,7 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         OperationKind::CreateExecutionPool
         | OperationKind::SetExecutionPoolEnabled
         | OperationKind::SetExecutionPoolProfile
+        | OperationKind::SetScheduledExternalPolicy
         | OperationKind::CreateJobWithInput
         | OperationKind::Open
         | OperationKind::Append
@@ -97,6 +98,7 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         // freeing it, so no slot is released and a capacity scan on the other
         // side would only be told to re-read what it already knows.
         OperationKind::QuarantineAbandonedJob
+        | OperationKind::SetScheduledExternalPolicy
         | OperationKind::ClaimExecution
         | OperationKind::SaveJobInput
         | OperationKind::CreateJobWithInput

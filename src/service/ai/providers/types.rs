@@ -130,6 +130,12 @@ pub enum ExternalAuthority {
     /// `ocg run-external-job`, under `manual_external_execution`. Through a
     /// trusted loopback proxy only.
     ManualExternalExecution,
+    /// The native scheduler, under `scheduled_external_transport`, through a
+    /// trusted loopback proxy only. It is formed from one durable scheduled
+    /// external policy and admits exactly the Job binding that policy
+    /// authorized; a manual approval of either kind neither forms nor enables
+    /// it.
+    ScheduledExternalTransport,
 }
 
 impl ExternalAuthority {
@@ -139,6 +145,9 @@ impl ExternalAuthority {
         match self {
             ExternalAuthority::ManualExternalTrial => ExecutionControl::ManualExternalTrial,
             ExternalAuthority::ManualExternalExecution => ExecutionControl::ManualExternalExecution,
+            ExternalAuthority::ScheduledExternalTransport => {
+                ExecutionControl::ScheduledExternalTransport
+            }
         }
     }
 
@@ -150,7 +159,12 @@ impl ExternalAuthority {
                 ApprovedRoute::Direct | ApprovedRoute::TrustedProxy(_),
             )
             | (ExternalAuthority::ManualExternalExecution, ApprovedRoute::TrustedProxy(_)) => true,
-            (ExternalAuthority::ManualExternalExecution, ApprovedRoute::Direct) => false,
+            (ExternalAuthority::ScheduledExternalTransport, ApprovedRoute::TrustedProxy(_)) => true,
+            (
+                ExternalAuthority::ManualExternalExecution
+                | ExternalAuthority::ScheduledExternalTransport,
+                ApprovedRoute::Direct,
+            ) => false,
         }
     }
 

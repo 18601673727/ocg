@@ -8104,3 +8104,80 @@ pub(crate) fn read_usage_retries(
         next: if more { last } else { None },
     })
 }
+
+/// One durable scheduled external policy by its stable identity. Absence is
+/// meaningful: no policy authorizes anything.
+pub(crate) fn read_scheduled_external_policy(
+    database: &Database,
+    id: crate::db::entities::ScheduledExternalPolicyId,
+) -> Result<Option<crate::db::entities::ScheduledExternalPolicyRecord>, StorageError> {
+    let rx = read(database)?;
+    let table = rx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+    table
+        .get(id.get())?
+        .map(|row| decode_scheduled_external_policy(id.get(), row.value()))
+        .transpose()
+}
+
+/// Policies in ascending identity order, strictly after `after`, at most
+/// `limit`; a `next` cursor is returned only when another row may follow.
+pub(crate) fn read_scheduled_external_policies(
+    database: &Database,
+    after: Option<crate::db::entities::ScheduledExternalPolicyId>,
+    limit: usize,
+) -> Result<
+    CursorPage<
+        crate::db::entities::ScheduledExternalPolicyRecord,
+        crate::db::entities::ScheduledExternalPolicyId,
+    >,
+    StorageError,
+> {
+    let rx = read(database)?;
+    let table = rx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+    let limit = limit.clamp(1, MAX_PAGE);
+    let mut records = Vec::new();
+    let mut more = false;
+    for entry in table.range((
+        std::ops::Bound::Excluded(after.map_or(0, |id| id.get())),
+        std::ops::Bound::Unbounded,
+    ))? {
+        if records.len() == limit {
+            more = true;
+            break;
+        }
+        let (key, row) = entry?;
+        records.push(decode_scheduled_external_policy(key.value(), row.value())?);
+    }
+    let next = records.last().map(|record| record.id).filter(|_| more);
+    Ok(CursorPage { records, next })
+}
+
+/// One Job's durable scheduled external binding together with the exact policy
+/// row it names, read in one read transaction. `Ok(None)` means no binding,
+/// which is every loopback and manual execution.
+pub(crate) fn read_scheduled_external_binding_with_policy(
+    database: &Database,
+    job: JobId,
+) -> Result<
+    Option<(
+        crate::db::entities::ScheduledExternalBinding,
+        crate::db::entities::ScheduledExternalPolicyRecord,
+    )>,
+    StorageError,
+> {
+    let rx = read(database)?;
+    let Some(row) = rx.open_table(SCHEDULED_EXTERNAL_BINDING)?.get(job.get())? else {
+        return Ok(None);
+    };
+    let binding = decode_scheduled_external_binding(job.get(), row.value())?;
+    let Some(policy_row) = rx
+        .open_table(SCHEDULED_EXTERNAL_POLICY)?
+        .get(binding.policy.get())?
+    else {
+        return Err(StorageError::corrupted(
+            "a scheduled external binding names a missing policy",
+        ));
+    };
+    let policy = decode_scheduled_external_policy(binding.policy.get(), policy_row.value())?;
+    Ok(Some((binding, policy)))
+}

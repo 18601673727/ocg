@@ -14,6 +14,7 @@ pub(crate) mod native_scheduler;
 pub(crate) mod notification;
 pub mod policy;
 pub mod runtime;
+pub(crate) mod scheduled_external;
 pub mod scheduler;
 pub(crate) mod secrets;
 

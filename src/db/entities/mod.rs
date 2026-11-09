@@ -19,6 +19,7 @@ pub(crate) mod output_filter;
 mod profiles;
 mod projects;
 mod requests;
+mod scheduled_external;
 mod scheduling;
 mod statistics;
 mod usage;
@@ -35,7 +36,8 @@ pub use headers::*;
 pub use identity::{
     AttachmentId, AvailabilityStatId, ComposerContextId, ConfigId, ExecutionPoolId, ExecutorId,
     JobId, JobInputId, JobOutputId, LlmProviderId, MetricsId, ProfileId, ProjectId, RecordRef,
-    RequestEventId, RequestNumber, RequestRef, ReservationRequestId, Timestamp, parse_entity_id,
+    RequestEventId, RequestNumber, RequestRef, ReservationRequestId, ScheduledExternalPolicyId,
+    Timestamp, parse_entity_id,
 };
 pub(crate) use job_context::parse_suggested_title;
 pub use job_context::{
@@ -56,6 +58,7 @@ pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
 pub use profiles::*;
 pub use projects::*;
 pub use requests::*;
+pub use scheduled_external::*;
 pub use scheduling::*;
 pub use statistics::{
     AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,
