@@ -4232,7 +4232,6 @@ pub(super) fn candidate_compatible(
     candidate: crate::db::AdmissionCandidate,
 ) -> Result<bool, StorageError> {
     let (executor, model, decision) = match candidate {
-        crate::db::AdmissionCandidate::Model(executor, model) => (executor, model, false),
         crate::db::AdmissionCandidate::Decision(executor, model) => (executor, model, true),
     };
     let configs = rx.table(CONFIGS)?;

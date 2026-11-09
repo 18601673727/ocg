@@ -3706,7 +3706,6 @@ impl Batch {
         let value = create(self)?;
         if !replay && let Some(candidate) = candidate {
             let (executor, model, decision) = match candidate {
-                crate::db::AdmissionCandidate::Model(executor, model) => (executor, model, false),
                 crate::db::AdmissionCandidate::Decision(executor, model) => (executor, model, true),
             };
             if !self

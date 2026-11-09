@@ -4088,47 +4088,6 @@ impl DatabaseHandle {
         })
         .await
     }
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn steer_with_format(
-        &self,
-        conversation: JobId,
-        entry: Entry,
-        freeze: Option<ExecutionConfiguration>,
-        submission: Option<Submission>,
-        format: Option<crate::db::entities::ResponseFormat>,
-        automatic: bool,
-        candidate: AdmissionCandidate,
-    ) -> Result<(Appended, Vec<(JobId, crate::db::entities::StopCause)>), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (
-                    conversation,
-                    entry,
-                    freeze,
-                    submission,
-                    format,
-                    automatic,
-                    candidate,
-                ),
-                reply,
-                |(_, first, _, _, format, _, _)| entry_bytes(first, format.as_ref()),
-                OperationKind::Append,
-                |(conversation, entry, freeze, submission, format, automatic, candidate), batch| {
-                    batch.with_admission_candidate(Some(candidate), submission, |batch| {
-                        batch.steer_with_format(
-                            conversation,
-                            entry,
-                            freeze,
-                            submission,
-                            format,
-                            automatic,
-                        )
-                    })
-                },
-            )
-        })
-        .await
-    }
     pub async fn stop_turn(
         &self,
         conversation: JobId,

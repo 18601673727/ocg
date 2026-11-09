@@ -202,16 +202,14 @@ pub(super) fn phase(record: &MutableJobRecord) -> &'static str {
         },
     }
 }
-fn view(record: MutableJobRecord) -> Value {
-    let phase = phase(&record);
-    let project = record.project;
-    let job = record.job;
+/// The editable input of `job` as the Composer reads it.
+fn input_view(job: &crate::db::entities::MutableJob) -> Value {
     let priority = match job.input.priority {
         JobQueuePriority::Foreground => "foreground",
         JobQueuePriority::Automatic => "automatic",
         JobQueuePriority::Speculative => "speculative",
     };
-    let input = match &job.input.content {
+    match &job.input.content {
         MutableJobContent::Generative {
             text,
             attachments,
@@ -225,15 +223,51 @@ fn view(record: MutableJobRecord) -> Value {
         } => {
             serde_json::json!({"kind":"decision", "decision_request":request, "decision_profile":profile.to_string(), "priority":priority})
         }
-    };
+    }
+}
+fn view(record: MutableJobRecord) -> Value {
+    let phase = phase(&record);
+    let input = input_view(&record.job);
+    let project = record.project;
+    let job = record.job;
     envelope(
         serde_json::json!({"job": {"id":job.id.to_string(), "conversation":job.parent_id.to_string(), "project":project.map(|id| id.to_string()), "previous":job.previous.map(|id| id.to_string()), "context":job.composer_context.to_string(), "revision":job.revision, "phase":phase, "created_at":job.created_at.as_unix_micros(), "submitted_at":job.submitted_at.map(|at| at.as_unix_micros()), "input":input}}),
     )
 }
+
+/// Adds the editable state of a Job to its `GET /api/v1/jobs/{job}` body: the
+/// Composer context it belongs to, its submission time and its editable
+/// input. When the request named a Composer `context`, a queued Generative
+/// Job also reports whether it is blocked behind Decision history.
+pub(super) async fn add_editable_state(
+    body: &mut Value,
+    database: &DatabaseHandle,
+    context: Option<ComposerContextId>,
+    record: &MutableJobRecord,
+) -> Result<(), Refusal> {
+    let job = &record.job;
+    body["context"] = serde_json::json!(job.composer_context.to_string());
+    body["submitted_at"] = serde_json::json!(job.submitted_at.map(|at| at.as_unix_micros()));
+    body["input"] = input_view(job);
+    if let Some(context) = context {
+        let queued_generative = job.phase == MutableJobPhase::Queued
+            && record.outcome.is_none()
+            && matches!(job.input.content, MutableJobContent::Generative { .. });
+        body["unsupported_decision_history"] = Value::Bool(if queued_generative {
+            database
+                .mutable_job_with_support(context, job.id)
+                .await
+                .map_err(refusal)?
+                .1
+        } else {
+            false
+        });
+    }
+    Ok(())
+}
 pub(super) enum Action {
     Create,
     Current,
-    Read(JobId),
     Edit(JobId),
     Submit(JobId),
     CancelQueued(JobId),
@@ -275,15 +309,6 @@ pub(super) async fn respond(
                 .map_err(refusal)?
                 .ok_or(NOT_FOUND)?;
             Ok(Reply::ok(view(record)))
-        }
-        Action::Read(id) => {
-            let (record, blocked) = database
-                .mutable_job_with_support(context, id)
-                .await
-                .map_err(refusal)?;
-            let mut result = view(record);
-            result["job"]["unsupported_decision_history"] = Value::Bool(blocked);
-            Ok(Reply::ok(result))
         }
         Action::Edit(id) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

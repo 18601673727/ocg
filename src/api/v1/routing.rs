@@ -124,7 +124,6 @@ pub(super) enum Route {
         job: JobId,
         after_seq: Option<i64>,
     },
-    Submit,
     DecisionSubmit,
     Admission,
     DecideApproval(crate::db::entities::ToolCallRef),
@@ -209,7 +208,6 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::LatestOutput(_)
             | Route::Events { .. }
             | Route::Admission
-            | Route::Submit
             | Route::DecisionSubmit
             | Route::DecideApproval(_)
             | Route::ReleaseSlot(_)
@@ -243,20 +241,17 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         .collect::<Vec<_>>();
     if request.method() == Method::POST {
         return match segments.as_slice() {
-            ["mutable-jobs", job, "cancel-unsupported"] => no_query(query).and_then(|()| {
+            ["jobs", job, "cancel-unsupported"] => no_query(query).and_then(|()| {
                 job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::CancelQueued(id)))
             }),
             ["update"] => no_query(query).map(|()| Route::StartUpdate),
-            ["mutable-jobs"] => {
-                no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Create))
-            }
-            ["mutable-jobs", job] => no_query(query).and_then(|()| {
+            ["jobs"] => no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Create)),
+            ["jobs", job] => no_query(query).and_then(|()| {
                 job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Edit(id)))
             }),
-            ["mutable-jobs", job, "submit"] => no_query(query).and_then(|()| {
+            ["jobs", job, "submit"] => no_query(query).and_then(|()| {
                 job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Submit(id)))
             }),
-            ["jobs"] => no_query(query).map(|()| Route::Submit),
             ["decisions"] => no_query(query).map(|()| Route::DecisionSubmit),
             ["jobs", job, "release-slot"] => {
                 no_query(query).and_then(|()| job_id(job).map(Route::ReleaseSlot))
@@ -335,7 +330,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     }
     if request.method() == Method::DELETE {
         return match segments.as_slice() {
-            ["mutable-jobs", job] => no_query(query).and_then(|()| {
+            ["jobs", job] => no_query(query).and_then(|()| {
                 job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Discard(id)))
             }),
             ["providers", id] => {
@@ -351,11 +346,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         };
     }
     match segments.as_slice() {
-        ["mutable-jobs", "current"] => {
+        ["jobs", "current"] => {
             no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Current))
         }
-        ["mutable-jobs", job] => no_query(query)
-            .and_then(|()| job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Read(id)))),
         ["update"] => match query {
             "" => Ok(Route::Update(false)),
             "latest=1" => Ok(Route::Update(true)),
@@ -645,6 +638,8 @@ pub(super) async fn respond(
                     body["project"] = serde_json::json!(
                         details.record.project.map(|project| project.to_string())
                     );
+                    mutable_jobs::add_editable_state(&mut body, database, context, &details.record)
+                        .await?;
                     Ok(Reply::ok(body))
                 }
                 crate::db::redb::MutableJobDetailsLookup::Inaccessible
@@ -805,12 +800,6 @@ pub(super) async fn respond(
             limit,
             depth,
         } => catalog::job_tree(shared, job, after, limit, depth).await,
-        Route::Submit => {
-            let key = submissions::idempotency_key(request.headers())?;
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
-            let job = submissions::JobRequest::parse(&body)?;
-            submissions::submit(shared, key, job).await
-        }
         Route::DecisionSubmit => {
             let key = submissions::idempotency_key(request.headers())?;
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

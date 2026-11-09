@@ -40,10 +40,7 @@ fn mutable_job_write(rest: &str) -> bool {
     let segments = rest.split('/').collect::<Vec<_>>();
     matches!(
         segments.as_slice(),
-        ["mutable-jobs"] | ["mutable-jobs", _] | ["mutable-jobs", _, "submit"]
-    ) || matches!(
-        segments.as_slice(),
-        ["mutable-jobs", _, "cancel-unsupported"]
+        ["jobs"] | ["jobs", _] | ["jobs", _, "submit"] | ["jobs", _, "cancel-unsupported"]
     )
 }
 
@@ -84,7 +81,7 @@ fn takes_post(path: &str) -> bool {
 /// member, whose LLM Profile is archived in place.
 fn takes_delete(path: &str) -> bool {
     path.strip_prefix("/api/v1/").is_some_and(|rest| {
-        member(rest, "profiles") || member(rest, "providers") || member(rest, "mutable-jobs")
+        member(rest, "profiles") || member(rest, "providers") || member(rest, "jobs")
     })
 }
 

@@ -42,14 +42,12 @@ use serde_json::Value;
 use super::{DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared};
 use crate::db::attachments::AttachmentError;
 use crate::db::attachments::{AttachmentImageError, attachment_images};
-use crate::db::entities::ResponseFormat;
 use crate::db::entities::{
     AttachmentId, AttachmentOrigin, ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration,
-    ExecutorId, JobExecution, JobId, JobKind, ModelCapability, ProfileId, ProjectId, RecordRef,
-    RequestFingerprint, Submission, SubmissionKey, SubmissionRecord, Violation,
+    ExecutorId, JobExecution, JobId, JobKind, ProfileId, RecordRef, RequestFingerprint, Submission,
+    SubmissionKey, SubmissionRecord, Violation,
 };
 use crate::db::{AdmissionCandidate, DatabaseError, DatabaseHandle};
-use crate::service::ai::providers::openai_compatible::ResponseFormatWire;
 use crate::service::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES;
 use crate::system::executor::execution_runtime::ExecutionRuntimeError;
 
@@ -65,7 +63,6 @@ pub(super) const MAX_NAME_BYTES: usize = 128;
 const MAX_UNRESOLVED: usize = 256;
 
 const KEY_DOMAIN: &[u8] = b"ocg.control-plane.idempotency-key.v1\n";
-const REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.job-submission.v1\n";
 const DECISION_REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.decision-submission.v1\n";
 
 pub(super) const KEY_REQUIRED: Refusal = Refusal::new(
@@ -108,40 +105,10 @@ const TOO_MANY_UNRESOLVED: Refusal = Refusal::new(
     "too_many_submissions",
     "too many submissions are unresolved; nothing was submitted; retry later",
 );
-const PROFILE_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "llm_profile_not_found",
-    "no such LLM Profile; nothing was submitted",
-);
-const AGENT_PROFILE_REQUIRED: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "agent_profile_required",
-    "name an Agent that lists this Model",
-);
-const AGENT_PROFILE_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "agent_profile_not_found",
-    "no such Agent Profile; nothing was submitted",
-);
-const AGENT_TARGET_MISMATCH: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "llm_profile_not_targeted",
-    "the Agent Profile is not configured to run with that LLM Profile; nothing was submitted",
-);
 const EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "executor_not_found",
     "no such Executor; nothing was submitted",
-);
-const EXECUTOR_INCOMPATIBLE: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "executor_incompatible",
-    "the Executor cannot run the LLM Profile; nothing was submitted",
-);
-const PROJECT_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "project_not_found",
-    "no such Project; nothing was submitted",
 );
 const PROJECT_REQUIRED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -174,11 +141,6 @@ const STORAGE_REFUSED: Refusal = Refusal::new(
     "storage_refused",
     "storage refused the Job; nothing was admitted",
 );
-const VISION_NOT_SUPPORTED: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "vision_not_supported",
-    "the selected LLM Profile does not declare the vision capability, but the conversation carries images; nothing was submitted",
-);
 const TOOLS_NOT_SUPPORTED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "tools_not_supported",
@@ -210,59 +172,6 @@ const ATTACHMENT_UNAVAILABLE: Refusal = Refusal::new(
     "an Attachment's content is no longer available; nothing was submitted",
 );
 
-/// A validated submission: an existing LLM Profile and Executor, by their
-/// persisted identities, an objective and an Agent Profile that targets the
-/// LLM Profile, a Job name, a Project, and a completed predecessor Job.
-/// Nothing else can be submitted: the Provider, its credential and the model
-/// come from the Profile; Workspace tools come from the frozen Agent grant and
-/// the Project.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct JobRequest {
-    reasoning_effort: Option<crate::db::entities::ReasoningEffort>,
-    agent_profile: Option<ProfileId>,
-    llm_profile: ProfileId,
-    executor: ExecutorId,
-    objective: String,
-    name: Option<String>,
-    conversation: Option<JobId>,
-    /// The Project the Job works in. A follow-up that names none takes its
-    /// previous turn's.
-    project: Option<ProjectId>,
-    /// Image Attachments sent with the objective, in order.
-    attachments: Vec<AttachmentId>,
-    response_format: Option<ResponseFormat>,
-    keep_open: bool,
-    steer: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SubmissionInput {
-    reasoning_effort: Option<String>,
-    /// The Agent that lists this Model. Every generative turn requires an
-    /// Agent.
-    #[serde(default)]
-    agent_profile: Option<String>,
-    #[serde(default)]
-    llm_profile: Option<String>,
-    executor: String,
-    objective: String,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    conversation: Option<String>,
-    #[serde(default)]
-    project: Option<String>,
-    #[serde(default)]
-    attachments: Vec<String>,
-    #[serde(default)]
-    response_format: Option<ResponseFormatWire>,
-    #[serde(default)]
-    keep_open: Option<bool>,
-    #[serde(default)]
-    mode: Option<String>,
-}
-
 /// Text that may be stored: no control character but tab, carriage return
 /// and line feed, and not only white space.
 pub(super) fn text(value: &str, max_bytes: usize) -> bool {
@@ -275,183 +184,6 @@ pub(super) fn text(value: &str, max_bytes: usize) -> bool {
 
 fn identity(text: &str, _prefix: &str) -> Option<u128> {
     crate::db::entities::parse_entity_id(text)
-}
-
-impl JobRequest {
-    /// Parses a submission body strictly: one JSON object of the known
-    /// fields, none repeated, each within its bounds.
-    pub(super) fn parse(body: &[u8]) -> Result<Self, Refusal> {
-        let wire: SubmissionInput = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
-        let shape: Value = serde_json::from_slice(body).map_err(|_| INVALID_BODY)?;
-        if shape
-            .pointer("/response_format/json_schema/description")
-            .is_some()
-            || (wire.conversation.is_some() && shape.get("keep_open").is_some())
-        {
-            return Err(INVALID_BODY);
-        }
-        let llm_profile = wire
-            .llm_profile
-            .as_deref()
-            .map(|model| identity(model, "profile:").ok_or(INVALID_BODY))
-            .transpose()?
-            .map(ProfileId::new)
-            .unwrap_or_default();
-        let executor = identity(&wire.executor, "executor:").ok_or(INVALID_BODY)?;
-        let agent_profile = wire
-            .agent_profile
-            .as_deref()
-            .map(|agent| identity(agent, "profile:").ok_or(INVALID_BODY))
-            .transpose()?
-            .map(ProfileId::new);
-        let conversation = wire
-            .conversation
-            .as_deref()
-            .map(|prev| identity(prev, "job:").ok_or(INVALID_BODY))
-            .transpose()?
-            .map(JobId::new);
-        let response_format = wire
-            .response_format
-            .map(|format| {
-                format.validate().map_err(|_| INVALID_BODY)?;
-                match format {
-                    ResponseFormatWire::JsonObject {} => Ok(ResponseFormat::JsonObject),
-                    ResponseFormatWire::JsonSchema { json_schema } => {
-                        let name = json_schema.name.ok_or(INVALID_BODY)?;
-                        if name.is_empty()
-                            || name.len() > 64
-                            || !name
-                                .bytes()
-                                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-                        {
-                            return Err(INVALID_BODY);
-                        }
-                        Ok(ResponseFormat::JsonSchema {
-                            name,
-                            schema: json_schema.schema.ok_or(INVALID_BODY)?,
-                            strict: json_schema.strict,
-                        })
-                    }
-                    ResponseFormatWire::Text {} => Err(INVALID_BODY),
-                }
-            })
-            .transpose()?;
-        let project = wire
-            .project
-            .as_deref()
-            .map(|project| identity(project, "project:").ok_or(INVALID_BODY))
-            .transpose()?
-            .map(ProjectId::new);
-        if wire.attachments.len() > MAX_REQUEST_IMAGES {
-            return Err(TOO_MANY_IMAGES);
-        }
-        let mut attachments = Vec::with_capacity(wire.attachments.len());
-        for attachment in &wire.attachments {
-            let attachment =
-                AttachmentId::new(identity(attachment, "attachment:").ok_or(INVALID_BODY)?);
-            if attachments.contains(&attachment) {
-                return Err(INVALID_BODY);
-            }
-            attachments.push(attachment);
-        }
-        if (wire.objective.trim().is_empty() && attachments.is_empty())
-            || wire.objective.len() > MAX_OBJECTIVE_BYTES
-            || wire
-                .objective
-                .chars()
-                .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
-            || wire
-                .name
-                .as_deref()
-                .is_some_and(|name| !text(name, MAX_NAME_BYTES))
-        {
-            return Err(INVALID_BODY);
-        }
-        let steer = match wire.mode.as_deref() {
-            None => None,
-            Some("queue") => Some(false),
-            Some("steer") if conversation.is_some() => Some(true),
-            Some(_) => return Err(INVALID_BODY),
-        };
-        let reasoning_effort = wire
-            .reasoning_effort
-            .as_deref()
-            .map(|value| crate::db::entities::ReasoningEffort::parse(value).ok_or(INVALID_BODY))
-            .transpose()?;
-        Ok(Self {
-            reasoning_effort,
-            steer,
-            agent_profile,
-            llm_profile,
-            executor: ExecutorId::new(executor),
-            objective: wire.objective,
-            name: wire.name,
-            conversation,
-            project,
-            attachments,
-            response_format,
-            keep_open: wire.keep_open.unwrap_or(true),
-        })
-    }
-
-    /// The digest of the request as parsed, whatever its JSON spelling.
-    pub(super) fn fingerprint(&self) -> RequestFingerprint {
-        let mut context = Context::new(&SHA256);
-        context.update(REQUEST_DOMAIN);
-        context.update(&self.llm_profile.get().to_le_bytes());
-        context.update(&self.executor.get().to_le_bytes());
-        let mut field = |value: &str| {
-            context.update(&(value.len() as u64).to_le_bytes());
-            context.update(value.as_bytes());
-        };
-        field(&self.objective);
-        match &self.name {
-            None => context.update(&[0]),
-            Some(name) => {
-                context.update(&[1]);
-                context.update(&(name.len() as u64).to_le_bytes());
-                context.update(name.as_bytes());
-            }
-        }
-        // Appended only when named, so the fingerprint of a request without
-        // an Agent Profile is what it was before one could be named.
-        if let Some(agent) = self.agent_profile {
-            context.update(&[2]);
-            context.update(&agent.get().to_le_bytes());
-        }
-        if let Some(previous) = self.conversation {
-            context.update(&[3]);
-            context.update(&previous.get().to_le_bytes());
-        }
-        if !self.attachments.is_empty() {
-            context.update(&[4]);
-            context.update(&(self.attachments.len() as u64).to_le_bytes());
-            for attachment in &self.attachments {
-                context.update(&attachment.get().to_le_bytes());
-            }
-        }
-        if let Some(project) = self.project {
-            context.update(&[5]);
-            context.update(&project.get().to_le_bytes());
-        }
-        if let Some(format) = &self.response_format {
-            context.update(&[6]);
-            context.update(&crate::db::redb::encode_response_format(format));
-        }
-        if !self.keep_open {
-            context.update(&[7]);
-        }
-        match self.steer {
-            Some(true) => context.update(&[8]),
-            None if self.conversation.is_some() => context.update(&[9]),
-            None | Some(false) => {}
-        }
-        if let Some(effort) = self.reasoning_effort {
-            context.update(&[10]);
-            context.update(effort.as_str().as_bytes());
-        }
-        RequestFingerprint::from_digest(sha256(context))
-    }
 }
 
 fn sha256(context: Context) -> [u8; 32] {
@@ -856,58 +588,17 @@ fn admission(admission: AdmissionView) -> Value {
     envelope(serde_json::json!(AdmissionResponseView { admission }))
 }
 
-/// Submits `request` once under `key`, see the module documentation, and
-/// waits at most the configured time for its admission: an admitted Job is
-/// `201 Created` when this request created it and `200 OK` when the key
-/// already named it; an admission still running is `202 Accepted`, pending,
-/// and runs on without the request.
-pub(super) async fn submit(
-    shared: &Arc<Shared>,
-    key: SubmissionKey,
-    request: JobRequest,
-) -> Result<Reply, Refusal> {
-    submit_plan(shared, key, Plan::Job(request)).await
-}
-
-/// Submits one typed decision under `key`, with the same admission
-/// guarantees as an ordinary Job submission.
+/// Submits one typed decision under `key`: the key names at most one Job, a
+/// request that raced it waits for the same admission, and an admission still
+/// running is `202 Accepted`, pending, and runs on without the request.
 pub(super) async fn submit_decision(
     shared: &Arc<Shared>,
     key: SubmissionKey,
     request: DecisionJobRequest,
 ) -> Result<Reply, Refusal> {
-    submit_plan(shared, key, Plan::Decision(request)).await
-}
-
-/// What a submission asks for. Both kinds are admitted once under one key.
-enum Plan {
-    Job(JobRequest),
-    Decision(DecisionJobRequest),
-}
-
-impl Plan {
-    fn fingerprint(&self) -> RequestFingerprint {
-        match self {
-            Self::Job(request) => request.fingerprint(),
-            Self::Decision(request) => request.fingerprint(),
-        }
-    }
-}
-
-async fn submit_plan(
-    shared: &Arc<Shared>,
-    key: SubmissionKey,
-    plan: Plan,
-) -> Result<Reply, Refusal> {
-    let fingerprint = plan.fingerprint();
-    let decision = matches!(plan, Plan::Decision(_));
-    let admission_value = move |job: JobId| async move {
-        if decision {
-            admitted_decision_value(shared, key, job).await
-        } else {
-            admitted_value(shared, key, job).await
-        }
-    };
+    let fingerprint = request.fingerprint();
+    let admission_value =
+        move |job: JobId| async move { admitted_decision_value(shared, key, job).await };
     // At most one uncertain entry is resolved before the key is claimed.
     for _ in 0..2 {
         let (outcome, owner) = match shared.submissions.claim(key, fingerprint) {
@@ -933,7 +624,7 @@ async fn submit_plan(
             } => {
                 // Spawned before anything is awaited: the admission is the
                 // listener's, whatever becomes of this request.
-                ntex::rt::spawn(admit(shared.clone(), key, generation, fingerprint, plan));
+                ntex::rt::spawn(admit(shared.clone(), key, generation, fingerprint, request));
                 (outcome, true)
             }
         };
@@ -1050,7 +741,7 @@ async fn admit(
     key: SubmissionKey,
     generation: u64,
     fingerprint: RequestFingerprint,
-    plan: Plan,
+    request: DecisionJobRequest,
 ) {
     let registry = &shared.submissions;
     // Every waiter of an admission that ran is of the owner's request.
@@ -1082,140 +773,7 @@ async fn admit(
             return finish(Outcome::Refused(refusal));
         }
     }
-    match plan {
-        Plan::Job(request) => {
-            admit_job(&shared, key, generation, fingerprint, request, finish).await
-        }
-        Plan::Decision(request) => {
-            admit_decision(&shared, key, generation, fingerprint, request, finish).await
-        }
-    }
-}
-
-/// The admission of an ordinary Job: its configuration is checked, then the
-/// Job is opened with its submission.
-async fn admit_job(
-    shared: &Arc<Shared>,
-    key: SubmissionKey,
-    generation: u64,
-    fingerprint: RequestFingerprint,
-    request: JobRequest,
-    finish: impl Fn(Outcome),
-) {
-    let mut request = request;
-    if let Err(refusal) = normalize(&shared.database, &mut request).await {
-        return finish(Outcome::Refused(refusal));
-    }
-    let project = match check_configuration(&shared.database, &request).await {
-        Ok(project) => project,
-        Err(refusal) => return finish(Outcome::Refused(refusal)),
-    };
-    let configuration = ExecutionConfiguration {
-        reasoning_effort: request.reasoning_effort,
-        agent_profile: request.agent_profile,
-        llm_profile: request.llm_profile,
-    };
-    let first = crate::db::entities::Entry::UserMessage {
-        text: request.objective,
-        attachments: request.attachments,
-    };
-    let submission = Some(Submission { key, fingerprint });
-    let candidate = AdmissionCandidate::Model(request.executor, request.llm_profile);
-
-    let admitted = match request.conversation {
-        Some(conversation) if request.steer != Some(false) => match shared
-            .database
-            .steer_with_format(
-                conversation,
-                first,
-                Some(configuration),
-                submission,
-                request.response_format,
-                request.steer.is_none(),
-                candidate,
-            )
-            .await
-        {
-            Ok((appended, running)) => {
-                for (job, cause) in running {
-                    shared.scheduler.stop(job, cause).await;
-                }
-                Ok(appended.turn)
-            }
-            Err(error) => Err(error),
-        },
-        Some(conversation) => shared
-            .database
-            .append_with_format(
-                conversation,
-                first,
-                Some(configuration),
-                submission,
-                request.response_format,
-                Some(candidate),
-            )
-            .await
-            .map(|appended| appended.turn),
-        None => shared
-            .database
-            .open_group_with_format(
-                None,
-                crate::db::entities::JobGroup {
-                    name: request.name.clone(),
-                    agent: request.agent_profile.map(Into::into),
-                    project,
-                    origin: crate::db::entities::Origin::User,
-                    keep_open: request.keep_open,
-                },
-                first,
-                configuration,
-                submission,
-                request.response_format,
-                Some(candidate),
-            )
-            .await
-            .map(|(_, appended)| appended.turn),
-    };
-    match admitted {
-        Ok(job) => finish(Outcome::Admitted { job, created: true }),
-        Err(DatabaseError::Rejected(Violation::SubmissionKeyUsed { job, same_request })) => {
-            finish(if same_request {
-                Outcome::Admitted {
-                    job,
-                    created: false,
-                }
-            } else {
-                Outcome::Conflict
-            })
-        }
-        Err(DatabaseError::Rejected(Violation::NotFound(RecordRef::Executor(_)))) => {
-            finish(Outcome::Refused(EXECUTOR_NOT_FOUND))
-        }
-        Err(DatabaseError::Rejected(Violation::InvalidValue("executor_incompatible", _))) => {
-            finish(Outcome::Refused(EXECUTOR_INCOMPATIBLE))
-        }
-        Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
-            shared
-                .submissions
-                .uncertain(key, generation, operation.epoch())
-        }
-        Err(DatabaseError::Rejected(Violation::InvalidValue("vision_not_supported", _))) => {
-            finish(Outcome::Refused(VISION_NOT_SUPPORTED))
-        }
-        Err(DatabaseError::Rejected(Violation::InvalidValue("too_many_images", _))) => {
-            finish(Outcome::Refused(TOO_MANY_IMAGES))
-        }
-        Err(DatabaseError::Rejected(Violation::InvalidValue("compaction_in_progress", _))) => {
-            finish(Outcome::Refused(Refusal::new(
-                StatusCode::CONFLICT,
-                "compaction_in_progress",
-                "rule-based or manual compaction only accepts queued prompts",
-            )))
-        }
-        Err(error) => finish(Outcome::Refused(not_admitted(
-            &ExecutionRuntimeError::Database(error),
-        ))),
-    }
+    admit_decision(&shared, key, generation, fingerprint, request, finish).await
 }
 
 // ---- decision submissions --------------------------------------------------------
@@ -1605,113 +1163,6 @@ async fn check_decision_configuration(
     Ok(())
 }
 
-/// Refuses a Profile that is not an existing LLM Profile, an Agent Profile
-/// that does not exist or does not target it, an Executor
-/// that does not exist or cannot run it now, and a Project that does not
-/// exist, is missing for an Agent with a grant, or is not the Project of the
-/// previous turn. The creation checks them again in its own transaction.
-/// Answers the Project the Job works in: the request's, else its previous
-/// turn's.
-pub(super) async fn check_configuration(
-    database: &DatabaseHandle,
-    request: &JobRequest,
-) -> Result<Option<ProjectId>, Refusal> {
-    let llm = match database.config(request.llm_profile.into()).await? {
-        Some(ConfigRecord {
-            body: ConfigBody::Model(model),
-            archived_at: None,
-            model_enabled: true,
-            ..
-        }) => model,
-        _ => return Err(PROFILE_NOT_FOUND),
-    };
-    if request.reasoning_effort.is_some_and(|effort| {
-        llm.reasoning_efforts
-            .as_ref()
-            .is_some_and(|values| !values.iter().any(|value| value == effort.as_str()))
-    }) {
-        return Err(Refusal::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "reasoning_effort_unsupported",
-            "the selected model does not support the requested reasoning effort",
-        ));
-    }
-    let agent_profile = request.agent_profile.ok_or(AGENT_PROFILE_REQUIRED)?;
-    let tool_grant = match database.config(agent_profile.into()).await? {
-        Some(ConfigRecord {
-            body: ConfigBody::Agent(agent),
-            ..
-        }) => {
-            if !agent.models.contains(&request.llm_profile.into())
-                || !agent.supports_model(&ConfigBody::Model(llm.clone()))
-                || !agent.runs_generative()
-            {
-                return Err(AGENT_TARGET_MISMATCH);
-            }
-            agent.workspace_grant().is_some()
-        }
-        _ => return Err(AGENT_PROFILE_NOT_FOUND),
-    };
-    if database.executor(request.executor).await?.is_none() {
-        return Err(EXECUTOR_NOT_FOUND);
-    }
-    let executors = database.compatible_executors(request.llm_profile).await?;
-    if !executors.contains(&request.executor)
-        && (executors.len() < crate::db::redb::MAX_PAGE
-            || !database
-                .candidate_compatible(AdmissionCandidate::Model(
-                    request.executor,
-                    request.llm_profile,
-                ))
-                .await?)
-    {
-        return Err(EXECUTOR_INCOMPATIBLE);
-    }
-    let mut images: Vec<AttachmentId> = Vec::new();
-    let mut capabilities = llm.declared_capabilities.clone();
-    if let Some(conversation) = request.conversation
-        && let Some(tip) = database
-            .conversation_turns(conversation, None, 1)
-            .await?
-            .first()
-        && tip.claim.is_none()
-        && tip.outcome.is_none()
-    {
-        capabilities = database
-            .job_execution(tip.id)
-            .await?
-            .0
-            .llm
-            .config
-            .declared_capabilities;
-        if let Some(input) = database.job_input_for_job(tip.id).await? {
-            images.extend(input.attachments);
-        }
-    }
-    let project = request.project;
-    match project {
-        Some(project) => {
-            if database.project(project).await?.is_none() {
-                return Err(PROJECT_NOT_FOUND);
-            }
-        }
-        None if tool_grant => return Err(PROJECT_REQUIRED),
-        None => {}
-    }
-    if tool_grant && !llm.declared_capabilities.contains(&ModelCapability::Tools) {
-        return Err(TOOLS_NOT_SUPPORTED);
-    }
-    images.extend(request.attachments.iter().copied());
-    if images.is_empty() {
-        return Ok(project);
-    }
-    if !capabilities.contains(&ModelCapability::Vision) {
-        return Err(VISION_NOT_SUPPORTED);
-    }
-    check_user_images(database, &images).await?;
-    Ok(project)
-}
-
 async fn check_user_images(
     database: &DatabaseHandle,
     images: &[AttachmentId],
@@ -1828,69 +1279,6 @@ fn conversation_refusal(code: &'static str) -> Refusal {
         code,
         "conversation action refused",
     )
-}
-
-async fn normalize(database: &DatabaseHandle, request: &mut JobRequest) -> Result<(), Refusal> {
-    if let Some(conversation) = request.conversation {
-        if request.project.is_some() {
-            return Err(conversation_refusal("project_fixed"));
-        }
-        let row = database
-            .job(conversation)
-            .await?
-            .ok_or(conversation_refusal("conversation_not_found"))?;
-        let crate::db::entities::JobKind::Group {
-            agent,
-            project,
-            origin,
-            ..
-        } = row.kind
-        else {
-            return Err(conversation_refusal("conversation_not_found"));
-        };
-        if matches!(origin, crate::db::entities::Origin::System) {
-            return Err(conversation_refusal("system_conversation"));
-        }
-        if row.outcome.is_some() {
-            return Err(conversation_refusal("conversation_closed"));
-        }
-        if row.children_closed_at.is_some() {
-            return Err(conversation_refusal("conversation_closing"));
-        }
-        if agent.is_none() {
-            return Err(conversation_refusal("conversation_has_no_agent")
-                .with_message("this conversation has no Agent; start a new one"));
-        }
-        if request.agent_profile.is_some() && request.agent_profile.map(Into::into) != agent {
-            return Err(conversation_refusal("agent_mismatch"));
-        }
-        request.agent_profile = agent.map(Into::into);
-        request.project = project;
-        if request.llm_profile.get() == 0 {
-            let tip = database
-                .conversation_turns(conversation, None, 1)
-                .await?
-                .into_iter()
-                .next()
-                .ok_or(INTERNAL)?;
-            request.llm_profile = database
-                .job_configuration(tip.id)
-                .await?
-                .ok_or(INTERNAL)?
-                .llm_profile;
-        }
-    } else if request.llm_profile.get() == 0 {
-        let agent = request.agent_profile.ok_or(INVALID_BODY)?;
-        let agent = match database.config(agent.into()).await? {
-            Some(ConfigRecord {
-                body: ConfigBody::Agent(agent),
-                ..
-            }) => agent,
-            _ => return Err(AGENT_PROFILE_NOT_FOUND),
-        };
-        request.llm_profile = agent.default_model().ok_or(INVALID_BODY)?.into();
-    }
-    Ok(())
 }
 
 /// `POST /api/v1/conversations/{id}/compact`. The body names the generative
