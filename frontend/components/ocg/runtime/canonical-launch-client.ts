@@ -9,14 +9,12 @@ import type {
   ControlProviderResponse,
   ControlToolCall,
 } from "../contracts";
-import type { ChatMessage, ChatSession, OcgRuntimeEvent, SendMessageInput } from "../types";
+import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
 import { RuntimeClientBase } from "./runtime-client-base";
 import type { CreateSessionInput } from "./runtime-types";
 import {
   readTranscriptEvidence,
   readOutputWindow,
-  ControlTransportError,
-  type ControlSubmission,
   type HttpCanonicalControlClient,
   type JobStreamSubscription,
 } from "./control-client";
@@ -218,12 +216,6 @@ function* turnAttachments(turn: Turn): Iterable<string> {
   for (const entry of turn.entries ?? []) yield* entry.attachments;
 }
 
-type Pending = {
-  key: string;
-  signature: string;
-  submission: ControlSubmission;
-  admittedJob?: string;
-};
 type StreamEntry = {
   subscription: JobStreamSubscription | null;
   unsubscribeCatalog: (() => void) | null;
@@ -256,7 +248,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly hiding = new Set<string>();
   private readonly tips = new Map<string, string>();
   private readonly selections = new Map<string, ChatModelSelection>();
-  private readonly pending = new Map<string, Pending>();
   private readonly sending = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
   private readonly earlier = new Map<string, string | null>();
@@ -408,9 +399,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!sessionId.startsWith("draft-")) {
       throw new Error("The 0.5 Control Plane does not provide conversation deletion.");
     }
-    if (this.tips.has(sessionId) || this.sending.has(sessionId) || this.pending.has(sessionId))
-      return;
-    this.pending.delete(sessionId);
+    if (this.tips.has(sessionId) || this.sending.has(sessionId)) return;
     this.selections.delete(sessionId);
     this.emit({ type: "conversation.session-deleted", sessionId });
   }
@@ -482,7 +471,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     try {
       await this.control.editConversation(root, { hidden: true }, this.lifetime.signal);
       this.hiddenRoots.add(root);
-      this.pending.delete(sessionId);
       this.selections.delete(sessionId);
       this.earlier.delete(sessionId);
       this.loadingEarlier.delete(sessionId);
@@ -1352,116 +1340,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     void tick();
   }
 
-  override async sendMessage(sessionId: string, input: SendMessageInput): Promise<void> {
-    await this.submit(
-      sessionId,
-      input,
-      this.pending.get(sessionId)?.submission.conversation ??
-        (this.pending.has(sessionId)
-          ? undefined
-          : [...this.roots].find(([, id]) => id === sessionId)?.[0]),
-    );
-  }
-
-  private async submit(sessionId: string, input: SendMessageInput, conversation?: string) {
-    if (this.hiding.has(sessionId))
-      throw new Error("Wait for this conversation to finish hiding before sending.");
-    if (!this.getSnapshot().sessions.some((session) => session.id === sessionId))
-      throw new Error("Conversation presentation is no longer available.");
-    if (this.sending.has(sessionId)) throw new Error("This turn is being submitted.");
-    const selection = input.selection ?? this.selections.get(sessionId);
-    if (!selection?.agentProfile || !selection.llmProfile || !selection.executor)
-      throw new Error("Select an Agent, Model and Executor before sending.");
-    const predecessor = this.turns.get(this.tips.get(sessionId) ?? "");
-    if (
-      predecessor?.input.configuration?.agent_profile &&
-      predecessor.input.configuration.agent_profile !== selection.agentProfile
-    )
-      throw new Error(
-        "A follow-up keeps the conversation's Agent. Start a new conversation to change Agents.",
-      );
-    const submission: ControlSubmission = {
-      ...(selection.effort ? { reasoning_effort: selection.effort } : {}),
-      ...(conversation && input.mode ? { mode: input.mode } : {}),
-      agent_profile: selection.agentProfile,
-      llm_profile: selection.llmProfile,
-      executor: selection.executor,
-      objective: input.content,
-      ...(conversation
-        ? { conversation }
-        : selection.project
-          ? { project: selection.project }
-          : {}),
-      attachments: input.images?.map((image) => image.id) ?? [],
-    };
-    const signature = JSON.stringify(submission);
-    const held = this.pending.get(sessionId);
-    if (held && held.signature !== signature)
-      throw new Error(
-        "The previous admission is unresolved. Resend the unchanged message to resolve its existing Idempotency-Key.",
-      );
-    const pending: Pending = held ?? { key: crypto.randomUUID(), signature, submission };
-    this.pending.set(sessionId, pending);
-    this.selections.set(sessionId, selection);
-    this.sending.add(sessionId);
-    try {
-      // A resend of an ambiguous or pending admission uses the original payload and key.
-      let job = pending.admittedJob;
-      if (!job) {
-        const admission = await this.control.submitJob(
-          pending.submission,
-          pending.key,
-          this.lifetime.signal,
-        );
-        // The admission already names the conversation it opened, so the draft
-        // claims it here instead of after another read.
-        if (admission.conversation) this.claimConversation(admission.conversation, sessionId);
-        job = admission.job ?? undefined;
-      }
-      if (!job)
-        job =
-          (await this.control.readAdmission(pending.key, this.lifetime.signal)).job ?? undefined;
-      if (!job)
-        throw new Error(
-          "Admission is pending. Resend this unchanged message to check it with the same Idempotency-Key.",
-        );
-      pending.admittedJob = job;
-      const session = this.getSnapshot().sessions.find((session) => session.id === sessionId);
-      if (!session) throw new Error("Conversation presentation is no longer available.");
-      this.tips.set(sessionId, job);
-      for (const image of input.images ?? []) this.images.set(image.id, image);
-      const admitted = await this.control.readJob(job);
-      if (admitted.conversation) this.claimConversation(admitted.conversation, sessionId);
-      this.emit({
-        type: "conversation.session-updated",
-        session: {
-          ...session,
-          conversationId: admitted.conversation ?? undefined,
-          sessionId: job,
-          agentProfile: selection.agentProfile,
-          llmProfile: selection.llmProfile,
-          reasoningEffort: selection.effort ?? null,
-          model: selection.model,
-          projectId: conversation ? session.projectId : selection.project,
-          title: conversation ? session.title : input.content.slice(0, 80) || "Image conversation",
-          updatedAt: new Date().toISOString(),
-        },
-      });
-      await this.trackTurn(sessionId, job);
-    } catch (error) {
-      if (
-        !pending.admittedJob &&
-        error instanceof ControlTransportError &&
-        ((error.status >= 400 && error.status < 500) || error.status === 503)
-      )
-        this.pending.delete(sessionId);
-      throw error;
-    } finally {
-      this.sending.delete(sessionId);
-    }
-  }
-
-  private async trackTurn(sessionId: string, job: string, clearPending = true) {
+  private async trackTurn(sessionId: string, job: string) {
     const previous = this.turns.get(job);
     const snapshot = previous ? { ...previous } : undefined;
     const [record, frozen, window] = await Promise.all([
@@ -1536,7 +1415,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (current) turn.job = reconcileJob(current.job, turn.job);
       this.turns.set(job, turn);
     }
-    if (clearPending) this.pending.delete(sessionId);
     this.publish(sessionId);
     if (record.settlement.state === "unsettled") this.watch(job);
   }
@@ -1573,7 +1451,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         this.lifetime.signal,
       );
     } finally {
-      await this.trackTurn(sessionId, turn.job.id, false);
+      await this.trackTurn(sessionId, turn.job.id);
     }
   }
 
@@ -1588,8 +1466,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       !turn ||
       !turn.job.conversation ||
       !["failed", "unknown", "cancelled"].includes(turn.job.settlement.state) ||
-      (this.tips.get(sessionId) !== turn.job.id &&
-        this.pending.get(sessionId)?.submission.conversation !== turn.job.conversation)
+      this.tips.get(sessionId) !== turn.job.id
     )
       throw new Error("Only the latest failed, unknown or cancelled turn can be retried.");
     if (this.hiding.has(sessionId) || this.sending.has(sessionId))

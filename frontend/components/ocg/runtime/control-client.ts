@@ -5,7 +5,6 @@ import {
   projectContextStatus,
   ContractError,
   TREE_MAX_DEPTH,
-  projectAdmission,
   projectAgentProfiles,
   type ControlApproval,
   projectJobDetails,
@@ -124,23 +123,6 @@ export type HttpCanonicalControlClientOptions = {
   csrfToken?: () => string | Promise<string>;
 };
 
-export type ControlSubmission = {
-  reasoning_effort?: string;
-  mode?: "queue" | "steer";
-  // An Agent Profile that targets `llm_profile`; its instructions are frozen with the Job.
-  agent_profile?: string;
-  llm_profile?: string;
-  executor: string;
-  objective: string;
-  name?: string;
-  // A completed predecessor Job whose conversation history precedes this turn.
-  conversation?: string;
-  // The Project the Job works in; an Agent with a Workspace grant requires one on a conversation's first turn.
-  project?: string;
-  // Image Attachments to send with the objective.
-  attachments?: string[];
-};
-
 export type MutableJobInput = {
   text: string;
   attachments: string[];
@@ -210,6 +192,38 @@ function mutableJob(value: unknown, context: string): MutableJob {
   return job;
 }
 
+// `GET /api/v1/jobs/{id}` answers the observation details with the editable state
+// beside them; the editable Job is read out of that one body.
+function editableJob(value: unknown): unknown {
+  const body = value as {
+    api_version?: number;
+    job?: { id?: string; conversation?: string | null; previous?: string | null };
+    project?: string | null;
+    context?: string;
+    revision?: number;
+    phase?: MutableJob["phase"];
+    submitted_at?: number | null;
+    unsupported_decision_history?: boolean;
+    input?: MutableJobInput;
+  } | null;
+  if (!body?.job) throw new ContractError("job", "a valid mutable Job");
+  return {
+    api_version: body.api_version,
+    job: {
+      id: body.job.id,
+      conversation: body.job.conversation,
+      previous: body.job.previous ?? null,
+      project: body.project ?? null,
+      context: body.context,
+      revision: body.revision,
+      phase: body.phase,
+      submitted_at: body.submitted_at ?? null,
+      unsupported_decision_history: body.unsupported_decision_history,
+      input: body.input,
+    },
+  };
+}
+
 export type ControlProfileWriteRequest =
   | {
       kind: "llm";
@@ -266,18 +280,6 @@ export type ControlProfileWriteRequest =
       default_model?: string | null;
       expected_edit_seq?: number;
     };
-
-export type ControlSubmissionResult = {
-  conversation: string | null;
-  seq: number | null;
-  joined: boolean;
-  model: string | null;
-  kept: boolean;
-  status: "admitted" | "pending";
-  job: string | null;
-  // Whether this request created the Job, rather than replay its key.
-  created: boolean;
-};
 
 function controlOrigin(raw: string, browserSession: boolean): string {
   const url = new URL(raw);
@@ -1501,7 +1503,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       try {
         return mutableJob(
           (
-            await send("GET", "/api/v1/mutable-jobs/current", {
+            await send("GET", "/api/v1/jobs/current", {
               context,
               signal,
             })
@@ -1520,12 +1522,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     },
     async readMutableJob(context: string, job: string, signal?: AbortSignal): Promise<MutableJob> {
       return mutableJob(
-        (
-          await send("GET", `/api/v1/mutable-jobs/${jobIdentity(job)}`, {
-            context,
-            signal,
-          })
-        ).input,
+        editableJob(
+          (
+            await send("GET", `/api/v1/jobs/${jobIdentity(job)}`, {
+              context,
+              signal,
+            })
+          ).input,
+        ),
         context,
       );
     },
@@ -1537,7 +1541,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     ): Promise<MutableJob> {
       return mutableJob(
         (
-          await send("POST", "/api/v1/mutable-jobs", {
+          await send("POST", "/api/v1/jobs", {
             context,
             body: { ...input, ...association },
             key: submissionKey(key),
@@ -1555,7 +1559,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     ): Promise<MutableJob> {
       return mutableJob(
         (
-          await send("POST", `/api/v1/mutable-jobs/${jobIdentity(job)}`, {
+          await send("POST", `/api/v1/jobs/${jobIdentity(job)}`, {
             context,
             body: { revision: sequence(revision), input },
             sign: !programmatic,
@@ -1573,7 +1577,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     ): Promise<MutableJob> {
       return mutableJob(
         (
-          await send("POST", `/api/v1/mutable-jobs/${jobIdentity(job)}/submit`, {
+          await send("POST", `/api/v1/jobs/${jobIdentity(job)}/submit`, {
             context,
             body: { revision: sequence(revision), input },
             key: submissionKey(key),
@@ -1584,7 +1588,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       );
     },
     async discardMutableJob(context: string, job: string, revision: number): Promise<void> {
-      await send("DELETE", `/api/v1/mutable-jobs/${jobIdentity(job)}`, {
+      await send("DELETE", `/api/v1/jobs/${jobIdentity(job)}`, {
         context,
         revision,
         sign: !programmatic,
@@ -1597,7 +1601,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     ): Promise<MutableJob> {
       return mutableJob(
         (
-          await send("POST", `/api/v1/mutable-jobs/${jobIdentity(job)}/cancel-unsupported`, {
+          await send("POST", `/api/v1/jobs/${jobIdentity(job)}/cancel-unsupported`, {
             context,
             body: { revision: sequence(revision) },
             sign: !programmatic,
@@ -2667,47 +2671,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return tools;
     },
 
-    /**
-     * Submits one Job under the request's `key`. The key names at most one
-     * Job: a request that timed out or answered `pending` is never
-     * submitted under a second key; the same key is looked up or replayed.
-     */
-    async submitJob(submission: ControlSubmission, key: string, signal?: AbortSignal) {
-      if (submission.agent_profile !== undefined)
-        identity(submission.agent_profile, "agent_profile");
-      if (submission.llm_profile !== undefined) identity(submission.llm_profile, "llm_profile");
-      identity(submission.executor, "executor");
-      if (submission.conversation !== undefined) jobIdentity(submission.conversation);
-      if (submission.project !== undefined) identity(submission.project, "project");
-      if (submission.attachments !== undefined) {
-        for (const [index, att] of submission.attachments.entries()) {
-          identity(att, `attachments[${index}]`);
-        }
-      }
-      submissionKey(key);
-      const answer = await send("POST", "/api/v1/jobs", {
-        body: submission,
-        key,
-        sign: true,
-        signal,
-      });
-      const admission = projectAdmission(answer.input as Api.AdmissionResponse);
-      if (admission.status !== "admitted" && admission.status !== "pending") {
-        throw new ContractError("admission.status", "admitted or pending from a submission");
-      }
-      conversationListeners.forEach((listener) => listener());
-      return {
-        status: admission.status,
-        job: admission.job,
-        conversation: admission.conversation,
-        seq: admission.seq,
-        joined: admission.joined,
-        model: admission.model,
-        kept: admission.kept,
-        created: answer.status === 201,
-      } satisfies ControlSubmissionResult;
-    },
-
     /** Uploads a PNG, JPEG, GIF or WebP image to the Attachment store. */
     async uploadAttachment(
       payload: {
@@ -2738,13 +2701,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     attachmentContentUrl(attachmentId: string): string {
       identity(attachmentId, "attachment");
       return `${base}/api/v1/attachments/${attachmentId}/content`;
-    },
-
-    /** What `key` created, however its submission ended. */
-    async readAdmission(key: string, signal?: AbortSignal) {
-      submissionKey(key);
-      const answer = await send("GET", "/api/v1/admissions", { key, signal });
-      return projectAdmission(answer.input as Api.AdmissionResponse);
     },
 
     /** Requests the stop of one Job this listener admitted. */

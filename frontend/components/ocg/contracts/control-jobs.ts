@@ -51,16 +51,3 @@ export function projectJobDetails(input: Api.JobDetails): ControlJobDetails {
     mutable_phase: (input as Api.JobDetails & { phase?: string }).phase,
   };
 }
-
-export function projectAdmission(input: Api.AdmissionResponse) {
-  const admission = input.admission;
-  if (admission.status === "admitted") return admission;
-  return {
-    ...admission,
-    conversation: null,
-    seq: null,
-    joined: false,
-    model: null,
-    kept: (admission as typeof admission & { kept?: boolean }).kept ?? false,
-  };
-}

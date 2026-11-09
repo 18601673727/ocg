@@ -1,10 +1,4 @@
-import type {
-  ChatMessage,
-  ChatSession,
-  OcgRuntimeEvent,
-  RuntimeStatus,
-  SendMessageInput,
-} from "../types";
+import type { ChatMessage, ChatSession, OcgRuntimeEvent, RuntimeStatus } from "../types";
 import type { JobExecution } from "../execution/domain";
 
 export type RuntimeAuthority = "canonical";
@@ -40,7 +34,6 @@ export interface OcgRuntimeClient {
     request: import("../contracts").ChatImageUploadRequest,
     signal?: AbortSignal,
   ): Promise<import("../contracts").ChatImage>;
-  sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
   retryMessage(sessionId: string, messageId: string): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
   getSnapshot(): RuntimeSnapshot;

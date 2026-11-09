@@ -12,7 +12,7 @@ import {
 import type { ReactNode } from "react";
 import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
 import type { CreateSessionInput, OcgRuntimeClient, RuntimeSnapshot } from "./runtime-types";
-import type { ChatSession, SendMessageInput } from "../types";
+import type { ChatSession } from "../types";
 import type { HttpCanonicalControlClient } from "./control-client";
 
 type RuntimeContextValue = {
@@ -21,7 +21,6 @@ type RuntimeContextValue = {
   snapshot: RuntimeSnapshot;
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
   deleteSession: (sessionId: string) => Promise<void>;
-  sendMessage: (sessionId: string, input: SendMessageInput) => Promise<void>;
   retryMessage: (sessionId: string, messageId: string) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
 };
@@ -69,12 +68,6 @@ export function OcgRuntimeProvider({
     async (input: CreateSessionInput) => client.createSession(input),
     [client],
   );
-  const sendMessage = useCallback(
-    async (sessionId: string, input: SendMessageInput) => {
-      await client.sendMessage(sessionId, input);
-    },
-    [client],
-  );
   const deleteSession = useCallback(
     async (sessionId: string) => {
       if (!client.deleteSession) throw new Error("This runtime does not support deleting chats.");
@@ -102,20 +95,10 @@ export function OcgRuntimeProvider({
       snapshot,
       createSession,
       deleteSession,
-      sendMessage,
       retryMessage,
       cancel,
     }),
-    [
-      cancel,
-      client,
-      controlClient,
-      createSession,
-      deleteSession,
-      retryMessage,
-      sendMessage,
-      snapshot,
-    ],
+    [cancel, client, controlClient, createSession, deleteSession, retryMessage, snapshot],
   );
   if (!hydrated) return null;
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;

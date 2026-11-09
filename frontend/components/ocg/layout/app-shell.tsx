@@ -20,7 +20,6 @@ import {
   confirmMutableComposerNavigation,
 } from "../chat/mutable-composer";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import type { ComposerIntent } from "../composer/domain";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
 import { PageTitleVisibilityContext } from "./page-title";
@@ -147,8 +146,13 @@ function AppShellContent({
     return () => desktop.removeEventListener("change", closeOnDesktop);
   }, [mobile]);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [openingJob, setOpeningJob] = useState<string | null>(null);
-  const opening = location.view === "chat" && location.job !== null && openingJob === location.job;
+  // The Job whose opening has finished; a Job is being opened until then.
+  const [openedJob, setOpenedJob] = useState<string | null>(null);
+  const opening =
+    location.view === "chat" &&
+    location.job !== null &&
+    Boolean(runtime.client.openConversation) &&
+    openedJob !== location.job;
   const [attempt, setAttempt] = useState(0);
   const [pageTitleInView, setPageTitleInView] = useState(true);
   const session = runtime.snapshot.sessions.find((session) => session.id === sessionId);
@@ -165,9 +169,13 @@ function AppShellContent({
   // Conversation identities the backend already listed are authoritative; opening one must not
   // probe it as a Job first.
   const listedConversations = useRef(new Set<string>());
-  currentLocationRef.current = { location, sessionId };
-  for (const listed of runtime.snapshot.sessions)
-    if (listed.conversationId) listedConversations.current.add(listed.conversationId);
+  useEffect(() => {
+    currentLocationRef.current = { location, sessionId };
+  });
+  useEffect(() => {
+    for (const listed of runtime.snapshot.sessions)
+      if (listed.conversationId) listedConversations.current.add(listed.conversationId);
+  }, [runtime.snapshot.sessions]);
   useEffect(() => {
     if (restoreMutableOnce.current || location.view !== "chat" || location.job || sessionId) return;
     restoreMutableOnce.current = true;
@@ -260,7 +268,6 @@ function AppShellContent({
   useEffect(() => {
     if (!location.job || location.view !== "chat" || !runtime.client.openConversation) return;
     let alive = true;
-    setOpeningJob(location.job);
     void (async () => {
       const chain = await conversationAncestors(
         (id) =>
@@ -289,10 +296,11 @@ function AppShellContent({
           });
       })
       .finally(() => {
-        if (alive) setOpeningJob(null);
+        if (alive) setOpenedJob(location.job);
       });
     return () => {
       alive = false;
+      setOpenedJob(null);
     };
   }, [
     location.job,
@@ -396,22 +404,6 @@ function AppShellContent({
     setSessionId(session.id);
     goDirect("chat", null, session.id);
   }, [runtime, goDirect, t]);
-
-  async function intent(intent: ComposerIntent) {
-    if (intent.kind !== "chat") throw new Error(t("app.jobLaunchUnavailable"));
-    if (!session) throw new Error(t("app.createConversationFirst"));
-    await runtime.sendMessage(session.id, {
-      content: intent.text,
-      selection: intent.selection,
-      images: intent.images,
-      mode: intent.mode,
-    });
-    const updated = runtime.client.getSnapshot().sessions.find((item) => item.id === session.id);
-    if (updated?.sessionId && !location.chain && ancestors.length <= 1) {
-      // Admission already installed the turn in the store; this only makes reload recover it.
-      window.history.replaceState(null, "", `/?job=${updated.sessionId}`);
-    }
-  }
 
   const runningSessionIds = new Set(
     runtime.snapshot.sessions
@@ -595,11 +587,6 @@ function AppShellContent({
                             ) : undefined
                           }
                           session={session}
-                          execution={null}
-                          runtimeStatus={runtime.snapshot.status}
-                          queueState={runtime.snapshot.chatQueues?.[session.id]}
-                          onComposerIntent={intent}
-                          onCancel={() => runtime.cancel(session.id)}
                         />
                       </div>
                     ) : (

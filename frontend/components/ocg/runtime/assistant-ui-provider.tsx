@@ -9,15 +9,10 @@
  */
 
 import { type FC, type ReactNode, useMemo, useCallback } from "react";
-import {
-  AssistantRuntimeProvider,
-  useExternalStoreRuntime,
-  type AppendMessage,
-} from "@assistant-ui/react";
+import { AssistantRuntimeProvider, useExternalStoreRuntime } from "@assistant-ui/react";
 import { useOcgRuntime } from "./runtime-context";
 import { createOcgExternalStoreAdapter, type OcgConversationState } from "./assistant-ui-adapter";
 import { useOcgControlUrl } from "../profile/control-url";
-import type { ChatImage } from "../contracts";
 import { useI18n } from "../i18n";
 
 type OcgReloadConfig = {
@@ -90,32 +85,11 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
     };
   }, [messages, hasEarlier, isRunning, execution, sessionId, projectId]);
 
-  // Handle new message from user
-  const onNew = useCallback(
-    async (message: AppendMessage) => {
-      const content = message.content
-        .map((part) => {
-          if (part.type === "text") return part.text;
-          return "";
-        })
-        .join("");
-
-      const images: ChatImage[] = (message.attachments ?? [])
-        .flatMap((attachment) => attachment.content)
-        .flatMap((part): ChatImage[] =>
-          part.type === "image" && part.id && part.filename
-            ? [{ id: part.id, name: part.filename, media_type: "image/*", url: part.image }]
-            : [],
-        );
-      await runtime.sendMessage(sessionId, {
-        content,
-        images,
-        projectId,
-        ...(message.steer ? { mode: "steer" as const } : {}),
-      });
-    },
-    [projectId, runtime, sessionId],
-  );
+  // A Job is created and submitted through the Composer, never through this
+  // runtime's thread; the thread only presents and acts on existing Jobs.
+  const onNew = useCallback(async () => {
+    throw new Error(t("app.jobLaunchUnavailable"));
+  }, [t]);
 
   // Handle message reload/regenerate
   const onReload = useCallback(

@@ -1,4 +1,4 @@
-import type { ChatSession, OcgRuntimeEvent, SendMessageInput } from "../types";
+import type { ChatSession, OcgRuntimeEvent } from "../types";
 import type { CreateSessionInput, OcgRuntimeClient, RuntimeSnapshot } from "./runtime-types";
 import { emptyRuntimeSnapshot, RuntimeStore } from "./runtime-store";
 
@@ -15,7 +15,6 @@ export abstract class RuntimeClientBase implements OcgRuntimeClient {
   }
   abstract createSession(input: CreateSessionInput): Promise<ChatSession>;
   abstract deleteSession(sessionId: string): Promise<void>;
-  abstract sendMessage(sessionId: string, input: SendMessageInput): Promise<void>;
   abstract retryMessage(sessionId: string, messageId: string): Promise<void>;
   abstract cancel(sessionId: string): Promise<void>;
   abstract removeQueuedMessage(sessionId: string, id: string): Promise<void>;
