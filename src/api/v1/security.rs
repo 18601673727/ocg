@@ -40,7 +40,11 @@ fn mutable_job_write(rest: &str) -> bool {
     let segments = rest.split('/').collect::<Vec<_>>();
     matches!(
         segments.as_slice(),
-        ["jobs"] | ["jobs", _] | ["jobs", _, "submit"] | ["jobs", _, "cancel-unsupported"]
+        ["jobs"]
+            | ["jobs", _]
+            | ["jobs", _, "submit"]
+            | ["jobs", _, "cancel-unsupported"]
+            | ["jobs", _, "stop"]
     )
 }
 

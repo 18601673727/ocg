@@ -1864,6 +1864,21 @@ impl Batch {
         sent: crate::db::entities::SentRequest,
         attachments: &[crate::db::entities::AttachmentRecord],
     ) -> Result<(), BatchError> {
+        // A stop committed before this transaction wins: the request is not
+        // recorded, so it is never sent, and the execution settles as one
+        // that sent nothing.
+        if self
+            .pool_allocation(proof.token().job)?
+            .is_some_and(|allocation| {
+                allocation.token == proof.token()
+                    && allocation.phase == crate::db::entities::AllocationPhase::StopRequested
+            })
+        {
+            return self.reject(Violation::InvalidValue(
+                "execution",
+                crate::db::entities::STOPPED_BEFORE_SEND,
+            ));
+        }
         self.require_development_write_any(proof)?;
         if sent.job != proof.token().job || sent.request != RequestNumber::FIRST {
             return self.reject(Violation::InvalidValue(

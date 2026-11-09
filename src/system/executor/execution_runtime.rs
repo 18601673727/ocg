@@ -122,6 +122,7 @@ pub(crate) async fn supervise_development_generative(
         database,
         handoff: &handoff,
         prepared,
+        cancellation: &config.cancellation,
         output_seq: 1,
         sent: false,
         observations: Vec::new(),
@@ -290,6 +291,7 @@ pub(crate) async fn supervise_development_decision_loopback(
         database,
         handoff: &handoff,
         prepared: body,
+        cancellation: &config.cancellation,
         output_seq: 1,
         sent: false,
         observations: Vec::new(),
@@ -536,6 +538,10 @@ struct DevelopmentLoopbackSink<'a> {
     database: &'a DatabaseHandle,
     handoff: &'a crate::db::DevelopmentHandoff,
     prepared: &'a serde_json::Value,
+    /// The exchange's own cancellation. A stop that the database recorded
+    /// before the request could be recorded as sent cancels it, so the
+    /// exchange settles as cancelled before sending.
+    cancellation: &'a CancellationToken,
     output_seq: u32,
     sent: bool,
     observations: Vec<ProviderObservation>,
@@ -554,12 +560,26 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                     message: "prepared request mismatch".into(),
                 });
             }
-            self.database
+            match self
+                .database
                 .record_development_sent_request(self.handoff, Timestamp::now())
                 .await
-                .map_err(|_| OutputSinkError {
-                    message: "request evidence unavailable".into(),
-                })?;
+            {
+                Ok(()) => {}
+                Err(DatabaseError::Rejected(Violation::InvalidValue("execution", reason)))
+                    if reason == crate::db::entities::STOPPED_BEFORE_SEND =>
+                {
+                    self.cancellation.cancel();
+                    return Err(OutputSinkError {
+                        message: "a stop was requested before the request was sent".into(),
+                    });
+                }
+                Err(_) => {
+                    return Err(OutputSinkError {
+                        message: "request evidence unavailable".into(),
+                    });
+                }
+            }
             self.sent = true;
             Ok(())
         })

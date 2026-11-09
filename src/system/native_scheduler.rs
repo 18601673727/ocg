@@ -36,10 +36,12 @@
 //! point can be reserved before an earlier entry that became eligible while
 //! the head search could not reach it.
 //!
-//! # Dispatch
+//! # Dispatch and stop
 //!
 //! Each reservation runs once: the checked start, with the same request check
-//! as manual loopback execution, and one bounded exchange. Nothing here retries,
+//! as manual loopback execution, and one bounded exchange. Its cancellation is
+//! registered under its Allocation's token before the start, so a stop
+//! ([`NativeStops`]) reaches exactly that execution. Nothing here retries,
 //! replays, reconciles or releases. A start refused before any request ends
 //! the reservation and fails the Job; an exchange that may have reached the
 //! Provider leaves its Allocation held as Uncertain, and a held Executor is
@@ -50,13 +52,15 @@
 //! scheduler stops claiming for the rest of the run.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::db::entities::{
-    AllocationPhase, DevelopmentFreshReservation, DevelopmentReadyCursor, DevelopmentReservation,
-    ExecutionOperation, ExecutionPoolId, ExecutorId, JobId, LlmTransport, OutcomeKind,
-    PoolAllocation, UnstartedCause,
+    AllocationPhase, AllocationToken, DevelopmentFreshReservation, DevelopmentReadyCursor,
+    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, JobId, LlmTransport,
+    OutcomeKind, PoolAllocation, UnstartedCause,
 };
 use crate::db::redb::{NativeResource, NativeResourceKind};
 use crate::db::{
@@ -116,6 +120,64 @@ fn scheduled_endpoint(endpoint: &str) -> bool {
     crate::system::http::direct_diagnostic_loopback(endpoint)
 }
 
+/// The cancellations of the executions this host's native scheduler runs, by
+/// Job, each with the token of the Allocation it runs under. A stop reaches
+/// an execution only through the token the database recorded the stop for,
+/// so it never reaches another Job, another Executor's work, a later
+/// Allocation or the host. Registered before the checked start and removed
+/// when the execution's task ends.
+#[derive(Clone, Default)]
+pub(crate) struct NativeStops(Arc<Mutex<BTreeMap<JobId, (AllocationToken, CancellationToken)>>>);
+
+impl NativeStops {
+    fn register(&self, token: AllocationToken, cancellation: CancellationToken) -> Registration {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(token.job, (token, cancellation));
+        Registration {
+            stops: self.clone(),
+            token,
+        }
+    }
+
+    /// Cancels the execution registered under exactly `token`, and says
+    /// whether there was one. Cancelling twice has no further effect.
+    pub(crate) fn cancel(&self, token: AllocationToken) -> bool {
+        match self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&token.job)
+        {
+            Some((registered, cancellation)) if *registered == token => {
+                cancellation.cancel();
+                true
+            }
+            Some(_) | None => false,
+        }
+    }
+}
+
+/// Removes its execution's entry from [`NativeStops`] when dropped, however
+/// the task ends.
+struct Registration {
+    stops: NativeStops,
+    token: AllocationToken,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        let mut stops = self.stops.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if stops
+            .get(&self.token.job)
+            .is_some_and(|(registered, _)| *registered == self.token)
+        {
+            stops.remove(&self.token.job);
+        }
+    }
+}
+
 /// Runs the native scheduler until `shutdown`, then waits for every dispatch
 /// it started to settle what it can. Without [`SchedulingAuthority`] it only
 /// waits for `shutdown`.
@@ -123,12 +185,13 @@ pub(crate) async fn run(
     database: DatabaseHandle,
     wake: SchedulerWakeSubscription,
     shutdown: CancellationToken,
+    stops: NativeStops,
 ) {
     let Some(authority) = SchedulingAuthority::autonomous() else {
         shutdown.cancelled().await;
         return;
     };
-    run_with(authority, database, wake, shutdown).await;
+    run_with(authority, database, wake, shutdown, stops).await;
 }
 
 /// [`run`] under an authority already held.
@@ -137,12 +200,14 @@ pub(crate) async fn run_with(
     database: DatabaseHandle,
     wake: SchedulerWakeSubscription,
     shutdown: CancellationToken,
+    stops: NativeStops,
 ) {
     log::info!("native scheduler running: single-request Generative Jobs, loopback endpoints only");
     let scheduler = Rc::new(NativeScheduler::new(
         database.clone(),
         authority,
         shutdown.clone(),
+        stops,
     ));
     Scheduler::new(&database, wake, shutdown)
         .run(
@@ -184,6 +249,7 @@ pub(crate) struct NativeScheduler {
     database: DatabaseHandle,
     _authority: SchedulingAuthority,
     shutdown: CancellationToken,
+    stops: NativeStops,
     /// Where the last search that ran out of budget stopped. Process memory
     /// only: a new run starts at the head of the ready index.
     resume: Cell<Option<DevelopmentReadyCursor>>,
@@ -200,11 +266,13 @@ impl NativeScheduler {
         database: DatabaseHandle,
         authority: SchedulingAuthority,
         shutdown: CancellationToken,
+        stops: NativeStops,
     ) -> Self {
         Self {
             database,
             _authority: authority,
             shutdown,
+            stops,
             resume: Cell::new(None),
             passes: Cell::new(0),
             running: RefCell::new(Vec::new()),
@@ -348,12 +416,15 @@ impl NativeScheduler {
         ExecutorPass::BudgetSpent
     }
 
-    /// Starts the dispatch of one reservation as a task of its own.
+    /// Registers the dispatch of one reservation under its token and starts
+    /// it as a task of its own.
     pub(crate) fn spawn(&self, allocation: PoolAllocation) {
         let database = self.database.clone();
         let cancellation = self.shutdown.child();
+        let registration = self.stops.register(allocation.token, cancellation.clone());
         let halted = self.halted.clone();
         let task = ntex::rt::spawn(async move {
+            let _registration = registration;
             let dispatched = dispatch(&database, allocation, &cancellation).await;
             dispatched.log();
             if !dispatched.resolved() && !halted.replace(true) {
@@ -434,9 +505,10 @@ impl Dispatched {
 }
 
 /// The checked start and the one exchange of `allocation`, under
-/// `cancellation` (a child of shutdown's), then what the
+/// `cancellation` (shutdown's, and the Job's own stop), then what the
 /// database shows. A reservation whose start a cancellation overtook is ended
-/// rather than started: it never reached a Provider.
+/// rather than started, unless a stop already ended it: it never reached a
+/// Provider.
 pub(crate) async fn dispatch(
     database: &DatabaseHandle,
     allocation: PoolAllocation,

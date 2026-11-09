@@ -244,6 +244,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             ["jobs", job, "cancel-unsupported"] => no_query(query).and_then(|()| {
                 job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::CancelQueued(id)))
             }),
+            ["jobs", job, "stop"] => no_query(query).and_then(|()| {
+                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Stop(id)))
+            }),
             ["update"] => no_query(query).map(|()| Route::StartUpdate),
             ["jobs"] => no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Create)),
             ["jobs", job] => no_query(query).and_then(|()| {
@@ -589,7 +592,14 @@ pub(super) async fn respond(
     match route {
         Route::Health => Ok(Reply::ok(health(database).await)),
         Route::MutableJob(action) => {
-            mutable_jobs::respond(action, request, payload, database).await
+            mutable_jobs::respond(
+                action,
+                request,
+                payload,
+                database,
+                shared.scheduler.native_stops(),
+            )
+            .await
         }
         Route::Update(latest) => update::get(latest).await,
         Route::StartUpdate => {

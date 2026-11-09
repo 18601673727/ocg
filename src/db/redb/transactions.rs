@@ -2955,9 +2955,15 @@ impl Batch {
             return self.reject(rejected());
         };
         let state = self.require_job_state(token.job)?;
+        // A stop request bars only a new Provider request (see
+        // `record_development_sent_request`); the execution it stops still
+        // owns the Allocation and records how it ended.
         if token.epoch != self.epoch
             || allocation.token != token
-            || allocation.phase != AllocationPhase::Running
+            || !matches!(
+                allocation.phase,
+                AllocationPhase::Running | AllocationPhase::StopRequested
+            )
             || allocation.operation != operation
             || allocation.job_revision != proof.revision()
             || allocation.stop_confirmed_at.is_some()
@@ -3354,7 +3360,9 @@ impl Batch {
 
     /// Ends a Reserved Allocation whose checked start never committed, and
     /// the Job it was reserved for, with a typed failure that preserves the
-    /// reason. This is the only way a Reserved Allocation is released.
+    /// reason. This, and the stop of a Job that never started (see
+    /// [`Self::request_native_stop`]), which shares its checks, are the only
+    /// ways a Reserved Allocation is released.
     ///
     /// A Reserved Allocation proves that no execution authority exists: the
     /// start transaction is the only writer that makes an Allocation Running
@@ -3368,6 +3376,29 @@ impl Batch {
         &mut self,
         token: crate::db::entities::AllocationToken,
         cause: crate::db::entities::UnstartedCause,
+    ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
+        self.end_untouched_reservation(
+            token,
+            OutcomeKind::Failed,
+            crate::db::entities::FinalResult {
+                summary: Some(cause.summary().to_owned()),
+                code: Some(cause.code().to_owned()),
+                goal_reached: Some(false),
+                value: None,
+            },
+        )
+    }
+
+    /// Ends an untouched reservation and its Job with `kind` and `result`,
+    /// under every check [`Self::fail_unstarted_reservation`] documents: a
+    /// reservation that is not exactly untouched is refused and left held.
+    /// The stop of a Job that was reserved but never started ends it here as
+    /// Cancelled; see [`Self::request_native_stop`].
+    fn end_untouched_reservation(
+        &mut self,
+        token: crate::db::entities::AllocationToken,
+        kind: OutcomeKind,
+        result: crate::db::entities::FinalResult,
     ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
         use crate::db::entities::{AllocationPhase, MutableJobPhase};
         self.allocation_format_gate()?;
@@ -3471,13 +3502,7 @@ impl Batch {
         if !consistent {
             return Err(refused("the reservation has other state; it is left held"));
         }
-        let result = crate::db::entities::FinalResult {
-            summary: Some(cause.summary().to_owned()),
-            code: Some(cause.code().to_owned()),
-            goal_reached: Some(false),
-            value: None,
-        };
-        let (seq, id) = self.settle_mutable_outcome(token, &job, OutcomeKind::Failed, result)?;
+        let (seq, id) = self.settle_mutable_outcome(token, &job, kind, result)?;
         let previous = allocation.clone();
         allocation.phase = AllocationPhase::Released;
         self.put_pool_allocation(&allocation, Some(&previous))?;
@@ -3487,6 +3512,69 @@ impl Batch {
             output: id,
             seq: i64::from(seq),
         })
+    }
+
+    /// Records the stop of one native Job, decided against its Allocation in
+    /// this one transaction:
+    ///
+    /// - Reserved: no execution authority exists yet, so the untouched
+    ///   reservation is ended here and the Job is Cancelled; nothing was or
+    ///   will be sent. A start racing this either committed first (the
+    ///   Allocation is Running) or is refused.
+    /// - Running: the Allocation becomes StopRequested. From then on no
+    ///   Provider request may be recorded as sent, so one that was not yet
+    ///   sent never is; an exchange already sent settles as it ends, held as
+    ///   Uncertain unless it returned a result. Ownership is not released here.
+    /// - StopRequested: already requested; nothing is written.
+    ///
+    /// A Job without an Allocation is not running, and a Job with an outcome
+    /// has ended; both are refused and nothing changes.
+    pub(crate) fn request_native_stop(
+        &mut self,
+        job: JobId,
+    ) -> Result<crate::db::entities::NativeStopRequest, BatchError> {
+        use crate::db::entities::{AllocationPhase, NativeStopRequest};
+        self.allocation_format_gate()?;
+        self.require_allocation_durability()?;
+        if self.mutable_job(job)?.is_none() {
+            return self.reject(Violation::NotFound(RecordRef::Job(job)));
+        }
+        let ended = Violation::InvalidValue("stop", crate::db::entities::STOP_JOB_ENDED);
+        if self.require_job_state(job)?.outcome.is_some() {
+            return self.reject(ended);
+        }
+        let Some(allocation) = self.pool_allocation(job)? else {
+            return self.reject(Violation::InvalidValue(
+                "stop",
+                crate::db::entities::STOP_JOB_NOT_RUNNING,
+            ));
+        };
+        let token = allocation.token;
+        match allocation.phase {
+            AllocationPhase::Reserved => {
+                self.end_untouched_reservation(
+                    token,
+                    OutcomeKind::Cancelled,
+                    crate::db::entities::FinalResult {
+                        summary: Some(
+                            "Stopped before it started. Nothing was sent to the Provider."
+                                .to_owned(),
+                        ),
+                        code: Some("stopped_before_start".to_owned()),
+                        goal_reached: Some(false),
+                        value: None,
+                    },
+                )?;
+                Ok(NativeStopRequest::EndedBeforeStart(token))
+            }
+            AllocationPhase::Running => {
+                self.transition_pool_allocation(token, AllocationPhase::StopRequested, None)?;
+                self.probe = Some(Probe::PoolAllocation(token));
+                Ok(NativeStopRequest::Requested(token))
+            }
+            AllocationPhase::StopRequested => Ok(NativeStopRequest::AlreadyRequested(token)),
+            AllocationPhase::Uncertain | AllocationPhase::Released => self.reject(ended),
+        }
     }
 
     pub(crate) fn transition_pool_allocation(
@@ -3528,7 +3616,14 @@ impl Batch {
                 AllocationPhase::StopRequested
                     | AllocationPhase::Uncertain
                     | AllocationPhase::Released
-            ) | (AllocationPhase::StopRequested, AllocationPhase::Uncertain)
+            ) | (
+                // A stopped execution that still returned a confirmed
+                // outcome (cancelled before its request was sent, or a
+                // result that arrived first) is released like a Running
+                // one: the Released branch below requires that outcome.
+                AllocationPhase::StopRequested,
+                AllocationPhase::Uncertain | AllocationPhase::Released
+            )
         );
         if !allowed {
             return self.reject(Violation::InvalidValue(

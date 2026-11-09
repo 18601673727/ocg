@@ -297,6 +297,13 @@ async fn exchange(
         request
     };
 
+    // Building the client may have waited; a cancellation that arrived
+    // meanwhile still ends the exchange before anything is recorded as sent.
+    if config.cancellation.is_cancelled() {
+        return Err(ProviderExecutionError::NotDelivered {
+            message: "provider execution was cancelled before sending".to_owned(),
+        });
+    }
     if let Some(sink) = sink.as_deref_mut() {
         sink.sending(&body)
             .await

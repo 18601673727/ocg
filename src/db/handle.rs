@@ -1863,6 +1863,64 @@ impl DatabaseHandle {
         }
     }
 
+    /// Records the stop of one native Job of `context` (a Job of another
+    /// context is not found); see [`redb::Batch::request_native_stop`]. A
+    /// stop already requested writes nothing. A reply lost after commit is
+    /// `OutcomeUnknown`: read the Job before asking again.
+    pub(crate) async fn request_native_stop(
+        &self,
+        context: entities::ComposerContextId,
+        job: entities::JobId,
+    ) -> Result<entities::NativeStopRequest, DatabaseError> {
+        self.submit(|reply| {
+            Command::custom(
+                (context, job),
+                reply,
+                |_| 8192,
+                |(context, job), reply, database, operation, commit| {
+                    let mut repeated = None;
+                    let outcome =
+                        redb::run_batch_declinable(database, operation.epoch, commit, |batch| {
+                            batch.require_mutable_job_context(context, job)?;
+                            match batch.request_native_stop(job)? {
+                                entities::NativeStopRequest::AlreadyRequested(token) => {
+                                    repeated = Some(token);
+                                    Ok(None)
+                                }
+                                written => Ok(Some(written)),
+                            }
+                        });
+                    let declined = matches!(outcome.result, Ok(None));
+                    let outcome = redb::BatchOutcome {
+                        result: outcome.result.and_then(|written| {
+                            written
+                                .or(repeated.map(entities::NativeStopRequest::AlreadyRequested))
+                                .ok_or(redb::BatchFailure::Rejected(Violation::InvalidValue(
+                                    "stop",
+                                    "the stop had no outcome",
+                                )))
+                        }),
+                        storage_failure: outcome.storage_failure,
+                        durable_commit_us: outcome.durable_commit_us,
+                        scheduling_wake: outcome.scheduling_wake,
+                        capacity_freed: outcome.capacity_freed,
+                        catalog_changed: outcome.catalog_changed,
+                        probe: outcome.probe,
+                    };
+                    settle(
+                        operation,
+                        commit,
+                        OperationKind::StopTurn,
+                        reply,
+                        outcome,
+                        declined,
+                    )
+                },
+            )
+        })
+        .await
+    }
+
     /// Read the Executor's durable owner after a lost reply. This is a writer
     /// barrier for commands already enqueued; concurrent callers can still own
     /// the returned allocation. Use operation reconciliation when an operation

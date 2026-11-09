@@ -352,6 +352,9 @@ pub struct SchedulerHandle {
     sender: flume::Sender<Box<SchedulerSubmission>>,
     notifications: SchedulerNotifications,
     state: SharedState,
+    /// The cancellations of the native scheduler's running executions; a
+    /// native stop reaches its one execution through them.
+    native_stops: crate::system::native_scheduler::NativeStops,
 }
 
 #[derive(Clone)]
@@ -386,6 +389,11 @@ impl StopHandle {
 }
 
 impl SchedulerHandle {
+    /// Where a native stop finds the one running execution it cancels.
+    pub(crate) fn native_stops(&self) -> &crate::system::native_scheduler::NativeStops {
+        &self.native_stops
+    }
+
     pub async fn stop(&self, turn: JobId, cause: crate::db::entities::StopCause) {
         StopHandle {
             notifications: self.notifications.clone(),
@@ -613,6 +621,7 @@ impl ExecutionRuntime {
         } else {
             None
         };
+        let native_stops = crate::system::native_scheduler::NativeStops::default();
         let (messages, receiver) = flume::bounded(SCHEDULER_NOTIFICATIONS);
         let (wakeups, wakes) = flume::bounded(1);
         let sender = SchedulerNotifications::new(messages, wakeups);
@@ -629,12 +638,14 @@ impl ExecutionRuntime {
             admissions,
             state.clone(),
             shutdown.clone(),
+            native_stops.clone(),
         ));
         Ok(Self {
             scheduler: SchedulerHandle {
                 sender: admission,
                 notifications: sender,
                 state,
+                native_stops,
             },
             shutdown,
             finished: Some(finished),
@@ -682,6 +693,7 @@ async fn dispatch_runtime(
     admissions: flume::Receiver<Box<SchedulerSubmission>>,
     state: SharedState,
     shutdown: CancellationToken,
+    native_stops: crate::system::native_scheduler::NativeStops,
 ) -> Result<(), ExecutionRuntimeError> {
     let Some(wake) = wake.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled()) else {
         // No autonomous dispatch of any kind.
@@ -697,7 +709,7 @@ async fn dispatch_runtime(
         drop(admissions);
         match scope {
             ClaimScope::Stored => {
-                crate::system::native_scheduler::run(database, wake, shutdown).await;
+                crate::system::native_scheduler::run(database, wake, shutdown, native_stops).await;
             }
             ClaimScope::Process => shutdown.cancelled().await,
         }

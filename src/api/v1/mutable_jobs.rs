@@ -33,6 +33,16 @@ const UNCERTAIN: Refusal = Refusal::new(
     "mutable_job_outcome_unknown",
     "the operation may have committed; reconcile the Job before retrying",
 );
+const NOT_RUNNING: Refusal = Refusal::new(
+    StatusCode::CONFLICT,
+    "job_not_running",
+    "the Job is not running; nothing was changed",
+);
+const ALREADY_ENDED: Refusal = Refusal::new(
+    StatusCode::CONFLICT,
+    "job_already_ended",
+    "the Job has already ended; its outcome was not changed",
+);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +89,10 @@ struct Submit {
 struct CancelQueued {
     revision: u64,
 }
+/// A stop names nothing but its Job: its body is the empty object.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stop {}
 
 fn context(request: &HttpRequest) -> Result<ComposerContextId, Refusal> {
     let name = header::HeaderName::from_static("x-ocg-composer-context");
@@ -272,6 +286,7 @@ pub(super) enum Action {
     Submit(JobId),
     CancelQueued(JobId),
     Discard(JobId),
+    Stop(JobId),
 }
 
 pub(super) async fn respond(
@@ -279,6 +294,7 @@ pub(super) async fn respond(
     request: &HttpRequest,
     payload: web::types::Payload,
     database: &DatabaseHandle,
+    stops: &crate::system::native_scheduler::NativeStops,
 ) -> Result<Reply, Refusal> {
     let context = context(request)?;
     match action {
@@ -368,5 +384,66 @@ pub(super) async fn respond(
                 .map_err(refusal)?;
             Ok(Reply::ok(view(job)))
         }
+        Action::Stop(id) => {
+            use crate::db::entities::NativeStopRequest;
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let Stop {} = serde_json::from_slice(&body).map_err(|_| INVALID)?;
+            let stop = database
+                .request_native_stop(context, id)
+                .await
+                .map_err(stop_refusal)?;
+            // The database decided the stop; this only reaches the execution
+            // it names, if this host is running it. Accepting a stop of a
+            // running Job is not a claim that it stopped: how it ended is the
+            // Job's outcome, Unknown if its request may have been sent.
+            let (token, request, status, stopped, phase) = match stop {
+                NativeStopRequest::EndedBeforeStart(token) => (
+                    token,
+                    "ended_before_start",
+                    StatusCode::OK,
+                    true,
+                    "cancelled",
+                ),
+                NativeStopRequest::Requested(token) => (
+                    token,
+                    "requested",
+                    StatusCode::ACCEPTED,
+                    false,
+                    "stop_requested",
+                ),
+                NativeStopRequest::AlreadyRequested(token) => (
+                    token,
+                    "already_requested",
+                    StatusCode::ACCEPTED,
+                    false,
+                    "stop_requested",
+                ),
+            };
+            stops.cancel(token);
+            Ok(Reply::new(
+                status,
+                envelope(
+                    serde_json::json!({"stop": {"job": id.to_string(), "request": request, "stopped": stopped, "execution_phase": phase}}),
+                ),
+            ))
+        }
+    }
+}
+
+/// A stop refused because of the Job's standing says which; every other
+/// refusal is the one any Job change gets.
+fn stop_refusal(error: DatabaseError) -> Refusal {
+    match error {
+        DatabaseError::Rejected(Violation::InvalidValue("stop", reason))
+            if reason == crate::db::entities::STOP_JOB_NOT_RUNNING =>
+        {
+            NOT_RUNNING
+        }
+        DatabaseError::Rejected(Violation::InvalidValue("stop", reason))
+            if reason == crate::db::entities::STOP_JOB_ENDED =>
+        {
+            ALREADY_ENDED
+        }
+        other => refusal(other),
     }
 }

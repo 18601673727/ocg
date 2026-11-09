@@ -192,6 +192,32 @@ pub enum ReadySelection {
     SingleRequestGenerative { endpoint: fn(&str) -> bool },
 }
 
+/// Why a stop of a native Job was refused: it has no Allocation, so it is not
+/// running (it may be queued or not submitted).
+pub const STOP_JOB_NOT_RUNNING: &str = "the Job is not running";
+/// Why a stop of a native Job was refused: it already has an outcome, or its
+/// Allocation is held as Uncertain or released. Nothing about it changes.
+pub const STOP_JOB_ENDED: &str = "the Job has already ended";
+/// Why the first Provider request of a stopped Job was not recorded as sent,
+/// and so was never sent.
+pub const STOPPED_BEFORE_SEND: &str = "a stop was requested before the request was sent";
+
+/// What a stop request did to one native Job, decided in one transaction
+/// against its Allocation. Each names the Allocation, whose token identifies
+/// the one execution to cancel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeStopRequest {
+    /// The Job was reserved and had not started: the reservation was ended
+    /// and the Job Cancelled. Nothing was sent. This is a confirmed stop.
+    EndedBeforeStart(AllocationToken),
+    /// The Job was running: its Allocation is now StopRequested and still
+    /// held. The execution is being cancelled; how it ended is recorded when
+    /// it returns, Uncertain if its request may have been sent.
+    Requested(AllocationToken),
+    /// A stop was already requested; nothing was written.
+    AlreadyRequested(AllocationToken),
+}
+
 /// A caller must use `Replay` after any uncertain reservation result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DevelopmentReservationAttempt {
