@@ -8,6 +8,7 @@ mod manual_host;
 #[cfg(unix)]
 mod reconcile_reserved;
 mod release_slot;
+mod run_external_job;
 mod run_loopback_job;
 pub mod typescript;
 #[cfg(unix)]
@@ -41,6 +42,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if command == "external-trial" {
             return external_trial::run(arguments.collect());
+        }
+        if command == run_external_job::COMMAND {
+            return run_external_job::run(arguments.collect());
         }
         if command == "run-loopback-job" {
             return run_loopback_job::run(arguments.collect());
@@ -100,6 +104,11 @@ fn usage() -> &'static str {
        release-slot <job> [--yes]\n\
        run-loopback-job <job> --pool <id> --executor <id> --timeout-secs <n> --confirm-loopback-only\n\
          (runs one named submitted Generative Job once against its own literal 127.0.0.1 endpoint; never an external Provider)\n\
+       run-external-job <job> --pool <id> --executor <id> --endpoint <https-url> --credential-ref <ref> --model <id>\n\
+         --trusted-http-proxy <http://127.0.0.1:port> --max-request-bytes <n> --max-output-tokens <n> --timeout-secs <n>\n\
+         --confirm-external-request\n\
+         (runs one named submitted Generative Job once against its approved HTTPS endpoint through the named proxy;\n\
+          refused unless the manual_external_execution control is enabled in the build)\n\
        inspect-held <data-directory>            (read-only)\n\
        verify <data-directory> [--pages]        (offline integrity check; never writes the original)\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start\n\

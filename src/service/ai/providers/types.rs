@@ -107,15 +107,56 @@ pub enum DestinationPolicy {
     /// [`crate::system::http::direct_diagnostic_loopback`].
     #[default]
     Standard,
-    /// One operator-approved HTTPS destination, for a manual external trial.
-    /// The connector refuses any other host or port, any address that is not
-    /// public, any scheme but https, and any certificate that does not verify
-    /// for exactly this host.
+    /// One operator-approved HTTPS destination, for one manually invoked
+    /// external exchange under `authority`. The connector refuses any other
+    /// host or port, any address that is not public, any scheme but https,
+    /// and any certificate that does not verify for exactly this host.
     ApprovedHttps {
         host: String,
         port: u16,
         route: ApprovedRoute,
+        authority: ExternalAuthority,
     },
+}
+
+/// Which manual authority approved an [`DestinationPolicy::ApprovedHttps`]
+/// destination. Each has its own execution control and enables nothing the
+/// other governs: enabling one never lets the other's destination connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalAuthority {
+    /// `ocg external-trial`, under `manual_external_trial`. Direct or through
+    /// a trusted loopback proxy.
+    ManualExternalTrial,
+    /// `ocg run-external-job`, under `manual_external_execution`. Through a
+    /// trusted loopback proxy only.
+    ManualExternalExecution,
+}
+
+impl ExternalAuthority {
+    /// The control that must be enabled for this authority to connect.
+    pub(crate) const fn control(self) -> crate::system::execution_controls::ExecutionControl {
+        use crate::system::execution_controls::ExecutionControl;
+        match self {
+            ExternalAuthority::ManualExternalTrial => ExecutionControl::ManualExternalTrial,
+            ExternalAuthority::ManualExternalExecution => ExecutionControl::ManualExternalExecution,
+        }
+    }
+
+    /// Whether this authority may use `route`.
+    pub(crate) const fn admits_route(self, route: &ApprovedRoute) -> bool {
+        match (self, route) {
+            (
+                ExternalAuthority::ManualExternalTrial,
+                ApprovedRoute::Direct | ApprovedRoute::TrustedProxy(_),
+            )
+            | (ExternalAuthority::ManualExternalExecution, ApprovedRoute::TrustedProxy(_)) => true,
+            (ExternalAuthority::ManualExternalExecution, ApprovedRoute::Direct) => false,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        self.control().name()
+    }
 }
 
 /// How the connection to an approved destination is made.

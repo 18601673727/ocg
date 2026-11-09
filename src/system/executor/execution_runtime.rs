@@ -54,16 +54,17 @@ impl<'a> DevelopmentExecutionReturn<'a> {
 pub(crate) enum EndpointPolicy<'a> {
     /// A literal loopback endpoint only.
     Loopback,
-    /// One manual external trial's approved endpoint only; see
-    /// [`crate::system::external_trial`].
-    ApprovedTrial(&'a crate::system::external_trial::TrialApproval),
+    /// One manually approved external endpoint only, under the approval's
+    /// own authority and control (the external trial or ordinary manual
+    /// external execution); see [`crate::system::external_approval`].
+    ApprovedExternal(&'a crate::system::external_approval::ExternalApproval),
 }
 
 impl EndpointPolicy<'_> {
     fn permits(self, endpoint: &str, config: &ProviderExecutionConfig) -> bool {
         match self {
             EndpointPolicy::Loopback => crate::system::http::direct_diagnostic_loopback(endpoint),
-            EndpointPolicy::ApprovedTrial(approval) => {
+            EndpointPolicy::ApprovedExternal(approval) => {
                 approval.permits_endpoint(endpoint) && config.destination == approval.destination()
             }
         }
@@ -72,7 +73,7 @@ impl EndpointPolicy<'_> {
     fn refusal(self) -> &'static str {
         match self {
             EndpointPolicy::Loopback => "direct loopback endpoint required",
-            EndpointPolicy::ApprovedTrial(_) => "the approved trial endpoint is required",
+            EndpointPolicy::ApprovedExternal(_) => "the approved external endpoint is required",
         }
     }
 }

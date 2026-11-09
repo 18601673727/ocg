@@ -182,8 +182,10 @@ async fn standard_client(timeout: Duration) -> Result<Client, ProviderExecutionE
 ///
 /// - [`DestinationPolicy::Standard`] reaches a literal loopback endpoint only
 ///   (see [`direct_diagnostic_loopback`]);
-/// - [`DestinationPolicy::ApprovedHttps`] requires
-///   [`ExecutionControl::ManualExternalTrial`] and gets a connector that
+/// - [`DestinationPolicy::ApprovedHttps`] requires the control of the
+///   authority that approved it ([`ExecutionControl::ManualExternalTrial`] or
+///   [`ExecutionControl::ManualExternalExecution`], never either for the
+///   other), a route that authority admits, and gets a connector that
 ///   connects nowhere but the approved host and port; see
 ///   [`approved_connector`].
 ///
@@ -194,7 +196,6 @@ pub(crate) async fn provider_client_for(
     endpoint: &str,
 ) -> Result<Client, ProviderExecutionError> {
     use crate::service::ai::providers::DestinationPolicy;
-    use crate::system::execution_controls::ExecutionControl;
     match destination {
         DestinationPolicy::Standard => {
             if !direct_diagnostic_loopback(endpoint) {
@@ -206,10 +207,20 @@ pub(crate) async fn provider_client_for(
             }
             standard_client(timeout).await
         }
-        DestinationPolicy::ApprovedHttps { host, port, route } => {
-            if !ExecutionControl::ManualExternalTrial.is_enabled() {
+        DestinationPolicy::ApprovedHttps {
+            host,
+            port,
+            route,
+            authority,
+        } => {
+            if !authority.control().is_enabled() {
                 return Err(ProviderExecutionError::Build {
-                    message: ExecutionControl::ManualExternalTrial.refusal(),
+                    message: authority.control().refusal(),
+                });
+            }
+            if !authority.admits_route(route) {
+                return Err(ProviderExecutionError::Build {
+                    message: format!("{} requires a trusted proxy route", authority.name()),
                 });
             }
             Client::builder()

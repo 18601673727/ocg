@@ -17,6 +17,17 @@ pub(crate) enum ExecutionControl {
     /// invocation. It is not [`Self::ExternalProviderTransport`]: it admits
     /// no Job, endpoint or credential that the invocation did not name.
     ManualExternalTrial,
+    /// One explicitly invoked, bounded, tool-free, ordinary native Generative
+    /// Job against one HTTPS endpoint, credential reference and Model that the
+    /// invocation names and the Job's frozen configuration already carries,
+    /// through one named trusted loopback HTTP proxy. It is a separate
+    /// authority from [`Self::ManualExternalTrial`] (neither enables the
+    /// other) and is not [`Self::ExternalProviderTransport`],
+    /// [`Self::ProviderDiscovery`], [`Self::AutonomousScheduling`] or
+    /// [`Self::RecoveryAndRedispatch`]: it admits no Job, endpoint,
+    /// credential or route the invocation did not name, and grants no tools,
+    /// Workspace or child Jobs.
+    ManualExternalExecution,
     /// A scheduler that picks and starts Jobs without a per-Job invocation.
     AutonomousScheduling,
     /// Provider requests to any endpoint that is not a literal loopback.
@@ -55,9 +66,10 @@ impl ControlState {
 }
 
 impl ExecutionControl {
-    pub(crate) const ALL: [ExecutionControl; 9] = [
+    pub(crate) const ALL: [ExecutionControl; 10] = [
         ExecutionControl::ManualLoopbackExecution,
         ExecutionControl::ManualExternalTrial,
+        ExecutionControl::ManualExternalExecution,
         ExecutionControl::AutonomousScheduling,
         ExecutionControl::ExternalProviderTransport,
         ExecutionControl::ProviderDiscovery,
@@ -71,6 +83,7 @@ impl ExecutionControl {
         match self {
             ExecutionControl::ManualLoopbackExecution => ControlState::Enabled,
             ExecutionControl::ManualExternalTrial
+            | ExecutionControl::ManualExternalExecution
             | ExecutionControl::AutonomousScheduling
             | ExecutionControl::ExternalProviderTransport
             | ExecutionControl::ProviderDiscovery
@@ -89,6 +102,7 @@ impl ExecutionControl {
         match self {
             ExecutionControl::ManualLoopbackExecution => "manual_loopback_execution",
             ExecutionControl::ManualExternalTrial => "manual_external_trial",
+            ExecutionControl::ManualExternalExecution => "manual_external_execution",
             ExecutionControl::AutonomousScheduling => "autonomous_scheduling",
             ExecutionControl::ExternalProviderTransport => "external_provider_transport",
             ExecutionControl::ProviderDiscovery => "provider_discovery",

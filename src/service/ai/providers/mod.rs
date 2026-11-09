@@ -48,8 +48,9 @@ pub(crate) use models::{ModelListError, ProviderModel, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
 pub use types::{
     ApprovedRoute, CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver,
-    LoopbackProxy, OutputSinkError, ProviderExecutionConfig, ProviderExecutionError,
-    ProviderExecutionResult, ProviderFact, ProviderObservation, ProviderOutputSink, ResponseFacts,
+    ExternalAuthority, LoopbackProxy, OutputSinkError, ProviderExecutionConfig,
+    ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
+    ProviderOutputSink, ResponseFacts,
 };
 
 pub(crate) use types::incomplete_tool_calls;
