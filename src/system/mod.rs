@@ -1,6 +1,7 @@
 pub mod data_directory;
 pub(crate) mod execution_controls;
 pub mod executor;
+pub(crate) mod external_trial;
 pub mod http;
 pub mod log_cleanup;
 pub mod logger;

@@ -1,6 +1,7 @@
 use crate::api::v1::ControlPlaneConfig;
 use crate::system::data_directory::DataDirectory;
 
+mod external_trial;
 mod inspect_held;
 mod llm_target;
 mod manual_host;
@@ -37,6 +38,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         if command == "reconcile-reserved" {
             return reconcile_reserved::run(arguments.collect());
+        }
+        if command == "external-trial" {
+            return external_trial::run(arguments.collect());
         }
         if command == "run-loopback-job" {
             return run_loopback_job::run(arguments.collect());

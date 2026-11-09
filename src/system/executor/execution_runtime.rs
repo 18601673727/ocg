@@ -51,21 +51,28 @@ impl<'a> DevelopmentExecutionReturn<'a> {
 
 /// Which endpoints a development execution may send to.
 #[derive(Clone, Copy)]
-pub(crate) enum EndpointPolicy {
+pub(crate) enum EndpointPolicy<'a> {
     /// A literal loopback endpoint only.
     Loopback,
+    /// One manual external trial's approved endpoint only; see
+    /// [`crate::system::external_trial`].
+    ApprovedTrial(&'a crate::system::external_trial::TrialApproval),
 }
 
-impl EndpointPolicy {
-    fn permits(self, endpoint: &str, _config: &ProviderExecutionConfig) -> bool {
+impl EndpointPolicy<'_> {
+    fn permits(self, endpoint: &str, config: &ProviderExecutionConfig) -> bool {
         match self {
             EndpointPolicy::Loopback => crate::system::http::direct_diagnostic_loopback(endpoint),
+            EndpointPolicy::ApprovedTrial(approval) => {
+                approval.permits_endpoint(endpoint) && config.destination == approval.destination()
+            }
         }
     }
 
     fn refusal(self) -> &'static str {
         match self {
             EndpointPolicy::Loopback => "direct loopback endpoint required",
+            EndpointPolicy::ApprovedTrial(_) => "the approved trial endpoint is required",
         }
     }
 }
@@ -88,7 +95,7 @@ pub(crate) async fn supervise_development_generative(
     database: &DatabaseHandle,
     handoff: crate::db::DevelopmentHandoff,
     config: &ProviderExecutionConfig,
-    policy: EndpointPolicy,
+    policy: EndpointPolicy<'_>,
 ) -> Result<AppendedOutput, DatabaseError> {
     let (frozen, conversation, prepared, token) =
         handoff
