@@ -2,15 +2,17 @@
 //! format 23. `--check` only reads; `--to <directory>` copies the source tree
 //! to a private staging directory, applies and verifies the migration there,
 //! and publishes it with an atomic no-replace rename. The source is never
-//! written.
+//! written, and writers stay excluded from before its first read until the
+//! destination is published: the data directory's host lock is held shared and
+//! the source database stays open read-only throughout.
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::db::redb::{MigrationInspection, apply, inspect};
-use crate::system::data_directory::DATA_DIRECTORY_VARIABLE;
+use crate::db::redb::{HeldSource, MigrationInspection, apply, inspect};
+use crate::system::data_directory::{DATA_DIRECTORY_VARIABLE, hold_database_lock_shared};
 
 struct StagingDirectory(Option<PathBuf>);
 
@@ -43,7 +45,13 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let destination = destination
         .map(|path| destination_path(&source, &path))
         .transpose()?;
-    let inspection = inspect(&db_path)?;
+    // Excluded from here to the end of the run, and released only when `run`
+    // returns: a host cannot start (its exclusive lock is refused) and no
+    // writer can open the database file while the source is read, copied,
+    // verified and published.
+    let _host_lock = hold_database_lock_shared(&source)?;
+    let held = HeldSource::open(&db_path)?;
+    let inspection = held.inspect()?;
     let plan = match inspection {
         MigrationInspection::Current => {
             println!("Database format: no migration required.");
@@ -79,7 +87,8 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     builder.create(&staging)?;
     let mut cleanup = StagingDirectory(Some(staging.clone()));
     copy_tree_contents(&source, &staging)?;
-    verify_tree(&source, &staging, true)?;
+    // The database file is a byte copy at this point, so it is compared too.
+    verify_tree(&source, &staging, false)?;
     let copied = inspect(&staging.join("ocg.redb"))?;
     match copied {
         MigrationInspection::Upgrade(copied) if copied == plan => {}
@@ -96,14 +105,33 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     if !matches!(migrated, MigrationInspection::Current) {
         return Err("migrated database does not report the current format".into());
     }
+    // The held source must still read as the snapshot that was planned.
+    match held.inspect()? {
+        MigrationInspection::Upgrade(again) if again == plan => {}
+        _ => return Err("the source changed during migration; nothing was published".into()),
+    }
+    // Everything in the staging tree is durable before it gets a public name.
+    sync_directory(&staging)?;
     publish(&staging, &destination)?;
+    // The destination exists from here on. Nothing below removes it, and a
+    // failure below must not say that it does not exist.
     cleanup.0 = None;
-    File::open(parent)?.sync_all()?;
+    if let Err(error) = sync_directory(parent) {
+        return Err(format!(
+            "the migrated database was published at {} but syncing its parent directory failed ({error}); the destination exists and the source is unchanged. Verify the destination before using it",
+            destination.display()
+        )
+        .into());
+    }
     let _ = writeln!(
         io::stdout().lock(),
         "Migration complete; authoritative records and copied files verified."
     );
     Ok(())
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
@@ -163,6 +191,8 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
 
 fn copy_tree_contents(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
     let metadata = fs::symlink_metadata(source)?;
+    // Opened before the mode is applied, which may remove read access.
+    let directory = File::open(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
@@ -181,6 +211,9 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<(), Box<dyn E
         }
     }
     fs::set_permissions(destination, metadata.permissions())?;
+    // The entries just created, and the directory's own mode, are durable
+    // before the directory is trusted; nested directories did the same.
+    directory.sync_all()?;
     Ok(())
 }
 

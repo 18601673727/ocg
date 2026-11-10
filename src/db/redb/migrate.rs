@@ -65,13 +65,31 @@ impl MigrationPlan {
 }
 
 /// Inspects `path` read-only. A running host holds the write lock, so this
-/// reports redb's `Database already open` instead of reading under it.
+/// reports redb's `Database already open` instead of reading under it. The
+/// handle is released on return; use [`HeldSource`] for a source that must stay
+/// excluded from writers.
 pub(crate) fn inspect(path: &Path) -> Result<MigrationInspection, Box<dyn std::error::Error>> {
-    if std::fs::metadata(path)?.len() == 0 {
-        return Err("database is empty/uninitialized; start OCG to initialize it".into());
+    HeldSource::open(path)?.inspect()
+}
+
+/// A source database opened read-only and kept open. redb's file lock is
+/// shared while the handle lives, so no writer can open the file between
+/// inspection, copy, verification and publication. The caller also holds the
+/// data directory's host lock for the same span.
+pub(crate) struct HeldSource(::redb::ReadOnlyDatabase);
+
+impl HeldSource {
+    pub(crate) fn open(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        if std::fs::metadata(path)?.len() == 0 {
+            return Err("database is empty/uninitialized; start OCG to initialize it".into());
+        }
+        Ok(Self(::redb::ReadOnlyDatabase::open(path)?))
     }
-    let database = ::redb::ReadOnlyDatabase::open(path)?;
-    inspect_database(&database)
+
+    /// Reads the held source again, in a new read transaction.
+    pub(crate) fn inspect(&self) -> Result<MigrationInspection, Box<dyn std::error::Error>> {
+        inspect_database(&self.0)
+    }
 }
 
 fn inspect_database(
@@ -93,6 +111,7 @@ fn inspect_database(
                 )
                 .into());
             }
+            reject_legacy_slot_table(&names)?;
             for required in [
                 SCHEDULED_EXTERNAL_POLICY.name(),
                 SCHEDULED_EXTERNAL_BINDING.name(),
@@ -124,8 +143,10 @@ fn inspect_database(
                     }
                 }
             }
+            reject_legacy_slot_table(&names)?;
             require_source_tables(&names)?;
             recovery::migration_check_headers(&tx)?;
+            recovery::migration_check_native(&tx)?;
             let digest = digest_tables(&tx, &names)?;
             Ok(MigrationInspection::Upgrade(MigrationPlan {
                 from: format,
@@ -171,6 +192,7 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
     {
         let tx = database.begin_read()?;
         let names = table_names(&tx)?;
+        reject_legacy_slot_table(&names)?;
         for required in [
             SCHEDULED_EXTERNAL_POLICY.name(),
             SCHEDULED_EXTERNAL_BINDING.name(),
@@ -184,9 +206,24 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
             return Err("migrated authoritative data differs from the source".into());
         }
         let meta = tx.open_table(META)?;
-        recovery::check_identity(&meta)?;
         check_metadata(&meta)?;
-        recovery::migration_check_headers(&tx)?;
+    }
+    // Not merely the marker and the two tables: the checks a host's startup
+    // preflight applies, plus every record header and native invariant. The
+    // copy is read, never opened by a host, so no epoch or shutdown marker
+    // changes and no ownership is released, adopted or cleared.
+    recovery::verify_migrated(&database)?;
+    Ok(())
+}
+
+/// `held_slot` is the legacy slot table. Native initialization refuses it, so
+/// a database that carries it is neither a supported source nor a valid
+/// destination; it is refused, never dropped or carried over.
+fn reject_legacy_slot_table(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Error>> {
+    if names.iter().any(|name| name == HELD_SLOTS.name()) {
+        return Err(
+            "database carries the legacy held_slot table, which a native database must not have; it is not migrated, deleted or reinterpreted".into(),
+        );
     }
     Ok(())
 }
@@ -262,8 +299,8 @@ fn open_table_len(tx: &ReadTransaction, name: &str) -> Result<u64, Box<dyn std::
     Ok(definition)
 }
 
-/// Every table the preceding format always had. `held_slot` is created lazily
-/// by a first Allocation and is allowed to be absent.
+/// Every table the preceding format always had. A `held_slot` table is not
+/// one of them: it is refused before this runs.
 fn require_source_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Error>> {
     for required in [
         "meta",
@@ -484,10 +521,6 @@ fn digest_tables(
                 tables_count += 1;
                 hash_table(tx, UNSETTLED, &mut tables)?
             }
-            "held_slot" => {
-                tables_count += 1;
-                hash_table(tx, HELD_SLOTS, &mut tables)?
-            }
             "children" => {
                 tables_count += 1;
                 hash_table(tx, CHILDREN, &mut tables)?
@@ -578,6 +611,22 @@ fn digest_tables(
     })
 }
 
+/// One length-prefixed, domain-tagged field of the logical digest. Raw keys and
+/// values are arbitrary bytes, so a separator byte could not delimit them: the
+/// explicit length makes every framing unambiguous. The digest is internal and
+/// never stored.
+fn frame(hash: &mut Context, domain: u8, bytes: &[u8]) {
+    hash.update(&[domain]);
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+}
+
+const TABLE_NAME: u8 = b'N';
+const TABLE_KEY: u8 = b'K';
+const TABLE_VALUE: u8 = b'V';
+const META_KEY: u8 = b'm';
+const META_VALUE: u8 = b'v';
+
 fn hash_table<K, V>(
     tx: &ReadTransaction,
     definition: TableDefinition<'_, K, V>,
@@ -590,15 +639,12 @@ where
     use ::redb::{ReadableTable, TableHandle};
     let name = definition.name().to_owned();
     let table = tx.open_table(definition)?;
-    hash.update(name.as_bytes());
-    hash.update(b"\0");
+    frame(hash, TABLE_NAME, name.as_bytes());
     let mut rows = 0u64;
     for entry in table.iter()? {
         let (key, value) = entry?;
-        hash.update(K::as_bytes(&key.value()).as_ref());
-        hash.update(b"\0");
-        hash.update(V::as_bytes(&value.value()).as_ref());
-        hash.update(b"\0");
+        frame(hash, TABLE_KEY, K::as_bytes(&key.value()).as_ref());
+        frame(hash, TABLE_VALUE, V::as_bytes(&value.value()).as_ref());
         rows = rows.saturating_add(1);
     }
     Ok(rows)
@@ -614,10 +660,8 @@ fn hash_meta(tx: &ReadTransaction, hash: &mut Context) -> Result<u64, Box<dyn st
         if key == DATABASE_FORMAT_KEY || key == SCHEMA_FINGERPRINT_KEY {
             continue;
         }
-        hash.update(key.as_bytes());
-        hash.update(b"\0");
-        hash.update(value.value());
-        hash.update(b"\0");
+        frame(hash, META_KEY, key.as_bytes());
+        frame(hash, META_VALUE, value.value());
         rows = rows.saturating_add(1);
     }
     Ok(rows)

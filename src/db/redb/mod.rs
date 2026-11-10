@@ -54,7 +54,7 @@ mod codec;
 mod indexes;
 mod job_records;
 mod migrate;
-pub(crate) use migrate::{MigrationInspection, apply, inspect};
+pub(crate) use migrate::{HeldSource, MigrationInspection, apply, inspect};
 mod notices;
 mod observations;
 pub(crate) use observations::{DecisionAvailabilityRecord, read_decision_availability};

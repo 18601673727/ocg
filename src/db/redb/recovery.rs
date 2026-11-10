@@ -368,6 +368,38 @@ pub(super) fn migration_check_headers(tx: &ReadTransaction) -> Result<(), Storag
     Ok(())
 }
 
+/// The native invariants and ownership policy a normal host applies, read-only,
+/// for the offline migration's inspection of its source. A clean, quiet
+/// database passes as the host's quick path would let it; any other must hold
+/// no capacity and no Unknown outcome, as the host's full verification
+/// requires. Nothing is released, adopted or cleared here.
+pub(super) fn migration_check_native(tx: &ReadTransaction) -> Result<(), StorageError> {
+    check_native_invariants(tx)?;
+    let clean = tx
+        .open_table(META)?
+        .get("clean_shutdown")?
+        .is_some_and(|value| matches!(value.value(), [1]));
+    if clean && allocations_are_quiet(tx)? {
+        return Ok(());
+    }
+    refuse_unresolved_ownership(tx)
+}
+
+/// What the offline migration requires of its staged destination before it is
+/// published: the very checks a host's startup preflight runs on a database
+/// (identity, required tables, metadata, and the quick-or-full ownership
+/// decision), and the record headers and native invariants even where the
+/// host's quick path would skip them. It opens nothing for writing, so no
+/// epoch or shutdown marker changes.
+pub(super) fn verify_migrated(
+    database: &impl ::redb::ReadableDatabase,
+) -> Result<(), StorageError> {
+    if startup_checks(database, false)? == Verification::Quick {
+        check_records(&database.begin_read()?)?;
+    }
+    Ok(())
+}
+
 /// Whether the Allocation rows, the source of ownership, hold no capacity and
 /// the stored indexes equal what they compute. This reads the Allocation rows
 /// (one small row per Allocation ever made) and the Pool configurations they

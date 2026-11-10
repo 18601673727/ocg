@@ -276,6 +276,13 @@ pub(super) fn allocation_by_request(
 /// The Jobs holding capacity on `pool`, or on one Executor of it, read from
 /// the active index. At most the Pool's capacity rows exist, so the range is
 /// bounded; more is corruption, reported by the caller.
+/// How many live scheduled external policies admit one frozen configuration.
+enum ScheduledPolicyMatch {
+    None,
+    One(crate::db::entities::ScheduledExternalPolicyRecord),
+    Ambiguous,
+}
+
 pub(super) fn active_allocations(
     active: &impl ReadableTable<(u128, u128, u128), ()>,
     pool: u128,
@@ -781,6 +788,90 @@ impl Batch {
             Ok(()) => Ok(false),
             Err(error) => Err(error),
         }
+    }
+
+    /// Why checked start cannot execute this Job: its conversation or context
+    /// needs preparation this build does not support. One predicate for the
+    /// start transaction and for scheduled selection, so a candidate the start
+    /// would refuse stays queued instead of being reserved and failed.
+    ///
+    /// Every question is scoped to this Job and its conversation, by the
+    /// conversation's own rows and by the Job's context: the Jobs whose output
+    /// the request would carry (the `previous` chain) and an adopted summary's
+    /// producer. `TOOL_CALLS` and `APPROVALS` are keyed by Job, so evidence is
+    /// a range read per such Job. `CHILD_GROUPS` and `LIVE_CHILDREN` are keyed
+    /// by the parent conversation and written with the child they name. Nothing
+    /// here reads unrelated history.
+    pub(crate) fn unsupported_start_context(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+    ) -> Result<Option<&'static str>, BatchError> {
+        use crate::db::entities::MutableContextSelection;
+        const CHAIN_LIMIT: usize = 4096;
+        const NESTED: &str =
+            "nested and summary-producing Jobs are not supported by checked handoff";
+        const UNSUPPORTED: &str =
+            "notices, child work, approvals or tool evidence require unsupported preparation";
+        let Some(conversation) = self.job(job.parent_id)? else {
+            return self.corrupted("the Job's conversation is missing".to_owned());
+        };
+        if conversation.parent_id.is_some() || job.summary_source.is_some() {
+            return Ok(Some(NESTED));
+        }
+        let mut context = vec![job.id];
+        if let MutableContextSelection::AdoptedSummary { producer, .. } = job.context_selection {
+            context.push(producer);
+        }
+        let mut previous = job.previous;
+        while let Some(id) = previous {
+            if context.len() > CHAIN_LIMIT {
+                return Ok(Some(UNSUPPORTED));
+            }
+            let Some(prior) = self.mutable_job(id)? else {
+                return self.corrupted("conversation predecessor missing".to_owned());
+            };
+            context.push(id);
+            previous = prior.previous;
+        }
+        let parent = job.parent_id.get();
+        self.step(|tx| {
+            let tools = tx.open_table(TOOL_CALLS)?;
+            let approvals = tx.open_table(APPROVALS)?;
+            for id in &context {
+                let range = (id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX);
+                if tools.range(range.clone())?.next().transpose()?.is_some()
+                    || approvals.range(range)?.next().transpose()?.is_some()
+                {
+                    return Ok(Some(UNSUPPORTED));
+                }
+            }
+            let conversation_rows = (parent, 0)..=(parent, u128::MAX);
+            Ok(
+                if tx
+                    .open_table(NOTICES)?
+                    .range((parent, 0)..=(parent, u32::MAX))?
+                    .next()
+                    .transpose()?
+                    .is_some()
+                    || tx
+                        .open_table(CHILD_GROUPS)?
+                        .range(conversation_rows.clone())?
+                        .next()
+                        .transpose()?
+                        .is_some()
+                    || tx
+                        .open_table(LIVE_CHILDREN)?
+                        .range(conversation_rows)?
+                        .next()
+                        .transpose()?
+                        .is_some()
+                {
+                    Some(UNSUPPORTED)
+                } else {
+                    None
+                },
+            )
+        })
     }
 
     fn mutable_predecessor_ready(
@@ -2028,9 +2119,9 @@ impl Batch {
                     return Ok(false);
                 }
                 let held = active_allocations(&active, pool_id.get(), None)?;
-                if held.len() as u64 > u64::from(pool.capacity.get()) {
-                    return Err(StorageError::corrupted("Pool occupancy exceeds capacity"));
-                }
+                // A Pool may be reduced below its occupancy: held Allocations
+                // keep their capacity and the Pool takes no new one until
+                // occupancy falls below the limit.
                 Ok((held.len() as u64) < u64::from(pool.capacity.get())
                     && !held
                         .iter()
@@ -2147,6 +2238,10 @@ impl Batch {
                 if frozen.single_request_refusal().is_some() || !policy(frozen) {
                     continue;
                 }
+                // The checked start would refuse these; leave them queued.
+                if self.unsupported_start_context(&job)?.is_some() {
+                    continue;
+                }
                 let loopback = frozen
                     .llm
                     .provider
@@ -2154,9 +2249,13 @@ impl Batch {
                     .as_deref()
                     .is_some_and(crate::system::http::direct_diagnostic_loopback);
                 scheduled_external = match self.scheduled_external_policy_for(frozen)? {
-                    Some(record) => Some((record.id, record.revision)),
-                    None if !loopback => continue,
-                    None => None,
+                    ScheduledPolicyMatch::One(record) => Some((record.id, record.revision)),
+                    // More than one live policy admits the Job: no policy
+                    // authorizes it, and none is chosen. It stays queued and
+                    // the scan goes on.
+                    ScheduledPolicyMatch::Ambiguous => continue,
+                    ScheduledPolicyMatch::None if !loopback => continue,
+                    ScheduledPolicyMatch::None => None,
                 };
             }
             let (operation, protocol) = match &frozen {
@@ -2354,9 +2453,8 @@ impl Batch {
             }
             let held =
                 active_allocations(&tx.open_table(ACTIVE_ALLOCATIONS)?, pool_id.get(), None)?;
-            if held.len() as u64 > u64::from(pool.capacity.get()) {
-                return Err(StorageError::corrupted("Pool occupancy exceeds capacity"));
-            }
+            // Occupancy above capacity is a legitimate state after the Pool
+            // was reduced; it refuses a new reservation below, nothing more.
             let occupied = held.len() as u64;
             let executor_free = !held
                 .iter()
@@ -2809,7 +2907,7 @@ impl Batch {
             reader::DevelopmentCandidate::Decision(context) => context.job.id,
         };
         self.scheduled_external_authorization(job)?;
-        let (snapshot, allocation, conversation) = match candidate {
+        let (snapshot, allocation) = match candidate {
             reader::DevelopmentCandidate::Generative(context) => {
                 if context.configuration.single_request_refusal().is_some() {
                     return self.reject(Violation::InvalidValue(
@@ -2817,11 +2915,9 @@ impl Batch {
                         "execution policy or provider requires unsupported preparation",
                     ));
                 }
-                (&context.job, &context.allocation, &context.conversation)
+                (&context.job, &context.allocation)
             }
-            reader::DevelopmentCandidate::Decision(context) => {
-                (&context.job, &context.allocation, &context.conversation)
-            }
+            reader::DevelopmentCandidate::Decision(context) => (&context.job, &context.allocation),
         };
         if !self.mutable_predecessor_ready(snapshot)? {
             return self.reject(Violation::InvalidValue(
@@ -2855,64 +2951,10 @@ impl Batch {
                 "credential changed or is unavailable",
             ));
         }
-        if conversation.parent_id.is_some() || snapshot.summary_source.is_some() {
-            return self.reject(Violation::InvalidValue(
-                "handoff",
-                "nested and summary-producing Jobs are not supported by checked handoff",
-            ));
-        }
-        let unsupported_policy = self.step(|tx| {
-            let table = tx.open_table(JOBS)?;
-            for (index, row) in table.iter()?.enumerate() {
-                if index == 100_000 {
-                    return Ok(true);
-                }
-                let (key, value) = row?;
-                match value.value().first() {
-                    Some(&JobSpec::MUTABLE_CONVERSATION_TAG) => {
-                        let group = JobSpec::decode_at(key.value(), value.value())?;
-                        if group.parent_id == Some(snapshot.parent_id) {
-                            return Ok(true);
-                        }
-                    }
-                    Some(&TAG_JOB) => {}
-                    _ => {
-                        return Err(StorageError::corrupted(
-                            "invalid Job record during handoff policy validation",
-                        ));
-                    }
-                }
-            }
-            Ok(tx
-                .open_table(NOTICES)?
-                .range((snapshot.parent_id.get(), 0)..=(snapshot.parent_id.get(), u32::MAX))?
-                .next()
-                .transpose()?
-                .is_some()
-                || tx
-                    .open_table(LIVE_CHILDREN)?
-                    .range((snapshot.parent_id.get(), 0)..=(snapshot.parent_id.get(), u128::MAX))?
-                    .next()
-                    .transpose()?
-                    .is_some()
-                || tx
-                    .open_table(APPROVALS)?
-                    .iter()?
-                    .next()
-                    .transpose()?
-                    .is_some()
-                || tx
-                    .open_table(TOOL_CALLS)?
-                    .iter()?
-                    .next()
-                    .transpose()?
-                    .is_some())
-        })?;
-        if unsupported_policy {
-            return self.reject(Violation::InvalidValue(
-                "handoff",
-                "notices, child work, approvals or tool evidence require unsupported preparation",
-            ));
+        // Authoritative reads in this transaction decide, not the snapshot's
+        // copy: the snapshot was just revalidated against the same rows.
+        if let Some(reason) = self.unsupported_start_context(snapshot)? {
+            return self.reject(Violation::InvalidValue("handoff", reason));
         }
         // The configuration was frozen when the Job was submitted; starting
         // reads it back and never resolves current settings.
@@ -5825,16 +5867,17 @@ impl Batch {
         Ok(updated)
     }
 
-    /// The one live policy that binds this frozen configuration, if any. It
-    /// refuses when the build's control is disabled, and when more than one
-    /// live policy would bind the same Job: choosing between them is not the
-    /// transaction's to make.
+    /// The live policy that binds this frozen configuration. `None` when the
+    /// build's control is disabled or no live policy admits it. More than one
+    /// is `Ambiguous`, an expected candidate result rather than a rejection: a
+    /// rejection would poison the transaction and with it the whole scan, and
+    /// choosing between policies is not the transaction's to make.
     fn scheduled_external_policy_for(
         &mut self,
         frozen: &FrozenExecutionConfig,
-    ) -> Result<Option<crate::db::entities::ScheduledExternalPolicyRecord>, BatchError> {
+    ) -> Result<ScheduledPolicyMatch, BatchError> {
         if !ExecutionControl::ScheduledExternalTransport.is_enabled() {
-            return Ok(None);
+            return Ok(ScheduledPolicyMatch::None);
         }
         let candidates = self.step(|tx| {
             let table = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
@@ -5852,14 +5895,12 @@ impl Batch {
                 record.is_live() && crate::system::scheduled_external::record_admits(record, frozen)
             })
             .collect();
-        match matching.len() {
-            0 => Ok(None),
-            1 => Ok(matching.into_iter().next()),
-            _ => self.reject(Violation::InvalidValue(
-                "scheduled_external_policy",
-                "more than one live policy binds this Job; refuse rather than choose",
-            )),
-        }
+        let mut matching = matching.into_iter();
+        Ok(match (matching.next(), matching.next()) {
+            (None, _) => ScheduledPolicyMatch::None,
+            (Some(record), None) => ScheduledPolicyMatch::One(record),
+            (Some(_), Some(_)) => ScheduledPolicyMatch::Ambiguous,
+        })
     }
 
     /// The policy authorizing this Job's current Allocation, revalidated in

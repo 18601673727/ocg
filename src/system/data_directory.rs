@@ -28,6 +28,45 @@ pub(crate) fn lock_database(directory: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Holds the host lock of an existing data directory shared, so no host can
+/// take it exclusively while the returned file lives. The lock is opened
+/// read-only, never created, truncated or written, and its bytes and
+/// permissions are left as they are. A directory without the lock file has
+/// never been opened by a host that honors it, so it cannot be excluded
+/// safely and is refused rather than given a lock nobody else respects.
+pub(crate) fn hold_database_lock_shared(directory: &Path) -> io::Result<std::fs::File> {
+    let path = directory.join(DATABASE_LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(&path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            io::Error::other(
+                "the data directory has no database lock file, so writers cannot be excluded without creating one; refusing to modify the source",
+            )
+        } else {
+            error
+        }
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != 0 {
+        return Err(io::Error::other(
+            "database lock must be an empty regular file",
+        ));
+    }
+    file.try_lock_shared().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            io::Error::other("the database is in use by a running OCG host")
+        }
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(file)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DataDirectoryError {
     #[error("{DATA_DIRECTORY_VARIABLE} must be set to the OCG data directory")]

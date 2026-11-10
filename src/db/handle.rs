@@ -752,10 +752,10 @@ impl DatabaseHandle {
             .await
         {
             Ok(counts) => (
-                Some(counts.0),
-                Some(counts.1),
-                Some(counts.2),
-                Some(counts.3),
+                Some(counts.pending),
+                Some(counts.ready),
+                Some(counts.delayed),
+                Some(counts.running),
             ),
             Err(error) => {
                 log::debug!("failed to read database vitals queue counts: {error}");
@@ -942,12 +942,15 @@ impl DatabaseHandle {
             return Err(DatabaseError::ShuttingDown);
         }
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
-        let (pending, ready, delayed, running) =
-            redb::queue_counts(&opened.database, true).map_err(DatabaseError::Read)?;
-        if pending != 0
-            || ready != 0
-            || delayed != 0
-            || running != 0
+        let counts = redb::queue_counts(&opened.database, true).map_err(DatabaseError::Read)?;
+        // `held` covers every Allocation holding capacity, so a Reserved,
+        // StopRequested or Uncertain one blocks the update as well as a
+        // Running one.
+        if counts.pending != 0
+            || counts.ready != 0
+            || counts.delayed != 0
+            || counts.running != 0
+            || counts.held != 0
             || !self.sender.is_empty()
             || self.shared.in_flight_commands.load(Ordering::SeqCst) != 0
         {

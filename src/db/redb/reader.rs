@@ -4884,31 +4884,44 @@ fn conversation_matches(
     }
     Ok(true)
 }
-/// (pending, ready, delayed, running). With `for_update`, pending and
-/// delayed count only Jobs due by now. Running never counts a quarantined
-/// slot in either mode; the update pause checks its process groups itself.
+/// Native queue and capacity accounting from one read transaction.
+pub(crate) struct QueueCounts {
+    /// Queued Jobs that hold no Allocation.
+    pub(crate) pending: u64,
+    /// Entries of the ready index.
+    pub(crate) ready: u64,
+    pub(crate) delayed: u64,
+    /// Allocations executing their Job: Running or StopRequested. Neither a
+    /// Reserved Allocation (not started) nor an Uncertain one (its outcome is
+    /// unknown, so it is held rather than running) counts.
+    pub(crate) running: u64,
+    /// Every Allocation still holding capacity: Reserved, Running,
+    /// StopRequested and Uncertain. This, not `running`, decides whether the
+    /// host is quiescent.
+    pub(crate) held: u64,
+}
+
+/// With `for_update`, pending and delayed count only Jobs due by now. A native
+/// Job has no eligibility time, so every pending Job is due; each must still
+/// have its Job row. A failed or inconsistent read is an error, never a zero.
 pub(crate) fn queue_counts(
     database: &Database,
     for_update: bool,
-) -> Result<(u64, u64, u64, u64), StorageError> {
+) -> Result<QueueCounts, StorageError> {
+    use crate::db::entities::AllocationPhase;
     let rx = read(database)?;
     let pending_table = rx.open_table(PENDING)?;
     let delayed_table = rx.open_table(DELAYED)?;
     let (pending, delayed) = if for_update {
         let clock = recovery::promotion_clock();
+        let jobs = rx.open_table(JOBS)?;
         let mut pending = 0;
         for entry in pending_table.iter()? {
-            let id = JobId::new(entry?.0.value());
-            let row = read_job_row(&rx, id)?
-                .ok_or_else(|| StorageError::corrupted("pending Job missing"))?;
-            if !row.kind.is_persistent()
-                || row
-                    .kind
-                    .eligible_at()
-                    .is_none_or(|at| at.as_unix_micros() <= clock)
-            {
-                pending += 1;
+            let id = entry?.0.value();
+            if jobs.get(id)?.is_none() {
+                return Err(StorageError::corrupted("pending Job missing"));
             }
+            pending += 1;
         }
         let mut delayed = 0;
         for entry in delayed_table.range(..=(clock, u128::MAX))? {
@@ -4926,12 +4939,33 @@ pub(crate) fn queue_counts(
     } else {
         (pending_table.len()?, delayed_table.len()?)
     };
-    let ready = rx.open_table(READY)?.len()?;
-    let mut running = 0;
-    for entry in rx.open_table(HELD_SLOTS)?.iter()? {
-        running += u64::from(!entry?.1.value().1);
+    let ready = rx.open_table(MUTABLE_READY)?.len()?;
+    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
+    let (mut running, mut held) = (0, 0);
+    for entry in rx.open_table(ACTIVE_ALLOCATIONS)?.iter()? {
+        let (_, _, job) = entry?.0.value();
+        let bytes = allocations.get(job)?.ok_or_else(|| {
+            StorageError::corrupted("active Allocation index references a missing Allocation")
+        })?;
+        let allocation = transactions::decode_pool_allocation(job, bytes.value())?;
+        match allocation.phase {
+            AllocationPhase::Running | AllocationPhase::StopRequested => running += 1,
+            AllocationPhase::Reserved | AllocationPhase::Uncertain => {}
+            AllocationPhase::Released => {
+                return Err(StorageError::corrupted(
+                    "active Allocation index references a released Allocation",
+                ));
+            }
+        }
+        held += 1;
     }
-    Ok((pending, ready, delayed, running))
+    Ok(QueueCounts {
+        pending,
+        ready,
+        delayed,
+        running,
+        held,
+    })
 }
 
 pub(crate) fn read_tool_stats(
