@@ -91,7 +91,10 @@ pub(crate) use reader::{
     JobScope, ProfilePageRecord, read_delegated_workspace, read_global_compaction_settings,
     read_job_scope,
 };
-pub(crate) use reader::{NativeResource, NativeResourceKind, read_native_resources};
+pub(crate) use reader::{
+    NativeResource, NativeResourceKind, PoolAllocationPage, read_native_resources,
+    read_pool_allocations,
+};
 pub(crate) use reader::{VerifiedNativeSummary, verify_native_summary};
 pub(crate) use reader::{
     inspect_held_allocations_offline, reconcile_development_reservation_offline, verify_offline,

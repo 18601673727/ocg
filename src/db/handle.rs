@@ -3494,6 +3494,18 @@ impl DatabaseHandle {
             .await
     }
 
+    /// One page of a Pool's held Allocations and its occupancy; `None` when
+    /// the Pool does not exist. Read-only.
+    pub(crate) async fn pool_allocations(
+        &self,
+        pool: entities::ExecutionPoolId,
+        after: Option<(u128, u128)>,
+        limit: usize,
+    ) -> Result<Option<redb::PoolAllocationPage>, DatabaseError> {
+        self.read(move |database| redb::read_pool_allocations(database, pool, after, limit))
+            .await
+    }
+
     pub(crate) async fn register_native_pool(
         &self,
         pool: entities::AllocationPool,
@@ -3521,6 +3533,62 @@ impl DatabaseHandle {
                 |_| 4096,
                 OperationKind::CreateExecutor,
                 |(executor,), batch| batch.register_allocation_executor(executor),
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn update_native_executor(
+        &self,
+        id: ExecutorId,
+        expected_revision: u32,
+        update: entities::ExecutorUpdate,
+    ) -> Result<entities::AllocationExecutor, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, expected_revision, update),
+                reply,
+                |_| 4096,
+                OperationKind::UpdateExecutor,
+                |(id, expected_revision, update), batch| {
+                    batch.update_native_executor(id, expected_revision, update)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn archive_native_executor(
+        &self,
+        id: ExecutorId,
+        expected_revision: u32,
+    ) -> Result<entities::AllocationExecutor, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, expected_revision),
+                reply,
+                |_| 4096,
+                OperationKind::ArchiveExecutor,
+                |(id, expected_revision), batch| {
+                    batch.archive_native_executor(id, expected_revision)
+                },
+            )
+        })
+        .await
+    }
+
+    pub(crate) async fn archive_native_pool(
+        &self,
+        id: ExecutionPoolId,
+        expected_revision: u32,
+    ) -> Result<entities::AllocationPool, DatabaseError> {
+        self.submit(|reply| {
+            Command::new(
+                (id, expected_revision),
+                reply,
+                |_| 4096,
+                OperationKind::ArchivePool,
+                |(id, expected_revision), batch| batch.archive_native_pool(id, expected_revision),
             )
         })
         .await

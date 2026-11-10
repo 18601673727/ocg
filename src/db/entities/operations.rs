@@ -84,6 +84,16 @@ pub enum OperationKind {
     CreateExecutionPool,
     SetExecutionPoolEnabled,
     SetExecutionPoolProfile,
+    /// An enable, disable, rename or capability change of one independent
+    /// Executor. It releases no capacity and starts nothing.
+    UpdateExecutor,
+    /// The permanent retirement of one idle independent Executor. It releases
+    /// no capacity, stops nothing and resolves no outcome.
+    ArchiveExecutor,
+    /// The permanent retirement of one independent Pool with no Allocation and
+    /// no unarchived Executor. It removes the Pool from future eligibility; it
+    /// releases no capacity, stops nothing and resolves no outcome.
+    ArchivePool,
     /// A create, update, enable, disable or revoke of one durable scheduled
     /// external policy. It never enables the build's control.
     SetScheduledExternalPolicy,

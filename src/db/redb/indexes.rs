@@ -507,8 +507,8 @@ pub(super) struct AllocationIndexes {
 }
 
 /// Computes the Allocation indexes, or reports corruption: a reused request
-/// identity, an Executor holding two Allocations, a Pool above its capacity,
-/// or an Allocation whose Pool configuration is missing.
+/// identity, an Executor holding two Allocations, or an Allocation whose Pool
+/// configuration is missing.
 pub(super) fn compute_allocation_indexes(
     allocations: &impl ReadableTable<u128, &'static [u8]>,
     configs: &impl ReadableTable<u128, &'static [u8]>,
@@ -518,7 +518,7 @@ pub(super) fn compute_allocation_indexes(
         requests: std::collections::BTreeMap::new(),
     };
     let mut executors = BTreeSet::new();
-    let mut occupancy = std::collections::BTreeMap::<u128, u64>::new();
+    let mut pools = BTreeSet::<u128>::new();
     for entry in allocations.iter()? {
         let (key, value) = entry?;
         let allocation = transactions::decode_pool_allocation(key.value(), value.value())?;
@@ -544,19 +544,20 @@ pub(super) fn compute_allocation_indexes(
                 ));
             }
             indexes.active.insert((pool, executor, key.value()));
-            *occupancy.entry(pool).or_default() += 1;
+            pools.insert(pool);
         }
     }
-    for (pool, held) in occupancy {
+    // Occupancy above the configured capacity is legitimate: a Pool may be
+    // shrunk below its active Allocations, which keep their capacity while new
+    // reservations stay refused. Only the Pool's existence and encoding are
+    // checked.
+    for pool in pools {
         let Some(bytes) = configs.get(pool)? else {
             return Err(StorageError::corrupted(
                 "active Allocation references a missing Pool",
             ));
         };
-        let capacity = transactions::decode_allocation_pool(pool, bytes.value())?.capacity;
-        if held > u64::from(capacity.get()) {
-            return Err(StorageError::corrupted("Pool occupancy exceeds capacity"));
-        }
+        transactions::decode_allocation_pool(pool, bytes.value())?;
     }
     Ok(indexes)
 }

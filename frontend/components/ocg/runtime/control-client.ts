@@ -61,6 +61,96 @@ export type NativeExecutor = {
   }[];
 };
 
+/** The one configuration change an Executor update makes. */
+export type NativeExecutorChange =
+  | { enabled: boolean; name?: never; capabilities?: never }
+  | { name: string; enabled?: never; capabilities?: never }
+  | {
+      capabilities: NativeExecutor["capabilities"];
+      enabled?: never;
+      name?: never;
+    };
+
+/** Whether an Executor update was refused because the Executor changed since it was read. */
+export function isExecutorConflict(error: unknown): boolean {
+  return error instanceof ControlTransportError && error.code === "executor_revision_conflict";
+}
+
+function validateNativeExecutor(
+  executor: NativeExecutor | undefined,
+): asserts executor is NativeExecutor {
+  if (
+    !executor ||
+    typeof executor.id !== "string" ||
+    typeof executor.pool !== "string" ||
+    typeof executor.name !== "string" ||
+    typeof executor.enabled !== "boolean" ||
+    executor.archived !== false ||
+    !Number.isSafeInteger(executor.revision) ||
+    executor.revision < 1 ||
+    !Array.isArray(executor.capabilities)
+  )
+    throw new ContractError("executor", "a native Executor");
+  identity(executor.id, "executor");
+  identity(executor.pool, "pool");
+  if (
+    !executor.capabilities.every(
+      (capability) =>
+        capability &&
+        ((capability.operation === "decision" && capability.protocol === null) ||
+          (capability.operation === "llm_request" &&
+            ["openai_chat_completions", "openai_responses", "anthropic_messages"].includes(
+              capability.protocol ?? "",
+            ))),
+    )
+  )
+    throw new ContractError("executor.capabilities", "supported Executor capabilities");
+}
+
+/** The phases of an Allocation that holds capacity. Released Allocations are never listed. */
+export type NativeAllocationPhase = "reserved" | "running" | "stop_requested" | "uncertain";
+
+export type NativeAllocation = {
+  pool: string;
+  job: string;
+  executor: string;
+  generation: number;
+  job_revision: number;
+  phase: NativeAllocationPhase;
+  holds_capacity: true;
+  claimed_at_unix_micros: number;
+  started_at_unix_micros: number | null;
+};
+
+/** Held Allocations by phase; every field is null when the Pool is too large to count in one read. */
+export type NativePoolOccupancy =
+  | {
+      available: true;
+      held: number;
+      reserved: number;
+      running: number;
+      stop_requested: number;
+      uncertain: number;
+    }
+  | { available: false };
+
+export type NativePoolAllocations = {
+  pool: string;
+  capacity: number;
+  occupancy: NativePoolOccupancy;
+  allocations: NativeAllocation[];
+  has_more: boolean;
+  next_after: string | null;
+};
+
+const ALLOCATION_PHASES: readonly string[] = ["reserved", "running", "stop_requested", "uncertain"];
+
+function counter(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+    throw new ContractError(path, "a non-negative count");
+  return value;
+}
+
 export function configurationIdentity(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   let time = Date.now();
@@ -353,6 +443,7 @@ function nativePool(value: unknown): ControlPools["pools"][number] {
     enabled: pool.enabled,
     concurrency_limit: pool.capacity,
     operations: undefined,
+    revision: pool.revision,
   };
 }
 
@@ -2324,34 +2415,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         typeof page.has_more !== "boolean"
       )
         throw new ContractError("executors", "a native Executor page");
-      for (const executor of page.executors) {
-        if (
-          !executor ||
-          typeof executor.id !== "string" ||
-          typeof executor.pool !== "string" ||
-          typeof executor.name !== "string" ||
-          typeof executor.enabled !== "boolean" ||
-          executor.archived !== false ||
-          !Number.isSafeInteger(executor.revision) ||
-          executor.revision < 1 ||
-          !Array.isArray(executor.capabilities)
-        )
-          throw new ContractError("executor", "a native Executor");
-        identity(executor.id, "executor");
-        identity(executor.pool, "pool");
-        if (
-          !executor.capabilities.every(
-            (capability) =>
-              capability &&
-              ((capability.operation === "decision" && capability.protocol === null) ||
-                (capability.operation === "llm_request" &&
-                  ["openai_chat_completions", "openai_responses", "anthropic_messages"].includes(
-                    capability.protocol ?? "",
-                  ))),
-          )
-        )
-          throw new ContractError("executor.capabilities", "supported Executor capabilities");
-      }
+      for (const executor of page.executors) validateNativeExecutor(executor);
       if (page.has_more) {
         if (typeof page.next_before !== "string")
           throw new ContractError("next_before", "an advancing Executor cursor");
@@ -2364,6 +2428,119 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         executors: page.executors,
         has_more: page.has_more,
         next_before: page.next_before ?? null,
+      };
+    },
+
+    /** One page of the Allocations holding capacity in a native Pool, and the Pool's occupancy. */
+    async readNativePoolAllocations(
+      pool: string,
+      settings: { after?: string; signal?: AbortSignal } = {},
+    ): Promise<NativePoolAllocations> {
+      identity(pool, "pool");
+      let suffix = "";
+      if (settings.after !== undefined) {
+        const [executor, job, ...rest] = settings.after.split(".");
+        if (rest.length > 0 || executor === undefined || job === undefined)
+          throw new ContractError("after", "an allocation cursor");
+        identity(executor, "after");
+        identity(job, "after");
+        suffix = `?after=${settings.after}`;
+      }
+      const result = await send("GET", `/api/v1/pools/${pool}/allocations${suffix}`, {
+        signal: settings.signal,
+      });
+      const page = result.input as Partial<Omit<NativePoolAllocations, "occupancy">> & {
+        api_version?: number;
+        occupancy?: Record<string, unknown>;
+      };
+      const occupancy = page.occupancy;
+      if (
+        page.api_version !== 1 ||
+        page.pool !== pool ||
+        typeof page.capacity !== "number" ||
+        !Number.isSafeInteger(page.capacity) ||
+        page.capacity < 1 ||
+        !occupancy ||
+        !Array.isArray(page.allocations) ||
+        page.allocations.length > 100 ||
+        typeof page.has_more !== "boolean"
+      )
+        throw new ContractError("allocations", "a native Pool allocation page");
+      let checked: NativePoolOccupancy;
+      if (occupancy.available === true) {
+        const held = counter(occupancy.held, "occupancy.held");
+        const reserved = counter(occupancy.reserved, "occupancy.reserved");
+        const running = counter(occupancy.running, "occupancy.running");
+        const stopRequested = counter(occupancy.stop_requested, "occupancy.stop_requested");
+        const uncertain = counter(occupancy.uncertain, "occupancy.uncertain");
+        if (held !== reserved + running + stopRequested + uncertain)
+          throw new ContractError("occupancy", "phase counts that add up to the held total");
+        checked = {
+          available: true,
+          held,
+          reserved,
+          running,
+          stop_requested: stopRequested,
+          uncertain,
+        };
+      } else if (occupancy.available === false) {
+        checked = { available: false };
+      } else throw new ContractError("occupancy", "an occupancy summary");
+      // Canonical lowercase UUIDs compare in string order exactly as they do
+      // numerically, and the Pool's index is ordered by (Executor, Job).
+      let previousKey = settings.after;
+      for (const allocation of page.allocations) {
+        if (
+          !allocation ||
+          typeof allocation.generation !== "number" ||
+          !Number.isSafeInteger(allocation.generation) ||
+          allocation.generation < 1 ||
+          typeof allocation.job_revision !== "number" ||
+          !Number.isSafeInteger(allocation.job_revision) ||
+          allocation.job_revision < 0 ||
+          !ALLOCATION_PHASES.includes(allocation.phase) ||
+          allocation.holds_capacity !== true ||
+          !Number.isSafeInteger(allocation.claimed_at_unix_micros) ||
+          (allocation.started_at_unix_micros !== null &&
+            !Number.isSafeInteger(allocation.started_at_unix_micros))
+        )
+          throw new ContractError("allocation", "a held Allocation");
+        identity(allocation.pool, "allocation.pool");
+        if (allocation.pool !== pool)
+          throw new ContractError("allocation.pool", "the requested Pool's identity");
+        identity(allocation.job, "job");
+        identity(allocation.executor, "executor");
+        const key = `${allocation.executor}.${allocation.job}`;
+        if (previousKey !== undefined && key <= previousKey)
+          throw new ContractError(
+            "allocations",
+            "Allocations in strictly increasing Executor and Job order after the cursor",
+          );
+        previousKey = key;
+      }
+      if (page.has_more) {
+        const last = page.allocations[page.allocations.length - 1];
+        if (
+          typeof page.next_after !== "string" ||
+          page.next_after === settings.after ||
+          !last ||
+          page.next_after !== `${last.executor}.${last.job}`
+        )
+          throw new ContractError("next_after", "the final returned Allocation's cursor");
+        const [executor, job, ...rest] = page.next_after.split(".");
+        if (rest.length > 0 || executor === undefined || job === undefined)
+          throw new ContractError("next_after", "an allocation cursor");
+        identity(executor, "next_after");
+        identity(job, "next_after");
+      } else if (page.next_after !== null)
+        throw new ContractError("next_after", "a terminal allocation cursor");
+      return {
+        pool,
+        capacity: page.capacity,
+        occupancy: checked,
+        allocations: page.allocations,
+        has_more: page.has_more,
+        next_after: page.next_after ?? null,
       };
     },
 
@@ -2391,6 +2568,93 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       )
         throw new ContractError("executor", "the registered Executor");
       return answer.executor;
+    },
+
+    /** Applies one change to an Executor, made from `expectedRevision`. */
+    async updateNativeExecutor(
+      id: string,
+      expectedRevision: number,
+      change: NativeExecutorChange,
+      signal?: AbortSignal,
+    ) {
+      identity(id, "executor");
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+        throw new ContractError("expected_revision", "a positive integer");
+      const result = await send("POST", `/api/v1/executors/${id}`, {
+        body: { expected_revision: expectedRevision, ...change },
+        sign: true,
+        signal,
+      });
+      const answer = result.input as {
+        api_version?: number;
+        executor?: NativeExecutor;
+      };
+      if (answer.api_version !== 1 || answer.executor?.id !== id)
+        throw new ContractError("executor", "the updated Executor");
+      validateNativeExecutor(answer.executor);
+      return answer.executor;
+    },
+
+    /**
+     * Retires an idle Executor for good, from `expectedRevision`. The answer is
+     * the authoritative archived configuration; nothing is released or stopped.
+     */
+    async archiveNativeExecutor(id: string, expectedRevision: number, signal?: AbortSignal) {
+      identity(id, "executor");
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+        throw new ContractError("expected_revision", "a positive integer");
+      const result = await send("POST", `/api/v1/executors/${id}/archive`, {
+        body: { expected_revision: expectedRevision },
+        sign: true,
+        signal,
+      });
+      const answer = result.input as {
+        api_version?: number;
+        executor?: NativeExecutor;
+      };
+      const archived = answer.executor;
+      if (
+        answer.api_version !== 1 ||
+        !archived ||
+        archived.id !== id ||
+        archived.archived !== true ||
+        archived.enabled !== false ||
+        archived.revision !== expectedRevision + 1
+      )
+        throw new ContractError("executor", "the archived Executor");
+      return archived;
+    },
+
+    /**
+     * Retires a Pool with no Allocation and no unarchived Executor for good,
+     * from `expectedRevision`. The answer is the authoritative archived Pool;
+     * nothing is released, stopped or cascaded.
+     */
+    async archiveNativePool(id: string, expectedRevision: number, signal?: AbortSignal) {
+      identity(id, "pool");
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+        throw new ContractError("expected_revision", "a positive integer");
+      const result = await send("POST", `/api/v1/pools/${id}/archive`, {
+        body: { expected_revision: expectedRevision },
+        sign: true,
+        signal,
+      });
+      const answer = result.input as {
+        api_version?: number;
+        resource_model?: string;
+        pool?: Record<string, unknown>;
+      };
+      const archived = answer.pool;
+      if (
+        answer.api_version !== 1 ||
+        answer.resource_model !== "independent" ||
+        !archived ||
+        archived.id !== id ||
+        archived.archived !== true ||
+        archived.enabled !== false ||
+        archived.revision !== expectedRevision + 1
+      )
+        throw new ContractError("pool", "the archived Pool");
     },
 
     /** Every Profile (LLM Profiles, Agent Profiles) and the merged Provider projection. */

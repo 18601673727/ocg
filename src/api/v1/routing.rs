@@ -90,13 +90,21 @@ pub(super) enum Route {
         limit: usize,
     },
     PoolsRetired,
+    PoolAllocations {
+        pool: ExecutionPoolId,
+        after: Option<(u128, u128)>,
+        limit: usize,
+    },
     PoolUpdate(ExecutionPoolId),
+    NativePoolArchive(ExecutionPoolId),
     NativePoolCreate,
     NativeExecutors {
         before: Option<ProfileId>,
         limit: usize,
     },
     NativeExecutorCreate,
+    NativeExecutorUpdate(crate::db::entities::ExecutorId),
+    NativeExecutorArchive(crate::db::entities::ExecutorId),
     JobEdit(JobId),
     Outputs {
         job: JobId,
@@ -146,7 +154,12 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
     let allowed = match (caller, &route) {
         (
             Caller::Operator(_),
-            Route::NativeExecutors { .. } | Route::NativeExecutorCreate | Route::NativePoolCreate,
+            Route::NativeExecutors { .. }
+            | Route::PoolAllocations { .. }
+            | Route::NativeExecutorCreate
+            | Route::NativeExecutorUpdate(_)
+            | Route::NativeExecutorArchive(_)
+            | Route::NativePoolCreate,
         ) => true,
         (Caller::Anonymous, Route::SessionCreate | Route::SessionStatus) => true,
         (
@@ -203,6 +216,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Pools { .. }
             | Route::PoolsRetired
             | Route::PoolUpdate(_)
+            | Route::NativePoolArchive(_)
             | Route::JobEdit(_)
             | Route::Outputs { .. }
             | Route::LatestOutput(_)
@@ -318,9 +332,21 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 let project = projects::project_id(project)?;
                 no_query(query).map(|()| Route::ProjectUpdate(project))
             }
+            ["pools", pool, "archive"] => {
+                let pool = pools::pool_id(pool)?;
+                no_query(query).map(|()| Route::NativePoolArchive(pool))
+            }
             ["pools", pool] => {
                 let pool = pools::pool_id(pool)?;
                 no_query(query).map(|()| Route::PoolUpdate(pool))
+            }
+            ["executors", executor] => {
+                let executor = pools::executor_id(executor)?;
+                no_query(query).map(|()| Route::NativeExecutorUpdate(executor))
+            }
+            ["executors", executor, "archive"] => {
+                let executor = pools::executor_id(executor)?;
+                no_query(query).map(|()| Route::NativeExecutorArchive(executor))
             }
             ["conversations", job] => {
                 let job = job_id(job)?;
@@ -406,6 +432,14 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
         }
         ["pools"] => Ok(Route::PoolsRetired),
+        ["pools", pool, "allocations"] => {
+            let pool = pools::pool_id(pool)?;
+            pools::allocations_query(query).map(|(after, limit)| Route::PoolAllocations {
+                pool,
+                after,
+                limit,
+            })
+        }
         ["executors"] => catalog::page_query(query, profiles::profile_id)
             .map(|(before, limit)| Route::NativeExecutors { before, limit }),
         ["attachments", attachment] => {
@@ -771,6 +805,9 @@ pub(super) async fn respond(
             "pool_api_retired",
             "use GET /api/v2/pools with cursor pagination",
         )),
+        Route::PoolAllocations { pool, after, limit } => {
+            pools::list_allocations(database, pool, after, limit).await
+        }
         Route::NativePoolCreate => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             pools::create_pool(database, &body).await
@@ -779,12 +816,24 @@ pub(super) async fn respond(
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             pools::update(database, pool, &body).await
         }
+        Route::NativePoolArchive(pool) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            pools::archive_pool(database, pool, &body).await
+        }
         Route::NativeExecutors { before, limit } => {
             pools::list_executors(database, before.map(Into::into), limit).await
         }
         Route::NativeExecutorCreate => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             pools::create_executor(database, &body).await
+        }
+        Route::NativeExecutorUpdate(executor) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            pools::update_executor(database, executor, &body).await
+        }
+        Route::NativeExecutorArchive(executor) => {
+            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            pools::archive_executor(database, executor, &body).await
         }
         Route::JobEdit(job) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

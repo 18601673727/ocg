@@ -3858,6 +3858,138 @@ pub(crate) fn read_native_resources(
     })
 }
 
+/// The most active index entries one Pool occupancy summary counts. A Pool
+/// with more cannot be counted inside one bounded read, so its summary is
+/// reported as unavailable rather than as a partial total.
+pub(crate) const MAX_POOL_OCCUPANCY_ENTRIES: usize = 4096;
+
+/// How many held Allocations a Pool has in each phase. `held` is their sum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PoolOccupancy {
+    pub held: u64,
+    pub reserved: u64,
+    pub running: u64,
+    pub stop_requested: u64,
+    pub uncertain: u64,
+}
+
+pub(crate) struct PoolAllocationPage {
+    pub pool: crate::db::entities::AllocationPool,
+    /// Absent when the Pool holds more Allocations than one bounded read counts.
+    pub occupancy: Option<PoolOccupancy>,
+    pub allocations: Vec<crate::db::entities::PoolAllocation>,
+    /// The (Executor, Job) after which the next page continues.
+    pub next: Option<(u128, u128)>,
+}
+
+/// Loads the authoritative Allocation behind one active-index entry and
+/// requires that the two agree.
+pub(super) fn indexed_allocation(
+    allocations: &impl ReadableTable<u128, &'static [u8]>,
+    pool: u128,
+    executor: u128,
+    job: u128,
+) -> Result<crate::db::entities::PoolAllocation, StorageError> {
+    let bytes = allocations.get(job)?.ok_or_else(|| {
+        StorageError::corrupted("active Allocation index references a missing Allocation")
+    })?;
+    let allocation = transactions::decode_pool_allocation(job, bytes.value())?;
+    if allocation.token.job.get() != job
+        || allocation.token.pool.get() != pool
+        || allocation.token.executor.get() != executor
+    {
+        return Err(StorageError::corrupted(
+            "active Allocation index disagrees with its Allocation's identity",
+        ));
+    }
+    if !allocation.holds_capacity() {
+        return Err(StorageError::corrupted(
+            "active Allocation index references a released Allocation",
+        ));
+    }
+    Ok(allocation)
+}
+
+/// One page of a Pool's held Allocations, in (Executor, Job) order after
+/// `after`, with the Pool's occupancy, all from one read transaction.
+/// `None` when the Pool does not exist. Any index entry that disagrees with
+/// its authoritative Allocation fails the read.
+pub(crate) fn read_pool_allocations(
+    database: &Database,
+    pool_id: crate::db::entities::ExecutionPoolId,
+    after: Option<(u128, u128)>,
+    limit: usize,
+) -> Result<Option<PoolAllocationPage>, StorageError> {
+    use crate::db::entities::AllocationPhase;
+    let tx = read(database)?;
+    let pool = {
+        let configs = tx.open_table(CONFIGS)?;
+        let Some(bytes) = configs.get(pool_id.get())? else {
+            return Ok(None);
+        };
+        if bytes.value().first() != Some(&transactions::TAG_ALLOCATION_POOL) {
+            return Ok(None);
+        }
+        transactions::decode_allocation_pool(pool_id.get(), bytes.value())?
+    };
+    let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
+    let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+    let pool_key = pool_id.get();
+    let high = (pool_key, u128::MAX, u128::MAX);
+
+    let limit = limit.clamp(1, MAX_PAGE);
+    let start = match after {
+        Some((executor, job)) => Bound::Excluded((pool_key, executor, job)),
+        None => Bound::Included((pool_key, 0, 0)),
+    };
+    let mut page = Vec::new();
+    let mut next = None;
+    for entry in active.range((start, Bound::Included(high)))? {
+        let (_, executor, job) = entry?.0.value();
+        if page.len() == limit {
+            next = page
+                .last()
+                .map(|last: &crate::db::entities::PoolAllocation| {
+                    (last.token.executor.get(), last.token.job.get())
+                });
+            break;
+        }
+        page.push(indexed_allocation(&allocations, pool_key, executor, job)?);
+    }
+
+    let mut occupancy = PoolOccupancy::default();
+    let mut counted = Some(());
+    for (scanned, entry) in active
+        .range((Bound::Included((pool_key, 0, 0)), Bound::Included(high)))?
+        .enumerate()
+    {
+        let (_, executor, job) = entry?.0.value();
+        if scanned == MAX_POOL_OCCUPANCY_ENTRIES {
+            counted = None;
+            break;
+        }
+        let allocation = indexed_allocation(&allocations, pool_key, executor, job)?;
+        occupancy.held += 1;
+        match allocation.phase {
+            AllocationPhase::Reserved => occupancy.reserved += 1,
+            AllocationPhase::Running => occupancy.running += 1,
+            AllocationPhase::StopRequested => occupancy.stop_requested += 1,
+            AllocationPhase::Uncertain => occupancy.uncertain += 1,
+            AllocationPhase::Released => {
+                return Err(StorageError::corrupted(
+                    "active Allocation index references a released Allocation",
+                ));
+            }
+        }
+    }
+    Ok(Some(PoolAllocationPage {
+        pool,
+        occupancy: counted.map(|()| occupancy),
+        allocations: page,
+        next,
+    }))
+}
+
 pub(crate) enum StoredCredential {
     Absent,
     Decrypted(CredentialSecret),

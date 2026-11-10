@@ -123,6 +123,55 @@ pub(super) fn decode_allocation_executor(
     })
 }
 
+/// The most `CONFIGS` rows one Pool archival examines to prove it has no
+/// unarchived Executor. The Executor's `pool` field is the only record of the
+/// relation, so the proof is a scan; a table beyond this bound is refused
+/// rather than archived on a partial scan.
+pub(super) const POOL_ARCHIVE_SCAN_LIMIT: usize = 4096;
+
+/// The refusal detail for a stored row the archival could not trust.
+const POOL_ARCHIVE_STORAGE_INCONSISTENT: &str = "configuration storage is inconsistent";
+
+/// One `CONFIGS` row, decoded for what it is. A malformed row is an error,
+/// never another kind.
+enum NativeConfigRow {
+    Pool(crate::db::entities::AllocationPool),
+    Executor(crate::db::entities::AllocationExecutor),
+    Other,
+}
+
+fn decode_native_config_row(key: u128, bytes: &[u8]) -> DecodeResult<NativeConfigRow> {
+    match bytes.first() {
+        Some(&TAG_ALLOCATION_POOL) => decode_allocation_pool(key, bytes).map(NativeConfigRow::Pool),
+        Some(&TAG_ALLOCATION_EXECUTOR) => {
+            decode_allocation_executor(key, bytes).map(NativeConfigRow::Executor)
+        }
+        _ => {
+            ConfigRow::decode_at(key, bytes)?;
+            Ok(NativeConfigRow::Other)
+        }
+    }
+}
+
+enum PoolRowRead {
+    Absent,
+    Found(crate::db::entities::AllocationPool),
+    Malformed,
+}
+
+enum PoolAllocationRead {
+    None,
+    Held,
+    Inconsistent,
+}
+
+enum PoolChildScan {
+    Clear,
+    UnarchivedExecutor,
+    BoundExceeded,
+    Inconsistent,
+}
+
 #[allow(dead_code)]
 fn encode_pool_allocation(allocation: &crate::db::entities::PoolAllocation) -> Vec<u8> {
     use crate::db::entities::AllocationPhase;
@@ -823,13 +872,15 @@ impl Batch {
             context.push(producer);
         }
         let mut previous = job.previous;
+        let mut predecessors = 0usize;
         while let Some(id) = previous {
-            if context.len() > CHAIN_LIMIT {
+            if predecessors == CHAIN_LIMIT {
                 return Ok(Some(UNSUPPORTED));
             }
             let Some(prior) = self.mutable_job(id)? else {
                 return self.corrupted("conversation predecessor missing".to_owned());
             };
+            predecessors += 1;
             context.push(id);
             previous = prior.previous;
         }
@@ -1985,6 +2036,312 @@ impl Batch {
         if let Some(enabled) = enabled {
             pool.enabled = enabled;
         }
+        self.insert(CONFIGS, id.get(), encode_allocation_pool(&pool).as_slice())?;
+        Ok(pool)
+    }
+
+    pub(crate) fn update_native_executor(
+        &mut self,
+        id: ExecutorId,
+        expected_revision: u32,
+        update: crate::db::entities::ExecutorUpdate,
+    ) -> Result<crate::db::entities::AllocationExecutor, BatchError> {
+        use crate::db::entities::ExecutorUpdate;
+        self.allocation_format_gate()?;
+        self.require_allocation_durability()?;
+        let existing = self.native_executor_row(id)?;
+        let Some(mut executor) = existing else {
+            return self.reject(Violation::NotFound(RecordRef::Executor(id)));
+        };
+        if executor.archived {
+            return self.reject(Violation::NotFound(RecordRef::Executor(id)));
+        }
+        if executor.revision != expected_revision {
+            return self.reject(Violation::InvalidValue("executor", "revision conflict"));
+        }
+        match update {
+            ExecutorUpdate::Enabled(enabled) => executor.enabled = enabled,
+            ExecutorUpdate::Name(name) => {
+                if name.trim().is_empty() || name.chars().any(char::is_control) || name.len() > 255
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "executor",
+                        "invalid Executor configuration",
+                    ));
+                }
+                executor.name = name;
+            }
+            ExecutorUpdate::Capabilities(capabilities) => {
+                if capabilities.len() > 8
+                    || capabilities.iter().any(|(operation, protocol)| {
+                        !matches!(
+                            (operation, protocol),
+                            (ExecutionOperation::LlmRequest, Some(_))
+                                | (ExecutionOperation::Decision, None)
+                        )
+                    })
+                {
+                    return self.reject(Violation::InvalidValue(
+                        "executor",
+                        "invalid Executor configuration",
+                    ));
+                }
+                executor.capabilities = capabilities;
+            }
+        }
+        executor.revision =
+            executor
+                .revision
+                .checked_add(1)
+                .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                    "revision",
+                ))))?;
+        self.insert(
+            CONFIGS,
+            id.get(),
+            encode_allocation_executor(&executor).as_slice(),
+        )?;
+        Ok(executor)
+    }
+
+    /// The independent Executor stored under `id`; `None` when the row is
+    /// absent or is another kind of configuration. A malformed row is an
+    /// error, never an absence.
+    fn native_executor_row(
+        &mut self,
+        id: ExecutorId,
+    ) -> Result<Option<crate::db::entities::AllocationExecutor>, BatchError> {
+        let existing = self.get(CONFIGS, id.get(), |bytes| match bytes.first() {
+            Some(&TAG_ALLOCATION_EXECUTOR) => decode_allocation_executor(id.get(), bytes).map(Some),
+            Some(&TAG_ALLOCATION_POOL) => {
+                decode_allocation_pool(id.get(), bytes)?;
+                Ok(None)
+            }
+            _ => {
+                ConfigRow::decode_at(id.get(), bytes)?;
+                Ok(None)
+            }
+        })?;
+        Ok(existing.flatten())
+    }
+
+    /// Permanently retires one idle Executor: `archived` is set, `enabled` is
+    /// cleared and the revision advances, all in this one transaction. The
+    /// row stays in `CONFIGS`, so the identity is never reused. The decision
+    /// reads only this Executor's `ACTIVE_ALLOCATIONS` range, in this
+    /// transaction. A held Allocation, or an index entry that disagrees with
+    /// its authoritative Allocation, refuses the archival; no Allocation, Job
+    /// or Pool row is touched.
+    pub(crate) fn archive_native_executor(
+        &mut self,
+        id: ExecutorId,
+        expected_revision: u32,
+    ) -> Result<crate::db::entities::AllocationExecutor, BatchError> {
+        self.allocation_format_gate()?;
+        self.require_allocation_durability()?;
+        let Some(mut executor) = self.native_executor_row(id)? else {
+            return self.reject(Violation::NotFound(RecordRef::Executor(id)));
+        };
+        if executor.archived {
+            return self.reject(Violation::InvalidValue("executor", "already archived"));
+        }
+        if executor.revision != expected_revision {
+            return self.reject(Violation::InvalidValue("executor", "revision conflict"));
+        }
+        let pool = executor.pool.get();
+        // Free, held, or untrustworthy. A storage failure is neither: it
+        // fails the batch and is never read as an idle Executor.
+        let held = self.step(|tx| {
+            let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
+            let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+            let entries = active_allocations(&active, pool, Some(id.get()))?;
+            for &(executor, job) in &entries {
+                match super::reader::indexed_allocation(&allocations, pool, executor, job) {
+                    Ok(_) => {}
+                    Err(error) if error.kind == StorageErrorKind::Corrupted => return Ok(None),
+                    Err(error) => return Err(error),
+                }
+            }
+            // An Executor holds at most one Allocation.
+            Ok(match entries.len() {
+                0 | 1 => Some(!entries.is_empty()),
+                _ => None,
+            })
+        })?;
+        match held {
+            Some(false) => {}
+            Some(true) => {
+                return self.reject(Violation::InvalidValue(
+                    "executor",
+                    "holds an active Allocation",
+                ));
+            }
+            None => {
+                return self.reject(Violation::InvalidValue(
+                    "executor",
+                    "active Allocation index is inconsistent",
+                ));
+            }
+        }
+        executor.archived = true;
+        executor.enabled = false;
+        executor.revision =
+            executor
+                .revision
+                .checked_add(1)
+                .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                    "revision",
+                ))))?;
+        self.insert(
+            CONFIGS,
+            id.get(),
+            encode_allocation_executor(&executor).as_slice(),
+        )?;
+        Ok(executor)
+    }
+
+    /// Permanently retires one independent Pool: `archived` is set, `enabled`
+    /// is cleared and the revision advances, all in this one transaction. The
+    /// row stays in `CONFIGS`, so the identity is never reused and historical
+    /// Executor and Allocation references still decode.
+    ///
+    /// Every decision is read in this transaction and any refusal leaves the
+    /// database unchanged:
+    /// - the Pool's `ACTIVE_ALLOCATIONS` range must be empty (an entry that
+    ///   disagrees with its authoritative Allocation fails closed);
+    /// - no unarchived Executor may name the Pool. The Executor's `pool` field
+    ///   is the only record of that relation, so `CONFIGS` is scanned, at most
+    ///   [`POOL_ARCHIVE_SCAN_LIMIT`] rows. A table too large to examine in full
+    ///   refuses the archival; a partial scan never archives.
+    ///
+    /// No Allocation, Job or Executor row is touched and no capacity is
+    /// released.
+    pub(crate) fn archive_native_pool(
+        &mut self,
+        id: ExecutionPoolId,
+        expected_revision: u32,
+    ) -> Result<crate::db::entities::AllocationPool, BatchError> {
+        self.allocation_format_gate()?;
+        self.require_allocation_durability()?;
+        let read = self.step(|tx| {
+            let configs = tx.open_table(CONFIGS)?;
+            let Some(bytes) = configs.get(id.get())? else {
+                return Ok(PoolRowRead::Absent);
+            };
+            Ok(match decode_native_config_row(id.get(), bytes.value()) {
+                Ok(NativeConfigRow::Pool(pool)) => PoolRowRead::Found(pool),
+                Ok(NativeConfigRow::Executor(_) | NativeConfigRow::Other) => PoolRowRead::Absent,
+                Err(error) if error.kind == StorageErrorKind::Corrupted => PoolRowRead::Malformed,
+                Err(error) => return Err(error),
+            })
+        })?;
+        let mut pool = match read {
+            PoolRowRead::Found(pool) => pool,
+            PoolRowRead::Absent => {
+                return self.reject(Violation::NotFound(RecordRef::ExecutionPool(id)));
+            }
+            PoolRowRead::Malformed => {
+                return self.reject(Violation::InvalidValue(
+                    "pool",
+                    POOL_ARCHIVE_STORAGE_INCONSISTENT,
+                ));
+            }
+        };
+        if pool.archived {
+            return self.reject(Violation::InvalidValue("pool", "already archived"));
+        }
+        if pool.revision != expected_revision {
+            return self.reject(Violation::InvalidValue("pool", "revision conflict"));
+        }
+        let pool_key = id.get();
+        // Free, held, or untrustworthy. One entry decides: any active entry
+        // blocks, so the range is never read past its first member.
+        let allocation = self.step(|tx| {
+            let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
+            let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+            let mut range = active.range((pool_key, 0, 0)..=(pool_key, u128::MAX, u128::MAX))?;
+            let Some(entry) = range.next() else {
+                return Ok(PoolAllocationRead::None);
+            };
+            let (_, executor, job) = entry?.0.value();
+            match super::reader::indexed_allocation(&allocations, pool_key, executor, job) {
+                Ok(_) => Ok(PoolAllocationRead::Held),
+                Err(error) if error.kind == StorageErrorKind::Corrupted => {
+                    Ok(PoolAllocationRead::Inconsistent)
+                }
+                Err(error) => Err(error),
+            }
+        })?;
+        match allocation {
+            PoolAllocationRead::None => {}
+            PoolAllocationRead::Held => {
+                return self.reject(Violation::InvalidValue(
+                    "pool",
+                    "holds an active Allocation",
+                ));
+            }
+            PoolAllocationRead::Inconsistent => {
+                return self.reject(Violation::InvalidValue(
+                    "pool",
+                    "active Allocation index is inconsistent",
+                ));
+            }
+        }
+        let scan = self.step(|tx| {
+            let configs = tx.open_table(CONFIGS)?;
+            for (examined, entry) in configs.iter()?.enumerate() {
+                let (key, value) = entry?;
+                if examined == POOL_ARCHIVE_SCAN_LIMIT {
+                    return Ok(PoolChildScan::BoundExceeded);
+                }
+                match decode_native_config_row(key.value(), value.value()) {
+                    Ok(NativeConfigRow::Executor(executor))
+                        if executor.pool.get() == pool_key && !executor.archived =>
+                    {
+                        return Ok(PoolChildScan::UnarchivedExecutor);
+                    }
+                    Ok(
+                        NativeConfigRow::Executor(_)
+                        | NativeConfigRow::Pool(_)
+                        | NativeConfigRow::Other,
+                    ) => {}
+                    Err(error) if error.kind == StorageErrorKind::Corrupted => {
+                        return Ok(PoolChildScan::Inconsistent);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(PoolChildScan::Clear)
+        })?;
+        match scan {
+            PoolChildScan::Clear => {}
+            PoolChildScan::UnarchivedExecutor => {
+                return self.reject(Violation::InvalidValue(
+                    "pool",
+                    "has an unarchived Executor",
+                ));
+            }
+            PoolChildScan::BoundExceeded => {
+                return self.reject(Violation::InvalidValue(
+                    "pool",
+                    "child Executor verification exceeds the scan bound",
+                ));
+            }
+            PoolChildScan::Inconsistent => {
+                return self.reject(Violation::InvalidValue(
+                    "pool",
+                    POOL_ARCHIVE_STORAGE_INCONSISTENT,
+                ));
+            }
+        }
+        pool.archived = true;
+        pool.enabled = false;
+        pool.revision = pool
+            .revision
+            .checked_add(1)
+            .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                "revision",
+            ))))?;
         self.insert(CONFIGS, id.get(), encode_allocation_pool(&pool).as_slice())?;
         Ok(pool)
     }

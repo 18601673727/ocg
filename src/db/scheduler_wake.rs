@@ -56,6 +56,9 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::ConfirmJobStopped
         | OperationKind::QuarantineAbandonedJob
         | OperationKind::CreateExecutor
+        | OperationKind::UpdateExecutor
+        | OperationKind::ArchiveExecutor
+        | OperationKind::ArchivePool
         // Configurations are frozen for submitted Jobs. These low-frequency
         // writes conservatively dirty the configuration available to admission.
         | OperationKind::CreateLlmProvider
@@ -114,6 +117,9 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::BoundaryB
         | OperationKind::AssignJobExecutor
         | OperationKind::CreateExecutor
+        | OperationKind::UpdateExecutor
+        | OperationKind::ArchiveExecutor
+        | OperationKind::ArchivePool
         | OperationKind::CreateLlmProvider
         | OperationKind::CreateProfile
         | OperationKind::CreateAgent

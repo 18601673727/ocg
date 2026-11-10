@@ -367,10 +367,107 @@ export const en = {
   "settings.pools.executorCapability": "Capability",
   "settings.pools.executorCreate": "Register Executor",
   "settings.pools.executorEmpty": "No Executors on this page.",
+  "settings.pools.executorState": "Executor: {state}",
+  "settings.pools.executorPoolState": "Pool {pool}: {state}",
+  "settings.pools.executorPoolElsewhere": "Pool {pool}",
+  "settings.pools.executorRename": "Rename",
+  "settings.pools.executorSaveName": "Save name",
+  "settings.pools.executorCapabilities": "Capabilities",
+  "settings.pools.executorSaveCapabilities": "Save capabilities",
+  "settings.pools.executorStale":
+    "This Executor changed after it was read. Reload this page of Executors before editing it again.",
+  "settings.pools.executorReload": "Reload",
+  "settings.pools.executorArchive": "Archive",
+  "settings.pools.executorArchiveTitle": "Archive this Executor?",
+  "settings.pools.executorArchiveActiveList":
+    "The Executor will disappear from the active list and can never be scheduled again.",
+  "settings.pools.executorArchiveHistory": "Historical Job and Allocation records are kept.",
+  "settings.pools.executorArchiveNotStop":
+    "Archiving is not an execution stop: it does not stop, cancel or confirm any external work.",
+  "settings.pools.executorArchiveNotRelease":
+    "Archiving is not a capacity release: it frees no Pool capacity and resolves no unknown outcome.",
+  "settings.pools.executorArchiveIrreversible": "This cannot be reversed through the current UI.",
+  "settings.pools.executorArchiveConfirm": "Archive permanently",
+  "settings.pools.executorArchiving": "Archiving…",
+  "settings.pools.poolArchive": "Archive",
+  "settings.pools.poolArchiveTitle": "Archive this Pool?",
+  "settings.pools.poolArchiveChildren":
+    "Every Executor of this Pool must already be archived. Archival is refused while any Executor is not; Executors are never archived for you.",
+  "settings.pools.poolArchiveActiveList":
+    "The Pool will disappear from the active list and can never be used for new reservations.",
+  "settings.pools.poolArchiveHistory": "Historical Job and Allocation records are kept.",
+  "settings.pools.poolArchiveNotStop":
+    "Archiving is not an execution stop: it does not stop, cancel or confirm any external work.",
+  "settings.pools.poolArchiveNotRelease":
+    "Archiving is not a capacity release: it frees no Pool capacity and resolves no unknown outcome.",
+  "settings.pools.poolArchiveIrreversible": "This cannot be reversed through the current UI.",
+  "settings.pools.poolArchiveConfirm": "Archive permanently",
+  "settings.pools.poolArchiving": "Archiving…",
   "settings.pools.note":
     "Lowering the limit below the number of running Jobs stops new claims; the running Jobs continue.",
   "settings.pools.refusal.notFound": "This Pool no longer exists. Refresh the list.",
   "settings.pools.refusal.invalidRequest": "The limit must be a whole number of at least 1.",
+  "settings.pools.refusal.executorNotFound": "This Executor no longer exists. Reload the list.",
+  "settings.pools.refusal.invalidExecutor":
+    "The Executor configuration is invalid: use a name of 1 to 255 bytes without control characters and at most 8 distinct capabilities.",
+  "settings.pools.refusal.executorChanged":
+    "The Executor changed after it was read. Reload this page of Executors, then retry.",
+  "settings.pools.refusal.executorHoldsAllocation":
+    "This Executor still holds an Allocation, so it was not archived and nothing was released. Expand this Pool's Allocations panel to see the holding Job and its phase. Archive it only after that Allocation no longer holds capacity.",
+  "settings.pools.refusal.executorArchived":
+    "This Executor is already archived. Reload this page of Executors.",
+  "settings.pools.refusal.executorIndexInconsistent":
+    "The stored Allocation index disagrees with its Allocation records, so the Executor was not archived. Nothing was changed.",
+  "settings.pools.refusal.poolChanged":
+    "The Pool changed after it was read. The page of Pools was reloaded; review it, then retry.",
+  "settings.pools.refusal.poolArchived":
+    "This Pool is already archived. The page of Pools was reloaded.",
+  "settings.pools.refusal.poolHoldsAllocation":
+    "This Pool still holds an Allocation, so it was not archived and nothing was released. Expand this Pool's Allocations panel to see the holding Jobs and their phases. Archive the Pool only after no Allocation holds capacity.",
+  "settings.pools.refusal.poolHasExecutor":
+    "An Executor of this Pool is not archived, so the Pool was not archived. Archive each of its Executors individually under Executors first, then retry.",
+  "settings.pools.refusal.poolScanUnavailable":
+    "The Pool's Executors could not all be examined within the safety bound, so archival was safely refused and nothing was changed.",
+  "settings.pools.refusal.poolIndexInconsistent":
+    "The stored Allocation index disagrees with its Allocation records, so the Pool was not archived. Nothing was changed.",
+  "settings.pools.refusal.poolStorageInconsistent":
+    "A stored Pool or Executor configuration could not be read, so the Pool was not archived. Nothing was changed.",
+  "settings.pools.refusal.invalidCursor":
+    "The Allocation page position is no longer valid. Refresh the Allocations.",
+  "settings.pools.refusal.allocationInconsistent":
+    "The stored Allocation index disagrees with its Allocation records, so this Pool's occupancy cannot be shown. Nothing was changed.",
+  "settings.pools.refusal.allocationUnavailable":
+    "The Allocations could not be read right now. Nothing was changed; retry.",
+  "settings.pools.capacityOnly": "Capacity: {capacity}",
+  "settings.pools.capacityHeld": "Held: {held} / Capacity: {capacity}",
+  "settings.pools.capacityHeldUnavailable": "Held: unavailable / Capacity: {capacity}",
+  "settings.pools.capacityHint":
+    "Held counts Allocations that are Reserved, Running, Stop requested or Uncertain. It can exceed Capacity after the limit was lowered.",
+  "settings.pools.occupancyBreakdown":
+    "Reserved {reserved} · Running {running} · Stop requested {stopRequested} · Uncertain {uncertain}",
+  "settings.pools.occupancyUnavailable":
+    "This Pool holds too many Allocations to count in one read, so the held total is unavailable.",
+  "settings.pools.overCapacity":
+    "Held exceeds Capacity because the limit was lowered. Lowering the limit does not cancel or release held work.",
+  "settings.pools.capacityChanged":
+    "The Pool's limit is now {capacity}. Refresh to compare it with the current held Allocations.",
+  "settings.pools.allocationsShow": "Allocations",
+  "settings.pools.allocationsHide": "Hide Allocations",
+  "settings.pools.allocationsRefresh": "Refresh",
+  "settings.pools.allocationsMore": "Load more",
+  "settings.pools.allocationsNone": "No Allocation holds capacity in this Pool.",
+  "settings.pools.allocationJob": "Job",
+  "settings.pools.allocationExecutor": "Executor",
+  "settings.pools.allocationHolds": "Holds capacity",
+  "settings.pools.allocationEarlierRead": "Earlier read: may have been released since",
+  "settings.pools.allocationsPagesNote":
+    "These pages were read at different times, so this list is not one consistent snapshot. Held and the phase counts above come only from the most recent read; Allocations from earlier reads may have been released since. Refresh to read again from the start.",
+  "settings.pools.allocationUnresolved":
+    "Unresolved: the outcome is unknown and capacity stays held.",
+  "settings.pools.phase.reserved": "Reserved",
+  "settings.pools.phase.running": "Running",
+  "settings.pools.phase.stopRequested": "Stop requested",
+  "settings.pools.phase.uncertain": "Uncertain",
 
   "sidebar.chatActions": "Chat actions: {title}",
   "sidebar.renameChat": "Rename",
@@ -1578,10 +1675,97 @@ export const zh: Dictionary = {
   "settings.pools.executorCapability": "能力",
   "settings.pools.executorCreate": "注册执行器",
   "settings.pools.executorEmpty": "此页没有执行器。",
+  "settings.pools.executorState": "执行器：{state}",
+  "settings.pools.executorPoolState": "执行池 {pool}：{state}",
+  "settings.pools.executorPoolElsewhere": "执行池 {pool}",
+  "settings.pools.executorRename": "重命名",
+  "settings.pools.executorSaveName": "保存名称",
+  "settings.pools.executorCapabilities": "能力",
+  "settings.pools.executorSaveCapabilities": "保存能力",
+  "settings.pools.executorStale":
+    "此执行器在读取后已发生变化。请先重新加载此页执行器，再继续编辑。",
+  "settings.pools.executorReload": "重新加载",
+  "settings.pools.executorArchive": "归档",
+  "settings.pools.executorArchiveTitle": "归档此执行器？",
+  "settings.pools.executorArchiveActiveList": "该执行器将从活动列表中消失，且永远不会再被调度。",
+  "settings.pools.executorArchiveHistory": "历史任务与分配记录将予以保留。",
+  "settings.pools.executorArchiveNotStop": "归档不是停止执行：它不会停止、取消或确认任何外部工作。",
+  "settings.pools.executorArchiveNotRelease":
+    "归档不是释放容量：它不会释放执行池容量，也不会解决任何未知结果。",
+  "settings.pools.executorArchiveIrreversible": "当前界面无法撤销此操作。",
+  "settings.pools.executorArchiveConfirm": "永久归档",
+  "settings.pools.executorArchiving": "正在归档…",
+  "settings.pools.poolArchive": "归档",
+  "settings.pools.poolArchiveTitle": "归档此执行池？",
+  "settings.pools.poolArchiveChildren":
+    "此执行池的所有执行器必须已经归档。只要有执行器未归档，归档就会被拒绝；系统不会替你归档执行器。",
+  "settings.pools.poolArchiveActiveList": "该执行池将从活动列表中消失，且永远不会再用于新的预留。",
+  "settings.pools.poolArchiveHistory": "历史任务与分配记录将予以保留。",
+  "settings.pools.poolArchiveNotStop": "归档不是停止执行：它不会停止、取消或确认任何外部工作。",
+  "settings.pools.poolArchiveNotRelease":
+    "归档不是释放容量：它不会释放执行池容量，也不会解决任何未知结果。",
+  "settings.pools.poolArchiveIrreversible": "当前界面无法撤销此操作。",
+  "settings.pools.poolArchiveConfirm": "永久归档",
+  "settings.pools.poolArchiving": "正在归档…",
   "settings.pools.note":
     "将限制降低到正在运行的任务数以下会停止新的认领；正在运行的任务将继续执行。",
   "settings.pools.refusal.notFound": "此执行池已不存在。请刷新列表。",
   "settings.pools.refusal.invalidRequest": "限制必须为不小于 1 的整数。",
+  "settings.pools.refusal.executorNotFound": "此执行器已不存在。请重新加载列表。",
+  "settings.pools.refusal.invalidExecutor":
+    "执行器配置无效：名称须为 1 至 255 字节且不含控制字符，能力最多 8 项且不重复。",
+  "settings.pools.refusal.executorChanged":
+    "此执行器在读取后已发生变化。请重新加载此页执行器，然后重试。",
+  "settings.pools.refusal.executorHoldsAllocation":
+    "此执行器仍持有分配，因此未归档，也未释放任何内容。请展开此执行池的分配面板，查看持有它的任务及其阶段；待该分配不再占用容量后再归档。",
+  "settings.pools.refusal.executorArchived": "此执行器已归档。请重新加载此页执行器。",
+  "settings.pools.refusal.executorIndexInconsistent":
+    "已存储的分配索引与分配记录不一致，因此未归档该执行器。未做任何更改。",
+  "settings.pools.refusal.poolChanged":
+    "此执行池在读取后已发生变化。已重新加载执行池列表，请检查后重试。",
+  "settings.pools.refusal.poolArchived": "此执行池已归档。已重新加载执行池列表。",
+  "settings.pools.refusal.poolHoldsAllocation":
+    "此执行池仍持有分配，因此未归档，也未释放任何内容。请展开此执行池的分配面板，查看持有它的任务及其阶段；待没有分配占用容量后再归档。",
+  "settings.pools.refusal.poolHasExecutor":
+    "此执行池仍有未归档的执行器，因此未归档该执行池。请先在“执行器”中逐个归档其执行器，然后重试。",
+  "settings.pools.refusal.poolScanUnavailable":
+    "无法在安全上限内检查该执行池的全部执行器，因此已安全拒绝归档，未做任何更改。",
+  "settings.pools.refusal.poolIndexInconsistent":
+    "已存储的分配索引与分配记录不一致，因此未归档该执行池。未做任何更改。",
+  "settings.pools.refusal.poolStorageInconsistent":
+    "有已存储的执行池或执行器配置无法读取，因此未归档该执行池。未做任何更改。",
+  "settings.pools.refusal.invalidCursor": "分配分页位置已失效。请刷新分配列表。",
+  "settings.pools.refusal.allocationInconsistent":
+    "已存储的分配索引与分配记录不一致，因此无法显示此执行池的占用情况。未做任何更改。",
+  "settings.pools.refusal.allocationUnavailable": "暂时无法读取分配。未做任何更改，请重试。",
+  "settings.pools.capacityOnly": "容量：{capacity}",
+  "settings.pools.capacityHeld": "占用：{held} / 容量：{capacity}",
+  "settings.pools.capacityHeldUnavailable": "占用：不可用 / 容量：{capacity}",
+  "settings.pools.capacityHint":
+    "占用统计已预留、运行中、已请求停止和不确定的分配。降低限制后，占用可能超过容量。",
+  "settings.pools.occupancyBreakdown":
+    "已预留 {reserved} · 运行中 {running} · 已请求停止 {stopRequested} · 不确定 {uncertain}",
+  "settings.pools.occupancyUnavailable":
+    "此执行池占用的分配过多，无法在一次读取中统计，因此占用总数不可用。",
+  "settings.pools.overCapacity":
+    "占用超过容量，因为限制已被降低。降低限制不会取消或释放已占用的工作。",
+  "settings.pools.capacityChanged": "此执行池的限制现为 {capacity}。请刷新以与当前占用的分配对比。",
+  "settings.pools.allocationsShow": "分配",
+  "settings.pools.allocationsHide": "收起分配",
+  "settings.pools.allocationsRefresh": "刷新",
+  "settings.pools.allocationsMore": "加载更多",
+  "settings.pools.allocationsNone": "此执行池中没有占用容量的分配。",
+  "settings.pools.allocationJob": "任务",
+  "settings.pools.allocationExecutor": "执行器",
+  "settings.pools.allocationHolds": "占用容量",
+  "settings.pools.allocationEarlierRead": "较早读取：此后可能已释放",
+  "settings.pools.allocationsPagesNote":
+    "这些页是在不同时间读取的，因此此列表不是一致的快照。上方的占用及各阶段计数仅来自最近一次读取；较早读取的分配此后可能已释放。请刷新以从头重新读取。",
+  "settings.pools.allocationUnresolved": "未解决：结果未知，容量仍被占用。",
+  "settings.pools.phase.reserved": "已预留",
+  "settings.pools.phase.running": "运行中",
+  "settings.pools.phase.stopRequested": "已请求停止",
+  "settings.pools.phase.uncertain": "不确定",
 
   "sidebar.chatActions": "对话操作：{title}",
   "sidebar.renameChat": "重命名",

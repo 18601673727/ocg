@@ -26,6 +26,16 @@ pub struct AllocationExecutor {
     pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
 }
 
+/// The one configuration change an Executor update applies. Identity and Pool
+/// ownership are never changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExecutorUpdate {
+    Enabled(bool),
+    Name(String),
+    /// The complete capability set, replacing the previous one.
+    Capabilities(BTreeSet<(ExecutionOperation, Option<LlmTransport>)>),
+}
+
 /// A generation identifies ownership; it is not a separate executable unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocationToken {

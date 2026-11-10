@@ -1,13 +1,29 @@
 use super::*;
 
 /// The collections whose members are changed with `POST`.
-const MEMBER_COLLECTIONS: [&str; 4] = ["profiles", "projects", "pools", "conversations"];
+const MEMBER_COLLECTIONS: [&str; 5] = [
+    "profiles",
+    "projects",
+    "pools",
+    "executors",
+    "conversations",
+];
 
 /// Whether `rest` names one member of `collection`.
 fn member(rest: &str, collection: &str) -> bool {
     rest.strip_prefix(collection)
         .and_then(|rest| rest.strip_prefix('/'))
         .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+fn executor_archive(rest: &str) -> bool {
+    let segments: Vec<_> = rest.split('/').collect();
+    matches!(segments.as_slice(), ["executors", id, "archive"] if !id.is_empty())
+}
+
+fn pool_archive(rest: &str) -> bool {
+    let segments: Vec<_> = rest.split('/').collect();
+    matches!(segments.as_slice(), ["pools", id, "archive"] if !id.is_empty())
 }
 
 fn decision(rest: &str) -> bool {
@@ -70,6 +86,8 @@ fn takes_post(path: &str) -> bool {
         Some(rest) => {
             mutable_job_write(rest)
                 || conversation_action(rest)
+                || executor_archive(rest)
+                || pool_archive(rest)
                 || decision(rest)
                 || profile_availability(rest)
                 || approval_or_release(rest)
@@ -108,6 +126,8 @@ fn json_post_limit(path: &str) -> Option<usize> {
             | "settings/outbound-headers",
         ) => Some(MAX_SUBMISSION_BYTES),
         Some(rest) => (mutable_job_write(rest)
+            || executor_archive(rest)
+            || pool_archive(rest)
             || decision(rest)
             || profile_availability(rest)
             || conversation_action(rest)
