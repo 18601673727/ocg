@@ -1,12 +1,24 @@
 import type * as Api from "./api";
 
 export type ControlCapability = "chat" | "tools" | "vision" | "reasoning";
-export type ControlPool = Omit<Api.Pool, "operations"> & {
-  operations: ("llm_request" | "decision")[] | undefined;
+export type NativePoolV2 = {
+  id: string;
+  name: string;
+  capacity: number;
+  enabled: boolean;
+  archived: boolean;
   /** The stored revision of an independent Pool; archival is made from it. */
-  revision?: number;
+  revision: number;
 };
-export type ControlPools = { pools: ControlPool[]; has_more: boolean; next_before: string | null };
+export type ControlPool = NativePoolV2 & {
+  operations: ("llm_request" | "decision")[] | undefined;
+};
+export type ControlPools = {
+  resource_model: "independent";
+  pools: ControlPool[];
+  has_more: boolean;
+  next_before: string | null;
+};
 export type ControlProject = Omit<Api.Project, "commands"> & {
   commands: (Omit<Api.ProjectCommand, "owner" | "status"> & {
     owner: "user" | "decision";

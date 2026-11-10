@@ -376,6 +376,14 @@ export const en = {
   "settings.pools.executorSaveCapabilities": "Save capabilities",
   "settings.pools.executorStale":
     "This Executor changed after it was read. Reload this page of Executors before editing it again.",
+  "settings.pools.executorStaleUnconfirmed":
+    "Whether the last change to this Executor was applied could not be confirmed. Its controls stay disabled until you reload this page of Executors and review its current values.",
+  "settings.pools.executorStaleArchiveUnconfirmed":
+    "Whether this Executor was archived could not be confirmed. Its controls stay disabled until you reload this page of Executors and review its current state.",
+  "settings.pools.executorBusy":
+    "Another Executor change is still in progress. Nothing was sent; try again when it finishes.",
+  "settings.pools.poolBusy":
+    "Another Pool change is still in progress. Nothing was sent; try again when it finishes.",
   "settings.pools.executorReload": "Reload",
   "settings.pools.executorArchive": "Archive",
   "settings.pools.executorArchiveTitle": "Archive this Executor?",
@@ -420,6 +428,29 @@ export const en = {
     "The stored Allocation index disagrees with its Allocation records, so the Executor was not archived. Nothing was changed.",
   "settings.pools.refusal.poolChanged":
     "The Pool changed after it was read. The page of Pools was reloaded; review it, then retry.",
+  "settings.pools.refusal.poolUpdateChanged":
+    "The Pool changed after it was read, so this change was not applied and nothing was changed. Reload this page of Pools and review the current values before trying again.",
+  "settings.pools.poolStale":
+    "This Pool changed or was removed after it was read. Its controls stay disabled until you reload this page of Pools and review its current values.",
+  "settings.pools.poolReload": "Reload",
+  "settings.pools.emptyPage":
+    "No Pools appeared on this page, but this is not the end of the list. Use Next page to continue to older Pools.",
+  "settings.pools.emptyLastPage":
+    "No Pools appear on this page, and no older Pools follow it. Previous can return to earlier pages.",
+  "settings.pools.poolStaleUnconfirmed":
+    "Whether the last change to this Pool was applied could not be confirmed. Its controls stay disabled until you reload this page of Pools and review its current values.",
+  "settings.pools.refusal.poolUpdateUnconfirmed":
+    "The change could not be confirmed, so it may or may not have been applied. It was not retried. Reload this page of Pools to read the current values before changing this Pool again.",
+  "settings.pools.poolStaleArchiveUnconfirmed":
+    "Whether this Pool was archived could not be confirmed. Its controls stay disabled until you reload this page of Pools and review its current state.",
+  "settings.pools.refusal.poolArchiveUnconfirmed":
+    "The archival could not be confirmed, so this Pool may or may not have been archived. Archival was not retried. Reload this page of Pools to read its current state.",
+  "settings.pools.refusal.storageRefused":
+    "Storage refused this change before it was committed, so nothing was changed. Try again later.",
+  "settings.pools.refusal.executorUpdateUnconfirmed":
+    "The change could not be confirmed, so it may or may not have been applied. It was not retried. Reload this page of Executors to read the current values before changing this Executor again.",
+  "settings.pools.refusal.executorArchiveUnconfirmed":
+    "The archival could not be confirmed, so this Executor may or may not have been archived. Archival was not retried. Reload this page of Executors to read its current state.",
   "settings.pools.refusal.poolArchived":
     "This Pool is already archived. The page of Pools was reloaded.",
   "settings.pools.refusal.poolHoldsAllocation":
@@ -1684,6 +1715,12 @@ export const zh: Dictionary = {
   "settings.pools.executorSaveCapabilities": "保存能力",
   "settings.pools.executorStale":
     "此执行器在读取后已发生变化。请先重新加载此页执行器，再继续编辑。",
+  "settings.pools.executorStaleUnconfirmed":
+    "未能确认此执行器的上一次更改是否已生效。在重新加载此页执行器并检查当前值之前，其控件保持禁用。",
+  "settings.pools.executorStaleArchiveUnconfirmed":
+    "未能确认此执行器是否已归档。在重新加载此页执行器并查看其当前状态之前，其控件保持禁用。",
+  "settings.pools.executorBusy": "另一项执行器更改仍在进行中。未发送此请求，请待其完成后再试。",
+  "settings.pools.poolBusy": "另一项执行池更改仍在进行中。未发送此请求，请待其完成后再试。",
   "settings.pools.executorReload": "重新加载",
   "settings.pools.executorArchive": "归档",
   "settings.pools.executorArchiveTitle": "归档此执行器？",
@@ -1723,6 +1760,29 @@ export const zh: Dictionary = {
     "已存储的分配索引与分配记录不一致，因此未归档该执行器。未做任何更改。",
   "settings.pools.refusal.poolChanged":
     "此执行池在读取后已发生变化。已重新加载执行池列表，请检查后重试。",
+  "settings.pools.refusal.poolUpdateChanged":
+    "此执行池在读取后已发生变化，因此未应用此更改，未做任何更改。请重新加载此页执行池，检查当前值后再重试。",
+  "settings.pools.poolStale":
+    "此执行池在读取后已发生变化或已被移除。在重新加载此页执行池并检查当前值之前，其控件保持禁用。",
+  "settings.pools.poolReload": "重新加载",
+  "settings.pools.emptyPage":
+    "此页没有执行池，但列表尚未结束。请使用“下一页”继续查看更早的执行池。",
+  "settings.pools.emptyLastPage":
+    "此页没有执行池，且没有更早的执行池。使用“上一页”可返回之前的页面。",
+  "settings.pools.poolStaleUnconfirmed":
+    "未能确认此执行池的上一次更改是否已生效。在重新加载此页执行池并检查当前值之前，其控件保持禁用。",
+  "settings.pools.refusal.poolUpdateUnconfirmed":
+    "未能确认此更改是否已生效，因此它可能已生效，也可能未生效。未自动重试。请重新加载此页执行池，查看当前值后再修改此执行池。",
+  "settings.pools.poolStaleArchiveUnconfirmed":
+    "未能确认此执行池是否已归档。在重新加载此页执行池并查看其当前状态之前，其控件保持禁用。",
+  "settings.pools.refusal.poolArchiveUnconfirmed":
+    "未能确认归档是否已生效，因此此执行池可能已归档，也可能未归档。未自动重试归档。请重新加载此页执行池，查看其当前状态。",
+  "settings.pools.refusal.storageRefused":
+    "存储在提交前拒绝了此更改，因此未做任何更改。请稍后重试。",
+  "settings.pools.refusal.executorUpdateUnconfirmed":
+    "未能确认此更改是否已生效，因此它可能已生效，也可能未生效。未自动重试。请重新加载此页执行器，查看当前值后再修改此执行器。",
+  "settings.pools.refusal.executorArchiveUnconfirmed":
+    "未能确认归档是否已生效，因此此执行器可能已归档，也可能未归档。未自动重试归档。请重新加载此页执行器，查看其当前状态。",
   "settings.pools.refusal.poolArchived": "此执行池已归档。已重新加载执行池列表。",
   "settings.pools.refusal.poolHoldsAllocation":
     "此执行池仍持有分配，因此未归档，也未释放任何内容。请展开此执行池的分配面板，查看持有它的任务及其阶段；待没有分配占用容量后再归档。",

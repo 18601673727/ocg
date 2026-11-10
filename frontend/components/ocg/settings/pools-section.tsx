@@ -1,7 +1,7 @@
 "use client";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -26,7 +26,9 @@ import { useI18n, type I18nKey } from "../i18n";
 
 const POOL_REFUSALS: Partial<Record<string, I18nKey>> = {
   pool_not_found: "settings.pools.refusal.notFound",
+  pool_revision_conflict: "settings.pools.refusal.poolUpdateChanged",
   invalid_request: "settings.pools.refusal.invalidRequest",
+  storage_refused: "settings.pools.refusal.storageRefused",
 };
 
 const POOL_ARCHIVE_REFUSALS: Partial<Record<string, I18nKey>> = {
@@ -39,7 +41,101 @@ const POOL_ARCHIVE_REFUSALS: Partial<Record<string, I18nKey>> = {
   pool_child_scan_unavailable: "settings.pools.refusal.poolScanUnavailable",
   allocation_index_inconsistent: "settings.pools.refusal.poolIndexInconsistent",
   pool_storage_inconsistent: "settings.pools.refusal.poolStorageInconsistent",
+  storage_refused: "settings.pools.refusal.storageRefused",
 };
+
+/** Why a row is stale. Each row has at most one, in the page's stale map. */
+type RowStale = "changed" | "updateUnconfirmed" | "archiveUnconfirmed";
+
+/** A row's stale reason, and when it was taken on the page's logical clock. */
+type StaleLock = { reason: RowStale; at: number };
+
+/**
+ * The stale locks of one kind of row, with a single owner. Mutation handlers
+ * ask `has`, which reads the owner synchronously, so a handler captured by an
+ * older render still sees every lock taken since; `view` only mirrors the owner
+ * for rendering, and nothing but `publish` writes either. A page read clears
+ * only the locks taken before it was sent: a read in flight when an outcome
+ * became uncertain may predate that outcome.
+ */
+function useStaleRows() {
+  const locks = useRef<ReadonlyMap<string, StaleLock>>(new Map());
+  const clock = useRef(0);
+  const [view, setView] = useState<ReadonlyMap<string, RowStale>>(new Map());
+  const actions = useMemo(() => {
+    const publish = (next: ReadonlyMap<string, StaleLock>) => {
+      locks.current = next;
+      setView(new Map([...next].map(([id, lock]) => [id, lock.reason])));
+    };
+    return {
+      has: (id: string) => locks.current.has(id),
+      mark: (id: string, reason: RowStale) =>
+        publish(new Map(locks.current).set(id, { reason, at: ++clock.current })),
+      /** Stamps a page read as it is sent. */
+      sendRead: () => ++clock.current,
+      /** A sent read succeeded: every lock taken before it was sent is released. */
+      readSucceeded: (sentAt: number) => {
+        const kept = new Map([...locks.current].filter(([, lock]) => lock.at > sentAt));
+        if (kept.size !== locks.current.size) publish(kept);
+      },
+    };
+  }, []);
+  return [view, actions] as const;
+}
+
+const POOL_STALE_TEXT: Record<RowStale, I18nKey> = {
+  changed: "settings.pools.poolStale",
+  updateUnconfirmed: "settings.pools.poolStaleUnconfirmed",
+  archiveUnconfirmed: "settings.pools.poolStaleArchiveUnconfirmed",
+};
+
+const EXECUTOR_STALE_TEXT: Record<RowStale, I18nKey> = {
+  changed: "settings.pools.executorStale",
+  updateUnconfirmed: "settings.pools.executorStaleUnconfirmed",
+  archiveUnconfirmed: "settings.pools.executorStaleArchiveUnconfirmed",
+};
+
+/**
+ * Answers that prove a native mutation was not committed: each was refused
+ * before any write, or never dispatched. Every other failure, including a lost
+ * connection, an unrecognized body and a malformed success answer, may have
+ * committed.
+ */
+const NOT_COMMITTED_CODES: ReadonlySet<string> = new Set([
+  "credential_unavailable",
+  "invalid_request",
+  "database_busy",
+  "shutting_down",
+  "storage_refused",
+  "pool_not_found",
+  "pool_revision_conflict",
+  "pool_archived",
+  "pool_holds_allocation",
+  "pool_has_active_executor",
+  "pool_child_scan_unavailable",
+  "pool_storage_inconsistent",
+  "allocation_index_inconsistent",
+  "invalid_pool",
+  "executor_not_found",
+  "executor_revision_conflict",
+  "executor_archived",
+  "executor_holds_allocation",
+  "invalid_executor",
+]);
+
+/** Whether a failed native mutation may still have committed. */
+function outcomeUnconfirmed(error: unknown): boolean {
+  return !(error instanceof ControlTransportError && NOT_COMMITTED_CODES.has(error.code));
+}
+
+function poolUpdateStale(error: unknown): RowStale | null {
+  if (
+    error instanceof ControlTransportError &&
+    (error.code === "pool_revision_conflict" || error.code === "pool_not_found")
+  )
+    return "changed";
+  return outcomeUnconfirmed(error) ? "updateUnconfirmed" : null;
+}
 
 /** Pool archive refusals after which the page of Pools must be read again. */
 const POOL_ARCHIVE_STALE_CODES: ReadonlySet<string> = new Set([
@@ -47,6 +143,15 @@ const POOL_ARCHIVE_STALE_CODES: ReadonlySet<string> = new Set([
   "pool_not_found",
   "pool_archived",
 ]);
+
+/**
+ * How one archival attempt ended. Only `archived` proves the resource was
+ * archived; `unconfirmed` leaves the row's stale state to explain it.
+ */
+type ArchiveOutcome =
+  | { kind: "archived" }
+  | { kind: "refused"; text: string }
+  | { kind: "unconfirmed" };
 
 const EXECUTOR_REFUSALS: Partial<Record<string, I18nKey>> = {
   executor_not_found: "settings.pools.refusal.executorNotFound",
@@ -56,6 +161,12 @@ const EXECUTOR_REFUSALS: Partial<Record<string, I18nKey>> = {
   executor_archived: "settings.pools.refusal.executorArchived",
   executor_holds_allocation: "settings.pools.refusal.executorHoldsAllocation",
   allocation_index_inconsistent: "settings.pools.refusal.executorIndexInconsistent",
+  storage_refused: "settings.pools.refusal.storageRefused",
+};
+
+/** Create refusals keep their detail, except storage refusals, which are resource-neutral. */
+const NATIVE_CREATE_REFUSALS: Partial<Record<string, I18nKey>> = {
+  storage_refused: "settings.pools.refusal.storageRefused",
 };
 
 /** Archive refusals after which the Executor must be read again before anything else. */
@@ -64,6 +175,16 @@ const ARCHIVE_STALE_CODES: ReadonlySet<string> = new Set([
   "executor_not_found",
   "executor_archived",
 ]);
+
+/** Why an Executor update left it stale, or null when it was refused without a change. */
+function executorUpdateStale(error: unknown): RowStale | null {
+  if (
+    isExecutorConflict(error) ||
+    (error instanceof ControlTransportError && error.code === "executor_not_found")
+  )
+    return "changed";
+  return outcomeUnconfirmed(error) ? "updateUnconfirmed" : null;
+}
 
 const ALLOCATION_REFUSALS: Partial<Record<string, I18nKey>> = {
   pool_not_found: "settings.pools.refusal.notFound",
@@ -148,11 +269,11 @@ function ExecutorRow({
   pool: ControlPool | undefined;
   /** An Executor update is pending; no other may be submitted. */
   busy: boolean;
-  /** The Executor changed since it was read; a fresh read is needed first. */
-  stale: boolean;
+  /** Why the Executor is stale: its controls stay disabled until a page read succeeds. */
+  stale: RowStale | undefined;
   onUpdate: (executor: NativeExecutor, change: NativeExecutorChange) => Promise<boolean>;
-  /** Archives the Executor; the refusal text, or null when it was archived. */
-  onArchive: (executor: NativeExecutor) => Promise<string | null>;
+  /** Archives the Executor, from the revision read. */
+  onArchive: (executor: NativeExecutor) => Promise<ArchiveOutcome>;
   onReload: () => void;
 }) {
   const { t } = useI18n();
@@ -161,7 +282,7 @@ function ExecutorRow({
   const [archiveRefusal, setArchiveRefusal] = useState<string | null>(null);
   const [name, setName] = useState<string | null>(null);
   const [draft, setDraft] = useState<ReadonlySet<string> | null>(null);
-  const disabled = busy || stale;
+  const disabled = busy || stale !== undefined;
   const current = new Set(executor.capabilities.map(capabilityKey));
   const state = t(executor.enabled ? "settings.pools.enabled" : "settings.pools.disabled");
   const nameValid = name !== null && name.trim() !== "" && name.trim() !== executor.name;
@@ -272,10 +393,11 @@ function ExecutorRow({
                 onClick={() => {
                   setArchiving(true);
                   setArchiveRefusal(null);
-                  void onArchive(executor).then((refusal) => {
+                  void onArchive(executor).then((outcome) => {
                     setArchiving(false);
-                    if (refusal === null) return;
-                    setArchiveRefusal(refusal);
+                    if (outcome.kind === "archived") return;
+                    // An unconfirmed outcome is stated by the row's stale alert alone.
+                    setArchiveRefusal(outcome.kind === "refused" ? outcome.text : null);
                     setConfirmingArchive(false);
                   });
                 }}
@@ -309,8 +431,8 @@ function ExecutorRow({
         </div>
       ) : null}
       {stale ? (
-        <div className="flex flex-wrap items-center gap-2 text-xs text-destructive">
-          <span>{t("settings.pools.executorStale")}</span>
+        <div role="alert" className="flex flex-wrap items-center gap-2 text-xs">
+          <p className="text-destructive">{t(EXECUTOR_STALE_TEXT[stale])}</p>
           <Button type="button" variant="outline" size="xs" onClick={onReload}>
             {t("settings.pools.executorReload")}
           </Button>
@@ -390,23 +512,30 @@ function PoolRow({
   onUpdate,
   onArchive,
   disabled,
+  stale,
+  reloading,
+  onReload,
 }: {
   pool: ControlPool;
-  onUpdate: (poolId: string, update: ControlPoolUpdate) => Promise<void>;
-  /** Archives the Pool; the refusal text, or null when it was archived. Absent when archival is not offered. */
-  onArchive: ((pool: ControlPool) => Promise<string | null>) | undefined;
+  onUpdate: (pool: ControlPool, update: ControlPoolUpdate) => Promise<void>;
+  /** Archives the Pool. Absent when archival is not offered. */
+  onArchive: ((pool: ControlPool) => Promise<ArchiveOutcome>) | undefined;
   disabled: boolean;
+  stale: RowStale | undefined;
+  reloading: boolean;
+  onReload: () => void;
 }) {
   const { t } = useI18n();
-  const [limit, setLimit] = useState(String(pool.concurrency_limit));
+  const [limit, setLimit] = useState(String(pool.capacity));
   const [confirmingArchive, setConfirmingArchive] = useState(false);
   const [archiving, setArchiving] = useState(false);
   const [archiveRefusal, setArchiveRefusal] = useState<string | null>(null);
+  const locked = disabled || stale !== undefined;
 
   const parsed = Number(limit.trim());
   const isIntegerGte1 = Number.isSafeInteger(parsed) && parsed >= 1 && /^\d+$/.test(limit.trim());
-  const isDifferent = isIntegerGte1 && parsed !== pool.concurrency_limit;
-  const saveDisabled = disabled || !isIntegerGte1 || !isDifferent;
+  const isDifferent = isIntegerGte1 && parsed !== pool.capacity;
+  const saveDisabled = locked || !isIntegerGte1 || !isDifferent;
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 py-3">
@@ -464,10 +593,10 @@ function PoolRow({
             onKeyDown={(e) => {
               if (e.key === "Enter" && !saveDisabled) {
                 e.preventDefault();
-                void onUpdate(pool.id, { concurrency_limit: parsed });
+                void onUpdate(pool, { concurrency_limit: parsed });
               }
             }}
-            disabled={disabled}
+            disabled={locked}
             className="h-8 w-20 text-xs"
           />
           <Button
@@ -475,7 +604,7 @@ function PoolRow({
             variant="outline"
             size="xs"
             disabled={saveDisabled}
-            onClick={() => void onUpdate(pool.id, { concurrency_limit: parsed })}
+            onClick={() => void onUpdate(pool, { concurrency_limit: parsed })}
           >
             {t("settings.pools.saveLimit")}
           </Button>
@@ -484,8 +613,8 @@ function PoolRow({
           type="button"
           variant="outline"
           size="xs"
-          disabled={disabled}
-          onClick={() => void onUpdate(pool.id, { enabled: !pool.enabled })}
+          disabled={locked}
+          onClick={() => void onUpdate(pool, { enabled: !pool.enabled })}
         >
           {t(pool.enabled ? "settings.pools.disable" : "settings.pools.enable")}
         </Button>
@@ -494,7 +623,7 @@ function PoolRow({
             type="button"
             variant="outline"
             size="xs"
-            disabled={disabled || archiving}
+            disabled={locked || archiving}
             onClick={() => {
               setArchiveRefusal(null);
               setConfirmingArchive(!confirmingArchive);
@@ -504,6 +633,14 @@ function PoolRow({
           </Button>
         ) : null}
       </div>
+      {stale ? (
+        <div role="alert" className="flex w-full flex-wrap items-center gap-2 text-xs">
+          <p className="text-destructive">{t(POOL_STALE_TEXT[stale])}</p>
+          <Button type="button" variant="outline" size="xs" disabled={reloading} onClick={onReload}>
+            {t("settings.pools.poolReload")}
+          </Button>
+        </div>
+      ) : null}
       {onArchive && (confirmingArchive || archiveRefusal) ? (
         <div
           role="alertdialog"
@@ -534,14 +671,15 @@ function PoolRow({
                 type="button"
                 variant="destructive"
                 size="xs"
-                disabled={disabled || archiving}
+                disabled={locked || archiving}
                 onClick={() => {
                   setArchiving(true);
                   setArchiveRefusal(null);
-                  void onArchive(pool).then((refusal) => {
+                  void onArchive(pool).then((outcome) => {
                     setArchiving(false);
-                    if (refusal === null) return;
-                    setArchiveRefusal(refusal);
+                    if (outcome.kind === "archived") return;
+                    // An unconfirmed outcome is stated by the row's stale alert alone.
+                    setArchiveRefusal(outcome.kind === "refused" ? outcome.text : null);
                     setConfirmingArchive(false);
                   });
                 }}
@@ -653,7 +791,7 @@ function PoolAllocations({
   }
 
   const occupancy = snapshot?.occupancy;
-  const capacity = snapshot?.capacity ?? pool.concurrency_limit;
+  const capacity = snapshot?.capacity ?? pool.capacity;
   const indicator = !snapshot
     ? t("settings.pools.capacityOnly", { capacity })
     : occupancy?.available
@@ -718,10 +856,10 @@ function PoolAllocations({
           {overCapacity ? (
             <p className="text-muted-foreground">{t("settings.pools.overCapacity")}</p>
           ) : null}
-          {snapshot && snapshot.capacity !== pool.concurrency_limit ? (
+          {snapshot && snapshot.capacity !== pool.capacity ? (
             <p className="text-muted-foreground">
               {t("settings.pools.capacityChanged", {
-                capacity: pool.concurrency_limit,
+                capacity: pool.capacity,
               })}
             </p>
           ) : null}
@@ -825,7 +963,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
   } | null>(null);
   const [creating, setCreating] = useState(false);
   const [updatingExecutorId, setUpdatingExecutorId] = useState<string | null>(null);
-  const [staleExecutors, setStaleExecutors] = useState<ReadonlySet<string>>(new Set());
+  const [staleExecutors, executorStale] = useStaleRows();
   const executorUpdating = useRef(false);
   const executorRequest = useRef<AbortController | null>(null);
   const [failedPage, setFailedPage] = useState<{
@@ -833,16 +971,19 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     history: (string | undefined)[];
   } | null>(null);
   const request = useRef<AbortController | null>(null);
+  const [stalePools, poolStale] = useStaleRows();
+  const poolMutating = useRef(false);
+  const archivedPools = useRef(new Set<string>());
 
   const loadPools = useCallback(
     async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
+      const sentAt = poolStale.sendRead();
       try {
         const page = await client.readPools({ before: cursor, signal });
         if (!signal.aborted) {
-          setNative(
-            (page as typeof page & { resource_model?: string }).resource_model === "independent",
-          );
+          setNative(page.resource_model === "independent");
           setPools(page.pools);
+          poolStale.readSucceeded(sentAt);
           setBefore(cursor);
           setPrevious(history);
           setNextBefore(page.next_before);
@@ -858,7 +999,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
         if (!signal.aborted) setLoading(false);
       }
     },
-    [client, t],
+    [client, t, poolStale],
   );
 
   useEffect(() => {
@@ -875,6 +1016,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
 
   const loadExecutors = useCallback(
     async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
+      const sentAt = executorStale.sendRead();
       try {
         const page = await client.readNativeExecutors({
           before: cursor,
@@ -882,7 +1024,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
         });
         if (!signal.aborted) {
           setExecutors(page.executors);
-          setStaleExecutors(new Set());
+          executorStale.readSucceeded(sentAt);
           setExecutorBefore(cursor);
           setExecutorPrevious(history);
           setExecutorNext(page.next_before);
@@ -898,7 +1040,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
         if (!signal.aborted) setExecutorLoading(false);
       }
     },
-    [client, t],
+    [client, t, executorStale],
   );
 
   useEffect(() => {
@@ -934,7 +1076,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
       setPoolCapacity("1");
       navigate(undefined, []);
     } catch (error) {
-      setActionError(describeError(error, t));
+      setActionError(refusalText(t, error, NATIVE_CREATE_REFUSALS));
     } finally {
       setCreating(false);
     }
@@ -958,32 +1100,37 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
       setExecutorName("");
       navigateExecutors(undefined, []);
     } catch (error) {
-      setActionError(describeError(error, t));
+      setActionError(refusalText(t, error, NATIVE_CREATE_REFUSALS));
     } finally {
       setCreating(false);
     }
   }
 
-  /** Applies one change from the revision read; true when it was applied. */
+  /**
+   * Applies one change from the revision read; true when it was applied. A
+   * refusal keeps its message. An outcome that cannot be established marks the
+   * row until a page read succeeds; it is never retried.
+   */
   async function handleExecutorUpdate(
     executor: NativeExecutor,
     change: NativeExecutorChange,
   ): Promise<boolean> {
-    if (executorUpdating.current) return false;
+    if (executorUpdating.current || executorStale.has(executor.id)) return false;
     executorUpdating.current = true;
     setActionError(null);
     setUpdatingExecutorId(executor.id);
     try {
-      const updated = await client.updateNativeExecutor(executor.id, executor.revision, change);
+      const updated = await client.updateNativeExecutor(executor, change);
       setExecutors((previous) => previous.map((item) => (item.id === updated.id ? updated : item)));
       return true;
     } catch (error) {
-      if (
-        isExecutorConflict(error) ||
-        (error instanceof ControlTransportError && error.code === "executor_not_found")
-      )
-        setStaleExecutors((previous) => new Set(previous).add(executor.id));
-      setActionError(refusalText(t, error, EXECUTOR_REFUSALS));
+      const stale = executorUpdateStale(error);
+      if (stale) executorStale.mark(executor.id, stale);
+      setActionError(
+        stale === "updateUnconfirmed"
+          ? t("settings.pools.refusal.executorUpdateUnconfirmed")
+          : refusalText(t, error, EXECUTOR_REFUSALS),
+      );
       return false;
     } finally {
       executorUpdating.current = false;
@@ -992,22 +1139,34 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
   }
 
   /**
-   * Archives one Executor from the revision read. The refusal text, or null
-   * when it was archived, after which the current page is read again.
+   * Archives one Executor from the revision read, once. A confirmed archival
+   * removes its row and reads the page again. A refusal keeps its message. An
+   * outcome that cannot be established marks the row until a page read
+   * succeeds; it is never retried.
    */
-  async function handleExecutorArchive(executor: NativeExecutor): Promise<string | null> {
-    if (executorUpdating.current) return t("settings.pools.executorStale");
+  async function handleExecutorArchive(executor: NativeExecutor): Promise<ArchiveOutcome> {
+    // Nothing is sent for a stale row; its earlier outcome still stands.
+    if (executorStale.has(executor.id)) return { kind: "unconfirmed" };
+    if (executorUpdating.current)
+      return { kind: "refused", text: t("settings.pools.executorBusy") };
     executorUpdating.current = true;
     setActionError(null);
     setUpdatingExecutorId(executor.id);
     try {
       await client.archiveNativeExecutor(executor.id, executor.revision);
+      // Removed now, so a failed reload cannot leave the archived Executor's row enabled.
+      setExecutors((current) => current.filter((item) => item.id !== executor.id));
       navigateExecutors(executorBefore, executorPrevious);
-      return null;
+      return { kind: "archived" };
     } catch (error) {
+      if (outcomeUnconfirmed(error)) {
+        executorStale.mark(executor.id, "archiveUnconfirmed");
+        setActionError(t("settings.pools.refusal.executorArchiveUnconfirmed"));
+        return { kind: "unconfirmed" };
+      }
       if (error instanceof ControlTransportError && ARCHIVE_STALE_CODES.has(error.code))
-        setStaleExecutors((previous) => new Set(previous).add(executor.id));
-      return refusalText(t, error, EXECUTOR_REFUSALS);
+        executorStale.mark(executor.id, "changed");
+      return { kind: "refused", text: refusalText(t, error, EXECUTOR_REFUSALS) };
     } finally {
       executorUpdating.current = false;
       setUpdatingExecutorId(null);
@@ -1023,41 +1182,70 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
   }
 
   /**
-   * Archives one Pool from the revision read. The refusal text, or null when
-   * it was archived, after which the current page of Pools is read again.
+   * Archives one Pool from the revision read, once. A confirmed archival reads
+   * the page again. A refusal keeps its message. An outcome that cannot be
+   * established marks the row stale until a page read succeeds; it is never
+   * retried.
    */
-  async function handlePoolArchive(pool: ControlPool): Promise<string | null> {
-    if (pool.revision === undefined) return t("settings.pools.refusal.poolChanged");
+  async function handlePoolArchive(pool: ControlPool): Promise<ArchiveOutcome> {
+    // Nothing is sent for a stale row; its earlier outcome still stands.
+    if (poolStale.has(pool.id)) return { kind: "unconfirmed" };
+    if (archivedPools.current.has(pool.id)) return { kind: "archived" };
+    if (poolMutating.current) return { kind: "refused", text: t("settings.pools.poolBusy") };
+    poolMutating.current = true;
     setActionError(null);
     setUpdatingPoolId(pool.id);
     try {
       await client.archiveNativePool(pool.id, pool.revision);
+      archivedPools.current.add(pool.id);
+      // Removed now, so a failed reload cannot leave the archived Pool's row enabled.
+      setPools((current) => current.filter((item) => item.id !== pool.id));
       navigate(before, previous);
-      return null;
+      return { kind: "archived" };
     } catch (error) {
+      if (outcomeUnconfirmed(error)) {
+        poolStale.mark(pool.id, "archiveUnconfirmed");
+        setActionError(t("settings.pools.refusal.poolArchiveUnconfirmed"));
+        return { kind: "unconfirmed" };
+      }
       const text = refusalText(t, error, POOL_ARCHIVE_REFUSALS);
       if (error instanceof ControlTransportError && POOL_ARCHIVE_STALE_CODES.has(error.code)) {
+        // The row's revision is out of date, so it stays locked until a page read succeeds.
+        poolStale.mark(pool.id, "changed");
         navigate(before, previous);
         setActionError(text);
       }
-      return text;
+      return { kind: "refused", text };
     } finally {
+      poolMutating.current = false;
       setUpdatingPoolId(null);
     }
   }
 
-  async function handleUpdate(poolId: string, update: ControlPoolUpdate) {
+  async function handleUpdate(pool: ControlPool, update: ControlPoolUpdate) {
+    if (poolStale.has(pool.id) || archivedPools.current.has(pool.id) || poolMutating.current)
+      return;
+    poolMutating.current = true;
     setActionError(null);
-    setUpdatingPoolId(poolId);
+    setUpdatingPoolId(pool.id);
     try {
-      const updated = await client.updatePool(poolId, update);
+      const updated = await client.updatePool(pool.id, pool.revision, update);
       setPools((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
     } catch (err) {
-      setActionError(refusalText(t, err, POOL_REFUSALS));
+      const stale = poolUpdateStale(err);
+      if (stale) poolStale.mark(pool.id, stale);
+      setActionError(
+        stale === "updateUnconfirmed"
+          ? t("settings.pools.refusal.poolUpdateUnconfirmed")
+          : refusalText(t, err, POOL_REFUSALS),
+      );
     } finally {
+      poolMutating.current = false;
       setUpdatingPoolId(null);
     }
   }
+
+  const emptyPage = pools.length === 0 && !loading && !loadError;
 
   return (
     <Section
@@ -1118,22 +1306,35 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
 
       <TooltipProvider delay={100}>
         <div className="divide-y divide-border/70 py-2">
-          {pools.length === 0 && nextBefore === null && !loading && !loadError ? (
+          {emptyPage && before === undefined && nextBefore === null ? (
             <p className="py-2 text-sm text-muted-foreground">{t("settings.pools.empty")}</p>
-          ) : (
-            pools.map((pool) => (
-              <div key={pool.id}>
-                <PoolRow
-                  key={`${pool.id}-${pool.concurrency_limit}`}
-                  pool={pool}
-                  onUpdate={handleUpdate}
-                  onArchive={native && pool.revision !== undefined ? handlePoolArchive : undefined}
-                  disabled={updatingPoolId === pool.id}
-                />
-                {native ? <PoolAllocations client={client} pool={pool} /> : null}
-              </div>
-            ))
-          )}
+          ) : null}
+          {emptyPage && nextBefore !== null ? (
+            <p className="py-2 text-sm text-muted-foreground">{t("settings.pools.emptyPage")}</p>
+          ) : null}
+          {emptyPage && before !== undefined && nextBefore === null ? (
+            <p className="py-2 text-sm text-muted-foreground">
+              {t("settings.pools.emptyLastPage")}
+            </p>
+          ) : null}
+          {pools.map((pool) => (
+            <div key={pool.id}>
+              <PoolRow
+                key={`${pool.id}-${pool.revision}`}
+                pool={pool}
+                onUpdate={handleUpdate}
+                onArchive={native ? handlePoolArchive : undefined}
+                disabled={updatingPoolId !== null}
+                stale={stalePools.get(pool.id)}
+                reloading={loading}
+                onReload={() => {
+                  setActionError(null);
+                  navigate(before, previous);
+                }}
+              />
+              {native ? <PoolAllocations client={client} pool={pool} /> : null}
+            </div>
+          ))}
         </div>
       </TooltipProvider>
 
@@ -1187,10 +1388,13 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
                 executor={executor}
                 pool={pools.find((pool) => pool.id === executor.pool)}
                 busy={updatingExecutorId !== null}
-                stale={staleExecutors.has(executor.id)}
+                stale={staleExecutors.get(executor.id)}
                 onUpdate={handleExecutorUpdate}
                 onArchive={handleExecutorArchive}
-                onReload={() => navigateExecutors(executorBefore, executorPrevious)}
+                onReload={() => {
+                  setActionError(null);
+                  navigateExecutors(executorBefore, executorPrevious);
+                }}
               />
             ))}
             {!executors.length && !executorLoading && !executorError ? (

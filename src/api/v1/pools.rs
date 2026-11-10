@@ -31,14 +31,15 @@ pub(super) const POOL_API_VERSION: u32 = 2;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolUpdateInput {
-    #[serde(default)]
-    concurrency_limit: Option<NonZeroU32>,
-    #[serde(default)]
-    enabled: Option<bool>,
+    expected_revision: u32,
+    #[serde(default, deserialize_with = "profiles::optional_value")]
+    concurrency_limit: Option<Option<NonZeroU32>>,
+    #[serde(default, deserialize_with = "profiles::optional_value")]
+    enabled: Option<Option<bool>>,
     /// Whether this Pool also offers typed decision work. Absent leaves the
     /// capability as it is.
-    #[serde(default)]
-    decision: Option<bool>,
+    #[serde(default, deserialize_with = "profiles::optional_value")]
+    decision: Option<Option<bool>>,
 }
 
 pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
@@ -597,16 +598,19 @@ pub(super) async fn update(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let wire: PoolUpdateInput = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
-    {
-        if wire.decision.is_some() || wire.concurrency_limit.is_some() == wire.enabled.is_some() {
-            return Err(INVALID_REQUEST);
-        }
-        let pool = database
-            .update_native_pool(id, wire.concurrency_limit, wire.enabled)
-            .await
-            .map_err(refusal)?;
-        Ok(Reply::ok(envelope(
-            serde_json::json!({"resource_model":"independent","pool":native_pool_json(&pool)}),
-        )))
+    if wire.decision.is_some() {
+        return Err(INVALID_REQUEST);
     }
+    let (capacity, enabled) = match (wire.concurrency_limit, wire.enabled) {
+        (Some(Some(capacity)), None) => (Some(capacity), None),
+        (None, Some(Some(enabled))) => (None, Some(enabled)),
+        _ => return Err(INVALID_REQUEST),
+    };
+    let pool = database
+        .update_native_pool(id, wire.expected_revision, capacity, enabled)
+        .await
+        .map_err(refusal)?;
+    Ok(Reply::ok(envelope(
+        serde_json::json!({"resource_model":"independent","pool":native_pool_json(&pool)}),
+    )))
 }

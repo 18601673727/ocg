@@ -1,4 +1,4 @@
-import type { ControlProjects, ControlPools, ControlChildren } from "../contracts";
+import type { ControlProjects, ControlPool, ControlPools, ControlChildren } from "../contracts";
 import type * as Api from "@/components/ocg/contracts/api";
 import {
   projectJob,
@@ -105,6 +105,18 @@ function validateNativeExecutor(
     )
   )
     throw new ContractError("executor.capabilities", "supported Executor capabilities");
+}
+
+/** Whether two Executor capability lists name the same capabilities, in any order. */
+function sameCapabilities(
+  left: NativeExecutor["capabilities"],
+  right: NativeExecutor["capabilities"],
+): boolean {
+  const keys = (list: NativeExecutor["capabilities"]) =>
+    list.map((item) => `${item.operation}:${item.protocol ?? ""}`).sort();
+  const first = keys(left);
+  const second = keys(right);
+  return first.length === second.length && first.every((key, index) => key === second[index]);
 }
 
 /** The phases of an Allocation that holds capacity. Released Allocations are never listed. */
@@ -418,7 +430,7 @@ function identity(value: string, path: string): string {
   return value;
 }
 
-function nativePool(value: unknown): ControlPools["pools"][number] {
+function nativePool(value: unknown): ControlPool {
   if (typeof value !== "object" || value === null) throw new ContractError("pool", "a native Pool");
   const pool = value as Record<string, unknown>;
   if (
@@ -440,10 +452,11 @@ function nativePool(value: unknown): ControlPools["pools"][number] {
   return {
     id: identity(pool.id, "pool"),
     name: pool.name,
+    capacity: pool.capacity,
     enabled: pool.enabled,
-    concurrency_limit: pool.capacity,
-    operations: undefined,
+    archived: pool.archived,
     revision: pool.revision,
+    operations: undefined,
   };
 }
 
@@ -2321,20 +2334,30 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).project as ControlProject;
     },
 
-    async readPools(settings: { before?: string; signal?: AbortSignal } = {}) {
+    async readPools(
+      settings: { before?: string; signal?: AbortSignal } = {},
+    ): Promise<ControlPools> {
       const query = settings.before ? `?before=${encodeURIComponent(settings.before)}` : "";
       const answer = await send("GET", `/api/v2/pools${query}`, {
         signal: settings.signal,
       });
-      const page = answer.input as Api.Envelope<ControlPools>;
+      const page = answer.input as {
+        api_version?: unknown;
+        resource_model?: unknown;
+        pools?: unknown;
+        has_more?: unknown;
+        next_before?: unknown;
+      };
       if (
         page.api_version !== 2 ||
+        page.resource_model !== "independent" ||
         !Array.isArray(page.pools) ||
         page.pools.length > 20 ||
         typeof page.has_more !== "boolean"
       ) {
         throw new ContractError("pools", "a version 2 Pool page");
       }
+      let nextBefore: string | null = null;
       if (page.has_more) {
         if (typeof page.next_before !== "string") {
           throw new ContractError("next_before", "an advancing Pool cursor");
@@ -2343,17 +2366,33 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         if (settings.before !== undefined && page.next_before >= settings.before) {
           throw new ContractError("next_before", "an advancing Pool cursor");
         }
+        nextBefore = page.next_before;
       } else if (page.next_before !== null) {
         throw new ContractError("next_before", "a terminal Pool cursor");
       }
-      return (answer.input as { resource_model?: string }).resource_model === "independent"
-        ? { ...page, pools: page.pools.map(nativePool) }
-        : page;
+      return {
+        resource_model: "independent",
+        pools: page.pools.map(nativePool),
+        has_more: page.has_more,
+        next_before: nextBefore,
+      };
     },
 
     /** Updates a Pool's concurrency limit or enabled state. */
-    async updatePool(poolId: string, body: ControlPoolUpdate, signal?: AbortSignal) {
+    async updatePool(
+      poolId: string,
+      expectedRevision: number,
+      body: ControlPoolUpdate,
+      signal?: AbortSignal,
+    ) {
       identity(poolId, "pool");
+      if (
+        !Number.isSafeInteger(expectedRevision) ||
+        expectedRevision < 1 ||
+        expectedRevision > 4294967295
+      ) {
+        throw new ContractError("expected_revision", "an integer from 1 to 4294967295");
+      }
       if (body.concurrency_limit !== undefined) {
         if (
           !Number.isSafeInteger(body.concurrency_limit) ||
@@ -2364,16 +2403,28 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         }
       }
       const answer = await send("POST", `/api/v1/pools/${poolId}`, {
-        body,
+        body: { expected_revision: expectedRevision, ...body },
         sign: true,
         signal,
       });
-      const response = answer.input as Api.PoolAnswer & {
-        resource_model?: string;
+      const response = answer.input as {
+        api_version?: unknown;
+        resource_model?: unknown;
+        pool?: unknown;
       };
-      return response.resource_model === "independent"
-        ? nativePool(response.pool)
-        : (response.pool as ControlPools["pools"][number]);
+      if (response.api_version !== 1 || response.resource_model !== "independent") {
+        throw new ContractError("pool", "a native Pool response");
+      }
+      const pool = nativePool(response.pool);
+      if (
+        pool.id !== poolId ||
+        pool.revision !== expectedRevision + 1 ||
+        (body.concurrency_limit !== undefined && pool.capacity !== body.concurrency_limit) ||
+        (body.enabled !== undefined && pool.enabled !== body.enabled)
+      ) {
+        throw new ContractError("pool", "the updated Pool");
+      }
+      return pool;
     },
 
     async createNativePool(id: string, name: string, capacity: number) {
@@ -2570,18 +2621,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.executor;
     },
 
-    /** Applies one change to an Executor, made from `expectedRevision`. */
+    /**
+     * Applies one change to an Executor, made from the revision read `executor`.
+     * The answer must be that Executor one revision later, with the requested
+     * field applied and every other field as it was read.
+     */
     async updateNativeExecutor(
-      id: string,
-      expectedRevision: number,
+      executor: NativeExecutor,
       change: NativeExecutorChange,
       signal?: AbortSignal,
     ) {
-      identity(id, "executor");
-      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+      identity(executor.id, "executor");
+      if (!Number.isSafeInteger(executor.revision) || executor.revision < 1)
         throw new ContractError("expected_revision", "a positive integer");
-      const result = await send("POST", `/api/v1/executors/${id}`, {
-        body: { expected_revision: expectedRevision, ...change },
+      const result = await send("POST", `/api/v1/executors/${executor.id}`, {
+        body: { expected_revision: executor.revision, ...change },
         sign: true,
         signal,
       });
@@ -2589,10 +2643,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         api_version?: number;
         executor?: NativeExecutor;
       };
-      if (answer.api_version !== 1 || answer.executor?.id !== id)
+      const updated = answer.executor;
+      if (answer.api_version !== 1 || updated?.id !== executor.id)
         throw new ContractError("executor", "the updated Executor");
-      validateNativeExecutor(answer.executor);
-      return answer.executor;
+      validateNativeExecutor(updated);
+      if (
+        updated.pool !== executor.pool ||
+        updated.revision !== executor.revision + 1 ||
+        updated.enabled !== (change.enabled ?? executor.enabled) ||
+        updated.name !== (change.name ?? executor.name) ||
+        !sameCapabilities(updated.capabilities, change.capabilities ?? executor.capabilities)
+      )
+        throw new ContractError("executor", "the updated Executor");
+      return updated;
     },
 
     /**

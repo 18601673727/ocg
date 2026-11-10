@@ -2010,6 +2010,7 @@ impl Batch {
     pub(crate) fn update_native_pool(
         &mut self,
         id: ExecutionPoolId,
+        expected_revision: u32,
         capacity: Option<std::num::NonZeroU32>,
         enabled: Option<bool>,
     ) -> Result<crate::db::entities::AllocationPool, BatchError> {
@@ -2023,6 +2024,9 @@ impl Batch {
         };
         if pool.archived {
             return self.reject(Violation::NotFound(RecordRef::ExecutionPool(id)));
+        }
+        if pool.revision != expected_revision {
+            return self.reject(Violation::InvalidValue("pool", "revision conflict"));
         }
         pool.revision = pool
             .revision

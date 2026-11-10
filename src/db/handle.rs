@@ -3597,16 +3597,19 @@ impl DatabaseHandle {
     pub(crate) async fn update_native_pool(
         &self,
         id: ExecutionPoolId,
+        expected_revision: u32,
         capacity: Option<std::num::NonZeroU32>,
         enabled: Option<bool>,
     ) -> Result<entities::AllocationPool, DatabaseError> {
         self.submit(|reply| {
             Command::new(
-                (id, capacity, enabled),
+                (id, expected_revision, capacity, enabled),
                 reply,
                 |_| 4096,
                 OperationKind::SetExecutionPoolProfile,
-                |(id, capacity, enabled), batch| batch.update_native_pool(id, capacity, enabled),
+                |(id, expected_revision, capacity, enabled), batch| {
+                    batch.update_native_pool(id, expected_revision, capacity, enabled)
+                },
             )
         })
         .await
