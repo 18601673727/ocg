@@ -42,6 +42,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "reconcile-reserved" {
             return reconcile_reserved::run(arguments.collect());
         }
+        if command == "reconcile-held" {
+            return reconcile_reserved::run_held(arguments.collect());
+        }
         if command == "external-trial" {
             return external_trial::run(arguments.collect());
         }
@@ -120,8 +123,10 @@ fn usage() -> &'static str {
           refused unless the manual_external_execution control is enabled in the build)\n\
        inspect-held <data-directory>            (read-only)\n\
        verify <data-directory> [--pages]        (offline integrity check; never writes the original)\n\
-       reconcile-reserved <data-directory> <job> --confirm-no-start\n\
-         (offline: ends one crash-surviving Reserved Allocation that never started; works on a copy, keeps a rollback artifact)\n\
+       reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\
+         (offline: ends one crash-surviving Reserved Allocation that never started; durably finalizes publication evidence)\n\
+       reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
+         (offline: releases only eligible stopped literal-loopback Allocations; preserves Unknown outcomes and evidence; finalizes without reapplying)\n\
        migrate [--check | --to <directory>]\n\
          (offline: migrates one stopped format 22 database to format 23 on a private copy; the source is never written)\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\

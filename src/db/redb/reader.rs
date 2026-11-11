@@ -215,18 +215,214 @@ pub(crate) fn verify_offline(
     directory: &std::path::Path,
     pages: bool,
 ) -> Result<serde_json::Value, StorageError> {
+    verify_offline_with_ownership(directory, pages, false)
+}
+
+/// Verifies the exact published file while the caller retains the exclusive
+/// publication lock. This is deliberately separate from the public offline
+/// verifier: it never acquires, releases, or bypasses that verifier's lock.
+/// Both the named database and lock must still identify the open files supplied
+/// by the publication path, and all redb access uses a private copy of that
+/// exact open database file rather than reopening its pathname.
+#[cfg(unix)]
+pub(crate) fn verify_reserved_publication(
+    directory: &std::path::Path,
+    database: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<serde_json::Value, StorageError> {
+    verify_publication_with_exclusive_lock(
+        directory,
+        database,
+        exclusive_lock,
+        expected_device,
+        expected_inode,
+        false,
+    )
+}
+
+/// Held-recovery variant of [`verify_reserved_publication`]. There is no
+/// general-purpose lock-bypass entry point: both publication operations must
+/// present their open database and their already-held exclusive lock.
+#[cfg(unix)]
+pub(crate) fn verify_recovered_publication(
+    directory: &std::path::Path,
+    database: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<serde_json::Value, StorageError> {
+    verify_publication_with_exclusive_lock(
+        directory,
+        database,
+        exclusive_lock,
+        expected_device,
+        expected_inode,
+        true,
+    )
+}
+
+#[cfg(unix)]
+fn verify_publication_with_exclusive_lock(
+    directory: &std::path::Path,
+    database_file: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+    recovered: bool,
+) -> Result<serde_json::Value, StorageError> {
+    use serde_json::json;
+    use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    fn io(error: std::io::Error) -> StorageError {
+        StorageError {
+            kind: StorageErrorKind::Io(error.kind()),
+            os_error: error.raw_os_error(),
+            detail: error.to_string(),
+        }
+    }
+    fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    fn open_named(path: &std::path::Path) -> Result<std::fs::File, StorageError> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).custom_flags(libc::O_NOFOLLOW);
+        options.open(path).map_err(io)
+    }
+
+    let directory = std::fs::canonicalize(directory).map_err(io)?;
+    let named_lock =
+        open_named(&directory.join(crate::system::data_directory::DATABASE_LOCK_FILE))?;
+    if !same_file(
+        &named_lock.metadata().map_err(io)?,
+        &exclusive_lock.metadata().map_err(io)?,
+    ) {
+        return Err(StorageError::corrupted(
+            "the publication lock pathname no longer identifies the held lock",
+        ));
+    }
+    match named_lock.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Ok(()) => {
+            return Err(StorageError::corrupted(
+                "the publication lock is not exclusively held",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(io(error)),
+    }
+    let named_database = open_named(&directory.join(DATABASE_FILE_NAME))?;
+    let named_before = named_database.metadata().map_err(io)?;
+    let held_before = database_file.metadata().map_err(io)?;
+    if !named_before.is_file()
+        || named_before.nlink() != 1
+        || named_before.dev() != expected_device
+        || named_before.ino() != expected_inode
+        || !same_file(&named_before, &held_before)
+    {
+        return Err(StorageError::corrupted(
+            "the published database pathname no longer identifies the intended file",
+        ));
+    }
+
+    let scratch = std::env::temp_dir().join(format!(".ocg-publish-{}", uuid::Uuid::now_v7()));
+    let mut create = std::fs::OpenOptions::new();
+    create.read(true).write(true).create_new(true);
+    let mut copy = crate::system::data_directory::private_file(&mut create)
+        .open(&scratch)
+        .map_err(io)?;
+    std::fs::remove_file(&scratch).map_err(io)?;
+    let mut original = database_file.try_clone().map_err(io)?;
+    original.seek(SeekFrom::Start(0)).map_err(io)?;
+    let copied = std::io::copy(&mut original, &mut copy).map_err(io)?;
+    if copied != held_before.len() || copied == 0 {
+        return Err(StorageError::corrupted(
+            "the published database changed while it was copied",
+        ));
+    }
+
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut database = Database::builder().create_file(copy)?;
+        let logical = if recovered {
+            recovery::verify_recovered(&database)
+        } else {
+            recovery::verify_full(&database)
+        };
+        let logical = logical_report(logical);
+        let intact = database.check_integrity()?;
+        Ok::<_, StorageError>((logical, intact))
+    }))
+    .unwrap_or_else(|_| {
+        Err(StorageError::corrupted(
+            "redb aborted while reading a damaged published page",
+        ))
+    })?;
+    let named_after = open_named(&directory.join(DATABASE_FILE_NAME))?
+        .metadata()
+        .map_err(io)?;
+    let held_after = database_file.metadata().map_err(io)?;
+    if !same_file(&named_before, &named_after)
+        || !same_file(&held_before, &held_after)
+        || named_after.len() != named_before.len()
+        || named_after.modified().map_err(io)? != named_before.modified().map_err(io)?
+        || held_after.len() != held_before.len()
+        || held_after.modified().map_err(io)? != held_before.modified().map_err(io)?
+    {
+        return Err(StorageError::corrupted(
+            "the published database changed during held-lock verification",
+        ));
+    }
+    match named_lock.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Ok(()) => {
+            return Err(StorageError::corrupted(
+                "the publication lock was released during verification",
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(io(error)),
+    }
+    Ok(json!({
+        "access": "private copy of the exact open published file; the exclusive publication lock remained held",
+        "exclusive_lock_held": true,
+        "logical_checks": guarded.0,
+        "page_checksums": if guarded.1 {
+            "every page checksum verified"
+        } else {
+            "redb found damage and had to repair the copy; publication is inconsistent"
+        },
+        "file_bytes": named_after.len(),
+        "file_unchanged_during_check": true,
+    }))
+}
+
+fn verify_offline_with_ownership(
+    directory: &std::path::Path,
+    pages: bool,
+    recovered: bool,
+) -> Result<serde_json::Value, StorageError> {
     use serde_json::json;
     let (mut report, bytes) = with_offline_database(directory, pages, |access| {
         let (access_note, page_checksums) = match access {
             OfflineAccess::InPlace(database) => {
+                let logical = if recovered {
+                    recovery::verify_recovered(database)
+                } else {
+                    recovery::verify_full(database)
+                };
                 return Ok(json!({
                     "access": "read-only; the database file was not copied",
-                    "logical_checks": logical_report(recovery::verify_full(database)),
+                    "logical_checks": logical_report(logical),
                     "page_checksums": "not checked; pass --pages to check them on a private copy",
                 }));
             }
             OfflineAccess::Copy(database) => {
-                let logical = logical_report(recovery::verify_full(&*database));
+                let logical = if recovered {
+                    recovery::verify_recovered(&*database)
+                } else {
+                    recovery::verify_full(&*database)
+                };
+                let logical = logical_report(logical);
                 let intact = database.check_integrity()?;
                 (
                     "read from a private unlinked copy; the original file was not opened for writing",

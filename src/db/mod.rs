@@ -107,7 +107,45 @@ pub(crate) fn verify_offline(
     redb::verify_offline(directory, pages).map_err(DatabaseError::Read)
 }
 
-pub(crate) use redb::{DATABASE_FILE_NAME, ReservedRefusal};
+#[cfg(unix)]
+pub(crate) fn verify_reserved_publication(
+    directory: &std::path::Path,
+    database: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::verify_reserved_publication(
+        directory,
+        database,
+        exclusive_lock,
+        expected_device,
+        expected_inode,
+    )
+    .map_err(DatabaseError::Read)
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_recovered_publication(
+    directory: &std::path::Path,
+    database: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::verify_recovered_publication(
+        directory,
+        database,
+        exclusive_lock,
+        expected_device,
+        expected_inode,
+    )
+    .map_err(DatabaseError::Read)
+}
+
+pub(crate) use redb::{
+    DATABASE_FILE_NAME, HeldRecoveryPlan, ReservedRefusal, storage_format_versions,
+};
 
 /// Decides on a private copy whether a Job is a Reserved Allocation that
 /// never started; see `redb::reconcile_reserved_preflight`.
@@ -125,6 +163,48 @@ pub(crate) fn reconcile_reserved_apply(
     job: entities::JobId,
 ) -> Result<serde_json::Value, ReservedRefusal> {
     redb::reconcile_reserved_apply(copy, job)
+}
+
+/// Plans recovery of every eligible stopped loopback Allocation on a private
+/// copy. The digest binds the source file and every decision in stable order.
+pub(crate) fn reconcile_held_preflight(
+    copy: std::fs::File,
+    source_sha256: &str,
+) -> Result<HeldRecoveryPlan, ReservedRefusal> {
+    redb::reconcile_held_preflight(copy, source_sha256)
+}
+
+/// Applies exactly the previously returned plan on a private copy.
+pub(crate) fn reconcile_held_apply(
+    copy: std::fs::File,
+    source_sha256: &str,
+    expected_digest: &str,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    redb::reconcile_held_apply(copy, source_sha256, expected_digest)
+}
+
+pub(crate) fn verify_reserved_publication_delta(
+    source: &std::fs::File,
+    published: &std::fs::File,
+    job: entities::JobId,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    redb::verify_reserved_publication_delta(source, published, job)
+}
+
+pub(crate) fn verify_held_publication_delta(
+    source: &std::fs::File,
+    published: &std::fs::File,
+    source_sha256: &str,
+    expected_plan: &serde_json::Value,
+    expected_digest: &str,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    redb::verify_held_publication_delta(
+        source,
+        published,
+        source_sha256,
+        expected_plan,
+        expected_digest,
+    )
 }
 
 /// The most queued commands one group commit covers. Commands that queue up

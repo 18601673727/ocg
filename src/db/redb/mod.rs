@@ -99,8 +99,12 @@ pub(crate) use reader::{VerifiedNativeSummary, verify_native_summary};
 pub(crate) use reader::{
     inspect_held_allocations_offline, reconcile_development_reservation_offline, verify_offline,
 };
+#[cfg(unix)]
+pub(crate) use reader::{verify_recovered_publication, verify_reserved_publication};
 pub(crate) use recovery::{
-    ReservedRefusal, reconcile_reserved_apply, reconcile_reserved_preflight,
+    HeldRecoveryPlan, ReservedRefusal, reconcile_held_apply, reconcile_held_preflight,
+    reconcile_reserved_apply, reconcile_reserved_preflight, verify_held_publication_delta,
+    verify_reserved_publication_delta,
 };
 /// The bytes `character` costs inside a JSON string. Projection chunks text
 /// by this cost so every serialized page fits the response budget.
@@ -168,6 +172,10 @@ use schema::*;
 pub(crate) use schema::{
     CACHE_BYTES, CREDENTIAL_KEY_FILE_NAME, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE,
 };
+
+pub(crate) const fn storage_format_versions() -> (u64, u8) {
+    (schema::DATABASE_FORMAT_VERSION, codec::RECORD_VERSION)
+}
 
 // ---- storage errors -------------------------------------------------------------
 
@@ -256,8 +264,22 @@ impl TxRead for WriteTransaction {
 pub(crate) fn record_clean_shutdown(database: &Database) -> Result<(), StorageError> {
     let tx = database.begin_write()?;
     {
-        let mut meta = tx.open_table(schema::META)?;
-        meta.insert("clean_shutdown", [1u8].as_slice())?;
+        // Unknown ownership, resolved or not, must always force the next open
+        // through the Full Path. In particular, never turn a recovered
+        // Released + Unknown database into a legacy Quick Path database.
+        let mut unknown = false;
+        for entry in tx.open_table(schema::JOB_STATES)?.iter()? {
+            let (key, value) = entry?;
+            if JobState::decode_at(key.value(), value.value())?
+                .outcome
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+            {
+                unknown = true;
+                break;
+            }
+        }
+        tx.open_table(schema::META)?
+            .insert("clean_shutdown", [u8::from(!unknown)].as_slice())?;
     }
     tx.commit()?;
     Ok(())

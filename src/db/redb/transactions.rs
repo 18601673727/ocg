@@ -4110,6 +4110,88 @@ impl Batch {
         self.put_pool_allocation(&allocation, Some(&previous))
     }
 
+    /// Offline recovery of a stopped, strictly loopback-shaped execution. The
+    /// plan has already proved host/boot ownership and audited all evidence;
+    /// this transaction binds that plan to the exact rows it read. Existing
+    /// Unknown outcomes are not rewritten, no Result is published, and the
+    /// Allocation indexes change atomically with the release.
+    pub(crate) fn reconcile_stopped_allocation(
+        &mut self,
+        action: &super::recovery::RecoveryAction,
+    ) -> Result<(), BatchError> {
+        use crate::db::entities::{AllocationPhase, MutableJobPhase, OutcomeRecord};
+
+        self.allocation_format_gate()?;
+        self.require_allocation_durability()?;
+        if action.token.epoch != self.epoch {
+            return self.reject(Violation::InvalidValue(
+                "allocation",
+                "stale offline recovery epoch",
+            ));
+        }
+        let unchanged = self.step(|tx| {
+            let allocation = tx
+                .open_table(POOL_ALLOCATIONS)?
+                .get(action.token.job.get())?
+                .is_some_and(|row| row.value() == action.expected_allocation);
+            let state = tx
+                .open_table(JOB_STATES)?
+                .get(action.token.job.get())?
+                .is_some_and(|row| row.value() == action.expected_state);
+            Ok(allocation && state)
+        })?;
+        if !unchanged {
+            return self.reject(Violation::InvalidValue(
+                "allocation",
+                "offline recovery source rows changed",
+            ));
+        }
+        let mut allocation = self.allocation_for_token(action.token)?;
+        if allocation.phase != action.phase
+            || allocation.stop_confirmed_at.is_some()
+            || allocation.stop_proof.is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "allocation",
+                "offline recovery phase changed",
+            ));
+        }
+        let Some(job) = self.mutable_job(action.token.job)? else {
+            return self.reject(Violation::NotFound(RecordRef::Job(action.token.job)));
+        };
+        if job.phase != MutableJobPhase::Executing || job.revision != allocation.job_revision {
+            return self.reject(Violation::InvalidValue(
+                "allocation",
+                "offline recovery Job revision changed",
+            ));
+        }
+        let mut state = self.require_job_state(action.token.job)?;
+        match (&state.outcome, action.preserve_unknown) {
+            (Some(outcome), true) if outcome.kind == OutcomeKind::Unknown => {}
+            (None, false) => {
+                state.outcome = Some(OutcomeRecord {
+                    kind: OutcomeKind::Unknown,
+                    at: self.now,
+                    cause: Some(crate::db::entities::OutcomeCause::Uncertain(action.reason)),
+                });
+                self.put_mutable_job_state(action.token.job, &state)?;
+            }
+            _ => {
+                return self.reject(Violation::InvalidValue(
+                    "outcome",
+                    "offline recovery would change an existing outcome",
+                ));
+            }
+        }
+        let previous = allocation.clone();
+        allocation.phase = AllocationPhase::Released;
+        allocation.stop_confirmed_at = Some(self.now);
+        allocation.stop_proof = Some(action.proof);
+        self.put_pool_allocation(&allocation, Some(&previous))?;
+        self.freed_capacity = true;
+        Ok(())
+    }
+
     pub(crate) fn confirm_allocation_stop(
         &mut self,
         token: crate::db::entities::AllocationToken,
