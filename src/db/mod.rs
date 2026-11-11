@@ -71,6 +71,18 @@ pub(crate) enum DevelopmentReservationError {
     Other(DatabaseError),
 }
 
+/// What one reservation pass of the native scheduler came to.
+#[derive(Debug)]
+pub(crate) enum ScheduledReservation {
+    /// The pass's own result.
+    Pass(Box<entities::DevelopmentReservation>),
+    /// The pass was refused, and the transaction that refused it read the
+    /// held Allocations at [`entities::GLOBAL_EXECUTION_LIMIT`]: no Executor
+    /// could have reserved in it. Nothing was written. A busy Executor or a
+    /// full Pool alone is never reported as this.
+    GlobalLimitReached,
+}
+
 /// Reconcile a reservation request against a stopped database without opening a worker.
 /// Access is restricted to trusted internal components and filesystem access.
 #[allow(dead_code)]

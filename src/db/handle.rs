@@ -1795,11 +1795,15 @@ impl DatabaseHandle {
     /// writes nor wakes the scheduler that asked for it; only a reservation
     /// commits. A first attempt only: a scheduler never replays a request to
     /// adopt the Allocation an uncertain reply may have left.
+    ///
+    /// A refusal the same transaction can attribute to the global limit is
+    /// answered as [`ScheduledReservation::GlobalLimitReached`] rather than
+    /// as an error, so a scheduler need not ask again for another Executor.
     pub(crate) async fn reserve_scheduled_job(
         &self,
         fresh: entities::DevelopmentFreshReservation,
         policy: fn(&entities::FrozenExecutionConfig) -> bool,
-    ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
+    ) -> Result<ScheduledReservation, DevelopmentReservationError> {
         let request = fresh.request();
         let result = self
             .submit(|reply| {
@@ -1808,7 +1812,9 @@ impl DatabaseHandle {
                     reply,
                     |_| 4096,
                     |(request, policy), reply, database, operation, commit| {
-                        let mut passed = entities::DevelopmentReservation::Exhausted;
+                        let mut passed = ScheduledReservation::Pass(Box::new(
+                            entities::DevelopmentReservation::Exhausted,
+                        ));
                         let outcome = redb::run_batch_declinable(
                             database,
                             operation.epoch,
@@ -1817,14 +1823,28 @@ impl DatabaseHandle {
                                 request,
                                 true,
                                 entities::ReadySelection::SingleRequestGenerative { policy },
-                            )? {
-                                reserved @ entities::DevelopmentReservation::Reserved(_) => {
-                                    Ok(Some(reserved))
+                            ) {
+                                Ok(reserved @ entities::DevelopmentReservation::Reserved(_)) => {
+                                    Ok(Some(ScheduledReservation::Pass(Box::new(reserved))))
                                 }
-                                other => {
-                                    passed = other;
+                                Ok(other) => {
+                                    passed = ScheduledReservation::Pass(Box::new(other));
                                     Ok(None)
                                 }
+                                // The refusal stands unless this same
+                                // transaction reads the global limit as
+                                // reached, which no Executor's pass could
+                                // have got past. Declining then writes
+                                // nothing, exactly as the refusal did.
+                                Err(redb::BatchError(redb::Failure::Rejected(violation))) => {
+                                    if batch.global_execution_limit_reached()? {
+                                        passed = ScheduledReservation::GlobalLimitReached;
+                                        Ok(None)
+                                    } else {
+                                        batch.reject(violation)
+                                    }
+                                }
+                                Err(error) => Err(error),
                             },
                         );
                         let declined = matches!(outcome.result, Ok(None));

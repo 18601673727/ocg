@@ -14,8 +14,8 @@
 //! # Selection
 //!
 //! A pass offers each enabled Executor that has the single-request Generative
-//! capability, in an order that rotates from pass to pass, to the writer,
-//! which selects and reserves in one transaction
+//! capability among those it discovered, in an order that rotates, to the
+//! writer, which selects and reserves in one transaction
 //! ([`crate::db::entities::ReadySelection::SingleRequestGenerative`]): the
 //! first ready Job in the ready index's order (priority, then submission time,
 //! then Job) whose frozen configuration can run as the checked single
@@ -40,6 +40,29 @@
 //! point can be reserved before an earlier entry that became eligible while
 //! the head search could not reach it.
 //!
+//! # Executor discovery
+//!
+//! A pass reads a bounded window of the configuration rows, newest first, and
+//! the next pass reads on from where it stopped, so a catalog longer than one
+//! window is covered over consecutive passes rather than its newest window
+//! over and over. Passes follow one another without waiting for a wake until
+//! they have gone once round the catalog from where they began; then the
+//! scheduler waits as before. The position is process memory and a hint about
+//! where to read, nothing else: it is separate from the ready index's resume
+//! point, a new run starts at the newest row, and what a window showed is
+//! never trusted, since the writer checks the Executor again in the
+//! transaction that reserves. Being discovered is not being given a Job: that
+//! still takes a ready Job this scheduler may run, a free Executor and room.
+//!
+//! When the writer reports that the global limit itself is reached, the pass
+//! stops offering Executors and the scheduler waits for the wake a freed
+//! Allocation publishes. A pass that had reserved before the limit was reached
+//! moves discovery on past its window, so each freed slot gives the next window
+//! its turn; one that reserved nothing leaves discovery where it was. Every
+//! window is therefore read within a bounded number of passes that find
+//! capacity, but a window's Executors that the limit cut off are not offered
+//! again until discovery returns to it.
+//!
 //! # Dispatch and stop
 //!
 //! Each reservation runs once: the checked start, with the same request check
@@ -62,14 +85,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::db::entities::{
-    AllocationPhase, AllocationToken, DevelopmentFreshReservation, DevelopmentReadyCursor,
-    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, FrozenExecutionConfig,
-    JobId, LlmTransport, OutcomeKind, PoolAllocation, UnstartedCause,
+    AllocationPhase, AllocationToken, ConfigId, DevelopmentFreshReservation,
+    DevelopmentReadyCursor, DevelopmentReservation, ExecutionOperation, ExecutionPoolId,
+    ExecutorId, FrozenExecutionConfig, JobId, LlmTransport, OutcomeKind, PoolAllocation,
+    UnstartedCause,
 };
 use crate::db::redb::{NativeResource, NativeResourceKind};
 use crate::db::{
     DatabaseError, DatabaseHandle, DevelopmentHandoffError, DevelopmentReservationError,
-    SchedulerWakeSubscription,
+    ScheduledReservation, SchedulerWakeSubscription,
 };
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::system::execution_controls::ExecutionControl;
@@ -241,9 +265,12 @@ pub(crate) async fn run_with(
 /// What one Executor's search came to.
 pub(crate) enum ExecutorPass {
     Reserved(Box<PoolAllocation>),
-    /// Nothing for this Executor now: it is busy, its Pool is full or the
-    /// global limit is reached. Nothing was read or written.
+    /// Nothing for this Executor now: it was refused, as a busy Executor or
+    /// one whose Pool is full is. Nothing was written.
     Nothing,
+    /// The writer read the global limit as reached: no Executor can reserve
+    /// until an Allocation is released. Nothing was written.
+    GlobalLimit,
     /// The search ran out of budget; the next one resumes where it stopped.
     /// Nothing was written.
     BudgetSpent,
@@ -257,6 +284,53 @@ pub(crate) enum ExecutorPass {
     Halted,
 }
 
+/// Where Executor discovery stands between passes. It says where to read and
+/// nothing about what may run.
+#[derive(Clone, Copy, Default)]
+struct Discovery {
+    /// The configuration row the next pass reads below; `None` is the newest.
+    next: Option<ConfigId>,
+    /// The round of the catalog under way, when the passes so far have not
+    /// completed one.
+    sweep: Option<Sweep>,
+}
+
+/// One round of the catalog, over as many passes as it takes.
+#[derive(Clone, Copy)]
+struct Sweep {
+    /// Where its first pass began reading.
+    origin: Option<ConfigId>,
+    /// Whether it has read to the oldest row and gone back to the newest.
+    wrapped: bool,
+}
+
+impl Discovery {
+    /// Where discovery stands after a pass that began here read down to
+    /// `reached`, or to the oldest row when `reached` is `None`. The round is
+    /// over once every row has been read since it began: at the oldest row
+    /// for a round that began at the newest, and otherwise on coming back
+    /// round to its origin. Rows are compared by key, so rows that appear or
+    /// are archived meanwhile neither end a round early nor prolong it.
+    fn advanced(self, reached: Option<ConfigId>) -> Self {
+        let sweep = self.sweep.unwrap_or(Sweep {
+            origin: self.next,
+            wrapped: false,
+        });
+        let complete = match (reached, sweep.origin) {
+            (None, origin) => origin.is_none() || sweep.wrapped,
+            (Some(reached), Some(origin)) => sweep.wrapped && reached.get() <= origin.get(),
+            (Some(_), None) => false,
+        };
+        Self {
+            next: reached,
+            sweep: (!complete).then_some(Sweep {
+                origin: sweep.origin,
+                wrapped: sweep.wrapped || reached.is_none(),
+            }),
+        }
+    }
+}
+
 /// The native scheduler of one host run.
 pub(crate) struct NativeScheduler {
     database: DatabaseHandle,
@@ -266,8 +340,14 @@ pub(crate) struct NativeScheduler {
     /// Where the last search that ran out of budget stopped. Process memory
     /// only: a new run starts at the head of the ready index.
     resume: Cell<Option<DevelopmentReadyCursor>>,
-    /// Passes so far, which rotate the order Executors are offered in.
-    passes: Cell<u64>,
+    /// Where Executor discovery continues. Process memory only, and never the
+    /// ready index's `resume`: a new run starts at the newest row.
+    discovery: Cell<Discovery>,
+    /// Rotates the order a window's Executors are offered in. It moves each
+    /// time discovery returns to the newest row and each time a pass leaves
+    /// discovery where it was, so a window is offered in a new order every
+    /// time it is read again, however many passes a round takes.
+    turns: Cell<u64>,
     running: RefCell<Vec<ntex::rt::JoinHandle<Dispatched>>>,
     /// Set once anything ends in a state the database does not show as
     /// settled or Uncertain; nothing is claimed after it.
@@ -287,7 +367,8 @@ impl NativeScheduler {
             shutdown,
             stops,
             resume: Cell::new(None),
-            passes: Cell::new(0),
+            discovery: Cell::new(Discovery::default()),
+            turns: Cell::new(0),
             running: RefCell::new(Vec::new()),
             halted: Rc::new(Cell::new(false)),
         }
@@ -322,9 +403,20 @@ impl NativeScheduler {
                 next_due: None,
             });
         }
+        // Discovery moves only once the whole window has been read: a failed
+        // read or a cancellation leaves it where it was, so the next pass
+        // reads the same window again and no Executor in it is skipped.
+        let discovery = self.discovery.get();
         let mut executors = Vec::new();
-        let mut before = None;
+        let mut before = discovery.next;
+        let mut reached = None;
         for _ in 0..MAX_EXECUTOR_PAGES {
+            if self.shutdown.is_cancelled() {
+                return Ok(DispatchBatch {
+                    grants,
+                    next_due: None,
+                });
+            }
             let page = self
                 .database
                 .native_resources(before, EXECUTOR_PAGE, NativeResourceKind::Executor)
@@ -338,19 +430,21 @@ impl NativeScheduler {
                     executors.push((executor.pool, executor.id));
                 }
             }
+            // A page that returned no Executor still moves the read on.
+            reached = page.next;
             match page.next {
                 Some(next) => before = Some(next),
                 None => break,
             }
         }
-        let pass = self.passes.get();
-        self.passes.set(pass.wrapping_add(1));
+        let turn = self.turns.get();
         if !executors.is_empty() {
             // No Executor is always offered the head of the queue first.
-            let start = usize::try_from(pass % executors.len() as u64).unwrap_or(0);
+            let start = usize::try_from(turn % executors.len() as u64).unwrap_or(0);
             executors.rotate_left(start);
         }
         let mut rotating = false;
+        let mut global_limit = false;
         for (pool, executor) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
                 break;
@@ -359,16 +453,55 @@ impl NativeScheduler {
                 ExecutorPass::Reserved(allocation) => grants.push(*allocation),
                 ExecutorPass::Nothing => {}
                 ExecutorPass::BudgetSpent => rotating = true,
+                ExecutorPass::GlobalLimit => {
+                    global_limit = true;
+                    break;
+                }
                 ExecutorPass::IndexExhausted | ExecutorPass::Halted => break,
             }
         }
+        // At the global limit every other Executor would be refused the same
+        // way, so the pass stops offering. What it does with discovery depends
+        // on whether this window used up the capacity that was free:
+        //
+        // - It reserved at least once: the window has had its use of what was
+        //   freed, so discovery moves on from it exactly as after any other
+        //   window. Were it to stay, the newest window would take every slot a
+        //   release frees and no older window would ever be read.
+        // - It reserved nothing: the limit was already reached when the pass
+        //   began (a wake that lost the freed slot to an earlier pass), the
+        //   window has had no use of capacity and discovery, round included,
+        //   stays as it was.
+        //
+        // Either way the pass waits for the wake a released Allocation
+        // publishes and does not follow itself.
+        let discovery = if global_limit && grants.is_empty() {
+            discovery
+        } else {
+            discovery.advanced(reached)
+        };
+        self.discovery.set(discovery);
+        // The window is offered in a new order each time it is read again:
+        // when discovery wraps to the newest row, and when a pass that
+        // reserved nothing at the limit leaves it in place.
+        if reached.is_none() || (global_limit && grants.is_empty()) {
+            self.turns.set(turn.wrapping_add(1));
+        }
         // A search that ran out of budget wrote nothing, so no wake follows
         // it: the next pass is due at once, and passes continue while
-        // searches advance, until one reads to the end of the index. A pass
-        // in which every Executor was refused advanced nothing and waits for
-        // a wake, as a settlement that frees one publishes.
-        let next_due = (rotating && self.resume.get().is_some() && !self.halted.get())
-            .then_some(Duration::ZERO);
+        // searches advance, until one reads to the end of the index. A window
+        // that did not complete a round of the catalog is followed at once by
+        // the next one too, whatever it reserved and whether or not it showed
+        // any Executor: a reservation's wake is not what continues discovery.
+        // Only the global limit holds this back: no pass can reserve until an
+        // Allocation is released, so it waits for that wake, and a round
+        // under way continues from there. A pass that ends a round with every
+        // Executor refused advanced nothing and waits for a wake, as a
+        // settlement that frees one publishes.
+        let next_due = ((rotating && self.resume.get().is_some() || discovery.sweep.is_some())
+            && !global_limit
+            && !self.halted.get())
+        .then_some(Duration::ZERO);
         Ok(DispatchBatch { grants, next_due })
     }
 
@@ -390,11 +523,16 @@ impl NativeScheduler {
                 after = Some(resume);
             }
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
-            match self
+            let passed = match self
                 .database
                 .reserve_scheduled_job(fresh, scheduled_policy)
                 .await
             {
+                Ok(ScheduledReservation::GlobalLimitReached) => return ExecutorPass::GlobalLimit,
+                Ok(ScheduledReservation::Pass(passed)) => Ok(*passed),
+                Err(error) => Err(error),
+            };
+            match passed {
                 Ok(DevelopmentReservation::Reserved(allocation)) => {
                     if allocation.token.executor != executor || allocation.token.pool != pool {
                         self.halt("a reservation names another Executor");

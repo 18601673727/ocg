@@ -2395,6 +2395,17 @@ impl Batch {
         Ok(())
     }
 
+    /// Whether the held Allocations of every Pool together are at
+    /// [`GLOBAL_EXECUTION_LIMIT`], read in this transaction. It decides
+    /// nothing: [`Self::reserve_next_development_job`] makes its own check,
+    /// and this only tells a scheduler which of that check's refusals it was
+    /// given.
+    pub(crate) fn global_execution_limit_reached(&mut self) -> Result<bool, BatchError> {
+        self.step(|tx| {
+            Ok(tx.open_table(ACTIVE_ALLOCATIONS)?.len()? >= u64::from(GLOBAL_EXECUTION_LIMIT))
+        })
+    }
+
     /// Select and reserve in one writer transaction. The cursor limits work per
     /// request; a new traversal starts at the head of the authoritative index.
     /// `selection` says which ready Jobs this pass may take; see
