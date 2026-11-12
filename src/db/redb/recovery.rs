@@ -343,6 +343,18 @@ fn startup_checks(
     force_full: bool,
 ) -> Result<Verification, StorageError> {
     let tx = database.begin_read()?;
+    let clean = startup_metadata(&tx)?;
+    if clean && !force_full && allocations_are_quiet(&tx)? && !unknown_outcomes_exist(&tx)? {
+        return Ok(Verification::Quick);
+    }
+    check_records(&tx)?;
+    refuse_unresolved_ownership(&tx)?;
+    Ok(Verification::Full)
+}
+
+/// The identity, required tables and metadata every startup checks first.
+/// Returns whether the database records a clean shutdown.
+fn startup_metadata(tx: &ReadTransaction) -> Result<bool, StorageError> {
     let meta = match tx.open_table(META) {
         Ok(meta) => meta,
         Err(TableError::TableDoesNotExist(_)) => {
@@ -353,7 +365,7 @@ fn startup_checks(
         Err(error) => return Err(error.into()),
     };
     check_identity(&meta)?;
-    check_required_tables(&tx)?;
+    check_required_tables(tx)?;
     let epoch = meta
         .get("open_epoch")?
         .ok_or_else(|| StorageError::corrupted("missing open epoch"))?;
@@ -363,21 +375,168 @@ fn startup_checks(
     if epoch.value().len() != 8 || !matches!(shutdown.value(), [0] | [1]) {
         return Err(StorageError::corrupted("invalid startup metadata"));
     }
+    let clean = matches!(shutdown.value(), [1]);
     let settings = meta
         .get("compaction_settings")?
         .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
     check_preflight_header(settings.value(), &[TAG_GLOBAL_COMPACTION])?;
     reader::global_compaction_settings(&meta)?;
-    if matches!(shutdown.value(), [1])
-        && !force_full
-        && allocations_are_quiet(&tx)?
-        && !unknown_outcomes_exist(&tx)?
-    {
-        return Ok(Verification::Quick);
+    Ok(clean)
+}
+
+/// The capacity ownership a database holds, classified rather than refused.
+/// Every held Allocation must name a native Job that the per-Job consistency
+/// reader accepts (the one `ocg inspect-held` reports), and every Unknown
+/// outcome must be either resolved by its own Released Allocation and stop
+/// proof ([`resolved_unknown_ownership`]) or retained by its own held
+/// Allocation. Anything else is corruption, never residual ownership.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResidualOwnership {
+    /// Jobs whose Allocation still holds capacity.
+    pub(crate) held: std::collections::BTreeSet<u128>,
+    /// Unknown outcomes whose own Allocation still holds capacity.
+    pub(crate) retained_unknown: std::collections::BTreeSet<u128>,
+    /// Unknown outcomes resolved locally by Released Allocation stop proof.
+    pub(crate) resolved_unknown: std::collections::BTreeSet<u128>,
+}
+
+impl ResidualOwnership {
+    /// Whether normal startup must refuse this ownership.
+    fn unresolved(&self) -> bool {
+        !self.held.is_empty() || !self.retained_unknown.is_empty()
     }
+
+    fn facts(&self) -> serde_json::Value {
+        let ids = |set: &std::collections::BTreeSet<u128>| {
+            set.iter()
+                .map(|id| JobId::new(*id).to_string())
+                .collect::<Vec<_>>()
+        };
+        serde_json::json!({
+            "held_jobs": ids(&self.held),
+            "retained_unknown_jobs": ids(&self.retained_unknown),
+            "resolved_unknown_jobs": ids(&self.resolved_unknown),
+        })
+    }
+}
+
+fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, StorageError> {
+    use crate::db::entities::{AllocationPhase, MutableJobPhase};
+    let mut ownership = ResidualOwnership::default();
+    for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+        let (key, value) = entry?;
+        let allocation = transactions::decode_pool_allocation(key.value(), value.value())?;
+        if !allocation.holds_capacity() {
+            continue;
+        }
+        let job = allocation.token.job;
+        if job.get() != key.value() {
+            return Err(StorageError::corrupted(format!(
+                "the held Allocation keyed {} names another Job",
+                JobId::new(key.value())
+            )));
+        }
+        let record = match reader::mutable_job_details_in(tx, job, None, false) {
+            Ok(Some(details)) => details.record,
+            Ok(None) => {
+                return Err(StorageError::corrupted(format!(
+                    "the held Allocation of {job} names no native Job"
+                )));
+            }
+            Err(error) if error.kind == StorageErrorKind::Corrupted => {
+                return Err(StorageError::corrupted(format!(
+                    "the held Allocation of {job} is inconsistent: {}",
+                    error.detail
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        // Stop evidence is written only when capacity is released, and the
+        // checked start makes the Job Executing and the Allocation started
+        // in one transaction.
+        let started = record.job.phase == MutableJobPhase::Executing;
+        let outcome = record.outcome.as_ref().map(|outcome| outcome.kind);
+        let shaped = allocation.stop_confirmed_at.is_none()
+            && allocation.stop_proof.is_none()
+            && allocation.job_revision == record.job.revision
+            && allocation.started_at.is_some() == started
+            && (started || record.job.phase == MutableJobPhase::Queued)
+            && match allocation.phase {
+                AllocationPhase::Reserved => !started && outcome.is_none(),
+                AllocationPhase::Running => started && outcome.is_none(),
+                AllocationPhase::StopRequested => outcome.is_none(),
+                AllocationPhase::Uncertain => outcome == Some(OutcomeKind::Unknown),
+                AllocationPhase::Released => false,
+            };
+        if !shaped {
+            return Err(StorageError::corrupted(format!(
+                "the held Allocation of {job} contradicts its Job"
+            )));
+        }
+        ownership.held.insert(job.get());
+    }
+    for entry in tx.open_table(JOB_STATES)?.iter()? {
+        let (key, value) = entry?;
+        let state = JobState::decode_at(key.value(), value.value())?;
+        if !state
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+        {
+            continue;
+        }
+        if resolved_unknown_ownership(tx, &state)? {
+            ownership.resolved_unknown.insert(key.value());
+        } else if ownership.held.contains(&key.value()) {
+            ownership.retained_unknown.insert(key.value());
+        } else {
+            return Err(StorageError::corrupted(format!(
+                "{} is unresolved Unknown without a retained held Allocation",
+                state.job_id
+            )));
+        }
+    }
+    Ok(ownership)
+}
+
+/// The verification of a database after one Reserved Allocation was
+/// reconciled individually: the startup metadata, every record header and
+/// native invariant, and the ownership left behind classified exactly, not
+/// refused. Then the normal startup decision itself is taken on the same
+/// read: it must refuse exactly when ownership remains unresolved, and a
+/// database without any must pass the full startup verification.
+pub(crate) struct ReservedResidual {
+    pub(crate) ownership: ResidualOwnership,
+    pub(crate) normal_startup_accepts: bool,
+}
+
+pub(crate) fn verify_reserved_residual(
+    database: &impl ::redb::ReadableDatabase,
+) -> Result<ReservedResidual, StorageError> {
+    let tx = database.begin_read()?;
+    startup_metadata(&tx)?;
     check_records(&tx)?;
-    refuse_unresolved_ownership(&tx)?;
-    Ok(Verification::Full)
+    let ownership = residual_ownership_in(&tx)?;
+    let must_refuse =
+        !ExecutionControl::RecoveryAndRedispatch.is_enabled() && ownership.unresolved();
+    let normal_startup_accepts = match (refuse_unresolved_ownership(&tx), must_refuse) {
+        (Ok(()), false) => true,
+        (Err(error), true) if error.kind == StorageErrorKind::Other => false,
+        (Err(error), _) => return Err(error),
+        (Ok(()), true) => {
+            return Err(StorageError::corrupted(
+                "normal startup would accept ownership that is still unresolved",
+            ));
+        }
+    };
+    drop(tx);
+    if normal_startup_accepts {
+        verify_full(database)?;
+    }
+    Ok(ReservedResidual {
+        ownership,
+        normal_startup_accepts,
+    })
 }
 
 /// A format this build accepts names the tables of that format. A database
@@ -1458,10 +1617,22 @@ impl From<::redb::DatabaseError> for ReservedRefusal {
 /// the one that made it. That is necessary (a different epoch means history
 /// this build cannot see) but not sufficient: the owner may still be running.
 /// Its absence is established by the exclusive host lock the caller holds.
+///
+/// Other capacity ownership does not decide this Job: other Allocations may
+/// remain Reserved, Running, StopRequested or Uncertain, and other Unknown
+/// outcomes may be resolved or retained. Each is classified exactly (see
+/// [`ResidualOwnership`]) and left unchanged; an inconsistent one refuses.
 fn reserved_preflight_in(
     database: &impl ReadableDatabase,
     job: JobId,
-) -> Result<(crate::db::entities::AllocationToken, serde_json::Value), ReservedRefusal> {
+) -> Result<
+    (
+        crate::db::entities::AllocationToken,
+        serde_json::Value,
+        ResidualOwnership,
+    ),
+    ReservedRefusal,
+> {
     use crate::db::entities::{AllocationPhase, MutableJobPhase};
     use serde_json::json;
 
@@ -1548,35 +1719,26 @@ fn reserved_preflight_in(
     }
     let same_boot = allocation.boot_id.is_some() && allocation.boot_id == current_boot_id();
 
-    // Capacity ownership elsewhere is not this command's to resolve, and the
-    // result could not pass the startup verification with it.
-    let (mut held, mut unknown) = (0u64, 0u64);
-    for entry in allocations.iter().map_err(StorageError::from)? {
-        let (key, value) = entry.map_err(StorageError::from)?;
-        if transactions::decode_pool_allocation(key.value(), value.value())?.holds_capacity() {
-            held += 1;
-        }
-    }
+    // Capacity ownership elsewhere is not this command's to resolve: it is
+    // classified, must be consistent, and is preserved exactly.
     drop(allocations);
-    let states = tx.open_table(JOB_STATES).map_err(StorageError::from)?;
-    for entry in states.iter().map_err(StorageError::from)? {
-        let (key, value) = entry.map_err(StorageError::from)?;
-        if JobState::decode_at(key.value(), value.value())?
-            .outcome
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-        {
-            unknown += 1;
-        }
-    }
-    drop(states);
-    if held != 1 || unknown != 0 {
+    let ownership = residual_ownership_in(&tx).map_err(|error| match error.kind {
+        StorageErrorKind::Corrupted => ReservedRefusal::new("ownership_inconsistent", error.detail),
+        StorageErrorKind::Io(_)
+        | StorageErrorKind::PreviousIo
+        | StorageErrorKind::AlreadyOpen
+        | StorageErrorKind::Closed
+        | StorageErrorKind::ValueTooLarge
+        | StorageErrorKind::Other => error.into(),
+    })?;
+    if !ownership.held.contains(&job.get()) {
         return Err(ReservedRefusal::new(
-            "other_unresolved_ownership",
-            format!(
-                "{held} Allocation(s) hold capacity and {unknown} Job outcome(s) are Unknown; only a database whose single held Allocation is this one is reconciled"
-            ),
+            "inconsistent_or_corrupt",
+            "the Reserved Allocation is not classified as held",
         ));
     }
+    let mut residual = ownership.clone();
+    residual.held.remove(&job.get());
 
     let record = reader::mutable_job_record_in(&tx, job)?
         .ok_or_else(|| ReservedRefusal::new("job_missing", "the reserved Job does not exist"))?;
@@ -1713,10 +1875,34 @@ fn reserved_preflight_in(
         "job_revision": allocation.job_revision,
         "claimed_by_this_host": true,
         "claimed_in_this_boot": same_boot,
-        "held_allocations": held,
-        "unknown_outcomes": unknown,
+        "held_allocations": ownership.held.len(),
+        "unknown_outcomes": ownership.retained_unknown.len() + ownership.resolved_unknown.len(),
+        "residual_ownership": residual.facts(),
     });
-    Ok((token, facts))
+    Ok((token, facts, residual))
+}
+
+/// The residual ownership a published reconciliation of `job` holds must be
+/// exactly the source's without the target, and the normal startup decision
+/// must follow from it.
+fn verify_reserved_residual_against(
+    database: &impl ReadableDatabase,
+    expected: &ResidualOwnership,
+) -> Result<serde_json::Value, ReservedRefusal> {
+    let verified = verify_reserved_residual(database)?;
+    if &verified.ownership != expected {
+        return Err(audit_delta(
+            "the residual ownership differs from the rollback source without the target",
+        ));
+    }
+    Ok(serde_json::json!({
+        "residual_ownership": verified.ownership.facts(),
+        "normal_startup": if verified.normal_startup_accepts {
+            "accepted: no Allocation holds capacity and no Unknown outcome is unresolved; full startup verification passed"
+        } else {
+            "refused: residual held ownership remains, as normal startup requires"
+        },
+    }))
 }
 
 /// Runs `body` on the database the file holds. The file is a private copy:
@@ -1772,7 +1958,7 @@ pub(crate) fn reconcile_reserved_preflight(
     job: JobId,
 ) -> Result<serde_json::Value, ReservedRefusal> {
     with_reconciliation_copy(file, |database| {
-        reserved_preflight_in(&*database, job).map(|(_, facts)| facts)
+        reserved_preflight_in(&*database, job).map(|(_, facts, _)| facts)
     })
 }
 
@@ -1786,7 +1972,7 @@ pub(crate) fn reconcile_reserved_apply(
 ) -> Result<serde_json::Value, ReservedRefusal> {
     use crate::db::entities::{AllocationPhase, UnstartedCause};
     with_reconciliation_copy(file, |database| {
-        let (token, mut facts) = reserved_preflight_in(&*database, job)?;
+        let (token, mut facts, residual) = reserved_preflight_in(&*database, job)?;
         let outcome =
             writer::run_batch_with(database, token.epoch, writer::Commit::Durable, |batch| {
                 batch.fail_unstarted_reservation(token, UnstartedCause::OfflineReconciled)
@@ -1807,8 +1993,9 @@ pub(crate) fn reconcile_reserved_apply(
                 "redb found damage in the reconciled copy and had to repair it",
             ));
         }
-        // Every record and derived index, and no held Allocation or Unknown outcome left.
-        verify_full(&*database)?;
+        // Every record and derived index, and exactly the ownership the source
+        // held besides this Allocation.
+        let residual = verify_reserved_residual_against(&*database, &residual)?;
         let tx = database.begin_read().map_err(StorageError::from)?;
         let allocations = tx
             .open_table(POOL_ALLOCATIONS)
@@ -1837,6 +2024,7 @@ pub(crate) fn reconcile_reserved_apply(
             "failure_code": UnstartedCause::OfflineReconciled.code(),
             "page_checksums": "every page checksum verified",
             "logical_checks": "every record header, derived index and ownership row verified",
+            "residual": residual,
         });
         Ok(facts)
     })
@@ -1864,7 +2052,7 @@ pub(crate) fn verify_reserved_publication_delta(
                 "redb found damage in the rollback copy and had to repair it",
             ));
         }
-        let (_, mut facts) = reserved_preflight_in(&*source_database, job)?;
+        let (_, mut facts, residual) = reserved_preflight_in(&*source_database, job)?;
         with_reconciliation_copy(published, |database| {
             if !database.check_integrity().map_err(StorageError::from)? {
                 return Err(ReservedRefusal::new(
@@ -1872,7 +2060,7 @@ pub(crate) fn verify_reserved_publication_delta(
                     "redb found damage in the published copy and had to repair it",
                 ));
             }
-            verify_full(&*database)?;
+            let residual = verify_reserved_residual_against(&*database, &residual)?;
             verify_unrelated_recovery_rows(
                 &*source_database,
                 &*database,
@@ -1964,6 +2152,7 @@ pub(crate) fn verify_reserved_publication_delta(
                 "unrelated_allocations_and_jobs": "byte-identical to the rollback source",
                 "preserved_evidence_and_derived_rows": "byte-identical to the rollback source except the authorized Result, sequence, settlement and active-index deltas",
                 "reconstructed_without_reapply": true,
+                "residual": residual,
             });
             Ok(facts)
         })

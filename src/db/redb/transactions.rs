@@ -352,6 +352,12 @@ pub(super) fn active_allocations(
 }
 
 #[allow(dead_code)]
+/// The typed Result of a Job whose untouched reservation was ended by a stop
+/// before Checked Start; see [`Batch::request_native_stop`].
+pub(super) const STOPPED_BEFORE_START_CODE: &str = "stopped_before_start";
+pub(super) const STOPPED_BEFORE_START_SUMMARY: &str =
+    "Stopped before it started. Nothing was sent to the Provider.";
+
 pub(super) fn mutable_priority(priority: crate::db::entities::JobQueuePriority) -> u8 {
     use crate::db::entities::JobQueuePriority;
     match priority {
@@ -4015,11 +4021,8 @@ impl Batch {
                     token,
                     OutcomeKind::Cancelled,
                     crate::db::entities::FinalResult {
-                        summary: Some(
-                            "Stopped before it started. Nothing was sent to the Provider."
-                                .to_owned(),
-                        ),
-                        code: Some("stopped_before_start".to_owned()),
+                        summary: Some(STOPPED_BEFORE_START_SUMMARY.to_owned()),
+                        code: Some(STOPPED_BEFORE_START_CODE.to_owned()),
                         goal_reached: Some(false),
                         value: None,
                     },

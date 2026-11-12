@@ -344,12 +344,23 @@ fn verify_publication_with_exclusive_lock(
 
     let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut database = Database::builder().create_file(copy)?;
+        // A Reserved reconciliation may leave other ownership held: it is
+        // classified exactly, and normal startup's decision is reported, not
+        // mistaken for a failed publication.
         let logical = if recovered {
-            recovery::verify_recovered(&database)
+            logical_report(recovery::verify_recovered(&database))
         } else {
-            recovery::verify_full(&database)
+            match recovery::verify_reserved_residual(&database) {
+                Ok(residual) => serde_json::json!({
+                    "passed": true,
+                    "held_allocations": residual.ownership.held.len(),
+                    "retained_unknown_outcomes": residual.ownership.retained_unknown.len(),
+                    "resolved_unknown_outcomes": residual.ownership.resolved_unknown.len(),
+                    "normal_startup": if residual.normal_startup_accepts { "accepted" } else { "refused_residual_held_ownership" },
+                }),
+                Err(error) => serde_json::json!({"passed": false, "detail": error.detail}),
+            }
         };
-        let logical = logical_report(logical);
         let intact = database.check_integrity()?;
         Ok::<_, StorageError>((logical, intact))
     }))
@@ -2081,12 +2092,28 @@ fn development_candidate_in(
                 "Decision predecessors cannot be projected as generative messages",
             ));
         }
-        if prior.job.parent_id != record.job.parent_id
-            || prior.job.phase != MutableJobPhase::Executing
-            || prior
-                .outcome
-                .as_ref()
-                .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown)
+        // A predecessor that ended before its start is settled exactly as the
+        // writer's predecessor admission treats it; it carries its input and
+        // its typed Result, never a generated answer.
+        let ended_unstarted = prior.job.parent_id == record.job.parent_id
+            && prior.job.phase == MutableJobPhase::Queued
+            && unstarted_settlement_in(
+                rx,
+                &prior,
+                rx.open_table(POOL_ALLOCATIONS)?
+                    .get(id.get())?
+                    .map(|row| transactions::decode_pool_allocation(id.get(), row.value()))
+                    .transpose()?
+                    .as_ref(),
+            )?
+            .is_some();
+        if !ended_unstarted
+            && (prior.job.parent_id != record.job.parent_id
+                || prior.job.phase != MutableJobPhase::Executing
+                || prior
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown))
         {
             return Err(context_unavailable(
                 "predecessor is not settled in this conversation",
@@ -2308,7 +2335,149 @@ fn mutable_configuration_in(
     }))
 }
 
-fn mutable_job_details_in(
+/// The settlement of a Job whose untouched reservation was ended before
+/// Checked Start: Failed by a refused start or an offline reconciliation
+/// ([`Batch::fail_unstarted_reservation`]), or Cancelled by a stop
+/// ([`Batch::request_native_stop`]). Such a Job stays `Queued` (it never
+/// entered `Executing`) and its Allocation is `Released`.
+///
+/// A Queued Job without a Released Allocation makes no such claim: `None`.
+/// One with a Released Allocation must be exactly that settlement, which this
+/// returns with its one Result; any other shape is corruption. Every reader
+/// that admits output or a terminal outcome on a Job that never started
+/// decides it here, so they cannot disagree.
+pub(super) fn unstarted_settlement_in(
+    rx: &ReadTransaction,
+    record: &crate::db::entities::MutableJobRecord,
+    allocation: Option<&crate::db::entities::PoolAllocation>,
+) -> Result<Option<JobOutputRecord>, StorageError> {
+    use crate::db::entities::{AllocationPhase, MutableJobPhase, UnstartedCause};
+    let Some(allocation) = allocation.filter(|allocation| {
+        record.job.phase == MutableJobPhase::Queued && allocation.phase == AllocationPhase::Released
+    }) else {
+        return Ok(None);
+    };
+    let invalid = || {
+        StorageError::corrupted(format!(
+            "{} was released before its start without an exact unstarted settlement",
+            record.job.id
+        ))
+    };
+    let id = record.job.id;
+    let Some(outcome) = record.outcome.as_ref() else {
+        return Err(invalid());
+    };
+    let state = read_state(rx, id)?;
+    if allocation.token.job != id
+        || allocation.job_revision != record.job.revision
+        || allocation.started_at.is_some()
+        || allocation.stop_confirmed_at.is_some()
+        || allocation.stop_proof.is_some()
+        || record.job.frozen.is_none()
+        || outcome.cause.is_some()
+        || state.claim.is_some()
+        || state.stop_confirmed_at.is_some()
+        || state.stop_confirmed_by.is_some()
+    {
+        return Err(invalid());
+    }
+    let failures = [
+        UnstartedCause::FrozenSecretUnavailable,
+        UnstartedCause::InputUnavailable,
+        UnstartedCause::StartRefused,
+        UnstartedCause::OfflineReconciled,
+    ];
+    let expected = |code: &str, summary: &str| match outcome.kind {
+        OutcomeKind::Cancelled => {
+            code == transactions::STOPPED_BEFORE_START_CODE
+                && summary == transactions::STOPPED_BEFORE_START_SUMMARY
+        }
+        OutcomeKind::Failed => failures
+            .iter()
+            .any(|cause| code == cause.code() && summary == cause.summary()),
+        OutcomeKind::Completed | OutcomeKind::Unknown => false,
+    };
+    let mut outputs = rx
+        .open_table(JOB_OUTPUTS)?
+        .range((id.get(), 0)..=(id.get(), u32::MAX))?
+        .take(2)
+        .map(|entry| {
+            let (key, value) = entry?;
+            decode_output(key.value(), value.value())
+        })
+        .collect::<Result<Vec<_>, StorageError>>()?;
+    let result = match (outputs.pop(), outputs.is_empty()) {
+        (Some(result), true) => result,
+        (Some(_), false) | (None, _) => return Err(invalid()),
+    };
+    if result.seq != 1
+        || result.kind != OutputKind::Result
+        || !expected(
+            result.code.as_deref().unwrap_or_default(),
+            result.summary.as_deref().unwrap_or_default(),
+        )
+        || result.goal_reached != Some(false)
+        || result.value.is_some()
+        || result.created_at != outcome.at
+    {
+        return Err(invalid());
+    }
+    let ready = record.job.submitted_at.map(|submitted| {
+        (
+            transactions::mutable_priority(record.job.input.priority),
+            submitted.as_unix_micros(),
+            id.get(),
+        )
+    });
+    let Some(ready) = ready else {
+        return Err(invalid());
+    };
+    let job_range = (id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX);
+    if rx
+        .open_table(REQUEST_EVENTS)?
+        .range(job_range.clone())?
+        .next()
+        .transpose()?
+        .is_some()
+        || rx
+            .open_table(TOOL_CALLS)?
+            .range(job_range.clone())?
+            .next()
+            .transpose()?
+            .is_some()
+        || rx
+            .open_table(APPROVALS)?
+            .range(job_range)?
+            .next()
+            .transpose()?
+            .is_some()
+        || rx
+            .open_table(JOB_OBSERVATIONS)?
+            .range((id.get(), 0, 0)..=(id.get(), u8::MAX, u128::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+        || rx
+            .open_table(LIVE_CHILDREN)?
+            .range((id.get(), 0)..=(id.get(), u128::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+        || rx
+            .open_table(MUTABLE_READY)?
+            .range((ready.0, ready.1, ready.2, 0)..=(ready.0, ready.1, ready.2, u16::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+        || rx.open_table(PENDING)?.get(id.get())?.is_some()
+        || rx.open_table(UNSETTLED)?.get(id.get())?.is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(result))
+}
+
+pub(super) fn mutable_job_details_in(
     rx: &ReadTransaction,
     id: JobId,
     context: Option<crate::db::entities::ComposerContextId>,
@@ -2378,19 +2547,8 @@ fn mutable_job_details_in(
         .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
         .transpose()?;
     // The one output a Job that never started may hold is the typed Result
-    // that ended its untouched reservation: Failed, with its Allocation
-    // Released and no request evidence (checked below).
-    let ended_unstarted = record.job.phase == MutableJobPhase::Queued
-        && record
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Failed)
-        && allocation
-            .as_ref()
-            .is_some_and(|allocation| allocation.phase == AllocationPhase::Released)
-        && latest_output
-            .as_ref()
-            .is_some_and(|output| output.kind == OutputKind::Result);
+    // that ended its untouched reservation; see `unstarted_settlement_in`.
+    let ended_unstarted = unstarted_settlement_in(rx, &record, allocation.as_ref())?.is_some();
     if record.job.phase != MutableJobPhase::Executing && latest_output.is_some() && !ended_unstarted
     {
         return Err(StorageError::corrupted("Job has output before execution"));
@@ -6460,14 +6618,20 @@ fn mutable_context_usage(
         let mut bytes = 16usize
             .saturating_add(record.job.input.text().len())
             .saturating_add(record.job.input.attachments().len().saturating_mul(4800));
+        // Only the Result that ended an untouched reservation may exist on a
+        // Job that never started (see `unstarted_settlement_in`).
+        let ended_unstarted = record.job.phase == MutableJobPhase::Queued
+            && unstarted_settlement_in(
+                rx,
+                &record,
+                allocations
+                    .get(turn.get())?
+                    .map(|row| transactions::decode_pool_allocation(turn.get(), row.value()))
+                    .transpose()?
+                    .as_ref(),
+            )?
+            .is_some();
         for entry in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
-            // Only the Result that ended an untouched reservation may exist
-            // on a Job that never started (see `mutable_job_details_in`).
-            let ended_unstarted = record.job.phase == MutableJobPhase::Queued
-                && record
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Failed);
             if record.job.phase != MutableJobPhase::Executing && !ended_unstarted {
                 return Err(StorageError::corrupted("Job has output before execution"));
             }

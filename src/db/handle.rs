@@ -441,11 +441,14 @@ fn prepare_development_handoff(
                 ));
             }
             for turn in &snapshot.history {
+                // A turn that never started has a typed Result written by the
+                // host, not an answer; a cancelled turn has none either.
                 let answer = if turn
                     .record
                     .outcome
                     .as_ref()
                     .is_some_and(|outcome| outcome.kind == entities::OutcomeKind::Cancelled)
+                    || turn.record.job.phase != entities::MutableJobPhase::Executing
                 {
                     None
                 } else {
