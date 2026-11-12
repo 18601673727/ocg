@@ -128,16 +128,12 @@ pub(crate) use reader::read_global_outbound_headers;
 pub(crate) use reader::read_handoff_credential;
 pub(crate) use reader::read_trial_job;
 pub(crate) use reader::{
-    AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
-    NativeJobItem, read_approved_calls, read_cards, read_conversation_children, read_has_decider,
-    read_has_pending_approvals,
-};
-pub(crate) use reader::{
-    ContextState, ContextWorkDetails, JobTree, SummarizationInput, TreeFacts, TreeNode,
-    UnresolvedExecution, UsageRetriesPage, content_available, probe_committed, queue_counts,
-    read_agent_model_configs, read_attachment, read_attachments, read_candidate_compatible,
-    read_children, read_compatible_executors, read_config, read_configs, read_context_state,
-    read_conversation_search, read_conversations, read_credential_ref_in_use,
+    ActivationSnapshot, ContextState, ContextWorkDetails, GENESIS_JOB, JobTree, OfflineActivation,
+    RecurrenceAudit, SummarizationInput, TreeFacts, TreeNode, UnresolvedExecution,
+    UsageRetriesPage, activation_snapshot, content_available, inspect_activation_offline,
+    probe_committed, queue_counts, read_agent_model_configs, read_attachment, read_attachments,
+    read_candidate_compatible, read_children, read_compatible_executors, read_config, read_configs,
+    read_context_state, read_conversation_search, read_conversations, read_credential_ref_in_use,
     read_decision_executors, read_decision_work, read_effective_context_policy,
     read_execution_pool, read_execution_pools, read_executor, read_executors, read_job,
     read_job_configuration, read_job_input, read_job_input_for_job, read_job_search, read_job_tree,
@@ -146,6 +142,11 @@ pub(crate) use reader::{
     read_project, read_projects, read_retries, read_submission, read_summarization_input,
     read_tool_evidence, read_tool_stats, read_unresolved_executions, read_usage_buckets,
     read_usage_retries, read_usage_summary,
+};
+pub(crate) use reader::{
+    AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
+    NativeJobItem, read_approved_calls, read_cards, read_conversation_children, read_has_decider,
+    read_has_pending_approvals,
 };
 pub(crate) use reader::{
     MutableConversationPage, MutableJobDetails, MutableJobDetailsLookup, TurnContext,

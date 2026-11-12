@@ -606,13 +606,38 @@ pub enum ClaimScope {
 }
 
 impl ExecutionRuntime {
+    /// A runtime without autonomous authority: whatever the build compiles,
+    /// it schedules nothing. Every host and command starts one of these
+    /// unless it was explicitly armed; see [`Self::start_armed`].
     pub fn start(
         database: DatabaseHandle,
         scope: ClaimScope,
     ) -> Result<Self, ExecutionRuntimeError> {
+        Self::start_with(database, scope, None)
+    }
+
+    /// A runtime the operator armed for autonomous loopback scheduling; see
+    /// [`crate::system::loopback_activation`]. The token is necessary, and
+    /// the compiled [`ExecutionControl::AutonomousScheduling`] remains
+    /// necessary too: without either, this schedules nothing.
+    pub(crate) fn start_armed(
+        database: DatabaseHandle,
+        scope: ClaimScope,
+        armed: crate::system::loopback_activation::ArmedActivation,
+    ) -> Result<Self, ExecutionRuntimeError> {
+        Self::start_with(database, scope, Some(armed))
+    }
+
+    fn start_with(
+        database: DatabaseHandle,
+        scope: ClaimScope,
+        armed: Option<crate::system::loopback_activation::ArmedActivation>,
+    ) -> Result<Self, ExecutionRuntimeError> {
         // Only a runtime that schedules takes the database's scheduler wake;
-        // one that never schedules leaves it untouched.
-        let wake = if ExecutionControl::AutonomousScheduling.is_enabled() {
+        // one that never schedules leaves it untouched. Scheduling takes the
+        // compiled control and the operator's arming of this run, both.
+        let armed = armed.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled());
+        let wake = if armed.is_some() {
             Some(
                 database
                     .take_scheduler_wake()
@@ -632,6 +657,7 @@ impl ExecutionRuntime {
             database,
             scope,
             wake,
+            armed,
             wakes,
             sender.clone(),
             receiver,
@@ -687,6 +713,7 @@ async fn dispatch_runtime(
     database: DatabaseHandle,
     scope: ClaimScope,
     wake: Option<crate::db::SchedulerWakeSubscription>,
+    armed: Option<crate::system::loopback_activation::ArmedActivation>,
     wakes: flume::Receiver<()>,
     sender: SchedulerNotifications,
     receiver: flume::Receiver<SchedulerMessage>,
@@ -695,8 +722,12 @@ async fn dispatch_runtime(
     shutdown: CancellationToken,
     native_stops: crate::system::native_scheduler::NativeStops,
 ) -> Result<(), ExecutionRuntimeError> {
-    let Some(wake) = wake.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled()) else {
-        // No autonomous dispatch of any kind.
+    let (Some(wake), Some(armed)) = (
+        wake.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled()),
+        armed,
+    ) else {
+        // No autonomous dispatch of any kind: the control is not compiled
+        // in, or this run was not armed.
         drop(admissions);
         shutdown.cancelled().await;
         return Ok(());
@@ -709,7 +740,8 @@ async fn dispatch_runtime(
         drop(admissions);
         match scope {
             ClaimScope::Stored => {
-                crate::system::native_scheduler::run(database, wake, shutdown, native_stops).await;
+                crate::system::native_scheduler::run(database, wake, shutdown, native_stops, armed)
+                    .await;
             }
             ClaimScope::Process => shutdown.cancelled().await,
         }

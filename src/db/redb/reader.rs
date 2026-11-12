@@ -59,15 +59,53 @@ enum OfflineAccess<'a> {
     Copy(&'a mut Database),
 }
 
+impl OfflineAccess<'_> {
+    /// How this session reached the file, for a report.
+    const fn name(&self) -> &'static str {
+        match self {
+            OfflineAccess::InPlace(_) => "in_place_read_only",
+            OfflineAccess::Copy(_) => "private_unlinked_copy",
+        }
+    }
+}
+
+/// What an offline session reads the original file's identity and metadata as,
+/// before it reads and after it returns. A successful session leaves every
+/// field here equal to the value it started with; anything else is refused.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OfflineFile {
+    pub(crate) bytes: u64,
+    /// The device and inode the file lives at; see
+    /// [`crate::system::loopback_activation::DatabaseIdentity`].
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) mode: u32,
+}
+
+/// What an offline session may do, beyond reading.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OfflineOptions {
+    /// Read a private unlinked copy even when the file could be read in place.
+    pub(crate) force_copy: bool,
+    /// Refuse a data directory without the host lock file. A directory that
+    /// has none has never been opened by a host that honors the lock, so a
+    /// concurrent writer cannot be excluded without creating the file, which
+    /// a read-only session never does.
+    pub(crate) require_host_lock: bool,
+}
+
 /// Runs `inspect` on a stopped database without ever opening the original for
 /// writing. It refuses while a host holds the database. A database that was
 /// not closed cleanly, or any call with `force_copy`, reads a private unlinked
-/// copy instead. The original must be unchanged when `inspect` returns.
+/// copy instead. The original must be unchanged when `inspect` returns: its
+/// bytes, modification time, mode and the device and inode it lives at are
+/// compared afterwards, and the path must still name the very file that was
+/// read.
 fn with_offline_database<T>(
     directory: &std::path::Path,
-    force_copy: bool,
+    options: OfflineOptions,
     inspect: impl FnOnce(OfflineAccess<'_>) -> Result<T, StorageError>,
-) -> Result<(T, u64), StorageError> {
+) -> Result<(T, OfflineFile), StorageError> {
     fn refused(detail: impl Into<String>) -> StorageError {
         StorageError {
             kind: StorageErrorKind::Other,
@@ -106,14 +144,14 @@ fn with_offline_database<T>(
     if !std::fs::symlink_metadata(&path).map_err(io)?.is_file() {
         return Err(StorageError::corrupted("database is not a regular file"));
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        open.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(&path).map_err(io)?;
+    let file = open.open(&path).map_err(io)?;
     let before = file.metadata().map_err(io)?;
     #[cfg(unix)]
     {
@@ -129,16 +167,28 @@ fn with_offline_database<T>(
         directory.join(crate::system::data_directory::DATABASE_LOCK_FILE),
     ) {
         Ok(lock) => Some(lock),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && !options.require_host_lock =>
+        {
+            None
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(refused(
+                "the data directory holds no database lock file, so a concurrent writer cannot be \
+                 excluded without creating one; refusing to read a database that may be changing",
+            ));
+        }
         Err(error) => return Err(io(error)),
     };
     if let Some(lock) = &host_lock
         && lock.try_lock_shared().is_err()
     {
-        return Err(refused("the database is in use by a running OCG host"));
+        return Err(refused(
+            "the database is in use by a running OCG host; the database lock is held exclusively",
+        ));
     }
 
-    let in_place = if force_copy {
+    let in_place = if options.force_copy {
         None
     } else {
         match ::redb::ReadOnlyDatabase::open(&path) {
@@ -181,7 +231,36 @@ fn with_offline_database<T>(
     {
         return Err(refused("database file changed during inspection"));
     }
-    Ok((result, after.len()))
+    // The name must still reach the very file that was read: a rename or a
+    // replacement under the read would otherwise pass every check above.
+    let named_after = std::fs::symlink_metadata(&path).map_err(io)?;
+    let mut identity = OfflineFile {
+        bytes: after.len(),
+        device: 0,
+        inode: 0,
+        mode: 0,
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let named_identity = (named_after.dev(), named_after.ino());
+        if named_identity != (before.dev(), before.ino())
+            || named_after.permissions().mode() & 0o7777 != before.permissions().mode() & 0o7777
+        {
+            return Err(refused(
+                "the database file was replaced or its permissions changed during inspection",
+            ));
+        }
+        identity.device = before.dev();
+        identity.inode = before.ino();
+        identity.mode = before.permissions().mode() & 0o7777;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &named_after;
+    }
+    Ok((result, identity))
 }
 
 /// Offline, strictly read-only inspection of the Pool Allocations that still
@@ -191,17 +270,21 @@ fn with_offline_database<T>(
 pub(crate) fn inspect_held_allocations_offline(
     directory: &std::path::Path,
 ) -> Result<serde_json::Value, StorageError> {
-    let (mut report, bytes) = with_offline_database(directory, false, |access| match access {
-        OfflineAccess::InPlace(database) => {
-            inspect_held_in(database, "read-only; the database file was not copied")
-        }
-        OfflineAccess::Copy(database) => inspect_held_in(
-            database,
-            "the database was not closed cleanly; read from a private unlinked copy \
-             that redb repaired, the original file was not opened for writing",
-        ),
-    })?;
-    report["database"]["file_bytes"] = serde_json::json!(bytes);
+    let (mut report, file) = with_offline_database(
+        directory,
+        OfflineOptions::default(),
+        |access| match access {
+            OfflineAccess::InPlace(database) => {
+                inspect_held_in(database, "read-only; the database file was not copied")
+            }
+            OfflineAccess::Copy(database) => inspect_held_in(
+                database,
+                "the database was not closed cleanly; read from a private unlinked copy \
+                 that redb repaired, the original file was not opened for writing",
+            ),
+        },
+    )?;
+    report["database"]["file_bytes"] = serde_json::json!(file.bytes);
     report["database"]["file_unchanged_during_inspection"] = serde_json::json!(true);
     Ok(report)
 }
@@ -413,45 +496,52 @@ fn verify_offline_with_ownership(
     recovered: bool,
 ) -> Result<serde_json::Value, StorageError> {
     use serde_json::json;
-    let (mut report, bytes) = with_offline_database(directory, pages, |access| {
-        let (access_note, page_checksums) = match access {
-            OfflineAccess::InPlace(database) => {
-                let logical = if recovered {
-                    recovery::verify_recovered(database)
+    let (mut report, file) = with_offline_database(
+        directory,
+        OfflineOptions {
+            force_copy: pages,
+            require_host_lock: false,
+        },
+        |access| {
+            let (access_note, page_checksums) = match access {
+                OfflineAccess::InPlace(database) => {
+                    let logical = if recovered {
+                        recovery::verify_recovered(database)
+                    } else {
+                        recovery::verify_full(database)
+                    };
+                    return Ok(json!({
+                        "access": "read-only; the database file was not copied",
+                        "logical_checks": logical_report(logical),
+                        "page_checksums": "not checked; pass --pages to check them on a private copy",
+                    }));
+                }
+                OfflineAccess::Copy(database) => {
+                    let logical = if recovered {
+                        recovery::verify_recovered(&*database)
+                    } else {
+                        recovery::verify_full(&*database)
+                    };
+                    let logical = logical_report(logical);
+                    let intact = database.check_integrity()?;
+                    (
+                        "read from a private unlinked copy; the original file was not opened for writing",
+                        (logical, intact),
+                    )
+                }
+            };
+            Ok(json!({
+                "access": access_note,
+                "logical_checks": page_checksums.0,
+                "page_checksums": if page_checksums.1 {
+                    "every page checksum verified"
                 } else {
-                    recovery::verify_full(database)
-                };
-                return Ok(json!({
-                    "access": "read-only; the database file was not copied",
-                    "logical_checks": logical_report(logical),
-                    "page_checksums": "not checked; pass --pages to check them on a private copy",
-                }));
-            }
-            OfflineAccess::Copy(database) => {
-                let logical = if recovered {
-                    recovery::verify_recovered(&*database)
-                } else {
-                    recovery::verify_full(&*database)
-                };
-                let logical = logical_report(logical);
-                let intact = database.check_integrity()?;
-                (
-                    "read from a private unlinked copy; the original file was not opened for writing",
-                    (logical, intact),
-                )
-            }
-        };
-        Ok(json!({
-            "access": access_note,
-            "logical_checks": page_checksums.0,
-            "page_checksums": if page_checksums.1 {
-                "every page checksum verified"
-            } else {
-                "redb found damage and had to repair the copy; the original needs restoring from a backup"
-            },
-        }))
-    })?;
-    report["file_bytes"] = json!(bytes);
+                    "redb found damage and had to repair the copy; the original needs restoring from a backup"
+                },
+            }))
+        },
+    )?;
+    report["file_bytes"] = json!(file.bytes);
     report["file_unchanged_during_check"] = json!(true);
     Ok(report)
 }
@@ -5394,8 +5484,13 @@ pub(crate) fn queue_counts(
     database: &Database,
     for_update: bool,
 ) -> Result<QueueCounts, StorageError> {
-    use crate::db::entities::AllocationPhase;
     let rx = read(database)?;
+    queue_counts_in(&rx, for_update)
+}
+
+/// [`queue_counts`] inside one read transaction the caller already holds.
+fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts, StorageError> {
+    use crate::db::entities::AllocationPhase;
     let pending_table = rx.open_table(PENDING)?;
     let delayed_table = rx.open_table(DELAYED)?;
     let (pending, delayed) = if for_update {
@@ -5452,6 +5547,298 @@ pub(crate) fn queue_counts(
         running,
         held,
     })
+}
+
+/// One entry of the native ready index as an activation preflight reads it:
+/// the Job, where it stands in the index, what it is and the configuration it
+/// was frozen with. It is a read, never a selection: nothing here decides
+/// what may run.
+pub(crate) struct ReadyQueueEntry {
+    pub(crate) job: JobId,
+    pub(crate) priority: u8,
+    pub(crate) submitted_at_us: i64,
+    pub(crate) phase: crate::db::entities::MutableJobPhase,
+    pub(crate) generative: bool,
+    pub(crate) frozen: Option<crate::db::entities::MutableFrozenConfiguration>,
+}
+
+/// The Genesis Job: the root of every parent chain. `recovery::open` records
+/// it as Job 0 in every database, so a read that never opens one can still
+/// name it.
+pub(crate) const GENESIS_JOB: JobId = JobId::new(0);
+
+/// What a first activation must know about the loops a database holds. A
+/// recurrence that is not `Halted` can append a new turn, and so create a Job,
+/// without any submission: `Active` is mid-loop, and `WaitingDue` is scheduled
+/// to append at its due time. Its derived index, `RECURRENCE_DUE`, is where
+/// `boundary_b` learns of the due ones, so the two must agree exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecurrenceAudit {
+    pub(crate) total: u64,
+    pub(crate) active: u64,
+    pub(crate) waiting_due: u64,
+    pub(crate) halted: u64,
+    /// `WaitingDue` rows whose time has already passed.
+    pub(crate) due_now: u64,
+    /// Rows in the derived due index.
+    pub(crate) due_index_rows: u64,
+    /// Jobs waiting for another Job to settle. None can be released while no
+    /// Allocation is held, but a first activation over a database that holds
+    /// none expects to find none.
+    pub(crate) dependency_waiters: u64,
+    /// The first disagreement between the recurrences and their due index.
+    pub(crate) inconsistency: Option<String>,
+}
+
+impl RecurrenceAudit {
+    /// Whether any loop can create work after activation, and why.
+    pub(crate) fn blocking(&self) -> Option<String> {
+        if self.active > 0 {
+            return Some(format!(
+                "{} recurrence(s) are Active: a loop is mid-iteration and its next turn can append a Job without any submission",
+                self.active
+            ));
+        }
+        if self.waiting_due > 0 {
+            return Some(format!(
+                "{} recurrence(s) are WaitingDue ({} already due, {} in the future): each appends a new turn, and so creates a Job, at its due time without any submission",
+                self.waiting_due,
+                self.due_now,
+                self.waiting_due - self.due_now
+            ));
+        }
+        if self.dependency_waiters > 0 {
+            return Some(format!(
+                "{} Job(s) wait for another Job to settle; a first activation over a database that holds no executable work expects none",
+                self.dependency_waiters
+            ));
+        }
+        None
+    }
+}
+
+/// Everything a first activation reads, from one read transaction, so every
+/// count describes the same state. It is a read: nothing here selects,
+/// reserves, cancels, repairs or rebuilds anything.
+pub(crate) struct ActivationSnapshot {
+    /// The stored `open_epoch`, before any opening this process makes.
+    pub(crate) open_epoch: u64,
+    /// The stored `clean_shutdown` marker, as left by the last closing host.
+    pub(crate) clean_shutdown: bool,
+    /// Exact counts. A non-zero `pending`, `ready`, `delayed` or `held` refuses
+    /// activation on its own, so no decision depends on a bounded listing.
+    pub(crate) counts: QueueCounts,
+    /// The first `limit` ready entries in the index's order.
+    pub(crate) ready: Vec<ReadyQueueEntry>,
+    /// Whether the ready index holds more entries than `ready` shows.
+    pub(crate) truncated: bool,
+    pub(crate) recurrences: RecurrenceAudit,
+}
+
+/// Reads [`ActivationSnapshot`] from `database`, whether that is an open
+/// `Database` or a `ReadOnlyDatabase`, without writing anything.
+///
+/// The queues are counted exhaustively: `pending`, `ready` and `delayed` are
+/// the indices the scheduler claims from and promotes, so a non-zero count of
+/// any is work that could start. The recurrences and their due index are read
+/// in full, because a loop can create work without appearing in any queue. An
+/// entry that names a Job or a recurrence that does not exist is an error,
+/// never a zero: a first activation refuses an inconsistent database.
+pub(crate) fn activation_snapshot(
+    database: &impl ReadableDatabase,
+    limit: usize,
+) -> Result<ActivationSnapshot, StorageError> {
+    let rx = database.begin_read()?;
+    let meta = rx.open_table(META)?;
+    recovery::check_identity(&meta)?;
+    let open_epoch = meta
+        .get("open_epoch")?
+        .and_then(|value| <[u8; 8]>::try_from(value.value()).ok())
+        .map_or(0, u64::from_le_bytes);
+    let clean_shutdown = meta
+        .get("clean_shutdown")?
+        .is_some_and(|value| value.value().first().is_some_and(|flag| *flag != 0));
+    // Exact counts, including whether any Allocation still holds capacity.
+    let counts = queue_counts_in(&rx, false)?;
+
+    // The queues the scheduler claims from, and the ones `boundary_b`
+    // promotes into them. Each entry must name a Job, within the bounded
+    // preview: the counts are exact, and a non-zero count refuses alone.
+    let jobs = rx.open_table(JOBS)?;
+    for (index, entry) in rx.open_table(PENDING)?.iter()?.enumerate() {
+        if index == limit {
+            break;
+        }
+        if jobs.get(entry?.0.value())?.is_none() {
+            return Err(StorageError::corrupted(
+                "pending entry references a missing Job",
+            ));
+        }
+    }
+    for (index, entry) in rx.open_table(DELAYED)?.iter()?.enumerate() {
+        if index == limit {
+            break;
+        }
+        if jobs.get(entry?.0.value().1)?.is_none() {
+            return Err(StorageError::corrupted(
+                "delayed entry references a missing Job",
+            ));
+        }
+    }
+    let mut ready = Vec::new();
+    let mut truncated = false;
+    for entry in rx.open_table(MUTABLE_READY)?.iter()? {
+        let key = entry?.0.value();
+        if ready.len() == limit {
+            truncated = true;
+            break;
+        }
+        let id = JobId::new(key.2);
+        let Some(bytes) = jobs.get(id.get())? else {
+            return Err(StorageError::corrupted(
+                "ready entry references a missing Job",
+            ));
+        };
+        let job = transactions::decode_mutable_job(id.get(), bytes.value())?;
+        ready.push(ReadyQueueEntry {
+            job: id,
+            priority: key.0,
+            submitted_at_us: key.1,
+            phase: job.phase,
+            generative: matches!(
+                job.input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            ),
+            frozen: job.frozen,
+        });
+    }
+    Ok(ActivationSnapshot {
+        open_epoch,
+        clean_shutdown,
+        counts,
+        ready,
+        truncated,
+        recurrences: recurrence_audit(&rx)?,
+    })
+}
+
+/// The loops a database holds, and whether their derived due index agrees
+/// with them; see [`RecurrenceAudit`]. Every recurrence row and every row of
+/// the due index is read: this is the one queue a bounded preview may not
+/// cover, because one row is enough to create work.
+fn recurrence_audit(rx: &ReadTransaction) -> Result<RecurrenceAudit, StorageError> {
+    use std::collections::BTreeSet;
+    let clock = recovery::promotion_clock();
+    let mut audit = RecurrenceAudit {
+        total: 0,
+        active: 0,
+        waiting_due: 0,
+        halted: 0,
+        due_now: 0,
+        due_index_rows: 0,
+        dependency_waiters: 0,
+        inconsistency: None,
+    };
+    let mut waiting: BTreeSet<(i64, u128)> = BTreeSet::new();
+    for entry in rx.open_table(RECURRENCES)?.iter()? {
+        let (key, value) = entry?;
+        let conversation = key.value();
+        let recurrence = Recurrence::decode(value.value())?;
+        audit.total += 1;
+        match recurrence.phase {
+            RecurrencePhase::Active => audit.active += 1,
+            RecurrencePhase::WaitingDue { due } => {
+                audit.waiting_due += 1;
+                if due <= clock {
+                    audit.due_now += 1;
+                }
+                waiting.insert((due, conversation));
+            }
+            RecurrencePhase::Halted { .. } => audit.halted += 1,
+        }
+    }
+    let mut seen: BTreeSet<(i64, u128)> = BTreeSet::new();
+    for entry in rx.open_table(RECURRENCE_DUE)?.iter()? {
+        let (due, conversation) = entry?.0.value();
+        audit.due_index_rows += 1;
+        if !waiting.contains(&(due, conversation)) {
+            audit.inconsistency.get_or_insert_with(|| {
+                format!(
+                    "the recurrence due index names a conversation due at {due} whose recurrence is not waiting for that time"
+                )
+            });
+        } else {
+            seen.insert((due, conversation));
+        }
+    }
+    for (due, _) in waiting.difference(&seen) {
+        audit.inconsistency.get_or_insert_with(|| {
+            format!(
+                "a recurrence is waiting to be due at {due} but the due index holds no row for it"
+            )
+        });
+    }
+    audit.dependency_waiters = rx.open_table(DEPENDENCY_WAITERS)?.len()?;
+    Ok(audit)
+}
+
+/// An offline read-only inspection of one existing database, and the identity
+/// of the file it read; see [`activation_snapshot`].
+pub(crate) struct OfflineActivation {
+    pub(crate) snapshot: ActivationSnapshot,
+    /// `in_place_read_only` or `private_unlinked_copy`.
+    pub(crate) access: &'static str,
+    /// Whether the file was copied. A copy means redb had to repair it, so the
+    /// state read is a recovered one and not necessarily what a host opening
+    /// the original would see.
+    pub(crate) copied: bool,
+    /// The file as it was read, and as [`with_offline_database`] verified it
+    /// still is afterwards.
+    pub(crate) file: OfflineFile,
+}
+
+/// Reads one existing database without opening it for writing, creating
+/// anything, or taking the host lock exclusively; see
+/// [`with_offline_database`], whose checks it inherits. It refuses a data
+/// directory without a database, a database that is not of this build's
+/// format, and a database a host currently holds.
+pub(crate) fn inspect_activation_offline(
+    directory: &std::path::Path,
+    limit: usize,
+) -> Result<OfflineActivation, StorageError> {
+    let (session, file) = with_offline_database(
+        directory,
+        OfflineOptions {
+            // A copy is the only way to read a database redb would have to
+            // repair: read in place whenever the file permits it.
+            force_copy: false,
+            require_host_lock: true,
+        },
+        |access| {
+            let (snapshot, access, copied) = match &access {
+                OfflineAccess::InPlace(database) => {
+                    (activation_snapshot(*database, limit)?, access.name(), false)
+                }
+                OfflineAccess::Copy(database) => (
+                    activation_snapshot(&**database, limit)?,
+                    access.name(),
+                    true,
+                ),
+            };
+            Ok(OfflineActivation {
+                snapshot,
+                access,
+                copied,
+                file: OfflineFile {
+                    bytes: 0,
+                    device: 0,
+                    inode: 0,
+                    mode: 0,
+                },
+            })
+        },
+    )?;
+    Ok(OfflineActivation { file, ..session })
 }
 
 pub(crate) fn read_tool_stats(

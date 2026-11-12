@@ -166,6 +166,7 @@ where
         signals,
         None,
         crate::system::scheduler::ClaimScope::Process,
+        None,
         until_stopped,
     )
 }
@@ -190,9 +191,48 @@ where
         signals,
         control,
         crate::system::scheduler::ClaimScope::Stored,
+        None,
         until_stopped,
     )
     .into_result()
+}
+
+/// Like [`run_controlled`], for the one host the operator arms for
+/// autonomous loopback scheduling over `data_directory`; see
+/// [`crate::system::loopback_activation`]. The activation preflight runs
+/// inside the host, after it holds the database exclusively and before its
+/// execution runtime starts, so nothing can be queued or claimed between the
+/// check and the arming. A refused preflight fails the run at startup with
+/// the refusal, `until_stopped` is not called and the database is closed
+/// unchanged. `report` receives the preflight report either way.
+pub(crate) fn run_activated<F>(
+    data_directory: &DataDirectory,
+    control: Option<ControlPlaneConfig>,
+    activation: crate::system::loopback_activation::ActivationRequest,
+    report: impl FnOnce(&serde_json::Value) + 'static,
+    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+) -> Result<(), HostError>
+where
+    F: Future<Output = ()> + 'static,
+{
+    run_scoped_reporting(
+        data_directory,
+        true,
+        control,
+        crate::system::scheduler::ClaimScope::Stored,
+        Some(Activation {
+            request: activation,
+            report: Box::new(report),
+        }),
+        until_stopped,
+    )
+    .into_result()
+}
+
+/// An activation the run was asked for, and where its preflight report goes.
+struct Activation {
+    request: crate::system::loopback_activation::ActivationRequest,
+    report: Box<dyn FnOnce(&serde_json::Value)>,
 }
 
 fn run_scoped_reporting<F>(
@@ -200,6 +240,7 @@ fn run_scoped_reporting<F>(
     signals: bool,
     control: Option<ControlPlaneConfig>,
     scope: crate::system::scheduler::ClaimScope,
+    activation: Option<Activation>,
     until_stopped: impl FnOnce(HostContext) -> F + 'static,
 ) -> HostReport
 where
@@ -232,8 +273,10 @@ where
         .build(ntex::rt::DefaultRuntime)
         .block_on(serve(
             database.handle(),
+            data_directory.clone(),
             scope,
             control,
+            activation,
             workspace_tools,
             until_stopped,
         ));
@@ -249,10 +292,13 @@ where
 /// the execution runtime, so no submission starts once stopping begins; log
 /// cleanup; the logger. The caller closes the
 /// database after it.
+#[allow(clippy::too_many_arguments)]
 async fn serve<F>(
     handle: DatabaseHandle,
+    data_directory: DataDirectory,
     scope: crate::system::scheduler::ClaimScope,
     control: Option<ControlPlaneConfig>,
+    activation: Option<Activation>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
@@ -260,7 +306,34 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
-    let execution = match ExecutionRuntime::start(handle.clone(), scope) {
+    // The activation preflight and the arming happen here, under the
+    // database lock this host holds and before anything can submit or
+    // claim: an unarmed start, the default, schedules nothing.
+    let armed = match activation {
+        None => None,
+        Some(activation) => {
+            let (preflight, armed) = crate::system::loopback_activation::arm(
+                &handle,
+                &data_directory,
+                &activation.request,
+            )
+            .await;
+            (activation.report)(&preflight);
+            match armed {
+                Ok(armed) => Some(armed),
+                Err(refusal) => {
+                    report.fail(Phase::Startup, refusal);
+                    return report;
+                }
+            }
+        }
+    };
+    let armed_run = armed.is_some();
+    let started = match armed {
+        None => ExecutionRuntime::start(handle.clone(), scope),
+        Some(armed) => ExecutionRuntime::start_armed(handle.clone(), scope, armed),
+    };
+    let execution = match started {
         Ok(execution) => execution,
         Err(error) => {
             report.fail(Phase::Startup, error);
@@ -295,6 +368,14 @@ where
                     control.state()
                 );
             }
+            log::info!(
+                "autonomous loopback scheduling runtime authority: {}",
+                if armed_run {
+                    "armed by the operator for this run"
+                } else {
+                    "not armed (default)"
+                }
+            );
             handle.log_open_warnings();
             if std::env::var_os(REMOVED_WORKSPACE_ROOT_VARIABLE).is_some() {
                 log::warn!(

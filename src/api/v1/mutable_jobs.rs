@@ -263,10 +263,17 @@ pub(super) async fn add_editable_state(
     body["context"] = serde_json::json!(job.composer_context.to_string());
     body["submitted_at"] = serde_json::json!(job.submitted_at.map(|at| at.as_unix_micros()));
     body["input"] = input_view(job);
+    let queued_generative = job.phase == MutableJobPhase::Queued
+        && record.outcome.is_none()
+        && matches!(job.input.content, MutableJobContent::Generative { .. });
+    // Derived from the frozen configuration, stored nowhere and deciding
+    // nothing: why autonomous loopback scheduling would or would not select
+    // this queued Job, so an ineligible one is never silently left waiting.
+    if queued_generative {
+        body["autonomous_loopback_eligibility"] =
+            crate::system::native_scheduler::loopback_eligibility(job.frozen.as_ref()).to_json();
+    }
     if let Some(context) = context {
-        let queued_generative = job.phase == MutableJobPhase::Queued
-            && record.outcome.is_none()
-            && matches!(job.input.content, MutableJobContent::Generative { .. });
         body["unsupported_decision_history"] = Value::Bool(if queued_generative {
             database
                 .mutable_job_with_support(context, job.id)

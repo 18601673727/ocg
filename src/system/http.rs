@@ -30,6 +30,75 @@ pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
     }
 }
 
+/// Why a frozen endpoint is, or is not, one [`direct_diagnostic_loopback`]
+/// admits. It explains the one policy; it never widens it: only
+/// [`Self::LiteralDirect`] is admitted, and the classification is derived
+/// from the endpoint text and the process's proxy configuration alone, never
+/// from a lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoopbackEndpointClass {
+    /// `http://127.0.0.1:<port>` that no configured proxy intercepts.
+    LiteralDirect,
+    /// A literal `127.0.0.1` endpoint the configured proxy would intercept,
+    /// or whose proxy configuration cannot be read.
+    LiteralProxied,
+    /// `http://127.0.0.1` without an explicit, non-zero port, or with a
+    /// scheme, credential or query the literal policy refuses.
+    LiteralMalformed,
+    /// The host is the name `localhost`: admitted by configuration, resolved
+    /// by a lookup this policy never makes.
+    LocalhostName,
+    /// The host is the IPv6 loopback address `::1`.
+    Ipv6Loopback,
+    /// Any other destination.
+    External,
+    /// Not a URI at all.
+    Unparseable,
+}
+
+impl LoopbackEndpointClass {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            LoopbackEndpointClass::LiteralDirect => "literal_direct_loopback",
+            LoopbackEndpointClass::LiteralProxied => "literal_loopback_proxied",
+            LoopbackEndpointClass::LiteralMalformed => "literal_loopback_malformed",
+            LoopbackEndpointClass::LocalhostName => "localhost_name",
+            LoopbackEndpointClass::Ipv6Loopback => "ipv6_loopback",
+            LoopbackEndpointClass::External => "external",
+            LoopbackEndpointClass::Unparseable => "unparseable",
+        }
+    }
+}
+
+/// Classifies `endpoint` against the literal loopback policy; see
+/// [`LoopbackEndpointClass`]. `LiteralDirect` if and only if
+/// [`literal_direct_loopback`] is true.
+pub(crate) fn classify_loopback_endpoint(endpoint: &str) -> LoopbackEndpointClass {
+    let Ok(uri) = endpoint.parse::<Uri>() else {
+        return LoopbackEndpointClass::Unparseable;
+    };
+    match uri.host() {
+        Some("127.0.0.1") => {
+            if literal_direct_loopback(endpoint) {
+                LoopbackEndpointClass::LiteralDirect
+            } else if uri.scheme_str() == Some("http")
+                && uri
+                    .authority()
+                    .is_some_and(|authority| !authority.as_str().contains('@'))
+                && uri.query().is_none()
+                && uri.port_u16().is_some_and(|port| port != 0)
+            {
+                LoopbackEndpointClass::LiteralProxied
+            } else {
+                LoopbackEndpointClass::LiteralMalformed
+            }
+        }
+        Some("localhost") => LoopbackEndpointClass::LocalhostName,
+        Some("::1" | "[::1]") => LoopbackEndpointClass::Ipv6Loopback,
+        Some(_) | None => LoopbackEndpointClass::External,
+    }
+}
+
 /// Diagnostic execution must never tunnel a loopback request through a proxy.
 fn literal_direct_loopback(endpoint: &str) -> bool {
     let Ok(uri) = endpoint.parse::<Uri>() else {

@@ -6,6 +6,7 @@ pub(crate) mod external_trial;
 pub mod http;
 pub mod log_cleanup;
 pub mod logger;
+pub(crate) mod loopback_activation;
 pub(crate) mod manual_execution;
 pub(crate) mod manual_external;
 pub(crate) mod manual_loopback;

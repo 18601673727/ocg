@@ -4,6 +4,7 @@ use crate::system::data_directory::DataDirectory;
 mod external_trial;
 mod inspect_held;
 mod llm_target;
+mod loopback_scheduling;
 mod manual_host;
 mod migrate;
 #[cfg(unix)]
@@ -53,6 +54,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         if command == "run-loopback-job" {
             return run_loopback_job::run(arguments.collect());
+        }
+        if command == loopback_scheduling::COMMAND {
+            return loopback_scheduling::run(arguments.collect());
         }
         if command == "verify" {
             return verify::run(arguments.collect());
@@ -121,6 +125,18 @@ fn usage() -> &'static str {
          --confirm-external-request\n\
          (runs one named submitted Generative Job once against its approved HTTPS endpoint through the named proxy;\n\
           refused unless the manual_external_execution control is enabled in the build)\n\
+       loopback-scheduling preflight --data-dir <path> [--database <device:inode>]\n\
+         (read-only activation preflight of an existing database: identity, queues, recurrences, controls, eligibility,\n\
+          and the challenge a serve of exactly this database state must be given; opens nothing, creates nothing, arms nothing)\n\
+       loopback-scheduling serve --data-dir <path> --database <device:inode> --confirm-first-activation --confirm-loopback-only\n\
+         [--confirm-challenge <ocg1-...>]\n\
+         (the one host armed for autonomous loopback scheduling over exactly that database; the flags alone authorize\n\
+          nothing: serve needs the challenge a preflight of this state printed, and it names one opening, so a static\n\
+          challenge cannot be replayed after any opening, its own included. That is a state-bound, per-opening\n\
+          confirmation, not proof of a person: any local process that can run preflight can obtain a fresh challenge\n\
+          and pass it to serve, so a local wrapper can re-arm unattended, and the authority involved is the local\n\
+          ability to run this command as this user; refused unless the autonomous_scheduling control is enabled in\n\
+          the build and the database holds no queued work, no Allocation and no loop that can create work)\n\
        inspect-held <data-directory>            (read-only)\n\
        verify <data-directory> [--pages]        (offline integrity check; never writes the original)\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\

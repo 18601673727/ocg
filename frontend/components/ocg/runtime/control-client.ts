@@ -247,8 +247,48 @@ export type MutableJob = {
   phase: "unsubmitted" | "queued" | "executing" | "completed" | "failed" | "cancelled" | "unknown";
   submitted_at: number | null;
   unsupported_decision_history?: boolean;
+  /**
+   * What the backend knows about autonomous loopback dispatch for a queued
+   * Generative Job, derived from its frozen configuration and the host's
+   * endpoint policy, stored nowhere. `eligible` means those admit dispatch; it
+   * does not mean the Job will run, and nothing here grants execution
+   * authority. `not_assessed` names what only the scheduler's own transaction
+   * decides, and what the runtime authority has to supply first: the
+   * autonomous_scheduling control compiled in, an armed Host run, and the
+   * reservation and writer checks.
+   */
+  autonomous_loopback_eligibility?: AutonomousLoopbackEligibility;
   input: MutableJobInput;
 };
+
+export type AutonomousLoopbackEligibility = {
+  eligible: boolean;
+  code: string;
+  detail: string;
+  endpoint_class: string | null;
+  scope: "autonomous_loopback_dispatch_policy";
+  not_assessed?: string[];
+};
+
+function autonomousLoopbackEligibility(value: unknown): AutonomousLoopbackEligibility | undefined {
+  if (value === undefined) return undefined;
+  const eligibility = value as AutonomousLoopbackEligibility | null;
+  if (
+    !eligibility ||
+    typeof eligibility.eligible !== "boolean" ||
+    typeof eligibility.code !== "string" ||
+    typeof eligibility.detail !== "string" ||
+    !(eligibility.endpoint_class === null || typeof eligibility.endpoint_class === "string") ||
+    eligibility.scope !== "autonomous_loopback_dispatch_policy" ||
+    !(
+      eligibility.not_assessed === undefined ||
+      (Array.isArray(eligibility.not_assessed) &&
+        eligibility.not_assessed.every((field) => typeof field === "string"))
+    )
+  )
+    throw new ContractError("job.autonomous_loopback_eligibility", "an eligibility explanation");
+  return eligibility;
+}
 
 function mutableJob(value: unknown, context: string): MutableJob {
   const envelope = value as { api_version?: number; job?: MutableJob } | null;
@@ -275,6 +315,9 @@ function mutableJob(value: unknown, context: string): MutableJob {
   ) {
     throw new ContractError("job", "a valid mutable Job");
   }
+  job.autonomous_loopback_eligibility = autonomousLoopbackEligibility(
+    job.autonomous_loopback_eligibility,
+  );
   identity(job.id, "job");
   identity(job.conversation, "conversation");
   if (job.previous !== null) identity(job.previous, "previous");
@@ -307,6 +350,7 @@ function editableJob(value: unknown): unknown {
     phase?: MutableJob["phase"];
     submitted_at?: number | null;
     unsupported_decision_history?: boolean;
+    autonomous_loopback_eligibility?: unknown;
     input?: MutableJobInput;
   } | null;
   if (!body?.job) throw new ContractError("job", "a valid mutable Job");
@@ -322,6 +366,7 @@ function editableJob(value: unknown): unknown {
       phase: body.phase,
       submitted_at: body.submitted_at ?? null,
       unsupported_decision_history: body.unsupported_decision_history,
+      autonomous_loopback_eligibility: body.autonomous_loopback_eligibility,
       input: body.input,
     },
   };

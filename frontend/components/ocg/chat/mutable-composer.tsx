@@ -1044,9 +1044,21 @@ export function MutableComposer({
         <div aria-label="Queued Jobs" className="space-y-1 text-sm">
           {queued.map((job) => (
             <div key={job.id} className="flex items-center gap-2">
-              <span className="min-w-0 flex-1 truncate">
-                {job.unsupported_decision_history ? "Blocked by Decision history" : job.phase}:{" "}
-                {job.input.text || "Image Job"}
+              <span
+                className="min-w-0 flex-1 truncate"
+                title={
+                  job.autonomous_loopback_eligibility &&
+                  !job.autonomous_loopback_eligibility.eligible
+                    ? `Not eligible for autonomous loopback scheduling (${job.autonomous_loopback_eligibility.code}): ${job.autonomous_loopback_eligibility.detail}`
+                    : undefined
+                }
+              >
+                {job.unsupported_decision_history ? "Blocked by Decision history" : job.phase}
+                {job.autonomous_loopback_eligibility &&
+                !job.autonomous_loopback_eligibility.eligible
+                  ? ` (not schedulable: ${job.autonomous_loopback_eligibility.code})`
+                  : ""}
+                : {job.input.text || "Image Job"}
               </span>
               <Button
                 type="button"

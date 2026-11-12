@@ -7,9 +7,11 @@
 //! authority and none of theirs enables it. It is reached only from the host's
 //! execution runtime ([`crate::system::scheduler`]), only in the host that
 //! serves stored Jobs, and only when the build enables its control and does
-//! not enable [`ExecutionControl::LegacyProviderExecution`]. In a build where
-//! the control is disabled no [`SchedulingAuthority`] exists, so nothing here
-//! claims, starts or sends anything.
+//! not enable [`ExecutionControl::LegacyProviderExecution`], and only in a
+//! run the operator armed ([`crate::system::loopback_activation`]). In a
+//! build where the control is disabled, or a run that was not armed, no
+//! [`SchedulingAuthority`] exists, so nothing here claims, starts or sends
+//! anything.
 //!
 //! # Selection
 //!
@@ -100,6 +102,7 @@ use crate::system::execution_controls::ExecutionControl;
 use crate::system::executor::execution_runtime::{
     EndpointPolicy, supervise_development_generative,
 };
+use crate::system::loopback_activation::ArmedActivation;
 use crate::system::manual_execution::within_deadline;
 use crate::system::manual_loopback::{MAX_TIMEOUT_CEILING, check_prepared};
 use crate::system::scheduler::{DispatchBatch, Scheduler};
@@ -127,15 +130,183 @@ const CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
 
 /// The authority of one autonomous scheduling run. [`Self::autonomous`] is
 /// the only way to make one, and it makes none unless the build enables
-/// [`ExecutionControl::AutonomousScheduling`]. It grants no transport: each
-/// dispatch takes the endpoint policy its reservation's durable binding names.
+/// [`ExecutionControl::AutonomousScheduling`] *and* this host run was armed
+/// by the operator ([`ArmedActivation`], which only a passed activation
+/// preflight produces). The compiled control is necessary, never sufficient.
+/// It grants no transport: each dispatch takes the endpoint policy its
+/// reservation's durable binding names.
 pub(crate) struct SchedulingAuthority(());
 
 impl SchedulingAuthority {
-    pub(crate) fn autonomous() -> Option<Self> {
+    pub(crate) fn autonomous(armed: ArmedActivation) -> Option<Self> {
+        let _armed = armed;
         ExecutionControl::AutonomousScheduling
             .is_enabled()
             .then_some(Self(()))
+    }
+}
+
+/// Why a queued Job is, or is not, one this scheduler's loopback dispatch
+/// would even consider. It is derived from the frozen configuration and the
+/// process's endpoint policy, stored nowhere, and decides nothing: the
+/// reservation transaction asks the same facts itself.
+///
+/// # What it does not say
+///
+/// It does not say the Job will run. Whether the scheduler selects a Job it
+/// would consider is decided in the reservation transaction, which asks more
+/// than this can answer without opening a write transaction: whether the
+/// conversation's start context is one checked start supports
+/// (`unsupported_start_context`: notices, child work, approvals and tool
+/// evidence), whether its predecessors are settled, whether its attachments
+/// are available, and whether an Executor with the required capability has
+/// capacity. Only the scheduler's own transaction is authoritative for that,
+/// and this report never stands in for it: no field here grants, and none is
+/// read as, execution authority.
+///
+/// So a Job that is not eligible here stays queued untouched; it may belong
+/// to a separately authorized workflow (a manual loopback execution, a manual
+/// external execution, or a scheduled external policy under its own control).
+/// A Job that is eligible here may still never be selected, and says why in
+/// the fields this report does not cover.
+///
+/// # What it says about authority
+///
+/// Nothing, and it cannot: this is derived from one Job's frozen
+/// configuration, so it reads no Host and never reports whether one is armed.
+/// Actual execution also needs the build to compile
+/// [`ExecutionControl::AutonomousScheduling`] enabled, the current Host to hold
+/// an [`ArmedActivation`] for this database, and the reservation and writer
+/// checks to admit the Job. `not_assessed` names all three, so policy
+/// eligibility is never read as immediate schedulability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoopbackEligibility {
+    pub(crate) code: &'static str,
+    pub(crate) detail: &'static str,
+    /// Set when the endpoint alone decided; see
+    /// [`crate::system::http::LoopbackEndpointClass`].
+    pub(crate) endpoint: Option<crate::system::http::LoopbackEndpointClass>,
+}
+
+/// What this policy answer does not cover, named so no reader can mistake it
+/// for a scheduling decision. The first four are questions the scheduler
+/// answers inside its own write transaction. The last three are the runtime
+/// authority that must exist before any of those questions is even asked:
+/// this calculation is static, sees no Host, and must not guess whether one
+/// is armed.
+const NOT_ASSESSED: [&str; 7] = [
+    "conversation_start_context",
+    "predecessor_settlement",
+    "attachment_availability",
+    "executor_capacity",
+    "autonomous_scheduling_control_compiled",
+    "host_armed_activation",
+    "reservation_and_writer_admission",
+];
+
+impl LoopbackEligibility {
+    pub(crate) fn eligible(self) -> bool {
+        self.code == "eligible"
+    }
+
+    /// The report. `eligible` means the frozen configuration and this
+    /// process's endpoint policy admit autonomous loopback dispatch, and
+    /// nothing more: it is neither schedulability nor authority.
+    /// `not_assessed` names everything it does not cover, including the
+    /// runtime authority a Host needs before any Job can run, so a reader
+    /// cannot mistake it for the scheduler's decision.
+    pub(crate) fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "eligible": self.eligible(),
+            "code": self.code,
+            "detail": self.detail,
+            "endpoint_class": self.endpoint.map(crate::system::http::LoopbackEndpointClass::name),
+            "scope": "autonomous_loopback_dispatch_policy",
+            "not_assessed": NOT_ASSESSED,
+        })
+    }
+}
+
+/// The eligibility of a Job frozen as `frozen` for this scheduler's loopback
+/// dispatch; see [`LoopbackEligibility`]. The predicates are exactly the ones
+/// the reservation transaction and the checked start ask about the *frozen
+/// configuration itself*
+/// ([`FrozenExecutionConfig::single_request_refusal`] and
+/// [`crate::system::http::direct_diagnostic_loopback`]); the endpoint class
+/// only explains the second. Everything the schedule also asks about the
+/// Job's conversation and the pool is reported as `not_assessed`, never
+/// guessed at, and the Job's Decision history is
+/// `GET /api/v1/jobs/{job}`'s own `unsupported_decision_history`.
+pub(crate) fn loopback_eligibility(
+    frozen: Option<&crate::db::entities::MutableFrozenConfiguration>,
+) -> LoopbackEligibility {
+    use crate::db::entities::MutableFrozenConfiguration;
+    use crate::system::http::{LoopbackEndpointClass, classify_loopback_endpoint};
+    let none = |code, detail| LoopbackEligibility {
+        code,
+        detail,
+        endpoint: None,
+    };
+    let frozen = match frozen {
+        None => {
+            return none(
+                "not_frozen",
+                "the Job has no frozen configuration; only a submitted Job is scheduled",
+            );
+        }
+        Some(MutableFrozenConfiguration::Decision(_)) => {
+            return none(
+                "decision_job",
+                "a Decision Job is never selected by autonomous loopback scheduling",
+            );
+        }
+        Some(MutableFrozenConfiguration::Generative(frozen)) => frozen,
+    };
+    if frozen.single_request_refusal().is_some() {
+        return none(
+            "not_single_request_generative",
+            "the frozen configuration cannot run as a single tool-free Generative request (a chat Agent without a Workspace grant, the OpenAI Chat Completions protocol and a declared context window are required)",
+        );
+    }
+    let Some(endpoint) = frozen.llm.provider.endpoint.as_deref() else {
+        return none("endpoint_missing", "the frozen Provider has no endpoint");
+    };
+    if ExecutionControl::ExternalProviderTransport.is_enabled() {
+        return none(
+            "external_transport_enabled",
+            "this build enables external Provider transport, under which the loopback dispatch admits no endpoint",
+        );
+    }
+    let class = classify_loopback_endpoint(endpoint);
+    let detail = match class {
+        LoopbackEndpointClass::LiteralDirect => {
+            return LoopbackEligibility {
+                code: "eligible",
+                detail: "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a single tool-free Generative request; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks",
+                endpoint: Some(class),
+            };
+        }
+        LoopbackEndpointClass::LiteralProxied => {
+            "the frozen endpoint is literal 127.0.0.1 but the configured proxy would intercept it; exclude it with NO_PROXY=127.0.0.1 or unset the proxy for the host, then resubmit"
+        }
+        LoopbackEndpointClass::LiteralMalformed => {
+            "the frozen endpoint names 127.0.0.1 but is not http://127.0.0.1:<explicit non-zero port> without credentials or a query; freeze the Provider endpoint in that form and resubmit"
+        }
+        LoopbackEndpointClass::LocalhostName => {
+            "the frozen endpoint names `localhost`, which configuration accepts but autonomous loopback scheduling never resolves; freeze the Provider endpoint as http://127.0.0.1:<port> and resubmit, or run the Job through a separately authorized workflow"
+        }
+        LoopbackEndpointClass::Ipv6Loopback => {
+            "the frozen endpoint is the IPv6 loopback `::1`, which configuration accepts but autonomous loopback scheduling never reaches; freeze the Provider endpoint as http://127.0.0.1:<port> and resubmit, or run the Job through a separately authorized workflow"
+        }
+        LoopbackEndpointClass::External => {
+            "the frozen endpoint is not a loopback endpoint; autonomous loopback scheduling never reaches it, and an external destination is admitted only by a live scheduled external policy under its own (disabled) control or by a manual external execution"
+        }
+        LoopbackEndpointClass::Unparseable => "the frozen endpoint is not a URI",
+    };
+    LoopbackEligibility {
+        code: "endpoint_not_literal_loopback",
+        detail,
+        endpoint: Some(class),
     }
 }
 
@@ -223,8 +394,9 @@ pub(crate) async fn run(
     wake: SchedulerWakeSubscription,
     shutdown: CancellationToken,
     stops: NativeStops,
+    armed: ArmedActivation,
 ) {
-    let Some(authority) = SchedulingAuthority::autonomous() else {
+    let Some(authority) = SchedulingAuthority::autonomous(armed) else {
         shutdown.cancelled().await;
         return;
     };

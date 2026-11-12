@@ -140,6 +140,45 @@ impl DataDirectory {
         Ok(data_directory)
     }
 
+    /// The layout of a data directory that already exists, resolved without
+    /// creating, chmodding or otherwise touching anything in it. It refuses a
+    /// missing directory and the obsolete `ocg_db` layout exactly as
+    /// [`Self::bootstrap`] does. A read-only command uses this: a data
+    /// directory whose attachments and logs directories are missing stays
+    /// missing, and the root keeps whatever mode it has.
+    pub fn existing(root: impl Into<PathBuf>) -> Result<Self, DataDirectoryError> {
+        let named = root.into();
+        let root = named
+            .canonicalize()
+            .map_err(|source| DataDirectoryError::Io {
+                path: named.clone(),
+                source,
+            })?;
+        let metadata =
+            std::fs::symlink_metadata(&root).map_err(|source| DataDirectoryError::Io {
+                path: root.clone(),
+                source,
+            })?;
+        if !metadata.is_dir() {
+            return Err(DataDirectoryError::Io {
+                path: root,
+                source: io::Error::other("the data directory is not a directory"),
+            });
+        }
+        let legacy = root.join("ocg_db");
+        match std::fs::symlink_metadata(&legacy) {
+            Ok(_) => return Err(DataDirectoryError::LegacyLayout { path: legacy }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(DataDirectoryError::Io {
+                    path: legacy,
+                    source,
+                });
+            }
+        }
+        Ok(Self { root })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

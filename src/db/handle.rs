@@ -836,6 +836,17 @@ impl DatabaseHandle {
         .await
     }
 
+    /// What a first activation reads, from one read transaction; see
+    /// [`redb::activation_snapshot`]. A read, never a selection, and never a
+    /// write: nothing here reserves, promotes or repairs anything.
+    pub(crate) async fn activation_snapshot(
+        &self,
+        limit: usize,
+    ) -> Result<redb::ActivationSnapshot, DatabaseError> {
+        self.read(move |database| redb::activation_snapshot(database, limit))
+            .await
+    }
+
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
         self.shared
             .scheduler_subscription
