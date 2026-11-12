@@ -1463,6 +1463,20 @@ impl DatabaseHandle {
     ) -> Result<Vec<(JobId, crate::db::redb::UnresolvedExecution)>, DatabaseError> {
         self.read(redb::read_unresolved_executions).await
     }
+    /// Every native Allocation that is Uncertain and still holds capacity,
+    /// from one consistent read. Read-only: it releases nothing, and a failed
+    /// read is an error, never an empty list.
+    pub async fn uncertain_allocations(
+        &self,
+    ) -> Result<Vec<crate::db::redb::UncertainAllocation>, DatabaseError> {
+        self.read(redb::read_uncertain_allocations).await
+    }
+
+    /// Whether `job` names a stored native conversation.
+    pub(crate) async fn conversation_exists(&self, job: JobId) -> Result<bool, DatabaseError> {
+        self.read(move |database| redb::read_conversation_exists(database, job))
+            .await
+    }
     pub async fn occupancy(&self) -> Result<Vec<(ExecutionPoolId, JobId)>, DatabaseError> {
         self.read(redb::read_occupancy).await
     }

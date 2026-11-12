@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use crate::db::entities::JobId;
 use crate::system::data_directory::DataDirectory;
 
@@ -8,11 +6,10 @@ pub fn run(
     arguments: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut job_arg = None;
-    let mut yes = false;
 
     for arg in arguments {
         if arg == "--yes" {
-            yes = true;
+            // Accepted for compatibility: there is nothing left to confirm.
         } else if job_arg.is_none() {
             job_arg = Some(arg);
         } else {
@@ -27,33 +24,40 @@ pub fn run(
 
     let result = std::rc::Rc::new(std::cell::RefCell::new(None));
     let returned = result.clone();
-    let report =
-        crate::system::runtime::run_hosted_reporting(directory, false, move |context| async move {
+    let report = crate::system::runtime::run_hosted_reporting(
+        directory,
+        false,
+        move |context| async move {
             let database = context.database();
             let outcome: Result<(), Box<dyn std::error::Error>> = async {
-                let quarantined = database.unresolved_executions().await?;
-                if !quarantined.iter().any(|(j, _)| *j == job) {
-                    return Err(format!("Job {job} is not quarantined").into());
-                }
-                println!("{job}");
-                if !yes {
-                    print!("Confirm that all processes for {job} have terminated [y/N]: ");
-                    std::io::stdout().flush()?;
-                    let mut response = String::new();
-                    std::io::stdin().read_line(&mut response)?;
-                    let trimmed = response.trim();
-                    if !trimmed.eq_ignore_ascii_case("y") && !trimmed.eq_ignore_ascii_case("yes") {
-                        return Err("aborted by operator".into());
+                // Classified before any ownership read: a native database holds
+                // no legacy slot table, and a native Allocation is never
+                // released from here. Nothing below writes.
+                use crate::db::redb::MutableJobDetailsLookup;
+                match database.mutable_job_details(job, None).await? {
+                    MutableJobDetailsLookup::Found(_) | MutableJobDetailsLookup::Inaccessible => {
+                        Err(format!(
+                            "Job {job} is a native Job: release-slot cannot release a native Allocation; \
+                             no Allocation, ownership or capacity was changed"
+                        )
+                        .into())
+                    }
+                    MutableJobDetailsLookup::NotMutable => {
+                        if database.conversation_exists(job).await? {
+                            Err(format!(
+                                "{job} is a conversation, not a Job holding a slot; nothing was changed"
+                            )
+                            .into())
+                        } else {
+                            Err(format!("Job {job} was not found").into())
+                        }
                     }
                 }
-                database
-                    .confirm_job_stopped(job, crate::db::entities::StopProof::Operator)
-                    .await?;
-                Ok(())
             }
             .await;
             *returned.borrow_mut() = Some(outcome);
-        });
+        },
+    );
 
     for failure in report.failures {
         if failure.phase != crate::system::runtime::Phase::Logger {

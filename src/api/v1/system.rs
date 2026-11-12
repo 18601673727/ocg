@@ -54,6 +54,15 @@ pub(crate) struct QuarantinedView {
     since: i64,
 }
 
+/// Why the quarantined list could not be published. Bounded: the cause stays
+/// in the server log.
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "QuarantinedError")]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuarantinedErrorView {
+    Unreadable,
+}
+
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Health")]
 pub(crate) struct HealthView {
@@ -63,7 +72,10 @@ pub(crate) struct HealthView {
     claims: ClaimsView,
     queue: QueueView,
     process: ProcessView,
-    quarantined: Vec<QuarantinedView>,
+    /// Absent (`null`) when the ownership state could not be read, which is
+    /// never the same as an empty list.
+    quarantined: Option<Vec<QuarantinedView>>,
+    quarantined_error: Option<QuarantinedErrorView>,
 }
 
 /// What the host can establish: it runs, as the listener answers only
@@ -78,18 +90,23 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
     };
     let readable = database.job(database.genesis()).await.is_ok();
     let vitals = database.vitals().await;
-    let quarantined = match database.unresolved_executions().await {
-        Ok(unresolved) => unresolved
-            .into_iter()
-            .map(|(job, execution)| QuarantinedView {
-                job: job.to_string(),
-                pool: execution.pool.map(|pool| pool.to_string()),
-                since: execution.unresolved_at.as_unix_micros(),
-            })
-            .collect::<Vec<_>>(),
+    let (quarantined, quarantined_error) = match database.uncertain_allocations().await {
+        Ok(uncertain) => (
+            Some(
+                uncertain
+                    .into_iter()
+                    .map(|allocation| QuarantinedView {
+                        job: allocation.job.to_string(),
+                        pool: Some(allocation.pool.to_string()),
+                        since: allocation.since.as_unix_micros(),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ),
         Err(error) => {
-            log::warn!("failed to read unresolved executions for health: {error}");
-            Vec::new()
+            log::warn!("failed to read uncertain allocations for health: {error}");
+            (None, Some(QuarantinedErrorView::Unreadable))
         }
     };
     envelope(serde_json::json!(HealthView {
@@ -122,5 +139,6 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             peak_rss_bytes: vitals.peak_rss_bytes,
         },
         quarantined,
+        quarantined_error,
     }))
 }

@@ -930,6 +930,8 @@ export const en = {
   "observations.quarantinedNote":
     "These jobs hold capacity until stop is proven or machine reboots.",
   "observations.noQuarantined": "No quarantined slots.",
+  "observations.quarantinedUnreadable":
+    "Unknown: the quarantined capacity could not be read.",
   "observations.job": "Job",
   "observations.pool": "Pool",
   "observations.quarantinedSince": "Quarantined since",
@@ -2213,6 +2215,7 @@ export const zh: Dictionary = {
   "observations.quarantinedCapacity": "隔离容量",
   "observations.quarantinedNote": "这些任务会一直占用容量，直到确认停止或机器重启。",
   "observations.noQuarantined": "没有隔离槽位。",
+  "observations.quarantinedUnreadable": "未知：无法读取隔离容量。",
   "observations.job": "任务",
   "observations.pool": "池",
   "observations.quarantinedSince": "隔离起始",

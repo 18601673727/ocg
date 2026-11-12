@@ -254,9 +254,15 @@ export function ObservationsSurface({
             <p className="my-2 text-sm text-muted-foreground">
               {t("observations.quarantinedNote")}
             </p>
-            {!health || health.quarantined.length === 0 ? (
+            {!health || !health.quarantined || health.quarantined.length === 0 ? (
               <p className="py-2 text-sm text-muted-foreground">
-                {t(health ? "observations.noQuarantined" : "common.unknown")}
+                {t(
+                  !health
+                    ? "common.unknown"
+                    : health.quarantined
+                      ? "observations.noQuarantined"
+                      : "observations.quarantinedUnreadable",
+                )}
               </p>
             ) : (
               <div className="overflow-x-auto">

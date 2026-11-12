@@ -5006,6 +5006,98 @@ pub(crate) fn read_unresolved_executions(
     Ok(unresolved)
 }
 
+/// A native Allocation that is Uncertain and still holds its Pool's
+/// capacity: the Job's work was never confirmed stopped. Evidence only; it is
+/// never a route to release anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UncertainAllocation {
+    pub job: JobId,
+    pub pool: ExecutionPoolId,
+    pub epoch: u64,
+    /// When the Job's Unknown outcome was recorded.
+    pub since: Timestamp,
+}
+
+/// Every Uncertain Allocation, read from one snapshot of the native ownership
+/// rows. Only the bounded active index is scanned, never historical
+/// Allocations. Each entry must agree with its authoritative Allocation, and
+/// each Uncertain one with its Job's Unknown outcome and the absence of stop
+/// evidence; any disagreement fails the read, so an empty result is only ever
+/// a successful, consistent read of no Uncertain Allocation.
+pub(crate) fn read_uncertain_allocations(
+    database: &Database,
+) -> Result<Vec<UncertainAllocation>, StorageError> {
+    use crate::db::entities::{AllocationPhase, GLOBAL_EXECUTION_LIMIT, MutableJobPhase};
+    let rx = read(database)?;
+    if !rx
+        .open_table(META)?
+        .get(DATABASE_FORMAT_KEY)?
+        .is_some_and(|version| version.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
+    {
+        return Err(StorageError::corrupted("allocation format is not active"));
+    }
+    let active = rx.open_table(ACTIVE_ALLOCATIONS)?;
+    if active.len()? > u64::from(GLOBAL_EXECUTION_LIMIT) {
+        return Err(StorageError::corrupted(
+            "the active Allocation index exceeds the global execution limit",
+        ));
+    }
+    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
+    let mut uncertain = Vec::new();
+    for entry in active.iter()? {
+        let (pool, executor, job) = entry?.0.value();
+        let allocation = indexed_allocation(&allocations, pool, executor, job)?;
+        if allocation.phase != AllocationPhase::Uncertain {
+            continue;
+        }
+        let record = mutable_job_record_in(&rx, JobId::new(job))?
+            .ok_or_else(|| StorageError::corrupted("an Uncertain Allocation has no Job"))?;
+        let started = record.job.phase == MutableJobPhase::Executing;
+        let shaped = allocation.job_revision == record.job.revision
+            && allocation.stop_confirmed_at.is_none()
+            && allocation.stop_proof.is_none()
+            && allocation.started_at.is_some() == started
+            && (started || record.job.phase == MutableJobPhase::Queued);
+        if !shaped {
+            return Err(StorageError::corrupted(
+                "an Uncertain Allocation contradicts its Job",
+            ));
+        }
+        let Some(outcome) = record
+            .outcome
+            .filter(|outcome| outcome.kind == OutcomeKind::Unknown)
+        else {
+            return Err(StorageError::corrupted(
+                "an Uncertain Allocation has no Unknown outcome",
+            ));
+        };
+        uncertain.push(UncertainAllocation {
+            job: JobId::new(job),
+            pool: allocation.token.pool,
+            epoch: allocation.token.epoch,
+            since: outcome.at,
+        });
+    }
+    Ok(uncertain)
+}
+
+/// Whether `id` is a stored native conversation. A Job row, or none, is not.
+pub(crate) fn read_conversation_exists(
+    database: &Database,
+    id: JobId,
+) -> Result<bool, StorageError> {
+    let rx = read(database)?;
+    let jobs = rx.open_table(JOBS)?;
+    let Some(bytes) = jobs.get(id.get())? else {
+        return Ok(false);
+    };
+    if bytes.value().first() != Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
+        return Ok(false);
+    }
+    JobSpec::decode_at(id.get(), bytes.value())?;
+    Ok(true)
+}
+
 /// Whether the natural key of a command is present in the database.
 pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool, StorageError> {
     let rx = read(database)?;

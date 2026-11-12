@@ -1691,17 +1691,26 @@ pub(super) async fn release_slot(
     {
         return Err(INVALID_ROUTE_BODY);
     }
-    if matches!(
-        database.mutable_job_details(job, None).await?,
-        crate::db::redb::MutableJobDetailsLookup::Found(_)
-    ) {
-        // A native Allocation is released only by confirmed termination
-        // evidence; the legacy slot release cannot prove or record it.
-        return Err(Refusal::new(
-            StatusCode::CONFLICT,
-            "native_allocation_not_releasable",
-            "a native Job's Allocation cannot be released through release-slot",
-        ));
+    match database.mutable_job_details(job, None).await? {
+        crate::db::redb::MutableJobDetailsLookup::Found(_) => {
+            // A native Allocation is released only by confirmed termination
+            // evidence; the legacy slot release cannot prove or record it.
+            return Err(Refusal::new(
+                StatusCode::CONFLICT,
+                "native_allocation_not_releasable",
+                "a native Job's Allocation cannot be released through release-slot",
+            ));
+        }
+        // Not visible without its composer context: indistinguishable from
+        // a missing Job, and never handed to the legacy reader.
+        crate::db::redb::MutableJobDetailsLookup::Inaccessible => {
+            return Err(super::JOB_NOT_FOUND);
+        }
+        crate::db::redb::MutableJobDetailsLookup::NotMutable => {}
+    }
+    // A native conversation is never decoded by the legacy reader below.
+    if database.conversation_exists(job).await? {
+        return Err(conversation_refusal("not_quarantined"));
     }
     let record = database.job(job).await?.ok_or(super::JOB_NOT_FOUND)?;
     if record.unknown_at.is_none() {
