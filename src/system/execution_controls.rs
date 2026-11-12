@@ -92,9 +92,9 @@ impl ExecutionControl {
     pub(crate) const fn state(self) -> ControlState {
         match self {
             ExecutionControl::ManualLoopbackExecution => ControlState::Enabled,
+            ExecutionControl::AutonomousScheduling => ControlState::Enabled,
             ExecutionControl::ManualExternalTrial
             | ExecutionControl::ManualExternalExecution
-            | ExecutionControl::AutonomousScheduling
             | ExecutionControl::ScheduledExternalTransport
             | ExecutionControl::ExternalProviderTransport
             | ExecutionControl::ProviderDiscovery
