@@ -5,20 +5,12 @@
 /dist/
 generated.ts
 
-# Local OCG state and per-project overrides
-.ocg.json
-*.events.jsonl
-
-# Conversation buffer for an external assistant (never committed)
-forward_to_gpt.md
-
 # Editors / OS
 .DS_Store
 .idea/
 .vscode/
 .codegraph/
-*.swp
-CONCERNS.md
+.workbuddy/
+.playwright-mcp/
 
-# Browser automation snapshots written by an MCP server
-/.playwright-mcp/
+CONCERNS.md
