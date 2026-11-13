@@ -1,24 +1,9 @@
-//! Custom HTTP request fields sent with Provider requests.
-//!
-//! A field is configured globally or on one Connection. A Connection's field
-//! replaces the global field of the same name, and either replaces OCG's
-//! built-in default (`User-Agent`). Names are compared case-insensitively and
-//! kept in lower case, so a configuration never holds two spellings of one
-//! field. A value is either plain text stored in the configuration row, or a
-//! secret stored once in the credential store and named here by reference;
-//! only a Connection may hold a secret, because a global secret would be sent
-//! to every Provider host.
-
 use std::fmt;
 
-/// Fields one scope may configure.
 pub const MAX_HEADER_FIELDS: usize = 32;
 pub const MAX_HEADER_NAME_BYTES: usize = 128;
 pub const MAX_HEADER_VALUE_BYTES: usize = 4096;
 
-/// Fields OCG owns. Each is set by OCG for the wire protocol it speaks, names
-/// the credential it manages, or frames the message, so a configured value
-/// would either be overwritten, break the exchange, or redirect a credential.
 const PROTECTED: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -42,12 +27,8 @@ const PROTECTED: &[&str] = &[
     "set-cookie",
 ];
 
-/// Prefixes of fields a client never sets: the proxy and fetch metadata
-/// families.
 const PROTECTED_PREFIXES: &[&str] = &["proxy-", "sec-"];
 
-/// Name fragments that mark a field as carrying a credential. Such a field
-/// can only be set as a secret, on one Connection.
 const CREDENTIAL_FRAGMENTS: &[&str] = &[
     "auth",
     "key",
@@ -62,20 +43,16 @@ const CREDENTIAL_FRAGMENTS: &[&str] = &[
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OutboundHeaderValue {
     Plain(String),
-    /// The name of the credential holding the value.
     Secret(String),
 }
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutboundHeader {
-    /// Lower case; see [`canonical_name`].
     pub name: String,
     pub value: OutboundHeaderValue,
 }
 
-/// A field's value is never printed, so a plain value mistaken for harmless
-/// cannot reach a log through `Debug` either.
 impl fmt::Debug for OutboundHeader {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.value {
@@ -86,17 +63,12 @@ impl fmt::Debug for OutboundHeader {
     }
 }
 
-/// The global fields and the revision they were saved at; revision 0 is "never
-/// configured".
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GlobalHeaders {
     pub revision: u32,
     pub fields: Vec<OutboundHeader>,
 }
 
-/// The fields a Job was frozen with: the merge of the global and the
-/// Connection fields, and the global revision it was merged from. Secrets are
-/// named by credential reference, never copied.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FrozenHeaders {
@@ -105,7 +77,6 @@ pub struct FrozenHeaders {
 }
 
 impl FrozenHeaders {
-    /// The credential references the fields name.
     pub fn secret_refs(&self) -> impl Iterator<Item = &str> {
         self.fields.iter().filter_map(|field| match &field.value {
             OutboundHeaderValue::Secret(reference) => Some(reference.as_str()),
@@ -141,7 +112,6 @@ pub enum HeaderError {
 }
 
 impl HeaderError {
-    /// A fixed description for a rejection, which names no field value.
     pub fn reason(&self) -> &'static str {
         match self {
             Self::InvalidName => "header name is not a valid HTTP field name",
@@ -157,7 +127,6 @@ impl HeaderError {
     }
 }
 
-/// The lower-case name, if it is a valid HTTP field name (an RFC 9110 token).
 pub fn canonical_name(name: &str) -> Result<String, HeaderError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_HEADER_NAME_BYTES
@@ -188,7 +157,6 @@ pub fn canonical_name(name: &str) -> Result<String, HeaderError> {
     }
 }
 
-/// Whether OCG owns the field (the name is canonical).
 pub fn is_protected(name: &str) -> bool {
     PROTECTED.contains(&name)
         || PROTECTED_PREFIXES
@@ -196,16 +164,12 @@ pub fn is_protected(name: &str) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// Whether the name marks a credential-bearing field (the name is canonical).
 pub fn is_credential_like(name: &str) -> bool {
     CREDENTIAL_FRAGMENTS
         .iter()
         .any(|fragment| name.contains(fragment))
 }
 
-/// A value is visible ASCII and spaces or tabs between, so it cannot hold a
-/// line break, a NUL or any other control byte that could split or smuggle a
-/// field.
 pub fn validate_value(value: &str) -> Result<(), HeaderError> {
     let valid = !value.is_empty()
         && value.len() <= MAX_HEADER_VALUE_BYTES
@@ -220,8 +184,6 @@ pub fn validate_value(value: &str) -> Result<(), HeaderError> {
     }
 }
 
-/// Checks one scope's fields: names canonical and unique, values valid,
-/// nothing OCG owns, credential-bearing names only as Connection secrets.
 pub fn validate_fields(fields: &[OutboundHeader], scope: HeaderScope) -> Result<(), HeaderError> {
     if fields.len() > MAX_HEADER_FIELDS {
         return Err(HeaderError::TooMany);
@@ -254,8 +216,6 @@ pub fn validate_fields(fields: &[OutboundHeader], scope: HeaderScope) -> Result<
     Ok(())
 }
 
-/// The fields a Connection's requests carry: the Connection's own, and the
-/// global ones it does not replace, ordered by name.
 pub fn merge(global: &[OutboundHeader], connection: &[OutboundHeader]) -> Vec<OutboundHeader> {
     let mut merged: std::collections::BTreeMap<&str, &OutboundHeader> = global
         .iter()

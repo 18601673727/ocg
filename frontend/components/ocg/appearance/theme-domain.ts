@@ -48,7 +48,6 @@ export function parseAppearancePreferences(raw: string | null | undefined): Appe
   }
 }
 
-/** Browser persistence is only for presentation preferences, never backend configuration. */
 export function readAppearancePreferences(
   storage: Pick<Storage, "getItem"> | null | undefined,
 ): AppearancePreferences {

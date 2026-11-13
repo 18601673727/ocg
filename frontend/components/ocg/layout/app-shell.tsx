@@ -146,7 +146,6 @@ function AppShellContent({
     return () => desktop.removeEventListener("change", closeOnDesktop);
   }, [mobile]);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  // The Job whose opening has finished; a Job is being opened until then.
   const [openedJob, setOpenedJob] = useState<string | null>(null);
   const opening =
     location.view === "chat" &&
@@ -166,8 +165,6 @@ function AppShellContent({
   const observedStatus = useRef<RuntimeStatus | null>(null);
   const activeConversation = useRef(conversationKey);
   const currentLocationRef = useRef({ location, sessionId });
-  // Conversation identities the backend already listed are authoritative; opening one must not
-  // probe it as a Job first.
   const listedConversations = useRef(new Set<string>());
   useEffect(() => {
     currentLocationRef.current = { location, sessionId };
@@ -314,7 +311,6 @@ function AppShellContent({
     t,
   ]);
 
-  // Runtime actions such as Retry also admit successors, so their addresses must recover on reload.
   useEffect(() => {
     if (
       location.view === "chat" &&

@@ -7,7 +7,6 @@ export type NativePoolV2 = {
   capacity: number;
   enabled: boolean;
   archived: boolean;
-  /** The stored revision of an independent Pool; archival is made from it. */
   revision: number;
 };
 export type ControlPool = NativePoolV2 & {

@@ -18,7 +18,6 @@ export type OperatorSession = {
   expiresAtUs: number;
 };
 
-/** The one sign-in: this run's pairing code, nothing else. */
 export function OperatorLogin({
   client,
   onSignedIn,

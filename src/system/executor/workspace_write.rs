@@ -1,54 +1,3 @@
-//! `workspace_write_file`: OCG's one tool that changes a file. It creates one
-//! small UTF-8 text file inside a Workspace the operator authorized, or
-//! replaces the whole content of one whose entire current content the call
-//! names exactly, and nothing else: it appends, patches, deletes, renames and
-//! creates directories never.
-//!
-//! The Workspace, its path rules and the walk to the file are those of
-//! `workspace_read_file`, see [`crate::system::executor::workspace_read`]: the
-//! root is the operator's, a call names only a plain relative path, no
-//! symbolic link is followed, and hidden, secret-bearing and OCG-internal
-//! names are refused, wherever they appear.
-//!
-//! New content is never written into the target itself. It is staged in a
-//! new hidden file beside the target, created exclusively (mode 0600, never
-//! through a link), written whole and synced; only then is it renamed onto
-//! the target's name, and the directory is synced. The target's name so
-//! always holds either its previous content or the complete new one, never
-//! part of it.
-//!
-//! `create` publishes with an exclusive rename (`RENAME_NOREPLACE`, Apple's
-//! `RENAME_EXCL`): when anything exists at the name, a file that appeared
-//! meanwhile included, nothing is replaced and the call fails. The created
-//! file keeps the staged file's mode, 0600 under the process umask.
-//!
-//! `update` opens the existing file without following a link and requires a
-//! regular file with a single link, within the read size limit. It reads the
-//! whole file, refuses it unless its content equals `expected_content`
-//! exactly, and refuses it when it changed while it was read. The staged
-//! file gets the target's permission bits (never set-id or sticky ones) and
-//! group; a file of another owner is refused, since a replacement would
-//! change its owner. Immediately before the rename, the target is checked
-//! again, through the file read and by its name: the same file, links, size,
-//! modification and status-change times. Extended attributes and ACLs are
-//! not carried over.
-//!
-//! What this does not establish. An update is a check followed by an
-//! ordinary rename, not an atomic compare-and-swap: a change another process
-//! makes after the last check, or through a descriptor it already holds,
-//! is lost or left on the replaced file, and a change that keeps a file's
-//! size and both times is not seen. Durability is what `fsync` gives (a
-//! full flush on Apple platforms); a crash leaves the previous or the new
-//! content under the name. A crash, or a failed cleanup, may leave a staged
-//! file named `.ocg-write-…` in the target's directory: nothing removes it
-//! later, and as a hidden name no Workspace tool reads or writes it. The
-//! Workspace limits of the read tool apply. This is for a trusted, local
-//! Workspace of a single operator.
-//!
-//! Every call is recorded, with its arguments, before it runs: the path, the
-//! new content and an update's expected content are kept in plaintext tool
-//! evidence. No message this tool reports repeats a path or any content.
-
 use std::fs::File;
 use std::future::Future;
 use std::io::Write as _;
@@ -70,30 +19,20 @@ use crate::system::executor::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 
-/// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_write_file";
 
-/// The largest content, expected_content, old or new a call may carry.
 const MAX_CONTENT_BYTES: usize = 8 * 1024;
 
-/// Identifies this handler's behavior in every call it records.
 const HANDLER_VERSION: &str = "workspace_write_file-3";
 
-/// The largest file a delete may read and delete.
 const MAX_DELETE_BYTES: usize = 64 * 1024;
 
-/// The largest file a replace may read and replace within.
 const MAX_REPLACE_FILE_BYTES: usize = 1024 * 1024;
 
-/// How a staged file's name begins. The leading dot keeps it out of reach
-/// of every Workspace tool.
 const STAGING_PREFIX: &str = ".ocg-write-";
 
-/// Names tried for a staged file before staging is given up.
 const STAGING_ATTEMPTS: usize = 8;
 
-/// Why a call changed nothing in the Workspace. Its message is recorded and
-/// may reach the Provider, so it never repeats the path or any content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 enum Refusal {
     #[error("the arguments are invalid for the requested operation")]
@@ -130,7 +69,6 @@ enum Refusal {
     Stopped,
 }
 
-/// Why what a call did to the Workspace is not known, or not all known.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 enum Uncertainty {
     #[error("a staged copy of the new content could not be removed")]
@@ -176,7 +114,6 @@ impl From<Failure> for ToolFailure {
     }
 }
 
-/// What a call asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Operation<'a> {
     Create { content: &'a str },
@@ -185,8 +122,6 @@ enum Operation<'a> {
     Delete { expected: &'a str },
 }
 
-/// A call's arguments, checked. The schema already enforces their shape;
-/// they are checked again here, so nothing malformed can become a write.
 fn parse(arguments: &Value) -> Result<(&str, Operation<'_>), Refusal> {
     let object = arguments.as_object().ok_or(Refusal::InvalidArguments)?;
     let text = |key: &str| {
@@ -272,8 +207,6 @@ fn parse(arguments: &Value) -> Result<(&str, Operation<'_>), Refusal> {
     Ok((path, operation))
 }
 
-/// The directory holding the file at `path`, and the file's name in it. A
-/// missing directory on the way is never created.
 fn parent<'a>(workspace: &Workspace, path: &'a str) -> Result<(File, &'a str), Refusal> {
     workspace.parent(path).map_err(|refusal| match refusal {
         PathRefusal::NotFound => Refusal::MissingDirectory,
@@ -281,18 +214,13 @@ fn parent<'a>(workspace: &Workspace, path: &'a str) -> Result<(File, &'a str), R
     })
 }
 
-/// Targets with a mutation in progress, by directory identity and name.
 static TARGETS: std::sync::Mutex<std::collections::BTreeSet<(u64, u64, String)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 static TARGETS_FREED: std::sync::Condvar = std::sync::Condvar::new();
 
-/// Exclusive hold on one target while it is checked and changed, so two
-/// calls cannot both publish over the version each of them checked.
 struct TargetLock(Option<(u64, u64, String)>);
 
 impl TargetLock {
-    /// Waits for the target of `name` in `directory`, giving up when `stop`
-    /// is requested.
     fn acquire(directory: &File, name: &str, stop: &StopSignal) -> Result<Self, Failure> {
         let stat = rustix::fs::fstat(directory).map_err(|_| PathRefusal::Unreadable)?;
         let key = (stat.st_dev as u64, stat.st_ino as u64, name.to_owned());
@@ -325,7 +253,6 @@ impl Drop for TargetLock {
     }
 }
 
-/// Creates the file at `path` with `content`, when nothing exists there.
 fn create(
     workspace: &Workspace,
     path: &str,
@@ -334,8 +261,6 @@ fn create(
 ) -> Result<(), Failure> {
     let (directory, name) = parent(workspace, path)?;
     let _target = TargetLock::acquire(&directory, name, stop)?;
-    // The exclusive rename is what refuses an existing target; this only
-    // names what was found.
     match rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
             return Err(PathRefusal::SymbolicLink.into());
@@ -348,8 +273,6 @@ fn create(
     staged.publish(name, Publication::Exclusive, stop)
 }
 
-/// Replaces the content of the file at `path` with `content`, when its whole
-/// current content is `expected`.
 fn update(
     workspace: &Workspace,
     path: &str,
@@ -380,7 +303,6 @@ fn update(
     )
 }
 
-/// Replaces a single occurrence of `old` with `new` in the file at `path`.
 fn replace(
     workspace: &Workspace,
     path: &str,
@@ -440,7 +362,6 @@ fn replace(
     Ok((offset, before_sha256, after_sha256))
 }
 
-/// Deletes the regular file at `path`, when its whole current content is `expected`.
 fn delete(
     workspace: &Workspace,
     path: &str,
@@ -500,8 +421,6 @@ fn delete(
         .map_err(|_| Uncertainty::DeleteNotDurable.into())
 }
 
-/// What identifies a file and its last change: a replacement, a new link,
-/// or a write or metadata change all differ.
 fn version(stat: &Stat) -> impl PartialEq + use<> {
     (
         stat.st_dev,
@@ -516,17 +435,11 @@ fn version(stat: &Stat) -> impl PartialEq + use<> {
     )
 }
 
-/// How a staged file takes the target's name.
 enum Publication<'a> {
-    /// Only when nothing has the name.
     Exclusive,
-    /// Over the file opened as `file`, still as it was when it was `read`.
     Replace { file: &'a File, read: &'a Stat },
 }
 
-/// New content, complete and synced, under a hidden name in the target's
-/// directory. Until it is published or removed it is removed when dropped,
-/// if its name still holds it.
 struct Staged<'a> {
     directory: &'a File,
     name: String,
@@ -535,8 +448,6 @@ struct Staged<'a> {
 }
 
 impl<'a> Staged<'a> {
-    /// Stages `content`, with the owner and permissions of `like` when it
-    /// replaces a file.
     fn new(directory: &'a File, content: &str, like: Option<&Stat>) -> Result<Self, Failure> {
         let (name, file) = staging_file(directory)?;
         let staged = Self {
@@ -573,7 +484,6 @@ impl<'a> Staged<'a> {
         Ok(())
     }
 
-    /// Gives the target's name the staged content, then syncs the directory.
     fn publish(
         mut self,
         name: &str,
@@ -611,9 +521,6 @@ impl<'a> Staged<'a> {
         match renamed {
             Ok(()) => self.settled = true,
             Err(Errno::EXIST) if exclusive => return Err(self.abandon(Refusal::Exists)),
-            // A rename that failed left both names as they were, unless the
-            // failure itself is ambiguous: the staged file must still be
-            // where it was put for the call to have changed nothing.
             Err(_) if self.is_in_place() => return Err(self.abandon(Refusal::NotPublished)),
             Err(_) => {
                 self.settled = true;
@@ -626,7 +533,6 @@ impl<'a> Staged<'a> {
             .map_err(|_| Uncertainty::NotDurable.into())
     }
 
-    /// Whether the staged name still holds the staged file.
     fn is_in_place(&self) -> bool {
         let (Ok(staged), Ok(named)) = (
             rustix::fs::fstat(&self.file),
@@ -641,8 +547,6 @@ impl<'a> Staged<'a> {
         (staged.st_dev, staged.st_ino) == (named.st_dev, named.st_ino)
     }
 
-    /// Removes the staged file and reports `refusal`, or, when the staged
-    /// file is not known to be gone, that a copy of the content may remain.
     fn abandon(mut self, refusal: Refusal) -> Failure {
         self.settled = true;
         if self.remove() {
@@ -652,8 +556,6 @@ impl<'a> Staged<'a> {
         }
     }
 
-    /// Removes the staged name when it still holds the staged file; nothing
-    /// else is ever removed.
     fn remove(&self) -> bool {
         self.is_in_place()
             && rustix::fs::unlinkat(self.directory, self.name.as_str(), AtFlags::empty()).is_ok()
@@ -668,8 +570,6 @@ impl Drop for Staged<'_> {
     }
 }
 
-/// A new, empty file under an unused staging name in `directory`, created
-/// exclusively and never through a link.
 fn staging_file(directory: &File) -> Result<(String, File), Refusal> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -691,7 +591,6 @@ fn staging_file(directory: &File) -> Result<(String, File), Refusal> {
     Err(Refusal::NotStaged)
 }
 
-/// The parameters a call must match exactly: a create, update, replace, or delete.
 fn parameters() -> Value {
     json!({
         "type": "object",
@@ -749,7 +648,6 @@ fn parameters() -> Value {
     })
 }
 
-/// The handler of `workspace_write_file`, bound to one authorized Workspace.
 struct WriteFile {
     workspace: Workspace,
     workers: blocking::WorkerTracker,
@@ -760,12 +658,10 @@ impl ToolHandler for WriteFile {
         HANDLER_VERSION
     }
 
-    /// A create, or an update, run again may change the file again.
     fn effect(&self) -> ToolEffect {
         ToolEffect::NonIdempotent
     }
 
-    /// Its blocking workers are tracked, so a stop waits for them.
     fn spawns(&self) -> bool {
         true
     }
@@ -778,7 +674,6 @@ impl ToolHandler for WriteFile {
         self.write(Some(call.job), arguments)
     }
 
-    /// Stops the writes of `job` and waits until their workers have ended.
     fn stop(&self, job: JobId) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
         Box::pin(async move {
             self.workers.stop_job(job).await;
@@ -788,7 +683,6 @@ impl ToolHandler for WriteFile {
 }
 
 impl WriteFile {
-    /// Writes on the blocking pool while holding a file permit.
     fn write(&self, job: Option<JobId>, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let (path, operation) = parse(&arguments)
@@ -878,8 +772,6 @@ impl WriteFile {
     }
 }
 
-/// Registers `workspace_write_file` for `workspace` in `registry`, without
-/// authorizing it.
 pub(crate) fn register(
     registry: &ToolRegistry,
     workspace: Workspace,

@@ -21,14 +21,9 @@ use crate::db::entities::{
     DecisionResult, FrozenDecisionConfig, NativeDecisionConfig, RequestRef,
 };
 
-/// The native TypeSafe System One route. A configured endpoint replaces the
-/// base; the resource is appended the same way as for generative transports.
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// One accepted structured answer and the facts of the request that produced
-/// it. The raw response is kept for provenance; normalized meaning lives in
-/// `result`.
 pub(crate) struct DecisionExecution {
     pub result: DecisionResult,
     pub usage: NormalizedUsage,
@@ -37,13 +32,6 @@ pub(crate) struct DecisionExecution {
     pub finished_in: Duration,
 }
 
-/// Sends one typed decision request and decodes the structured answer.
-///
-/// Pre-send validation happens before any credential or request is built, so
-/// a refused request is unambiguously [`ProviderExecutionError::Build`]. An
-/// accepted HTTP response with a missing, extra, mismatched or malformed
-/// answer is [`ProviderExecutionError::Incomplete`]: the provider answered,
-/// but not with a usable decision.
 async fn execute_native(
     frozen: &NativeDecisionConfig,
     input: &DecisionRequest,
@@ -225,8 +213,6 @@ pub(crate) async fn execute_native_with_sink(
     execute_native(frozen, input, body, resolver, config, reference, Some(sink)).await
 }
 
-/// The answer of one accepted decision response: the typed result, the
-/// provider's own body, and the usage it reported.
 fn decode_decision(
     frozen: &NativeDecisionConfig,
     input: &DecisionRequest,
@@ -338,8 +324,6 @@ fn native_request_body(
         "state": input.state,
         "questions": { "decision": question },
     });
-    // Without the provider's tokenizer these are conservative UTF-8 byte
-    // upper bounds, including framing, rather than calibrated token counts.
     let request_bound = crate::db::serialized_len(&body)
         .map_err(|_| ProviderExecutionError::Build {
             message: "decision request could not be serialized".into(),
@@ -378,8 +362,6 @@ fn native_request_body(
     Ok(body)
 }
 
-/// Decodes one TypeSafe response. The returned usage keeps the provider's raw
-/// object and normalizes only the counters it reports.
 fn decode_response(
     frozen: &NativeDecisionConfig,
     input: &DecisionRequest,
@@ -594,8 +576,6 @@ fn decode_usage(usage: Option<&Value>) -> NormalizedUsage {
     }
 }
 
-/// Lists the model names one TypeSafe account may send. The route reports
-/// `models[].name`, unlike the OpenAI-compatible `data[].id` shape.
 pub(crate) async fn list_models(
     endpoint: &str,
     credential: Option<&str>,

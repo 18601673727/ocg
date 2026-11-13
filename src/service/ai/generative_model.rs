@@ -30,9 +30,6 @@ pub(crate) const CHART_INSTRUCTIONS: &str = "For line, bar, pie, or combo charts
      {\"type\":\"line|bar|pie|combo\",\"labels\":[\"label\"],\"series\":[{\"label\":\"series\",\"data\":[1],\"type\":\"line|bar\",\"axis\":\"left|right\"}],\"ariaLabel\":\"accessible description\"}. \
      Series `type` and `axis` are optional; pie requires exactly one series.";
 
-/// Tells the Provider which Project it works in, where its root is, what
-/// its grant allows and, for a grant that runs commands, which command names
-/// it may run.
 pub(crate) fn ground_project(
     name: &str,
     root: &str,
@@ -56,8 +53,6 @@ pub(crate) fn ground_project(
     ))
 }
 
-/// The conversation a Job's objective is sent as: the frozen Agent
-/// instructions, when there are any, then the objective. It offers no tools.
 #[must_use]
 pub fn objective_conversation(
     frozen: &FrozenExecutionConfig,
@@ -79,9 +74,6 @@ pub fn objective_conversation(
     }
 }
 
-/// [`objective_conversation`] with `images` in the objective's user message:
-/// its text first, when there is any, then each image as an `image_url`
-/// part, in order. Without images it is exactly [`objective_conversation`].
 #[must_use]
 pub fn objective_conversation_with_images(
     frozen: &FrozenExecutionConfig,
@@ -107,8 +99,6 @@ pub fn objective_conversation_with_images(
     conversation
 }
 
-/// The request body: the conversation as given, with the frozen model and
-/// parameters. Streaming with usage is always requested.
 pub(crate) fn request_body(
     model: &str,
     parameters: &LlmParameters,
@@ -155,17 +145,6 @@ pub(crate) fn request_body(
     Ok(body)
 }
 
-/// Sends one validated conversation, with the tools it offers, to the
-/// frozen Provider and model with the frozen parameters, and reads the
-/// streamed response. The conversation is the whole message list sent.
-/// Calls come back in wire order; a complete call this request did not
-/// admit (a name not offered or not chosen, arguments not one JSON object
-/// or refused by the schema) is in `tool_calls` as sent and in `refused`
-/// with its reason, inside `Ok`. A caller with no tool loop applies
-/// [`ProviderExecutionResult::admitted`], as `run_provider_job_inner` does
-/// inside its retry loop when no tools are offered. A cut-off or malformed
-/// stream and response-wide refusals are still `Err`.
-/// No tool is ever run here.
 pub async fn execute_conversation(
     frozen: &FrozenExecutionConfig,
     conversation: &ChatConversation,
@@ -184,8 +163,6 @@ pub async fn execute_conversation(
         &mut announced,
     )
     .await;
-    // An error before any response head is classified by what it proves about
-    // delivery; a response head has already announced the request.
     if let Err(error) = &result
         && !announced
     {
@@ -297,8 +274,6 @@ async fn exchange(
         request
     };
 
-    // Building the client may have waited; a cancellation that arrived
-    // meanwhile still ends the exchange before anything is recorded as sent.
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
             message: "provider execution was cancelled before sending".to_owned(),
@@ -318,7 +293,6 @@ async fn exchange(
     )
     .await;
     let response = match sent {
-        // The request future is dropped here, with whatever it had sent.
         Either::Left(()) => {
             return Err(ProviderExecutionError::Interrupted {
                 message: "provider execution was cancelled before a response arrived".to_owned(),
@@ -332,7 +306,6 @@ async fn exchange(
         finished: false,
     })?
     .map_err(classify_client_error)?;
-    // A response head proves the request reached a Provider, whatever it says.
     *announced = true;
     announce(borrow_output_sink(sink), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
@@ -349,8 +322,6 @@ async fn exchange(
         .and_then(|value| value.to_str().ok())
         .and_then(observe::retry_after_ms);
     if response.status() != StatusCode::OK {
-        // Nothing of a refused image-bearing request's body is kept, so it is
-        // not read; see `rejected_failure`.
         if conversation.carries_images() {
             return Err(ProviderExecutionError::Rejected {
                 failure: observe::with_retry_after(
@@ -359,7 +330,6 @@ async fn exchange(
                 ),
             });
         }
-        // A cancelled read keeps the status the Provider answered with.
         let body = match select(
             config.cancellation.cancelled(),
             ntex::time::timeout(
@@ -373,8 +343,6 @@ async fn exchange(
             Either::Right(Ok(body)) => body,
             Either::Right(Err(())) => None,
         };
-        // The raw body is redacted before it is parsed, so the message and
-        // code read from it cannot carry the credential either.
         let body = body.map(|body| redactor.body(&body));
         return Err(ProviderExecutionError::Rejected {
             failure: observe::with_retry_after(
@@ -400,12 +368,6 @@ async fn exchange(
 
 const MAX_NATIVE_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Reads one response stream, then admits its tool calls only as far as
-/// `conversation` allowed them. Text, reasoning and every completed call
-/// are kept as sent; a complete call this request did not admit is in
-/// `tool_calls` as sent and in `refused` with its reason. The configured
-/// timeout applies only while waiting for the next provider chunk; parsing
-/// and persistence are outside that interval.
 pub(crate) async fn read_response(
     payload: Payload,
     status_code: u16,
@@ -773,8 +735,6 @@ async fn parse_stream_body(
                 continue;
             };
             let data = trim_ascii(data);
-            // `[DONE]` ends the response whether or not the connection
-            // closes; whatever follows it is not part of the response.
             if data == b"[DONE]" {
                 buffer.clear();
                 break 'stream;
@@ -787,9 +747,6 @@ async fn parse_stream_body(
             })?;
             buffer.clear();
             saw_event = true;
-            // The usage is taken before anything else of the event, so
-            // neither a refused part of the event nor a failed delta write
-            // loses its counters.
             let event = if anthropic {
                 messages
                     .event(&event, config.max_output_bytes)
@@ -895,8 +852,6 @@ async fn parse_stream_body(
                 });
             }
             if native && responses.terminal {
-                // The completed native snapshot owns the final answer and calls;
-                // already published deltas remain progress in the output history.
                 response = StreamedResponse {
                     usage: std::mem::take(&mut response.usage),
                     ..Default::default()
@@ -959,7 +914,6 @@ async fn parse_stream_body(
             }
         }
     }
-    // A stream cut short after cancellation is the local stop, not the provider's incomplete stream.
     let cut_short = !buffer.is_empty() || !saw_event || response.finish_reason.is_none();
     if cut_short && config.cancellation.is_cancelled() {
         return Err(local_stop(
@@ -1016,7 +970,6 @@ async fn parse_stream_body(
     })
 }
 
-/// A stop on this side after the response head arrived, keeping the facts seen so far.
 fn local_stop(
     message: &str,
     status_code: u16,
@@ -1033,7 +986,6 @@ fn local_stop(
     }
 }
 
-/// What a response stream has produced so far.
 #[derive(Default)]
 struct StreamedResponse {
     text: String,
@@ -1045,7 +997,6 @@ struct StreamedResponse {
 }
 
 impl StreamedResponse {
-    /// The bytes the response limit covers: text, reasoning and tool calls.
     fn output_bytes(&self) -> usize {
         self.text
             .len()
@@ -1053,7 +1004,6 @@ impl StreamedResponse {
             .saturating_add(self.tool_calls.bytes())
     }
 
-    /// The facts accepted so far, under the status of the response head.
     fn facts(&self, status_code: u16) -> ResponseFacts {
         ResponseFacts {
             status_code,
@@ -1062,7 +1012,6 @@ impl StreamedResponse {
         }
     }
 
-    /// A protocol fault of the response, with the facts accepted before it.
     fn incomplete(&self, message: impl Into<String>, status_code: u16) -> ProviderExecutionError {
         ProviderExecutionError::Incomplete {
             message: message.into(),
@@ -1070,8 +1019,6 @@ impl StreamedResponse {
         }
     }
 
-    /// A transport failure or Provider silence after the response head,
-    /// with the facts accepted before it.
     fn unknown(&self, message: impl Into<String>, status_code: u16) -> ProviderExecutionError {
         ProviderExecutionError::Unknown {
             message: message.into(),
@@ -1081,19 +1028,11 @@ impl StreamedResponse {
     }
 }
 
-/// Why one stream event was refused.
 enum Refused {
-    /// A tool call fragment the Provider sent is malformed or conflicting.
     ToolCall(InvalidToolCall),
-    /// Taking the event would exceed the configured output limit, a local
-    /// protection rather than a fault of the Provider.
     OutputLimit,
 }
 
-/// Folds the choice of one event into `response` and returns its ordered deltas.
-/// The event's usage is not read here, see [`reported_usage`]. An invalid
-/// tool-call fragment rejects the whole choice, so none of its text and no
-/// finish reason of it is taken either.
 fn consume_event(
     event: &Value,
     response: &mut StreamedResponse,

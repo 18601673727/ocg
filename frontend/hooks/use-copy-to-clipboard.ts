@@ -25,7 +25,6 @@ export const useCopyToClipboard = ({ copiedDuration = 3000 }: UseCopyToClipboard
     [],
   );
 
-  // One timer for both outcomes: a retry replaces the previous feedback.
   const settle = (succeeded: boolean) => {
     if (copiedTimerRef.current !== undefined) {
       clearTimeout(copiedTimerRef.current);

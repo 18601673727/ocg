@@ -12,8 +12,6 @@ use crate::db::{DatabaseError, DatabaseHandle, DatabaseStatus};
 use crate::system::monitor::{ProtectedArea, ProtectionReason};
 
 pub const CLEANUP_QUEUE_CAPACITY: usize = 8;
-/// How often a scheduled worker looks for expired runtime logs. Retention is
-/// counted in days, so an hour keeps a log at most an hour past it.
 pub const RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub const CLEANUP_FAILURE_DETAIL_LIMIT: usize = 16;
 const FAILURE_MESSAGE_BYTES: usize = 256;
@@ -37,7 +35,6 @@ pub struct CleanupSummary {
     pub deleted_file_bytes: u64,
     pub failure_details: Vec<CleanupFailure>,
     pub failure_details_truncated: bool,
-    // None means eligibility could not be determined, not that nothing remains.
     pub additional_candidates_remain: Option<bool>,
     pub scan_interrupted: bool,
     pub interruption_reason: Option<&'static str>,
@@ -157,14 +154,11 @@ pub struct CoreLogCleanup {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Retention runs once at host startup and then every `interval`, without
-/// creating Jobs or consuming execution capacity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetentionSchedule {
     pub interval: Duration,
 }
 
-/// What wakes the worker.
 enum WorkerWake {
     Request(Result<Request, flume::RecvError>),
     Stop,
@@ -181,12 +175,10 @@ pub async fn start_retention(database: &DatabaseHandle) -> Result<CoreLogCleanup
 }
 
 impl CoreLogCleanup {
-    /// Starts a worker that runs cleanup only when invoked.
     pub fn start(database: DatabaseHandle) -> Result<Self, CleanupError> {
         Self::start_with(database, None)
     }
 
-    /// Starts a worker that also runs `schedule` by itself, until shutdown.
     pub fn start_scheduled(
         database: DatabaseHandle,
         schedule: RetentionSchedule,
@@ -227,7 +219,6 @@ impl CoreLogCleanup {
                     receiver: receiver.clone(),
                     claimed: worker_claimed,
                 };
-                // A schedule runs once at start, then waits its interval.
                 let mut due = schedule.map(|_| Instant::now());
                 loop {
                     if worker_shared.stopping.load(Ordering::SeqCst) {
@@ -243,7 +234,6 @@ impl CoreLogCleanup {
                     match wake {
                         WorkerWake::Request(Ok(request)) => {
                             let result = execute(&worker_shared);
-                            // Losing an observer never cancels recorded work or triggers a retry.
                             request.reply.send(result).ok();
                         }
                         WorkerWake::Due => {
@@ -396,9 +386,6 @@ fn execute(shared: &Shared) -> Result<CleanupResult, CleanupError> {
     Ok(CleanupResult { outcome, summary })
 }
 
-/// One scheduled cleanup. Returns whether to run again at once: only after a
-/// run that deleted logs and stopped at its batch limit, so every repeat
-/// makes progress.
 fn run_scheduled(shared: &Shared) -> bool {
     if !expired_logs_may_exist(shared) {
         return false;
@@ -413,7 +400,6 @@ fn run_scheduled(shared: &Shared) -> bool {
             );
             summary.additional_candidates_remain == Some(true) && summary.deleted_count > 0
         }
-        // Protection and shutdown leave the files for a later interval.
         Err(error) => {
             log::warn!("scheduled log cleanup did not complete: {error}");
             false
@@ -421,9 +407,6 @@ fn run_scheduled(shared: &Shared) -> bool {
     }
 }
 
-/// Whether the log directory may hold a runtime log older than the retention
-/// period. Reads metadata only and stops at the first one; anything it cannot
-/// read counts as possibly expired, so the cleanup records the failure.
 fn expired_logs_may_exist(shared: &Shared) -> bool {
     let retention_days = shared
         .database

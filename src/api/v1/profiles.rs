@@ -1,15 +1,3 @@
-//! Profile management and computed Provider projection routes:
-//! - `GET /api/v1/profiles`
-//! - `POST /api/v1/profiles`
-//! - `POST /api/v1/profiles/{profile}`
-//!
-//! A Profile is a config: an LLM Profile is a Model config and an Agent
-//! Profile an Agent config. Providers are computed projections derived from
-//! the LLM Profiles; the Connection configs they name are resolved or created
-//! automatically from Profile-owned configuration. Edits are always allowed
-//! and change no Job that froze the old values. Raw credentials are
-//! write-only and never returned in any read response.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::contracts::*;
@@ -258,11 +246,8 @@ enum ProfileRequest {
         declared_capabilities: Vec<String>,
         #[serde(default)]
         parameters: ParametersInput,
-        /// `None` keeps the Connection's headers; a list replaces them all.
         #[serde(default)]
         headers: Option<Vec<OutboundHeaderInput>>,
-        /// The `edit_seq` of the Profile this edit was made from; required to
-        /// update one and refused when the Profile has changed since.
         #[serde(default)]
         expected_edit_seq: Option<u32>,
     },
@@ -276,11 +261,9 @@ enum ProfileRequest {
         llm_targets: Vec<String>,
         #[serde(default, deserialize_with = "optional_value")]
         compaction_policy: Option<Option<CompactionPolicyInput>>,
-        /// See the Generative Model request.
         #[serde(default)]
         expected_edit_seq: Option<u32>,
     },
-    /// A Decision Model: a typed model reached over a decision protocol.
     DecisionModel {
         name: String,
         model: String,
@@ -300,11 +283,9 @@ enum ProfileRequest {
         limits: DecisionLimitInput,
         #[serde(default)]
         headers: Option<Vec<OutboundHeaderInput>>,
-        /// See the Generative Model request.
         #[serde(default)]
         expected_edit_seq: Option<u32>,
     },
-    /// A Decision Profile: an Agent whose models are Decision Models.
     DecisionAgent {
         name: String,
         #[serde(default)]
@@ -313,7 +294,6 @@ enum ProfileRequest {
         models: Vec<String>,
         #[serde(default, deserialize_with = "optional_value")]
         default_model: Option<Option<String>>,
-        /// See the Generative Model request.
         #[serde(default)]
         expected_edit_seq: Option<u32>,
     },
@@ -397,7 +377,6 @@ fn bounded_provider_message(mut message: String) -> String {
     message
 }
 
-/// Whether a live Model names a Connection with this credential reference.
 async fn saved_connection_credential(
     database: &DatabaseHandle,
     reference: &str,
@@ -504,8 +483,6 @@ async fn previous_model_connection(
     )))
 }
 
-/// The revision an Agent edit is made from: required, and refused when the
-/// stored Profile has moved on. The writer checks it again atomically.
 fn config_revision(current: u32, expected_edit_seq: Option<u32>) -> Result<Option<u32>, Refusal> {
     match expected_edit_seq {
         None => Err(PROFILE_REVISION_REQUIRED),
@@ -514,10 +491,6 @@ fn config_revision(current: u32, expected_edit_seq: Option<u32>) -> Result<Optio
     }
 }
 
-/// The save guard for an update made from `expected_edit_seq`. The Profile
-/// must still be at that revision now, and the writer checks the same
-/// revisions again inside its transaction, so an edit made from a stale form
-/// can neither overwrite nor resurrect what another edit changed.
 fn revision_guard(
     previous: Option<crate::db::mutations::ProfileSaveGuard>,
     expected_edit_seq: Option<u32>,
@@ -532,9 +505,6 @@ fn revision_guard(
     }
 }
 
-/// The credential reference a Profile names, and the secret to write, if
-/// any. An update keeps the reference it had when none is supplied, and an
-/// explicit clear removes it.
 fn resolve_credential_input(
     profile_name: &str,
     credential_ref: Option<&str>,
@@ -596,8 +566,6 @@ fn invalid_headers(error: &HeaderError) -> Refusal {
     INVALID_HEADERS.with_reason(error.to_string())
 }
 
-/// Answers a stored secret by reference, and a new one by the placeholder it
-/// was given for a probe that precedes the save.
 struct ProbeResolver {
     stored: Arc<dyn CredentialResolver>,
     supplied: BTreeMap<String, String>,
@@ -628,16 +596,11 @@ impl CredentialResolver for ProbeResolver {
     }
 }
 
-/// A save's header edits, checked, with the headers a probe request sent
-/// before the save would carry.
 struct HeaderPlan {
     change: HeaderChange,
     probe: RequestHeaders,
 }
 
-/// Checks `inputs` against `previous`, the Connection's stored headers, and
-/// returns the change to store and the headers a probe should send. `None`
-/// keeps `previous`. Every refusal names a header, never a value.
 async fn plan_headers(
     database: &DatabaseHandle,
     inputs: Option<Vec<OutboundHeaderInput>>,
@@ -717,7 +680,6 @@ async fn plan_headers(
     Ok(HeaderPlan { change, probe })
 }
 
-/// A header as read back: a plain value is shown, a secret only as present.
 fn header_views(
     fields: &[OutboundHeader],
     credentials: &BTreeSet<String>,
@@ -814,11 +776,8 @@ async fn validate_decision_model(
     }
 }
 
-/// The default Profile page size.
 const DEFAULT_PROFILE_PAGE: usize = 50;
-/// How many configs one page examines per Profile it may return.
 const PROFILE_SCAN_FACTOR: usize = 4;
-/// The serialized budget one Profile page may exceed only for a single entry.
 const MAX_PROFILE_PAGE_BYTES: usize = 512 * 1024;
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -953,11 +912,6 @@ pub(crate) struct ProfilesView {
     profile_id: Option<String>,
 }
 
-/// Reads one page of LLM and Agent Profiles, newest first, and the Provider
-/// projection of the LLM Profiles on that page. `next_before` continues from
-/// the last Profile returned, or from the last config examined when the scan
-/// or byte budget ended the page first; `None` means the configs were
-/// exhausted.
 pub(crate) async fn list_profiles(
     database: &DatabaseHandle,
     before: Option<ConfigId>,
@@ -969,7 +923,6 @@ pub(crate) async fn list_profiles(
     Ok(Reply::ok(build_profiles_page(page, None)?))
 }
 
-/// The first page after a mutation, which also names the Profile it saved.
 async fn build_profiles_snapshot(
     database: &DatabaseHandle,
     saved_profile: Option<ProfileId>,
@@ -1211,7 +1164,6 @@ fn build_profiles_page(
             }
         }
     }
-    // Newest first, as Profiles have always been listed.
     llm_profiles.sort_by_key(|profile| {
         std::cmp::Reverse(profile_id(&profile.id).ok().map_or(0, ProfileId::get))
     });
@@ -1256,8 +1208,6 @@ fn build_profiles_page(
     Ok(result)
 }
 
-/// Whether `entry` fits the page budget. The first entry always does, so a
-/// page that starts on an oversized Profile still advances.
 fn fits_profile_page(entry: &impl serde::Serialize, bytes: &mut usize) -> Result<bool, Refusal> {
     let size = serde_json::to_vec(entry).map_err(|_| INCONSISTENT_RECORD)?;
     if *bytes > 0 && *bytes + size.len() > MAX_PROFILE_PAGE_BYTES {
@@ -1268,7 +1218,6 @@ fn fits_profile_page(entry: &impl serde::Serialize, bytes: &mut usize) -> Result
 }
 
 enum PreparedProfileSave {
-    /// A config body and, for an update, the revision it was edited from.
     Config(Config, Option<u32>),
     Model(ModelProfileSave),
 }
@@ -1528,8 +1477,6 @@ pub(crate) async fn save_profile(
                     return Err(INVALID_DECISION_LIMITS);
                 }
             }
-            // The existing Profile's Connection, when it is edited, keeps its
-            // credential reference unless another one is named.
             let previous =
                 previous_model_connection(database, existing_id, ConfigKind::DecisionModel).await?;
             let prior_credential_ref = previous
@@ -1632,9 +1579,6 @@ pub(crate) async fn save_profile(
             if default_model.is_some_and(|id| !parsed_models.contains(&id)) {
                 return Err(invalid_default);
             }
-            // Workspace reads are not implemented. A Decision Profile that
-            // names metadata or full access would advertise a permission it
-            // cannot use, so only none is accepted.
             let expected = match existing_id {
                 Some(id) => {
                     let record = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
@@ -1941,17 +1885,12 @@ struct ProviderModelsRequest {
     protocol: Option<String>,
     credential: Option<String>,
     credential_ref: Option<String>,
-    /// A saved Profile of the Connection being probed. Its stored headers are
-    /// sent unless `headers` replaces them, and name the secrets `headers` keeps.
     #[serde(default)]
     profile_id: Option<String>,
     #[serde(default)]
     headers: Option<Vec<OutboundHeaderInput>>,
 }
 
-/// Which protocol a discovery request names: a generative transport, or a
-/// decision protocol. The two are discovered by different routes, so the
-/// protocol decides which one is used.
 #[derive(Clone, Copy)]
 enum DiscoveryProtocol {
     Generative(LlmTransport),
@@ -1981,7 +1920,6 @@ pub(crate) async fn provider_models(
     if request.credential.is_some() && request.credential_ref.is_some() {
         return Err(INVALID_PROFILE_BODY);
     }
-    // Before any stored credential is read: a refused endpoint never sees one.
     if !crate::system::http::discovery_permitted(&request.endpoint) {
         return Err(PROVIDER_DISCOVERY_DISABLED);
     }

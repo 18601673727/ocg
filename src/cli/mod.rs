@@ -17,12 +17,6 @@ pub mod typescript;
 mod update;
 mod verify;
 
-/// Without arguments, runs until a graceful shutdown signal (SIGINT,
-/// SIGTERM, SIGQUIT or SIGHUP), then stops in the reverse order of starting;
-/// see [`crate::system::runtime`]. `register-llm` registers the LLM target that Control
-/// Plane submissions name, prints its identities and exits, see
-/// `llm_target`. Without arguments, the local Control Plane is served too
-/// when it is configured, see [`crate::api::v1`].
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
     let command = arguments.next();
@@ -82,7 +76,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Err(format!("unknown command `{command}`; see `ocg help`").into());
     }
-    // Refused before anything starts when it is given but invalid.
     let control = ControlPlaneConfig::from_environment()?;
     let data_directory = DataDirectory::from_environment()?;
     eprintln!("OCG data directory: {}", data_directory.root().display());

@@ -60,13 +60,10 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::UpdateExecutor
         | OperationKind::ArchiveExecutor
         | OperationKind::ArchivePool
-        // Configurations are frozen for submitted Jobs. These low-frequency
-        // writes conservatively dirty the configuration available to admission.
         | OperationKind::CreateLlmProvider
         | OperationKind::CreateProfile
         | OperationKind::UpdateProfile
         | OperationKind::CreateAgent
-        // Tool effects gate confirmed finalization and repeatable retries.
         | OperationKind::RecordToolOutcome
         | OperationKind::ReconcileToolEffect => true,
         OperationKind::ClaimExecution
@@ -81,8 +78,6 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::RecordProviderAnswer
         | OperationKind::ConsumeAvailability
         | OperationKind::ConsumeTokenUsage
-        // Decisions only add evidence while the owning Job executes locally;
-        // outcome/finalization/stop changes announce subsequent eligibility.
         | OperationKind::RecordToolDecision
         | OperationKind::CreateAttachment
         | OperationKind::CleanupAttachment => false,
@@ -97,9 +92,6 @@ pub(super) fn releases_capacity(kind: OperationKind) -> bool {
         | OperationKind::SetExecutionPoolEnabled
         | OperationKind::SetExecutionPoolProfile
         | OperationKind::UpdateProfile => true,
-        // Quarantining retains the abandoned Job's occupancy rather than
-        // freeing it, so no slot is released and a capacity scan on the other
-        // side would only be told to re-read what it already knows.
         OperationKind::QuarantineAbandonedJob
         | OperationKind::SetScheduledExternalPolicy
         | OperationKind::ClaimExecution

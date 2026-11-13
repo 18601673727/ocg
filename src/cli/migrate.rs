@@ -1,11 +1,3 @@
-//! Offline migration of one stopped database directory to the current format.
-//! No migration step exists yet (format 1 is the first format), so this
-//! reports the current format or refuses another. `--check` only reads; `--to <directory>` copies the source tree
-//! to a private staging directory, applies and verifies the migration there,
-//! and publishes it with an atomic no-replace rename. The source is never
-//! written, and writers stay excluded from before its first read until the
-//! destination is published: the data directory's host lock is held shared and
-//! the source database stays open read-only throughout.
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -46,10 +38,6 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let destination = destination
         .map(|path| destination_path(&source, &path))
         .transpose()?;
-    // Excluded from here to the end of the run, and released only when `run`
-    // returns: a host cannot start (its exclusive lock is refused) and no
-    // writer can open the database file while the source is read, copied,
-    // verified and published.
     let _host_lock = hold_database_lock_shared(&source)?;
     let held = HeldSource::open(&db_path)?;
     let inspection = held.inspect()?;
@@ -88,7 +76,6 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     builder.create(&staging)?;
     let mut cleanup = StagingDirectory(Some(staging.clone()));
     copy_tree_contents(&source, &staging)?;
-    // The database file is a byte copy at this point, so it is compared too.
     verify_tree(&source, &staging, false)?;
     let copied = inspect(&staging.join("ocg.redb"))?;
     match copied {
@@ -106,16 +93,12 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     if !matches!(migrated, MigrationInspection::Current) {
         return Err("migrated database does not report the current format".into());
     }
-    // The held source must still read as the snapshot that was planned.
     match held.inspect()? {
         MigrationInspection::Upgrade(again) if again == plan => {}
         _ => return Err("the source changed during migration; nothing was published".into()),
     }
-    // Everything in the staging tree is durable before it gets a public name.
     sync_directory(&staging)?;
     publish(&staging, &destination)?;
-    // The destination exists from here on. Nothing below removes it, and a
-    // failure below must not say that it does not exist.
     cleanup.0 = None;
     if let Err(error) = sync_directory(parent) {
         return Err(format!(
@@ -192,7 +175,6 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
 
 fn copy_tree_contents(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
     let metadata = fs::symlink_metadata(source)?;
-    // Opened before the mode is applied, which may remove read access.
     let directory = File::open(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
@@ -212,8 +194,6 @@ fn copy_tree_contents(source: &Path, destination: &Path) -> Result<(), Box<dyn E
         }
     }
     fs::set_permissions(destination, metadata.permissions())?;
-    // The entries just created, and the directory's own mode, are durable
-    // before the directory is trusted; nested directories did the same.
     directory.sync_all()?;
     Ok(())
 }

@@ -159,9 +159,7 @@ export function SettingsSurface({
   const [snapshot, setSnapshot] = useState<ControlProfilesSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  // Model form state
   const [editingLlmId, setEditingLlmId] = useState<string | null>(null);
-  // The revision the open form was made from; the server refuses an edit made from an older one.
   const [editingEditSeq, setEditingEditSeq] = useState<number | null>(null);
   const [llmFormOpen, setLlmFormOpen] = useState(false);
   const [modelKind, setModelKind] = useState<ModelKind>("llm");
@@ -170,7 +168,6 @@ export function SettingsSurface({
   const [llmProtocol, setLlmProtocol] = useState<LlmProtocol>("openai_chat_completions");
   const [llmEndpoint, setLlmEndpoint] = useState("");
   const [llmCredentialRef, setLlmCredentialRef] = useState("");
-  // Write-only secret input: never populated from server responses and cleared after save.
   const [llmSecret, setLlmSecret] = useState("");
   const [llmHeaders, setLlmHeaders] = useState<HeaderDraft[]>([]);
   const [llmHeaderError, setLlmHeaderError] = useState<HeaderDraftError>();
@@ -192,13 +189,10 @@ export function SettingsSurface({
   const [llmError, setLlmError] = useState<string | null>(null);
   const [catalogNotice, setCatalogNotice] = useState<string | null>(null);
   const [inFlight, setInFlight] = useState<Set<string>>(() => new Set());
-  // Own availability toggles update the snapshot in place; other notices wait until toggles finish.
   const ownAvailabilityToggles = useRef(0);
   const missedProfileChange = useRef(false);
 
-  // Agent Profile form state
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
-  // The revision the open Agent form was made from; the server refuses an edit made from an older one.
   const [editingAgentSeq, setEditingAgentSeq] = useState<number | null>(null);
   const [agentName, setAgentName] = useState("");
   const [agentInstructions, setAgentInstructions] = useState("");
@@ -295,7 +289,6 @@ export function SettingsSurface({
     setLlmProtocol(profile.protocol);
     setLlmEndpoint(profile.endpoint ?? "");
     setLlmCredentialRef(profile.credential_ref ?? "");
-    // Never populate raw credentials back into the browser.
     setLlmSecret("");
     setLlmHeaders(headersToDrafts(profile.headers));
     setLlmHeaderError(undefined);
@@ -468,8 +461,6 @@ export function SettingsSurface({
       );
     } catch (error) {
       if (isProfileConflict(error) && editingLlmId) {
-        // Keep the draft, show the latest version in the list, and rebase the form on it so a
-        // deliberate second save replaces the other edit instead of failing forever.
         setLlmError(t("settings.llm.conflict"));
         try {
           const latest = await client.readProfiles();
@@ -478,16 +469,11 @@ export function SettingsSurface({
             (profile) => profile.id === editingLlmId,
           );
           if (current) setEditingEditSeq(current.edit_seq);
-        } catch {
-          // The list is stale until the next refresh; the draft and the conflict notice stay.
-        }
+        } catch {}
         return;
       }
       setLlmError(describeError(error, t));
       if (error instanceof ControlTransportError && error.code === "credential_not_saved") {
-        // The Profile was committed even though its key was not; refresh so
-        // the catalog shows the saved Profile, and keep the form open so the
-        // key can be saved again.
         await refreshProfiles();
       }
     } finally {
@@ -608,17 +594,13 @@ export function SettingsSurface({
       );
     } catch (error) {
       if (isProfileConflict(error) && editingAgentId) {
-        // Keep the draft, show the latest version in the list, and rebase the form on it so a
-        // deliberate second save replaces the other edit.
         setAgentError(t("settings.agent.conflict"));
         try {
           const latest = await client.readProfiles();
           setSnapshot(latest);
           const current = latest.agent_profiles.find((profile) => profile.id === editingAgentId);
           if (current) setEditingAgentSeq(current.edit_seq);
-        } catch {
-          // The list is stale until the next refresh; the draft and the conflict notice stay.
-        }
+        } catch {}
       } else {
         setAgentError(describeError(error, t));
       }
@@ -719,7 +701,6 @@ export function SettingsSurface({
                   <ProviderModelImport
                     client={client}
                     snapshot={snapshot}
-                    // The client announces the change, which refreshes the catalog.
                     onImported={setCatalogNotice}
                   />
                   <h3 className="border-t border-border pt-4 text-sm font-semibold">

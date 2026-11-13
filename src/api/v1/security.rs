@@ -1,6 +1,5 @@
 use super::*;
 
-/// The collections whose members are changed with `POST`.
 const MEMBER_COLLECTIONS: [&str; 5] = [
     "profiles",
     "projects",
@@ -9,7 +8,6 @@ const MEMBER_COLLECTIONS: [&str; 5] = [
     "conversations",
 ];
 
-/// Whether `rest` names one member of `collection`.
 fn member(rest: &str, collection: &str) -> bool {
     rest.strip_prefix(collection)
         .and_then(|rest| rest.strip_prefix('/'))
@@ -63,9 +61,6 @@ fn mutable_job_write(rest: &str) -> bool {
     )
 }
 
-/// Whether `path` names a route that is submitted to with `POST`: Job
-/// submission, a Job's stop, a Profile, Project, Pool or conversation
-/// change, or an image upload.
 fn takes_post(path: &str) -> bool {
     if path == "/api/v1/executors" || path == "/api/v1/pools" {
         return true;
@@ -98,16 +93,12 @@ fn takes_post(path: &str) -> bool {
     }
 }
 
-/// Whether `path` names a route that is removed with `DELETE`: one Profile
-/// member, whose LLM Profile is archived in place.
 fn takes_delete(path: &str) -> bool {
     path.strip_prefix("/api/v1/").is_some_and(|rest| {
         member(rest, "profiles") || member(rest, "providers") || member(rest, "jobs")
     })
 }
 
-/// The largest JSON body `path` accepts with `POST`, or `None` when it
-/// accepts none.
 fn json_post_limit(path: &str) -> Option<usize> {
     if path == "/api/v1/executors" || path == "/api/v1/pools" {
         return Some(MAX_SUBMISSION_BYTES);
@@ -139,29 +130,18 @@ fn json_post_limit(path: &str) -> Option<usize> {
     }
 }
 
-/// Where an admitted request is answered from.
 pub(super) enum Destination {
-    /// The exported frontend's files.
     Asset,
-    /// An API route, for one caller.
     Api(Caller),
 }
 
-/// Who an API request is.
 #[derive(Clone)]
 pub(super) enum Caller {
-    /// A programmatic client carrying the bearer token.
     Programmatic,
-    /// The operator's browser, within its session.
     Operator(browser::Session),
-    /// No one yet: only the sign-in, which needs this run's pairing code
-    /// and nothing else.
     Anonymous,
 }
 
-/// Checks everything about a request but its route: its shape, that it
-/// names this listener and its own origin, who it is, and what it may
-/// carry.
 pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destination, Refusal> {
     let headers = request.headers();
     let header_bytes = headers
@@ -209,14 +189,9 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
         return Err(FORBIDDEN_ORIGIN);
     }
     if !api {
-        // The frontend's files are the same shell for every reader on this
-        // machine: all application data and every command is API, and
-        // refused there without its credential.
         return Ok(Destination::Asset);
     }
     let caller = if login && method == Method::POST {
-        // A sign-in carries its own credential, this run's pairing code;
-        // the bearer API has no use for it.
         if headers.get_all(header::AUTHORIZATION).count() != 0 {
             return Err(NOT_FOUND);
         }
@@ -226,10 +201,6 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
         && shared.assets.is_some()
         && headers.get_all(header::AUTHORIZATION).count() == 0
     {
-        // The frontend this listener serves signs itself in: a browser with
-        // no live session, or one from an earlier run, is answered as
-        // anonymous here so the route can begin one. The pairing code stays
-        // for a headless listener's remote control client.
         authenticate(headers, shared).unwrap_or(Caller::Anonymous)
     } else {
         authenticate(headers, shared)?
@@ -266,10 +237,6 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
     Ok(Destination::Api(caller))
 }
 
-/// The request's one credential, or refusal: exactly one of the bearer
-/// token and a live session cookie. A request with both, with a
-/// duplicated header, or with a cookie that names no live session, is
-/// refused rather than believed in part.
 fn authenticate(headers: &HeaderMap, shared: &Shared) -> Result<Caller, Refusal> {
     let credentials = headers.get_all(header::AUTHORIZATION).count();
     let presented = browser::presented(headers);
@@ -288,7 +255,6 @@ fn authenticate(headers: &HeaderMap, shared: &Shared) -> Result<Caller, Refusal>
     }
 }
 
-/// The request's one `Host`, lowercased, if it names this listener exactly.
 fn names_listener(headers: &HeaderMap, port: u16) -> Option<String> {
     let host = single(headers, &header::HOST)?
         .to_str()
@@ -297,8 +263,6 @@ fn names_listener(headers: &HeaderMap, port: u16) -> Option<String> {
     (host == format!("127.0.0.1:{port}") || host == format!("localhost:{port}")).then_some(host)
 }
 
-/// Whether the request says nothing of an origin, or its one `Origin` is
-/// the `http` origin of the `host` it names.
 fn same_origin(headers: &HeaderMap, host: &str) -> bool {
     let origin_allowed = match headers.get_all(header::ORIGIN).count() {
         0 => true,
@@ -317,7 +281,6 @@ fn same_origin(headers: &HeaderMap, host: &str) -> bool {
     origin_allowed && site_allowed
 }
 
-/// Whether the request's one `Authorization` is the bearer token.
 fn authenticated(headers: &HeaderMap, token: &Token) -> bool {
     let Some(value) = single(headers, &header::AUTHORIZATION) else {
         return false;

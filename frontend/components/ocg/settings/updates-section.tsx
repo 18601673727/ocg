@@ -33,9 +33,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
           const current = identity(next.state);
           try {
             sessionStorage.setItem(seenKey, current);
-          } catch {
-            // The current page can still track the update without storage.
-          }
+          } catch {}
           setSeen(current);
           if (next.state.phase === "installing") {
             const key = `${seenKey}-installing`;
@@ -51,18 +49,14 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
             installing.current = { id: current, started };
             try {
               sessionStorage.setItem(key, `${current}|${started}`);
-            } catch {
-              // Keep the timer in memory when storage is unavailable.
-            }
+            } catch {}
             setInstallingAt(started);
           }
         } else {
           try {
             const saved = sessionStorage.getItem(seenKey);
             if (saved !== null) setSeen(saved);
-          } catch {
-            // Keep the current page's seen update.
-          }
+          } catch {}
         }
         if (running.current && running.current !== next.running) {
           window.location.reload();
@@ -190,9 +184,7 @@ export function UpdatesSection({ client }: { client: HttpCanonicalControlClient 
                     setSeen(current);
                     try {
                       sessionStorage.setItem(seenKey, current);
-                    } catch {
-                      // The current page can still track the update without storage.
-                    }
+                    } catch {}
                     setView((previous) => previous && { ...previous, state });
                   },
                   (cause) => setError(cause),

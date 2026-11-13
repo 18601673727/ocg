@@ -5,10 +5,6 @@ import { Input } from "@/components/ui/input";
 import { useI18n } from "../i18n";
 import { type HeaderDraft, type HeaderDraftError, blankHeaderDraft } from "./header-drafts";
 
-/**
- * Edits a list of custom request headers. A secret row's value is write-only:
- * the field starts empty, and leaving it empty keeps the stored value.
- */
 export function HeadersEditor({
   value,
   onChange,
@@ -21,7 +17,6 @@ export function HeadersEditor({
   value: HeaderDraft[];
   onChange: (value: HeaderDraft[]) => void;
   disabled?: boolean;
-  /** Global headers are sent to every Provider, so they cannot be secret. */
   allowSecret: boolean;
   error?: HeaderDraftError;
   legend: string;
@@ -69,7 +64,6 @@ export function HeadersEditor({
                     className="size-4 accent-primary"
                     checked={draft.secret}
                     onChange={(event) =>
-                      // Changing the kind drops the typed value and the stored secret.
                       update(index, { secret: event.target.checked, value: "", stored: false })
                     }
                   />

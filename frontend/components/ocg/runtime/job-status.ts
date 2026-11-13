@@ -28,19 +28,11 @@ export function taskPlanActive(plan: ControlTaskPlan | null | undefined): boolea
 
 export type NativeExecutionStatus = {
   phase: ControlExecutionPhase;
-  /** True while a Pool Allocation still owns executor capacity. */
   holdsCapacity: boolean;
-  /** Which Executor and Pool the Allocation is held on, when one exists. */
   owner?: { executor: string; pool: string };
-  /**
-   * Whether the legacy conversation actions (Stop, Retry, Compact, Close, Hold, queue
-   * edits) apply. Derived from the Job's own details, never stored: a native (mutable)
-   * Job carries a mutable phase, and the backend refuses those actions for it.
-   */
   actionsSupported: boolean;
 };
 
-/** One phase vocabulary for every Job surface; none of them implies stopped. */
 export const EXECUTION_PHASE_KEYS = {
   unsubmitted: "job.phase.unsubmitted",
   queued: "job.phase.queued",
@@ -65,11 +57,6 @@ export const EXECUTION_PHASE_TONES = {
   cancelled: "slate",
 } as const satisfies Record<ControlExecutionPhase, Tone>;
 
-/**
- * The phase is the backend's own derivation (`execution_phase`); the Allocation only
- * adds who still holds capacity. An uncertain or stop-requested Job is never described
- * as stopped.
- */
 export function nativeExecutionStatus(
   phase: ControlExecutionPhase,
   details: Pick<ControlJobDetails, "allocation" | "mutable_phase"> | undefined,
@@ -87,10 +74,6 @@ export function executionLabel(t: TranslateFn, status: NativeExecutionStatus): s
   return t(EXECUTION_PHASE_KEYS[status.phase]);
 }
 
-/**
- * What the phase does and does not establish. Held capacity is named with its owner so an
- * uncertain or stop-requested Job is never read as stopped.
- */
 export function executionDetail(t: TranslateFn, status: NativeExecutionStatus): string | undefined {
   const owner = status.owner ?? { executor: "—", pool: "—" };
   const vars = { executor: owner.executor, pool: owner.pool };

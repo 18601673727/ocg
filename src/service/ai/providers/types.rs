@@ -1,7 +1,5 @@
 use super::*;
 
-/// The temporary bootstrap credential boundary. The name is persisted, while
-/// this resolver returns the secret only to the request builder.
 pub trait CredentialResolver: Send + Sync {
     fn resolve<'a>(
         &'a self,
@@ -9,13 +7,6 @@ pub trait CredentialResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Option<String>, ProviderExecutionError>> + Send + 'a>>;
 }
 
-/// Receives text deltas while the provider stream is still active. The
-/// runtime uses this to publish bounded intermediate outputs through the
-/// authoritative database before final settlement.
-///
-/// It also receives the Token facts of the request as they become known, see
-/// [`ProviderObservation`]. Each is awaited, so the producer never runs ahead
-/// of what the sink has taken.
 pub trait ProviderOutputSink {
     fn append<'a>(
         &'a mut self,
@@ -30,9 +21,6 @@ pub trait ProviderOutputSink {
         Box::pin(async { Ok(()) })
     }
 
-    /// Takes one Token fact. It cannot fail the request: a sink that cannot
-    /// keep a fact owns that gap, and the provider outcome stays what the
-    /// provider and transport made it.
     fn observe<'a>(
         &'a mut self,
         _observation: ProviderObservation,
@@ -41,7 +29,6 @@ pub trait ProviderOutputSink {
     }
 }
 
-/// A Token fact of one request, with the time the producer learned it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderObservation {
     pub observed_at: Timestamp,
@@ -50,24 +37,14 @@ pub struct ProviderObservation {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProviderFact {
-    /// The request was positively known not to have been sent: it failed
-    /// while being built, or before any byte could leave. No Provider saw it.
     NotDelivered,
-    /// The request was issued or may have been delivered: a response head
-    /// arrived, or the send failed in a way that cannot rule delivery out.
-    /// It is announced only once delivery is no longer excluded, so a
-    /// request that can still be classified NotDelivered never has it.
     Delivered,
-    /// One usage object the provider reported. Its counters are normalized
-    /// only where valid, and the object is kept raw.
     Usage {
         usage: NormalizedUsage,
         finality: UsageFinality,
     },
 }
 
-/// A local failure to persist a streamed delta. It is a fact about this
-/// runtime, not about the provider, so it never becomes a provider failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputSinkError {
     pub message: String,
@@ -98,19 +75,10 @@ impl CredentialResolver for EnvironmentCredentialResolver {
     }
 }
 
-/// Where a Provider request may be connected.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DestinationPolicy {
-    /// The ordinary connector: the destination is whatever the frozen
-    /// endpoint names. Every path that reaches it has already refused an
-    /// endpoint that is not a literal loopback, see
-    /// [`crate::system::http::direct_diagnostic_loopback`].
     #[default]
     Standard,
-    /// One operator-approved HTTPS destination, for one manually invoked
-    /// external exchange under `authority`. The connector refuses any other
-    /// host or port, any address that is not public, any scheme but https,
-    /// and any certificate that does not verify for exactly this host.
     ApprovedHttps {
         host: String,
         port: u16,
@@ -119,27 +87,14 @@ pub enum DestinationPolicy {
     },
 }
 
-/// Which manual authority approved an [`DestinationPolicy::ApprovedHttps`]
-/// destination. Each has its own execution control and enables nothing the
-/// other governs: enabling one never lets the other's destination connect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalAuthority {
-    /// `ocg external-trial`, under `manual_external_trial`. Direct or through
-    /// a trusted loopback proxy.
     ManualExternalTrial,
-    /// `ocg run-external-job`, under `manual_external_execution`. Through a
-    /// trusted loopback proxy only.
     ManualExternalExecution,
-    /// The native scheduler, under `scheduled_external_transport`, through a
-    /// trusted loopback proxy only. It is formed from one durable scheduled
-    /// external policy and admits exactly the Job binding that policy
-    /// authorized; a manual approval of either kind neither forms nor enables
-    /// it.
     ScheduledExternalTransport,
 }
 
 impl ExternalAuthority {
-    /// The control that must be enabled for this authority to connect.
     pub(crate) const fn control(self) -> crate::system::execution_controls::ExecutionControl {
         use crate::system::execution_controls::ExecutionControl;
         match self {
@@ -151,7 +106,6 @@ impl ExternalAuthority {
         }
     }
 
-    /// Whether this authority may use `route`.
     pub(crate) const fn admits_route(self, route: &ApprovedRoute) -> bool {
         match (self, route) {
             (
@@ -173,26 +127,16 @@ impl ExternalAuthority {
     }
 }
 
-/// How the connection to an approved destination is made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovedRoute {
-    /// OCG resolves the name itself, requires every address to be public,
-    /// and connects to exactly those addresses.
     Direct,
-    /// An HTTP CONNECT tunnel through one explicitly named loopback proxy.
-    /// The proxy resolves the name and chooses the route: OCG does not look
-    /// the name up and cannot prove the address the proxy reaches. There is
-    /// no fallback to a direct connection.
     TrustedProxy(LoopbackProxy),
 }
 
-/// The address of a proxy on this machine. It can only be built from a
-/// loopback address, so no remote proxy can be named by accident.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopbackProxy(std::net::SocketAddr);
 
 impl LoopbackProxy {
-    /// `None` unless `address` is a loopback address with a nonzero port.
     pub fn new(address: std::net::SocketAddr) -> Option<Self> {
         (address.ip().is_loopback() && address.port() != 0).then_some(Self(address))
     }
@@ -243,21 +187,12 @@ impl Default for ProviderExecutionConfig {
     }
 }
 
-/// One finished Provider exchange. It may be assistant text, tool calls, or
-/// both. Tool calls are complete requests the Provider made; `refused` names
-/// those the request did not admit. None has been run, and a result carrying
-/// calls is not a finished answer. Admission is not permission to execute.
-/// Paths without a tool loop must require [`Self::admitted`].
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionResult {
     pub response_items: Vec<Value>,
     pub text: String,
-    /// The streamed `reasoning_content`, kept apart from the text and never
-    /// published as output.
     pub reasoning: String,
-    /// Ordered by their wire index, with ids, names and arguments as sent.
     pub tool_calls: Vec<CompletedToolCall>,
-    /// Answerable refusals ordered by index, each also present in `tool_calls`.
     pub refused: Vec<InvalidToolCall>,
     pub usage: NormalizedUsage,
     pub finish_reason: Option<ChatFinishReason>,
@@ -268,11 +203,6 @@ pub struct ProviderExecutionResult {
     pub finished_in: Duration,
 }
 
-/// The facts of a provider response observed before execution ended
-/// abnormally. The status is always present: these facts exist only once
-/// the response head arrived. A finish reason is the one an accepted event
-/// reported; it is a raw observation, and whether it witnesses a normal
-/// termination is decided only where it is classified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResponseFacts {
     pub status_code: u16,
@@ -286,17 +216,10 @@ pub enum ProviderExecutionError {
     Build { message: String },
     #[error("provider request failed before delivery: {message}")]
     NotDelivered { message: String },
-    /// The transport failed, or the Provider fell silent, after the request
-    /// may have been delivered.
     #[error("provider response failed after possible delivery: {message}")]
     Unknown {
         message: String,
-        /// What the response had shown before the failure; `None` when no
-        /// response head arrived.
         facts: Option<ResponseFacts>,
-        /// Whether the response had already finished before the failure: its
-        /// finish reason was accepted and no tool call of it is left
-        /// unchecked. Its facts then stand apart from the later failure.
         finished: bool,
     },
     #[error("provider response failed after possible delivery: {failure}")]
@@ -307,24 +230,13 @@ pub enum ProviderExecutionError {
     },
     #[error("provider rejected the request: {failure}")]
     Rejected { failure: ProviderFailure },
-    /// The response broke the protocol, or what it sent was refused, such
-    /// as a malformed or unadmitted tool call. The refusal is about the
-    /// response itself, so its facts never stand apart from it.
     #[error("provider stream was incomplete: {message}")]
     Incomplete {
         message: String,
         facts: ResponseFacts,
     },
-    /// Execution was cancelled on this side before any response head
-    /// arrived, after the request may have been sent. Delivery cannot be
-    /// ruled out, and nothing about the Provider was observed: it is neither
-    /// a Provider nor a transport fault.
     #[error("provider execution was interrupted locally: {message}")]
     Interrupted { message: String },
-    /// Execution stopped on this side after the provider had answered: the
-    /// caller cancelled, the response reached the local output limit, or the
-    /// runtime could not persist streamed output. None is a provider or
-    /// transport fault, so only the response facts already observed are kept.
     #[error("provider execution stopped locally: {message}")]
     Stopped {
         message: String,
@@ -335,10 +247,6 @@ pub enum ProviderExecutionError {
         message: String,
         stream: Box<ProviderExecutionError>,
     },
-    /// The Provider response completed, but its last buffered output could not
-    /// be persisted. The completed result travels with the failure so its
-    /// text, reasoning and tool calls are not lost; the local persistence gap
-    /// still leaves the outcome unknown, and no call of it is run.
     #[error("provider response completed but its output could not be persisted: {message}")]
     CompletionUnpersisted {
         message: String,
@@ -347,7 +255,6 @@ pub enum ProviderExecutionError {
 }
 
 impl ProviderExecutionResult {
-    /// Requires every call to be admitted when no tool loop can answer refusals.
     pub fn admitted(self) -> Result<Self, ProviderExecutionError> {
         if let Some(refusal) = self.refused.iter().min_by_key(|refusal| refusal.index) {
             return Err(incomplete_tool_calls(
@@ -362,7 +269,6 @@ impl ProviderExecutionResult {
         Ok(self)
     }
 
-    /// Whether the Provider asked for tools to be run before it can answer.
     #[must_use]
     pub fn requests_tools(&self) -> bool {
         !self.tool_calls.is_empty()

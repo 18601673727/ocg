@@ -1,13 +1,3 @@
-//! What the manually initiated execution commands (`external-trial`,
-//! `run-external-job` and `run-loopback-job`) share: strict argument pieces,
-//! the existing database they run against, the one-shot host they run inside,
-//! and, for the two external ones, the report of the approved route and of
-//! what the database shows afterwards.
-//!
-//! No command may create a database, wait for another host, or run beside
-//! one: the host takes the database lock without waiting and fails when it is
-//! held.
-
 use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
@@ -30,8 +20,6 @@ pub(super) fn uuid(text: &str, what: &str) -> Result<u128, Failure> {
         .map_err(|_| format!("the {what} must be a UUID").into())
 }
 
-/// Prints the refusal as the command's JSON answer and returns the failure
-/// that ends the command. Nothing was sent.
 pub(super) fn refused(code: &str, detail: &str) -> Failure {
     println!(
         "{}",
@@ -47,7 +35,6 @@ pub(super) fn refused(code: &str, detail: &str) -> Failure {
     format!("refused: {code}").into()
 }
 
-/// An existing database only: a mistyped directory must not become a new one.
 pub(super) fn existing_data_directory(never_creates: &str) -> Result<DataDirectory, Failure> {
     let root = std::env::var_os(DATA_DIRECTORY_VARIABLE)
         .filter(|value| !value.is_empty())
@@ -64,11 +51,6 @@ pub(super) fn existing_data_directory(never_creates: &str) -> Result<DataDirecto
     Ok(DataDirectory::bootstrap(root)?)
 }
 
-/// Runs `run` once inside a host of its own and returns what it produced,
-/// with how the host closed. The operator's stop (SIGINT or SIGTERM) cancels
-/// the token `run` was given and lets it settle what it can; it is not a
-/// claim about the Provider. `None` means `run` never started because the
-/// host did not open, so nothing was sent.
 pub(super) fn host_once<T, F>(
     data_directory: &DataDirectory,
     run: impl FnOnce(DatabaseHandle, CancellationToken) -> F + 'static,
@@ -99,9 +81,6 @@ where
     (finished, hosted)
 }
 
-/// What the connection of an approved external exchange guarantees, stated
-/// for the route the approval names. The ambient proxy, if any is configured,
-/// is never used.
 pub(super) fn external_network_json(approval: &ExternalApproval) -> serde_json::Value {
     let ambient = crate::system::http::ambient_proxy_configured();
     match approval.route() {
@@ -131,10 +110,6 @@ pub(super) fn external_network_json(approval: &ExternalApproval) -> serde_json::
     }
 }
 
-/// What the operating system reports about the process listening on the
-/// proxy port. It is an observation for the operator, never an authorization:
-/// a process can use any name, and a listener can change between this look
-/// and the connection.
 fn observe_listener(proxy: LoopbackProxy) -> serde_json::Value {
     let port = proxy.address().port();
     let output = std::process::Command::new("/usr/sbin/lsof")
@@ -170,7 +145,6 @@ fn observe_listener(proxy: LoopbackProxy) -> serde_json::Value {
     })
 }
 
-/// What the database shows after an approved external exchange.
 pub(super) fn external_report_json(
     report: &ExecutionReport,
     network: &serde_json::Value,
@@ -199,9 +173,6 @@ pub(super) fn external_report_json(
     })
 }
 
-/// Turns what one hosted external exchange produced into the command's
-/// answer: the report or refusal on standard output, and success only for a
-/// Completed Job. `what` names the command's run in messages.
 pub(super) fn conclude_external(
     finished: Option<Result<ExecutionReport, Stop>>,
     hosted: Result<(), HostError>,
@@ -209,7 +180,6 @@ pub(super) fn conclude_external(
     render: impl FnOnce(&ExecutionReport) -> serde_json::Value,
 ) -> Result<(), Failure> {
     let Some(finished) = finished else {
-        // It never ran: the host did not open, so nothing was sent.
         return Err(match hosted {
             Err(error) => refused(
                 "host_failed",
@@ -219,9 +189,6 @@ pub(super) fn conclude_external(
         });
     };
     if let Err(error) = hosted {
-        // It ran and the host then failed to close cleanly. The result below
-        // is what it recorded; the close failure is reported with it, never
-        // instead of it.
         eprintln!("the database could not be closed cleanly after the {what}: {error}");
     }
     match finished {

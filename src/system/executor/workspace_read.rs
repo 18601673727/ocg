@@ -1,48 +1,3 @@
-//! `workspace_read_file`: reads one UTF-8 text file inside a Workspace the
-//! operator authorized, whole when it is small, or a range of its lines, and
-//! nothing else. The Workspace, its path rules and its checks are shared with
-//! `workspace_write_file` and the discovery tools, see
-//! [`crate::system::executor::workspace_write`] and
-//! [`crate::system::executor::workspace_discovery`].
-//!
-//! The Workspace root is chosen by the operator, never by a Provider: a call
-//! carries only a path relative to it. The root is resolved and checked once,
-//! by [`Workspace::authorize`], before the tool can be registered, and it is
-//! refused when it is not an existing directory, when it would contain the
-//! home directory or the OCG data directory, or when it lies inside the data
-//! directory. The home directory is that of the effective user's account, as
-//! the system's account database states it, never `HOME`, which whoever
-//! starts OCG can set to anything; when it cannot be found, every root is
-//! refused.
-//!
-//! Each call opens the root, then every component of its path, relative to
-//! the directory opened before it, with `O_NOFOLLOW`, so no symbolic link is
-//! ever followed, not even one swapped in while the call runs: the file read
-//! is reached from the root through directories the call itself held open.
-//! A path is refused before anything is opened when it is not a plain
-//! relative path, or names a hidden, secret-bearing or OCG-internal location.
-//! A file is read only when it is a regular file with a single link, within
-//! [`MAX_FILE_BYTES`], and the same size and modification time before and
-//! after the read; its contents are returned whole, or not at all.
-//!
-//! A ranged read, a call that names `start_line` or `line_count`, reads a
-//! file of up to [`MAX_RANGED_FILE_BYTES`] with the same walk and checks. It
-//! streams the file once, keeping only the lines asked for, at most
-//! [`MAX_RANGE_LINES`] of them and as many as fit [`MAX_FILE_BYTES`] once
-//! escaped for JSON, and returns them exactly, with their line ends. Lines
-//! are numbered from 1 and end at `\n`. The result says which lines it holds,
-//! how many the file has, and where to continue; a single line too long for
-//! the limit is returned cut, and says so. Only the lines returned must be
-//! UTF-8 text.
-//!
-//! What this does not establish: a bind mount or a hard-linked directory
-//! inside the Workspace can still lead outside it; the root itself is
-//! checked against the directory authorized, but its ancestors are resolved
-//! by path; a file replaced by a device between its check and its open is
-//! opened, though never read unless it is a regular file; and a change that
-//! keeps a file's size and modification time is not detected. The tool is
-//! meant for a trusted, local Workspace of a single operator.
-
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -60,29 +15,19 @@ use crate::system::executor::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
 };
 
-/// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_read_file";
 
-/// The largest file the tool reads whole. A larger one is refused, never
-/// truncated; it may be read in ranges. Also the most a ranged read returns.
 pub const MAX_FILE_BYTES: usize = 32 * 1024;
 
-/// The largest file a ranged read reads from.
 pub const MAX_RANGED_FILE_BYTES: usize = 16 * 1024 * 1024;
 
-/// The most lines one ranged read returns.
 pub const MAX_RANGE_LINES: u64 = 2_000;
 
-/// Identifies this handler's behavior in every call it records.
 const HANDLER_VERSION: &str = "workspace_read_file-3";
 
-/// The longest relative path, in bytes, and the most components, a call may
-/// name.
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_PATH_COMPONENTS: usize = 64;
 
-/// Names that are refused wherever they appear in a path, compared without
-/// case: OCG's own storage, and files that usually hold secrets.
 const PROTECTED_NAMES: &[&str] = &[
     "ocg_db",
     "ocg.redb",
@@ -95,16 +40,11 @@ const PROTECTED_NAMES: &[&str] = &[
     "secrets.yaml",
     "secrets.yml",
 ];
-/// Prefixes of private key files.
 const PROTECTED_PREFIXES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
-/// Extensions of key, certificate store and environment files.
 const PROTECTED_EXTENSIONS: &[&str] = &[
     "env", "jks", "kdbx", "key", "keystore", "p12", "pem", "pfx", "ppk",
 ];
 
-// Commands can execute arbitrary project code, including writes outside their
-// declared root. Conservatively invalidate every local snapshot for any OCG
-// workspace mutation, and keep it dirty for the entire operation's lifetime.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MutationStamp {
     revision: u128,
@@ -152,7 +92,6 @@ impl Drop for WorkspaceMutation {
     }
 }
 
-/// A directory's identity, which a later open can be compared against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity {
     device: u64,
@@ -168,7 +107,6 @@ impl Identity {
     }
 }
 
-/// Why a Workspace root cannot be authorized.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
     #[error("the Workspace root must be an absolute path")]
@@ -179,8 +117,6 @@ pub enum WorkspaceError {
     NotDirectory,
     #[error("the Workspace root may not be the filesystem root or contain the home directory")]
     TooBroad,
-    /// The effective user's home directory is unknown, so whether the root
-    /// contains it cannot be checked.
     #[error(
         "the home directory of the effective user cannot be determined from the account database, so no Workspace root can be authorized: {0}"
     )]
@@ -189,9 +125,6 @@ pub enum WorkspaceError {
     OverlapsDataDirectory,
 }
 
-/// A Workspace root the operator authorized for Provider access, resolved
-/// and checked. Only [`Workspace::authorize`] makes one; a clone is the same
-/// authorization, for the tools of one execution to share.
 #[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
@@ -200,20 +133,10 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Resolves `root` and checks that it may be read from: it must be an
-    /// absolute path to an existing directory that neither contains the
-    /// effective user's home directory, see [`account_home`], nor overlaps
-    /// `data_directory`.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the root is refused; [`WorkspaceError::HomeUnknown`]
-    /// whatever the root when the home directory cannot be determined.
     pub fn authorize(root: &Path, data_directory: &DataDirectory) -> Result<Self, WorkspaceError> {
         Self::authorize_beside(root, data_directory, account_home())
     }
 
-    /// [`Self::authorize`], with `home` as what [`account_home`] answered.
     fn authorize_beside(
         root: &Path,
         data_directory: &DataDirectory,
@@ -244,12 +167,10 @@ impl Workspace {
         })
     }
 
-    /// The resolved root.
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The whole text of the file at `path`, relative to the root.
     fn read(&self, path: &str) -> Result<String, Refusal> {
         let (directory, name) = self.parent(path)?;
         let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
@@ -270,8 +191,6 @@ impl Workspace {
         read_whole(&file)
     }
 
-    /// Up to `line_count` lines of the file at `path`, relative to the root,
-    /// from line `start_line`, see [`read_lines`].
     fn read_range(
         &self,
         path: &str,
@@ -315,25 +234,12 @@ impl Workspace {
         }
     }
 
-    /// The whole content of the file at `path`, relative to the root, as
-    /// bytes, when it has at most `limit` of them: the path rules, the walk
-    /// and the checks of reading text, without requiring text. For a file
-    /// the operator chose, such as an image to send.
-    ///
-    /// # Errors
-    ///
-    /// Returns why nothing was read; [`Refusal::TooLarge`] for a file over
-    /// `limit`.
     pub fn read_binary(&self, path: &str, limit: usize) -> Result<Vec<u8>, Refusal> {
         let (directory, name) = self.parent(path)?;
         let file = open_within(&directory, name, Step::File, limit)?;
         read_bytes(&file, limit)
     }
 
-    /// The directory that holds the last component of `path`, opened from
-    /// the root through every directory before it, and that component. The
-    /// path is checked first, and the root must still be the directory that
-    /// was authorized; no directory on the way may be the data directory.
     pub(super) fn parent<'a>(&self, path: &'a str) -> Result<(File, &'a str), Refusal> {
         let components = components(path)?;
         let (name, parents) = components.split_last().ok_or(Refusal::InvalidPath)?;
@@ -344,9 +250,6 @@ impl Workspace {
         Ok((directory, *name))
     }
 
-    /// The directory at `path`, relative to the root, opened from the root
-    /// through every directory on the way, as [`Self::parent`] opens them;
-    /// `.` names the root itself.
     pub(super) fn directory(&self, path: &str) -> Result<File, Refusal> {
         let components = if path == "." {
             Vec::new()
@@ -360,8 +263,6 @@ impl Workspace {
         Ok(directory)
     }
 
-    /// The directory `name` inside `directory`, opened without following a
-    /// link, unless it is the data directory.
     pub(crate) fn subdirectory(&self, directory: &File, name: &str) -> Result<File, Refusal> {
         let opened = open_at(directory, name, Step::Directory)?;
         let metadata = opened.metadata().map_err(|_| Refusal::Unreadable)?;
@@ -371,8 +272,6 @@ impl Workspace {
         Ok(opened)
     }
 
-    /// The root, opened, when it still exists and is still the directory
-    /// that was authorized.
     pub(crate) fn open_root(&self) -> Result<File, Refusal> {
         let directory = open_directory(&self.root).map_err(|_| Refusal::WorkspaceChanged)?;
         let metadata = directory
@@ -385,7 +284,6 @@ impl Workspace {
     }
 }
 
-/// Why the effective user's home directory is unknown.
 #[derive(Debug, thiserror::Error)]
 pub enum HomeError {
     #[error("the account lookup failed: {0}")]
@@ -398,16 +296,6 @@ pub enum HomeError {
     Unresolved(#[source] std::io::Error),
 }
 
-/// The home directory of the effective user, resolved: the one its entry in
-/// the account database names (`getpwuid_r` of the effective user ID), the
-/// source the system itself uses to set `HOME` at login. The environment is
-/// never consulted, so an unset, missing or misleading `HOME` changes
-/// nothing. A home directory that is not absolute or does not exist is not
-/// one a root can be checked against, so it is an error too.
-///
-/// # Errors
-///
-/// Returns why the home directory cannot be determined.
 pub fn account_home() -> Result<PathBuf, HomeError> {
     let user = nix::unistd::User::from_uid(nix::unistd::Uid::effective())
         .map_err(|errno| HomeError::Lookup(errno.into()))?
@@ -418,8 +306,6 @@ pub fn account_home() -> Result<PathBuf, HomeError> {
     user.dir.canonicalize().map_err(HomeError::Unresolved)
 }
 
-/// Why a call reads nothing. Its message is recorded and may reach the
-/// Provider, so it never repeats the path or anything read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
     #[error("the path is not a plain relative path inside the Workspace")]
@@ -472,9 +358,6 @@ impl Refusal {
     }
 }
 
-/// The components of a plain relative path: no leading, trailing or doubled
-/// separator, no `.` or `..`, no backslash, colon or control character, and
-/// no hidden or protected name.
 pub(crate) fn components(path: &str) -> Result<Vec<&str>, Refusal> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES {
         return Err(Refusal::InvalidPath);
@@ -489,7 +372,6 @@ pub(crate) fn components(path: &str) -> Result<Vec<&str>, Refusal> {
     Ok(components)
 }
 
-/// Checks one component of a path as [`components`] does.
 pub(crate) fn check_component(component: &str) -> Result<(), Refusal> {
     if component.is_empty()
         || component == "."
@@ -518,31 +400,22 @@ fn is_protected(component: &str) -> bool {
             .is_some_and(|(_, extension)| PROTECTED_EXTENSIONS.contains(&extension))
 }
 
-/// What a component of a path must be.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Directory,
     File,
 }
 
-/// Opens the directory at `path`, refusing a symbolic link as its last
-/// component.
 fn open_directory(path: &Path) -> std::io::Result<File> {
     let flags =
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     Ok(File::from(rustix::fs::open(path, flags, Mode::empty())?))
 }
 
-/// Opens `name` inside `directory` as `step` requires, without following a
-/// symbolic link. Its type is checked first, so nothing but a directory or a
-/// regular file of an acceptable size is opened; the open itself refuses a
-/// link, and a directory step refuses anything but a directory, whatever
-/// replaced the checked entry meanwhile.
 pub(super) fn open_at(directory: &File, name: &str, step: Step) -> Result<File, Refusal> {
     open_within(directory, name, step, MAX_FILE_BYTES)
 }
 
-/// [`open_at`], with a file of up to `limit` bytes.
 pub(crate) fn open_within(
     directory: &File,
     name: &str,
@@ -577,7 +450,6 @@ pub(crate) fn open_within(
         .map_err(Refusal::from_errno)
 }
 
-/// Reads the whole of an opened file, bounded by [`MAX_FILE_BYTES`], as text.
 pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
     let content = read_bytes(file, MAX_FILE_BYTES)?;
     let text = String::from_utf8(content).map_err(|_| Refusal::NotText)?;
@@ -587,8 +459,6 @@ pub(super) fn read_whole(file: &File) -> Result<String, Refusal> {
     Ok(text)
 }
 
-/// Reads the whole of an opened file, bounded by `limit`: a regular file
-/// with a single link, unchanged while it was read.
 pub(crate) fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> {
     let before = readable(file, limit)?;
     let size = usize::try_from(before.len()).unwrap_or(limit);
@@ -605,8 +475,6 @@ pub(crate) fn read_bytes(file: &File, limit: usize) -> Result<Vec<u8>, Refusal> 
     Ok(content)
 }
 
-/// The metadata of an opened file that may be read: a regular file with a
-/// single link, of at most `limit` bytes.
 fn readable(file: &File, limit: usize) -> Result<std::fs::Metadata, Refusal> {
     let metadata = file.metadata().map_err(|_| Refusal::Unreadable)?;
     if !metadata.is_file() {
@@ -623,8 +491,6 @@ fn readable(file: &File, limit: usize) -> Result<std::fs::Metadata, Refusal> {
     Ok(metadata)
 }
 
-/// Refuses a file that `read` bytes were read from when they are not all it
-/// held, or when its size or times changed since `before`.
 fn unchanged(file: &File, before: &std::fs::Metadata, read: u64) -> Result<(), Refusal> {
     let after = file.metadata().map_err(|_| Refusal::Unreadable)?;
     let state = |metadata: &std::fs::Metadata| {
@@ -642,24 +508,16 @@ fn unchanged(file: &File, before: &std::fs::Metadata, read: u64) -> Result<(), R
     Ok(())
 }
 
-/// Lines of a file, as a ranged read returns them.
 #[derive(Debug, PartialEq, Eq)]
 struct LineRange {
-    /// The first line asked for.
     start_line: u64,
-    /// The last line returned, if any is: none when the file ends before
-    /// `start_line`.
     end_line: Option<u64>,
-    /// The lines returned, exactly as the file holds them.
     content: String,
-    /// The one line returned is only its beginning: it alone is longer
-    /// than the limit.
     line_truncated: bool,
     total_lines: u64,
 }
 
 impl LineRange {
-    /// The line to read next, unless the file ends with these lines.
     fn next_start_line(&self) -> Option<u64> {
         let last = self.end_line.unwrap_or(self.start_line - 1);
         (last < self.total_lines).then_some(last + 1)
@@ -678,9 +536,6 @@ impl LineRange {
     }
 }
 
-/// The bytes `byte` takes in a JSON string: it is escaped when it is a quote,
-/// a backslash or a control character; a byte of a multibyte character is
-/// written as it is.
 fn escaped_len(byte: u8) -> usize {
     match byte {
         b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
@@ -689,13 +544,6 @@ fn escaped_len(byte: u8) -> usize {
     }
 }
 
-/// Reads an opened file once, from its start, in a bounded buffer, keeping
-/// only lines `start_line` to `start_line + line_count - 1`, and of those
-/// only whole lines that fit [`MAX_FILE_BYTES`] escaped for JSON, except
-/// that a first line too long for it alone is kept cut at a character
-/// boundary. The file must be a regular file with a single link, within
-/// [`MAX_RANGED_FILE_BYTES`] and unchanged while it was read, and the lines
-/// kept must be UTF-8 text without NUL.
 fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange, Refusal> {
     let before = readable(file, MAX_RANGED_FILE_BYTES).map_err(|refusal| match refusal {
         Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
@@ -706,8 +554,6 @@ fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange
     let mut buffer = [0; 8 * 1024];
     let mut content = Vec::new();
     let mut escaped = 0;
-    // The line the next byte belongs to, and how many lines were kept
-    // whole, ending where `kept` ends.
     let mut line = 1;
     let mut whole = 0;
     let mut kept = 0;
@@ -753,13 +599,11 @@ fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange
         last = buffer[count - 1];
     }
     unchanged(file, &before, read)?;
-    if cut {
-        // The cut may fall inside a character, which is left out.
-        if let Err(error) = std::str::from_utf8(&content)
-            && error.error_len().is_none()
-        {
-            content.truncate(error.valid_up_to());
-        }
+    if cut
+        && let Err(error) = std::str::from_utf8(&content)
+        && error.error_len().is_none()
+    {
+        content.truncate(error.valid_up_to());
     }
     let content = String::from_utf8(content).map_err(|_| Refusal::NotText)?;
     if content.contains('\0') {
@@ -781,8 +625,6 @@ fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange
     })
 }
 
-/// The parameters a call must match exactly: one relative path, and for a
-/// ranged read, where its lines start and how many it asks for.
 fn parameters() -> Value {
     json!({
         "type": "object",
@@ -808,9 +650,6 @@ fn parameters() -> Value {
     })
 }
 
-/// The range a call asks for, if it names one: its first line and how many
-/// lines, each defaulted when not named. The schema already refuses other
-/// values; they are checked again here.
 fn requested_range(arguments: &Value) -> Result<Option<(u64, u64)>, Refusal> {
     let field = |name: &str| match arguments.get(name) {
         None => Ok(None),
@@ -825,7 +664,6 @@ fn requested_range(arguments: &Value) -> Result<Option<(u64, u64)>, Refusal> {
     }
 }
 
-/// The handler of `workspace_read_file`, bound to one authorized Workspace.
 struct ReadFile {
     workspace: Workspace,
 }
@@ -835,14 +673,10 @@ impl ToolHandler for ReadFile {
         HANDLER_VERSION
     }
 
-    /// Reading changes nothing outside OCG. That says nothing about whether
-    /// what it reads may be disclosed, which the operator decided by
-    /// authorizing the Workspace.
     fn effect(&self) -> ToolEffect {
         ToolEffect::ReadOnly
     }
 
-    /// Reads on the blocking pool while holding a file permit.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let refused = |refusal: Refusal| ToolFailure::not_applied(refusal.to_string());
@@ -875,8 +709,6 @@ impl ToolHandler for ReadFile {
     }
 }
 
-/// Registers `workspace_read_file` for `workspace` in `registry`, without
-/// authorizing it.
 pub(crate) fn register(
     registry: &ToolRegistry,
     workspace: Workspace,

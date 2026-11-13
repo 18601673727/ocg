@@ -27,11 +27,6 @@ type Attachment = {
   error?: string;
 };
 
-/**
- * Clipboard and some drag sources expose the same image as more than one
- * File. Name, type and size identify one pending image without reading it;
- * two distinct images that happen to share all three still both attach.
- */
 function attachmentKey(file: File): string {
   return `${file.name}\0${file.type}\0${file.size}\0${file.lastModified}`;
 }

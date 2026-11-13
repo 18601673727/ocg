@@ -85,15 +85,6 @@ const reasoningDuration = (timing: ThreadGroupPart["timing"]) =>
     ? undefined
     : Math.max(0, (timing.completedAt - timing.startedAt) / 1000);
 
-/**
- * Optional component overrides for the thread. `AssistantMessage` and
- * `Welcome` replace whole sections; the remaining slots override how the
- * assistant message renders tool calls and part groups. Tool UIs registered
- * by name (toolkit `render`, `useAssistantDataUI`) take precedence over
- * `ToolFallback`. When `TaskGroup` is set, tool calls that carry a nested
- * conversation and have no registered UI render through it instead of the
- * tool group; without it they render like any other tool call.
- */
 export type ThreadComponents = {
   AssistantMessage?: ComponentType | undefined;
   Welcome?: ComponentType | undefined;
@@ -139,12 +130,9 @@ const EMPTY_COMPONENTS: ThreadComponents = {};
 
 const ThreadComponentsContext = createContext<ThreadComponents>(EMPTY_COMPONENTS);
 
-// Startup exposes a loading placeholder thread; treat it as a new chat so
-// the composer mounts centered. Loads after startup keep the docked layout.
 const isNewChatView = (s: AssistantState) =>
   s.thread.messages.length === 0 && (!s.thread.isLoading || s.threads.isLoading);
 
-// A switched thread that is still fetching its history: skeleton, not welcome.
 const isHistoryLoadingView = (s: AssistantState) =>
   s.thread.messages.length === 0 &&
   s.thread.isLoading &&
@@ -397,8 +385,6 @@ const ThreadLoadEarlier: FC = () => {
   const slotRef = useRef<HTMLDivElement>(null);
   const focusedRef = useRef<Element | null>(null);
 
-  // The last page removes the button; a keyboard user on it continues from the
-  // next control in tab order rather than from the document body.
   useLayoutEffect(() => {
     const focused = focusedRef.current;
     const slot = slotRef.current;
@@ -522,7 +508,6 @@ const Composer: FC<{ autoFocus: boolean }> = ({ autoFocus }) => {
 
 const ComposerAction: FC = () => {
   const { t } = useI18n();
-  // The stop control only cancels the send while no run it could stop is going.
   const isSending = useAuiState(
     (s) =>
       s.composer.submission !== undefined && !(s.thread.isRunning && s.thread.capabilities.cancel),
@@ -643,7 +628,6 @@ const AssistantMessage: FC = () => {
     (s) => s.message.status?.type === "incomplete" && s.message.status.reason === "error",
   );
   const ACTION_BAR_PT = "pt-1.5";
-  // Keep the action bar inside the contained root's paint box, then cancel its reserved space in flow.
   const ACTION_BAR_HEIGHT = `min-h-7.5 ${ACTION_BAR_PT}`;
 
   if (agentInstruction)

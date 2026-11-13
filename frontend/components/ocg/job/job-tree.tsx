@@ -11,7 +11,6 @@ import type { ControlTreeNode, ControlTreeState } from "../contracts";
 import type { HttpCanonicalControlClient } from "../runtime/control-client";
 import { runtimeStateLabel, useI18n, type TranslateFn } from "../i18n";
 
-/** What a state means to the eye: the same vocabulary every surface uses. */
 const STATE_TONE: Record<ControlTreeState, Tone> = {
   running: "violet",
   waiting_for_user: "slate",
@@ -38,7 +37,6 @@ function stateLabel(t: TranslateFn, state: ControlTreeState): string {
   return runtimeStateLabel(t, state);
 }
 
-/** Refresh incoming facts while retaining descendants and pages already loaded. */
 export function mergeChildren(
   existing: ControlTreeNode[],
   incoming: ControlTreeNode[],
@@ -60,7 +58,6 @@ export function mergeChildren(
   return [...merged.values()];
 }
 
-/** One node with its children replaced, wherever it sits in the tree. */
 function replaceNode(
   node: ControlTreeNode,
   id: string,
@@ -77,11 +74,6 @@ function replaceNode(
   return changed ? { ...node, children } : node;
 }
 
-/**
- * The tree of the work below a Job: who runs what, what waits on what, and
- * which conversations hold which turns. The server builds the tree; this view
- * only reads it and asks for the levels it was not given.
- */
 export function JobTree({
   client,
   root,
@@ -103,7 +95,6 @@ export function JobTree({
   const [failure, setFailure] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set<string>());
-  // One page per node at a time: a second click while it is in flight is ignored.
   const loadingNodes = useRef(new Map<string, AbortController>());
 
   const loading = loaded !== root;
@@ -173,7 +164,6 @@ export function JobTree({
     };
   }, [client, root]);
 
-  /** Reads the children of a node the answer did not list, or the page after them. */
   const loadChildren = useCallback(
     async (node: ControlTreeNode, after?: string) => {
       if (loadingNodes.current.has(node.id)) return;

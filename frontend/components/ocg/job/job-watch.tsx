@@ -113,11 +113,6 @@ const TONE = { loading: "bg-muted text-muted-foreground" };
 type StopState = "idle" | "sending" | "locked";
 type StopNotice = { message: string; tone: "status" | "warning" | "error" };
 
-/**
- * Why a stop request did not become an answer. A lost connection, an uncertain
- * commit and a malformed success answer may all have changed the Job, so the
- * control stays locked until the Job's own record shows another phase.
- */
 function classifyStopFailure(t: TranslateFn, cause: unknown): StopNotice & { locked: boolean } {
   if (cause instanceof ContractError) {
     return { message: t("job.stop.contract"), tone: "error", locked: true };
@@ -167,23 +162,9 @@ const PHASE_BADGE = {
   cancelled: "bg-muted text-muted-foreground",
 } as const satisfies Record<ControlExecutionPhase, string>;
 
-/**
- * One Job as the Control Plane records it: its stored outputs, its actual
- * output stream, and its actual outcome. Nothing here is simulated; the
- * stream is the stored history continued live, and a reconnect replays
- * from the last output this view processed, never twice.
- *
- * State retains only the latest resident output window (see
- * `./output-window`): every accepted output is appended once and the window
- * is trimmed from the front, so neither the retained rows nor the work per
- * event grows with the Job. The processed cursor is the highest stored
- * sequence and is independent of the visible rows.
- */
 export function JobWatch(props: {
   client: HttpCanonicalControlClient;
   jobId: string;
-  // The inspector shows the Job's record around its answer; chat shows the
-  // answer first and keeps the record one click away.
   presentation?: "inspector" | "chat";
   bare?: boolean;
   onStateChange?: (
@@ -191,7 +172,6 @@ export function JobWatch(props: {
     job: ControlJob | null,
   ) => void;
 }) {
-  // Retry or switching Jobs re-runs the whole load (record, stored history, stream) from scratch.
   const [attempt, setAttempt] = useState(0);
   return (
     <JobWatchBody
@@ -227,7 +207,6 @@ function JobWatchBody({
   const [outputs, setOutputs] = useState<ControlOutput[]>([]);
   const storedTotal = outputs.at(-1)?.seq ?? 0;
   const [storedOpen, setStoredOpen] = useState(false);
-  // Automatically retained rows; earlier outputs load only on explicit request.
   const windowRef = useRef(JOB_WATCH_RESIDENT_OUTPUTS);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [earlierFailure, setEarlierFailure] = useState<{ code: string; scope: "read" } | null>(
@@ -240,7 +219,6 @@ function JobWatchBody({
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
   const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
-  // The objective and attachments are read from the Job's frozen input; the record names it only by identity.
   const [input, setInput] = useState<
     { objective: string | null; attachments: string[] } | { error: string } | null
   >(null);
@@ -251,8 +229,6 @@ function JobWatchBody({
   const [stopState, setStopState] = useState<StopState>("idle");
   const [stopOutcome, setStopOutcome] = useState<ControlNativeStopRequest | null>(null);
   const [stopNotice, setStopNotice] = useState<StopNotice | null>(null);
-  // Successful reads of the Job's own record. A stop whose answer was lost is
-  // retriable only after a later read, never merely because time passed.
   const statusReads = useRef(0);
   const [readCount, setReadCount] = useState(0);
   const [stopLockedAt, setStopLockedAt] = useState<number | null>(null);
@@ -282,8 +258,6 @@ function JobWatchBody({
   useEffect(() => {
     let alive = true;
     let subscription: JobStreamSubscription | null = null;
-    // The application consumes each stored output once: everything the
-    // page reads and everything the stream replays passes this cursor.
     const watch = watchRef.current;
     watch.processed = 0;
     watch.historyComplete = false;
@@ -292,12 +266,10 @@ function JobWatchBody({
     watch.replies = [];
     windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
     let currentJob: ControlJob | null = null;
-    // Initial loading owns the status read until its output window is installed.
     let refreshingStatus = true;
     let statusQueued = false;
     const evidenceController = new AbortController();
 
-    // `read` failures are of the Job's record or stored history; `stream` ones of the live stream.
     const fail = (error: unknown, scope: "read" | "stream") => {
       if (error instanceof ControlTransportError) setFailure({ code: error.code, scope });
       else if (error instanceof ContractError) setFailure({ code: "contract", scope });
@@ -420,7 +392,6 @@ function JobWatchBody({
           if (!alive) return;
           const previousProcessed = watch.processed;
           if (window.latestSeq > previousProcessed) {
-            // Compare before advancing the cursor: a later window may not reach the resident tail.
             const gap = (window.outputs[0]?.seq ?? 1) > previousProcessed + 1;
             const lostCompleteness =
               watch.historyComplete &&
@@ -469,7 +440,6 @@ function JobWatchBody({
 
     const listener = (event: JobStreamEvent) => {
       if (!alive) return;
-      // Anything the server sent proves the connection is back.
       setStream((current) => (current === "reconnecting" ? "live" : current));
       if (event.type === "job") {
         currentJob = currentJob ? reconcileJob(currentJob, event.job) : event.job;
@@ -546,7 +516,6 @@ function JobWatchBody({
         setJob(record);
         setDetails(record);
         watch.completed = record.settlement.state === "completed";
-        // The record is the Job's own truth, whether or not the stream ever connects.
         if (record.settlement.state !== "unsettled") {
           setSettlement({
             state: record.settlement.state,
@@ -606,7 +575,6 @@ function JobWatchBody({
               setStream("closed");
             }
           },
-          // A stream that cannot go on, such as an ended session, is a failure to show, not a lost rejection.
           (error: unknown) => {
             if (alive) fail(error, "stream");
           },
@@ -628,8 +596,6 @@ function JobWatchBody({
     };
   }, [client, jobId]);
 
-  // Until the record is read there is no settlement to claim.
-  // A settlement already read wins over the phase last announced with the record.
   const phase: ControlExecutionPhase | null =
     settlement && settlement.state !== "unsettled"
       ? settlement.state
@@ -642,12 +608,6 @@ function JobWatchBody({
   const badgeClass = phase ? PHASE_BADGE[phase] : TONE.loading;
   const stopPhase = phase === "reserved" || phase === "running";
   const stopAvailable = Boolean(details?.context);
-  // Fail closed, not unusable. An accepted stop is never sent twice. A stop
-  // whose answer was lost, uncertain or unreadable stays locked until a later
-  // read of the Job's own record still shows it reserved or running: that read
-  // is the evidence that no stop took effect, and the server's stop is
-  // idempotent (`already_requested`), so a manual retry then is safe. Nothing
-  // retries on its own, and a Job the record shows as settled offers no stop.
   const stopRetry =
     stopState === "locked" &&
     stopOutcome === null &&
@@ -679,9 +639,6 @@ function JobWatchBody({
     if (!controller.signal.aborted) refreshRef.current();
   }
 
-  // The authoritative phase decides what a requested stop means now: a
-  // completion may have been recorded before the stop took effect, and a
-  // stop_requested phase is never presented as a cancelled Job.
   const stopMessage = (() => {
     if (stopNotice) return stopNotice;
     if (!stopOutcome) return null;
@@ -706,9 +663,6 @@ function JobWatchBody({
     };
   })();
 
-  // Earlier stored outputs are durable on the server, not in state. Loading
-  // them is an explicit walk from the first stored sequence, merged by `seq`
-  // with whatever the live stream appended meanwhile.
   async function loadEarlierOutputs() {
     if (earlierLoad.current) return;
     const controller = new AbortController();
@@ -724,7 +678,6 @@ function JobWatchBody({
         signal: controller.signal,
       });
       if (controller.signal.aborted) return;
-      // The live window can move beyond the captured rows while this page is in flight.
       if (watch.processed - (outputs.at(-1)?.seq ?? 0) > windowRef.current) return;
       windowRef.current = nextWindow;
       const incoming = walked;

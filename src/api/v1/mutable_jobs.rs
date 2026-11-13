@@ -89,7 +89,6 @@ struct Submit {
 struct CancelQueued {
     revision: u64,
 }
-/// A stop names nothing but its Job: its body is the empty object.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Stop {}
@@ -216,7 +215,6 @@ pub(super) fn phase(record: &MutableJobRecord) -> &'static str {
         },
     }
 }
-/// The editable input of `job` as the Composer reads it.
 fn input_view(job: &crate::db::entities::MutableJob) -> Value {
     let priority = match job.input.priority {
         JobQueuePriority::Foreground => "foreground",
@@ -249,10 +247,6 @@ fn view(record: MutableJobRecord) -> Value {
     )
 }
 
-/// Adds the editable state of a Job to its `GET /api/v1/jobs/{job}` body: the
-/// Composer context it belongs to, its submission time and its editable
-/// input. When the request named a Composer `context`, a queued Generative
-/// Job also reports whether it is blocked behind Decision history.
 pub(super) async fn add_editable_state(
     body: &mut Value,
     database: &DatabaseHandle,
@@ -266,9 +260,6 @@ pub(super) async fn add_editable_state(
     let queued_generative = job.phase == MutableJobPhase::Queued
         && record.outcome.is_none()
         && matches!(job.input.content, MutableJobContent::Generative { .. });
-    // Derived from the frozen configuration, stored nowhere and deciding
-    // nothing: why autonomous loopback scheduling would or would not select
-    // this queued Job, so an ineligible one is never silently left waiting.
     if queued_generative {
         body["autonomous_loopback_eligibility"] =
             crate::system::native_scheduler::loopback_eligibility(job.frozen.as_ref()).to_json();
@@ -399,10 +390,6 @@ pub(super) async fn respond(
                 .request_native_stop(context, id)
                 .await
                 .map_err(stop_refusal)?;
-            // The database decided the stop; this only reaches the execution
-            // it names, if this host is running it. Accepting a stop of a
-            // running Job is not a claim that it stopped: how it ended is the
-            // Job's outcome, Unknown if its request may have been sent.
             let (token, request, status, stopped, phase) = match stop {
                 NativeStopRequest::EndedBeforeStart(token) => (
                     token,
@@ -437,8 +424,6 @@ pub(super) async fn respond(
     }
 }
 
-/// A stop refused because of the Job's standing says which; every other
-/// refusal is the one any Job change gets.
 fn stop_refusal(error: DatabaseError) -> Refusal {
     match error {
         DatabaseError::Rejected(Violation::InvalidValue("stop", reason))

@@ -247,7 +247,6 @@ fn mirror() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The release page of `version`. A mirror publishes no such page.
 pub(crate) fn release_page(version: &str) -> Option<String> {
     mirror()
         .is_none()

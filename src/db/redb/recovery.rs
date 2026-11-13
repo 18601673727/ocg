@@ -6,22 +6,14 @@ use super::*;
 use crate::db::entities::{JobId, OutcomeKind, Timestamp};
 use crate::system::execution_controls::ExecutionControl;
 
-// ---- open ----------------------------------------------------------------------
-
 static PROMOTION_CLOCK_BASE: OnceLock<(i64, Instant)> = OnceLock::new();
 
-/// Fixes the promotion clock: the wall time at open, plus the monotonic time
-/// elapsed since.
 pub(crate) fn init_promotion_clock(wall_time_at_open: i64) {
     let _ = PROMOTION_CLOCK_BASE.set((wall_time_at_open, Instant::now()));
 }
 
 static PROMOTION_HIGH_WATER: AtomicI64 = AtomicI64::new(i64::MIN);
 
-/// The later of the monotonic and the wall reading, never going back. Wall
-/// time catches up after a suspend, which the monotonic reading does not
-/// count, and deadlines are made from wall time; a backward wall step moves
-/// nothing.
 pub(crate) fn promotion_clock() -> i64 {
     let wall = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -41,8 +33,6 @@ pub(crate) fn promotion_clock() -> i64 {
 
 static IDENTIFIERS: OnceLock<(Option<String>, Option<String>)> = OnceLock::new();
 
-/// The host and boot identifiers, read once per process; either may be
-/// unreadable.
 fn identifiers() -> &'static (Option<String>, Option<String>) {
     IDENTIFIERS.get_or_init(|| (read_host_id(), read_boot_id()))
 }
@@ -108,8 +98,6 @@ pub(crate) fn database_file(directory: &Path) -> PathBuf {
     directory.join(DATABASE_FILE_NAME)
 }
 
-/// An opened database file with this opening's operation epoch and the
-/// instance's Genesis Job (always Job 0).
 pub(crate) struct OpenedFile {
     pub(crate) database: Database,
     pub(crate) epoch: u64,
@@ -210,8 +198,6 @@ fn same_file_identity(actual: &std::fs::Metadata, named: &std::fs::Metadata) -> 
     }
     #[cfg(windows)]
     {
-        // The cooperative lock excludes OCG pathname replacement; stable
-        // Windows metadata APIs do not expose a file identity here.
         let _ = (actual, named);
         true
     }
@@ -222,9 +208,6 @@ fn same_file_identity(actual: &std::fs::Metadata, named: &std::fs::Metadata) -> 
     }
 }
 
-/// Refuses any database whose declared identity is not this build's, with a
-/// message that names what was found. A database of another format is never
-/// reinterpreted; `ocg migrate --check` says whether a migration reads it.
 pub(super) fn check_identity(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<(), StorageError> {
@@ -254,19 +237,12 @@ pub(super) fn check_identity(
     Ok(())
 }
 
-/// How much of the database `open` verified before it opened the file for
-/// writing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verification {
-    /// The file opened without repair, shut down cleanly, and holds no
-    /// capacity-holding Allocation: only its identity was read.
     Quick,
-    /// Every record header, derived index and ownership row was checked.
     Full,
 }
 
-/// Set `OCG_VERIFY_STARTUP=full` to make every open do the full verification
-/// and rebuild, as a database that did not shut down cleanly always does.
 fn full_verification_requested() -> bool {
     std::env::var_os("OCG_VERIFY_STARTUP").is_some_and(|value| value == "full")
 }
@@ -277,16 +253,12 @@ fn validate_preflight(
     startup_checks(database, full_verification_requested())
 }
 
-/// The full startup checks on a database nothing will open for writing.
 pub(crate) fn verify_full(
     database: &impl ::redb::ReadableDatabase,
 ) -> Result<Verification, StorageError> {
     startup_checks(database, true)
 }
 
-/// Verifies a published held-recovery result without rejecting Allocations
-/// that the plan explicitly left held. Released Unknown outcomes still need
-/// their own durable stop proof; every record and derived index is checked.
 pub(crate) fn verify_recovered(
     database: &impl ::redb::ReadableDatabase,
 ) -> Result<Verification, StorageError> {
@@ -352,8 +324,6 @@ fn startup_checks(
     Ok(Verification::Full)
 }
 
-/// The identity, required tables and metadata every startup checks first.
-/// Returns whether the database records a clean shutdown.
 fn startup_metadata(tx: &ReadTransaction) -> Result<bool, StorageError> {
     let meta = match tx.open_table(META) {
         Ok(meta) => meta,
@@ -384,24 +354,14 @@ fn startup_metadata(tx: &ReadTransaction) -> Result<bool, StorageError> {
     Ok(clean)
 }
 
-/// The capacity ownership a database holds, classified rather than refused.
-/// Every held Allocation must name a native Job that the per-Job consistency
-/// reader accepts (the one `ocg inspect-held` reports), and every Unknown
-/// outcome must be either resolved by its own Released Allocation and stop
-/// proof ([`resolved_unknown_ownership`]) or retained by its own held
-/// Allocation. Anything else is corruption, never residual ownership.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResidualOwnership {
-    /// Jobs whose Allocation still holds capacity.
     pub(crate) held: std::collections::BTreeSet<u128>,
-    /// Unknown outcomes whose own Allocation still holds capacity.
     pub(crate) retained_unknown: std::collections::BTreeSet<u128>,
-    /// Unknown outcomes resolved locally by Released Allocation stop proof.
     pub(crate) resolved_unknown: std::collections::BTreeSet<u128>,
 }
 
 impl ResidualOwnership {
-    /// Whether normal startup must refuse this ownership.
     fn unresolved(&self) -> bool {
         !self.held.is_empty() || !self.retained_unknown.is_empty()
     }
@@ -451,9 +411,6 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
             }
             Err(error) => return Err(error),
         };
-        // Stop evidence is written only when capacity is released, and the
-        // checked start makes the Job Executing and the Allocation started
-        // in one transaction.
         let started = record.job.phase == MutableJobPhase::Executing;
         let outcome = record.outcome.as_ref().map(|outcome| outcome.kind);
         let shaped = allocation.stop_confirmed_at.is_none()
@@ -499,12 +456,6 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
     Ok(ownership)
 }
 
-/// The verification of a database after one Reserved Allocation was
-/// reconciled individually: the startup metadata, every record header and
-/// native invariant, and the ownership left behind classified exactly, not
-/// refused. Then the normal startup decision itself is taken on the same
-/// read: it must refuse exactly when ownership remains unresolved, and a
-/// database without any must pass the full startup verification.
 pub(crate) struct ReservedResidual {
     pub(crate) ownership: ResidualOwnership,
     pub(crate) normal_startup_accepts: bool,
@@ -539,9 +490,6 @@ pub(crate) fn verify_reserved_residual(
     })
 }
 
-/// A format this build accepts names the tables of that format. A database
-/// that claims the current format but lacks a required table is incomplete: it
-/// is refused rather than silently extended.
 fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
     use ::redb::TableHandle;
     let present: Vec<String> = tx
@@ -561,14 +509,11 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Every record header and the native invariants, without any judgement of
-/// who owns capacity.
 fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
     check_record_headers(tx)?;
     check_native_invariants(tx)
 }
 
-/// The record-header checks of every authoritative table.
 fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
     macro_rules! headers {
         ($($table:ident => $tags:expr),+ $(,)?) => { $(check_preflight_table(tx, $table, $tags)?;)+ };
@@ -583,12 +528,6 @@ fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// What the offline migration requires of its staged destination before it is
-/// published: the very checks a host's startup preflight runs on a database
-/// (identity, required tables, metadata, and the quick-or-full ownership
-/// decision), and the record headers and native invariants even where the
-/// host's quick path would skip them. It opens nothing for writing, so no
-/// epoch or shutdown marker changes.
 pub(super) fn verify_migrated(
     database: &impl ::redb::ReadableDatabase,
 ) -> Result<(), StorageError> {
@@ -598,12 +537,6 @@ pub(super) fn verify_migrated(
     Ok(())
 }
 
-/// Whether the Allocation rows, the source of ownership, hold no capacity and
-/// the stored indexes equal what they compute. This reads the Allocation rows
-/// (one small row per Allocation ever made) and the Pool configurations they
-/// name, never the large Job tables. A missing index, a
-/// corrupt row or any difference is not a quick-path database: the full checks
-/// then run and report it.
 fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
     let (allocations, configs, active, requests) = match (
         tx.open_table(POOL_ALLOCATIONS),
@@ -623,9 +556,6 @@ fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
         && computed == indexes::stored_allocation_indexes(&active, &requests)?)
 }
 
-/// Read-only fail-closed checks of the facts the native model relies on: the
-/// Allocation indexes equal what their source computes, and no Job state
-/// carries a legacy claim (a claim is a lease nothing in this build honors).
 fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     let (allocations, configs, active, requests) = match (
         tx.open_table(POOL_ALLOCATIONS),
@@ -656,10 +586,6 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Refuses, before anything is opened for writing, a database in which an
-/// Allocation still holds capacity or a Job's outcome is Unknown. A restart
-/// is not evidence that the work stopped, so neither is adopted, retried or
-/// released here; `ocg inspect-held` reports them without changing the file.
 fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError> {
     if !ExecutionControl::RecoveryAndRedispatch.is_enabled() {
         let mut held = 0u64;
@@ -703,8 +629,6 @@ fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError>
     Ok(())
 }
 
-/// The Quick Path is safe only when no Unknown outcome needs its ownership
-/// proof checked. Even a Released Unknown therefore always takes the Full Path.
 fn unknown_outcomes_exist(tx: &ReadTransaction) -> Result<bool, StorageError> {
     match tx.open_table(JOB_STATES) {
         Ok(table) => {
@@ -724,9 +648,6 @@ fn unknown_outcomes_exist(tx: &ReadTransaction) -> Result<bool, StorageError> {
     }
 }
 
-/// A native Unknown is resolved only by its own Released Allocation and durable
-/// stop evidence. The Job remains Unknown forever; this proof releases local
-/// capacity, never execution uncertainty, and never makes the Job dispatchable.
 fn resolved_unknown_ownership(
     tx: &ReadTransaction,
     state: &JobState,
@@ -1035,10 +956,6 @@ pub(super) fn initialize(
             })?;
     }
     let abandoned = {
-        // Derived tables are committed in the same transaction as the rows
-        // they derive from, so a database that shut down cleanly and passed
-        // the quick checks needs no rebuild. Every other state rebuilds them
-        // from their source rows and verifies the result.
         let rebuild = match verification {
             Verification::Full => true,
             Verification::Quick => !clean_shutdown || indexes_missing,
@@ -1241,8 +1158,6 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
             {
                 return batch.corrupted("invalid native summary producer state".to_owned());
             }
-            // Summary producer Jobs are not conversation turns. The verifier
-            // checks their source and output when an artifact is requested.
             continue;
         }
         if job.phase != MutableJobPhase::Unsubmitted {
@@ -1348,8 +1263,6 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                         .to_owned(),
                 );
             }
-            // Unknown is terminal for dispatch but has no Result and remains
-            // unsettled in the conversation, exactly as the runtime records it.
             continue;
         }
         if state.outcome.is_some() {
@@ -1386,8 +1299,6 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                         Err(error) => return Err(error),
                     }
                 }
-                // A submitted Job's requirement comes from the configuration it
-                // froze, never from settings edited since.
                 let requirement = match &job.frozen {
                     Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) => {
                         transactions::decision_requirement()
@@ -1427,9 +1338,6 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
     settle_rebuilt_conversations(batch)
 }
 
-/// A conversation is settled once it has an outcome and no unsettled turn or
-/// child conversation. Children carry higher IDs than their parents, so a
-/// descending walk settles each conversation before its parent counts it.
 fn settle_rebuilt_conversations(batch: &mut Batch) -> Result<(), BatchError> {
     let mut before: Option<u128> = None;
     loop {
@@ -1483,9 +1391,6 @@ fn settle_rebuilt_conversations(batch: &mut Batch) -> Result<(), BatchError> {
     }
 }
 
-/// Allocates monotonically across restarts and clock rollback. The persisted
-/// high water retains UUIDv7's random starting payload; a stale clock advances
-/// that payload as the UUIDv7 monotonic counter rather than reusing an ID.
 pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {
     let mut table = tx.open_table(SEQUENCES)?;
     let previous = table.get("entity")?.map_or(0, |value| value.value());
@@ -1589,10 +1494,6 @@ fn unsupported_format(detail: &str) -> StorageError {
     }
 }
 
-// ---- offline reconciliation of a crash-surviving Reserved Allocation -------------
-
-/// Why an offline reconciliation refused. Nothing was changed: the only file
-/// it ever wrote was a private copy.
 #[derive(Debug)]
 pub(crate) struct ReservedRefusal {
     pub(crate) code: &'static str,
@@ -1629,21 +1530,6 @@ impl From<::redb::DatabaseError> for ReservedRefusal {
     }
 }
 
-/// Reads the facts that decide whether `job` is a Reserved Allocation that
-/// never started, from a database nothing is writing.
-///
-/// The epoch rule: a Reservation is minted in the epoch of the process that
-/// opened the database, and an open that finds a held Allocation refuses
-/// before it increments the epoch. So the Allocation's epoch equals the
-/// stored `open_epoch` exactly when no process has opened the database since
-/// the one that made it. That is necessary (a different epoch means history
-/// this build cannot see) but not sufficient: the owner may still be running.
-/// Its absence is established by the exclusive host lock the caller holds.
-///
-/// Other capacity ownership does not decide this Job: other Allocations may
-/// remain Reserved, Running, StopRequested or Uncertain, and other Unknown
-/// outcomes may be resolved or retained. Each is classified exactly (see
-/// [`ResidualOwnership`]) and left unchanged; an inconsistent one refuses.
 fn reserved_preflight_in(
     database: &impl ReadableDatabase,
     job: JobId,
@@ -1741,8 +1627,6 @@ fn reserved_preflight_in(
     }
     let same_boot = allocation.boot_id.is_some() && allocation.boot_id == current_boot_id();
 
-    // Capacity ownership elsewhere is not this command's to resolve: it is
-    // classified, must be consistent, and is preserved exactly.
     drop(allocations);
     let ownership = residual_ownership_in(&tx).map_err(|error| match error.kind {
         StorageErrorKind::Corrupted => ReservedRefusal::new("ownership_inconsistent", error.detail),
@@ -1904,9 +1788,6 @@ fn reserved_preflight_in(
     Ok((token, facts, residual))
 }
 
-/// The residual ownership a published reconciliation of `job` holds must be
-/// exactly the source's without the target, and the normal startup decision
-/// must follow from it.
 fn verify_reserved_residual_against(
     database: &impl ReadableDatabase,
     expected: &ResidualOwnership,
@@ -1927,9 +1808,6 @@ fn verify_reserved_residual_against(
     }))
 }
 
-/// Runs `body` on the database the file holds. The file is a private copy:
-/// redb may repair it on open, and a damaged page is reported as a refusal
-/// instead of aborting the process.
 fn with_reconciliation_copy<T>(
     file: std::fs::File,
     body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
@@ -1946,9 +1824,6 @@ fn with_reconciliation_copy<T>(
     })
 }
 
-/// Copies an already-open file into an unlinked private file for finalization.
-/// Neither the published database nor its rollback artifact is opened by a new
-/// pathname or exposed to redb's repair path.
 fn verification_copy(file: &std::fs::File) -> Result<std::fs::File, ReservedRefusal> {
     use std::io::{Seek, SeekFrom};
 
@@ -1973,8 +1848,6 @@ fn verification_copy(file: &std::fs::File) -> Result<std::fs::File, ReservedRefu
     Ok(copy)
 }
 
-/// Decides, on a private copy, whether `job` is an unstarted Reservation.
-/// Writes nothing the caller keeps.
 pub(crate) fn reconcile_reserved_preflight(
     file: std::fs::File,
     job: JobId,
@@ -1984,10 +1857,6 @@ pub(crate) fn reconcile_reserved_preflight(
     })
 }
 
-/// Ends the unstarted Reservation on a private copy with the one transaction
-/// the runtime uses for it, then verifies the copy completely: every page
-/// checksum, every record and every derived index. The returned report is
-/// what was verified.
 pub(crate) fn reconcile_reserved_apply(
     file: std::fs::File,
     job: JobId,
@@ -2015,8 +1884,6 @@ pub(crate) fn reconcile_reserved_apply(
                 "redb found damage in the reconciled copy and had to repair it",
             ));
         }
-        // Every record and derived index, and exactly the ownership the source
-        // held besides this Allocation.
         let residual = verify_reserved_residual_against(&*database, &residual)?;
         let tx = database.begin_read().map_err(StorageError::from)?;
         let allocations = tx
@@ -2052,8 +1919,6 @@ pub(crate) fn reconcile_reserved_apply(
     })
 }
 
-/// Reconstructs the reserved-recovery verification from the exact source and
-/// published files after a crash. This never invokes the release transaction.
 pub(crate) fn verify_reserved_publication_delta(
     source: &std::fs::File,
     published: &std::fs::File,
@@ -2181,11 +2046,6 @@ pub(crate) fn verify_reserved_publication_delta(
     })
 }
 
-// ---- offline reconciliation of stopped loopback executions ----------------------
-
-/// One source-bound action. The expected bytes make apply fail closed if the
-/// authoritative rows differ from the dry-run, even when their decoded facts
-/// would still look eligible.
 #[derive(Clone, Debug)]
 pub(crate) struct RecoveryAction {
     pub(super) token: crate::db::entities::AllocationToken,
@@ -2248,8 +2108,6 @@ fn sha256_json(value: &serde_json::Value) -> Result<String, ReservedRefusal> {
     Ok(hex(context.finish().as_ref()))
 }
 
-/// Plans every held Allocation in stable Job order. Ineligible rows are
-/// explicit refusals and are never silently converted or removed from the plan.
 fn held_recovery_plan_in(
     database: &impl ReadableDatabase,
     source_sha256: &str,
@@ -2508,8 +2366,6 @@ fn recovery_action_in(
         );
     }
 
-    // Conservative evidence audit: preserve every row, but refuse shapes that
-    // can represent another request, tools, children, or a published Result.
     for entry in tx
         .open_table(REQUEST_EVENTS)
         .map_err(StorageError::from)?
@@ -2698,8 +2554,6 @@ pub(crate) fn reconcile_held_preflight(
     })
 }
 
-/// Applies the entire eligible plan in one transaction. Other held rows remain
-/// held and are included in the audit; no commit occurs inside the action loop.
 pub(crate) fn reconcile_held_apply(
     file: std::fs::File,
     source_sha256: &str,
@@ -2973,8 +2827,6 @@ fn audit_held_recovery(
     }))
 }
 
-/// Verifies a published-unfinalized held recovery against the exact prepared
-/// plan and rollback source. The Allocation release transaction is never run.
 pub(crate) fn verify_held_publication_delta(
     source: &std::fs::File,
     published: &std::fs::File,

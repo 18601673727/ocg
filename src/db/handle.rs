@@ -4,8 +4,6 @@ use super::commands::{
 };
 use super::*;
 
-/// An owned request prepared before start. Only this module constructs it;
-/// database checks still have to succeed in the start transaction.
 pub(crate) struct PreparedDevelopmentHandoff {
     candidate: redb::DevelopmentCandidate,
     images: Vec<(
@@ -19,20 +17,15 @@ pub(crate) struct PreparedDevelopmentHandoff {
     credentials: DevelopmentHandoffCredentials,
 }
 
-/// The credentials a Job's requests use: the Provider credential and the
-/// secret values of its custom headers. Each is read once, with the stored row
-/// kept as change evidence for the start transaction.
 #[derive(Default)]
 struct DevelopmentHandoffCredentials {
     items: Vec<DevelopmentHandoffCredential>,
-    /// The encodings of every secret, built once, that leak checks look for.
     spellings: Option<crate::system::secrets::Spellings>,
 }
 
 struct DevelopmentHandoffCredential {
     reference: String,
     encrypted_row: Vec<u8>,
-    // CredentialSecret redacts Debug; never include it in the request body.
     secret: redb::CredentialSecret,
 }
 
@@ -50,27 +43,14 @@ impl DevelopmentHandoffCredentials {
     }
 }
 
-/// The tools a native execution offers its Provider, and the Workspace facts
-/// its request states about them. Built by the executor from the Job's own
-/// Project before the start; the handoff prepares the exact request from it
-/// and never reads a Workspace itself.
 #[derive(Clone, Debug)]
 pub(crate) struct DevelopmentToolOffer {
     pub(crate) wires: Vec<crate::service::ai::providers::openai_compatible::ToolWire>,
-    /// What the Workspace tools allow, as the request tells the Provider;
-    /// `None` when the offer has no Workspace tool.
     pub(crate) grant: Option<&'static str>,
-    /// The Workspace's own `AGENTS.md`, sent as a system message.
     pub(crate) agents_md: Option<String>,
 }
 
-/// Builds the tools offer of a native execution from the facts the checked
-/// handoff itself resolved: the frozen configuration and the Project of the
-/// Job's conversation. The offer is made for exactly that Project, so the
-/// start transaction, which revalidates the snapshot, covers it too.
 pub(crate) trait DevelopmentTooling {
-    /// `Ok(None)` for a Job that is offered no tool. A refusal is a definite
-    /// pre-start failure.
     async fn offer(
         &self,
         frozen: &entities::FrozenExecutionConfig,
@@ -79,22 +59,13 @@ pub(crate) trait DevelopmentTooling {
     ) -> Result<Option<DevelopmentToolOffer>, &'static str>;
 }
 
-/// What a Job's place in its conversation says about the tools it may be
-/// offered.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DevelopmentToolContext {
-    /// A user decides for the Job, so a call may wait for their decision.
     pub(crate) decider: bool,
-    /// The Job's conversation is itself a child of another, whose worker may
-    /// ask the user a question. A conversation the user holds asks nothing:
-    /// the Agent answers in the conversation.
     pub(crate) nested: bool,
-    /// The conversation is one step of a plan this Agent submitted, so it is
-    /// offered no plan of its own.
     pub(crate) plan_step: bool,
 }
 
-/// The tooling of a path that offers no tool and no Workspace.
 pub(crate) struct NoTooling;
 
 impl DevelopmentTooling for NoTooling {
@@ -109,19 +80,15 @@ impl DevelopmentTooling for NoTooling {
 }
 
 enum DevelopmentToolPolicy {
-    /// No tool and no Workspace: the request is a single chat exchange.
     ToolFree,
-    /// The Agent's Workspace grant, offered as exactly these tool definitions.
     Offered,
 }
 
 impl PreparedDevelopmentHandoff {
-    /// The exact request body the first Provider request will carry.
     pub(crate) fn request(&self) -> &serde_json::Value {
         &self.request
     }
 
-    /// The frozen Generative configuration this handoff executes, if it is one.
     pub(crate) fn generative_configuration(&self) -> Option<&entities::FrozenExecutionConfig> {
         match &self.candidate {
             redb::DevelopmentCandidate::Generative(context) => Some(&context.configuration),
@@ -129,7 +96,6 @@ impl PreparedDevelopmentHandoff {
         }
     }
 
-    /// The frozen native Decision configuration this handoff executes, if it is one.
     pub(crate) fn decision_configuration(&self) -> Option<&entities::NativeDecisionConfig> {
         match &self.candidate {
             redb::DevelopmentCandidate::Generative(_) => None,
@@ -137,7 +103,6 @@ impl PreparedDevelopmentHandoff {
         }
     }
 
-    /// Every credential the frozen configuration names; see the private reader.
     pub(crate) fn credential_references(&self) -> Vec<&str> {
         self.expected_credential_references()
     }
@@ -146,7 +111,6 @@ impl PreparedDevelopmentHandoff {
         &self.candidate
     }
 
-    /// The stored credential rows read for this handoff.
     pub(super) fn credential_evidence(&self) -> impl Iterator<Item = (&str, &[u8])> {
         self.credentials
             .items
@@ -175,8 +139,6 @@ impl PreparedDevelopmentHandoff {
         headers.secret_refs().collect()
     }
 
-    /// Every credential the frozen configuration names, each once: the
-    /// Provider credential, then the secret header values.
     pub(super) fn expected_credential_references(&self) -> Vec<&str> {
         let mut references: Vec<&str> = self.provider_credential_reference().into_iter().collect();
         for reference in self.header_secret_references() {
@@ -211,7 +173,6 @@ impl PreparedDevelopmentHandoff {
     }
 }
 
-/// A single-use, in-memory result returned only after durable start commit.
 #[allow(dead_code)]
 pub(crate) struct DevelopmentHandoff {
     prepared: PreparedDevelopmentHandoff,
@@ -220,14 +181,10 @@ pub(crate) struct DevelopmentHandoff {
     output_busy: AtomicBool,
     output_uncertain: AtomicBool,
     usage_checkpoint: std::sync::Mutex<DevelopmentUsageCheckpoint>,
-    /// What the Job's earlier requests recorded, so a later request carries
-    /// only the message bodies not stored yet. It changes only after the
-    /// evidence it describes committed.
     recorder: std::sync::Mutex<crate::service::ai::providers::RequestRecorder>,
 }
 
 impl DevelopmentHandoff {
-    /// The Job this handoff executes.
     pub(crate) fn job(&self) -> entities::JobId {
         match &self.prepared.candidate {
             redb::DevelopmentCandidate::Generative(context) => context.allocation.token.job,
@@ -321,13 +278,8 @@ impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
     }
 }
 
-/// Derived only from confirmed writes belonging to this handoff. The start
-/// transaction refuses existing evidence and the writer checks the durable
-/// sequence before using it; an uncertain write makes the handoff unusable.
 #[derive(Clone, Default)]
 pub(super) struct DevelopmentUsageCheckpoint {
-    /// The request this checkpoint's evidence belongs to; another request
-    /// starts from an empty checkpoint.
     request: Option<entities::RequestNumber>,
     last_sequence: u32,
     evidence: entities::TokenEvidence,
@@ -350,7 +302,6 @@ impl DevelopmentUsageCheckpoint {
         }
     }
 
-    /// This checkpoint if it describes `request`, otherwise an empty one.
     fn for_request(self, request: entities::RequestNumber) -> Self {
         if self.request == Some(request) {
             self
@@ -397,7 +348,6 @@ fn development_contains_secret(
     }
 }
 
-/// Only a committed handoff can create this in-process write proof.
 pub(crate) struct DevelopmentWriteProof {
     token: entities::AllocationToken,
     revision: u64,
@@ -415,37 +365,23 @@ impl DevelopmentWriteProof {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum DevelopmentHandoffError {
-    /// The handoff failed before any start was submitted, or the checked
-    /// start definitely refused it. No execution authority exists and nothing
-    /// was sent; the Allocation is still only Reserved and may be ended with
-    /// [`DatabaseHandle::fail_unstarted_development_reservation`].
     NotStarted {
         cause: entities::UnstartedCause,
         error: Box<DatabaseError>,
     },
-    /// The failure does not prove that nothing started or that the failure is
-    /// permanent (storage, shutdown, queue pressure); ownership stays held.
     Database(Box<DatabaseError>),
-    /// Reconciliation is evidence only: no in-memory permit is returned.
     OutcomeUnknown {
         error: Box<DatabaseError>,
         reconciliation: Result<OperationStatus, Box<DatabaseError>>,
     },
 }
 
-/// Why a preview of a start did not complete. Neither case changed anything.
 #[derive(Debug)]
 pub(crate) enum DevelopmentPreviewError {
-    /// The caller's guard refused the exact prepared request.
     Refused(&'static str),
-    /// The request could not be prepared: the Job, its context or a stored
-    /// credential is unavailable, or the read failed.
     Unavailable(DatabaseError),
 }
 
-/// A handoff failure that a retry cannot change and that happened before any
-/// start was committed, with the reason to record. Storage, shutdown and queue
-/// failures are not decisions about the Job, so they are not classified.
 fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffError {
     let cause = match &error {
         DatabaseError::Rejected(Violation::InvalidValue(field, reason))
@@ -512,17 +448,10 @@ fn prepare_development_handoff(
         redb::DevelopmentResolvedCandidate::Generative(context) => {
             let snapshot = &context.snapshot;
             let frozen = &snapshot.configuration;
-            // The Agent's Workspace grant and the Workspace tools offered are
-            // one fact: a Job with a grant runs with its tools or not at all,
-            // and a Job without one is never offered any. Asking the user is
-            // not a Workspace tool.
             let granted = frozen
                 .agent
                 .as_ref()
                 .is_some_and(|agent| agent.workspace_grant().is_some());
-            // An Agent with a Workspace grant runs with its Workspace tools or
-            // not at all. One that only manages Jobs may be offered the job
-            // tools, and runs without when none is offered.
             let manages = frozen
                 .agent
                 .as_ref()
@@ -560,8 +489,6 @@ fn prepare_development_handoff(
                 ));
             }
             for turn in &snapshot.history {
-                // A turn that never started has a typed Result written by the
-                // host, not an answer; a cancelled turn has none either.
                 let answer = if turn
                     .record
                     .outcome
@@ -702,8 +629,6 @@ pub struct Vitals {
     pub peak_rss_bytes: Option<u64>,
 }
 
-/// The database file's size and the space free beside it. Both readings are
-/// optional: a probe that fails stays unknown rather than becoming zero.
 fn filesystem_vitals(directory: &std::path::Path) -> (Option<u64>, Option<u64>) {
     let db_file = crate::db::redb::database_file(directory);
     (
@@ -756,7 +681,6 @@ fn model_profile_save_bytes(save: &mutations::ModelProfileSave) -> u64 {
         .saturating_add(4096)
 }
 
-/// What the header fields of a save add to its command size.
 fn header_change_bytes(change: &mutations::HeaderChange) -> u64 {
     match change {
         mutations::HeaderChange::Preserve => 0,
@@ -775,8 +699,6 @@ fn header_change_bytes(change: &mutations::HeaderChange) -> u64 {
     }
 }
 
-/// Reads [`filesystem_vitals`] on a blocking worker, so a slow filesystem
-/// never holds an async worker.
 async fn filesystem_vitals_async(directory: std::path::PathBuf) -> (Option<u64>, Option<u64>) {
     ntex::rt::spawn_blocking(move || filesystem_vitals(&directory))
         .await
@@ -846,9 +768,6 @@ impl DatabaseHandle {
         Ok(AttachmentPermit(self.shared.attachment_slots.0.clone()))
     }
 
-    /// Successful durable commits of command groups since this worker started.
-    /// A flushed group counts once; refused or declined commands and failed
-    /// commits do not count. Recovery and maintenance commits are excluded.
     pub fn durable_commits(&self) -> u64 {
         self.shared.durable_commits.load(Ordering::SeqCst)
     }
@@ -935,9 +854,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// What a first activation reads, from one read transaction; see
-    /// [`redb::activation_snapshot`]. A read, never a selection, and never a
-    /// write: nothing here reserves, promotes or repairs anything.
     pub(crate) async fn activation_snapshot(
         &self,
         limit: usize,
@@ -1052,9 +968,6 @@ impl DatabaseHandle {
         }
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
         let counts = redb::queue_counts(&opened.database, true).map_err(DatabaseError::Read)?;
-        // `held` covers every Allocation holding capacity, so a Reserved,
-        // StopRequested or Uncertain one blocks the update as well as a
-        // Running one.
         if counts.pending != 0
             || counts.ready != 0
             || counts.delayed != 0
@@ -1065,8 +978,6 @@ impl DatabaseHandle {
         {
             return Ok(None);
         }
-        // No command's process group may be alive, or unproven, when the
-        // executable is replaced; none of them survives a restart.
         if crate::system::executor::blocking::groups_tracked() {
             return Ok(None);
         }
@@ -1109,10 +1020,6 @@ impl DatabaseHandle {
                 })?;
             operation
         };
-        // Every command that reaches the worker is answered, so a closed
-        // reply channel means the worker stopped. Its execution mark tells
-        // whether the command began; worker termination alone says nothing
-        // about a begun command's commit.
         response.recv_async().await.map_err(|_| {
             if started.load(Ordering::SeqCst) {
                 DatabaseError::OutcomeUnknown {
@@ -1132,7 +1039,6 @@ impl DatabaseHandle {
         self.read_opened(move |opened| read(&opened.database)).await
     }
 
-    /// Reads stay available under disk protection unless storage failed.
     async fn read_opened<T: Send + 'static>(
         &self,
         read: impl FnOnce(&Opened) -> Result<T, StorageError> + Send + 'static,
@@ -1169,26 +1075,14 @@ impl DatabaseHandle {
             .map_err(|_| DatabaseError::ReadInterrupted)?
     }
 
-    /// The Jobs that this worker's start found abandoned by an earlier
-    /// opening of the database, a process that died or a worker that was
-    /// shut down while they ran, and settled as unknown with their stop
-    /// confirmed. Empty when nothing was abandoned.
     pub fn abandoned_at_open(&self) -> &[JobId] {
         &self.shared.abandoned_at_open
     }
 
-    /// The content files this worker's start found that committed cleanups
-    /// authorized it to reclaim, those of cleaned-up Attachments whose
-    /// content no available Attachment names, and what became of each:
-    /// [`Reclamation::Removed`], or why it is still there. Such a file is
-    /// left over by a reclamation that failed or was interrupted. Empty
-    /// when there was none; a file already gone is not listed. At most 1,000
-    /// details are retained; see [`Self::reclamation_omitted_at_open`].
     pub fn reclaimed_at_open(&self) -> &[(ContentDigest, Result<Reclamation, StoreError>)] {
         &self.shared.reclaimed_at_open
     }
 
-    /// Reclamation details omitted after the first 1,000 entries at startup.
     pub fn reclamation_omitted_at_open(&self) -> u64 {
         self.shared.reclamation_omitted_at_open
     }
@@ -1208,34 +1102,18 @@ impl DatabaseHandle {
         }
     }
 
-    /// The operation epoch of the current opening. A recovery that reopens
-    /// the database moves it forward.
     pub fn epoch(&self) -> u64 {
         self.shared.epoch.load(Ordering::SeqCst)
     }
 
-    /// The current disk protection status. Never waits for storage.
     pub fn disk_protection(&self) -> DiskProtectionStatus {
         self.shared.protection.status()
     }
 
-    /// Notifies of every later disk protection change until the database
-    /// worker stops.
     pub fn watch_disk_protection(&self) -> ProtectionWatch {
         self.shared.protection.watch()
     }
 
-    /// Compacts the database file when the policy says it is worth it: the
-    /// file is large, a large share of it is free, and no attempt was made
-    /// recently. Otherwise reports why it did not. Nothing calls this
-    /// automatically, because redb's compaction cannot be interrupted and
-    /// holds off every read and command for as long as it runs; the caller
-    /// chooses a quiet moment. Commands and reads that arrive meanwhile wait
-    /// in their queues and fail with a full-queue error beyond their limits,
-    /// and [`DatabaseWorker::shutdown`] waits for it.
-    ///
-    /// Every earlier command is already durable and acknowledged by the time
-    /// it runs, and a failed compaction leaves the file consistent.
     pub async fn compact_storage(&self) -> Result<CompactionOutcome, MaintenanceError> {
         let (reply, response) = flume::bounded(1);
         {
@@ -1258,14 +1136,6 @@ impl DatabaseHandle {
             .unwrap_or(Err(MaintenanceError::WorkerStopped))
     }
 
-    /// Clears disk protection once every protected filesystem has the resume
-    /// threshold available, a failed database has been released and
-    /// reopened, and every operation whose outcome was unknown has been
-    /// reconciled against its marker. Otherwise the lock stays and the
-    /// failed step is returned. Concurrent requests share one attempt.
-    ///
-    /// Commands refused while locked are not replayed, operations with an
-    /// unknown outcome are not retried, and no Job is resumed.
     pub async fn recover_storage(&self) -> Result<RecoveryReport, RecoveryError> {
         let response = self
             .shared
@@ -1277,9 +1147,6 @@ impl DatabaseHandle {
             .unwrap_or(Err(RecoveryError::WorkerStopped))
     }
 
-    /// Queues a control request unless the worker is stopping or stopped.
-    /// Callers hold the request's lock, and the worker closes admission
-    /// before answering pending requests on exit, so none is left unanswered.
     fn request(&self, control: Control) -> Result<(), RecoveryError> {
         let admission = self
             .shared
@@ -1295,8 +1162,6 @@ impl DatabaseHandle {
             })
     }
 
-    /// The instance's Genesis Job: the root of every parent chain, and the
-    /// parent to name for top-level work.
     pub fn genesis(&self) -> JobId {
         self.shared.genesis
     }
@@ -1355,8 +1220,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Newest Jobs first, strictly before `before` when given; at most
-    /// 1,000 per call.
     pub async fn jobs(
         &self,
         before: Option<JobId>,
@@ -1366,7 +1229,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// One submitted Job with its Allocation evidence, or none.
     pub(crate) async fn native_job(
         &self,
         job: JobId,
@@ -1375,8 +1237,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Newest submitted Jobs whose identity or input text contains every term,
-    /// with cursor pagination.
     pub(crate) async fn search_jobs(
         &self,
         terms: Vec<String>,
@@ -1387,7 +1247,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// One page of conversations by immutable conversation ID, newest first.
     pub async fn conversations(
         &self,
         before: Option<JobId>,
@@ -1397,9 +1256,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Conversations by immutable ID, newest first, whose title or message and result text holds
-    /// every term. `terms` are already lowercased query terms. `before` and
-    /// `limit` page like [`Self::conversations`].
     pub async fn search_conversations(
         &self,
         terms: Vec<String>,
@@ -1410,17 +1266,12 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Every native Allocation that is Uncertain and still holds capacity,
-    /// from one consistent read. Read-only: it releases nothing, and a failed
-    /// read is an error, never an empty list.
     pub async fn uncertain_allocations(
         &self,
     ) -> Result<Vec<crate::db::redb::UncertainAllocation>, DatabaseError> {
         self.read(redb::read_uncertain_allocations).await
     }
 
-    /// A Job's ordinary children in ID order, strictly after `after` when
-    /// given; at most 1,000 per call. The Genesis Job is not its own child.
     pub async fn children(
         &self,
         parent: JobId,
@@ -1431,9 +1282,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// The tree of the work below a Job: the ancestors above it and the
-    /// nodes below it, the root's own children in one page. `None` when the
-    /// root has no Job of its own.
     pub async fn job_tree(
         &self,
         job: JobId,
@@ -1453,9 +1301,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// The typed work of a decision turn, or `None` for every other Job. A
-    /// caller that receives `Some` must run the decision runtime, not the
-    /// generative one.
     pub async fn decision_work(
         &self,
         job: JobId,
@@ -1464,10 +1309,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// The Executors that support the transport of an LLM Profile's Provider
-    /// as configured now, oldest first, at most 1,000. This lists candidates
-    /// for new work only; it neither ranks nor reserves them, and running on
-    /// any of them never changes the Provider, model or parameters.
     pub async fn compatible_executors(
         &self,
         llm_profile: crate::db::entities::ProfileId,
@@ -1484,14 +1325,10 @@ impl DatabaseHandle {
             .await
     }
 
-    /// The Executors that offer typed decision work, oldest first, at most
-    /// 1,000. These are the candidates for new decision Jobs; running on any
-    /// of them never changes the Decision Model or its request.
     pub async fn decision_executors(&self) -> Result<Vec<ExecutorId>, DatabaseError> {
         self.read(redb::read_decision_executors).await
     }
 
-    /// The Jobs that explicitly retry `original`, oldest first.
     pub async fn retries(
         &self,
         original: JobId,
@@ -1502,8 +1339,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// A Job's outputs in seq order, strictly after `after_seq` when given;
-    /// at most 1,000 per call.
     pub async fn job_outputs(
         &self,
         job: JobId,
@@ -1546,8 +1381,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Executors in reverse ID order, newest first. Strictly before `before` when given;
-    /// at most 1,000 per call.
     pub async fn executors(
         &self,
         before: Option<ExecutorId>,
@@ -1562,8 +1395,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Projects newest first, strictly before `before` when given; at most
-    /// 1,000 per call.
     pub async fn projects(
         &self,
         before: Option<ProjectId>,
@@ -1573,8 +1404,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// A Job's Metrics in recording order, strictly after `after` when
-    /// given; at most 1,000 per call.
     pub async fn job_metrics(
         &self,
         job: JobId,
@@ -1585,8 +1414,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// A Job's AvailabilityStats in recording order, strictly after `after`
-    /// when given; at most 1,000 per call.
     pub async fn job_availability(
         &self,
         job: JobId,
@@ -1597,13 +1424,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// One page of the Metrics `filter` selects, in observation order
-    /// (`observed_at`, then record ID), strictly after `after` when given.
-    /// Pass the returned `next` back as `after` to continue; a page can be
-    /// empty while `next` is set. At most `limit` records (clamped to
-    /// 1..=1,000) per page, and at most [`MAX_OBSERVATION_SCAN`] index
-    /// entries read, matching or not. Each record names the target its Job
-    /// froze, not a Profile's current values.
     pub async fn metrics(
         &self,
         filter: ObservationFilter,
@@ -1616,9 +1436,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// One page of the AvailabilityStats `filter` selects, paged like
-    /// [`Self::metrics`]. These are raw observations; no availability
-    /// verdict or rate is derived from them here.
     pub async fn availability_stats(
         &self,
         filter: ObservationFilter,
@@ -1631,9 +1448,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// The submission recorded under `key`: the Job it created and the
-    /// fingerprint of its request. `None` when no committed Job was created
-    /// with it. A read never sees a creation whose commit is not durable.
     pub async fn submission(
         &self,
         key: SubmissionKey,
@@ -1642,11 +1456,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Resolves a command reported as [`DatabaseError::OutcomeUnknown`] by
-    /// reading the natural key it writes (section 11.2). Call it after
-    /// reopening: for an operation of an earlier opening, a missing key proves
-    /// the command did not commit. A command that writes no key to read is
-    /// [`OperationStatus::Unresolvable`].
     pub async fn reconcile_operation(
         &self,
         operation: OperationId,
@@ -1668,12 +1477,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Manually select and reserve one development-model Job. This does not
-    /// start execution. `New` is only for an identity never attempted before.
-    /// After an unknown outcome, callers must use `Replay`, which never creates
-    /// an Allocation when attribution is unresolved. Request IDs are not
-    /// authorization credentials; this interface is restricted to the trusted
-    /// internal allocator.
     #[allow(dead_code)]
     pub(crate) async fn reserve_next_development_job(
         &self,
@@ -1684,11 +1487,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Like [`Self::reserve_next_development_job`]; with
-    /// [`entities::ReadySelection::Only`], a ready entry of any other Job is
-    /// never reserved, so a manual trial reserves the one Job it names or
-    /// none. The selection is not stored: the Allocation is the same row
-    /// either way.
     #[allow(dead_code)]
     pub(crate) async fn reserve_development_job(
         &self,
@@ -1742,17 +1540,6 @@ impl DatabaseHandle {
         }
     }
 
-    /// One reservation pass of the native scheduler, under
-    /// [`entities::ReadySelection::Scheduled`]: the selection
-    /// and the reservation are one writer transaction, as for every other
-    /// pass. A pass that reserves nothing declines to commit, so it neither
-    /// writes nor wakes the scheduler that asked for it; only a reservation
-    /// commits. A first attempt only: a scheduler never replays a request to
-    /// adopt the Allocation an uncertain reply may have left.
-    ///
-    /// A refusal the same transaction can attribute to the global limit is
-    /// answered as [`ScheduledReservation::GlobalLimitReached`] rather than
-    /// as an error, so a scheduler need not ask again for another Executor.
     pub(crate) async fn reserve_scheduled_job(
         &self,
         fresh: entities::DevelopmentFreshReservation,
@@ -1793,11 +1580,6 @@ impl DatabaseHandle {
                                     passed = ScheduledReservation::Pass(Box::new(other));
                                     Ok(None)
                                 }
-                                // The refusal stands unless this same
-                                // transaction reads the global limit as
-                                // reached, which no Executor's pass could
-                                // have got past. Declining then writes
-                                // nothing, exactly as the refusal did.
                                 Err(redb::BatchError(redb::Failure::Rejected(violation))) => {
                                     if batch.global_execution_limit_reached()? {
                                         passed = ScheduledReservation::GlobalLimitReached;
@@ -1848,10 +1630,6 @@ impl DatabaseHandle {
         }
     }
 
-    /// Records the stop of one native Job of `context` (a Job of another
-    /// context is not found); see [`redb::Batch::request_native_stop`]. A
-    /// stop already requested writes nothing. A reply lost after commit is
-    /// `OutcomeUnknown`: read the Job before asking again.
     pub(crate) async fn request_native_stop(
         &self,
         context: entities::ComposerContextId,
@@ -1906,10 +1684,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Read the Executor's durable owner after a lost reply. This is a writer
-    /// barrier for commands already enqueued; concurrent callers can still own
-    /// the returned allocation. Use operation reconciliation when an operation
-    /// ID is available. If storage is unavailable, do not retry until resolved.
     #[allow(dead_code)]
     pub(crate) async fn development_executor_allocation(
         &self,
@@ -1927,8 +1701,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// The stored Job a manual trial names and the Allocation it already has,
-    /// if any. Evidence only.
     #[allow(dead_code)]
     pub(crate) async fn development_trial_job(
         &self,
@@ -1939,8 +1711,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Builds the request of a resolved candidate and reads the stored
-    /// credential rows it names, each once. Reads only.
     async fn prepare_with_credentials(
         &self,
         resolved: redb::DevelopmentResolvedCandidate,
@@ -1967,8 +1737,6 @@ impl DatabaseHandle {
                 })
                 .await
                 .map_err(|error| match &error {
-                    // A stored secret that cannot be read or decrypted is the
-                    // same fact to the Job as one that was deleted.
                     DatabaseError::Read(storage)
                         if storage.kind == StorageErrorKind::Other
                             && storage.os_error.is_none() =>
@@ -1995,15 +1763,6 @@ impl DatabaseHandle {
         Ok(prepared)
     }
 
-    /// Builds, without reserving anything, the exact request a start of `job`
-    /// on `executor` would prepare, and lets `guard` look at it. Reads only:
-    /// nothing is reserved, started, recorded or sent, and the prepared request
-    /// and the credential values it read are dropped when this returns, so a
-    /// refusal leaves the Job exactly as submitted.
-    ///
-    /// This is a preflight, not an authorization. The start transaction
-    /// revalidates every fact against the real reservation, and a Job that
-    /// changes in between is refused there.
     #[allow(dead_code)]
     pub(crate) async fn preview_development_handoff(
         &self,
@@ -2039,8 +1798,6 @@ impl DatabaseHandle {
         guard(&prepared).map_err(DevelopmentPreviewError::Refused)
     }
 
-    /// Prepare locally, then return the single-use result only after the Worker
-    /// confirms the checked start transaction is durable. This does not dispatch.
     #[allow(dead_code)]
     pub(crate) async fn checked_development_handoff(
         &self,
@@ -2050,10 +1807,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Like [`Self::checked_development_handoff`], and `guard` sees the exact
-    /// prepared request before any start is submitted. A refusal is a
-    /// definite pre-start failure: no authority exists and the Allocation is
-    /// still only Reserved.
     #[allow(dead_code)]
     pub(crate) async fn checked_development_handoff_guarded(
         &self,
@@ -2141,8 +1894,6 @@ impl DatabaseHandle {
         }
     }
 
-    /// A sequence is a caller-supplied output identity, not execution authority.
-    /// An uncertain result requires read-only reconciliation; do not retry blindly.
     #[allow(dead_code)]
     pub(crate) async fn append_development_output(
         &self,
@@ -2218,8 +1969,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Record evidence of the first provider request, using the exact body
-    /// prepared by the checked handoff. This method does not send a request.
     #[allow(dead_code)]
     pub(crate) async fn record_development_sent_request(
         &self,
@@ -2235,11 +1984,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Records that `request` is about to be sent, with the exact body it
-    /// will carry. The first request's body is the handoff's prepared one; a
-    /// later request carries the conversation as it stands after the earlier
-    /// request's answer and its tool results. It is recorded durably before
-    /// anything is sent, and only after the previous request was answered.
     pub(crate) async fn record_development_request(
         &self,
         handoff: &DevelopmentHandoff,
@@ -2391,7 +2135,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Records an observed answer; this operation does not contact a provider.
     #[allow(dead_code)]
     pub(crate) async fn record_development_provider_answer(
         &self,
@@ -2519,9 +2262,6 @@ impl DatabaseHandle {
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         if result.is_ok() {
-            // The next request repeats this response as its assistant
-            // message; its body is stored, so that request does not store it
-            // again.
             handoff
                 .recorder
                 .lock()
@@ -2531,8 +2271,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Records one explicitly annotated Token observation. `expected_seq` is
-    /// the existing request-event key retained by the caller for replay.
     #[allow(dead_code)]
     pub(crate) async fn record_development_usage(
         &self,
@@ -2652,7 +2390,6 @@ impl DatabaseHandle {
         })
     }
 
-    /// Finalizes only after the supervising runtime observed an in-process return.
     #[allow(dead_code)]
     pub(crate) async fn finalize_development_job(
         &self,
@@ -2758,7 +2495,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Finalizes a typed native Decision after the local executor has returned.
     #[allow(dead_code)]
     pub(crate) async fn finalize_development_decision(
         &self,
@@ -2854,11 +2590,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Settles a Job Failed or Cancelled without an answer, for either typed
-    /// handoff. A Failed settlement may carry the observation of a Provider
-    /// response that rejected the request; it is committed with the terminal
-    /// transition. Only the supervising runtime, having observed the exchange
-    /// return, can provide the proof. Success evidence is never supplied here.
     #[allow(dead_code)]
     pub(crate) async fn finalize_development_failure(
         &self,
@@ -3005,12 +2736,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Ends the Job and releases the capacity of a Reserved Allocation whose
-    /// checked start never committed, after [`DevelopmentHandoffError::NotStarted`].
-    /// The writer re-proves in one transaction that the reservation is
-    /// untouched and holds no execution authority; anything else is refused
-    /// and the Allocation stays held. Repeating the call is refused because
-    /// the first one releases the Allocation.
     #[allow(dead_code)]
     pub(crate) async fn fail_unstarted_development_reservation(
         &self,
@@ -3041,11 +2766,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Records, with a typed reason, that a supervised exchange returned
-    /// without an outcome this process can classify. The Job becomes Unknown
-    /// and the Allocation Uncertain and still held; nothing is released or
-    /// retried. Only the supervising runtime, having observed the exchange
-    /// return, can provide the proof.
     #[allow(dead_code)]
     pub(crate) async fn record_development_uncertain(
         &self,
@@ -3105,7 +2825,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Snapshot evidence only; this neither grants dispatch authority nor adopts ownership.
     #[allow(dead_code)]
     pub(crate) async fn development_execution_context(
         &self,
@@ -3117,8 +2836,6 @@ impl DatabaseHandle {
         self.resolve_development_candidate(snapshot).await
     }
 
-    /// Reads the image content a snapshot names and checks it is the content
-    /// the snapshot saw.
     async fn resolve_development_candidate(
         &self,
         snapshot: redb::DevelopmentCandidate,
@@ -3185,7 +2902,6 @@ impl DatabaseHandle {
         ))
     }
 
-    /// Read-only provenance evidence; it does not authorize adoption or dispatch.
     #[allow(dead_code)]
     pub(crate) async fn verify_native_summary(
         &self,
@@ -3200,9 +2916,6 @@ impl DatabaseHandle {
         .await
     }
 
-    // These commands are not yet connected to the HTTP API. Their storage
-    // gate refuses the current format, and their replies remain tentative
-    // until the write worker has completed its durable group commit.
     #[allow(dead_code)]
     pub(crate) async fn create_mutable_job(
         &self,
@@ -3325,8 +3038,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Update the context selection of a Job in its authenticated Composer
-    /// context. A successful reply follows durable transaction commit.
     pub async fn set_mutable_context_selection(
         &self,
         context: entities::ComposerContextId,
@@ -3437,9 +3148,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// T1: submits a Job, or the next turn of a conversation when it names a
-    /// predecessor in `previous`. The Job is pending; the claim batch grants
-    /// it when a compatible Pool has room.
     pub async fn create_job(&self, job: Job) -> Result<JobId, DatabaseError> {
         self.submit(|reply| {
             Command::new(
@@ -3501,7 +3209,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// A config, whatever its kind.
     pub async fn config(&self, id: ConfigId) -> Result<Option<ConfigRecord>, DatabaseError> {
         self.read(move |database| redb::read_config(database, id))
             .await
@@ -3516,9 +3223,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Configs of `kind` (every kind when `None`), newest first, strictly
-    /// before `before` when given; at most 1,000 rows are examined per call.
-    /// Archived configs are included; an empty page can have a continuation.
     pub async fn configs(
         &self,
         kind: Option<ConfigKind>,
@@ -3539,8 +3243,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// One page of a Pool's held Allocations and its occupancy; `None` when
-    /// the Pool does not exist. Read-only.
     pub(crate) async fn pool_allocations(
         &self,
         pool: entities::ExecutionPoolId,
@@ -3678,11 +3380,6 @@ impl DatabaseHandle {
         }
     }
 
-    /// One bounded page of active Profile configs (Models and Agents), newest
-    /// first and strictly before `before`, with the Connections those Models
-    /// name and their compatible Executors read in the same transaction.
-    /// `scan` bounds the configs examined, so an empty page can still advance
-    /// its `next_before`; `None` there means the configs were exhausted.
     pub(crate) async fn profile_page(
         &self,
         before: Option<ConfigId>,
@@ -3696,8 +3393,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Creates a Connection, Model, Agent or Pool config. Its references must
-    /// name configs of the kinds its body requires.
     pub async fn create_config(&self, config: Config) -> Result<ConfigId, DatabaseError> {
         self.submit(|reply| {
             Command::new(
@@ -3742,8 +3437,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Creates or edits an LLM or Decision Model Profile, resolving its
-    /// Connection and any required LLM Executor in the same write batch.
     pub(crate) async fn save_model_profile(
         &self,
         mut save: mutations::ModelProfileSave,
@@ -3795,7 +3488,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Imports missing models and their Provider connection in one transaction.
     pub(crate) async fn import_models(
         &self,
         mut save: mutations::ImportModelsSave,
@@ -3859,16 +3551,12 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Archives a model and removes it from Agent choices, preserving frozen Jobs.
-    /// The global custom request headers.
     pub async fn global_outbound_headers(
         &self,
     ) -> Result<crate::db::entities::GlobalHeaders, DatabaseError> {
         self.read(redb::read_global_outbound_headers).await
     }
 
-    /// Replaces the global custom request headers if `expected_revision` is
-    /// still current.
     pub async fn set_global_outbound_headers(
         &self,
         expected_revision: u32,
@@ -3892,7 +3580,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// A secret wrapped with the credential key, for a save to store.
     pub(crate) async fn credential_payload(
         &self,
         secret: redb::CredentialSecret,
@@ -3936,10 +3623,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Edits a config in place: a new name and body of the same kind, made
-    /// from `expected_edit_seq`. It raises the edit counter and is refused
-    /// (`ProfileChanged`, nothing written) when the stored counter differs;
-    /// Jobs that froze the old values keep them.
     pub async fn update_config(
         &self,
         id: ConfigId,
@@ -4071,8 +3754,6 @@ impl DatabaseHandle {
         self.read(move |database| redb::read_context_state(database, conversation, before, limit))
             .await
     }
-    /// Opens a system conversation with one typed decision turn and freezes
-    /// its Decision Model and Profile in the same transaction.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_decision(
         &self,
@@ -4109,9 +3790,6 @@ impl DatabaseHandle {
         })
         .await
     }
-    /// Requests one manual compaction of `conversation` through generative
-    /// `model`. The submission key returns the same Job on repeat. A source
-    /// that will not fit the model's window is refused, not truncated.
     pub async fn request_compaction(
         &self,
         conversation: JobId,
@@ -4160,10 +3838,6 @@ impl DatabaseHandle {
         })
         .await
     }
-    /// Takes what the settling of each of `turns` sets in motion above it: a
-    /// one-shot child closes, what waited for it that now never can run ends,
-    /// and its parent is told what its children came to. Idempotent, and no
-    /// part of recording a turn's outcome.
     pub(crate) async fn settle_child_turns(
         &self,
         turns: Vec<JobId>,
@@ -4182,8 +3856,6 @@ impl DatabaseHandle {
         })
         .await
     }
-    /// [`Self::settle_child_turns`] for the turns a restart finds not yet
-    /// reported, a few at a time until none is left.
     pub(crate) async fn settle_unreported_children(&self) -> Result<(), DatabaseError> {
         const BATCH: usize = 8;
         loop {
@@ -4334,8 +4006,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Replaces a Project's name, description and commands. Its root never
-    /// changes.
     pub async fn update_project(
         &self,
         id: ProjectId,
@@ -4361,7 +4031,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Renames or hides the conversation whose root Job is `root`.
     pub async fn set_conversation(&self, root: JobId, edit: JobEdit) -> Result<(), DatabaseError> {
         self.submit(|reply| {
             Command::new(
@@ -4381,7 +4050,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Hides the conversation and closes its live subtree in the same transaction.
     pub async fn hide_conversation(&self, root: JobId) -> Result<JobAction, DatabaseError> {
         self.submit(|reply| {
             Command::new(
@@ -4398,18 +4066,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Stores `attachment` as a new user-provided Attachment. Its content is
-    /// published durably first, see [`crate::db::attachments`]; only then is the
-    /// record committed. When the commit fails, the published content stays,
-    /// named by no Attachment, and a later publication of the same bytes
-    /// reuses it. Nothing is published while commands are not admitted.
-    ///
-    /// The content is pinned from before it is published until the commit's
-    /// outcome is known, so no cleanup reclaims it meanwhile; a returned
-    /// Attachment always has its content. When the outcome is unknown, the
-    /// content stays pinned until the process ends. Publishing waits, on the
-    /// caller's thread like the rest of the publication, while a cleanup
-    /// reclaims content.
     pub async fn create_user_attachment(
         &self,
         attachment: Attachment,
@@ -4445,27 +4101,19 @@ impl DatabaseHandle {
                 origin: AttachmentOrigin::UserProvided,
             };
             if handoff_tx.send(Ok(published)).is_err() {
-                // The awaiting async future was cancelled while publication was in progress.
-                // Database submission certainly never occurred.
                 pin.release();
                 drop(permit);
                 return;
             }
             match settle_rx.recv() {
                 Ok(true) => {
-                    // Settled commit outcome (committed or known non-committed): release pin.
                     pin.release();
                 }
-                Ok(false) => {
-                    // Unknown commit outcome: retain pin.
-                }
+                Ok(false) => {}
                 Err(_) => {
-                    // Async caller dropped / cancelled.
                     if !submitted_for_worker.load(Ordering::Acquire) {
-                        // Certainly not submitted: release pin.
                         pin.release();
                     }
-                    // If submitted, outcome is unknown: retain pin without release.
                 }
             }
             drop(permit);
@@ -4496,8 +4144,6 @@ impl DatabaseHandle {
                 )
             })
             .await;
-        // Committed, and durable, so every later read sees the record that
-        // now protects the content; or certainly not committed.
         let settled = match &created {
             Ok(_) => true,
             Err(error) => matches!(
@@ -4518,8 +4164,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Attachments in reverse ID order; newest first, cleaned up or not.
-    /// Strictly before `before` when given; at most 1,000 per call.
     pub async fn attachments(
         &self,
         before: Option<AttachmentId>,
@@ -4529,9 +4173,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// An available Attachment with its content, read from the attachment
-    /// store and verified against the record's length and SHA-256. Content
-    /// that is missing or does not match is refused, never replaced.
     pub async fn attachment_content(
         &self,
         id: AttachmentId,
@@ -4556,8 +4197,6 @@ impl DatabaseHandle {
         .map_err(|_| DatabaseError::WorkerPanicked)?;
         let bytes = match loaded {
             Ok(bytes) => bytes,
-            // Reclaimed since the record was read, by a cleanup that
-            // committed meanwhile; otherwise the file is truly missing.
             Err(StoreError::Missing) => {
                 return Err(match self.attachment(id).await?.and_then(|r| r.cleanup) {
                     Some(cleanup) => AttachmentError::CleanedUp { id, cleanup },
@@ -4572,25 +4211,6 @@ impl DatabaseHandle {
         Ok(AttachmentContent { record, bytes })
     }
 
-    /// The operator's manual cleanup of an Attachment: records that it was
-    /// cleaned up, [`CleanupKind::Manual`] at the database's time, in one
-    /// commit, then reclaims its content file unless another available
-    /// Attachment, or a publication in progress, still needs that content;
-    /// see [`crate::db::attachments`]. The Attachment keeps its identity and
-    /// every other field, and every input keeps naming it; from the commit
-    /// on, its content is refused to every new read and to every Job whose
-    /// execution has not yet read it. Bytes already read, or already sent to
-    /// a Provider, are not recalled.
-    ///
-    /// An Attachment already cleaned up, manually or automatically, keeps
-    /// its cleanup: nothing is recorded, and only the reclamation of its
-    /// content is tried again. The report says which, and what became of
-    /// the content file; a failed reclamation does not undo the cleanup.
-    ///
-    /// # Errors
-    ///
-    /// [`AttachmentError::NotFound`] for an unknown Attachment, or why the
-    /// cleanup was not recorded.
     pub async fn cleanup_attachment(
         &self,
         id: AttachmentId,
@@ -4614,7 +4234,6 @@ impl DatabaseHandle {
                 .await
             {
                 Ok(record) => (record, true),
-                // Cleaned up meanwhile by another cleanup, which is kept.
                 Err(DatabaseError::Rejected(Violation::AttachmentCleanedUp(_))) => (
                     self.attachment(id)
                         .await?
@@ -4634,9 +4253,6 @@ impl DatabaseHandle {
         })
     }
 
-    /// Reclaims the content `digest` on a read worker, so that whether an
-    /// available Attachment still names it is read from committed, durable
-    /// records while the store holds its pins' lock.
     async fn reclaim(
         &self,
         digest: ContentDigest,
@@ -4653,7 +4269,6 @@ impl DatabaseHandle {
         .map_err(ReclamationError::Store)
     }
 
-    /// Appends measurements for a Job. Their LLM is the one the Job froze.
     pub async fn record_metrics(&self, metrics: Metrics) -> Result<MetricsId, DatabaseError> {
         self.submit(|reply| {
             Command::custom(
@@ -4775,8 +4390,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// Appends one availability observation of an LLM request a configured
-    /// Job sent. Its LLM is the one the Job froze.
     pub async fn record_availability_stat(
         &self,
         stat: AvailabilityStat,
@@ -4825,9 +4438,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// The write proof of `handoff`'s execution, taken for one write: only
-    /// one write at a time, and a write whose outcome is unknown makes the
-    /// handoff unusable until reconciled.
     fn begin_development_write<'a>(
         &self,
         handoff: &'a DevelopmentHandoff,
@@ -4864,11 +4474,6 @@ impl DatabaseHandle {
         Ok((guard, proof))
     }
 
-    /// Records OCG's refusal or admission of a tool call a Provider
-    /// requested, before anything about the call can run. Only the execution
-    /// that holds the Job's Allocation may record it; a handler is invoked
-    /// only once its admission is durable, which is when this returns `Ok`.
-    /// See [`mutations::record_tool_decision`].
     pub(crate) async fn record_development_tool_decision(
         &self,
         handoff: &DevelopmentHandoff,
@@ -4902,8 +4507,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// Records, once, what is known of an admitted call's execution. Only
-    /// the execution that holds the Job's Allocation may record it.
     pub(crate) async fn record_development_tool_outcome(
         &self,
         handoff: &DevelopmentHandoff,
@@ -4935,8 +4538,6 @@ impl DatabaseHandle {
         result
     }
 
-    /// A Job's tool evidence in call order, after the call named by its
-    /// request and index when given; at most 1,000 per call.
     pub async fn tool_evidence(
         &self,
         job: JobId,
@@ -4982,7 +4583,6 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Replaces a Pool's capabilities and concurrency limit.
     pub async fn update_execution_pool(
         &self,
         id: ExecutionPoolId,
@@ -5106,10 +4706,6 @@ impl crate::service::ai::providers::CredentialResolver for LocalCredentialResolv
     }
 }
 
-/// The durable scheduled external policy: created disabled, updated, enabled,
-/// disabled or revoked under its own operation. None of these methods can
-/// enable the build's control, and a policy row alone never authorizes a
-/// dispatch.
 impl DatabaseHandle {
     pub(crate) async fn create_scheduled_external_policy(
         &self,
@@ -5209,11 +4805,6 @@ impl DatabaseHandle {
             .await
     }
 
-    /// The runtime authorization of one Job's current Allocation: the policy
-    /// its binding names, at the revision the binding recorded. `Ok(None)` is
-    /// every execution that is not a scheduled external one. A binding that
-    /// names a missing, changed or refused policy is an error, never a
-    /// fallback to the loopback path.
     pub(crate) async fn scheduled_external_grant(
         &self,
         job: entities::JobId,

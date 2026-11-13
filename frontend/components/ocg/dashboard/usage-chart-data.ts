@@ -27,7 +27,6 @@ export function summarize(
   for (const row of rows) {
     if (row.bucket_us < fromUs || row.bucket_us >= untilUs) continue;
     const bar = bars[Math.floor((row.bucket_us - fromUs) / widthUs)];
-    // Prompt tokens include cache reads; output tokens include reasoning.
     const tokens = row.input_tokens + row.output_tokens;
     bar.totals.set(row.model, (bar.totals.get(row.model) ?? 0) + tokens);
     bar.total += tokens;

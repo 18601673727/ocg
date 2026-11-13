@@ -1,72 +1,3 @@
-//! `workspace_run_command`: runs one of the Project's commands in a
-//! Workspace the operator authorized, and returns how it exited and what it
-//! printed.
-//!
-//! A call names a command, never a command line. The built-in `cargo_check`
-//! runs `cargo check --all-targets` and `cargo_test` runs
-//! `cargo test --all-targets`; the Project adds commands of its own by name,
-//! each with the base argument vector its owner stored. A call may append
-//! literal strings through its optional `arguments` array. It cannot replace
-//! the program, base arguments, directory or environment. The process is
-//! started directly, never through a shell. A bare program name is found on
-//! the PATH OCG itself was started with, among absolute entries only, so never
-//! in a path a call names or the Workspace provides by a relative entry; an
-//! absolute program path is used
-//! when it is an executable regular file. A program that is not found is
-//! refused before anything starts.
-//!
-//! The process runs in the Workspace root, once the root is checked to still
-//! be the directory authorized. Its environment is built, not inherited:
-//! only [`PASSED_VARIABLES`] are taken from OCG's environment, with PATH
-//! reduced to its absolute entries, and [`SET_VARIABLES`] are added. Nothing
-//! else of OCG's environment reaches it: no Provider credential, credential
-//! reference or OCG setting.
-//!
-//! The process is started from a thread of its own, as the leader of a new
-//! process group, and supervised there; the executor only awaits the
-//! supervisor's report, so it never blocks on the process. Its stdout and
-//! stderr are each read to their end by a thread of their own, so the process
-//! never waits on a full pipe, and kept within a bound. Once the process has
-//! exited, and before it is reaped, the rest of its group is killed, so a
-//! process it left behind in the group does not outlive the call. When the
-//! call is stopped instead, by its own [`COMMAND_TIMEOUT`], by the tool
-//! loop's limit or by cancellation, the whole group is killed (`SIGKILL`)
-//! and the supervisor reaps the process. A group is only ever signalled
-//! while its leader is unreaped, so its id cannot be another's.
-//!
-//! An exit, with any status, is a completed call: a failing build or test is
-//! a result for the Provider to read. A call is refused (not applied) only
-//! when nothing was started; once the process has started, a call whose end
-//! cannot be observed, or that was stopped, leaves its effect uncertain.
-//!
-//! Output: at most [`OUTPUT_BYTES`] of stdout and stderr together are
-//! returned, each stream whole or as its beginning and end around a marker
-//! that says how many bytes were omitted, and `truncated` says whether
-//! anything was. The serialized result stays within [`RESULT_BYTES`].
-//!
-//! Resource usage: `wall_ms`, `cpu_user_ms`, `cpu_system_ms`, and
-//! `peak_rss_bytes` describe the leader and the descendants it waited for
-//! (cargo waits for rustc). Nothing else stores them: the result is the
-//! evidence, once.
-//!
-//! What this is not: a sandbox. Build scripts, procedural macros and tests
-//! run arbitrary code with the permissions of the OCG process; they may read
-//! or write anything it may, outside the Workspace too, and use the network.
-//! Cargo may fetch the dependencies a manifest names, and a rustup proxy may
-//! install the toolchain a project names. The working directory and the
-//! environment restrict none of this. A descendant that leaves the process
-//! group (`setsid`, `setpgid`, daemonizing) is not reached by the group kill
-//! and may keep running; when it keeps the output open, the call is not seen
-//! to end and stops at its limit as uncertain. The root is checked before
-//! the process starts, then entered by path. This tool is for a trusted,
-//! local Workspace of a single operator; it must never be offered to a
-//! remote or untrusted caller.
-//!
-//! Every call is recorded with its arguments before it runs, and its result,
-//! the output included, is kept in plaintext tool evidence and sent to the
-//! Provider. Output may carry secrets or private paths; nothing here logs it,
-//! and no failure message repeats it.
-
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Read;
@@ -91,28 +22,19 @@ use crate::system::executor::tools::{
 };
 use crate::system::executor::workspace_read::{self, Refusal as PathRefusal, Workspace};
 
-/// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_run_command";
 
-/// Identifies this handler's behavior in every call it records.
 const HANDLER_VERSION: &str = "workspace_run_command-7";
 
 const MAX_EXTRA_ARGUMENTS: usize = 64;
 const MAX_EXTRA_ARGUMENT_BYTES: usize = 4096;
 
-/// Longest a command may run before it is stopped.
 pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// The most output, of stdout and stderr together, a result carries.
 pub const OUTPUT_BYTES: usize = 12 * 1024;
 
-/// The largest serialized result: within the coding loop's limit of a single
-/// result, whatever the output's JSON escaping costs.
 pub const RESULT_BYTES: usize = 15 * 1024;
 
-/// The variables taken from OCG's own environment, when set: what locates
-/// the toolchain, its temporary files and the SSH agent. PATH is taken too,
-/// reduced to its absolute entries.
 pub const PASSED_VARIABLES: &[&str] = &[
     "HOME",
     "TMPDIR",
@@ -122,10 +44,8 @@ pub const PASSED_VARIABLES: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// Variables every command gets.
 pub const SET_VARIABLES: &[(&str, &str)] = &[("CARGO_TERM_COLOR", "never")];
 
-/// The commands a call may name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Preset {
     CargoCheck,
@@ -158,8 +78,6 @@ impl Preset {
     }
 }
 
-/// Why a call started nothing. Its message is recorded and may reach the
-/// Provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 enum Refusal {
     #[error(
@@ -176,8 +94,6 @@ enum Refusal {
     CommandBusy,
 }
 
-/// Why a started command's effect is not known. Its message never repeats
-/// the command's output.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 enum Uncertainty {
     #[error("the command did not finish within {0:?} and was stopped")]
@@ -217,7 +133,6 @@ impl From<Failure> for ToolFailure {
     }
 }
 
-/// The command a call names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Selected {
     Preset(Preset),
@@ -243,7 +158,6 @@ impl Selected {
     }
 }
 
-/// The command a call names, after checking its optional extra arguments.
 fn parse(arguments: &Value, commands: &[ProjectCommand]) -> Result<Selected, Refusal> {
     let object = arguments.as_object().ok_or(Refusal::InvalidArguments)?;
     if object
@@ -287,9 +201,6 @@ fn parse(arguments: &Value, commands: &[ProjectCommand]) -> Result<Selected, Ref
         .ok_or(Refusal::InvalidArguments)
 }
 
-/// What a command may see of OCG's environment: where its program is looked
-/// for, and every variable it gets. Read once, from the operator's
-/// environment, when the tool is registered.
 #[derive(Clone, Debug)]
 pub(crate) struct CommandEnvironment {
     search: Vec<PathBuf>,
@@ -297,12 +208,10 @@ pub(crate) struct CommandEnvironment {
 }
 
 impl CommandEnvironment {
-    /// From the environment OCG was started with.
     pub(crate) fn of_process() -> Self {
         Self::from_source(|name| std::env::var_os(name))
     }
 
-    /// From the variables `source` gives.
     pub(crate) fn from_source(source: impl Fn(&str) -> Option<OsString>) -> Self {
         let search = source("PATH")
             .map(|path| {
@@ -328,9 +237,6 @@ impl CommandEnvironment {
         Self { search, variables }
     }
 
-    /// The first executable regular file named `program` in the search
-    /// path. The path is used as found, never resolved further, since a
-    /// toolchain proxy may tell the tool to run by the name it is run as.
     fn find(&self, program: &str) -> Option<PathBuf> {
         self.search
             .iter()
@@ -338,8 +244,6 @@ impl CommandEnvironment {
             .find(|candidate| executable(candidate))
     }
 
-    /// The program a command names: a bare name found on the search path,
-    /// or an absolute path that is an executable regular file.
     fn locate(&self, program: &str) -> Option<PathBuf> {
         if !program.contains('/') {
             return self.find(program);
@@ -354,7 +258,6 @@ fn executable(path: &std::path::Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
-/// Everything needed to start one command, prepared by trusted code.
 struct Invocation {
     program: PathBuf,
     arguments: Vec<String>,
@@ -386,14 +289,11 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// Up to [`OUTPUT_BYTES`] from the beginning of one output stream and up to
-/// as many from its end, and how long it was.
 #[derive(Default)]
 struct Capture {
     head: Vec<u8>,
     tail: VecDeque<u8>,
     total: usize,
-    /// Reading failed before the stream's end.
     unread: bool,
 }
 
@@ -417,9 +317,6 @@ impl Capture {
         self.tail.drain(..excess);
     }
 
-    /// The stream in at most `budget` bytes, and whether any was left out:
-    /// whole, or its first and last bytes around a marker saying how many
-    /// were omitted. Bytes that are not UTF-8 are replaced.
     fn render(&self, stream: &str, budget: usize) -> (String, bool) {
         let kept = self
             .head
@@ -450,8 +347,6 @@ impl Capture {
     }
 }
 
-/// How `budget` bytes are shared by two streams of these lengths: each gets
-/// all it has when that fits, and what one leaves goes to the other.
 fn shares(stdout: usize, stderr: usize, budget: usize) -> (usize, usize) {
     let half = budget / 2;
     if stdout.saturating_add(stderr) <= budget {
@@ -465,7 +360,6 @@ fn shares(stdout: usize, stderr: usize, budget: usize) -> (usize, usize) {
     }
 }
 
-/// What a command that ran to its end left.
 struct Ended {
     finished: Finished,
     stdout: Capture,
@@ -602,9 +496,6 @@ fn compact(preset: Preset, ended: &Ended) -> Option<Capture> {
     Some(capture)
 }
 
-/// The call's result: the command, its exit, and its output within the
-/// bounds. A process ended by a signal has no exit code, and its signal is
-/// given instead.
 fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
     let compact = match selected {
         Selected::Preset(preset) => compact(*preset, ended),
@@ -650,8 +541,6 @@ fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
     }
 }
 
-/// Starts the command and supervises it to its end, on the calling thread,
-/// which is never the executor's.
 fn supervise(
     invocation: Invocation,
     stop: StopSignal,
@@ -716,7 +605,6 @@ fn supervise(
     }
 }
 
-/// Reads `pipe` to its end on a thread of its own.
 fn reader(mut pipe: impl Read + Send + 'static) -> Option<JoinHandle<Capture>> {
     thread::Builder::new()
         .name("ocg-command-output".to_owned())
@@ -739,8 +627,6 @@ fn reader(mut pipe: impl Read + Send + 'static) -> Option<JoinHandle<Capture>> {
         .ok()
 }
 
-/// The handler of `workspace_run_command`, bound to one authorized Workspace
-/// and the environment its commands get.
 struct RunCommand {
     workspace: Workspace,
     commands: Vec<ProjectCommand>,
@@ -749,8 +635,6 @@ struct RunCommand {
 }
 
 impl RunCommand {
-    /// The command `selected` names, ready to start: the Workspace root must
-    /// still be the directory authorized, and the program must be found.
     fn prepare(&self, selected: &Selected) -> Result<Invocation, Refusal> {
         self.workspace.open_root()?;
         let mut argv = selected.argv().into_iter();
@@ -772,8 +656,6 @@ impl ToolHandler for RunCommand {
         HANDLER_VERSION
     }
 
-    /// A build or a test may run project code that changes anything, so a
-    /// command run again may change things again.
     fn effect(&self) -> ToolEffect {
         ToolEffect::NonIdempotent
     }
@@ -815,9 +697,6 @@ impl ToolHandler for RunCommand {
         })
     }
 
-    /// Starts the command on a supervising thread and awaits its report
-    /// within the command's limit. Dropping the call, as its time limit or
-    /// cancellation does, stops the command.
     fn spawns(&self) -> bool {
         true
     }
@@ -873,8 +752,6 @@ impl RunCommand {
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(active_id.clone(), (stop.clone(), proven));
             let process_start = start.clone();
-            // The obligation is registered before the call's admission; a
-            // caller that made none registers it here, before any thread.
             let starting = match call {
                 CommandCall::Job(call_ref) => Some(
                     start
@@ -941,8 +818,6 @@ impl RunCommand {
     }
 }
 
-/// One command name and optional extra arguments. The names list the built-in
-/// presets first, then the Project's commands.
 fn parameters(commands: &[ProjectCommand]) -> Value {
     let names = Preset::ALL
         .map(Preset::name)
@@ -1008,9 +883,6 @@ fn parameters(commands: &[ProjectCommand]) -> Value {
     })
 }
 
-/// Registers `workspace_run_command` for `workspace` in `registry`, without
-/// authorizing it. It offers the built-in presets and `commands`; they get
-/// `environment` and run for at most `timeout`.
 pub(crate) fn register(
     registry: &ToolRegistry,
     workspace: Workspace,
@@ -1033,9 +905,6 @@ pub(crate) fn register(
     )
 }
 
-/// The tool loop limits of a coding execution: several rounds of reading,
-/// editing and testing, with every call given as long as a command may run
-/// and a little more, so a command is stopped by its own limit first.
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
     ToolLoopLimits {
         handler_timeout: timeout.saturating_add(blocking::STOP_GRACE),

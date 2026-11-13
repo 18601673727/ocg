@@ -1,7 +1,5 @@
 import type { ControlOutput } from "../contracts";
 
-// A presentation view of a durable record. Non-result payload fields that do
-// not affect the transcript stay in the database rather than being fabricated.
 export type OutputView = Pick<
   ControlOutput,
   "seq" | "kind" | "created_at_us" | "summary" | "code" | "value"
@@ -13,7 +11,6 @@ export type OutputSequence = Iterable<OutputView> & {
 
 const RAW_TAIL_LIMIT = 256;
 
-/** Ordered, rebuildable presentation data plus a bounded recent raw tail. */
 export class OutputHistory implements OutputSequence {
   private readonly sequences: number[] = [];
   private readonly times: number[] = [];

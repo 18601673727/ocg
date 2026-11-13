@@ -29,7 +29,6 @@ const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
   invalid_request: "settings.projects.refusal.invalidRequest",
 };
 
-/** Copies a Project's root path verbatim and reports the outcome inline. */
 function CopyRootButton({ project }: { project: ControlProject }) {
   const { t } = useI18n();
   const { isCopied, isCopyFailed, copyToClipboard } = useCopyToClipboard();

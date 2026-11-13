@@ -111,8 +111,6 @@ async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
     Ok(())
 }
 
-/// A release staged by the installer's `--stage` mode; removed on drop so
-/// every success and failure path cleans it up.
 struct StageDir(PathBuf);
 
 impl Drop for StageDir {
@@ -149,8 +147,6 @@ fn remove_stale_stages(prefix: &Path) {
     }
 }
 
-/// Downloads, verifies and extracts the release into a fresh stage directory
-/// using the target installer's `--stage` mode, so database writes stay enabled.
 async fn stage_release(install: &Install, version: &str, installer: &[u8]) -> Result<StageDir> {
     let dir = install
         .prefix
@@ -239,7 +235,6 @@ async fn prepare(
     if actual != checksum {
         return Err("installer checksum mismatch".into());
     }
-    // Older installers have no staging mode: download after the pause as before.
     let stage = if String::from_utf8_lossy(&installer).contains("--stage") {
         Some(stage_release(install, &version, &installer).await?)
     } else {

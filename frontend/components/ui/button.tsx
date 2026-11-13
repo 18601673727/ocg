@@ -16,13 +16,6 @@ const buttonVariants = cva(
           "hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:hover:bg-muted/50",
         destructive:
           "bg-destructive/10 text-destructive hover:bg-destructive/20 focus-visible:border-destructive/40 focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:hover:bg-destructive/30 dark:focus-visible:ring-destructive/40",
-        /*
-         * A pressed choice inside a group. It derives its mark from --primary,
-         * which the accent preference owns, and mirrors SELECTED_OPTION in
-         * components/ocg/primitives/selection.ts so a pressed Button and a
-         * pressed plain button look the same. The neutral `secondary` variant
-         * means "a quieter surface", not "this one is chosen".
-         */
         selected:
           "border-primary/40 bg-primary/10 text-foreground hover:bg-primary/15 aria-expanded:bg-primary/10",
         link: "text-primary underline underline-offset-4 hover:underline",

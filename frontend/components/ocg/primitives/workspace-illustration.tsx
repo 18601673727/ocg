@@ -2,7 +2,6 @@ import { useId } from "react";
 
 import { cn } from "@/lib/utils";
 
-/** Exploded isometric view of the workspace engine. Purely illustrative. */
 export function WorkspaceIllustration({ className }: { className?: string }) {
   const id = useId();
 

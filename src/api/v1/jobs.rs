@@ -24,9 +24,6 @@ pub(crate) enum JobKindView {
     Turn,
 }
 
-/// Where a native Job is in its execution, derived from its outcome, its
-/// phase and its Allocation. `stop_requested` and `unknown` are not stopped:
-/// only a confirmed stop is.
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename = "ExecutionPhase")]
@@ -131,8 +128,6 @@ pub(super) fn allocation_view(allocation: &crate::db::entities::PoolAllocation) 
 }
 
 impl JobView {
-    /// What an events stream announces the Job again for: its settlement and
-    /// its confirmed stop.
     pub(super) fn lifecycle(&self) -> [Option<i64>; 4] {
         [
             Some(self.execution_phase as i64),
@@ -142,8 +137,6 @@ impl JobView {
         ]
     }
 
-    /// Whether the Job concluded: an outcome that is final, or an unknown
-    /// one whose local execution was confirmed stopped.
     pub(super) fn concluded(&self) -> bool {
         match self.settlement.state {
             SettlementState::Completed | SettlementState::Failed | SettlementState::Cancelled => {
@@ -177,8 +170,6 @@ pub(super) fn jobs_page_view(page: &crate::db::redb::JobSearchPage) -> JobsView 
     }
 }
 
-/// The display title of a native Job: the first 80 characters of its
-/// Generative text, or of its Decision question prompt.
 pub(super) fn mutable_title(job: &crate::db::entities::MutableJob) -> String {
     match &job.input.content {
         crate::db::entities::MutableJobContent::Generative { text, .. } => text.as_str(),
@@ -191,9 +182,6 @@ pub(super) fn mutable_title(job: &crate::db::entities::MutableJob) -> String {
     .collect()
 }
 
-/// Derives the execution phase. A settled outcome wins; otherwise a live
-/// Allocation says how far execution got, and a Job without one is where its
-/// own phase says.
 fn execution_phase(
     record: &crate::db::entities::MutableJobRecord,
     allocation: Option<&crate::db::entities::PoolAllocation>,
@@ -256,7 +244,6 @@ pub(super) fn mutable_job_view(
         assigned_executor: None,
         created_at_us: job.created_at.as_unix_micros(),
         updated_at_us,
-        // Only a committed start is a start; a reservation or a queue time is not.
         started_at_us: allocation
             .and_then(|allocation| allocation.started_at)
             .map(|time| time.as_unix_micros()),

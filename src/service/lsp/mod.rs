@@ -258,7 +258,6 @@ fn shared(workspace: &Workspace) -> Result<Arc<Shared>, ToolFailure> {
         log::warn!("workspace_code index cache exceeds 8 workspaces");
     }
     let (release, available) = flume::bounded(1);
-    // The channel is new and empty, so the initial permit always fits.
     if let Err(error) = release.try_send(()) {
         log::error!("workspace_code initial permit: {error}");
     }
@@ -691,9 +690,6 @@ fn compute_line_starts(source: &str) -> Vec<usize> {
     line_starts
 }
 
-/// The absolute byte offset of a tree-sitter point, with the same validation
-/// the positions it feeds had: the row must exist and the column must stay
-/// within its line.
 fn point_to_offset(
     point: Point,
     line_starts: &[usize],
@@ -705,9 +701,8 @@ fn point_to_offset(
 
     let offset = line_starts[point.row] + point.column;
 
-    // Validate the offset is within the line
     let line_end = if point.row + 1 < line_starts.len() {
-        line_starts[point.row + 1] - 1 // -1 for the \n
+        line_starts[point.row + 1] - 1
     } else {
         source_len
     };
@@ -719,17 +714,12 @@ fn point_to_offset(
     Ok(offset)
 }
 
-/// Converts absolute byte offsets to 1-based `(line, utf16_column)` positions
-/// in one pass: the offsets are answered in ascending order while a single
-/// forward scan counts lines and UTF-16 units, so any number of positions
-/// costs one scan of the source instead of one line-prefix scan each.
 fn offsets_to_positions(
     source: &str,
     offsets: &[usize],
     deadline: Deadline,
 ) -> Result<Vec<(u64, u64)>, ToolFailure> {
     for &offset in offsets {
-        // Ensure each offset is at a character boundary
         if offset > source.len() || !source.is_char_boundary(offset) {
             return Err(ToolFailure::not_applied("invalid tree-sitter position"));
         }
@@ -739,9 +729,9 @@ fn offsets_to_positions(
     order.sort_unstable_by_key(|&i| offsets[i]);
 
     let mut positions = vec![(0u64, 0u64); offsets.len()];
-    let mut line = 0u64; // 0-based line at `byte`
-    let mut column = 0u64; // UTF-16 units between the line start and `byte`
-    let mut byte = 0usize; // scan position; only advances
+    let mut line = 0u64;
+    let mut column = 0u64;
+    let mut byte = 0usize;
     let mut chars = source.char_indices();
     let mut next = chars.next();
 
@@ -762,8 +752,6 @@ fn offsets_to_positions(
             byte += c.len_utf8();
             next = chars.next();
         }
-        // `byte == target`: every target is a char boundary, and the scan
-        // steps boundary to boundary.
         positions[i] = (line + 1, column + 1);
     }
 
@@ -771,7 +759,6 @@ fn offsets_to_positions(
 }
 
 struct RawError<'tree> {
-    /// The node kind a MISSING node stands in for; none for an ERROR node.
     expected: Option<&'tree str>,
     start: usize,
     end: usize,
@@ -802,7 +789,6 @@ fn walk_tree<'tree>(
             });
         }
 
-        // Descend first; when a subtree is done, ascend until a next sibling.
         if cursor.goto_first_child() {
             continue;
         }
@@ -1521,7 +1507,6 @@ impl ToolHandler for WorkspaceCode {
                     })
                     .map(|(path, stamp)| (path.clone(), *stamp))
                     .collect();
-                // A failed refresh must never leave a stale definition searchable.
                 for (path, _) in &pending {
                     index.remove(path);
                 }
@@ -1604,14 +1589,11 @@ impl ToolHandler for WorkspaceCode {
                 let result = loop {
                     let (text, counts) = render(&sections, &report, text_budget);
                     let result = json!({"text": text, "counts": counts, "index": {"files": index.files.len(), "reparsed": reparsed, "skipped": scan.skipped + failures.len(), "unsupported": scan.unsupported, "bounds": scan.limits}});
-                    // Re-render after accounting for JSON escaping, so summaries survive truncation.
                     let bytes = result.to_string().len();
                     if bytes <= max_result_bytes { break result; }
                     if text_budget == 0 { return Err(refused("result limit too small for counts")); }
                     text_budget = text_budget.saturating_sub(bytes - max_result_bytes);
                 };
-                // Only files this call indexed count as seen; one that was
-                // skipped stays changed for the next call.
                 *previous.lock().unwrap_or_else(PoisonError::into_inner) = scan
                     .files
                     .into_iter()

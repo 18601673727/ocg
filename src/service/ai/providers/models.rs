@@ -6,14 +6,9 @@ use crate::system::http::{DiscoveryClientError, authorization, discovery_client}
 pub(crate) use crate::db::entities::DiscoveredModel as ProviderModel;
 
 pub(crate) enum ModelListError {
-    /// The build does not permit model discovery against this endpoint; no
-    /// request was made. See [`crate::system::http::discovery_permitted`].
     NotAuthorized,
     Unreachable,
-    Rejected {
-        status_code: u16,
-        message: String,
-    },
+    Rejected { status_code: u16, message: String },
     NotListed,
 }
 

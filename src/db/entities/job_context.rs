@@ -40,8 +40,6 @@ impl JobLimits {
     }
 }
 
-/// Automatic policy selection. Preset token budgets are resolved against the
-/// actual generative model by the policy runtime, never by message count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionPreset {
@@ -90,8 +88,6 @@ pub enum CompactionMode {
     Custom { policy: CustomPolicy },
 }
 
-/// A frozen predictor binding selected by the global compaction policy.
-/// Runtime eligibility and the global opt-out are rechecked before work runs.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredictiveCompaction {
@@ -235,13 +231,9 @@ impl Default for CompactionPolicy {
     }
 }
 
-/// One resolved automatic recipe. The numbers are the uncalibrated proposal
-/// in the workstream notes: they are not approved production defaults.
-/// `Disabled` is explicit and does not trigger preparation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedCompaction {
     pub mode: &'static str,
-    /// Trigger when estimated occupancy exceeds this. `None` is Disabled.
     pub trigger: Option<u32>,
     pub target: u32,
     pub headroom: u32,
@@ -250,13 +242,10 @@ pub struct ResolvedCompaction {
     pub preserve_recent_turns: u32,
     pub cooldown_seconds: u32,
     pub summarization_model: Option<ConfigId>,
-    /// These values are a proposal, not a calibrated or approved default.
     pub uncalibrated: bool,
 }
 
 impl CompactionPolicy {
-    /// Resolves the selected policy against a known window. An unknown window
-    /// cannot drive utilization automation. Disabled stays disabled.
     pub fn recipe(
         &self,
         window: Option<u32>,
@@ -293,15 +282,12 @@ impl CompactionPolicy {
         let headroom = headroom.max(output_reserve);
         let (trigger_gap, target_gap, preserve, cooldown) = match self.mode {
             CompactionMode::Off => return Ok(disabled),
-            // Uncalibrated proposal: Conservative B-H / B-2H / four turns / 10 minutes.
             CompactionMode::Auto {
                 preset: CompactionPreset::Conservative,
             } => (1, 2, 4, 600),
-            // Uncalibrated proposal: Balanced B-2H / B-3H / two turns / 5 minutes.
             CompactionMode::Auto {
                 preset: CompactionPreset::Balanced,
             } => (2, 3, 2, 300),
-            // Uncalibrated proposal: Aggressive B-3H / B-4H / one turn / 2 minutes.
             CompactionMode::Auto {
                 preset: CompactionPreset::Aggressive,
             } => (3, 4, 1, 120),
@@ -390,10 +376,6 @@ impl CompactionPolicy {
         }
         Ok(())
     }
-    /// Whole-policy replacement: conversation > Profile > host. An explicit
-    /// Off policy suppresses inherited automatic behavior. Predictive is off
-    /// unless explicitly present on the selected Profile/conversation policy;
-    /// host defaults never opt a conversation into predictive work.
     pub fn resolve(host: Self, profile: Option<Self>, conversation: Option<Self>) -> Self {
         conversation.or(profile).unwrap_or(Self {
             predictive: None,
@@ -402,9 +384,6 @@ impl CompactionPolicy {
     }
 }
 
-/// A sealed source range. High-water marks are inclusive input/output
-/// sequences; `content` hashes the exact canonical source bytes captured by
-/// the source reader. Appends beyond these marks remain an uncompacted tail.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceBoundary {
@@ -421,7 +400,6 @@ pub struct ContextSourceManifest {
     pub conversation: JobId,
     pub through_turn: JobId,
     pub turns: Vec<SourceBoundary>,
-    /// An earlier artifact included as source, not a second copy of its text.
     pub base_artifact: Option<JobId>,
 }
 
@@ -443,8 +421,6 @@ impl ContextSourceManifest {
     }
 }
 
-/// A native source boundary binds a frozen Job revision and every output
-/// through the inclusive final sequence, rather than a legacy input journal.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSummaryBoundary {
@@ -463,8 +439,6 @@ pub struct NativeSummaryManifest {
     pub sources: Vec<NativeSummaryBoundary>,
 }
 
-/// The final output of an authorized producer links its source manifest and
-/// the immutable content-addressed summary payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSummaryResultLink {
@@ -494,14 +468,8 @@ impl NativeSummaryManifest {
     }
 }
 
-/// What a manual compaction request did. A repeated key returns the same
-/// outcome. No eligible source is a no-op, not a failure; a source that
-/// cannot fit the summarizer is an explicit refusal, never a truncated job.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionRequest {
-    /// Ordinary system summarization work was created, or the same key
-    /// already created it. `subsequent` means a turn is still active, so
-    /// this artifact is for a later execution.
     Prepared {
         job: JobId,
         conversation: JobId,
@@ -509,28 +477,21 @@ pub enum CompactionRequest {
         subsequent: bool,
         already: bool,
     },
-    /// Nothing to summarize: no settled prefix, or the prefix is already
-    /// covered and would not shrink.
-    Noop { reason: &'static str },
+    Noop {
+        reason: &'static str,
+    },
 }
 
-/// The name of a manual or automatic summarization child. It is ordinary
-/// system work, not the title helper.
 pub const COMPACTION_JOB_NAME: &str = "Compact conversation context";
 
-/// Tokens reserved for the summary itself. The source must fit beside this
-/// in the summarizer's own window; it is never truncated to make room.
 pub const SUMMARIZER_OUTPUT_RESERVE: u32 = 4096;
 
-/// Stored once in the producing Job's FinalResult.value. The result's Job ID
-/// is the artifact identity; the consuming turn/input sequence is its use identity.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummarizationResult {
     pub schema_version: u32,
     pub source: ContentDigest,
     pub summary: String,
-    /// Information loss is explicit. Original records remain recoverable.
     pub omitted_details: Vec<String>,
 }
 
@@ -599,8 +560,6 @@ pub enum StopProof {
     Operator,
 }
 
-/// Frozen generative work with one content-addressed sealed manifest. It has
-/// no Agent tools or workspace authority. The producing Job owns the result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SummarizationWork {
     pub frozen: FrozenExecutionConfig,
@@ -744,20 +703,14 @@ pub enum Entry {
     Iteration {
         n: u64,
     },
-    /// The requested response shape for this turn only. Retries without an
-    /// override use their chain root's format; follow-ups do not inherit it.
     ResponseFormat {
         format: ResponseFormat,
     },
-    /// Internal pre-claim metadata; outcome/status comes from this Job.
     ContextPreparation {
         job: JobId,
         policy_revision: u64,
     },
-    /// Candidate selection only. Adoption must validate the sealed source in the
-    /// claim transaction before it can affect model context.
     ContextUse {
-        /// None explicitly selects original context, superseding an earlier candidate.
         artifact: Option<JobId>,
     },
 }
@@ -836,14 +789,9 @@ pub struct Notice {
 pub struct JobAction {
     pub conversation: JobId,
     pub record_seq: Option<u32>,
-    /// The executions this action asked to stop, by the Allocation each runs under.
     pub running: Vec<AllocationToken>,
-    /// The turns this action ended itself, which never ran: what depends on
-    /// each has to be told.
     pub ended: Vec<JobId>,
     pub already: bool,
-    /// With `already`: the conversation has settled, rather than being closed
-    /// and still settling.
     pub settled: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -874,7 +822,6 @@ pub struct Recurrence {
     pub interval_s: u32,
 }
 
-// Reserved for tool-free system conversations whose parent receives the result.
 pub const TITLE_JOB_NAME: &str = "Generate conversation title";
 
 pub fn title_prompt(text: &str) -> String {
@@ -897,15 +844,12 @@ pub(crate) fn parse_suggested_title(text: &str) -> Option<String> {
     .then(|| title.to_owned())
 }
 
-/// What the owner changes about a conversation, which is a chat thread
-/// root. The Jobs of the conversation are never changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobEdit {
     Limits(super::JobLimits),
     CompactionPolicy(Option<super::CompactionPolicy>),
     Title(String),
     SuggestedTitle(String),
-    /// Hides it from the conversation list, for good.
     Hide,
 }
 

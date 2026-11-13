@@ -1,29 +1,3 @@
-//! `ocg run-external-job <job> --pool <id> --executor <id> --endpoint <https-url>
-//!  --credential-ref <ref> --model <id> --trusted-http-proxy <http://loopback:port>
-//!  --max-request-bytes <n> --max-output-tokens <n> --timeout-secs <n>
-//!  --confirm-external-request`
-//!
-//! Runs one explicitly named, ordinary, submitted, tool-free native Generative
-//! Job once against one approved HTTPS Provider endpoint, through one named
-//! trusted loopback HTTP CONNECT proxy. It is not an HTTP route, is refused
-//! unless the `manual_external_execution` control is enabled in the build
-//! (the `manual_external_trial` and `manual_loopback_execution` controls do
-//! not stand in for it), runs against the existing database in `OCG_DATA_DIR`
-//! as a host of its own (so it cannot run beside another host), and runs
-//! exactly one Job once: no retry, no recovery, no scheduling, no tools.
-//!
-//! Every flag is required and nothing is defaulted or selected for the
-//! operator. `--endpoint`, `--credential-ref` and `--model` are assertions
-//! against the Job's frozen configuration, not overrides: a mismatch is
-//! refused before anything is reserved. The API key is never an argument; the
-//! Job's frozen credential reference names the stored secret. The connection
-//! goes through the named proxy only and never falls back to a direct one;
-//! the environment's proxy variables and the system proxy are never used.
-//!
-//! Interrupting it (SIGINT or SIGTERM) cancels the local exchange. A request
-//! that may have reached the Provider then stays held as Uncertain: stopping
-//! the local transport says nothing about the Provider.
-
 use std::time::Duration;
 
 use super::manual_host::{

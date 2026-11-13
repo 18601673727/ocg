@@ -156,7 +156,6 @@ pub(super) fn open(
         return Err(SHUTTING_DOWN);
     }
     let slot = events::Slot::take(shared)?;
-    // Subscribe before the first read so a commit racing that read cannot be lost.
     let observation_cursor = match &topic {
         Topic::ObservationChanges(since) => {
             Some(since.unwrap_or_else(|| shared.database.observation_cursor()))

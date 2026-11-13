@@ -21,7 +21,6 @@ import { describeError } from "./settings-parts";
 import { HeadersEditor } from "./headers-editor";
 import { type HeaderDraft, type HeaderDraftError, draftsToInputs } from "./header-drafts";
 
-/** The backend saves a source as "<name> provider"; show the name it was given. */
 function sourceName(name: string) {
   return name.replace(/\s+provider\s*$/i, "");
 }
@@ -87,14 +86,12 @@ function ImportContent({
   );
   const [error, setError] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
-  // A committed import stays committed even when the following catalog refresh fails.
   const [result, setResult] = useState<string | null>(null);
   const endpoint = sourceId === "new" ? newConnection?.endpoint : provider?.endpoint;
   const protocol = sourceId === "new" ? newConnection?.protocol : provider?.protocol;
   const credentialRef = sourceId === "new" ? undefined : provider?.credential_ref;
   const credential = sourceId === "new" ? newConnection?.credential : undefined;
   const headers = sourceId === "new" ? newConnection?.headers : undefined;
-  // A saved Provider is probed with the headers its Profile already stores.
   const savedProfile = sourceId === "new" ? undefined : provider?.profile_ids[0];
   const headersKey = JSON.stringify(headers ?? null);
   const canDiscover = sourceId !== "new" || newConnection !== null;
@@ -139,7 +136,6 @@ function ImportContent({
       clearTimeout(timer);
       controller.abort();
     };
-    // `headers` is keyed by its content so typing in another field does not re-probe.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     canDiscover,

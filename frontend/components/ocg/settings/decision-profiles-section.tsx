@@ -64,7 +64,6 @@ function ProfileEditor({
 }: ProfileEditorProps & { kind: "decision_model" | "decision_agent" }) {
   const { t } = useI18n();
   const [editing, setEditing] = useState<string>();
-  // The revision the open form was made from; the server refuses an edit made from an older one.
   const [editingSeq, setEditingSeq] = useState<number>();
   const [name, setName] = useState("");
   const [model, setModel] = useState("");
@@ -139,8 +138,6 @@ function ProfileEditor({
       reset();
     } catch (cause) {
       if (isProfileConflict(cause) && editing) {
-        // Keep the draft, show the latest version, and rebase the form on it so a deliberate
-        // second save replaces the other edit.
         setError(
           t(kind === "decision_agent" ? "settings.agent.conflict" : "settings.llm.conflict"),
         );
@@ -151,9 +148,7 @@ function ProfileEditor({
             (profile) => profile.id === editing,
           );
           if (current) setEditingSeq(current.edit_seq);
-        } catch {
-          // The list is stale until the next refresh; the draft and the conflict notice stay.
-        }
+        } catch {}
       } else {
         setError(describeError(cause, t));
       }

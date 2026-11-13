@@ -38,7 +38,6 @@ export function isTrustedControlUrl(raw: string): boolean {
   }
 }
 
-/** One invocation-scoped connection hint; never a source of Profile truth. */
 export function useOcgControlUrl(): string | null {
   const url = useSyncExternalStore(
     (listener) => {

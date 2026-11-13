@@ -1,13 +1,3 @@
-//! The argument half of admitting a Provider's tool call: the arguments of
-//! a call must be one strict JSON object that satisfies the parameter schema
-//! of the function its request offered under that name.
-//!
-//! Admission is scoped to one request. It is not permission to execute: an
-//! admitted call has only been found to be one its request offered and
-//! allowed, with arguments its declared schema accepts. Whatever executes a
-//! call must still check it against OCG's own tool registry, policies and
-//! effective permissions.
-
 use std::fmt;
 
 use jsonschema::Validator;
@@ -16,21 +6,10 @@ use serde_json::{Map, Number, Value};
 
 use super::stream::{InvalidToolCall, ToolCallRefusal};
 
-/// The one dialect a parameter schema is read as.
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
-/// Deepest nesting of subschemas a parameter schema may have.
 const MAX_SCHEMA_DEPTH: usize = 32;
-/// The largest integer every IEEE-754 double reader takes exactly, 2^53 - 1;
-/// I-JSON's interoperable integers are those of at most this magnitude.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
-/// Compiles the parameter schema of `name`, offered without one when
-/// `parameters` is `None`, which admits no call: arguments are never taken
-/// as safe for want of a schema. The schema is read as JSON Schema 2020-12
-/// and is refused unless every keyword of it is enforced as written: see
-/// [`require_supported`]. Formats are asserted, an unknown one is refused,
-/// and patterns use a regular-expression engine whose matching time is
-/// linear in the input. Nothing is ever fetched to resolve a reference.
 pub(crate) fn parameter_validator(
     index: u32,
     name: &str,
@@ -52,8 +31,6 @@ pub(crate) fn parameter_validator(
     })
 }
 
-/// Compiles a parameter schema as [`parameter_validator`] does, or says why
-/// it cannot be enforced.
 pub(crate) fn compile_parameters(schema: &Value) -> Result<Validator, String> {
     require_supported(schema, "", 0)?;
     jsonschema::draft202012::options()
@@ -64,11 +41,6 @@ pub(crate) fn compile_parameters(schema: &Value) -> Result<Validator, String> {
         .map_err(|error| format!("cannot be enforced: {error}"))
 }
 
-/// Refuses a schema that uses anything not enforced as written: a keyword
-/// outside the 2020-12 vocabularies that are validated, including the
-/// content keywords, which only annotate; a base URI of its own; a
-/// reference that leaves the schema; another dialect; or nesting deeper
-/// than [`MAX_SCHEMA_DEPTH`]. Returns what it found, where.
 fn require_supported(schema: &Value, at: &str, depth: usize) -> Result<(), String> {
     if depth > MAX_SCHEMA_DEPTH {
         return Err(format!(
@@ -126,8 +98,6 @@ fn require_supported(schema: &Value, at: &str, depth: usize) -> Result<(), Strin
                     return Err(format!("declares a dialect other than {DRAFT_2020_12}"));
                 }
             }
-            // Assertions and annotations whose values are data; the
-            // meta-schema checks their form when the schema is compiled.
             "$anchor" | "$comment" | "$dynamicAnchor" | "const" | "default"
             | "dependentRequired" | "deprecated" | "description" | "enum" | "examples"
             | "exclusiveMaximum" | "exclusiveMinimum" | "format" | "maxContains" | "maxItems"
@@ -140,12 +110,6 @@ fn require_supported(schema: &Value, at: &str, depth: usize) -> Result<(), Strin
     Ok(())
 }
 
-/// Admits the arguments of the call at `index` to `name` when they are one
-/// strict JSON object, see [`parse_strict`], that `parameters` accepts, and
-/// returns them as parsed. The arguments are only read: nothing is
-/// defaulted, removed, converted or repaired, and the call keeps them exactly
-/// as they were sent. A refusal names where the schema refused them, never
-/// what they held.
 pub(crate) fn admit_arguments(
     index: u32,
     name: &str,
@@ -172,10 +136,6 @@ pub(crate) fn admit_arguments(
     Ok(value)
 }
 
-/// Parses `text` as one I-JSON value (RFC 7493), so that what the schema
-/// validates is what any reader of the text will take it to say: no object
-/// has a key twice, and every number is exactly the double it is read as,
-/// of a magnitude no greater than the largest safe integer.
 fn parse_strict(text: &str) -> Result<Value, String> {
     let mut numbers = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(text);
@@ -197,8 +157,6 @@ fn parse_strict(text: &str) -> Result<Value, String> {
     Ok(value)
 }
 
-/// Builds a [`Value`], refusing a key that one object repeats, and records
-/// every number in the order of the text.
 struct Strict<'a> {
     numbers: &'a mut Vec<Number>,
 }
@@ -279,7 +237,6 @@ impl<'de> Visitor<'de> for Strict<'_> {
     }
 }
 
-/// The number literals of valid JSON `text`, in order.
 fn number_literals(text: &str) -> Vec<&str> {
     let bytes = text.as_bytes();
     let mut literals = Vec::new();
@@ -317,13 +274,6 @@ fn number_literals(text: &str) -> Vec<&str> {
     literals
 }
 
-/// Whether `literal` is exactly the value `number` holds and every reader
-/// takes it exactly too. An integer read as one must be within
-/// ±[`MAX_SAFE_INTEGER`]. A double must be the decimal the literal denotes,
-/// its shortest representation, so a literal the double rounded, such as a
-/// fraction with more digits than a double keeps, is not; and it must be
-/// within the same bound, which, as every double beyond it is an integer,
-/// holds integers in decimal or exponent notation to the same range.
 fn is_exact(literal: &str, number: &Number) -> bool {
     if let Some(integer) = number.as_i64() {
         return integer.unsigned_abs() <= MAX_SAFE_INTEGER;
@@ -338,9 +288,6 @@ fn is_exact(literal: &str, number: &Number) -> bool {
     })
 }
 
-/// A number literal as its sign, significant digits and decimal exponent,
-/// `digits × 10^exponent`, with no leading or trailing zero. Zero has no
-/// digits and no sign.
 fn decimal(literal: &str) -> Option<(bool, String, i64)> {
     let (negative, unsigned) = match literal.strip_prefix('-') {
         Some(unsigned) => (true, unsigned),

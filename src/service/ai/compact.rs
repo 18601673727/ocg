@@ -9,8 +9,6 @@ pub(crate) const IMAGES_OMITTED_NOTICE: &str = "Images of earlier turns were omi
 pub(crate) const OMITTED_NOTICE: &str =
     "Earlier turns of this conversation were omitted to fit the model's context window.";
 
-/// Stated when the request offers the web tools, whose reach is not the
-/// Workspace's: a model that assumed otherwise would refuse work it can do.
 const INTERNET_NOTICE: &str = "Internet access is available during execution through web_search and web_fetch, using OCG's configured proxy. Workspace filesystem path restrictions do not restrict these web tools.";
 
 fn append_omitted_notice(conversation: &mut ChatConversation) {
@@ -86,11 +84,6 @@ fn tool_bytes(tool: &ToolWire) -> usize {
     crate::db::serialized_len(tool).unwrap_or(0)
 }
 
-/// Estimates the token count of a conversation request under conservative assumptions:
-/// `ceil(UTF-8 bytes / 3)` over all message text, tool arguments, tool results, and
-/// offered tool definitions (serializing each [`ToolWire`]: name, description, and
-/// parameters), plus each tool call's function name with its arguments, plus 1,600
-/// tokens per image, plus `max_tokens` (or 4,096 when unset).
 pub(crate) fn estimate_request_tokens(
     conversation: &ChatConversation,
     max_tokens: Option<u32>,
@@ -221,14 +214,11 @@ fn assemble_final_conversation(
     }
 }
 
-/// What the context read already dropped or says, which the fitted request
-/// must carry and count.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ContextNotices<'a> {
     pub(crate) images_omitted: bool,
     pub(crate) context_omitted: bool,
     pub(crate) tree_status: Option<&'a str>,
-    // Execution appends these messages after fitting the history.
     pub(crate) request_messages: &'a [ChatMessage],
 }
 
@@ -245,8 +235,6 @@ pub(crate) fn fit_with_notices(
     context_limits: ContextLimits,
     notices: ContextNotices<'_>,
 ) -> Option<ChatConversation> {
-    // The system messages of the request, led by the tree status and the
-    // images notice; the omitted notice is part of the system prompt.
     let web = tools.iter().any(|tool| tool.function.name == "web_fetch");
     let with_prefix = |omitted: bool| {
         let mut system = Vec::new();
@@ -261,7 +249,6 @@ pub(crate) fn fit_with_notices(
         ));
         system
     };
-    // 1. Build messages once without per-attempt cloning.
     let prior_messages: Vec<PriorTurnMessages> = prior_turns
         .into_iter()
         .map(|(objective, images, assistant_text)| {
@@ -298,7 +285,6 @@ pub(crate) fn fit_with_notices(
     let system_without_notice = with_prefix(notices.context_omitted);
     let system_with_notice = with_prefix(true);
 
-    // 2. Estimate token weights once for prior turns and the rest (system, notice, current turn, tools, max_tokens).
     let tools_bytes: usize = tools.iter().map(tool_bytes).sum();
     let request_bytes: usize = notices
         .request_messages
@@ -344,7 +330,6 @@ pub(crate) fn fit_with_notices(
 
     let output_tokens = context_limits.max_tokens.map_or(4096, u64::from);
 
-    // 3. Check if full conversation (no turns dropped, no notice) fits.
     let full_bytes = rest_without_notice_bytes.saturating_add(total_prior_bytes);
     let full_images = current_images_count.saturating_add(total_prior_images);
     let full_tokens = (full_bytes.div_ceil(3) as u64)
@@ -360,7 +345,6 @@ pub(crate) fn fit_with_notices(
         ));
     }
 
-    // 4. Drop oldest turns until the sum fits.
     let total_priors = prior_messages.len();
     let mut remaining_prior_bytes = total_prior_bytes;
     let mut remaining_prior_images = total_prior_images;
@@ -383,7 +367,6 @@ pub(crate) fn fit_with_notices(
         }
     }
 
-    // 5. Assemble the final conversation once.
     let drop_count = selected_drop?;
     let mut kept_prior_messages = prior_messages;
     kept_prior_messages.drain(0..drop_count);

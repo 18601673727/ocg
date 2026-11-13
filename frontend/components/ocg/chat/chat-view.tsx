@@ -31,8 +31,6 @@ import {
   type ComposerSuggestion,
 } from "../composer/domain";
 
-/* ---------- composer ---------- */
-
 export function ChatComposer({
   sessionId,
   conversationId,
@@ -66,7 +64,6 @@ export function ChatComposer({
   activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
   onCancel?: () => Promise<void>;
   autoFocus?: boolean;
-  /** Compact Project selector shown beside the model selector above the card. */
   projectSelector?: React.ReactNode;
   draft: string;
   onDraftChange: (v: string) => void;
@@ -144,7 +141,6 @@ export function ChatComposer({
   const actionLock = useRef(false);
   const [submitting, setSubmitting] = useState(false);
 
-  // A drop that misses the composer must not navigate the page to the file.
   useEffect(() => {
     const block = (event: DragEvent) => {
       if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
@@ -330,8 +326,6 @@ export function ChatComposer({
               if (imageInputDisabled) return;
               const clipboard = e.clipboardData;
               if (!clipboard) return;
-              // One image can arrive as both an item and a file. Collect once
-              // and let the shared attachment state drop the duplicate.
               const pasted = [
                 ...Array.from(clipboard.items).flatMap((item) =>
                   item.type.startsWith("image/") ? [item.getAsFile()] : [],

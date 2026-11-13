@@ -42,7 +42,6 @@ pub struct SentRequest {
     pub parameters: ContentDigest,
     pub dropped_turns: Option<u32>,
     pub bodies: Vec<MessageBody>,
-    // Only the recorder can exempt references it has already durably stored for this Job.
     pub(crate) required_messages: Vec<ContentDigest>,
 }
 
@@ -62,16 +61,12 @@ pub struct ProviderRequestRecord {
     pub response: Option<Value>,
 }
 
-/// The SHA-256 of an Attachment's content. It names the immutable file
-/// that holds the content, never the Attachment: several Attachments may
-/// share one content file.
 #[derive(
     Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct ContentDigest([u8; 32]);
 
 impl ContentDigest {
-    /// The SHA-256 of `bytes`.
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
         let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
@@ -89,7 +84,6 @@ impl ContentDigest {
     }
 }
 
-/// Lowercase hexadecimal, 64 characters: the name of the content file.
 impl fmt::Display for ContentDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
@@ -102,9 +96,6 @@ impl fmt::Debug for ContentDigest {
     }
 }
 
-/// What a client's idempotency key is recorded as: a SHA-256 digest of it,
-/// computed by its caller. The key itself is never stored, and only the
-/// first bytes of the digest are ever displayed.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubmissionKey([u8; 32]);
 
@@ -139,8 +130,6 @@ impl fmt::Display for SubmissionKey {
     }
 }
 
-/// A SHA-256 digest of a submission's normalized request, computed by its
-/// caller, so a key reused for another request is told apart.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestFingerprint([u8; 32]);
 
@@ -166,23 +155,18 @@ impl fmt::Debug for RequestFingerprint {
     }
 }
 
-/// The idempotency of one submitted Job: recorded in the transaction that
-/// creates the Job, and refused there when its key is already recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Submission {
     pub key: SubmissionKey,
     pub fingerprint: RequestFingerprint,
 }
 
-/// A recorded submission: the one Job its key ever created, and the request
-/// that created it. Never changed once committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubmissionRecord {
     pub key: SubmissionKey,
     pub fingerprint: RequestFingerprint,
     pub job: JobId,
     pub seq: u32,
-    /// When the Job was created with it.
     pub recorded_at: Timestamp,
 }
 

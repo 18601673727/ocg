@@ -1,9 +1,5 @@
 use super::*;
 
-/// What an error before any response head proves about delivery. Only a
-/// failure that positively happened before the request could leave is
-/// NotDelivered; anything that may have reached a Provider is Delivered,
-/// whatever the Job's outcome becomes.
 pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
     match error {
         ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => {
@@ -20,13 +16,10 @@ pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
     }
 }
 
-/// Hands one fact to the sink with the current time.
 pub(crate) async fn announce(sink: Option<&mut (dyn ProviderOutputSink + '_)>, fact: ProviderFact) {
     announce_at(sink, Timestamp::now(), fact).await;
 }
 
-/// Hands one fact to the sink with the time the producer learned it. The time
-/// is fixed by the caller before this awaits, so a slow sink cannot move it.
 pub(crate) async fn announce_at(
     sink: Option<&mut (dyn ProviderOutputSink + '_)>,
     observed_at: Timestamp,
@@ -56,17 +49,8 @@ pub(crate) async fn bounded_body(response: ClientResponse, limit: usize) -> Opti
         .and_then(|body| String::from_utf8(body.to_vec()).ok())
 }
 
-/// The replacement written wherever a resolved credential is found.
 const REDACTED: &str = "[redacted]";
 
-/// Removes a resolved credential from provider-controlled values before they
-/// can leave provider execution. One is built in `exchange`, while the
-/// credential is still known, and every failure that can reach persistence,
-/// an API response, a log or `Display` passes through it. The credential as
-/// sent and its common encodings (JSON-escaped, percent-encoded, hexadecimal
-/// and Base64 at any alignment) are covered, so a secret echoed inside a JSON
-/// error body cannot survive as the parsed message either. A secret split or
-/// otherwise transformed is not found; see `system::secrets`.
 #[derive(Debug, Default)]
 pub(crate) struct Redactor {
     secrets: crate::system::secrets::Spellings,
@@ -79,7 +63,6 @@ impl Redactor {
         }
     }
 
-    /// Also removes each of `extra`, such as the secret request headers.
     pub(crate) fn with_secrets(mut self, extra: &[String]) -> Self {
         for secret in extra {
             self.secrets.extend(secret);
@@ -214,12 +197,6 @@ impl Redactor {
     }
 }
 
-/// What OCG keeps of a non-200 response to `conversation`. A Provider or
-/// gateway may echo the request it refuses, and an image-bearing request
-/// carries whole images, so an image refusal keeps a generic message, the
-/// provider code, request id and retry metadata, but drops the Provider's
-/// message and response body. A text-only refusal is kept as the Provider
-/// gave it.
 pub(crate) fn rejected_failure(
     conversation: &ChatConversation,
     status_code: u16,
@@ -236,7 +213,6 @@ pub(crate) fn rejected_failure(
     }
 }
 
-/// Whether a refusal with this status may succeed when sent again.
 fn retryable_status(status_code: u16) -> bool {
     matches!(status_code, 408 | 409 | 425 | 429 | 500..=599)
 }
@@ -288,7 +264,6 @@ pub(crate) fn parse_provider_error(body: &str) -> Option<(String, Option<String>
     Some((message, code))
 }
 
-/// A failure before any response head: it observed no response fact.
 pub(crate) fn classify_client_error(error: ClientError) -> ProviderExecutionError {
     let message = error.to_string();
     match error {
@@ -322,8 +297,6 @@ pub(crate) fn trim_ascii(value: &[u8]) -> &[u8] {
     &value[start..end]
 }
 
-/// The timing of a finished request, and nothing else. Its usage is in the
-/// result and in the annotated Metrics records captured while it streamed.
 pub fn metrics(result: &ProviderExecutionResult) -> crate::db::entities::Measurements {
     crate::db::entities::Measurements {
         ttfb_ms: Some(result.ttfb.as_millis().min(u128::from(u64::MAX)) as u64),
@@ -334,14 +307,6 @@ pub fn metrics(result: &ProviderExecutionResult) -> crate::db::entities::Measure
     }
 }
 
-/// The availability observations an error proves, in the order they were
-/// observed; at most two. Only what the provider or transport actually
-/// reported becomes a failure: a refusal before delivery proves nothing, and
-/// a local stop keeps just the response facts it already had. A failure keeps
-/// the response facts observed before it. When the response had finished
-/// before an independent transport failure, its facts and the failure are
-/// two observations, so the failure is not recorded as part of the finish.
-/// Nothing is inferred from an unknown outcome.
 pub fn error_observations(
     error: &ProviderExecutionError,
 ) -> Vec<crate::db::entities::AvailabilityObservation> {
@@ -357,7 +322,6 @@ pub fn error_observations(
         message: error.to_string(),
         ..ProviderFailure::default()
     };
-    // A failure without any response fact beside it.
     let failure_only = || AvailabilityObservation {
         status_code: None,
         finish_reason: None,
@@ -365,8 +329,6 @@ pub fn error_observations(
         failure: Some(failure()),
     };
     match error {
-        // A local interruption before any response head observed nothing
-        // about the Provider.
         ProviderExecutionError::Build { .. }
         | ProviderExecutionError::NotDelivered { .. }
         | ProviderExecutionError::Interrupted { .. } => Vec::new(),

@@ -32,9 +32,7 @@ export function ApprovalRequest({
     formatted = JSON.stringify(value, null, 2);
     if (value && typeof value === "object" && !Array.isArray(value))
       args = Object.fromEntries(Object.entries(value));
-  } catch {
-    /* The original request remains available for review. */
-  }
+  } catch {}
   const steps =
     tool === "job_plan" && Array.isArray(args.steps)
       ? args.steps.map((value: unknown, index) => {

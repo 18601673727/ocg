@@ -23,7 +23,6 @@ type Phase = "checking" | "out" | "in" | "unreachable";
 
 type Health = Api.Health;
 
-/** The local operator console: one browser session on this machine. */
 export function OperatorConsole() {
   const { t } = useI18n();
   const [client, setClient] = useState<HttpCanonicalControlClient | null>(null);
@@ -38,8 +37,6 @@ export function OperatorConsole() {
     const created = createHttpCanonicalControlClient({
       baseUrl: window.location.origin,
       fetch: window.fetch.bind(window),
-      // The CSRF token never becomes a credential of its own: it signs the
-      // requests of the session cookie beside it, and nothing else.
       csrfToken: () => csrf.current,
     });
     setClient(created);
@@ -91,7 +88,6 @@ export function OperatorConsole() {
         if (!alive) return;
         csrf.current = renewed.csrfToken;
         setSession(renewed);
-        // A session that still cannot read health is not signed in.
         try {
           const answer = await client.readHealth();
           if (alive) setHealth(answer);
@@ -131,7 +127,6 @@ export function OperatorConsole() {
     try {
       await client.deleteSession();
     } catch (error: unknown) {
-      // A server rejection of this session confirms it is no longer authorized.
       if (!(error instanceof ControlTransportError && error.status === 401)) {
         const code = error instanceof ControlTransportError ? error.code : "invalid_response";
         setSignOutError(t("session.signOutUnconfirmed", { code }));

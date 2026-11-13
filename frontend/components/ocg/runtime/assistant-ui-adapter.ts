@@ -1,9 +1,3 @@
-/**
- * The assistant-ui adapter is a view of OCG's canonical conversation state.
- * It never owns messages or execution state; those remain in the runtime
- * snapshot and are passed through as assistant-ui message-likes.
- */
-
 import type {
   AppendMessage,
   FileMessagePart,
@@ -94,14 +88,6 @@ function textPart(text: string): TextMessagePart {
   return { type: "text", text };
 }
 
-/**
- * Managed images are served by OCG's control server, so their stored URL is a
- * path relative to that server (e.g. `/api/v1/attachments/...`). A
- * browser can only fetch it once it is resolved against the control base; the
- * page origin is not necessarily that server. Already-absolute URLs (https,
- * data, blob) are left untouched, and with no control base a relative path is
- * passed through as-is rather than being pointed at a fabricated host.
- */
 function resolveManagedImageUrl(url: string, baseUrl: string | null | undefined): string {
   if (/^(https?:\/\/|data:|blob:)/i.test(url)) return url;
   if (!baseUrl) return url;
@@ -112,15 +98,6 @@ function resolveManagedImageUrl(url: string, baseUrl: string | null | undefined)
   }
 }
 
-/**
- * An assistant-turn image, emitted as a file part.
- *
- * The installed SDK's converter drops assistant `image` parts whose URL is not
- * `https:`/`blob:`/`data:image`, which would discard OCG's loopback (`http:`)
- * managed images. A `file` part with an `image/*` mime type passes through the
- * converter unchanged and renders through the same `Image` surface, keeping the
- * managed image visible in both a live stream and stored history.
- */
 function assistantImagePart(
   image: NonNullable<ChatMessage["images"]>[number],
   baseUrl: string | null | undefined,
@@ -135,13 +112,6 @@ function assistantImagePart(
   };
 }
 
-/**
- * A user-turn image, emitted as an image part inside its attachment.
- *
- * The SDK's converter passes user image parts through untouched, so the image
- * part survives regardless of scheme; only the URL needs resolving so the
- * preview thumbnail is fetched from the control server, not the page origin.
- */
 function userImagePart(
   image: NonNullable<ChatMessage["images"]>[number],
   baseUrl: string | null | undefined,
@@ -171,7 +141,6 @@ function assistantParts(
   t: TranslateFn,
 ): readonly ThreadAssistantMessagePart[] {
   const parts: ThreadAssistantMessagePart[] = [];
-  // Reasoning precedes the answer so the thought is read before the result.
   if (message.reasoning) {
     const reasoning: ReasoningMessagePart = { type: "reasoning", text: message.reasoning };
     parts.push(reasoning);
@@ -236,7 +205,6 @@ function userAttachments(
   }));
 }
 
-/** Convert one canonical OCG message to the installed assistant-ui shape. */
 export function convertOcgMessage(
   message: ChatMessage,
   _idx: number,

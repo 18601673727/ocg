@@ -7,7 +7,6 @@ export type ControlOutput = Api.Output;
 export type ControlJobDetails = Api.Job &
   Pick<Api.JobDetails, "result" | "unknown_reason" | "activity" | "task_plan" | "allocation"> & {
     mutable_phase?: string;
-    /** The Composer context the Job belongs to; the native stop route requires it. */
     context?: string;
   };
 export type ControlJobActivity = ControlJobDetails["activity"];
@@ -57,11 +56,6 @@ export function projectJobDetails(input: Api.JobDetails): ControlJobDetails {
 
 export type ControlNativeStopRequest = "ended_before_start" | "requested" | "already_requested";
 
-/**
- * The answer to `POST /api/v1/jobs/{job}/stop`. Only `ended_before_start`
- * confirms the Job stopped; the two 202 answers request a stop and are
- * deliberately not a claim that the execution stopped.
- */
 export type ControlNativeStop = {
   job: string;
   request: ControlNativeStopRequest;

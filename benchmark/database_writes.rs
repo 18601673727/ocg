@@ -1,11 +1,3 @@
-//! Write-path and read-latency benchmark for the database worker.
-//!
-//! Run with `cargo bench --bench database_writes [-- serial|concurrent|reads]`.
-//! It drives the public [`DatabaseHandle`] against a throwaway data
-//! directory, so it measures the whole command path: admission, the write
-//! worker, the redb commit and the reply. Commands are `create_project`
-//! calls, which are one small transaction each.
-
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -26,8 +18,6 @@ impl Wake for Unpark {
     }
 }
 
-/// Drives a database future on the calling thread. Every redb access happens
-/// on a database thread, so no async runtime is needed.
 fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
@@ -48,11 +38,8 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
     sorted.get(index.min(last)).copied().unwrap_or_default()
 }
 
-/// Projects created so far. `create_project` scans every root, so the count
-/// is part of what a case measures.
 static PROJECTS: AtomicUsize = AtomicUsize::new(0);
 
-/// The count a case starts from, to pass to [`report`] once it has run.
 fn projects_now() -> usize {
     PROJECTS.load(Ordering::Relaxed)
 }
@@ -72,8 +59,6 @@ fn report(label: &str, projects_before: usize, mut latencies: Vec<Duration>, ela
     );
 }
 
-/// Closed-loop writers: each submits its next command when the previous one
-/// is acknowledged, so the queue depth equals the number of writers.
 fn write_workload(
     handle: &DatabaseHandle,
     writers: usize,

@@ -1,14 +1,3 @@
-//! The tree of native conversations: a conversation an Agent opens inside
-//! another is a child of it, and the Jobs of a child run like any native Job.
-//!
-//! Every fact here is kept in the row that owns it: the parent of a child
-//! and the call that opened it are in its conversation row, what its owner
-//! changed (limits, hold, closing, prerequisites, retries, the last result
-//! already returned) in its [`JobControl`], and how a turn ended in its Job
-//! state. What a conversation waits for, whether it is held and whether it
-//! has settled are read from those rows when they are needed; nothing is
-//! derived and kept.
-
 use super::*;
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ComposerContextId, DependencyState, ExecutionConfiguration,
@@ -17,24 +6,15 @@ use crate::db::entities::{
     RequestFingerprint, Submission, ToolCallRef, Violation,
 };
 
-/// The most live conversations one conversation has directly, and the most
-/// one tree has in all.
 const MAX_LIVE_CHILDREN: usize = 16;
 const MAX_LIVE_SUBTREE: usize = 64;
-/// The most retries an Agent makes of one turn.
 const MAX_AGENT_RETRIES: usize = 2;
-/// The most of a child's answer that is returned to its parent.
 const RETURNED_RESULT_CHARS: usize = 4000;
-/// The most children one tree level is scanned for when results are returned.
 const MAX_CHILD_SCAN: usize = 256;
 
-/// Who put a conversation on hold, kept in [`JobControl::on_hold`]: only the
-/// user lifts the user's hold.
 pub(crate) const HELD_BY_USER: u32 = 1;
 pub(crate) const HELD_BY_AGENT: u32 = 2;
 
-/// What a conversation's tool-call identity makes of a recorded submission:
-/// the same call always names the same Job, so a replayed call finds it.
 pub(crate) fn tool_submission(call: ToolCallRef, purpose: &[u8], n: u32) -> Submission {
     let mut identity = b"ocg native job tool ".to_vec();
     identity.extend_from_slice(purpose);
@@ -50,8 +30,6 @@ pub(crate) fn tool_submission(call: ToolCallRef, purpose: &[u8], n: u32) -> Subm
 }
 
 impl Batch {
-    // ---- ancestry and limits -------------------------------------------------------------
-
     pub(crate) fn root_group(&mut self, mut root: JobId) -> Result<JobId, BatchError> {
         for _ in 0..=crate::db::entities::MAX_JOB_DEPTH {
             match self.require_job(root)?.parent_id {
@@ -76,8 +54,6 @@ impl Batch {
         Ok(result)
     }
 
-    /// The limits in force for `conversation`, with its depth: every
-    /// ancestor's limits intersected with its own.
     pub(crate) fn group_limits(
         &mut self,
         conversation: JobId,
@@ -134,10 +110,6 @@ impl Batch {
         self.put_job_control(conversation, &control)
     }
 
-    // ---- turns -----------------------------------------------------------------------------
-
-    /// The turns of `conversation` that have not settled, oldest first. A
-    /// conversation runs its turns in order, so they are its newest ones.
     pub(crate) fn unsettled_turns(
         &mut self,
         conversation: JobId,
@@ -161,7 +133,6 @@ impl Batch {
         Ok(open)
     }
 
-    /// The latest turn of `conversation`, when it is a native Job.
     pub(super) fn head_turn(
         &mut self,
         conversation: JobId,
@@ -172,8 +143,6 @@ impl Batch {
         }
     }
 
-    /// The execution configuration `conversation` last ran with, which a turn
-    /// the host adds to it runs with too.
     pub(super) fn conversation_configuration(
         &mut self,
         conversation: JobId,
@@ -200,8 +169,6 @@ impl Batch {
         }
     }
 
-    /// Adds a turn the host authors to `conversation`: created and submitted
-    /// in this transaction, named by `submission` so a replay finds it.
     pub(crate) fn host_turn(
         &mut self,
         conversation: JobId,
@@ -226,8 +193,6 @@ impl Batch {
         Ok(id)
     }
 
-    /// A turn the host adds to an existing `conversation` with the
-    /// configuration it last ran with.
     pub(super) fn agent_turn(
         &mut self,
         conversation: JobId,
@@ -246,9 +211,6 @@ impl Batch {
         )
     }
 
-    // ---- opening a child ---------------------------------------------------------------------
-
-    /// Whether `parent` may open another live conversation.
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
         let row = self.require_mutable_conversation(parent)?;
         if !row.kind.is_group()
@@ -271,8 +233,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Opens a conversation inside `parent`, for the call `call` of one of
-    /// its Agents. It waits for each of `after` before its first turn runs.
     pub(crate) fn open_child_conversation(
         &mut self,
         parent: JobId,
@@ -316,10 +276,6 @@ impl Batch {
         Ok(id)
     }
 
-    // ---- who may manage whom -----------------------------------------------------------------
-
-    /// The target must be strictly below the caller, and neither it nor its
-    /// subtree may have a turn queued or running that the user wrote.
     pub(crate) fn tool_rights(&mut self, caller: JobId, target: JobId) -> Result<(), BatchError> {
         let target_row = self.require_mutable_conversation(target)?;
         let mut parent = target_row.parent_id;
@@ -353,10 +309,6 @@ impl Batch {
         Ok(())
     }
 
-    // ---- holding and waiting -------------------------------------------------------------------
-
-    /// How one prerequisite of a conversation stands: its latest turn has
-    /// settled the way the condition asks, has not settled, or never can.
     fn prerequisite_state(
         &mut self,
         prerequisite: JobId,
@@ -379,9 +331,6 @@ impl Batch {
         })
     }
 
-    /// Whether the turn must not be reserved yet: its conversation or one
-    /// above it is held, or the conversation waits for a prerequisite that
-    /// has not settled the way it asked, or never will.
     pub(crate) fn mutable_job_blocked(&mut self, job: &MutableJob) -> Result<bool, BatchError> {
         let mut current = Some(job.parent_id);
         let mut own = true;
@@ -408,11 +357,6 @@ impl Batch {
         self.corrupted("conversation ancestry exceeds the hard depth limit".into())
     }
 
-    // ---- ending turns ------------------------------------------------------------------------
-
-    /// Ends the turns of `conversation` that have not settled: a queued turn
-    /// is cancelled here, a running one is asked to stop, and the tokens of
-    /// those the caller must cancel are returned.
     fn stop_unsettled_turns(
         &mut self,
         conversation: JobId,
@@ -462,9 +406,6 @@ impl Batch {
         })
     }
 
-    /// Closes `conversation` and every live conversation below it: their turns
-    /// end, no further turn is accepted, and each settles once its last turn
-    /// has.
     pub(crate) fn close(
         &mut self,
         conversation: JobId,
@@ -472,10 +413,6 @@ impl Batch {
     ) -> Result<JobAction, BatchError> {
         self.require_mutable_conversation(conversation)?;
         if self.job_control(conversation)?.closing.is_some() {
-            // A repeated close retries the cancellation: every execution of
-            // the live subtree that has not ended is named again by its
-            // persisted Allocation token, so a cancel that was lost can be
-            // sent again. Nothing here says an execution has stopped.
             let subtree = self.live_subtree(conversation)?;
             let mut running = Vec::new();
             let mut ended = Vec::new();
@@ -529,7 +466,6 @@ impl Batch {
         })
     }
 
-    /// Settles a closing conversation once nothing of it is left running.
     fn settle_closing(&mut self, conversation: JobId) -> Result<(), BatchError> {
         let control = self.job_control(conversation)?;
         let mut state = self.require_job_state(conversation)?;
@@ -571,8 +507,6 @@ impl Batch {
         if let Some(parent) = parent {
             self.remove(LIVE_CHILDREN, (parent.get(), conversation.get()))?;
         }
-        // Its turns and children are all settled, so the conversation is: its
-        // row leaves the unsettled index and its parent has one child fewer.
         let released = self.step(|tx| {
             let mut unsettled = tx.open_table(UNSETTLED)?;
             let open = unsettled.get(conversation.get())?.map(|row| row.value());
@@ -618,8 +552,6 @@ impl Batch {
         })
     }
 
-    /// Runs the turn `turn` of `conversation` again, as a new turn that
-    /// carries the same request.
     pub(crate) fn retry(
         &mut self,
         conversation: JobId,
@@ -715,13 +647,6 @@ impl Batch {
         })
     }
 
-    // ---- when a turn of a child settles -----------------------------------------------------
-
-    /// Everything a turn's settling sets in motion above it, taken once and
-    /// safe to take again: a one-shot child closes, the conversations that
-    /// waited for a prerequisite that can never be met end, and the parent
-    /// hears what the children opened by one call came to. Nothing here is
-    /// needed for the turn's own outcome, so it is not part of recording it.
     pub(crate) fn child_turn_settled(&mut self, job: JobId) -> Result<bool, BatchError> {
         let Some(turn) = self.mutable_job(job)? else {
             return Ok(false);
@@ -763,8 +688,6 @@ impl Batch {
         Ok(true)
     }
 
-    /// Ends the live siblings of `settled` that waited for it and now never
-    /// can run.
     fn end_impossible_dependents(
         &mut self,
         parent: JobId,
@@ -801,7 +724,6 @@ impl Batch {
         Ok(())
     }
 
-    /// The answer of a settled turn as the parent is told it.
     fn returned_answer(&mut self, turn: JobId) -> Result<Option<String>, BatchError> {
         let answer = self.step(|tx| {
             let outputs = tx.open_table(JOB_OUTPUTS)?;
@@ -819,9 +741,6 @@ impl Batch {
             .map(|text| text.chars().take(RETURNED_RESULT_CHARS).collect()))
     }
 
-    /// Tells `parent` how the children opened by one call ended, once each of
-    /// them has settled its latest turn, as a turn the host adds to the
-    /// parent. A child is reported once for each turn it settles.
     fn return_child_results(&mut self, parent: JobId, child: JobId) -> Result<(), BatchError> {
         let JobKind::Group {
             origin: Origin::Agent { call },
@@ -911,8 +830,6 @@ impl Batch {
         self.put_job_control(parent, &control)
     }
 
-    /// Every child conversation whose latest settled turn has not been
-    /// reported to its parent, with that turn: the work a restart finds undone.
     pub(crate) fn unreported_child_turns(&mut self) -> Result<Vec<JobId>, BatchError> {
         let children = self.step(|tx| {
             tx.open_table(CHILD_GROUPS)?
@@ -937,8 +854,6 @@ impl Batch {
         Ok(turns)
     }
 
-    /// Takes, for each of `turns`, what its settling sets in motion; the ones
-    /// that had nothing to do are skipped. Returns how many did something.
     pub(crate) fn settle_child_turns(&mut self, turns: &[JobId]) -> Result<usize, BatchError> {
         let mut settled = 0;
         for turn in turns {
@@ -949,17 +864,12 @@ impl Batch {
         Ok(settled)
     }
 
-    /// Takes the same for up to `limit` turns a restart finds unreported.
     pub(crate) fn settle_unreported_children(&mut self, limit: usize) -> Result<usize, BatchError> {
         let mut turns = self.unreported_child_turns()?;
         turns.truncate(limit);
         self.settle_child_turns(&turns)
     }
 
-    // ---- reading the tree --------------------------------------------------------------------
-
-    /// Whether `conversation` is an idle worker of `caller`: its own, open,
-    /// kept open, not held, written by no user and with every turn settled.
     pub(crate) fn idle_worker(&mut self, caller: JobId, worker: JobId) -> Result<bool, BatchError> {
         let row = self.require_mutable_conversation(worker)?;
         if row.parent_id != Some(caller)
@@ -989,7 +899,6 @@ impl Batch {
         }
     }
 
-    /// The Agent a Job froze, when it has one that may manage Jobs.
     pub(crate) fn frozen_agent_manages_jobs(
         &mut self,
         job: &MutableJob,

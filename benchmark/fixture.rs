@@ -1,25 +1,13 @@
-//! Test fixture generation for benchmarking.
-//!
-//! The fixture is a workspace of ordinary text files, written once before a
-//! measurement and read by the tools the reference job calls. Its size is
-//! recorded with the measurement, because a search over ten files and a
-//! search over a thousand are different measurements.
-
 use std::path::{Path, PathBuf};
 
-/// Configuration for generating a test fixture.
 #[derive(Clone, Debug)]
 pub struct FixtureConfig {
-    /// Number of workspace files to create.
     pub file_count: usize,
-    /// Average file size in bytes.
     pub avg_file_size: usize,
-    /// The name of the file the reference job's tool call reads.
     pub probe_file: String,
 }
 
 impl FixtureConfig {
-    /// A fixture small enough for a smoke run.
     pub fn small() -> Self {
         Self {
             file_count: 10,
@@ -28,7 +16,6 @@ impl FixtureConfig {
         }
     }
 
-    /// The fixture the reference measurements use.
     pub fn medium() -> Self {
         Self {
             file_count: 200,
@@ -37,7 +24,6 @@ impl FixtureConfig {
         }
     }
 
-    /// A fixture large enough for the search measurement to have a corpus.
     pub fn large() -> Self {
         Self {
             file_count: 2_000,
@@ -47,7 +33,6 @@ impl FixtureConfig {
     }
 }
 
-/// Statistics about a generated fixture.
 #[derive(Clone, Debug)]
 pub struct FixtureStats {
     pub file_count: usize,
@@ -57,7 +42,6 @@ pub struct FixtureStats {
     pub generation_time_secs: f64,
 }
 
-/// Generates a deterministic workspace of text files.
 pub struct FixtureGenerator {
     config: FixtureConfig,
     root: PathBuf,
@@ -68,7 +52,6 @@ impl FixtureGenerator {
         Self { config, root }
     }
 
-    /// Writes the fixture and returns what it holds.
     pub fn generate(&self) -> Result<FixtureStats, Box<dyn std::error::Error + Send + Sync>> {
         let started = std::time::Instant::now();
         let workspace = self.workspace_path();
@@ -105,10 +88,6 @@ impl FixtureGenerator {
     }
 }
 
-/// The content of one fixture file.
-///
-/// The text is a function of the index, so a fixture is the same bytes every
-/// run and a search over it finds the same terms every time.
 fn file_content(index: usize, size: usize) -> String {
     let mut content = String::with_capacity(size + 128);
     content.push_str("beacon rarebeacon fixture file\n");
@@ -125,7 +104,6 @@ fn file_content(index: usize, size: usize) -> String {
     content
 }
 
-/// The size of every file below `path`, added up.
 pub fn measure_fixture_bytes(path: &Path) -> std::io::Result<u64> {
     let mut total = 0;
     let mut directories = vec![path.to_path_buf()];
@@ -143,7 +121,6 @@ pub fn measure_fixture_bytes(path: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// The number of files below `path`.
 pub fn count_fixture_files(path: &Path) -> std::io::Result<usize> {
     let mut count = 0;
     let mut directories = vec![path.to_path_buf()];

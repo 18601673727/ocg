@@ -1,26 +1,18 @@
 use super::*;
 
-/// A storage failure that ends this opening of the database.
 pub(super) struct StorageFailure {
     pub(super) error: StorageError,
-    /// The command's commit failed, so whether it committed is unknown.
     pub(super) outcome_unknown: bool,
 }
 
-/// Sends a command's result. It receives the error of the group's durable
-/// commit when that failed, and `None` otherwise.
 pub(super) type Answer = Box<dyn FnOnce(Option<&StorageError>) + Send>;
 
-/// Sends a control reply when the caller is still waiting; a dropped receiver
-/// means the caller cancelled or timed out, which needs no action from the worker.
 fn send_reply<T>(reply: &flume::Sender<T>, value: T) {
     let _ = reply.send(value);
 }
 
-/// A command that ran and has not been answered.
 pub(super) struct Executed {
     operation: OperationId,
-    /// Its changes are in a staged commit that is not durable yet.
     staged: bool,
     durable_commit_us: Option<u64>,
     scheduling_dirty: bool,
@@ -29,11 +21,8 @@ pub(super) struct Executed {
     pub(super) observations: Vec<ObservationChange>,
     pub(super) committed: bool,
     capacity_released: bool,
-    /// The natural key that says whether the command committed, should its
-    /// commit turn out uncertain.
     probe: Option<Probe>,
     answer: Answer,
-    /// The storage failure that must release this opening of the database.
     failure: Option<StorageFailure>,
 }
 
@@ -49,12 +38,6 @@ pub(super) fn run<T: Send + 'static>(
     settle(operation, commit, kind, reply, outcome, false)
 }
 
-/// Answers a command from its batch outcome and says how it must be waited on.
-/// `declined` is set only by a command that deliberately ended without
-/// committing and replied `Ok`. It leaves nothing staged for the group's
-/// durable commit to cover, so a lost group commit did not lose it: its answer
-/// then reports that nothing of it was committed, like a refusal, because the
-/// decline may rest on state that the lost commit had written.
 pub(super) fn settle<T: Send + 'static>(
     operation: OperationId,
     commit: Commit,
@@ -88,8 +71,6 @@ pub(super) fn settle<T: Send + 'static>(
                 operation,
                 cause: UnknownCause::Commit(error.clone()),
             }),
-            // The refusal may rest on state that a lost commit of the same
-            // group had written. Nothing of this command was committed.
             (Err(DatabaseError::Rejected(_)), Some(error)) => {
                 Err(DatabaseError::RolledBack(error.clone()))
             }
@@ -116,23 +97,12 @@ pub(super) fn settle<T: Send + 'static>(
     }
 }
 
-/// Owns the process's single embedded database. Commands are executed one at
-/// a time on a dedicated write thread, in admission order, each in its own
-/// write transaction. Reads run on [`READ_WORKERS`] dedicated read threads.
 pub struct DatabaseWorker {
     pub(super) handle: DatabaseHandle,
     pub(super) thread: JoinHandle<Result<(), DatabaseError>>,
     pub(super) readers: Vec<JoinHandle<()>>,
 }
 
-/// A cloneable endpoint for the database worker.
-///
-/// Submissions never wait for queue space: when [`COMMAND_QUEUE_CAPACITY`]
-/// commands are already pending, they fail with [`DatabaseError::QueueFull`].
-/// Reads wait asynchronously for space in the bounded read queue. Waiting for
-/// space or a result never blocks the caller's thread and needs no
-/// particular async runtime: every redb access and decode happens on a
-/// database thread.
 #[derive(Clone)]
 pub struct DatabaseHandle {
     pub(super) sender: flume::Sender<Message>,
@@ -142,15 +112,10 @@ pub struct DatabaseHandle {
 }
 
 impl DatabaseWorker {
-    /// Starts with the default [`FilesystemConfig`].
     pub fn start(data_directory: &DataDirectory) -> Result<Self, DatabaseError> {
         Self::start_with_config(data_directory, FilesystemConfig::default())
     }
 
-    /// Opens the database, allocates this
-    /// opening's operation epoch and checks every protected filesystem
-    /// before returning, so a returned worker is ready to accept commands and
-    /// reads, or already refuses commands under disk protection.
     pub fn start_with_config(
         data_directory: &DataDirectory,
         config: FilesystemConfig,
@@ -185,9 +150,6 @@ impl DatabaseWorker {
         let thread = std::thread::Builder::new()
             .name("ocg-database".to_string())
             .spawn(move || {
-                // Every protected filesystem must meet the configured lock
-                // threshold before the database file is opened or its epoch
-                // is written.
                 let shortfalls = space_shortfalls(&paths, config.disk_lock_threshold_bytes);
                 if !shortfalls.is_empty() {
                     ready_sender
@@ -217,9 +179,6 @@ impl DatabaseWorker {
                 };
                 let abandoned_at_open = abandoned;
                 let next_operation = 1;
-                // Opened only once the database file is locked by this process,
-                // so no other OCG process
-                // publishes into the directory while it is cleaned up.
                 let attachments = match AttachmentStore::open(&attachment_directory)
                     .and_then(|store| store.remove_staging_files().map(|_| store))
                 {
@@ -231,10 +190,6 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                // Finishes reclamations that an earlier opening's cleanups
-                // committed and did not complete, before anything can be
-                // published. A file that cannot be reclaimed is reported,
-                // and does not keep the database from starting.
                 let reclamation = match redb::reclaim_pending(&database, &attachments) {
                     Ok(report) => report,
                     Err(error) => {
@@ -389,21 +344,6 @@ impl DatabaseWorker {
         self.handle.take_scheduler_wake()
     }
 
-    /// Closes admission, lets the worker finish every command accepted before
-    /// that point, releases the database once executing reads have returned,
-    /// answers every queued read, and waits for all database threads to exit.
-    /// When this returns, the database file is closed and may be reopened
-    /// immediately.
-    ///
-    /// Commands refused by disk protection meanwhile stay refused, and a
-    /// pending space check or recovery is answered as shutting down.
-    ///
-    /// Returns [`DatabaseError::StorageUnavailable`] when storage had failed
-    /// and was not recovered, or [`DatabaseError::WorkerPanicked`] when the
-    /// worker panicked; resources are released all the same.
-    ///
-    /// Blocks the calling thread; call it from the process's lifecycle code,
-    /// not from inside an async task.
     pub fn shutdown(self) -> Result<(), DatabaseError> {
         {
             let mut admission = self
@@ -416,12 +356,8 @@ impl DatabaseWorker {
                 *admission = Admission::ShuttingDown;
             }
         }
-        // The marker queues behind every accepted command, waiting for space
-        // if needed. If the worker is already gone, joining reports why.
         self.handle.sender.send(Message::Shutdown).ok();
         let written = join(self.thread);
-        // The database is released by now, so reads still queued ahead of the
-        // stop markers are answered with the refusal.
         for _ in &self.readers {
             self.handle.read_sender.send(ReadMessage::Stop).ok();
         }
@@ -482,8 +418,6 @@ impl DatabaseHandle {
     }
 }
 
-/// Every protected filesystem that is below `threshold_bytes` or cannot be
-/// measured.
 pub(super) fn space_shortfalls(
     paths: &[(ProtectedArea, PathBuf)],
     threshold_bytes: u64,
@@ -494,27 +428,16 @@ pub(super) fn space_shortfalls(
         .collect()
 }
 
-/// The write thread. It alone executes commands, measures space, changes
-/// the protection lock, and releases or reopens the database, so every
-/// protection transition happens between commands, never inside one.
 pub(super) struct WriteWorker {
     pub(super) shared: Arc<Shared>,
     pub(super) receiver: flume::Receiver<Message>,
     pub(super) control: flume::Receiver<Control>,
-    /// The database directory, which is also the path checked before each
-    /// command.
     pub(super) directory: PathBuf,
     pub(super) paths: [(ProtectedArea, PathBuf); 3],
     pub(super) config: FilesystemConfig,
-    /// `None` when the interval does not fit in an `Instant`.
     pub(super) next_check: Option<Instant>,
-    /// Operations whose commit failed with an unknown outcome; the next
-    /// successful recovery reconciles them.
     pub(super) uncertain: Vec<(OperationId, Option<Probe>)>,
-    /// Set from a storage failure until a reopen replaces the failed handle.
     pub(super) storage_failure: Option<StorageError>,
-    /// When the last successful compaction started, including one that moved
-    /// no pages. Failed attempts leave it unchanged.
     pub(super) last_compaction: Option<Instant>,
     pub(super) shutdown_requested: bool,
 }
@@ -531,9 +454,6 @@ pub(super) enum Event {
 }
 
 impl WriteWorker {
-    /// Runs control requests, due checks and commands until shutdown. A due
-    /// check runs before the next command, so steady traffic cannot
-    /// postpone it by more than one command.
     pub(super) fn serve(&mut self) {
         while !self.shutdown_requested {
             if self.next_check.is_some_and(|due| Instant::now() >= due) {
@@ -555,7 +475,6 @@ impl WriteWorker {
                 Event::Control(Ok(control)) => self.handle(control),
                 Event::Message(Ok(Message::Run(envelope))) => self.execute_group(*envelope),
                 Event::CheckDue => {}
-                // Without senders, no handle and therefore no caller remains.
                 Event::Message(Ok(Message::Shutdown))
                 | Event::Message(Err(_))
                 | Event::Control(Err(_)) => return,
@@ -586,9 +505,6 @@ impl WriteWorker {
         }
     }
 
-    /// Refuses a command whose allowance the database filesystem cannot
-    /// give, or any command while protection is locked. A refused command is
-    /// answered here, before it starts, and `None` is returned.
     pub(super) fn admit(&mut self, envelope: Envelope) -> Option<Envelope> {
         let operation = envelope.operation;
         if self.shared.update_paused.load(Ordering::SeqCst) {
@@ -599,8 +515,6 @@ impl WriteWorker {
             command.refuse(|| DatabaseError::NeverExecuted { operation });
             return None;
         }
-        // Activation drains the queue, so no command should arrive while
-        // locked; refusing here keeps that true even if one did.
         if let Some(lock) = self.shared.protection.status().lock {
             let Envelope {
                 command, in_flight, ..
@@ -639,9 +553,6 @@ impl WriteWorker {
         }
     }
 
-    /// Checks the database filesystem for `expected_write_bytes`. Space
-    /// already below the lock threshold, or a failed measurement, locks; an
-    /// allowance that alone would cross the threshold refuses only this write.
     pub(super) fn check_database_space(
         &mut self,
         expected_write_bytes: u64,
@@ -662,23 +573,6 @@ impl WriteWorker {
         }
     }
 
-    /// Runs `first` and the commands queued behind it, up to [`GROUP_LIMIT`],
-    /// in queue order, and answers each of them.
-    ///
-    /// A lone command commits durably, as it always did. A group runs each
-    /// command in its own write transaction with staged durability, so a
-    /// refused or failed command rolls back only itself, then makes all of
-    /// them durable with one empty durable transaction. The separate
-    /// transactions are not one atomic batch: a failure of the durable commit
-    /// leaves every staged command's outcome unknown. A command that declined
-    /// to commit staged nothing, so it neither needs that durable commit nor
-    /// stays unknown when it fails.
-    ///
-    /// No command is answered before that durable commit, so no caller acts
-    /// on a change that can still be lost, and readers are held back by
-    /// [`Shared::staging`] meanwhile. A storage failure stops the group; the
-    /// commands not yet run are refused like queued ones, and the staged
-    /// commands are still made durable if the database allows it.
     pub(super) fn execute_group(&mut self, first: Envelope) {
         let mut group = vec![first];
         while group.len() < GROUP_LIMIT {
@@ -766,9 +660,6 @@ impl WriteWorker {
                 self.note_uncertain(ran.operation, ran.probe);
             }
         }
-        // The database guard is gone and the staging barrier still held, so
-        // releasing the database waits for no reader and no reader can see a
-        // lost change before it is released.
         let scheduling_dirty = failure.is_none()
             && lost.is_none()
             && executed.iter().any(|(ran, _)| ran.scheduling_dirty);
@@ -824,9 +715,6 @@ impl WriteWorker {
     }
 
     fn publish_scheduling_change(&self, dirty: bool, capacity: bool) {
-        // Shutdown drains accepted writes too. A known durable commit may
-        // still dirty the generation then, but protected storage must recover
-        // before a notification can advertise its state as readable again.
         if self.storage_failure.is_none()
             && !self.shared.released.load(Ordering::SeqCst)
             && self.shared.protection.status().lock.is_none()
@@ -835,16 +723,6 @@ impl WriteWorker {
         }
     }
 
-    /// Compacts the file if the policy allows, between command groups, so
-    /// nothing is staged and every earlier commit is already durable.
-    ///
-    /// Taking the database lock for writing waits for every executing read
-    /// and holds off new ones, so redb sees no read transaction on the handle
-    /// and `compact` gets its exclusive `&mut Database` without any unsafe
-    /// code. The worker is the only writer, so no write transaction exists
-    /// either. Reads and commands wait, up to their queue limits, for as long
-    /// as `compact` runs, which grows with the file; it cannot be interrupted,
-    /// and shutdown waits for it. Hence the policy and the cooldown.
     pub(super) fn compact_storage(&mut self) -> Result<CompactionOutcome, MaintenanceError> {
         self.shared.admission().check_maintenance()?;
         if let Some(remaining) = self
@@ -894,8 +772,6 @@ impl WriteWorker {
         }
 
         let began = Instant::now();
-        // The guard ends before any failure is handled, which takes the same
-        // lock to release the database.
         let compacted = {
             let mut guard = shared
                 .database
@@ -909,8 +785,6 @@ impl WriteWorker {
         let duration = began.elapsed();
         match compacted {
             Ok(moved) => {
-                // Only a completed attempt starts the cooldown. A refused or
-                // failed one leaves it unset.
                 self.last_compaction = Some(began);
                 let report = CompactionReport {
                     file_bytes_before: file_bytes,
@@ -931,17 +805,12 @@ impl WriteWorker {
         }
     }
 
-    /// Ends this opening of the database for a storage failure that no
-    /// command observed, so it is released and awaits recovery like any other.
     pub(super) fn fail_storage(&mut self, error: StorageError) -> MaintenanceError {
         self.storage_failure = Some(error.clone());
         self.activate(vec![ProtectionReason::StorageUnavailable(error.clone())]);
         MaintenanceError::Storage(error)
     }
 
-    /// Closes command admission, refuses every queued command, and releases
-    /// the database when storage failed. Runs between commands, so the one
-    /// that was executing has already answered with its own result.
     pub(super) fn activate(&mut self, reasons: Vec<ProtectionReason>) -> ProtectionLock {
         let storage_failed = reasons
             .iter()
@@ -976,7 +845,6 @@ impl WriteWorker {
         if storage_failed {
             self.shared.release_database();
         }
-        // A locked database is checked again soon, whatever the interval.
         let soon = Instant::now().checked_add(self.check_interval());
         self.next_check = match (self.next_check, soon) {
             (Some(due), Some(soon)) => Some(due.min(soon)),
@@ -992,17 +860,11 @@ impl WriteWorker {
         )
     }
 
-    /// Checks every protected filesystem against the lock threshold and
-    /// locks when any is short or cannot be measured. When every one meets
-    /// it and the lock only ever lacked space, it attempts the recovery a
-    /// caller could request, which lifts the lock only once every
-    /// filesystem has the resume threshold available.
     pub(super) fn check_all_paths(&mut self) {
         let reasons = space_shortfalls(&self.paths, self.config.disk_lock_threshold_bytes);
         if !reasons.is_empty() {
             self.activate(reasons);
         } else if self.only_lacks_space() {
-            // A failed attempt keeps the lock; the next check tries again.
             let _ = self.recover();
         }
         self.shared.protection.update(|status| {
@@ -1012,10 +874,6 @@ impl WriteWorker {
         self.next_check = Instant::now().checked_add(self.check_interval());
     }
 
-    /// Whether admission is locked for no reason but measured shortages of
-    /// space, so lifting it needs nothing but space. A failed measurement, a
-    /// failed write, a failed commit or flush, and any operation whose
-    /// outcome is unknown all leave the lock to an explicit recovery.
     pub(super) fn only_lacks_space(&self) -> bool {
         matches!(self.shared.admission(), Admission::Protected(_))
             && self.storage_failure.is_none()
@@ -1030,8 +888,6 @@ impl WriteWorker {
             })
     }
 
-    /// Runs one recovery attempt for every caller that joined it. The lock
-    /// stays unless every step succeeds.
     pub(super) fn recover(&mut self) -> Result<RecoveryReport, RecoveryError> {
         match self.shared.admission() {
             Admission::Open => {
@@ -1053,7 +909,6 @@ impl WriteWorker {
                 .admission
                 .write()
                 .unwrap_or_else(PoisonError::into_inner);
-            // Shutdown began during the attempt; it keeps the lock.
             if !matches!(*admission, Admission::Protected(_)) {
                 return Err(RecoveryError::ShuttingDown);
             }
@@ -1112,9 +967,6 @@ impl WriteWorker {
         })
     }
 
-    /// Releases the failed handle completely, waiting for executing reads,
-    /// then opens the database again under a new epoch. Admission is closed,
-    /// so no identifier is allocated while the epoch changes.
     pub(super) fn reopen(&mut self) -> Result<u64, RecoveryError> {
         self.shared.release_database();
         let OpenedFile {
@@ -1144,8 +996,6 @@ impl WriteWorker {
         Ok(epoch)
     }
 
-    /// Remembers an operation whose commit has an unknown outcome, with the
-    /// natural key that will say whether it committed.
     pub(super) fn note_uncertain(&mut self, operation: OperationId, probe: Option<Probe>) {
         self.uncertain.push((operation, probe));
         self.shared
@@ -1155,8 +1005,6 @@ impl WriteWorker {
             .insert(operation, probe);
     }
 
-    /// Probes the natural key of every operation whose outcome was unknown.
-    /// A failed read is a storage failure, so the handle is released again.
     pub(super) fn reconcile_uncertain(
         &mut self,
     ) -> Result<Vec<(OperationId, OperationStatus)>, RecoveryError> {
@@ -1191,8 +1039,6 @@ impl WriteWorker {
         })
     }
 
-    /// Closes admission for good, releases the database, and answers every
-    /// queued command and pending request, so no caller is left waiting.
     pub(super) fn exit(self) -> Result<(), DatabaseError> {
         if self.storage_failure.is_none()
             && let Some(opened) = self
@@ -1213,8 +1059,6 @@ impl WriteWorker {
             *admission = Admission::ShuttingDown;
         }
         self.shared.release_database();
-        // Admission closed before the shutdown marker was queued, so this
-        // finds nothing unless every handle was dropped without a shutdown.
         for message in self.receiver.drain() {
             if let Message::Run(envelope) = message {
                 let Envelope {

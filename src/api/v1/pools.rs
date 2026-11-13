@@ -1,16 +1,3 @@
-//! Pool routes:
-//! - `GET /api/v2/pools` (cursor-paged; `GET /api/v1/pools` is retired, 410)
-//! - `POST /api/v1/pools/{execution_pool}`
-//! - `POST /api/v1/executors/{executor}` (one change, from `expected_revision`)
-//! - `POST /api/v1/executors/{executor}/archive` (retire an idle Executor)
-//! - `POST /api/v1/pools/{execution_pool}/archive` (retire a Pool with no
-//!   Allocation and no unarchived Executor)
-//!
-//! A Pool is a config whose Executors share its identity. The list answers
-//! every Pool at once. An update either sets the concurrency limit or
-//! enables or disables the Pool. Lowering the limit below the number of
-//! Jobs running stops new claims; the Jobs running continue.
-
 use std::num::NonZeroU32;
 
 use super::contracts::*;
@@ -23,11 +10,8 @@ use crate::db::{DatabaseError, DatabaseHandle};
 
 const POOL_NOT_FOUND: Refusal =
     Refusal::new(StatusCode::NOT_FOUND, "pool_not_found", "no such Pool");
-/// The Pool list's version: `GET /api/v2/pools` pages with a cursor. The
-/// unpaged `GET /api/v1/pools` is retired and answers 410.
 pub(super) const POOL_API_VERSION: u32 = 2;
 
-/// Exactly one of the two fields.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolUpdateInput {
@@ -36,8 +20,6 @@ struct PoolUpdateInput {
     concurrency_limit: Option<Option<NonZeroU32>>,
     #[serde(default, deserialize_with = "profiles::optional_value")]
     enabled: Option<Option<bool>>,
-    /// Whether this Pool also offers typed decision work. Absent leaves the
-    /// capability as it is.
     #[serde(default, deserialize_with = "profiles::optional_value")]
     decision: Option<Option<bool>>,
 }
@@ -48,7 +30,6 @@ pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
         .ok_or(INVALID_REQUEST)
 }
 
-/// The operations a Pool offers, as the API names them.
 fn operation_str(operation: ExecutionOperation) -> &'static str {
     match operation {
         ExecutionOperation::LlmRequest => "llm_request",
@@ -192,7 +173,6 @@ struct NativeCapabilityInput {
     protocol: Option<String>,
 }
 
-/// The capability set a request names: each pair valid, none repeated.
 fn capability_set(
     capabilities: Vec<NativeCapabilityInput>,
 ) -> Result<
@@ -252,8 +232,6 @@ pub(super) async fn create_executor(
     )))
 }
 
-/// Exactly one of `enabled`, `name` and `capabilities`, made from
-/// `expected_revision`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeExecutorUpdateInput {
@@ -297,15 +275,12 @@ pub(super) async fn update_executor(
     )))
 }
 
-/// Exactly `expected_revision`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeExecutorArchiveInput {
     expected_revision: u32,
 }
 
-/// Retires one idle Executor for good. The Executor is archived only when it
-/// holds no Allocation; nothing is released, stopped or resolved.
 pub(super) async fn archive_executor(
     database: &DatabaseHandle,
     id: crate::db::entities::ExecutorId,
@@ -322,16 +297,12 @@ pub(super) async fn archive_executor(
     )))
 }
 
-/// Exactly `expected_revision`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativePoolArchiveInput {
     expected_revision: u32,
 }
 
-/// Retires one Pool for good. The Pool is archived only when it holds no
-/// Allocation and every Executor naming it is already archived; nothing is
-/// released, stopped, resolved or cascaded.
 pub(super) async fn archive_pool(
     database: &DatabaseHandle,
     id: ExecutionPoolId,
@@ -359,8 +330,6 @@ const ALLOCATION_INDEX_INCONSISTENT: Refusal = Refusal::new(
     "the Pool's active Allocation index disagrees with its stored Allocations",
 );
 
-/// `after` and `limit`, each at most once. `after` is `{executor}.{job}`, the
-/// last entry of the previous page.
 pub(super) fn allocations_query(query: &str) -> Result<(Option<(u128, u128)>, usize), Refusal> {
     let (mut after, mut limit) = (None, None);
     if !query.is_empty() {
@@ -395,9 +364,6 @@ pub(super) fn allocations_query(query: &str) -> Result<(Option<(u128, u128)>, us
 
 const ALLOCATIONS_DEFAULT_PAGE: usize = 20;
 
-/// `GET /api/v1/pools/{pool}/allocations`: the Allocations that hold capacity
-/// in one Pool, and the Pool's occupancy, read-only. Held may exceed the
-/// Pool's capacity after the capacity was lowered; nothing is clamped.
 pub(super) async fn list_allocations(
     database: &DatabaseHandle,
     pool: ExecutionPoolId,

@@ -7,13 +7,9 @@ type UsageObservation = Api.Usage["observations"][number];
 export type ReliabilityBucket = {
   bucketUs: number;
   requests: number;
-  /** Requests with a recorded HTTP error status (400 through 599). */
   errors: number;
-  /** Turn retries attributed to this bucket. */
   retries: number;
-  /** Tokens served from cache. */
   cacheReads: number;
-  /** Tokens written to cache. */
   cacheWrites: number;
   ttfbCount: number;
   ttfbAvgMs: number | null;
@@ -38,12 +34,6 @@ function average(sum: number, count: number): number | null {
   return count > 0 ? sum / count : null;
 }
 
-/**
- * Zero-fills one bucket per `widthUs` over `[fromUs, untilUs)`, then folds
- * recorded HTTP errors, turn retries, cache reads and writes, and
- * usage-observation latencies (average time to first byte and total
- * duration) into each bucket.
- */
 export function summarizeReliability(
   bucketRows: readonly BucketRow[],
   retryRows: readonly RetryRow[],

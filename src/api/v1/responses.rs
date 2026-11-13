@@ -22,7 +22,6 @@ pub(crate) struct ProviderResponsesView {
     has_more: bool,
 }
 
-/// Pages received assistant text, splitting large replies only at UTF-8 boundaries.
 pub(super) async fn provider_responses(
     shared: &Shared,
     job: JobId,

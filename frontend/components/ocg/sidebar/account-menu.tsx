@@ -1,24 +1,5 @@
 "use client";
 
-/**
- * The one account menu, shared by the expanded sidebar footer and the collapsed
- * rail so both offer the same actions in the same order:
- *
- * 1. Log out, where signing out is a real operation (remote sessions only).
- * 2. Open settings, where Settings is offered.
- *
- * The expanded trigger names who is signed in — the signed Access email, or the
- * local-operator label where there is no signed identity — and the popup omits
- * a duplicate disabled identity row.
- *
- * Signing out precedes Settings because it ends the session this menu names,
- * while Settings stays a workspace destination.
- *
- * The rail form anchors the menu to the viewport: the 64px rail clips its own
- * overflow, so a menu placed inside it would be cut off. The expanded form
- * stays anchored to the footer it belongs to.
- */
-
 import { ChevronsUpDown, LogOut, SlidersHorizontal, User } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
@@ -31,15 +12,10 @@ import {
 import { useI18n } from "../i18n";
 
 export type AccountMenuProps = {
-  /** The signed Access email; null/undefined where no signed identity exists. */
   email?: string | null;
-  /** Logging out. Omitted where the installation has no logout to run. */
   onLogout?: () => void;
-  /** Opens Settings. Omitted where Settings is not offered. */
   onSettingsClick?: () => void;
-  /** `expanded` anchors to the sidebar footer; `rail` to the collapsed rail. */
   variant?: "expanded" | "rail";
-  /** Controlled open state, mirroring the menu primitive. */
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
 };

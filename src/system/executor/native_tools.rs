@@ -1,13 +1,3 @@
-//! The Workspace tools of a native Generative execution: which tools a
-//! Job's Agent grant offers, built for the Project of the Job's conversation.
-//!
-//! The checked handoff resolves the Job's frozen configuration and Project
-//! and asks [`NativeTooling`] for the offer, so the tools, the request that
-//! names them and the start transaction that revalidates the snapshot all
-//! describe the same Project. A Workspace that no longer authorizes, or a
-//! root that is no longer the directory the Project was created with, refuses
-//! the start before anything is sent.
-
 use std::cell::RefCell;
 
 use super::tool_loop::{
@@ -19,28 +9,19 @@ use crate::db::entities::{FrozenExecutionConfig, ModelCapability, ProjectRecord,
 use crate::db::{DevelopmentToolContext, DevelopmentToolOffer, DevelopmentTooling};
 use crate::system::execution_controls::ExecutionControl;
 
-/// What an offer states about the grant of an Agent that codes: it reads,
-/// edits and runs commands, while Workspace mutation is enabled; otherwise it
-/// only reads.
 fn offered_grant(mutation: bool) -> &'static str {
     if mutation { "code" } else { "read" }
 }
 
-/// The most of a Workspace's own `AGENTS.md` that is sent.
 const MAX_AGENTS_MD_BYTES: usize = 32 * 1024;
 
-/// Builds the offer of one execution and keeps the tools it built, for the
-/// loop that runs after the start.
 pub(crate) struct NativeTooling<'a> {
     data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
-    /// Where an execution a job tool stops is reached.
     stops: crate::system::native_scheduler::NativeStops,
     built: RefCell<Option<ToolExecution>>,
 }
 
 impl<'a> NativeTooling<'a> {
-    /// A path that has a data directory to keep Workspaces apart from; one
-    /// that has none offers no tool and refuses an Agent that needs them.
     pub(crate) fn new(
         data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
         stops: crate::system::native_scheduler::NativeStops,
@@ -52,7 +33,6 @@ impl<'a> NativeTooling<'a> {
         }
     }
 
-    /// The tools built for the offer, once.
     pub(crate) fn into_execution(self) -> Option<ToolExecution> {
         self.built.into_inner()
     }
@@ -72,9 +52,6 @@ impl DevelopmentTooling for NativeTooling<'_> {
             .config
             .declared_capabilities
             .contains(&ModelCapability::Tools);
-        // An Agent that manages Jobs is offered the job tools through a model
-        // that can call tools; an Agent with a Workspace grant is offered its
-        // Workspace tools or none at all.
         let jobs = agent.is_some_and(|agent| agent.manages_jobs())
             && tools
             && ExecutionControl::ToolsAndChildJobs.is_enabled();
@@ -92,8 +69,6 @@ impl DevelopmentTooling for NativeTooling<'_> {
         } else {
             None
         };
-        // The user can be asked only by a worker of a nested conversation,
-        // through a model that can call tools.
         let ask = context.decider && context.nested && tools;
         let wiring = Wiring {
             ask,
@@ -109,8 +84,6 @@ impl DevelopmentTooling for NativeTooling<'_> {
     }
 }
 
-/// A tool whose call is decided by the user, never run by a handler: the
-/// loop records it as waiting for the user's answer or approval.
 struct AwaitsUser(&'static str);
 
 impl ToolHandler for AwaitsUser {
@@ -149,9 +122,6 @@ fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
     registry.authorize(ASK_USER_TOOL_NAME)
 }
 
-/// The tools of one execution and the offer that states them: the Workspace
-/// tools of `project` when the Agent has a Workspace grant, and the job tools
-/// when it manages Jobs.
 #[cfg(unix)]
 async fn build(
     data_directory: Option<&crate::system::data_directory::DataDirectory>,
@@ -214,26 +184,15 @@ async fn build(
     Err("workspace_unsupported")
 }
 
-/// What of the tools an execution is wired with.
 #[derive(Clone, Copy)]
 struct Wiring {
-    /// The user can be asked a question.
     ask: bool,
-    /// A user decides for this execution, so a command may be requested.
     decider: bool,
-    /// Files may be written and commands run.
     mutation: bool,
-    /// The Agent manages Jobs.
     jobs: bool,
-    /// The Agent may submit a plan here: it is not itself a step of one.
     plan: bool,
 }
 
-/// The tools of an execution: with a Workspace, file reads, directory listing
-/// and search, full-text search, the public web through OCG's proxy and, where
-/// the platform has it, code navigation; with Workspace mutation enabled also
-/// file writes and the Project's commands, and a way to request one more; and,
-/// for an Agent that manages Jobs, the job tools.
 #[cfg(unix)]
 fn tools_of(
     workspace: Option<(Workspace, &[crate::db::entities::ProjectCommand])>,
@@ -263,9 +222,6 @@ fn tools_of(
         ]);
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         names.push(crate::service::lsp::TOOL_NAME);
-        // The web tools reach the public internet through OCG's configured
-        // proxy. They come with the Workspace grant, and no Workspace path
-        // applies to what they reach.
         super::network::register(&registry)?;
         names.extend(super::network::NAMES);
         if wiring.mutation {
@@ -308,9 +264,6 @@ fn tools_of(
     })
 }
 
-/// The Workspace's `AGENTS.md`, when it has one that is readable text within
-/// bounds. Anything else is skipped, not an error: the file is context, not
-/// a requirement.
 #[cfg(unix)]
 async fn read_agents_md(workspace: &Workspace) -> Option<String> {
     use super::blocking::{self, Kind};

@@ -1,49 +1,3 @@
-//! The approval of one manually invoked external exchange: one explicitly
-//! named, bounded, tool-free Job sent to one operator-approved HTTPS endpoint
-//! with one operator-approved credential reference.
-//!
-//! Two authorities use it, each with its own control and its own entry point:
-//! the external trial ([`crate::system::external_trial`], under
-//! [`ExecutionControl::ManualExternalTrial`]) and ordinary manual external
-//! execution ([`crate::system::manual_external`], under
-//! [`ExecutionControl::ManualExternalExecution`]). An approval names the
-//! authority that formed it; the authority's control is asked again by the
-//! shared runner below, by the endpoint policy of the exchange and by the
-//! Provider client itself, so neither control can carry the other's approval
-//! to the network. Neither is manual loopback execution, whose endpoint guard
-//! this leaves untouched, and neither is general external transport,
-//! discovery, autonomous scheduling or recovery, which stay disabled.
-//!
-//! An approval names, for this one invocation: the endpoint, the credential
-//! reference, optionally (the trial) or necessarily (ordinary execution) the
-//! Model, the route and the limits. They are assertions against the Job's
-//! frozen configuration, never overrides: the Job must already name exactly
-//! the approved endpoint, credential and Model, carry no secret header, and
-//! bound its own output, or the exchange is refused before anything is
-//! reserved.
-//!
-//! Every deterministic refusal happens before the reservation. The exact
-//! request is built without an Allocation (a read-only preview), the route is
-//! checked, and the request is measured against the approved limits, so a
-//! limit that is too small, a destination or proxy that is not usable, or a
-//! request the approval does not cover leaves the submitted Job untouched. The
-//! same facts are checked again on the exact prepared request inside the
-//! start, against the real reservation, so a Job, credential or configuration
-//! that changed in between still fails closed.
-//!
-//! The connection is direct (trial only) or through one named trusted
-//! loopback HTTP proxy. Either way the ambient proxy (environment or system)
-//! is never consulted. Direct: OCG resolves the name, checks every address,
-//! and connects to exactly those. Through the named proxy: OCG does not look
-//! the name up at all; the proxy resolves it and chooses the route, which OCG
-//! cannot validate, and there is no fallback to a direct connection.
-//!
-//! There is one dispatch attempt. The single-use handoff is consumed by one
-//! exchange; there is no retry, and an exchange that may have reached the
-//! Provider is never settled as unsent. Stopping the local transport proves
-//! nothing about the Provider: such an exchange leaves the Allocation held as
-//! Uncertain.
-
 use std::time::Duration;
 
 use crate::db::entities::{FrozenExecutionConfig, LlmTransport, MutableFrozenConfiguration};
@@ -58,15 +12,11 @@ use crate::system::manual_execution::{
     require_free_executor, reserve_named_job, within_deadline,
 };
 
-/// Hard ceilings, whatever the operator asks for.
 pub(crate) const MAX_REQUEST_BYTES_CEILING: usize = 1 << 20;
 pub(crate) const MAX_OUTPUT_TOKENS_CEILING: u32 = 4096;
 pub(crate) const MAX_TIMEOUT_CEILING: Duration = Duration::from_secs(600);
-/// The response bytes an exchange reads before it gives up.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
-/// Why an approval cannot be formed or an exchange was refused. `code` is
-/// stable.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {detail}")]
 pub(crate) struct ApprovalRefusal {
@@ -90,12 +40,8 @@ impl From<ApprovalRefusal> for Stop {
     }
 }
 
-/// An HTTPS endpoint that may be approved: a public DNS name or public
-/// address literal, an explicit or default port, no credentials, query or
-/// fragment, and a plain path. Two spellings of the same endpoint are equal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ApprovedEndpoint {
-    /// Lower-case host without brackets.
     host: String,
     port: u16,
     request_url: String,
@@ -142,10 +88,6 @@ impl ApprovedEndpoint {
         }
         let path = uri.path().trim_end_matches('/');
         let path = path.strip_suffix("/chat/completions").unwrap_or(path);
-        // The request URL is assembled from the frozen endpoint by
-        // `providers::endpoint`, which strips exactly one of these resource
-        // names. A path that still ends in another would be rewritten there,
-        // so the URL sent would not be the URL approved.
         if [
             "/responses",
             "/messages",
@@ -171,7 +113,6 @@ impl ApprovedEndpoint {
             return Err(invalid("the endpoint path must be plain and normalized"));
         }
         let host = crate::system::http::bare_host(host);
-        // An IPv6 literal is bracketed in a URL.
         let host_text = if host.contains(':') {
             format!("[{host}]")
         } else {
@@ -193,7 +134,6 @@ impl ApprovedEndpoint {
         &self.host
     }
 
-    /// The one canonical request URL this endpoint names.
     pub(crate) fn request_url(&self) -> &str {
         &self.request_url
     }
@@ -202,14 +142,11 @@ impl ApprovedEndpoint {
         self.port
     }
 
-    /// Whether a frozen endpoint names exactly this one.
     pub(crate) fn permits(&self, frozen: &str) -> bool {
         Self::parse(frozen).is_ok_and(|frozen| frozen == *self)
     }
 }
 
-/// What one exchange may spend. Every field is required of the operator and
-/// capped by a ceiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ApprovalLimits {
     pub(crate) max_request_bytes: usize,
@@ -246,10 +183,6 @@ impl ApprovalLimits {
     }
 }
 
-/// Parses the loopback proxy an operator names: `http://127.0.0.1:<port>` or
-/// `http://[::1]:<port>`, nothing else. A name such as `localhost`, another
-/// scheme, a remote or non-loopback address, credentials, a query, a fragment,
-/// a path beyond `/` and a missing or zero port are all refused.
 pub(crate) fn parse_trusted_proxy(text: &str) -> Result<LoopbackProxy, ApprovalRefusal> {
     let invalid = |detail: &str| refuse("proxy_not_approvable", detail);
     if text.is_empty() || text.len() > 64 || !text.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
@@ -278,7 +211,6 @@ pub(crate) fn parse_trusted_proxy(text: &str) -> Result<LoopbackProxy, ApprovalR
     })
 }
 
-/// A Model id the operator may name: 1..=128 visible ASCII characters.
 fn valid_model_id(model: &str) -> Result<(), ApprovalRefusal> {
     if model.is_empty()
         || model.len() > 128
@@ -292,10 +224,6 @@ fn valid_model_id(model: &str) -> Result<(), ApprovalRefusal> {
     Ok(())
 }
 
-/// Thinking rules of the Kimi Code `k3.1-pro` family: thinking cannot be
-/// disabled, and the supported `reasoning_effort` values are low, high and
-/// max. The documented default is not stated consistently, so the effort must
-/// be named rather than left to the Provider. Other models carry no rule here.
 fn check_thinking(model: &str, effort: Option<&str>) -> Result<(), ApprovalRefusal> {
     if !model.starts_with("k3.1-pro") {
         return Ok(());
@@ -311,7 +239,6 @@ fn check_thinking(model: &str, effort: Option<&str>) -> Result<(), ApprovalRefus
     }
 }
 
-/// The operator's approval for one invocation, under one authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalApproval {
     authority: ExternalAuthority,
@@ -319,8 +246,6 @@ pub(crate) struct ExternalApproval {
     credential_ref: String,
     limits: ApprovalLimits,
     route: ApprovedRoute,
-    /// The one model id the Job may name. The trial may leave it open;
-    /// ordinary manual execution always names it.
     model: Option<String>,
 }
 
@@ -335,8 +260,6 @@ fn approved_credential_ref(credential_ref: &str) -> Result<String, ApprovalRefus
 }
 
 impl ExternalApproval {
-    /// An external-trial approval: direct unless
-    /// [`Self::with_trusted_proxy`], any Model unless [`Self::with_model`].
     pub(crate) fn trial(
         endpoint: &str,
         credential_ref: &str,
@@ -353,9 +276,6 @@ impl ExternalApproval {
         })
     }
 
-    /// An ordinary manual external-execution approval. Every identity is
-    /// named and the route is the named trusted proxy; there is no default
-    /// and no direct route.
     pub(crate) fn manual_execution(
         endpoint: &str,
         credential_ref: &str,
@@ -375,11 +295,6 @@ impl ExternalApproval {
         })
     }
 
-    /// The approval one durable scheduled external policy derives: every
-    /// identity is already canonical, the route is the named trusted proxy,
-    /// and the Model is exact. It is formed under
-    /// [`ExternalAuthority::ScheduledExternalTransport`], so neither manual
-    /// authority can stand in for it.
     pub(crate) fn scheduled_external(
         endpoint: &str,
         credential_ref: &str,
@@ -399,13 +314,11 @@ impl ExternalApproval {
         })
     }
 
-    /// Connects through the named loopback proxy instead of directly.
     pub(crate) fn with_trusted_proxy(mut self, proxy: LoopbackProxy) -> Self {
         self.route = ApprovedRoute::TrustedProxy(proxy);
         self
     }
 
-    /// Requires the Job's frozen model to be exactly `model`.
     pub(crate) fn with_model(mut self, model: &str) -> Result<Self, ApprovalRefusal> {
         valid_model_id(model)?;
         self.model = Some(model.to_owned());
@@ -420,7 +333,6 @@ impl ExternalApproval {
         &self.route
     }
 
-    /// The approved destination as `host:port`, for reports.
     pub(crate) fn destination_text(&self) -> String {
         if self.endpoint.host().contains(':') {
             format!("[{}]:{}", self.endpoint.host(), self.endpoint.port())
@@ -437,7 +349,6 @@ impl ExternalApproval {
         &self.credential_ref
     }
 
-    /// Whether this approval names exactly `model`.
     pub(crate) fn names_model(&self, model: &str) -> bool {
         self.model.as_deref() == Some(model)
     }
@@ -451,8 +362,6 @@ impl ExternalApproval {
         }
     }
 
-    /// Whether this approval may act at all: its authority's control is
-    /// enabled and the authority admits its route.
     fn authorized(&self) -> Result<(), ApprovalRefusal> {
         let control = self.authority.control();
         if !control.is_enabled() {
@@ -470,14 +379,10 @@ impl ExternalApproval {
         Ok(())
     }
 
-    /// Whether `endpoint`, as frozen into a Job, is the approved one, and the
-    /// approval's authority may act.
     pub(crate) fn permits_endpoint(&self, endpoint: &str) -> bool {
         self.authorized().is_ok() && self.endpoint.permits(endpoint)
     }
 
-    /// The provider configuration of the one exchange: the approved
-    /// destination only, the approved per-chunk timeout, a bounded response.
     pub(crate) fn provider_config(
         &self,
         cancellation: CancellationToken,
@@ -492,12 +397,6 @@ impl ExternalApproval {
         }
     }
 
-    /// Whether the approved route is usable from here, without sending
-    /// anything to the destination. Direct: the approved name resolves to
-    /// public addresses only (a lookup, not a connection; the connector
-    /// resolves and checks again and connects to exactly the addresses it
-    /// checked). Trusted proxy: something accepts connections at the proxy
-    /// address; the Provider name is not looked up and no CONNECT is sent.
     pub(crate) async fn check_destination(&self) -> Result<(), ApprovalRefusal> {
         use crate::system::http::{DestinationFault, check_direct_destination};
         match &self.route {
@@ -518,8 +417,6 @@ impl ExternalApproval {
         }
     }
 
-    /// What the Job's frozen configuration must be, checked before anything
-    /// is reserved.
     pub(crate) fn check_frozen(
         &self,
         frozen: &MutableFrozenConfiguration,
@@ -600,9 +497,6 @@ impl ExternalApproval {
         Ok(())
     }
 
-    /// The same facts on the exact prepared request, before the start is
-    /// submitted: the frozen configuration, the credentials the handoff holds
-    /// (only the approved one), the request's size and its own output bound.
     pub(crate) fn check_prepared(
         &self,
         prepared: &crate::db::PreparedDevelopmentHandoff,
@@ -667,13 +561,6 @@ impl ExternalApproval {
     }
 }
 
-/// Runs the one approved exchange of `target`. Everything before the
-/// reservation is a read; the reservation, the checked start and the exchange
-/// each happen at most once. `cancellation` is the operator's stop; the
-/// approved timeout cancels it too. Neither is a claim about the Provider.
-///
-/// Reached only through the entry point of the approval's authority, which
-/// has already asked its own control; the control is asked again here.
 pub(crate) async fn run_approved_external(
     database: &DatabaseHandle,
     target: Target,
@@ -685,16 +572,12 @@ pub(crate) async fn run_approved_external(
     };
     approval.authorized()?;
 
-    // 1. Reads only: the Job, its frozen configuration and its standing.
     let record = read_submitted_job(database, target.job).await?;
     if let Some(frozen) = record.job.frozen.as_ref() {
         approval.check_frozen(frozen)?;
     }
     require_free_executor(database, target.executor).await?;
 
-    // 1b. Everything else that is predictable, before anything is reserved:
-    // the route, and the exact request built without an Allocation. A
-    // refusal here changes nothing; the Job stays submitted.
     approval.check_destination().await?;
     let refusal = std::cell::RefCell::new(None);
     match database
@@ -727,10 +610,8 @@ pub(crate) async fn run_approved_external(
         }
     }
 
-    // 2. One reservation, of this Job only.
     let allocation = reserve_named_job(database, target).await?;
 
-    // 3. The checked start, then 4. the one exchange.
     let handoff = checked_start(database, allocation.token, |prepared| {
         approval
             .check_prepared(prepared)
@@ -751,12 +632,9 @@ pub(crate) async fn run_approved_external(
     )
     .await;
 
-    // 5. What the database now shows is the report.
     report(database, target.job, &exchange).await
 }
 
-/// A bare TCP connection to the loopback proxy, before anything is reserved.
-/// It sends no byte and names no destination.
 async fn probe_proxy(proxy: LoopbackProxy) -> Result<(), ApprovalRefusal> {
     let address = proxy.address();
     let reachable = ntex::rt::spawn_blocking(move || {
@@ -776,7 +654,6 @@ async fn probe_proxy(proxy: LoopbackProxy) -> Result<(), ApprovalRefusal> {
     }
 }
 
-/// The control a caller names must be the one its approval was formed under.
 pub(crate) fn require_authority(
     approval: &ExternalApproval,
     control: ExecutionControl,

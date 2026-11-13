@@ -18,10 +18,6 @@ use crate::service::ai::providers::ProviderExecutionError;
 
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
 
-/// Whether `endpoint` may receive a Provider request. Only a literal loopback
-/// endpoint is ever permitted: the external-transport control is disabled and
-/// no allow-listed external endpoint guard exists, so enabling the control
-/// would still refuse every endpoint rather than admit one unchecked.
 pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
     use crate::system::execution_controls::{ControlState, ExecutionControl};
     match ExecutionControl::ExternalProviderTransport.state() {
@@ -30,29 +26,14 @@ pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
     }
 }
 
-/// Why a frozen endpoint is, or is not, one [`direct_diagnostic_loopback`]
-/// admits. It explains the one policy; it never widens it: only
-/// [`Self::LiteralDirect`] is admitted, and the classification is derived
-/// from the endpoint text and the process's proxy configuration alone, never
-/// from a lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoopbackEndpointClass {
-    /// `http://127.0.0.1:<port>` that no configured proxy intercepts.
     LiteralDirect,
-    /// A literal `127.0.0.1` endpoint the configured proxy would intercept,
-    /// or whose proxy configuration cannot be read.
     LiteralProxied,
-    /// `http://127.0.0.1` without an explicit, non-zero port, or with a
-    /// scheme, credential or query the literal policy refuses.
     LiteralMalformed,
-    /// The host is the name `localhost`: admitted by configuration, resolved
-    /// by a lookup this policy never makes.
     LocalhostName,
-    /// The host is the IPv6 loopback address `::1`.
     Ipv6Loopback,
-    /// Any other destination.
     External,
-    /// Not a URI at all.
     Unparseable,
 }
 
@@ -70,9 +51,6 @@ impl LoopbackEndpointClass {
     }
 }
 
-/// Classifies `endpoint` against the literal loopback policy; see
-/// [`LoopbackEndpointClass`]. `LiteralDirect` if and only if
-/// [`literal_direct_loopback`] is true.
 pub(crate) fn classify_loopback_endpoint(endpoint: &str) -> LoopbackEndpointClass {
     let Ok(uri) = endpoint.parse::<Uri>() else {
         return LoopbackEndpointClass::Unparseable;
@@ -99,7 +77,6 @@ pub(crate) fn classify_loopback_endpoint(endpoint: &str) -> LoopbackEndpointClas
     }
 }
 
-/// Diagnostic execution must never tunnel a loopback request through a proxy.
 fn literal_direct_loopback(endpoint: &str) -> bool {
     let Ok(uri) = endpoint.parse::<Uri>() else {
         return false;
@@ -125,10 +102,6 @@ fn literal_direct_loopback(endpoint: &str) -> bool {
 
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The Authorization header of a request. It is marked sensitive, so no
-/// dump of the request's headers, such as the HTTP client's own request
-/// tracing, prints the credential. A credential that is no valid header
-/// value is refused without being named.
 pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExecutionError> {
     let mut value = HeaderValue::try_from(format!("Bearer {credential}")).map_err(|_| {
         ProviderExecutionError::Build {
@@ -139,12 +112,6 @@ pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExe
     Ok(value)
 }
 
-/// The custom request fields of one Provider request, resolved from a frozen
-/// set. It is the only place configured fields become request headers: it
-/// revalidates the set, resolves each secret from the credential store through
-/// the caller's resolver (failing closed when one is missing), and marks secret
-/// values sensitive. Secret values are wiped when it is dropped, as far as
-/// the allocator allows.
 #[derive(Default)]
 pub(crate) struct RequestHeaders {
     fields: Vec<(HeaderName, HeaderValue)>,
@@ -169,9 +136,6 @@ impl Drop for RequestHeaders {
 }
 
 impl RequestHeaders {
-    /// Sets each field on `request`, replacing a default of the same name,
-    /// such as OCG's `User-Agent`. OCG-managed fields are set after this, and
-    /// no configured field may name one.
     pub(crate) fn apply(&self, mut request: ClientRequest) -> ClientRequest {
         for (name, value) in &self.fields {
             request = request.set_header(name.clone(), value.clone());
@@ -179,13 +143,11 @@ impl RequestHeaders {
         request
     }
 
-    /// The resolved secret values, for redaction.
     pub(crate) fn secrets(&self) -> &[String] {
         &self.secrets
     }
 }
 
-/// Resolves a frozen set into request headers; see [`RequestHeaders`].
 pub(crate) async fn resolve_request_headers(
     frozen: &crate::db::entities::FrozenHeaders,
     resolver: &dyn crate::service::ai::providers::CredentialResolver,
@@ -222,10 +184,6 @@ pub(crate) async fn resolve_request_headers(
     Ok(resolved)
 }
 
-/// The ordinary Provider client: ambient proxy, if one is configured. It is
-/// private on purpose. Every Provider request is built through
-/// [`provider_client_for`] or [`discovery_client`], which refuse a destination
-/// that the build's controls do not permit before any socket exists.
 async fn standard_client(timeout: Duration) -> Result<Client, ProviderExecutionError> {
     Client::builder()
         .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
@@ -233,8 +191,6 @@ async fn standard_client(timeout: Duration) -> Result<Client, ProviderExecutionE
         .disable_redirects()
         .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
         .response_payload_timeout(Millis::ZERO)
-        // Stream idle deadlines bound stalled requests without terminating
-        // long replies when an intermediary does not answer HTTP/2 PINGs.
         .build(
             ntex::SharedCfg::new("provider")
                 .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
@@ -245,20 +201,6 @@ async fn standard_client(timeout: Duration) -> Result<Client, ProviderExecutionE
         })
 }
 
-/// The Provider client of one execution request to `endpoint`, the full
-/// request URL. The destination is checked here, not only by the callers, so
-/// no caller can reach an endpoint its build does not permit:
-///
-/// - [`DestinationPolicy::Standard`] reaches a literal loopback endpoint only
-///   (see [`direct_diagnostic_loopback`]);
-/// - [`DestinationPolicy::ApprovedHttps`] requires the control of the
-///   authority that approved it ([`ExecutionControl::ManualExternalTrial`] or
-///   [`ExecutionControl::ManualExternalExecution`], never either for the
-///   other), a route that authority admits, and gets a connector that
-///   connects nowhere but the approved host and port; see
-///   [`approved_connector`].
-///
-/// A refusal is a `Build` error: nothing was sent.
 pub(crate) async fn provider_client_for(
     timeout: Duration,
     destination: &crate::service::ai::providers::DestinationPolicy,
@@ -310,19 +252,11 @@ pub(crate) async fn provider_client_for(
     }
 }
 
-/// Why a discovery client was not built.
 pub(crate) enum DiscoveryClientError {
-    /// The build does not permit model discovery against this endpoint.
     NotAuthorized,
     Unavailable,
 }
 
-/// Whether a model-list request may be sent to `endpoint`. Discovery is a
-/// Provider egress that carries the stored or supplied credential to a
-/// caller-named endpoint, so it has its own control,
-/// [`ExecutionControl::ProviderDiscovery`], separate from execution. While
-/// that control is disabled only a literal loopback endpoint is permitted.
-/// Enabling a manual external trial does not enable discovery.
 pub(crate) fn discovery_permitted(endpoint: &str) -> bool {
     use crate::system::execution_controls::{ControlState, ExecutionControl};
     match ExecutionControl::ProviderDiscovery.state() {
@@ -331,9 +265,6 @@ pub(crate) fn discovery_permitted(endpoint: &str) -> bool {
     }
 }
 
-/// The client of one model-list request to `endpoint`, the endpoint as the
-/// caller named it. Refused before any socket exists unless
-/// [`discovery_permitted`].
 pub(crate) async fn discovery_client(
     timeout: Duration,
     endpoint: &str,
@@ -457,8 +388,6 @@ impl Proxy {
     }
 }
 
-/// Reads one `NO_PROXY` entry: a host or IPv6 address, optionally followed by
-/// a port that the entry then applies to alone.
 fn parse_exclusion(value: &str) -> Option<Exclusion> {
     let value = value
         .trim()
@@ -479,7 +408,6 @@ fn parse_exclusion(value: &str) -> Option<Exclusion> {
         let (host, port) = value.split_once(':')?;
         (host, Some(port.parse().ok()?))
     } else {
-        // No colon, or several (an unbracketed IPv6 address): no port.
         (value.as_str(), None)
     };
     (!host.is_empty()).then(|| Exclusion {
@@ -591,8 +519,6 @@ pub(crate) fn initialize() -> Result<(), String> {
     }
 }
 
-/// Whether an HTTPS proxy is configured in the environment or the system.
-/// The approved external-trial connection ignores it either way.
 pub(crate) fn ambient_proxy_configured() -> bool {
     !matches!(PROXY.get_or_init(load), Ok(None))
 }
@@ -683,22 +609,6 @@ fn connector() -> Result<Connector, ProviderExecutionError> {
         )))
 }
 
-/// A connector for one approved HTTPS destination and no other, always
-/// direct. It refuses: plain HTTP; any host or port but the approved ones
-/// (case-insensitively for the host), which also stops a redirect target,
-/// though redirects are off; a literal or resolved address that is not public
-/// (loopback, private, link-local and the like), so a name cannot be pointed
-/// at an internal service; and a certificate that does not verify, against
-/// the bundled public roots, for exactly the approved host.
-///
-/// The name is resolved here, every address is checked, and the connection
-/// is pinned to exactly the addresses that were checked, so the checked and
-/// the used destination cannot differ. The ambient proxy (`HTTPS_PROXY`,
-/// `ALL_PROXY`, the macOS system proxy) is deliberately not consulted: a proxy
-/// resolves the name itself, so OCG could not validate the destination
-/// address, and silently inheriting one would change the network trust
-/// boundary the operator approved. A trusted proxy would have to be named by
-/// the approval itself; see [`trusted_proxy_connector`].
 fn approved_connector(
     host: &str,
     port: u16,
@@ -711,19 +621,6 @@ fn approved_connector(
     }
 }
 
-/// A connector for one approved HTTPS destination through one named loopback
-/// proxy and no other path. It connects to the proxy address it was given
-/// (a literal, never looked up), asks it with HTTP CONNECT for exactly the
-/// approved `host:port` (no credential or other field in that request), and
-/// only after a 2xx answer negotiates TLS inside the tunnel with the approved
-/// name, verified against the bundled public roots. Nothing here consults the
-/// environment or the system proxy, looks the Provider name up locally, or
-/// falls back to another route when the proxy refuses or fails.
-///
-/// The proxy, not OCG, resolves the name and picks the outbound route, so the
-/// address reached is not validated. What OCG establishes is that the peer
-/// answering the TLS handshake holds a public-root certificate for the
-/// approved name.
 fn trusted_proxy_connector(
     host: &str,
     port: u16,
@@ -776,7 +673,6 @@ fn direct_approved_connector(host: &str, port: u16) -> Result<Connector, Provide
         .connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
             async move |_request: Connect<Uri>, _service| {
-                // An approved destination is https only.
                 Err::<Io, ConnectError>(ConnectError::InvalidInput)
             },
         ))
@@ -804,20 +700,12 @@ fn direct_approved_connector(host: &str, port: u16) -> Result<Connector, Provide
         )))
 }
 
-/// Why an approved destination cannot be reached by a direct connection.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DestinationFault {
-    /// The name does not resolve here.
     Unresolvable,
-    /// The name, or an address it resolves to, is not public.
     NonPublic,
 }
 
-/// Resolves `host` exactly as the approved connector will and checks every
-/// address. It sends nothing to the destination: only the name lookup runs,
-/// which the local resolver may forward. A name that passes can still fail at
-/// connect or TLS time, and may resolve differently later; the connector
-/// checks again at connect time and uses only the addresses it checked.
 pub(crate) async fn check_direct_destination(
     host: &str,
     port: u16,
@@ -905,12 +793,6 @@ fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecu
         )))
 }
 
-/// The direct resolution an approved destination gets: the web tools' checks,
-/// plus a refusal of fake-IP answers (198.18.0.0/15). Web tools accept those
-/// for resolved names because Clash/Surge-style resolvers hand them out for
-/// every name and a proxy then carries the traffic. For an approved
-/// destination that answer means something else resolved the name and will
-/// route the connection, so OCG did not validate the address it connects to.
 async fn resolve_approved_target(
     host: &str,
     port: u16,
@@ -953,13 +835,6 @@ async fn resolve_direct_web_target(
     Ok(addrs)
 }
 
-/// Checks a target before opening a CONNECT tunnel through the proxy. The
-/// proxy's own address is never checked (it is often 127.0.0.1), and local DNS
-/// is not required because proxy-only networks may not have working local
-/// resolution; DNS rebinding through the proxy is out of scope. Intranet-style
-/// names (no dot, or `.local`, `.corp`, ...) are refused by literal check even
-/// when local DNS cannot resolve them; other names that local DNS cannot
-/// resolve are still allowed through the proxy.
 async fn check_proxied_web_target(
     host: &str,
     port: u16,
@@ -980,9 +855,6 @@ async fn check_proxied_web_target(
     Ok(())
 }
 
-/// Whether `host`, as written in a URL, may name an approved external
-/// destination: not `localhost`, an intranet-style name, or a non-public
-/// address literal.
 pub(crate) fn host_may_be_external(host: &str) -> bool {
     !is_non_public_host_literal(host)
 }
@@ -1058,10 +930,6 @@ fn is_public_ip(ip: IpAddr) -> bool {
 }
 
 fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    // 198.18.0.0/15 is intentionally allowed for resolved names: Clash/Surge
-    // fake-IP DNS hands out these addresses for every name, so refusing them
-    // would break web tools for those users. Only URL host literals in that
-    // range are refused (see `is_non_public_host_literal`).
     let [a, b, c, d] = ip.octets();
     !(a == 0
         || a == 10
@@ -1105,7 +973,6 @@ fn is_fake_ip_ipv4(ip: Ipv4Addr) -> bool {
 
 fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    // Local-use NAT64 64:ff9b:1::/48.
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 1 {
         return false;
     }

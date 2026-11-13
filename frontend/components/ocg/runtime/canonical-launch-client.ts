@@ -35,9 +35,7 @@ import {
   type OutputView,
 } from "./output-history";
 
-/** Turns read per conversation page: the newest page and each earlier page. */
 const TURN_PAGE_SIZE = 20;
-// Catalog changes can include every output write; keep one trailing refresh.
 const CATALOG_REFRESH_DELAY_MS = 750;
 const MAX_RECOVERY_DELAY_MS = 10_000;
 const TOOL_TIME_CACHE_LIMIT = 128;
@@ -136,8 +134,6 @@ async function readPartialToolBoundaries(
         .map((response) => [response.request, response.created_at_us]),
     );
     for (let offset = 0; offset < requests.length; ) {
-      // The first request often already precedes the window. Later batches
-      // bound speculative reads while avoiding a serial walk through a long turn.
       const count = offset === 0 ? 1 : TOOL_TIME_BATCH_SIZE;
       let batch = requests.slice(offset, offset + count);
       const knownBoundary = batch.findIndex((request) => {
@@ -196,11 +192,7 @@ type Turn = {
   job: ControlJob;
   input: ControlConversationTurn["input"];
   outputs: OutputHistory;
-  // Advances when the live array is appended in place, including while an
-  // asynchronous history read holds a shallow snapshot of this turn.
   outputRevision?: number;
-  // Advances whenever transcript evidence is committed so older in-flight
-  // reads cannot overwrite newer committed evidence.
   evidenceRevision: number;
   tools: ControlToolCall[];
   responses: ControlProviderResponse[];
@@ -223,7 +215,6 @@ type StreamEntry = {
   stop: () => void;
 };
 
-/** Projects and sessions are presentation scope only: every backend turn is a Job. */
 export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private started = false;
   private disposed = false;
@@ -242,7 +233,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   >();
   private readonly roots = new Map<string, string>();
   private listedRoots = new Set<string>();
-  // hiddenRoots and unlisted live as long as the client.
   private readonly hiddenRoots = new Set<string>();
   private readonly unlisted = new Set<string>();
   private readonly hiding = new Set<string>();
@@ -250,8 +240,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private readonly selections = new Map<string, ChatModelSelection>();
   private readonly sending = new Set<string>();
   private readonly stopping = new Set<string>();
-  // Jobs whose stop answer was accepted; one accepted answer is the request,
-  // so a later click sends nothing more.
   private readonly stopAccepted = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
   private readonly earlier = new Map<string, string | null>();
@@ -330,9 +318,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     this.listedRoots = visible;
     for (const item of page.conversations) {
       if (this.hiddenRoots.has(item.root_job)) continue;
-      // The conversation names its session, not the other way round: a draft
-      // that already presents this conversation keeps presenting it, so a
-      // list read that lands after admission cannot mint a second row for it.
       const id =
         this.roots.get(item.root_job) ??
         this.getSnapshot().sessions.find((session) => session.conversationId === item.root_job)
@@ -341,7 +326,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       this.roots.set(item.root_job, id);
       this.unlisted.delete(id);
       const current = this.getSnapshot().sessions.find((session) => session.id === id);
-      // A stale list read must not roll an admitted local successor backwards.
       const known = this.tips.get(id);
       const local = known ? this.turns.get(known) : undefined;
       if (
@@ -429,18 +413,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     for (const id of attachments) this.images.delete(id);
   }
 
-  /**
-   * Records that `sessionId` presents the conversation `root`.
-   *
-   * Admitting a first turn answers with the conversation the server just
-   * opened, while the same admission also makes the client re-read the
-   * conversation list. A list read that lands first mints its own session for
-   * that root, which would sit in the sidebar beside the draft that is already
-   * showing it, under the title both derive from the same first message. The
-   * root therefore claims the session that admitted it, and a second
-   * presentation of that same root is dropped: both entries name one
-   * conversation, so nothing distinct is hidden and no stored row is touched.
-   */
   private claimConversation(root: string, sessionId: string) {
     this.roots.set(root, sessionId);
     const stray = this.getSnapshot().sessions.find(
@@ -581,7 +553,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         },
       });
     }
-    // Read each turn's attachments and tool evidence as well as its stored text.
     const isCurrent = () => !this.disposed && (hiddenBefore || !this.hiddenRoots.has(root));
     const held = new Set(
       [...this.turns.values()].filter((turn) => turn.sessionId === id).map((turn) => turn.job.id),
@@ -1372,7 +1343,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         )
       : null;
     const stored = page?.turns.find((turn) => turn.job.id === job);
-    // A Decision Job has no provider responses or tools; do not request them.
     const evidence = stored?.native_decision
       ? { tools: [], responses: [], error: undefined }
       : await readTranscriptEvidence(this.control, job, {
@@ -1410,8 +1380,6 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!this.getSnapshot().sessions.some((s) => s.id === sessionId)) return;
     const current = this.turns.get(job);
     if (current && !this.historyTurnIsCurrent({ state: turn, previous, snapshot })) {
-      // The watcher owns this object. Keep its live state and apply the
-      // freshly read entries, including queue edits, without replacing it.
       current.entries = turn.entries;
       current.input = turn.input;
       current.compaction = turn.compaction;

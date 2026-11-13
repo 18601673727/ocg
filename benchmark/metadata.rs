@@ -1,39 +1,19 @@
-//! The metadata a measurement needs to be reproducible.
-//!
-//! A latency without the machine, the build and the workload behind it is
-//! an anecdote. Every measurement carries the state that produced it, so a
-//! reader can tell whether two runs are comparable and can repeat the one
-//! they read.
-
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// The environment a measurement was taken in.
 #[derive(Clone, Debug)]
 pub struct BenchmarkMetadata {
-    /// The commit the tree was at, when it was a git tree.
     pub commit_hash: Option<String>,
-    /// Whether the tree carried uncommitted changes.
     pub dirty_tree: bool,
-    /// Fingerprint of tracked changes and the worktree status for comparison.
     pub tree_fingerprint: Option<String>,
-    /// The compiler that built the binary.
     pub compiler_version: String,
-    /// The Cargo profile the binary was built with.
     pub build_profile: String,
-    /// The operating system the binary ran on.
     pub os: String,
-    /// The architecture the binary ran on.
     pub arch: String,
-    /// The model of the processor, when it could be read.
     pub cpu_model: Option<String>,
-    /// How many processors the machine offers.
     pub available_parallelism: usize,
-    /// Where the run kept its data.
     pub storage_path: PathBuf,
-    /// The filesystem the data directory is on, when it could be read.
     pub filesystem_info: Option<String>,
-    /// The memory the machine has, in bytes, when it could be read.
     pub total_memory_bytes: Option<u64>,
 }
 
@@ -124,7 +104,6 @@ fn worktree_fingerprint(status: &[u8]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// The output of a git command, when it succeeded.
 fn git_output(arguments: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(arguments)
@@ -165,7 +144,6 @@ fn cpu_model_name() -> Option<String> {
     None
 }
 
-/// The filesystem the path is on, as the operating system names it.
 fn filesystem_of(path: &Path) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -212,7 +190,6 @@ fn filesystem_of(path: &Path) -> Option<String> {
     }
 }
 
-/// The memory the machine has, in bytes.
 fn total_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
@@ -235,22 +212,14 @@ fn total_memory_bytes() -> Option<u64> {
     }
 }
 
-/// The workload parameters of one measurement case.
 #[derive(Clone, Debug)]
 pub struct WorkloadParameters {
-    /// The name of the case.
     pub case_name: String,
-    /// Which trial of the case this is.
     pub trial: Option<usize>,
-    /// How many clients the case ran.
     pub concurrency: usize,
-    /// How many operations the case performed.
     pub operation_count: usize,
-    /// How large the fixture was, when the case used one.
     pub fixture_size: Option<usize>,
-    /// What state the caches were in.
     pub cache_state: Option<String>,
-    /// The parameters of the case beyond the ones every case has.
     pub custom: Value,
 }
 

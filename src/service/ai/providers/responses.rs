@@ -399,7 +399,6 @@ impl ResponseStream {
                     return Err("Responses completion omitted streamed items");
                 }
                 self.bytes = self.bytes.max(completed.bytes);
-                // The terminal snapshot bounds encrypted reasoning and other retained metadata too.
                 if output.iter().map(|v| v.to_string().len()).sum::<usize>()
                     > limit.saturating_mul(6).saturating_add(MAX_SSE_LINE_BYTES)
                 {

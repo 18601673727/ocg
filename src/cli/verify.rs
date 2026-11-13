@@ -1,5 +1,3 @@
-/// Offline integrity check of a stopped database. It never opens the original
-/// file for writing, starts no host and resolves no Allocation.
 pub fn run(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let (directory, pages) = match arguments.as_slice() {
         [directory] => (directory, false),

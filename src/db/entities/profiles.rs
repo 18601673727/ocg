@@ -1,24 +1,17 @@
 use super::*;
 
-/// A Pool config seen as the Executor that runs work.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutorRecord {
     pub id: ExecutorId,
     pub name: String,
     pub concurrency_limit: u32,
-    /// The LLM transports the Pool offers `LlmRequest` for.
     pub llm_transports: BTreeSet<LlmTransport>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
 
-/// The wire protocol an LLM request is sent with. Each variant is an adapter
-/// OCG implements; a Provider states which one it speaks, and an Executor
-/// which ones it can run. Compatibility is never inferred from a model name
-/// or an endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LlmTransport {
-    /// [`crate::service::ai::providers::openai_compatible`] Chat Completions.
     OpenAiChatCompletions,
     OpenAiResponses,
     AnthropicMessages,
@@ -43,7 +36,6 @@ impl LlmTransport {
     }
 }
 
-/// A capability a user declares for a model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModelCapability {
     Chat,
@@ -72,7 +64,6 @@ impl ModelCapability {
     }
 }
 
-/// A capability a user declares for a decision model.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -104,7 +95,6 @@ impl DecisionCapability {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionProtocol {
-    /// TypeSafe System One REST JSON protocol.
     TypeSafeSystemOne,
 }
 
@@ -133,7 +123,6 @@ impl DecisionProtocol {
     }
 }
 
-/// Request parameters the OpenAI-compatible transport already forwards.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReasoningEffort {
     None,
@@ -192,15 +181,11 @@ pub struct LlmParameters {
     pub frequency_penalty: Option<f64>,
 }
 
-/// What a Model config holds of the model itself; its Connection is a
-/// reference, see [`ModelConfig::connection_id`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmConfig {
     pub model: String,
     pub context_window: Option<u32>,
     pub parameters: LlmParameters,
-    /// What the user states the model supports. Observed capability check
-    /// results never change it.
     pub declared_capabilities: BTreeSet<ModelCapability>,
 }
 
@@ -271,16 +256,9 @@ impl AgentConfig {
     pub fn manages_jobs(&self) -> bool {
         self.capabilities.contains(&AgentCapability::Chat)
     }
-    /// Whether this Agent may run a Generative Job at all: it chats or codes.
-    /// An Agent with only the Decision capability runs typed Decision work.
     pub fn runs_generative(&self) -> bool {
         self.manages_jobs() || self.workspace_grant().is_some()
     }
-    /// Whether the checked single-request execution may run a Job for this
-    /// Agent. Chat capability is a permission the full runtime exercises by
-    /// offering Job tools; the single-request execution offers no tool, so
-    /// holding it grants nothing there. A Workspace grant is refused because
-    /// that execution has no Workspace.
     pub fn permits_single_request(&self) -> bool {
         self.manages_jobs() && self.workspace_grant().is_none()
     }
@@ -320,7 +298,6 @@ impl Default for AgentConfig {
     }
 }
 
-/// Limits for a decision model.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionLimits {
@@ -330,7 +307,6 @@ pub struct DecisionLimits {
     pub max_output_tokens_per_question: Option<u32>,
 }
 
-/// The body of a Decision Model config.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionModelConfig {
@@ -341,7 +317,6 @@ pub struct DecisionModelConfig {
     pub declared_capabilities: BTreeSet<DecisionCapability>,
 }
 
-/// The body of a Decision Agent config.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionAgentConfig {
@@ -361,8 +336,6 @@ pub enum ConfigKind {
 }
 
 impl ConnectionConfig {
-    /// Every credential this Connection names: its own, and those holding its
-    /// secret header values.
     pub fn credential_refs(&self) -> impl Iterator<Item = &str> {
         self.credential_ref
             .as_deref()
@@ -379,7 +352,6 @@ pub struct ConnectionConfig {
     pub protocol: LlmTransport,
     pub endpoint: Option<String>,
     pub credential_ref: Option<String>,
-    /// Custom request fields, in name order; see [`super::headers`].
     pub headers: Vec<OutboundHeader>,
 }
 
@@ -401,7 +373,7 @@ pub struct PoolConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)] // Configuration snapshots remain inline, like JobExecution.
+#[allow(clippy::large_enum_variant)]
 pub enum ConfigBody {
     Connection(ConnectionConfig),
     Model(ModelConfig),
@@ -444,12 +416,9 @@ pub struct Config {
     pub body: ConfigBody,
 }
 
-/// The Provider facts needed to interpret a request. The credential is
-/// named, never copied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderSnapshot {
     pub id: LlmProviderId,
-    /// The Connection's edit counter when it was frozen.
     pub edit_seq: u32,
     pub name: String,
     pub transport: LlmTransport,
@@ -458,38 +427,27 @@ pub struct ProviderSnapshot {
     pub headers: FrozenHeaders,
 }
 
-/// A config row and the edit counter it had when a Job froze its values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConfigRef {
     pub id: ConfigId,
     pub edit_seq: u32,
 }
 
-/// A Model config as it was when frozen: model, request parameters,
-/// declared capabilities and the Connection that serves them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenLlmConfig {
     pub config: LlmConfig,
     pub provider: ProviderSnapshot,
-    /// The Model config the values came from.
     pub model: ConfigRef,
 }
 
-/// What a submitted Job was configured to execute, frozen in its spec when
-/// it was submitted. `agent` is absent for work submitted without an Agent.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenExecutionConfig {
     pub agent: Option<AgentConfig>,
-    /// The Agent config `agent` came from.
     pub agent_ref: Option<ConfigRef>,
     pub llm: FrozenLlmConfig,
 }
 
 impl FrozenExecutionConfig {
-    /// Why this configuration can never run as the checked single-request
-    /// Generative execution, or `None` when it can. Every fact here is frozen
-    /// with the Job, so admission, handoff and the start transaction all ask
-    /// this one question and cannot disagree.
     pub fn single_request_refusal(&self) -> Option<&'static str> {
         match &self.agent {
             None => return Some("an Agent is required"),
@@ -503,12 +461,6 @@ impl FrozenExecutionConfig {
         self.provider_refusal()
     }
 
-    /// Why this configuration can never run as a native Generative execution
-    /// on the local endpoint paths, or `None` when it can. Unlike
-    /// [`Self::single_request_refusal`] it admits an Agent with a Workspace
-    /// grant: such a Job runs the native tool loop, which sends one or more
-    /// requests. An endpoint path that authorizes exactly one request keeps
-    /// asking [`Self::single_request_refusal`].
     pub fn native_execution_refusal(&self) -> Option<&'static str> {
         match &self.agent {
             None => return Some("an Agent is required"),
@@ -533,9 +485,6 @@ impl FrozenExecutionConfig {
     }
 }
 
-/// A submitted Job's configuration: the Agent and Model configs it was
-/// submitted with, as provenance, and the values it was frozen with, as the
-/// authority for what it executes. Later config edits change neither.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubmittedConfiguration {
     pub agent_profile: Option<ProfileId>,
@@ -546,8 +495,6 @@ pub struct SubmittedConfiguration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExecutionOperation {
     LlmRequest,
-    /// One typed decision request over a Decision Model's native protocol.
-    /// Pools offering it are candidates for ordinary decision Jobs.
     Decision,
 }
 
@@ -571,13 +518,9 @@ pub struct ExecutionPoolConfig {
 }
 
 impl ExecutionPoolConfig {
-    /// The Pool body this configuration is stored as.
     pub fn body(&self, enabled: bool) -> PoolConfig {
         let mut capabilities = BTreeSet::new();
         for operation in &self.capabilities.operations {
-            // Decision work names no LLM transport, so its Pool offers it
-            // without one whether or not the same Pool serves generative
-            // work over transports.
             if *operation == ExecutionOperation::Decision
                 || self.capabilities.llm_protocols.is_empty()
             {
@@ -596,7 +539,6 @@ impl ExecutionPoolConfig {
 }
 
 impl PoolConfig {
-    /// The capabilities of this Pool as operations and protocols.
     pub fn capability_set(&self) -> CapabilitySet {
         let mut set = CapabilitySet::default();
         for (operation, protocol) in &self.capabilities {
@@ -608,8 +550,6 @@ impl PoolConfig {
         set
     }
 
-    /// Whether this Pool offers `operation` for `protocol`. A capability
-    /// without a protocol offers only work that needs none.
     pub fn offers(&self, operation: ExecutionOperation, protocol: Option<LlmTransport>) -> bool {
         self.capabilities.contains(&(operation, protocol))
     }
@@ -622,7 +562,6 @@ pub struct ExecutionPool {
     pub enabled: bool,
 }
 
-/// A Pool config as the scheduler's callers see it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionPoolRecord {
     pub id: ExecutionPoolId,
@@ -668,8 +607,6 @@ impl FrozenDecisionAgent {
     }
 }
 
-/// Tool-free snapshot for the typed decision runtime. References name the
-/// versions captured in one database transaction; credentials remain references.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeDecisionConfig {
@@ -788,8 +725,6 @@ impl FrozenDecisionConfig {
     }
 }
 
-/// Shared freeze result. A caller must dispatch on execution class; a decision
-/// snapshot cannot be passed to a generative runner by structural coincidence.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum FrozenConfiguration {
@@ -797,14 +732,9 @@ pub enum FrozenConfiguration {
     Decision(FrozenDecisionConfig),
 }
 
-/// An Executor is a Pool config. It offers `LlmRequest` for each of the LLM
-/// transports its adapter implements and nothing else, so one without
-/// transports is never granted LLM work.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Executor {
     pub name: String,
     pub concurrency_limit: NonZeroU32,
-    /// The LLM transports this Executor's adapter implements, fixed at
-    /// registration.
     pub llm_transports: BTreeSet<LlmTransport>,
 }

@@ -1,20 +1,3 @@
-//! `ocg run-loopback-job <job> --pool <id> --executor <id> --timeout-secs <n>
-//!  --confirm-loopback-only`
-//!
-//! Runs one explicitly named, submitted, tool-free Generative Job once,
-//! against the literal `127.0.0.1` endpoint the Job itself froze. It is the
-//! operator's manual loopback execution and nothing else: it cannot reach an
-//! external Provider (the Job's endpoint must be a literal loopback address,
-//! and there is no flag to name another), does not discover, schedule, retry
-//! or recover, and never selects a Job for the operator. It is refused unless
-//! the `manual_loopback_execution` control is enabled in the build, and it
-//! runs against the existing database in `OCG_DATA_DIR` as a host of its own,
-//! so it cannot run beside another host. Every flag is required; nothing is
-//! defaulted.
-//!
-//! Interrupting it (SIGINT or SIGTERM) cancels the local exchange. A request
-//! that may have reached the Provider then stays held as Uncertain.
-
 use std::time::Duration;
 
 use serde_json::json;
@@ -119,7 +102,6 @@ pub fn run(arguments: Vec<String>) -> Result<(), Failure> {
         run_loopback_job(&database, request, cancellation).await
     });
     let Some(finished) = finished else {
-        // It never ran: the host did not open, so nothing was sent.
         return Err(match hosted {
             Err(error) => refused(
                 "host_failed",
@@ -129,9 +111,6 @@ pub fn run(arguments: Vec<String>) -> Result<(), Failure> {
         });
     };
     if let Err(error) = hosted {
-        // It ran and the host then failed to close cleanly. The result below
-        // is what it recorded; the close failure is reported with it, never
-        // instead of it.
         eprintln!("the database could not be closed cleanly after the execution: {error}");
     }
     match finished {

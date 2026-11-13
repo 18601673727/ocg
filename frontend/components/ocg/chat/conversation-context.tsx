@@ -41,7 +41,6 @@ function formatTokens(value: number): string {
   return `${(value / 1_000_000).toFixed(1)}M`;
 }
 
-/** Presents a Decision answer plainly; provider confidence never reads as correctness. */
 function describeDecisionAnswer(
   answer: ControlDecisionAnswer,
   t: ReturnType<typeof useI18n>["t"],

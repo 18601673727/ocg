@@ -1,10 +1,3 @@
-//! One process run: start the components, wait to be told to stop, then stop
-//! them in the reverse order.
-//!
-//! Every stop step is attempted even when an earlier one failed, and every
-//! failure, startup or shutdown, is kept with the phase it happened in. The
-//! database is closed last, after everything that may still write to it.
-
 use std::future::Future;
 use std::net::SocketAddr;
 
@@ -17,10 +10,8 @@ use crate::system::monitor::report_protection;
 use crate::system::policy::SystemPolicy;
 use crate::system::scheduler::{ExecutionRuntime, SchedulerHandle};
 
-/// The variable that named the one Workspace of a host before Projects.
 const REMOVED_WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 
-/// Where in a run something happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Startup,
@@ -50,14 +41,12 @@ pub struct HostFailure {
     pub error: String,
 }
 
-/// Every failure of a run, in the order they happened.
 #[derive(Debug, thiserror::Error)]
 #[error("{}", .failures.iter().map(|failure| format!("{}: {}", failure.phase, failure.error)).collect::<Vec<_>>().join("; "))]
 pub struct HostError {
     pub failures: Vec<HostFailure>,
 }
 
-/// What a run did: the phases it attempted and the failures it met.
 #[derive(Debug, Default)]
 pub(crate) struct HostReport {
     pub(crate) attempted: Vec<Phase>,
@@ -98,10 +87,6 @@ impl HostReport {
     }
 }
 
-/// What a caller running inside the host gets: the database and the
-/// scheduler of the host's own execution runtime. The host keeps owning
-/// both. Once the host begins to stop, the scheduler refuses every
-/// submission, however many clones of it exist.
 #[derive(Clone)]
 pub struct HostContext {
     database: DatabaseHandle,
@@ -114,20 +99,15 @@ impl HostContext {
         &self.database
     }
 
-    /// Submits work to the host's execution runtime; see [`SchedulerHandle`].
     pub fn scheduler(&self) -> &SchedulerHandle {
         &self.scheduler
     }
 
-    /// Where the Control Plane listens, when the run was given one; it
-    /// answers from before the caller is called until the caller returns.
     pub fn control_plane(&self) -> Option<SocketAddr> {
         self.control_plane
     }
 }
 
-/// Runs the process until `until_stopped` finishes, then stops it. With
-/// `signals`, the host's runtime owns the process signals.
 pub fn run<F>(
     data_directory: &DataDirectory,
     signals: bool,
@@ -141,7 +121,6 @@ where
     })
 }
 
-/// Like [`run`], giving `until_stopped` the whole [`HostContext`].
 pub fn run_hosted<F>(
     data_directory: &DataDirectory,
     signals: bool,
@@ -171,12 +150,6 @@ where
     )
 }
 
-/// Like [`run_hosted`], also serving the local Control Plane `control`
-/// describes, when given, for as long as `until_stopped` runs; see
-/// [`crate::api::v1`]. It starts only once every service the host
-/// waits for runs; a listener that cannot start fails the run, and
-/// `until_stopped` is then not called. It is stopped first, before the
-/// execution runtime.
 pub fn run_controlled<F>(
     data_directory: &DataDirectory,
     signals: bool,
@@ -197,14 +170,6 @@ where
     .into_result()
 }
 
-/// Like [`run_controlled`], for the one host the operator arms for
-/// autonomous loopback scheduling over `data_directory`; see
-/// [`crate::system::loopback_activation`]. The activation preflight runs
-/// inside the host, after it holds the database exclusively and before its
-/// execution runtime starts, so nothing can be queued or claimed between the
-/// check and the arming. A refused preflight fails the run at startup with
-/// the refusal, `until_stopped` is not called and the database is closed
-/// unchanged. `report` receives the preflight report either way.
 pub(crate) fn run_activated<F>(
     data_directory: &DataDirectory,
     control: Option<ControlPlaneConfig>,
@@ -229,7 +194,6 @@ where
     .into_result()
 }
 
-/// An activation the run was asked for, and where its preflight report goes.
 struct Activation {
     request: crate::system::loopback_activation::ActivationRequest,
     report: Box<dyn FnOnce(&serde_json::Value)>,
@@ -286,12 +250,6 @@ where
     report
 }
 
-/// Runs the components that need the host's async runtime, waits for
-/// `until_stopped`, then stops everything it was given, in this order: the
-/// Control Plane, if any, so no request reads or submits past this point;
-/// the execution runtime, so no submission starts once stopping begins; log
-/// cleanup; the logger. The caller closes the
-/// database after it.
 #[allow(clippy::too_many_arguments)]
 async fn serve<F>(
     handle: DatabaseHandle,
@@ -306,9 +264,6 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
-    // The activation preflight and the arming happen here, under the
-    // database lock this host holds and before anything can submit or
-    // claim: an unarmed start, the default, schedules nothing.
     let armed = match activation {
         None => None,
         Some(activation) => {
@@ -342,8 +297,6 @@ where
             return report;
         }
     };
-    // Started first: a lock also blocks the file log, so it is reported on
-    // standard error for as long as the process runs.
     ntex::rt::spawn(report_protection(handle.watch_disk_protection()));
     let context = HostContext {
         database: handle.clone(),
@@ -419,8 +372,6 @@ where
     .await;
 
     report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
-    // The cleanup worker is joined while the database and the logger it
-    // uses are still open; a run in flight stops at its next file.
     if let Some(cleanup) = cleanup
         && let Err(error) = cleanup.shutdown()
     {
@@ -468,16 +419,10 @@ async fn serve_control_plane<F>(
         }
     };
     context.control_plane = listener.as_ref().map(ControlPlane::address);
-    // Announced only once everything runs, right before waiting to stop.
     if let Some(address) = context.control_plane {
         log::info!("control plane listening on http://{address}");
         eprintln!("OCG control plane listening on http://{address}");
     }
-    // The sign-in code is for a remote control client of a headless
-    // listener, on this machine: it is not the bearer token and
-    // reveals none of it. A served frontend signs itself in and
-    // prints no code. Each run prints its own, and only that one
-    // signs a browser in.
     if let Some(pairing) = listener.as_ref().and_then(ControlPlane::pairing_code) {
         eprintln!("OCG local browser pairing code: {pairing}");
     }

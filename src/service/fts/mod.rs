@@ -1,52 +1,3 @@
-//! `workspace_fts_search`: indexed full-text search over an
-//! authorized Workspace, and the bounded in-memory index behind it.
-//!
-//! The scan-based workspace_search remains available. Indexes are lazy,
-//! immutable, and owned by their registered handler.
-//!
-//! # What searching means here
-//!
-//! Retrieval is lexical. There are no embeddings, no vectors and no
-//! semantic similarity: only exact tokens, scored by Okapi BM25.
-//!
-//! Tokenization, stated exactly:
-//!
-//! * Text splits into words at every character that is not alphanumeric, so
-//!   `_` separates and `job_admission` is two words.
-//! * Each word splits at camelCase and acronym boundaries into subtokens:
-//!   `JobScheduler` is `job` + `scheduler`, `HTTPServer` is `http` +
-//!   `server`, `u64` stays `u64`.
-//! * Every subtoken is lowercased, so matching is case-insensitive.
-//! * A subtoken over [`MAX_TOKEN_BYTES`] is not indexed and never matches.
-//!
-//! A query word is tokenized the same way. One subtoken matches any
-//! document holding it as a token; a word that becomes several subtokens,
-//! and any `"quoted phrase"`, requires those subtokens as adjacent tokens
-//! in order. Separate query words and phrases must all match (AND). This is
-//! tokenized search, not substring search: `job` matches `Job` and the
-//! `job` of `JobScheduler`, but not `jobless`, and `scheduler` does not
-//! match `schedulers`. A phrase may span lines, because adjacency is over
-//! the token stream of the whole file.
-//!
-//! # Freshness
-//!
-//! A first call builds synchronously from the caller's perspective; refresh
-//! stages a full replacement while readers retain the preceding snapshot.
-//! Generations fence obsolete and disposed builds. Known OCG mutations mark
-//! snapshots dirty, including writes overlapping construction. No snapshot
-//! proves the absence of external edits; every response states that limit.
-//!
-//! # Bounds and security
-//!
-//! The same protections as `workspace_search`: only the Workspace an
-//! operator authorized (the Provider never names the root), no symlinks, no
-//! hidden, secret-bearing or OCG-internal names, no OCG data files, only
-//! UTF-8 text without NUL, opened component by component from the root,
-//! never through a joined path. Everything is read within [`FtsLimits`],
-//! which bounds files, content, tokens and time, and every build reports
-//! what its bounds left out. The index lives in memory only: it is dropped
-//! with its handler or on rebuild, and is never written to disk.
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -67,59 +18,35 @@ use crate::system::executor::workspace_read::{
     read_bytes,
 };
 
-/// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_fts_search";
 
-/// Identifies this handler's behavior in every call it records.
 const HANDLER_VERSION: &str = "workspace_fts_search-2";
 
-/// The longest query, in bytes, and the most of a line an excerpt returns.
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_EXCERPT_BYTES: usize = 200;
 
-/// The longest run of letters and digits, in bytes, that a query may hold
-/// or an index holds as one subtoken.
 const MAX_TOKEN_BYTES: usize = 128;
 
-/// The most query clauses and subtokens per clause.
 const MAX_CLAUSES: usize = 8;
 const MAX_CLAUSE_TOKENS: usize = 16;
 
-/// Okapi BM25 parameters, the standard values Lucene and Tantivy use.
 const BM25_K1: f64 = 1.2;
 const BM25_B: f64 = 0.75;
 
-/// The bounds of indexing and searching. Everything a build or a query may
-/// read, hold or return is bounded here; a build that reaches one of the
-/// build bounds installs a partial snapshot that says so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FtsLimits {
-    /// Names read from one directory; the rest are not seen.
     pub directory_entries: usize,
-    /// How many directories deep below the root indexing goes.
     pub depth: usize,
-    /// Entries one build examines.
     pub entries: usize,
-    /// The largest file one build indexes.
     pub file_bytes: usize,
-    /// Content bytes one snapshot holds in all.
     pub content_bytes: u64,
-    /// Files one snapshot holds in all.
     pub files: usize,
-    /// Subtokens one snapshot holds in all; bounds index memory together
-    /// with [`Self::content_bytes`].
     pub tokens: u64,
-    /// How long one build may walk.
     pub time: Duration,
-    /// How long one query may run.
     pub query_time: Duration,
-    /// Ranked documents one query may open to verify phrases and excerpt.
     pub query_candidates: usize,
-    /// The most result records one query returns.
     pub results: usize,
-    /// The largest serialized result of a query.
     pub result_bytes: usize,
-    /// Result records returned for one file.
     pub matches_per_file: usize,
 }
 
@@ -173,24 +100,14 @@ fn query_checkpoint(stop: &AtomicBool, deadline: Instant) -> Result<(), SearchRe
     Ok(())
 }
 
-/// What a build could not index, counted for its coverage report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Skipped {
-    /// Hidden, secret-bearing or OCG-internal names, and names no Workspace
-    /// path could name.
     pub protected: usize,
-    /// Symbolic links, never followed.
     pub symlink: usize,
-    /// Not UTF-8 text, or text holding NUL.
     pub binary: usize,
-    /// Regular files over [`FtsLimits::file_bytes`].
     pub too_large: usize,
-    /// Files with more than one link.
     pub hard_linked: usize,
-    /// Anything that could not be opened, read or examined.
     pub unreadable: usize,
-    /// Entries that are neither a regular file nor a directory, including
-    /// build output and installed dependencies directories.
     pub other: usize,
 }
 
@@ -208,7 +125,6 @@ impl Skipped {
     }
 }
 
-/// Which bound ended a build before it walked everything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuildLimit {
     Entries,
@@ -234,9 +150,6 @@ impl BuildLimit {
     }
 }
 
-/// What a snapshot holds, honestly: how far its build walked and what its
-/// bounds left out. `complete` is false whenever a bound ended the walk, so
-/// a caller never mistakes a partial index for the whole Workspace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Coverage {
     pub complete: bool,
@@ -245,26 +158,18 @@ pub struct Coverage {
     pub files_indexed: usize,
     pub content_bytes_indexed: u64,
     pub tokens_indexed: u64,
-    /// Distinct subtokens: the term dictionary's size.
     pub terms: u64,
-    /// `(document, subtoken)` postings held.
     pub posting_entries: u64,
     pub skipped: Skipped,
 }
 
-/// What building an index did: which snapshot now exists, what it covers,
-/// and what it occupies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BuildReport {
     pub generation: u64,
     pub coverage: Coverage,
-    /// What the snapshot occupies in memory, by the accounting of
-    /// [`Index::memory_bytes_approx`]; not a measured allocation.
     pub memory_bytes_approx: u64,
 }
 
-/// Why a call produced no result. Messages are recorded and may reach the
-/// Provider, so none repeats the query or anything read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SearchRefusal {
     #[error(transparent)]
@@ -285,8 +190,6 @@ pub enum SearchRefusal {
     Access(#[from] Refusal),
 }
 
-/// Why a query is refused before it runs. Its message is recorded and may
-/// reach the Provider, so it never repeats the query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum QueryRefusal {
     #[error(
@@ -299,9 +202,6 @@ pub enum QueryRefusal {
     OversizedToken,
 }
 
-/// One indexed file: its path, the content held for excerpts and phrase
-/// verification, the byte offset of every line, and its length in subtokens
-/// for BM25.
 #[derive(Debug)]
 struct Document {
     path: String,
@@ -310,8 +210,6 @@ struct Document {
     token_count: u32,
 }
 
-/// One `(document, subtoken)` posting: the document, the subtoken's term
-/// frequency there, and the start of its occurrence positions.
 #[derive(Clone, Copy, Debug)]
 struct Posting {
     document: u32,
@@ -319,19 +217,12 @@ struct Posting {
     position_start: u32,
 }
 
-/// The indexed snapshot of one build: immutable once installed, shared
-/// between queries, and dropped when a rebuild replaces it or its handler
-/// goes away.
 #[derive(Debug)]
 struct Index {
     generation: u64,
     built_at: SystemTime,
     documents: Vec<Document>,
-    /// Subtoken to its postings, in ascending document order. A `BTreeMap`
-    /// keeps every query and every report deterministic.
     postings: BTreeMap<String, Vec<Posting>>,
-    /// Posting occurrence ranges in one flat array, in zero-based subtoken
-    /// stream positions matching `scan_document`.
     positions: Vec<u32>,
     total_tokens: u64,
     coverage: Coverage,
@@ -340,10 +231,6 @@ struct Index {
 }
 
 impl Index {
-    /// What the snapshot occupies: its documents (path, text, line offsets),
-    /// its term dictionary, postings and positions, counted by their fields'
-    /// own sizes and a fixed per-record allowance. A structural approximation,
-    /// not a measured allocation; the formula is the point of the field.
     fn memory_bytes_approx(&self) -> u64 {
         let documents = self
             .documents
@@ -371,8 +258,6 @@ impl Index {
     }
 }
 
-/// The installed snapshot: the latest generation number, and the snapshot
-/// itself while one is installed.
 #[derive(Default)]
 struct Slot {
     generation: u64,
@@ -382,18 +267,12 @@ struct Slot {
     refresh_failed: bool,
 }
 
-/// An index of one authorized Workspace. It builds, rebuilds, searches and
-/// disposes snapshots of that Workspace only; the Workspace came from
-/// trusted OCG code and nothing in a call may widen it. Calls share one
-/// snapshot; the tool loop of one execution runs them one at a time.
 pub struct WorkspaceFts {
     workspace: Workspace,
     limits: FtsLimits,
     slot: Mutex<Slot>,
 }
 
-/// Why a walk or scan stopped without finishing: the call was cancelled, so
-/// nothing it produced is used or claimed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Stopped;
 
@@ -403,25 +282,17 @@ impl From<Stopped> for SearchRefusal {
     }
 }
 
-/// One parsed query clause: one or more adjacent subtokens. A single
-/// subtoken is an ordinary term; more is an exact phrase, whether it came
-/// from `"quotes"` or from one word like `JobScheduler`.
 #[derive(Debug, PartialEq, Eq)]
 struct Clause {
     subtokens: Vec<String>,
 }
 
-/// A query as it is searched: deduplicated clauses, all of which must match.
 #[derive(Debug)]
 struct ParsedQuery {
     clauses: Vec<Clause>,
-    /// Every distinct subtoken of every clause, for the postings lookup and
-    /// the BM25 sum.
     subtokens: Vec<String>,
 }
 
-/// One scanned subtoken: its lowercased form, the byte offset where it
-/// starts in the text, and its line.
 #[derive(Debug)]
 struct ScannedToken<'query> {
     lower: &'query str,
@@ -430,15 +301,10 @@ struct ScannedToken<'query> {
     position: u32,
 }
 
-/// Every subtoken occurrence of one document, in stream order.
 struct Scanned<'query> {
     tokens: Vec<ScannedToken<'query>>,
 }
 
-/// Splits `text` into lowercased subtokens and hands each to `sink` with its
-/// byte range. Words split at every non-alphanumeric character, then at
-/// camelCase and acronym boundaries; see the module documentation for the
-/// exact rules this implements.
 fn tokenize(text: &str, sink: &mut impl FnMut(&str, u32, u32)) {
     tokenize_while(text, sink, &mut || true);
 }
@@ -468,11 +334,6 @@ fn tokenize_while(
     }
 }
 
-/// Splits one word into subtokens at case boundaries and hands each to
-/// `sink` with its byte range in the text. An uppercase run belongs to one
-/// subtoken unless it ends in an uppercase letter followed by a lowercase
-/// one (`HTTPServer` is `HTTP` + `Server`); digits belong to the subtoken
-/// beside them (`u64`).
 fn split_word(word: &str, base: u32, sink: &mut impl FnMut(&str, u32, u32)) {
     let mut chars = word.char_indices().peekable();
     let Some((_, mut previous)) = chars.next() else {
@@ -494,8 +355,6 @@ fn split_word(word: &str, base: u32, sink: &mut impl FnMut(&str, u32, u32)) {
     emit(&word[start..], base + start as u32, sink);
 }
 
-/// Lowercases one subtoken into a buffer and hands it to `sink` with its
-/// range. A subtoken over [`MAX_TOKEN_BYTES`] is dropped, never half-indexed.
 fn emit(subtoken: &str, start: u32, sink: &mut impl FnMut(&str, u32, u32)) {
     if subtoken.is_empty() || subtoken.len() > MAX_TOKEN_BYTES {
         return;
@@ -513,9 +372,6 @@ fn emit(subtoken: &str, start: u32, sink: &mut impl FnMut(&str, u32, u32)) {
     sink(&buffer, start, start + subtoken.len() as u32);
 }
 
-/// Parses `query` into the clauses a search must all find. Quoted spans are
-/// phrases; unquoted words are terms or, when a word becomes several
-/// subtokens, phrases of those subtokens.
 fn parse(query: &str) -> Result<ParsedQuery, QueryRefusal> {
     if query.is_empty() || query.len() > MAX_QUERY_BYTES || query.chars().any(char::is_control) {
         return Err(QueryRefusal::Invalid);
@@ -569,8 +425,6 @@ fn parse(query: &str) -> Result<ParsedQuery, QueryRefusal> {
     Ok(ParsedQuery { clauses, subtokens })
 }
 
-/// Adds the unquoted word in `query` at `[start, end)`, when one was being
-/// collected.
 fn flush_word(
     query: &str,
     start: usize,
@@ -584,8 +438,6 @@ fn flush_word(
     Ok(())
 }
 
-/// Adds the span of `query` at `[start, end)` as one clause: every subtoken
-/// of the span, adjacent and in order.
 fn add_clause(
     query: &str,
     start: usize,
@@ -603,9 +455,6 @@ fn add_clause(
     Ok(())
 }
 
-/// What the entry `name` of `directory` is, examined without following a
-/// link: a file of so many bytes, a directory, or nothing that may be
-/// indexed.
 enum Entry {
     File { stamp: FileStamp },
     Directory,
@@ -649,9 +498,6 @@ fn entry(directory: &std::fs::File, name: &str) -> Entry {
     }
 }
 
-/// The names of a directory that a Workspace path could name, sorted, with
-/// the count of names it refused: hidden, secret-bearing, OCG-internal, or
-/// not text a path could hold. `partial` says reading stopped at the limit.
 fn names(directory: &std::fs::File, limit: usize) -> (Vec<String>, usize, Option<BuildLimit>) {
     let mut refused = 0;
     let Ok(mut entries) = Dir::read_from(directory) else {
@@ -814,8 +660,6 @@ impl WalkVisitor for Build<'_> {
     }
 }
 
-/// One build in progress: its budgets, its coverage so far, and the
-/// documents and postings it has gathered.
 struct Build<'a> {
     limits: &'a FtsLimits,
     stop: &'a AtomicBool,
@@ -831,8 +675,6 @@ struct Build<'a> {
 }
 
 impl Build<'_> {
-    /// Whether the build must end now, recording why. A stop is not a
-    /// coverage limit: a stopped build installs nothing.
     fn ended(&mut self) -> Result<(), Stopped> {
         if self.limit.is_some() {
             return Err(Stopped);
@@ -854,9 +696,6 @@ impl Build<'_> {
         }
     }
 
-    /// Indexes `directory`, at `path` and `depth` directories below the
-    /// root, in the order of its names. Every entry is examined before it is
-    /// read, and every read is within the budgets above.
     fn directory(
         &mut self,
         workspace: &Workspace,
@@ -875,8 +714,6 @@ impl Build<'_> {
         )
     }
 
-    /// Indexes the file `name` of `directory` at `path`, of `bytes` bytes as
-    /// it was examined, or counts why it was not indexed.
     fn file(
         &mut self,
         directory: &std::fs::File,
@@ -917,8 +754,6 @@ impl Build<'_> {
                 return Ok(());
             }
         };
-        // Only securely read, indexable content consumes the snapshot budget;
-        // directory metadata can be stale and excluded binary files consume none.
         if self
             .coverage
             .content_bytes_indexed
@@ -1010,10 +845,6 @@ impl Build<'_> {
     }
 }
 
-/// Walks the Workspace under `limits` until it is walked or a bound ends it,
-/// gathering one snapshot's documents and postings. A stop returns
-/// [`SearchRefusal::Stopped`] and no partial state escapes it; a bound
-/// returns an honest partial snapshot.
 fn build_index(
     fts: &WorkspaceFts,
     stop: &AtomicBool,
@@ -1079,7 +910,6 @@ fn build_index(
     Ok(index)
 }
 
-/// Which bound ended a query before it found everything it could.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueryLimit {
     Results,
@@ -1099,8 +929,6 @@ impl QueryLimit {
     }
 }
 
-/// One result record before it is serialized: the line a clause matched,
-/// what matched it, and the score of its file.
 struct Hit {
     path: String,
     line: u32,
@@ -1127,17 +955,12 @@ impl Hit {
     }
 }
 
-/// The outcome of one query over one snapshot.
 struct Answer {
     hits: Vec<Hit>,
     files_matched: usize,
     limit: Option<QueryLimit>,
 }
 
-/// Searches `index` for `query`, returning at most `limits.results` records
-/// within `budget` serialized bytes, ranked by BM25 score with the path and
-/// line breaking ties deterministically. Every bound that ends the search
-/// early is named in its result.
 fn search_index(
     index: &Index,
     query: &ParsedQuery,
@@ -1153,9 +976,6 @@ fn search_index(
     };
     let total = index.documents.len();
     let average = index.average_length();
-    // The candidates are the documents holding every subtoken of the query,
-    // each scored by the BM25 sum over those subtokens. The intersection
-    // walks the postings in ascending document order, which the build kept.
     let mut candidates: Vec<(u32, f64)> = Vec::new();
     let mut seeded = false;
     for subtoken in &query.subtokens {
@@ -1205,9 +1025,6 @@ fn search_index(
             })
         },
     );
-    // Documents are opened in rank order, and only as many as the result
-    // needs or `query_candidates` allows, so a phrase query never opens the
-    // whole Workspace's worth of candidates.
     let mut size = 0;
     let mut suppressed_lines = false;
     for (rank, (document, score)) in candidates.iter().enumerate() {
@@ -1276,8 +1093,6 @@ fn search_index(
     Ok(answer)
 }
 
-/// Whether every multi-subtoken clause has one ordered, adjacent occurrence in
-/// `document`, using only the indexed positions and no document text scan.
 fn phrases_match(
     index: &Index,
     document: u32,
@@ -1332,8 +1147,6 @@ fn phrases_match(
     Ok(true)
 }
 
-/// Every subtoken occurrence of `document`, with its line, in stream order.
-/// Phrase adjacency is over `position`, so a phrase may span lines.
 fn scan_document<'query>(
     document: &Document,
     query: &'query ParsedQuery,
@@ -1355,8 +1168,6 @@ fn scan_document<'query>(
                 interrupted = true;
                 return;
             }
-            // Keep only query terms. Positions preserve adjacency across omitted
-            // tokens, without allocating a String and line lookup for every word.
             if let Some(term) = query.subtokens.iter().find(|term| *term == lower) {
                 tokens.push(ScannedToken {
                     lower: term,
@@ -1373,18 +1184,11 @@ fn scan_document<'query>(
     Ok(Scanned { tokens })
 }
 
-/// The 1-based line holding the byte `offset`, through a document's stored
-/// line offsets.
 fn line_of(line_starts: &[u32], offset: u32) -> u32 {
     let index = line_starts.partition_point(|start| *start <= offset);
     index.saturating_sub(1) as u32
 }
 
-/// The lines of `document` its scanned tokens match: for each, how many
-/// clause occurrences matched there, its number, the byte offset of the
-/// earliest match within the line, and the distinct subtokens matched. A
-/// clause matches where its subtokens are adjacent in the stream. Lines
-/// come out in line order; the caller ranks them.
 type MatchingLine = (usize, u32, u32, Vec<String>);
 
 fn matching_lines(
@@ -1442,8 +1246,6 @@ fn matching_lines(
         .collect())
 }
 
-/// The line `line` of `document` as an excerpt: without its line end, cut to
-/// [`MAX_EXCERPT_BYTES`] at a character boundary, with whether it was cut.
 fn excerpt_of(document: &Document, line: u32, offset: u32) -> (String, bool, usize) {
     let start = document.line_starts[line as usize] as usize;
     let end = document
@@ -1452,7 +1254,6 @@ fn excerpt_of(document: &Document, line: u32, offset: u32) -> (String, bool, usi
         .map_or(document.text.len(), |next| *next as usize - 1);
     let text = &document.text[start..end];
     let text = text.strip_suffix('\r').unwrap_or(text);
-    // Leave room for the longest original subtoken, even at a late match.
     let window = if offset as usize > MAX_EXCERPT_BYTES - MAX_TOKEN_BYTES {
         text.ceil_char_boundary(
             (offset as usize).saturating_sub(MAX_EXCERPT_BYTES - MAX_TOKEN_BYTES),
@@ -1469,8 +1270,6 @@ fn excerpt_of(document: &Document, line: u32, offset: u32) -> (String, bool, usi
 }
 
 impl WorkspaceFts {
-    /// An index of `workspace` under `limits`. It holds no snapshot until
-    /// [`Self::build`] installs one.
     pub fn new(workspace: Workspace, limits: FtsLimits) -> Self {
         Self {
             workspace,
@@ -1483,33 +1282,14 @@ impl WorkspaceFts {
         self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Builds a snapshot of the Workspace now and installs it, replacing
-    /// and releasing any earlier one. A build a bound ended installs a
-    /// partial snapshot whose coverage names the bound; a cancelled build
-    /// installs nothing. This is the refresh path too: there is no
-    /// incremental indexing, so a refresh rebuilds everything.
-    ///
-    /// # Errors
-    ///
-    /// [`SearchRefusal::Access`] when the Workspace root is no longer as it
-    /// was authorized, [`SearchRefusal::Stopped`] when the build was
-    /// cancelled.
     pub fn build(&self) -> Result<BuildReport, SearchRefusal> {
         self.build_with(&AtomicBool::new(false), Instant::now() + self.limits.time)
     }
 
-    /// Replaces the installed snapshot with one built now: an explicit
-    /// refresh after files changed. The old snapshot is released when
-    /// nothing is reading it any more.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::build`].
     pub fn rebuild(&self) -> Result<BuildReport, SearchRefusal> {
         self.build()
     }
 
-    /// [`Self::build`], with the cancellation and deadline a call carries.
     fn build_with(
         &self,
         stop: &AtomicBool,
@@ -1565,15 +1345,6 @@ impl WorkspaceFts {
         Ok(report)
     }
 
-    /// Searches the installed snapshot. The Provider never names the
-    /// snapshot or the files it may see: every call searches the one OCG
-    /// built, over the whole authorized Workspace.
-    ///
-    /// # Errors
-    ///
-    /// [`SearchRefusal::Query`] when the query cannot be searched,
-    /// [`SearchRefusal::NoIndex`] when no snapshot is installed,
-    /// [`SearchRefusal::Stopped`] when the call was cancelled.
     pub fn search(&self, query: &str, results: usize) -> Result<Value, SearchRefusal> {
         self.search_with(
             query,
@@ -1583,7 +1354,6 @@ impl WorkspaceFts {
         )
     }
 
-    /// [`Self::search`], with the cancellation and deadline a call carries.
     fn search_with(
         &self,
         query: &str,
@@ -1651,16 +1421,12 @@ impl WorkspaceFts {
         Ok(value)
     }
 
-    /// The installed snapshot's generation, coverage and build time, and
-    /// nothing of its content, or `None` while none is installed.
     pub fn coverage(&self) -> Option<(u64, Coverage, SystemTime)> {
         let slot = self.lock();
         let index = slot.index.as_ref()?;
         Some((index.generation, index.coverage, index.built_at))
     }
 
-    /// Drops the installed snapshot and everything it holds. A query
-    /// already reading the snapshot finishes with it.
     pub fn dispose(&self) {
         let mut slot = self.lock();
         slot.disposed = true;
@@ -1691,8 +1457,6 @@ impl Drop for BuildLease<'_> {
     }
 }
 
-/// The result of a query: its records and limits, and the snapshot they
-/// describe, said plainly.
 fn envelope(index: &Index, answer: Answer) -> Value {
     let age = SystemTime::now()
         .duration_since(index.built_at)
@@ -1706,7 +1470,6 @@ fn envelope(index: &Index, answer: Answer) -> Value {
     })
 }
 
-/// The snapshot a result describes, and how stale it may be.
 fn index_block(index: &Index, age: Duration) -> Value {
     json!({
         "generation": index.generation,
@@ -1730,8 +1493,6 @@ fn index_block(index: &Index, age: Duration) -> Value {
     })
 }
 
-/// The parameters a search call must match exactly: the query, and bounds
-/// below [`FtsLimits`] the call may tighten.
 fn parameters() -> Value {
     json!({
         "type": "object",
@@ -1758,14 +1519,10 @@ fn parameters() -> Value {
     })
 }
 
-/// The handler of `workspace_fts_search`, bound to one authorized Workspace
-/// and one index of it. The index is built on the first call or a call that
-/// asks to refresh, and reused for every call between.
 struct FtsSearch {
     fts: Arc<WorkspaceFts>,
 }
 
-/// The parsed arguments of one call, checked again beyond the schema.
 struct Call {
     query: String,
     results: usize,
@@ -1805,9 +1562,6 @@ fn call_of(arguments: &Value) -> Result<Call, QueryRefusal> {
     })
 }
 
-/// What one blocking task does for one call: build or rebuild the snapshot
-/// when the call asks for one, then search it. A build is installed only if
-/// it finishes, so a stop leaves no half-built index behind.
 fn run_call(fts: &WorkspaceFts, call: &Call, stop: &AtomicBool) -> Result<Value, SearchRefusal> {
     let installed = fts.lock().index.is_some();
     if call.refresh || !installed {
@@ -1826,14 +1580,10 @@ impl ToolHandler for FtsSearch {
         HANDLER_VERSION
     }
 
-    /// Searching changes nothing outside OCG.
     fn effect(&self) -> ToolEffect {
         ToolEffect::ReadOnly
     }
 
-    /// Runs on the blocking pool and awaits its result. Dropping the call
-    /// signals running work to stop and leaves no index a stopped call was
-    /// building.
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         Box::pin(async move {
             let call = call_of(&arguments).map_err(refused)?;
@@ -1853,8 +1603,6 @@ impl ToolHandler for FtsSearch {
     }
 }
 
-/// Tells a call to stop when it ends without its result, as when its limit
-/// or cancellation drops it.
 struct StopOnDrop {
     stop: Arc<AtomicBool>,
     fts: Arc<WorkspaceFts>,
@@ -1879,9 +1627,6 @@ fn refused(refusal: impl std::fmt::Display) -> ToolFailure {
     ToolFailure::not_applied(refusal.to_string())
 }
 
-/// Registers `workspace_fts_search` for `workspace` in `registry`, without
-/// authorizing it. Coding executions offer it by default; its first query
-/// builds the bounded index, and refresh remains explicit.
 pub(crate) fn register(
     registry: &ToolRegistry,
     workspace: Workspace,

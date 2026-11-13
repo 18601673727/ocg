@@ -17,8 +17,6 @@ where
         }
     }
 
-    /// The global request fields frozen into the configurations this resolver
-    /// builds; without them a configuration carries only its Connection's.
     pub(crate) fn with_global_headers(mut self, global_headers: GlobalHeaders) -> Self {
         self.global_headers = global_headers;
         self

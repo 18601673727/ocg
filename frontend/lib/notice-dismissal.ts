@@ -21,9 +21,7 @@ export function isNoticeDismissed(identity: string): boolean {
         if (typeof entry === "string" && /^[a-f0-9]{64}$/.test(entry)) dismissed.add(entry);
       }
     }
-  } catch {
-    // Browser storage can be unavailable; dismissals still last for this page.
-  }
+  } catch {}
   return dismissed.has(identity);
 }
 
@@ -35,7 +33,5 @@ export function dismissNotice(identity: string): void {
       STORAGE_KEY,
       JSON.stringify([...dismissed].filter((entry) => /^[a-f0-9]{64}$/.test(entry))),
     );
-  } catch {
-    // Keep the in-memory dismissal when browser storage is unavailable.
-  }
+  } catch {}
 }

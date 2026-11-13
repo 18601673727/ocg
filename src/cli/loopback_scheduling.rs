@@ -1,62 +1,3 @@
-//! `ocg loopback-scheduling preflight --data-dir <path> [--database <id>
-//!  [--allow-job <job>]...]`
-//! `ocg loopback-scheduling serve --data-dir <path> --database <id>
-//!  --confirm-first-activation --confirm-loopback-only
-//!  [--confirm-challenge <ocg1-...>]`
-//! `ocg loopback-scheduling serve --data-dir <path> --database <id>
-//!  --confirm-queued-work --allow-job <job> [--allow-job <job>]... (1 to 16)
-//!  --confirm-loopback-only [--confirm-challenge <ocg1-...>]`
-//!
-//! The operator's explicit, per-run activation of autonomous loopback
-//! scheduling; see [`crate::system::loopback_activation`].
-//!
-//! `preflight` reads the named existing database **without opening it for
-//! writing**: no host, no worker, no `open_epoch` bump, no `clean_shutdown`
-//! change, no directory, lock file or log created, no derived index rebuilt.
-//! It prints the activation preflight report, including the challenge a
-//! `serve` of exactly this database state must be given, and exits. It arms
-//! nothing.
-//!
-//! `serve` refuses on its own read of the database whenever that read already
-//! proves a first activation impossible, so such a refusal never opens
-//! anything. Only then does it open the host, and only the preflight inside
-//! that host, under its exclusive lock, arms it.
-//!
-//! A static command line is not an authorization. The confirmation flags say
-//! what the operator intends; the challenge says which database state, opened
-//! which time, this process confirmed. The challenge covers `open_epoch`,
-//! which every opening increments, so it names one opening and cannot be
-//! reused by the next one: a unit file, alias or script that carries a
-//! challenge printed earlier is refused after any opening, including its own.
-//! When stdin is a terminal the challenge is asked for there; otherwise it
-//! must be passed with `--confirm-challenge`, and the operator has to read it
-//! from a `preflight` of the state the host is about to open.
-//!
-//! What this does not do is identify the operator, or prove that a person
-//! gave the confirmation. `preflight` prints the challenge for the state it
-//! reads, so any process able to run these commands over this data directory
-//! can obtain a fresh challenge and pass it to `serve`, and a noninteractive
-//! caller can read the expected challenge out of a refusal and retry with it.
-//! The gate therefore records a per-opening, state-bound confirmation, not
-//! human presence, and it does not stop a local wrapper from confirming and
-//! re-arming unattended. What it authorizes is a local command-execution
-//! authority: whoever can run `serve` this way could already run arbitrary
-//! commands as this user over these files.
-//!
-//! A *queued-work* activation (`--confirm-queued-work`, and `--allow-job` on
-//! `preflight` to get its challenge) is the other mode, and the two are never
-//! mixed: a command line is exactly one of them. It lets a database that holds
-//! queued work be activated again, but only when the operator names every
-//! queued Job, and every named Job is a submitted, never-started Generative
-//! Job frozen for the strict loopback policy. Any other queued Job, Delayed
-//! Job, Allocation, loop or dependency waiter refuses it, untouched. Its
-//! challenge binds the mode, the canonical allowlist and each Job's identity,
-//! revision and stored row, so a changed Job, queue or allowlist is a
-//! different challenge.
-//!
-//! Neither command creates a database. A build without the
-//! `autonomous_scheduling` control refuses `serve` before opening anything.
-
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -143,8 +84,6 @@ fn parse(arguments: &[String]) -> Result<Command, Failure> {
         }
     }
     let data_directory = data_directory.ok_or(USAGE)?;
-    // The allowlist is parsed only for a mode that has one; the two modes are
-    // never mixed.
     let allowlist = |allowed: &[String]| {
         QueuedAllowlist::parse(allowed)
             .map(ActivationMode::QueuedWork)
@@ -152,8 +91,6 @@ fn parse(arguments: &[String]) -> Result<Command, Failure> {
     };
     match verb.as_str() {
         "preflight" if !first && !queued_work && !loopback && challenge.is_none() => {
-            // A queued-work reading is asked for by naming Jobs, and needs the
-            // database it is for, like any other requested activation.
             let mode = if allowed.is_empty() {
                 ActivationMode::FirstActivation
             } else if database.is_some() {
@@ -183,9 +120,6 @@ fn parse(arguments: &[String]) -> Result<Command, Failure> {
     }
 }
 
-/// The named directory must already hold a database: a mistyped path must
-/// not become a new one, and a preflight over nothing proves nothing. Nothing
-/// here creates, chmods or otherwise touches the directory.
 fn existing(named: &Path) -> Result<DataDirectory, Failure> {
     if !named.is_dir() {
         return Err(refused(
@@ -248,7 +182,6 @@ fn run_preflight(
         },
         mode,
     });
-    // No host, no worker, no opening: a read of the file, nothing else.
     let Preflight { report, .. } = preflight(&data_directory, request.as_ref());
     print_report(&report);
     Ok(())
@@ -266,10 +199,7 @@ fn run_serve(
             &ExecutionControl::AutonomousScheduling.refusal(),
         ));
     }
-    // Refused before anything opens when it is given but invalid.
     let control = ControlPlaneConfig::from_environment()?;
-    // Refused without opening anything when the directory or the database
-    // cannot even be read read-only.
     let data_directory = existing(&named)?;
     let mut request = ActivationRequest {
         data_directory: named.clone(),
@@ -283,17 +213,12 @@ fn run_serve(
         mode,
     };
 
-    // The advisory reading: it decides nothing, but a refusal it already
-    // proves refuses here, before this process writes anything to the
-    // database or creates any directory, lock file or log.
     let mut preliminary = preflight(&data_directory, Some(&request));
     if let Some(refusal) = preliminary.refusal.take() {
         print_report(&preliminary.report);
         return Err(refused(refusal.code, &refusal.detail));
     }
 
-    // The confirmation: a challenge for exactly this state, at exactly this
-    // open_epoch, produced in this process.
     let challenge = preliminary
         .report
         .get("confirmation_challenge")
@@ -359,8 +284,6 @@ fn run_serve(
         control,
         request,
         move |report| {
-            // An armed run reports before it serves; a refusal reports after
-            // its host has stopped, with the scope it actually changed.
             if report["verdict"] == "armed" {
                 print_report(report);
             } else {
@@ -372,8 +295,6 @@ fn run_serve(
             log::info!("OCG received {signals:?}; shutting down the armed loopback host");
         },
     );
-    // The host has closed the database, so read it again: the report says
-    // what the refusal did and did not change, verified rather than assumed.
     if let Some(mut report) = captured.borrow_mut().take() {
         let reread = preflight(&data_directory, None).report;
         let unchanged = reread
@@ -389,11 +310,6 @@ fn run_serve(
     Ok(())
 }
 
-/// Asks for the challenge on the terminal. An interactive terminal is where
-/// an operator usually is; it is not proof that one is there, and this does
-/// not claim otherwise: any process can write to standard input, and the
-/// challenge, not the terminal, is what binds the confirmation to a database
-/// state and one opening.
 fn ask(challenge: &str, mode: &ActivationMode) -> Result<String, Failure> {
     if !std::io::stdin().is_terminal() {
         return Err(refused(

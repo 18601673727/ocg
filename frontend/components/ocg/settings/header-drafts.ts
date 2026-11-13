@@ -1,13 +1,10 @@
 import type { GlobalOutboundHeaders, OutboundHeader, OutboundHeaderInput } from "../contracts/api";
 
-/** One header row being edited. A stored secret's value is never loaded. */
 export type HeaderDraft = {
   key: string;
   name: string;
   secret: boolean;
-  /** Plain text, or a new secret value. Blank on a stored secret keeps it. */
   value: string;
-  /** The row names a secret already stored on the server. */
   stored: boolean;
 };
 
@@ -37,10 +34,6 @@ export type HeaderDraftError =
   | { kind: "value"; row: number }
   | { kind: "duplicate"; row: number };
 
-/**
- * The request rows for the drafts, or the first row that cannot be sent. The
- * server validates again; this only keeps an obvious mistake off the wire.
- */
 export function draftsToInputs(
   drafts: readonly HeaderDraft[],
 ): { inputs: OutboundHeaderInput[] } | { error: HeaderDraftError } {

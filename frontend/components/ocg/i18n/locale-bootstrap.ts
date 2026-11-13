@@ -1,9 +1,5 @@
 import { DEFAULT_LOCALE, LOCALE_STORAGE_KEY } from "./locale";
 
-/**
- * Applies the stored locale to <html lang> before first paint, mirroring the
- * theme bootstrap. Plain JS inlined into HTML; resolvers stay in locale.ts.
- */
 export const LOCALE_BOOTSTRAP_SCRIPT = `(function () {
   try {
     var stored = ${JSON.stringify(LOCALE_STORAGE_KEY)};

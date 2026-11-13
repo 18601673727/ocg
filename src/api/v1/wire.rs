@@ -1,13 +1,11 @@
 use super::contracts::*;
 use super::*;
 
-/// A refused or failed request: its status and a fixed code and message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Refusal {
     pub(super) status: StatusCode,
     pub(super) code: &'static str,
     pub(super) message: &'static str,
-    /// The methods a `405` names.
     pub(super) allow: &'static str,
     reason: Option<std::sync::Arc<str>>,
 }
@@ -61,8 +59,6 @@ impl Refusal {
     }
 }
 
-/// An answered request: its status and JSON body, and a cookie when the
-/// answer signs a browser in or out.
 pub(crate) struct Reply {
     pub(super) status: StatusCode,
     pub(super) body: Value,
@@ -191,8 +187,6 @@ pub(crate) const INTERNAL: Refusal = Refusal::new(
 );
 
 impl From<DatabaseError> for Refusal {
-    /// A failed read never says what failed inside, and never becomes a
-    /// Job state.
     fn from(error: DatabaseError) -> Self {
         match error {
             DatabaseError::ReadQueueFull => DATABASE_BUSY,
@@ -244,8 +238,6 @@ pub(super) fn bounded_json(body: &Value, limit: usize) -> Result<Vec<u8>, Refusa
     Ok(output.bytes)
 }
 
-/// Answers one request: refuses it unless it passes every check, in order,
-/// then routes it.
 pub(super) async fn answer(
     request: HttpRequest,
     payload: web::types::Payload,
@@ -309,8 +301,6 @@ pub(super) async fn answer(
     }
 }
 
-/// A submission's body is declared JSON, with exactly one length, and no
-/// larger than `limit`, before any of it is read.
 pub(super) fn submission_body(headers: &HeaderMap, limit: usize) -> Result<(), Refusal> {
     let mut lengths = headers.get_all(header::CONTENT_LENGTH);
     let length = match (lengths.next(), lengths.next()) {
@@ -341,7 +331,6 @@ pub(super) fn submission_body(headers: &HeaderMap, limit: usize) -> Result<(), R
     }
 }
 
-/// The body, whole, refused once it exceeds `limit` bytes.
 pub(super) async fn read_body(
     mut payload: web::types::Payload,
     limit: usize,
@@ -357,7 +346,6 @@ pub(super) async fn read_body(
     Ok(body)
 }
 
-/// The only value of `name`, if it has exactly one.
 pub(super) fn single<'a>(
     headers: &'a HeaderMap,
     name: &header::HeaderName,

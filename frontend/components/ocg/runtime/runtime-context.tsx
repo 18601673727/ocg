@@ -49,7 +49,6 @@ export function OcgRuntimeProvider({
     const retained = leases.current;
     retained.set(client, token);
     return () => {
-      // StrictMode reattaches the same client before this microtask runs.
       queueMicrotask(() => {
         if (retained.get(client) !== token) return;
         retained.delete(client);

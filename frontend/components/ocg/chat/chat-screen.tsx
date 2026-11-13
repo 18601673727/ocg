@@ -76,8 +76,6 @@ const ChatComposerSlot: FC = () => {
         setModel("error");
       });
     return () => abort.abort();
-    // A submitted new conversation keeps this Composer mounted; its context is
-    // rebound by the Composer after confirmation.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [control, sessionId]);
   if (!value) return null;

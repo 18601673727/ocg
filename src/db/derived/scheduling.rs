@@ -13,7 +13,6 @@ pub(crate) enum JobActivityPhase {
     RunningTools,
     WaitingForUser,
     RateLimited,
-    // Part of the generated wire contract; native Jobs never plan tasks.
     #[allow(dead_code)]
     RunningTasks,
     #[allow(dead_code)]

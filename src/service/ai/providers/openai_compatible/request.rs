@@ -1,8 +1,3 @@
-//! OpenAI Chat Completions request parsing.
-//!
-//! Strict request validation for the OpenAI Chat Completions wire format.
-//! Unknown fields are rejected on deserialization.
-
 use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,8 +8,6 @@ use super::error::TransportError;
 use super::image::{self, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES};
 use super::stream::{CompletedToolCall, InvalidToolCall, ToolCallRefusal};
 
-/// An OpenAI Chat Completions request, restricted to the fields this transport
-/// explicitly forwards. Unknown fields are rejected on deserialization.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatRequest {
@@ -73,35 +66,18 @@ pub struct ChatRequest {
 }
 
 impl ChatRequest {
-    /// Deserialize a request body. Performs no network I/O.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::InvalidRequest`] when the body does not match
-    /// the supported OpenAI Chat Completions contract.
     pub fn from_json(body: Value) -> Result<Self, TransportError> {
         serde_json::from_value(body).map_err(|error| {
             TransportError::invalid("request", format!("could not parse chat request: {error}"))
         })
     }
 
-    /// Deserialize a request body from bytes. Performs no network I/O.
-    ///
-    /// # Errors
-    ///
-    /// See [`ChatRequest::from_json`].
     pub fn from_slice(body: &[u8]) -> Result<Self, TransportError> {
         serde_json::from_slice(body).map_err(|error| {
             TransportError::invalid("request", format!("could not parse chat request: {error}"))
         })
     }
 
-    /// Validate every field before dispatch.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed [`TransportError`] for the first unsupported or invalid
-    /// field.
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.model.trim().is_empty() {
             return Err(TransportError::invalid("model", "model must not be empty"));
@@ -159,10 +135,6 @@ impl ChatRequest {
     }
 }
 
-/// The conversation part of one outgoing Chat Completions request: its
-/// messages, in order, and the function tools offered with them. The model
-/// and sampling parameters are deliberately absent; they come from the
-/// frozen execution configuration and nothing here can change them.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatConversation {
     #[serde(skip)]
@@ -178,22 +150,11 @@ pub struct ChatConversation {
     pub tool_choice: Option<ToolChoiceWire>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
-    /// The requested response shape for this turn; model text is kept verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormatWire>,
 }
 
 impl ChatConversation {
-    /// Validates the conversation before it is sent: every message and tool
-    /// definition, their limits, its images and their total, and the
-    /// tool-call structure. Each assistant
-    /// tool call has a unique id and is answered by exactly one tool message,
-    /// and those answers follow it before any other message.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed [`TransportError`] for the first invalid or
-    /// unsupported field.
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.messages.is_empty() {
             return Err(TransportError::invalid(
@@ -299,9 +260,6 @@ impl ChatConversation {
         self.tools.iter().any(|tool| tool.function.name == name)
     }
 
-    /// Whether any message carries an image part. A conversation that once
-    /// did keeps doing so in every continuation that resends it, tool turns
-    /// included.
     #[must_use]
     pub fn carries_images(&self) -> bool {
         self.messages.iter().any(|message| {
@@ -310,26 +268,6 @@ impl ChatConversation {
         })
     }
 
-    /// Admits the completed tool calls a Provider returned for this
-    /// conversation only as far as this request allowed them. Each call must
-    /// name exactly one function tool offered here, under that exact name;
-    /// none is admitted with `tool_choice: none`, only the named function
-    /// when one was forced, and one call at most when parallel calls were
-    /// turned off. Its arguments must then be one strict JSON object that
-    /// satisfies the parameter schema offered for that function; a function
-    /// offered without one admits no call. Nothing the Provider sent, not a
-    /// name, a definition or an argument, widens what is admitted, and no
-    /// call is changed to fit.
-    ///
-    /// Admission is scoped to this request and is not permission to execute
-    /// a call: whatever executes one must still check it against OCG's own
-    /// tool registry, policies and effective permissions.
-    ///
-    /// # Errors
-    ///
-    /// Returns every answerable refusal of the response, one per call,
-    /// ordered by index. An invalid offer, schema or response-wide
-    /// constraint stays an error.
     pub fn admit_tool_calls(
         &self,
         calls: &[CompletedToolCall],
@@ -344,15 +282,10 @@ impl ChatConversation {
                 ),
             ));
         }
-        // The assembler's per-call refusals, by wire index. A name this
-        // request did not allow replaces one; an offered and chosen call
-        // keeps its own.
         let mut assembled: std::collections::BTreeMap<u32, InvalidToolCall> = assembled
             .into_iter()
             .filter_map(|refusal| refusal.index.map(|index| (index, refusal)))
             .collect();
-        // Each offered function's schema is compiled once, when a call first
-        // names it.
         let mut validators: Vec<Option<Validator>> = self.tools.iter().map(|_| None).collect();
         let mut refused = Vec::new();
         for call in calls {
@@ -416,7 +349,6 @@ impl ChatConversation {
     }
 }
 
-/// OpenAI `stream_options`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamOptions {
@@ -424,7 +356,6 @@ pub struct StreamOptions {
     pub include_usage: Option<bool>,
 }
 
-/// OpenAI `stop`: either one string or an array of strings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum StopSequences {
@@ -442,7 +373,6 @@ impl StopSequences {
     }
 }
 
-/// One message in the request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
@@ -455,8 +385,6 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ChatToolCallWire>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// Forwarded only when set: some Providers require an assistant turn's
-    /// reasoning back with its tool calls, others refuse it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -492,7 +420,6 @@ impl ChatMessage {
         }
     }
 
-    /// A user turn of content parts, in order: text, images, or both.
     #[must_use]
     pub fn user_parts(parts: Vec<ContentPartWire>) -> Self {
         Self {
@@ -501,8 +428,6 @@ impl ChatMessage {
         }
     }
 
-    /// An assistant turn, as a Provider returned it: its text, if any, and
-    /// the tool calls it made, if any.
     #[must_use]
     pub fn assistant(content: Option<String>, tool_calls: Vec<ChatToolCallWire>) -> Self {
         Self {
@@ -512,7 +437,6 @@ impl ChatMessage {
         }
     }
 
-    /// The result of the tool call `tool_call_id`.
     #[must_use]
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -523,7 +447,6 @@ impl ChatMessage {
     }
 }
 
-/// The images a request's messages carry so far.
 #[derive(Default)]
 struct ImageTally {
     count: usize,
@@ -651,8 +574,6 @@ impl ChatMessage {
         content.to_text_parts(field)
     }
 
-    /// A user message's content: text, or parts of text and images. Each
-    /// image is checked, and counted toward the request's image limits.
     fn require_user_content(
         &self,
         field: &str,
@@ -708,7 +629,6 @@ impl ChatMessage {
     }
 }
 
-/// Message role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatRole {
@@ -720,7 +640,6 @@ pub enum ChatRole {
     Function,
 }
 
-/// Message content: a string or an array of content parts.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum MessageContentWire {
@@ -760,9 +679,6 @@ impl MessageContentWire {
     }
 }
 
-/// A supported content part: text, or, in a user message, an image as an
-/// inline `data:` URL, see [`super::image`]. Other parts (audio, files) are
-/// rejected during deserialization.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContentPartWire {
@@ -770,8 +686,6 @@ pub enum ContentPartWire {
     ImageUrl { image_url: ImageUrlWire },
 }
 
-/// The image of an `image_url` part. Only its URL is forwarded; its `Debug`
-/// never shows the URL, which carries the whole image.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ImageUrlWire {
@@ -796,7 +710,6 @@ impl std::fmt::Debug for ImageUrlWire {
     }
 }
 
-/// One tool definition.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolWire {
@@ -832,21 +745,13 @@ impl ToolWire {
     }
 }
 
-/// Most tools one request may offer.
 pub const MAX_TOOLS: usize = 128;
-/// Most tool calls one assistant message or one streamed response may carry.
 pub const MAX_TOOL_CALLS: usize = 128;
-/// Longest function name, as the OpenAI function-calling contract allows.
 pub const MAX_FUNCTION_NAME_BYTES: usize = 64;
-/// Longest tool call id.
 pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
-/// Largest compact serialization of one function definition.
 pub const MAX_TOOL_DEFINITION_BYTES: usize = 64 * 1024;
-/// Largest serialized arguments of one tool call.
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
 
-/// Whether `name` is a function name of the OpenAI contract: 1 to 64 ASCII
-/// letters, digits, underscores or dashes.
 #[must_use]
 pub fn is_function_name(name: &str) -> bool {
     (1..=MAX_FUNCTION_NAME_BYTES).contains(&name.len())
@@ -855,8 +760,6 @@ pub fn is_function_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
-/// Requires a valid function name. `field` names the owning tool entry
-/// and is used to build the error path `{field}.function.name`.
 fn require_function_name(name: &str, field: &str) -> Result<(), TransportError> {
     if !is_function_name(name) {
         return Err(TransportError::invalid(
@@ -869,8 +772,6 @@ fn require_function_name(name: &str, field: &str) -> Result<(), TransportError> 
     Ok(())
 }
 
-/// Whether the compact JSON of `value` fits in `limit` bytes. Counting stops
-/// at the limit, so an oversized value is never serialized in full.
 fn serializes_within(value: &impl Serialize, limit: usize) -> bool {
     struct Budget(usize);
 
@@ -891,7 +792,6 @@ fn serializes_within(value: &impl Serialize, limit: usize) -> bool {
     serde_json::to_writer(Budget(limit), value).is_ok()
 }
 
-/// A function tool definition.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FunctionDefinitionWire {
@@ -904,13 +804,10 @@ pub struct FunctionDefinitionWire {
     pub strict: Option<bool>,
 }
 
-/// One tool call in an assistant message.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatToolCallWire {
     pub id: String,
-    /// Optional when read; validation admits only `function`, which is
-    /// always written, as the outgoing contract requires it.
     #[serde(rename = "type", default, serialize_with = "function_type")]
     pub tool_type: Option<String>,
     pub function: ChatFunctionCallWire,
@@ -924,7 +821,6 @@ fn function_type<S: serde::Serializer>(
 }
 
 impl From<&CompletedToolCall> for ChatToolCallWire {
-    /// The call as an assistant message carries it back, arguments unchanged.
     fn from(call: &CompletedToolCall) -> Self {
         Self {
             id: call.id.clone(),
@@ -974,8 +870,6 @@ impl ChatToolCallWire {
     }
 }
 
-/// A function call in an assistant message. `arguments` is the serialized
-/// JSON exactly as it was received, never re-encoded.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatFunctionCallWire {
@@ -1027,7 +921,6 @@ fn validate_tool_choice(choice: &ToolChoiceWire) -> Result<(), TransportError> {
     }
 }
 
-/// OpenAI `tool_choice`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ToolChoiceWire {
@@ -1049,7 +942,6 @@ pub struct NamedFunctionWire {
     pub name: String,
 }
 
-/// OpenAI `response_format`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ResponseFormatWire {

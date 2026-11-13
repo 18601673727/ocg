@@ -2,8 +2,6 @@ use super::*;
 use crate::db::entities::JobClosing;
 
 impl Batch {
-    /// A system conversation holds one turn and closes when that turn
-    /// ends. Native conversations close through their own rules.
     pub(crate) fn turn_ended(&mut self, turn: JobId) -> Result<(), BatchError> {
         let row = self.require_job(turn)?;
         if !row.kind.is_persistent() {

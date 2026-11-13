@@ -368,7 +368,6 @@ function TurnToolCalls({
   );
 }
 
-/** One Job as its objective and answer; see `jobTranscript` for what each is made of. */
 export function JobTranscript({
   turns,
   jobId,

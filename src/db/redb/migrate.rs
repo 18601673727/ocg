@@ -1,21 +1,3 @@
-//! The offline migration framework. Format 1 is the first database format, so
-//! no migration step exists yet: [`STEPS`] is empty, and the framework refuses
-//! any format but the current one with that reason.
-//!
-//! The framework is what a future format change plugs into. `ocg migrate`
-//! inspects a stopped database read-only, copies the data directory to a
-//! private staging directory, applies the one [`Step`] that reads the source's
-//! format to the copy in a single write transaction, verifies the result
-//! against the source, and publishes it with an atomic no-replace rename. The
-//! source is opened read-only and never modified.
-//!
-//! A step is verified by logical identity: [`digest_tables`] hashes every row of
-//! every table, and the migrated copy must hash exactly like the source. That
-//! suits an additive step. A step that adds tables or rewrites rows must extend
-//! [`digest_tables`] and the comparison in [`apply`] to say what changed.
-//!
-//! Any other format is refused rather than reinterpreted.
-
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -25,29 +7,15 @@ use super::*;
 
 type StepResult = Result<(), Box<dyn std::error::Error>>;
 
-/// One migration step: it reads format [`Step::from`] and writes the current
-/// format. The framework runs exactly one step; a chain of formats is a
-/// chain of `ocg migrate` runs.
 pub(super) struct Step {
-    /// The format this step reads.
     pub(super) from: u64,
-    /// The schema fingerprint the source must carry.
     pub(super) fingerprint: &'static [u8],
-    /// Read-only checks of the source, including its own record encoding: the
-    /// source's records are not the current format's, so the framework reads
-    /// none of them.
     pub(super) check: fn(&ReadTransaction, &BTreeSet<String>) -> StepResult,
-    /// Applies the change to the private copy, inside the one write transaction
-    /// that also writes the new format marker and fingerprint.
     pub(super) apply: fn(&::redb::WriteTransaction) -> StepResult,
 }
 
-/// Every migration this build can run. Empty: format 1 is the first format.
 pub(super) const STEPS: &[Step] = &[];
 
-/// The logical identity of every authoritative row in a database. Two
-/// databases with equal digests hold exactly the same rows; table pages, free
-/// space and file layout are deliberately excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MigrationDigest {
     tables: [u8; 32],
@@ -56,11 +24,8 @@ pub(super) struct MigrationDigest {
     pub(super) tables_count: u64,
 }
 
-/// What `--check` found.
 pub(crate) enum MigrationInspection {
-    /// Already this build's format; nothing to do.
     Current,
-    /// A format a [`Step`] reads, with a verified logical snapshot.
     Upgrade(MigrationPlan),
 }
 
@@ -72,7 +37,6 @@ pub(crate) struct MigrationPlan {
 }
 
 impl MigrationPlan {
-    /// Logical tables and rows that must survive unchanged.
     pub(crate) fn tables(&self) -> u64 {
         self.digest.tables_count
     }
@@ -82,18 +46,10 @@ impl MigrationPlan {
     }
 }
 
-/// Inspects `path` read-only. A running host holds the write lock, so this
-/// reports redb's `Database already open` instead of reading under it. The
-/// handle is released on return; use [`HeldSource`] for a source that must stay
-/// excluded from writers.
 pub(crate) fn inspect(path: &Path) -> Result<MigrationInspection, Box<dyn std::error::Error>> {
     HeldSource::open(path)?.inspect()
 }
 
-/// A source database opened read-only and kept open. redb's file lock is
-/// shared while the handle lives, so no writer can open the file between
-/// inspection, copy, verification and publication. The caller also holds the
-/// data directory's host lock for the same span.
 pub(crate) struct HeldSource(::redb::ReadOnlyDatabase);
 
 impl HeldSource {
@@ -104,7 +60,6 @@ impl HeldSource {
         Ok(Self(::redb::ReadOnlyDatabase::open(path)?))
     }
 
-    /// Reads the held source again, in a new read transaction.
     pub(crate) fn inspect(&self) -> Result<MigrationInspection, Box<dyn std::error::Error>> {
         inspect_database(&self.0)
     }
@@ -152,9 +107,6 @@ fn inspect_database(
     }))
 }
 
-/// Applies the plan to the private copy at `path` in one immediate write
-/// transaction, then verifies that every logical row, every metadata value
-/// other than the two identity markers, and the table set are unchanged.
 pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std::error::Error>> {
     let step = STEPS
         .iter()
@@ -192,10 +144,6 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
         let meta = tx.open_table(META)?;
         check_metadata(&meta)?;
     }
-    // Not merely the marker: the checks a host's startup preflight applies,
-    // plus every record header and native invariant. The copy is read, never
-    // opened by a host, so no epoch or shutdown marker changes and no ownership
-    // is released, adopted or cleared.
     recovery::verify_migrated(&database)?;
     Ok(())
 }
@@ -262,7 +210,6 @@ fn check_metadata(
     Ok(())
 }
 
-/// Every table the current format defines.
 fn require_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Error>> {
     for required in [
         "meta",
@@ -569,10 +516,6 @@ fn digest_tables(
     })
 }
 
-/// One length-prefixed, domain-tagged field of the logical digest. Raw keys and
-/// values are arbitrary bytes, so a separator byte could not delimit them: the
-/// explicit length makes every framing unambiguous. The digest is internal and
-/// never stored.
 fn frame(hash: &mut Context, domain: u8, bytes: &[u8]) {
     hash.update(&[domain]);
     hash.update(&(bytes.len() as u64).to_le_bytes());

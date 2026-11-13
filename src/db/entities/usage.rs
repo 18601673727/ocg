@@ -1,62 +1,24 @@
-//! Request-level Token usage evidence: a pure reducer from Metrics records,
-//! plus two facts those records do not store, to one derived sample per
-//! request.
-//!
-//! Nothing here is scheduled or read from the database. The reducer needs, for
-//! every record, whether its request was ever issued ([`RequestEligibility`])
-//! and whether its counters are cumulative or final ([`UsageFinality`]).
-//! Neither can be inferred from a Job's outcome, its Profile, an HTTP status,
-//! a finish reason or an availability class. A producer states them in a
-//! [`TokenAnnotation`] stored with the Metrics record; a record without one
-//! carries no trusted Token contract and is never treated as eligible, excluded
-//! or final.
-//!
-//! The evidence keeps one small record per Token field (a cumulative maximum
-//! and a final candidate), never the observation history, so replay in any
-//! order, or with duplicates, reaches the same sample.
-
 use super::{JobId, MetricsId, MetricsRecord, MixedRequests, RequestNumber, RequestRef, Timestamp};
 
-/// Whether a request was ever issued to an LLM Provider. It is a trusted
-/// input of the caller. It is per request, so the records of one request
-/// may not disagree about it; two requests of one Job may.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestEligibility {
-    /// The request was issued or may have been delivered. It stays eligible
-    /// if it later timed out, was cancelled or has an Unknown Job outcome.
     Eligible,
-    /// Known pre-send rejection or local-only work: no request was sent.
     Excluded,
 }
 
-/// What a record's counters mean. It is a trusted input of the caller and is
-/// per record: every counter the record reports has this meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageFinality {
-    /// Running totals so far, which a later report may supersede.
     Cumulative,
-    /// The request's final counts for each counter the record reports. A
-    /// counter the record omits is not reported, not zero and not final.
     Final,
 }
 
-/// The Token facts a producer states about one Metrics record, stored with
-/// it. They are the producer's trusted knowledge of delivery and of what its
-/// counters mean, never derived from a Job's outcome or any response fact.
-///
-/// An [`Excluded`](RequestEligibility::Excluded) annotation says the request
-/// was positively known never to have been sent. It reports no usage and its
-/// finality is always [`Cumulative`](UsageFinality::Cumulative), so one fact
-/// has one representation; [`TokenAnnotation::excluded`] builds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TokenAnnotation {
     pub eligibility: RequestEligibility,
-    /// What every counter this record reports means.
     pub finality: UsageFinality,
 }
 
 impl TokenAnnotation {
-    /// The request was positively known not to have been sent.
     #[must_use]
     pub const fn excluded() -> Self {
         Self {
@@ -65,8 +27,6 @@ impl TokenAnnotation {
         }
     }
 
-    /// The request was issued or may have been delivered, and the record's
-    /// counters, if any, have the given finality.
     #[must_use]
     pub const fn eligible(finality: UsageFinality) -> Self {
         Self {
@@ -76,8 +36,6 @@ impl TokenAnnotation {
     }
 }
 
-/// One Metrics record with the facts it does not store. The record is only
-/// read; its raw values are not copied.
 #[derive(Clone, Copy, Debug)]
 pub struct TokenObservation<'a> {
     pub metrics: &'a MetricsRecord,
@@ -86,8 +44,6 @@ pub struct TokenObservation<'a> {
 }
 
 impl<'a> TokenObservation<'a> {
-    /// The observation a stored record states; none for a record without a
-    /// Token annotation.
     #[must_use]
     pub fn from_record(metrics: &'a MetricsRecord) -> Option<Self> {
         let annotation = metrics.token?;
@@ -99,33 +55,23 @@ impl<'a> TokenObservation<'a> {
     }
 }
 
-/// Why records could not be reduced to one request.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TokenEvidenceError {
     #[error("{0}")]
     MixedRequests(MixedRequests),
-    /// Records of one request disagree whether it was issued. No delivery
-    /// report is preferred over another.
     #[error("records of {0} disagree on whether it was issued")]
     ContradictoryEligibility(RequestRef),
 }
 
-/// What is known of one Token counter of a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenCount {
-    /// No record reported the counter.
     Missing,
-    /// No final value yet: the largest cumulative value reported.
     Provisional(u32),
-    /// A final value. It wins over every cumulative value, larger or later.
     Final(u32),
-    /// Two different final values were reported. The counter has no value;
-    /// neither candidate nor the cumulative maximum stands in for it.
     Conflicted,
 }
 
 impl TokenCount {
-    /// The count when one is known, final or provisional.
     #[must_use]
     pub fn value(self) -> Option<u32> {
         match self {
@@ -135,25 +81,13 @@ impl TokenCount {
     }
 }
 
-/// How much of a request's core usage (input and output) is established.
-///
-/// It is separate from the counters' own states: a conflicted counter is
-/// visible there, and this only says the core is not yet Complete. Detail
-/// counters (cache, reasoning) never affect it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TokenUsageState {
-    /// No counter of any kind was reported.
     Missing,
-    /// Something was reported, but input and output are not both final.
-    /// That covers cumulative-only values, an absent core counter, a core
-    /// conflict, and detail counters alone.
     Incomplete,
-    /// Input and output both have a final, non-conflicting count.
     Complete,
 }
 
-/// The evidence of one counter. Two distinct finals collapse into a conflict
-/// that later repetitions cannot clear.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FieldEvidence {
     pub(crate) cumulative_max: Option<u32>,
@@ -195,21 +129,14 @@ impl FieldEvidence {
     }
 }
 
-/// The claims the observations of one request have made so far. It keeps
-/// claims, not observations, so the order and repetition of the feed do not
-/// matter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TokenEvidence {
     request: Option<(RequestRef, RequestEligibility)>,
-    /// The lowest Metrics ID of an eligible record, with its observed time.
-    /// An eligible record anchors it even when it reports no usage.
     first: Option<(MetricsId, Timestamp)>,
     counters: [FieldEvidence; 5],
 }
 
 impl TokenEvidence {
-    /// Adds one observation. On an error nothing is added; the feed is then
-    /// not one request and the caller must not use the evidence.
     pub fn add(&mut self, observation: TokenObservation<'_>) -> Result<(), TokenEvidenceError> {
         let record = observation.metrics;
         let request = RequestRef {
@@ -248,7 +175,6 @@ impl TokenEvidence {
         Ok(())
     }
 
-    /// The request's sample; none when no eligible record was added.
     #[must_use]
     pub fn sample(&self) -> Option<TokenRequestSample> {
         let (request, _) = self.request?;
@@ -285,16 +211,11 @@ impl TokenEvidence {
     }
 }
 
-/// The derived view of one eligible Provider request. It is computed, never
-/// stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenRequestSample {
     pub job: JobId,
     pub request: RequestNumber,
-    /// The lowest Metrics ID among the request's eligible records.
     pub first_metrics: MetricsId,
-    /// `observed_at` of that record: the sample's time. Later or backdated
-    /// records of the request do not move it, and neither does `recorded_at`.
     pub observed_at: Timestamp,
     pub usage: TokenUsageState,
     pub input: TokenCount,
@@ -302,18 +223,10 @@ pub struct TokenRequestSample {
     pub cache_read: TokenCount,
     pub cache_write: TokenCount,
     pub reasoning: TokenCount,
-    /// Input plus output, exact, when both have a value (final or
-    /// provisional); otherwise unknown. Detail counts are not included. A
-    /// total from provisional values says nothing about completeness: see
-    /// [`usage`](Self::usage).
     pub total: Option<u64>,
 }
 
 impl TokenRequestSample {
-    /// Reduces the stored Metrics records of one request, in any order.
-    /// Records without a Token annotation carry no trusted contract and are
-    /// skipped, so they neither make nor exclude a request. Records of
-    /// several requests are refused; see [`Self::per_request`].
     pub fn from_metrics<'a>(
         records: impl IntoIterator<Item = &'a MetricsRecord>,
     ) -> Result<Option<Self>, TokenEvidenceError> {
@@ -324,9 +237,6 @@ impl TokenRequestSample {
         )
     }
 
-    /// Reduces the observations of one request, in any order. The result
-    /// depends only on the set of observations. Empty input, and input with
-    /// no eligible observation, is no sample.
     pub fn from_observations<'a>(
         observations: impl IntoIterator<Item = TokenObservation<'a>>,
     ) -> Result<Option<Self>, TokenEvidenceError> {
@@ -337,9 +247,6 @@ impl TokenRequestSample {
         Ok(evidence.sample())
     }
 
-    /// Reduces the stored Metrics records of one Job's requests, in any
-    /// order, to one sample per eligible request, ordered by request. Each
-    /// request is reduced on its own; nothing crosses from one to another.
     pub fn per_request<'a>(
         records: impl IntoIterator<Item = &'a MetricsRecord>,
     ) -> Result<Vec<Self>, TokenEvidenceError> {
@@ -370,14 +277,8 @@ impl TokenRequestSample {
     }
 }
 
-/// The width of one usage summary bucket: one hour. A summary rounds its
-/// lower bound down to a bucket and its upper bound up, so the buckets it
-/// covers are those an instant in `[from_us, until_us)` falls in.
 pub const USAGE_SUMMARY_HOUR_MICROS: i64 = 3_600_000_000;
 
-/// One aggregated row in a token usage summary breakdown. `agent` is 0 for
-/// work submitted without an Agent; the route reports it as `<profile-uuid>` or
-/// `null`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummaryRow {
     pub agent: u128,
@@ -392,12 +293,6 @@ pub struct UsageSummaryRow {
     pub reasoning_tokens: u64,
 }
 
-/// One aggregated row in a usage summary retry breakdown. The grouping
-/// matches [`UsageSummaryRow`]: `agent` is 0 for work submitted without an
-/// Agent, and `bucket_us` is the requested day or week bucket start. A page
-/// can return the same key more than once across pages, so a consumer sums
-/// `retries` by `(bucket_us, agent, provider, model)` to obtain the exact
-/// count.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageRetryRow {
     pub bucket_us: i64,
@@ -407,9 +302,6 @@ pub struct UsageRetryRow {
     pub retries: u64,
 }
 
-/// A position in the usage totals: the last source row a page examined.
-/// Continuing strictly after it reads every remaining row exactly once, even
-/// inside one dense hour or chart bucket.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -420,10 +312,6 @@ pub struct UsageCursor {
     pub model_hash: [u8; 32],
 }
 
-/// The aggregated token usage summary response. `complete` says the scan
-/// reached the end of the requested range; `resume_after` is set exactly
-/// when it did not. A page can hold partial aggregates for groups that the
-/// next page continues, so a consumer merges rows by their group key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummaryResponse {
     pub from_us: i64,
@@ -433,7 +321,6 @@ pub struct UsageSummaryResponse {
     pub rows: Vec<UsageSummaryRow>,
 }
 
-/// Optional filters for querying usage summaries.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummaryFilter {
     pub from_us: Option<i64>,
@@ -487,9 +374,6 @@ pub struct UsageBucketRow {
     pub row: UsageSummaryRow,
 }
 
-/// One page of chart buckets. As with [`UsageSummaryResponse`], a page can
-/// hold partial aggregates and `resume_after` continues strictly after the
-/// last source row examined.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UsageBucketResponse {
     pub from_us: i64,

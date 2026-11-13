@@ -1,5 +1,3 @@
-/** Import frontend view models and checked Control Plane projections here. */
-
 export type {
   ChatImage,
   ChatImageUploadRequest,
@@ -45,6 +43,5 @@ export type ChatModelSelection = import("./view-models").ChatModelSelection & {
   agentProfile?: string;
   llmProfile?: string;
   executor?: string;
-  // The Project of a conversation's first turn; chosen only for an Agent with a Workspace grant.
   project?: string;
 };

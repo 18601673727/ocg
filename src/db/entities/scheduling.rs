@@ -2,8 +2,6 @@ use super::*;
 
 pub const GLOBAL_EXECUTION_LIMIT: u8 = 16;
 
-/// A Pool configuration for the independent allocation model. The legacy
-/// scheduler does not use this type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllocationPool {
     pub id: ExecutionPoolId,
@@ -14,7 +12,6 @@ pub struct AllocationPool {
     pub revision: u32,
 }
 
-/// An execution resource belongs to one Pool and can hold one allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllocationExecutor {
     pub id: ExecutorId,
@@ -26,17 +23,13 @@ pub struct AllocationExecutor {
     pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
 }
 
-/// The one configuration change an Executor update applies. Identity and Pool
-/// ownership are never changed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutorUpdate {
     Enabled(bool),
     Name(String),
-    /// The complete capability set, replacing the previous one.
     Capabilities(BTreeSet<(ExecutionOperation, Option<LlmTransport>)>),
 }
 
-/// A generation identifies ownership; it is not a separate executable unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllocationToken {
     pub job: JobId,
@@ -62,11 +55,7 @@ pub struct PoolAllocation {
     pub request_after: Option<DevelopmentReadyCursor>,
     pub job_revision: u64,
     pub phase: AllocationPhase,
-    /// When the Executor was reserved for the Job. Not the start of execution.
     pub claimed_at: Timestamp,
-    /// When the checked start committed, the only moment an Allocation becomes
-    /// Running. Absent while Reserved, and for a Reservation that ended or
-    /// became Uncertain without a start.
     pub started_at: Option<Timestamp>,
     pub host_id: Option<String>,
     pub boot_id: Option<String>,
@@ -78,25 +67,15 @@ pub struct PoolAllocation {
     pub stop_proof: Option<StopProof>,
 }
 
-/// Why a Job was ended while its Allocation was still only Reserved, before
-/// any execution authority existed. Nothing was sent to a Provider.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnstartedCause {
-    /// A credential the Job's frozen configuration names was deleted, or
-    /// replaced since the Job was read for handoff.
     FrozenSecretUnavailable,
-    /// The Job's input, attachments or context cannot be prepared safely.
     InputUnavailable,
-    /// The checked start refused the Job for another reason.
     StartRefused,
-    /// The process that reserved the Job stopped before the checked start
-    /// committed, and an offline reconciliation ended the untouched
-    /// reservation.
     OfflineReconciled,
 }
 
 impl UnstartedCause {
-    /// The typed failure code stored with the Job's Result.
     pub fn code(self) -> &'static str {
         match self {
             Self::FrozenSecretUnavailable => "frozen_secret_unavailable",
@@ -137,11 +116,9 @@ impl PoolAllocation {
     }
 }
 
-/// An opaque continuation through the development model's ordered ready index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DevelopmentReadyCursor(pub(crate) (u8, i64, u128, u16));
 
-/// An internal allocator request. Its ID is correlation data, not a credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DevelopmentReservationRequest {
     pub id: ReservationRequestId,
@@ -150,8 +127,6 @@ pub struct DevelopmentReservationRequest {
     pub after: Option<DevelopmentReadyCursor>,
 }
 
-/// A non-cloneable first-attempt permit binds the request before submission.
-/// It is not an authorization credential.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DevelopmentFreshReservation {
     request: DevelopmentReservationRequest,
@@ -174,7 +149,6 @@ impl DevelopmentFreshReservation {
         }
     }
 
-    /// Persist this request before consuming the permit if it must survive a crash.
     pub(crate) fn request(&self) -> DevelopmentReservationRequest {
         self.request
     }
@@ -184,66 +158,37 @@ impl DevelopmentFreshReservation {
     }
 }
 
-/// Which ready Jobs one reservation pass may take. The selection is not
-/// stored: the Allocation a pass makes is the same row whichever selected it.
 #[derive(Clone, Copy, Debug)]
 pub enum ReadySelection {
-    /// The first ready Job the Executor can run.
     Any,
-    /// Only this Job: an invocation that names its Job reserves it or none,
-    /// and a ready entry of any other Job is never reserved.
     Only(JobId),
-    /// The native scheduler's selection: the first ready native Generative or
-    /// native Decision Job whose frozen configuration can run on the checked
-    /// native execution path and whose corresponding policy admits it.
     Scheduled {
         generative_policy: fn(&FrozenExecutionConfig) -> bool,
         decision_policy: fn(&NativeDecisionConfig) -> bool,
     },
 }
 
-/// Why a stop of a native Job was refused: it has no Allocation, so it is not
-/// running (it may be queued or not submitted).
 pub const STOP_JOB_NOT_RUNNING: &str = "the Job is not running";
-/// Why a stop of a native Job was refused: it already has an outcome, or its
-/// Allocation is held as Uncertain or released. Nothing about it changes.
 pub const STOP_JOB_ENDED: &str = "the Job has already ended";
-/// Why the first Provider request of a stopped Job was not recorded as sent,
-/// and so was never sent.
 pub const STOPPED_BEFORE_SEND: &str = "a stop was requested before the request was sent";
 
-/// What a stop request did to one native Job, decided in one transaction
-/// against its Allocation. Each names the Allocation, whose token identifies
-/// the one execution to cancel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStopRequest {
-    /// The Job was reserved and had not started: the reservation was ended
-    /// and the Job Cancelled. Nothing was sent. This is a confirmed stop.
     EndedBeforeStart(AllocationToken),
-    /// The Job was running: its Allocation is now StopRequested and still
-    /// held. The execution is being cancelled; how it ended is recorded when
-    /// it returns, Uncertain if its request may have been sent.
     Requested(AllocationToken),
-    /// A stop was already requested; nothing was written.
     AlreadyRequested(AllocationToken),
 }
 
-/// A caller must use `Replay` after any uncertain reservation result.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DevelopmentReservationAttempt {
-    /// A first-attempt permit can be consumed only once.
     New(DevelopmentFreshReservation),
-    /// Resolve an earlier attempt without creating an Allocation.
     Replay,
 }
 
-/// The result of one bounded, manually requested reservation pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DevelopmentReservation {
     Reserved(PoolAllocation),
-    /// Stored evidence only; it does not authorize dispatch or recovery.
     Replayed(PoolAllocation),
-    /// No durable Allocation bears the requested identity.
     Unresolved,
     Continue(DevelopmentReadyCursor),
     Exhausted,
@@ -251,9 +196,7 @@ pub enum DevelopmentReservation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DevelopmentReservationReconciliation {
-    /// Stored evidence only; it does not authorize dispatch or recovery.
     Found(Box<PoolAllocation>),
     Conflict,
-    /// No durable record was found; absence alone does not prove non-commit.
     Unresolved,
 }

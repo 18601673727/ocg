@@ -1,13 +1,3 @@
-//! The job tools of a native Agent: how the host applies what an Agent that
-//! manages Jobs asks of its conversation tree.
-//!
-//! A tool that only changes what the tree already holds (limits, holds,
-//! stops, messages, retries, plans) is applied here, in the transaction that
-//! also records the call's outcome, so a call is applied exactly once. A call
-//! that spends the user's choice (a dispatch to a target the user picks, an
-//! assignment the user confirms) is not applied here: it waits for the user,
-//! and [`Batch::decide`] performs it with that decision.
-
 use super::*;
 use crate::db::entities::{
     AllocationToken, ConfigBody, ConfigKind, DispatchSelection, ExecutionConfiguration,
@@ -16,13 +6,9 @@ use crate::db::entities::{
 };
 use serde_json::{Value, json};
 
-/// What applying one job tool came to: the result the Agent is told, and what
-/// the caller must do now that the transaction is committed.
 pub(crate) struct JobToolApplied {
     pub(crate) value: Value,
-    /// Executions the call asked to stop.
     pub(crate) running: Vec<AllocationToken>,
-    /// Turns the call ended before they ran.
     pub(crate) ended: Vec<JobId>,
 }
 
@@ -36,11 +22,9 @@ impl JobToolApplied {
     }
 }
 
-/// The most steps of a plan, and the bounds on what each says.
 const MAX_PLAN_STEPS: usize = 6;
 const MAX_STEP_TITLE_CHARS: usize = 120;
 const MAX_STEP_OBJECTIVE_CHARS: usize = 2000;
-/// The most projects, dependencies and entries a page of a catalog has.
 const MAX_SELECTED_PROJECTS: usize = 16;
 const MAX_INSTRUCTION_SUMMARY_CHARS: usize = 256;
 
@@ -62,10 +46,6 @@ impl Batch {
         }
     }
 
-    // ---- the call being applied ----------------------------------------------------------------
-
-    /// Applies `tool` for the call `call` of the execution that `proof`
-    /// owns, and records the call's outcome in the same transaction.
     pub(crate) fn apply_job_tool(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -180,7 +160,6 @@ impl Batch {
         Ok(applied)
     }
 
-    /// The conversation must be open: not closing and not settled.
     fn require_open_conversation(&mut self, conversation: JobId) -> Result<(), BatchError> {
         self.require_mutable_conversation(conversation)?;
         if self.job_control(conversation)?.closing.is_some() {
@@ -275,8 +254,6 @@ impl Batch {
         }))
     }
 
-    // ---- plans ------------------------------------------------------------------------------------
-
     fn job_plan(
         &mut self,
         job: &MutableJob,
@@ -330,7 +307,6 @@ impl Batch {
                 "a task plan must precede execution",
             ));
         }
-        // A step of a plan does not plan again.
         let spec = self.require_mutable_conversation(conversation)?;
         if let JobKind::Group {
             origin: Origin::Agent { call: opened },
@@ -402,10 +378,6 @@ impl Batch {
         })))
     }
 
-    // ---- what the user decides ---------------------------------------------------------------------
-
-    /// The call the user is deciding, read back from what its admission
-    /// recorded.
     fn awaiting_job_call(
         &mut self,
         evidence: &ToolEvidenceRecord,
@@ -425,10 +397,6 @@ impl Batch {
         }
     }
 
-    /// Performs, with the decision the user has just taken, the call that
-    /// waited for it, and says what it came to in the words the Job that
-    /// continues the conversation is given. `None` when the call is not a job
-    /// call, which the decision then treats as it always has.
     pub(crate) fn perform_decided_job_call(
         &mut self,
         approval: ToolCallRef,
@@ -657,8 +625,6 @@ impl Batch {
         Ok(())
     }
 
-    // ---- catalogs ------------------------------------------------------------------------------------
-
     fn job_agent_catalog(
         &mut self,
         after: Option<String>,
@@ -773,7 +739,6 @@ impl Batch {
     }
 }
 
-/// What a tool does to a conversation of the caller's subtree.
 #[derive(Clone, Copy)]
 enum ConversationAction {
     Stop,

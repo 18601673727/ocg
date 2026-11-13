@@ -7,9 +7,6 @@ pub(super) enum Message {
     Shutdown,
 }
 
-/// Write-worker requests that are not commands. They have their own queue,
-/// so a full command queue never delays them, and the worker takes them
-/// before its next command.
 pub(super) enum Control {
     FilesystemFailure {
         reason: ProtectionReason,
@@ -39,8 +36,6 @@ impl Control {
     }
 }
 
-/// Tracks an admitted command from `submit` until the write worker has either
-/// executed it (under `database.read`) or refused it.
 pub(super) struct InFlightCommand(Arc<Shared>);
 
 impl InFlightCommand {
@@ -56,10 +51,6 @@ impl Drop for InFlightCommand {
     }
 }
 
-/// An admitted command with its execution mark, which the worker sets before
-/// the command touches storage. The submitter keeps the other reference, so
-/// when the reply is lost it can tell a command that never began from one
-/// that began.
 pub(super) struct Envelope {
     pub(super) operation: OperationId,
     pub(super) started: Arc<AtomicBool>,
@@ -163,8 +154,6 @@ impl Command {
     }
 }
 
-// At most three gram keys per lowercased scalar; each 53-byte key has
-// an additional allowance for its index entry. The command doubles this too.
 pub(super) fn search_index_bytes(text: &str) -> u64 {
     byte_count(text.chars().flat_map(char::to_lowercase).count())
         .saturating_mul(3)
@@ -229,9 +218,6 @@ pub(super) fn json_bytes(value: Option<&serde_json::Value>) -> u64 {
     value.map_or(0, |value| counted_json_bytes(value, ByteCounter::default()))
 }
 
-/// Measures the compact serialization of `value` on top of what `counter`
-/// already holds, without retaining the serialized bytes. An overflow or an
-/// unexpected serialization failure answers `u64::MAX`, never a short count.
 pub(super) fn counted_json_bytes(value: &serde_json::Value, mut counter: ByteCounter) -> u64 {
     match serde_json::to_writer(&mut counter, value) {
         Ok(()) => counter.bytes,
@@ -239,7 +225,6 @@ pub(super) fn counted_json_bytes(value: &serde_json::Value, mut counter: ByteCou
     }
 }
 
-/// A write sink that only counts the bytes written to it.
 #[derive(Default)]
 pub(super) struct ByteCounter {
     pub(super) bytes: u64,

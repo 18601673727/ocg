@@ -41,21 +41,16 @@ pub(crate) struct CredentialPayload {
     pub(crate) key: std::sync::Arc<crate::db::redb::CredentialKey>,
 }
 
-/// One request field a save sets. A secret carries its new value; `None`
-/// keeps the secret the Connection already holds for that name.
 pub(crate) enum HeaderEditValue {
     Plain(String),
     Secret(Option<CredentialPayload>),
 }
 
 pub(crate) struct HeaderEdit {
-    /// Canonical (lower case) name.
     pub(crate) name: String,
     pub(crate) value: HeaderEditValue,
 }
 
-/// How a save treats a Connection's request fields: keep them, or replace the
-/// whole set, so a field left out is deleted.
 pub(crate) enum HeaderChange {
     Preserve,
     Replace(Vec<HeaderEdit>),
@@ -91,10 +86,6 @@ pub(crate) fn save_model_profile(
     batch.save_model_profile(save)
 }
 
-// ---- Jobs ---------------------------------------------------------------------------
-
-/// The immutable spec of a Job about to be submitted: its input, its
-/// relationships and the configuration it freezes.
 fn spec_of(batch: &mut Batch, job: &Job, allow_stored: bool) -> Result<JobSpec, BatchError> {
     let stored = job.parent.get() != 0 && batch.require_job(job.parent)?.kind.is_group();
     if stored && !allow_stored {
@@ -103,7 +94,6 @@ fn spec_of(batch: &mut Batch, job: &Job, allow_stored: bool) -> Result<JobSpec, 
             "turns are created by append or open_group",
         ));
     }
-    // CLI is being redesigned separately.
     let frozen = match job.configuration {
         Some(configuration) => match batch.freeze_system_configuration(configuration)? {
             FrozenConfiguration::Generative(frozen) => Some(frozen),
@@ -178,7 +168,6 @@ fn spec_of(batch: &mut Batch, job: &Job, allow_stored: bool) -> Result<JobSpec, 
     })
 }
 
-/// T1 constructs a spec directly. Interactive messages use append instead.
 pub(crate) fn create_job(batch: &mut Batch, job: Job) -> OpResult<JobId> {
     submit(batch, job, None, false)
 }
@@ -217,11 +206,6 @@ pub(crate) fn create_submitted_job(
     submit(batch, job, Some(submission), false)
 }
 
-// ---- outputs and outcomes ------------------------------------------------------------
-
-/// Intermediate outputs are refused once the Job has any outcome, unknown
-/// included, so a final result stays the Job's newest output and an unknown
-/// Job's recorded outputs stay as they were (I11).
 pub(crate) fn append_job_output(
     batch: &mut Batch,
     job: JobId,
@@ -246,19 +230,6 @@ pub(crate) fn append_job_output(
     })
 }
 
-// ---- tool calls -------------------------------------------------------------------------
-
-/// Records OCG's decision about a call a Provider requested, before
-/// anything about the call can run: its refusal, or its admission with the
-/// exact registration, arguments and authorization it runs under. The call
-/// is identified by its Job's Provider request, which must have a recorded
-/// observation, and its wire index there; the Provider's id for it must be
-/// unused in the Job. A call has one decision, never replaced.
-///
-/// `evidence.spawns` says whether the handler can start an OS process; the
-/// caller takes it from [`ToolAdmission::spawns`]. Only the trusted execution
-/// path of the Job, while it executes it, may record a decision. An admission
-/// is refused when its arguments exceed [`MAX_STORED_TOOL_ARGUMENTS_BYTES`].
 pub(crate) fn record_tool_decision(
     batch: &mut Batch,
     proof: &crate::db::handle::DevelopmentWriteProof,
@@ -303,10 +274,6 @@ pub(crate) fn record_tool_decision(
     batch.tool_decide(proof, evidence)
 }
 
-/// Records what is known of an admitted call's execution, once. Only the
-/// trusted execution path of the Job, while it executes it, may record it,
-/// and only after the call's admission. An uncertain outcome stays
-/// uncertain: no later outcome replaces it.
 pub(crate) fn record_tool_outcome(
     batch: &mut Batch,
     proof: &crate::db::handle::DevelopmentWriteProof,
@@ -316,15 +283,10 @@ pub(crate) fn record_tool_outcome(
     batch.tool_outcome(proof, call, outcome)
 }
 
-/// Whether `text` is one JSON object.
 fn is_json_object(text: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(text).is_ok_and(|value| value.is_object())
 }
 
-// ---- configs ------------------------------------------------------------------------
-
-/// Creates a config. Its references must name configs of the kinds its body
-/// requires (I17).
 pub(crate) fn create_config(batch: &mut Batch, config: Config) -> OpResult<ConfigId> {
     batch.create_config(config.name, config.body)
 }
@@ -340,8 +302,6 @@ pub(crate) fn archive_model(batch: &mut Batch, id: ConfigId) -> OpResult<()> {
     batch.archive_model(id)
 }
 
-/// Edits a config in place: its name and body, with the same kind. The edit
-/// counter rises by one; Jobs that froze the old values keep them.
 pub(crate) fn update_config(
     batch: &mut Batch,
     id: ConfigId,
@@ -351,8 +311,6 @@ pub(crate) fn update_config(
     batch.update_config_from(id, config.name, config.body, Some(expected_edit_seq))
 }
 
-/// Registers an Executor: a Pool that offers `LlmRequest` over each of the
-/// transports its adapter implements.
 pub(crate) fn create_executor(batch: &mut Batch, executor: Executor) -> OpResult<ExecutorId> {
     let capabilities = executor
         .llm_transports
@@ -378,7 +336,6 @@ pub(crate) fn create_execution_pool(
     Ok(id.into())
 }
 
-/// Replaces a Pool's capabilities and limit. Whether it is enabled stays as it is.
 pub(crate) fn update_execution_pool(
     batch: &mut Batch,
     id: ExecutionPoolId,
@@ -408,10 +365,6 @@ pub(crate) fn set_execution_pool_enabled(
     batch.update_config(id.into(), existing.name, ConfigBody::Pool(body))
 }
 
-// ---- attachments and projects ------------------------------------------------------------
-
-/// Whether `mime` is a lowercase `type/subtype` of RFC 6838 restricted-name
-/// characters, without parameters.
 fn is_mime_type(mime: &str) -> bool {
     let name = |part: &str| {
         (1..=127).contains(&part.len())
@@ -426,8 +379,6 @@ fn is_mime_type(mime: &str) -> bool {
             .is_some_and(|(kind, subtype)| name(kind) && name(subtype))
 }
 
-/// Checks what [`create_attachment`] would refuse of `attachment`, so that
-/// nothing is published for an Attachment that cannot be recorded.
 pub(crate) fn check_new_attachment(attachment: &Attachment) -> Result<(), Violation> {
     if attachment.content.is_empty() {
         return Err(Violation::InvalidValue("content", "cannot be empty"));
@@ -444,8 +395,6 @@ pub(crate) fn check_new_attachment(attachment: &Attachment) -> Result<(), Violat
     Ok(())
 }
 
-/// What a new Attachment records of its content, once that content is
-/// published under `sha256`.
 pub(crate) struct PublishedAttachment {
     pub(crate) sha256: ContentDigest,
     pub(crate) byte_length: u64,
@@ -454,8 +403,6 @@ pub(crate) struct PublishedAttachment {
     pub(crate) origin: AttachmentOrigin,
 }
 
-/// Records an Attachment whose content is already published. Its display
-/// name is sanitized here.
 pub(crate) fn create_attachment(
     batch: &mut Batch,
     attachment: PublishedAttachment,
@@ -486,10 +433,6 @@ pub(crate) fn create_attachment(
     Ok(id)
 }
 
-/// Records that an available Attachment was cleaned up: `kind` and the
-/// batch's time, in one write. Nothing else of it changes, nor any input
-/// that names it. An Attachment already cleaned up keeps its cleanup, and
-/// the batch is refused with [`Violation::AttachmentCleanedUp`].
 pub(crate) fn cleanup_attachment(
     batch: &mut Batch,
     id: AttachmentId,
@@ -507,8 +450,6 @@ pub(crate) fn cleanup_attachment(
     Ok(record)
 }
 
-/// Creates a Project. Its root, which the caller resolved, may not equal,
-/// contain or lie inside another Project's root.
 pub(crate) fn create_project(batch: &mut Batch, mut project: Project) -> OpResult<ProjectId> {
     if let Err(reason) = validate_project_commands(&project.commands) {
         return batch.reject(Violation::InvalidValue("commands", reason));
@@ -540,7 +481,6 @@ pub(crate) fn create_project(batch: &mut Batch, mut project: Project) -> OpResul
     Ok(id)
 }
 
-/// Replaces a Project's name, description and commands. Its root stays.
 pub(crate) fn update_project(
     batch: &mut Batch,
     id: ProjectId,
@@ -633,9 +573,6 @@ pub(crate) fn configure_project_decision(
     Ok(project)
 }
 
-// ---- conversations --------------------------------------------------------------------------
-
-/// Conversation edits apply only to specs of kind Conversation.
 fn require_conversation(batch: &mut Batch, id: JobId) -> OpResult<()> {
     let row = match batch.job(id)? {
         Some(row) => row,
@@ -648,8 +585,6 @@ fn require_conversation(batch: &mut Batch, id: JobId) -> OpResult<()> {
     }
 }
 
-/// Edits conversation metadata or limits. Hiding twice changes nothing, and no
-/// Job is touched.
 pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) -> OpResult<()> {
     require_conversation(batch, root)?;
     let mut row = batch.job_control(root)?;
@@ -683,8 +618,6 @@ pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) ->
     }
     batch.put_job_control(root, &row)
 }
-
-// ---- request events -------------------------------------------------------------------------
 
 pub(crate) fn record_sent_request(batch: &mut Batch, sent: SentRequest) -> OpResult<()> {
     batch.require_legacy_evidence_job(sent.job)?;
@@ -743,12 +676,6 @@ pub(crate) fn record_provider_answer(
     Ok((metrics, availability))
 }
 
-/// Appends measurements for a Job as request events. Their LLM, if any, is
-/// the one the Job froze; the Job itself is not changed.
-///
-/// A Token annotation must agree with the eligibility the request's
-/// committed annotations state, so contradictory evidence is refused here, in
-/// the transaction that would write it, rather than met later by a reader.
 pub(crate) fn record_metrics(batch: &mut Batch, metrics: Metrics) -> OpResult<MetricsId> {
     batch.require_legacy_evidence_job(metrics.job)?;
     let job = batch.require_job(metrics.job)?;
@@ -814,9 +741,6 @@ pub(crate) fn record_metrics(batch: &mut Batch, metrics: Metrics) -> OpResult<Me
     Ok(MetricsId::new(id.map_or(0, |event| event.get())))
 }
 
-/// Appends one availability observation of an LLM request made by a Job
-/// that was submitted with an LLM configuration. Neither the Job nor its
-/// outcome is changed or consulted.
 pub(crate) fn record_availability_stat(
     batch: &mut Batch,
     stat: AvailabilityStat,

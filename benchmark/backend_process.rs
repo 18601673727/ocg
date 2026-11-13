@@ -1,12 +1,3 @@
-//! Starts the production host the measurements drive.
-//!
-//! The host must be the real binary: only its `loopback-scheduling serve`
-//! path arms the autonomous scheduler, and an in-process runtime started any
-//! other way schedules nothing. The harness therefore prepares the data
-//! directory, runs the activation preflight, and starts `serve` with exactly
-//! the confirmations the preflight issues — the same sequence an operator
-//! performs — then waits for the control plane's listening line.
-
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -49,8 +40,6 @@ impl BackendConfig {
     }
 }
 
-/// The identities a measurement names: the Pool and Executor that run its
-/// Jobs, the profiles and Project its Jobs use, and when the host was ready.
 #[derive(Clone, Debug)]
 pub struct BackendHandshake {
     pub pid: u32,
@@ -64,7 +53,6 @@ pub struct BackendHandshake {
     pub startup: Duration,
 }
 
-/// A running host, and where its control plane answers.
 pub struct BackendProcess {
     owner: ChildOwner,
     address: String,
@@ -73,7 +61,6 @@ pub struct BackendProcess {
     startup: Duration,
     shutdown_timeout: Duration,
     data_dir: PathBuf,
-    /// Filled once the harness has created the identities the run names.
     handshake: Option<BackendHandshake>,
 }
 
@@ -94,15 +81,12 @@ impl BackendProcess {
         let binary = host_binary()?;
         let mut config = config.clone();
         if config.port == 0 {
-            // The control plane refuses port 0; take a free one instead.
             config.port = std::net::TcpListener::bind("127.0.0.1:0")?
                 .local_addr()?
                 .port();
         }
         let config = &config;
         if config.hang_before_handshake {
-            // The negative control: the harness must give up on its own
-            // deadline, exactly as it would for a host that never answers.
             std::thread::sleep(config.startup_timeout + Duration::from_secs(1));
             return Err(format!(
                 "the backend child did not become ready within {:?}",
@@ -112,8 +96,6 @@ impl BackendProcess {
         }
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(&config.workspace)?;
-        // A fresh directory holds no database, and the host never creates one
-        // under `serve`: one plain run does, then closes.
         if !database_exists(&config.data_dir)? {
             create_database(&binary, config)?;
         }
@@ -134,7 +116,6 @@ impl BackendProcess {
         })
     }
 
-    /// Names the identities the harness created for this host.
     pub fn attach_handshake(&mut self, handshake: BackendHandshake) {
         self.handshake = Some(handshake);
     }
@@ -189,13 +170,11 @@ impl BackendProcess {
     }
 }
 
-/// The `ocg` binary beside this benchmark's own executable, or `OCG_BIN`.
 fn host_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(path) = std::env::var_os("OCG_BIN") {
         return Ok(PathBuf::from(path));
     }
     let current = std::env::current_exe()?;
-    // `target/<profile>/deps/backend-<hash>` and `target/<profile>/ocg`.
     let directory = current
         .parent()
         .and_then(Path::parent)
@@ -226,9 +205,6 @@ fn database_exists(data_dir: &Path) -> Result<bool, Box<dyn std::error::Error + 
 
 fn command(binary: &Path, config: &BackendConfig) -> Command {
     let mut command = Command::new(binary);
-    // The host supervises the process groups of the commands it runs, so it
-    // must lead its own group: sharing the harness's would let a stop signal
-    // reach the harness.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -238,9 +214,6 @@ fn command(binary: &Path, config: &BackendConfig) -> Command {
         .env("OCG_DATA_DIR", &config.data_dir)
         .env("OCG_CONTROL_PORT", config.port.to_string())
         .env("OCG_CONTROL_TOKEN", &config.token);
-    // The mock provider and the control plane are loopback endpoints. A proxy
-    // configured for the machine would intercept them, and the host refuses to
-    // dispatch a Job whose frozen endpoint is loopback behind a proxy.
     let excluded = match std::env::var("NO_PROXY") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing},127.0.0.1,localhost"),
         _ => "127.0.0.1,localhost".to_owned(),
@@ -251,7 +224,6 @@ fn command(binary: &Path, config: &BackendConfig) -> Command {
     command
 }
 
-/// One plain run of the host, which creates the database and then exits.
 fn create_database(
     binary: &Path,
     config: &BackendConfig,
@@ -384,9 +356,6 @@ fn terminate(child: &mut Child) -> Result<(), Box<dyn std::error::Error + Send +
     }
 }
 
-/// Reads the host's output until it names the address it listens on, then
-/// keeps draining both pipes so the host never blocks on a full one. The
-/// control plane announces itself on standard error.
 fn read_address(
     child: &mut Child,
     started: Instant,
@@ -457,7 +426,6 @@ fn read_address(
     }
 }
 
-/// `OCG control plane listening on http://127.0.0.1:PORT`, as the host prints it.
 fn listening_address(line: &str) -> Option<String> {
     let (_, rest) = line.split_once("listening on ")?;
     let address = rest.trim();

@@ -1,7 +1,5 @@
 use super::*;
 
-/// `result` is deliberately absent: a final result output is only published
-/// by [`JobFinalization`], in the same transaction that finalizes the Job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntermediateOutputKind {
     Progress,
@@ -40,12 +38,6 @@ pub enum DependencyCondition {
     Settled,
 }
 
-/// How a dependency currently stands. A prerequisite is settled once it has
-/// a confirmed outcome, or an unknown outcome whose execution is confirmed
-/// stopped; until then the dependency waits. A completed prerequisite
-/// satisfies either condition. Any other settled prerequisite satisfies a
-/// settled dependency, while a success dependency on it can never be met and
-/// is not a wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DependencyState {
     Waiting,
@@ -53,40 +45,24 @@ pub enum DependencyState {
     Impossible,
 }
 
-/// What a Job is asked to do: its objective, the Attachments it carries and
-/// its limits on descendants. It becomes part of the Job's spec.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobInputDraft {
     pub objective: Option<String>,
-    /// The Attachments the input carries, in order. Each must exist and must
-    /// not be cleaned up; see [`AttachmentRecord`].
     pub attachments: Vec<AttachmentId>,
 }
 
-/// Every relationship here is fixed once the Job is submitted. The Project
-/// is independent of `parent`: a child never inherits its parent's Project.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Job {
     pub name: Option<String>,
     pub eligible_at: Option<Timestamp>,
-    /// Top-level work names the Genesis Job (0), see
-    /// [`crate::db::DatabaseHandle::genesis`].
     pub parent: JobId,
     pub project: Option<ProjectId>,
-    /// The CLI grant stored with a Process plan. Stored turns use the frozen Agent.
     pub process_grant: Option<String>,
     pub input: JobInputDraft,
-    /// Present for an LLM execution child; absent for orchestrating or
-    /// system work.
     pub configuration: Option<ExecutionConfiguration>,
-    /// The conversation tip this directly constructed turn follows.
     pub previous: Option<JobId>,
 }
 
-/// The configuration an LLM execution child Job is submitted with. Both
-/// references are fixed at submission. Work that runs an LLM directly names
-/// no Agent; when one is named, `llm_profile` must be one of its Models. The
-/// values the Job executes with are frozen into its spec at submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExecutionConfiguration {
     pub reasoning_effort: Option<super::ReasoningEffort>,
@@ -94,14 +70,12 @@ pub struct ExecutionConfiguration {
     pub llm_profile: ProfileId,
 }
 
-/// The user-authored input owned by a mutable Job in the new storage model.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MutableJobInput {
     pub priority: JobQueuePriority,
     pub content: MutableJobContent,
 }
 
-/// The request belongs to the Job; its operation is never inferred from text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutableJobContent {
     Generative {
@@ -112,7 +86,6 @@ pub enum MutableJobContent {
     Decision {
         request: DecisionRequest,
         profile: ConfigId,
-        /// Configuration revisions observed when this Job input was accepted.
         references: Vec<ConfigRef>,
     },
 }
@@ -153,8 +126,6 @@ impl MutableJobInput {
     }
 }
 
-/// The context requested by the Job. An adopted summary is not execution
-/// authority: its producer and sealed source still require validation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutableContextSelection {
     FullHistory,
@@ -164,7 +135,6 @@ pub enum MutableContextSelection {
     },
 }
 
-/// Matches the existing foreground, automatic and speculative priority classes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobQueuePriority {
     Foreground,
@@ -179,7 +149,6 @@ pub enum MutableJobPhase {
     Executing,
 }
 
-/// Configuration frozen at the checked execution-start boundary.
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum MutableFrozenConfiguration {
@@ -187,7 +156,6 @@ pub enum MutableFrozenConfiguration {
     Decision(NativeDecisionConfig),
 }
 
-/// The Job row is the sole owner of editable input and its revision.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MutableJob {
     pub id: JobId,
@@ -200,13 +168,10 @@ pub struct MutableJob {
     pub phase: MutableJobPhase,
     pub input: MutableJobInput,
     pub context_selection: MutableContextSelection,
-    /// A summary-producing Job is authorized for exactly this sealed source.
-    /// Ordinary mutable Jobs have no summary-producing role.
     pub summary_source: Option<super::ContentDigest>,
     pub frozen: Option<MutableFrozenConfiguration>,
 }
 
-/// The terminal outcome remains owned by Job state and is read with the Job.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MutableJobRecord {
     pub job: MutableJob,
@@ -214,9 +179,6 @@ pub struct MutableJobRecord {
     pub project: Option<ProjectId>,
 }
 
-/// `value` carries a machine-readable payload, such as the conclusion of a
-/// capability check. It is published as given and never changes the Job's
-/// outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobOutput {
     pub kind: IntermediateOutputKind,
@@ -238,14 +200,10 @@ pub struct FinalResult {
 pub enum JobFinalization {
     Completed(FinalResult),
     Failed(FinalResult),
-    /// A confirmed cancellation still publishes a final result, which may be
-    /// no more than a short explanation of the cancellation.
     Cancelled(FinalResult),
-    /// An unknown outcome is recorded without publishing a final result output.
     Unknown,
 }
 
-/// A Job's terminal outcome without its published result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobOutcome {
     Completed,
@@ -255,7 +213,6 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
-    /// An unknown outcome publishes no result, so `result` is dropped for it.
     pub fn finalization(self, result: FinalResult) -> JobFinalization {
         match self {
             Self::Completed => JobFinalization::Completed(result),
@@ -272,14 +229,10 @@ pub struct AppendedOutput {
     pub seq: i64,
 }
 
-/// The normalized decision contract, independent of a provider's wire format.
 pub const DECISION_SCHEMA_VERSION: u32 = 1;
 pub const MAX_DECISION_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_DECISION_OPTIONS: usize = 256;
 
-/// Counts a shadow prediction may see. Conversation text and workspace
-/// content are absent on purpose. The recommendation is recorded for
-/// comparison; it does not authorize summarization.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PredictionSnapshot {
@@ -294,8 +247,6 @@ pub struct PredictionSnapshot {
 }
 
 impl PredictionSnapshot {
-    /// A choice among NoNeed, Defer, Prepare and InsufficientEvidence.
-    /// The prompt names the counts and asks for no arithmetic.
     pub fn request(&self) -> DecisionRequest {
         DecisionRequest {
             schema_version: DECISION_SCHEMA_VERSION,
@@ -354,7 +305,6 @@ pub enum DecisionQuestion {
 }
 
 impl DecisionQuestion {
-    /// The question as the asker worded it.
     pub fn prompt(&self) -> &str {
         match self {
             Self::Choice { prompt, .. }
@@ -376,7 +326,6 @@ impl DecisionQuestion {
 #[serde(deny_unknown_fields)]
 pub struct DecisionRequest {
     pub schema_version: u32,
-    /// Explicit caller-supplied evidence, never an implicit workspace grant.
     pub state: serde_json::Value,
     pub question: DecisionQuestion,
 }
@@ -438,8 +387,6 @@ impl DecisionRequest {
     }
 }
 
-/// Immutable work payload carried by the existing Turn execution descriptor.
-/// Execution uses the ordinary Job lifecycle and Pool claims.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecisionWork {
     pub frozen: FrozenDecisionConfig,
@@ -490,7 +437,6 @@ pub struct PredictionBinding {
     pub policy_revision: u64,
     pub policy_profile: Option<ConfigRef>,
     pub max_tokens: u32,
-    /// Effective policy frozen at admission, including acceptance and spending limits.
     pub policy: CompactionPolicy,
 }
 
@@ -534,9 +480,6 @@ impl DecisionWork {
     }
 }
 
-/// Provider-specific uncertainty evidence. `semantics` identifies its formula;
-/// a consumer must recognize that meaning before applying any threshold.
-/// It is not a calibrated probability of correctness by default.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionConfidence {
@@ -557,7 +500,6 @@ pub enum DecisionAnswer {
     },
     OrdinalScore {
         expectation: f64,
-        /// Probabilities in the request's level order, when supplied.
         distribution: Option<Vec<f64>>,
         confidence: Option<DecisionConfidence>,
     },
@@ -578,12 +520,10 @@ pub struct DecisionResult {
     pub outcome: DecisionOutcome,
     pub requested_model: String,
     pub reported_model: Option<String>,
-    /// Only present when a provider or a pinned configuration establishes it.
     pub model_version: Option<String>,
     pub model: ConfigRef,
     pub agent: Option<ConfigRef>,
     pub connection: ConfigRef,
-    /// Existing provider-request identity; usage and native evidence belong there.
     pub request: RequestRef,
 }
 
@@ -719,42 +659,30 @@ fn validate_distribution(values: impl Iterator<Item = f64>) -> Result<(), &'stat
     Ok(())
 }
 
-/// A Job assembled from its immutable `job` row, its mutable `job_state` row
-/// and the derived tables that describe it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobRecord {
     pub id: JobId,
     pub name: Option<String>,
-    /// Always `None`: storage records no claim.
     pub started_at: Option<Timestamp>,
     pub completed_at: Option<Timestamp>,
     pub failed_at: Option<Timestamp>,
     pub cancelled_at: Option<Timestamp>,
     pub unknown_at: Option<Timestamp>,
-    /// When the trusted execution path confirmed that an unknown-outcome
-    /// Job's execution has actually stopped. The outcome stays unknown.
     pub stop_confirmed_at: Option<Timestamp>,
     pub stop_confirmed_by: Option<StopProof>,
     pub created_at: Timestamp,
-    /// The latest time one of the Job's lifecycle facts was recorded.
     pub updated_at: Timestamp,
-    /// The Job's own input, which its spec holds: the identity is the Job's.
     pub input: JobInputId,
-    /// The parent Job; 0 for a top-level Job.
     pub parent: JobId,
     pub parent_id: Option<JobId>,
     pub kind: JobKind,
     pub group: Option<JobId>,
     pub objective: Option<String>,
-    /// The Agent and Model configs the Job was submitted with, as provenance.
     pub configuration: Option<ExecutionConfiguration>,
-    /// Always `None`: storage records no claim.
     pub assigned_executor: Option<ExecutorId>,
     pub previous: Option<JobId>,
     pub outcome: Option<OutcomeRecord>,
     pub children_closed_at: Option<Timestamp>,
-    /// Whether the Job has no `unsettled` row: it and every Job below it
-    /// have stopped.
     pub subtree_settled: bool,
 }
 
@@ -794,34 +722,20 @@ pub enum OutcomeCause {
     Text(String),
     Abandoned,
     DependencyImpossible,
-    Stopped {
-        record: u32,
-    },
+    Stopped { record: u32 },
     Closed,
-    /// Why an execution is Unknown. It records what this process could not
-    /// establish; it never says the remote work stopped.
     Uncertain(UncertaintyReason),
 }
 
-/// The local reason an execution's outcome is uncertain. Every reason keeps
-/// the Allocation: none of them is evidence that remote work ended, was
-/// refused, or incurred no charge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)] // Reasons are recorded only where this process observes them.
+#[allow(dead_code)]
 pub enum UncertaintyReason {
-    /// The local execution task was dropped or lost before it returned.
     LocalExecutionDropped,
-    /// The request may have left this process; no response head was seen.
     RequestPossiblySent,
-    /// The connection or stream failed after the request may have been delivered.
     ConnectionInterrupted,
-    /// A response arrived but was incomplete, refused, or not provably a refusal.
     ResponseIncompleteOrInvalid,
-    /// A worker acknowledgement is pending or its outcome is ambiguous.
     WorkerAckPendingOrAmbiguous,
-    /// A stop was requested locally; termination was never confirmed.
     StopRequestedWithoutConfirmedTermination,
-    /// None of the above could be established.
     Unclassified,
 }
 
@@ -851,8 +765,6 @@ impl UncertaintyReason {
         }
     }
 
-    /// What is known, for display. No reason says the remote work stopped,
-    /// was refused, or incurred no charge.
     pub const fn description(self) -> &'static str {
         match self {
             Self::LocalExecutionDropped => {
@@ -899,8 +811,6 @@ pub struct OutcomeRecord {
     pub cause: Option<OutcomeCause>,
 }
 
-/// A Job's input as its spec holds it: the objective, limits, Attachments and
-/// frozen configuration. Its identity is the Job's.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobInputRecord {
     pub id: JobInputId,
@@ -908,18 +818,10 @@ pub struct JobInputRecord {
     pub submitted_at: Option<Timestamp>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    /// What an LLM execution child submitted with this input was configured
-    /// to execute, frozen with the input. `None` for unconfigured work and
-    /// for an input not yet submitted.
     pub configuration: Option<FrozenExecutionConfig>,
-    /// The Attachments the input carries, in the order they were given.
-    /// Frozen with the input when it is submitted; a reference outlives the
-    /// cleanup of its Attachment's content.
     pub attachments: Vec<AttachmentId>,
 }
 
-/// A published output. Outputs have no update path, so they carry no
-/// `updated_at`.
 #[derive(Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 pub struct JobOutputRecord {
     pub id: JobOutputId,
@@ -1041,14 +943,11 @@ pub struct JobAllocation {
 }
 
 impl JobToolCall {
-    /// The call a Provider response named `name` with `arguments` makes, when
-    /// `name` is a job tool and the arguments fit it.
     pub(crate) fn parse(name: &str, arguments: &str) -> Option<Self> {
         let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
         serde_json::from_value(serde_json::json!({"name": name, "arguments": arguments})).ok()
     }
 
-    /// Whether `name` is one of the job tools.
     pub(crate) fn is_job_tool(name: &str) -> bool {
         matches!(
             name,
@@ -1103,7 +1002,7 @@ impl JobToolCall {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)] // Keep the public spec value inline, as Frozen carries its snapshot.
+#[allow(clippy::large_enum_variant)]
 pub enum JobExecution {
     Frozen(FrozenExecutionConfig),
     Ref(JobId),
@@ -1127,7 +1026,7 @@ pub enum PlanSource {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)] // Mirrors the stored spec without a second allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum JobKind {
     Group {
         agent: Option<ConfigId>,
@@ -1251,7 +1150,6 @@ pub(crate) struct JobState {
     pub(crate) stop_confirmed_by: Option<StopProof>,
 }
 
-/// What the owner changed about a Job group.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct JobControl {
     pub(crate) limits: Option<JobLimits>,
@@ -1262,15 +1160,9 @@ pub(crate) struct JobControl {
     pub(crate) closing: Option<JobClosing>,
     pub(crate) compaction_policy: Option<CompactionPolicy>,
     pub(crate) compaction_revision: u64,
-    /// Sibling conversations this one waits for: none of its Jobs is
-    /// reserved until each prerequisite's latest Job has settled as asked.
     pub(crate) after: Vec<(JobId, DependencyCondition)>,
-    /// The turns of this conversation that were retried, one entry per retry.
     pub(crate) retried: Vec<JobId>,
-    /// A user wrote a turn of this conversation, so its Agent parent no
-    /// longer manages it.
     pub(crate) user_input: bool,
-    /// The latest turn of this conversation whose result its parent was told.
     pub(crate) reported: Option<JobId>,
 }
 

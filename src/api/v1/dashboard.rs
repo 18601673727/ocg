@@ -329,8 +329,6 @@ pub(super) fn usage_summary_query(
     {
         return Err(INVALID_REQUEST);
     }
-    // The bounds are rounded to the hour buckets the summary scans; a bound
-    // whose bucket is not an `i64` is refused here rather than overflowing.
     if let Some(from) = from_us
         && from.div_euclid(HOUR).checked_mul(HOUR).is_none()
     {
@@ -420,7 +418,6 @@ pub(super) fn usage_summary_query(
     ))
 }
 
-/// Decodes the opaque usage continuation: a source row position.
 fn usage_cursor(text: &str) -> Result<UsageCursor, Refusal> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| INVALID_REQUEST)?;
     let (hour, agent, provider, model_hash): (i64, u128, u128, [u8; 32]) =

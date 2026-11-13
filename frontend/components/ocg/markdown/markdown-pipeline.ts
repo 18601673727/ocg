@@ -6,15 +6,6 @@ import MarkdownIt, {
 import taskLists from "markdown-it-task-lists";
 import hljs from "highlight.js/lib/common";
 
-/**
- * One Markdown pipeline for every Chat surface.
- *
- * The parser is markdown-it with CommonMark plus the GFM extensions it ships
- * or that we implement here directly. Nothing in this module is allowed to
- * emit document-authored HTML: the parser runs with `html: false`, links and
- * images pass through {@link sanitizeUrl}, and KaTeX runs with `trust: false`.
- */
-
 const DOLLAR = "$";
 
 function lineBreakTag(state: StateInline, silent: boolean): boolean {
@@ -34,7 +25,6 @@ function isEscaped(source: string, position: number): boolean {
   return backslashes % 2 === 1;
 }
 
-/** TeX rule: the opening delimiter may not be followed by whitespace and the closing one may not be preceded by it. */
 function isMathDelimiter(source: string, open: number, close: number): boolean {
   if (open + 1 >= close) return false;
   if (/\s/.test(source[open + 1])) return false;
@@ -42,12 +32,6 @@ function isMathDelimiter(source: string, open: number, close: number): boolean {
   return true;
 }
 
-/**
- * `$...$` inside a paragraph.
- *
- * An unterminated run is left as literal text, so a half-streamed line never
- * swallows the rest of the message.
- */
 function mathInline(state: StateInline, silent: boolean): boolean {
   const source = state.src;
   const open = state.pos;
@@ -72,13 +56,6 @@ function mathInline(state: StateInline, silent: boolean): boolean {
   return true;
 }
 
-/**
- * `$$...$$` as its own block, on one line or across several.
- *
- * An unclosed fence still produces a token covering the rest of the block, so
- * a stream that stops mid-equation renders the partial source rather than
- * nothing.
- */
 function mathBlock(
   state: StateBlock,
   startLine: number,
@@ -112,7 +89,6 @@ function mathBlock(
     const closeAt = text.indexOf(DOLLAR + DOLLAR);
 
     if (closeAt >= 0) {
-      // Text before the closing delimiter stays part of the equation.
       const tail = text.slice(0, closeAt);
       if (tail.trim()) body.push(tail);
       nextLine = line + 1;
@@ -137,13 +113,6 @@ function mathBlock(
 
 const SAFE_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
-/**
- * KaTeX's render options.
- *
- * `trust: false` is what keeps `\href`, `\url` and `\includegraphics` in a
- * source expression from becoming a live link or a remote fetch. Exported so
- * the guarantee can be asserted directly.
- */
 export const KATEX_OPTIONS = {
   throwOnError: true,
   trust: false,
@@ -151,24 +120,13 @@ export const KATEX_OPTIONS = {
   output: "htmlAndMathml",
 } as const;
 
-/** Re-exported so the renderer walks the same token type the parser emits. */
 export type { Token } from "markdown-it";
 
-/**
- * Returns the URL to navigate to, or `null` when the scheme is not one this
- * app is willing to follow. `javascript:`, `data:` and protocol-relative
- * `//host` references are rejected, and the check is deliberately free of any
- * browser global so it holds during server rendering too.
- */
 export function sanitizeUrl(rawUrl: string): string | null {
   const url = rawUrl.trim();
   if (/[\u0000-\u001f\u007f\\]/.test(url)) return null;
   if (!url) return null;
-  // Protocol-relative references name another origin; they are not in-site.
   if (url.startsWith("//")) return null;
-  // Anything without a scheme is a same-site reference: `/settings`,
-  // `#anchor`, `./diagram.png`, `docs/readme.md`. Only a scheme can carry an
-  // unsafe payload, so relative targets are admitted rather than parsed.
   if (!/^[a-z][a-z\d+.-]*:/i.test(url)) return url;
   try {
     return SAFE_PROTOCOLS.has(new URL(url).protocol) ? url : null;
@@ -182,14 +140,6 @@ export interface HighlightedCode {
   html: string;
 }
 
-/**
- * Syntax highlighting for a fenced block.
- *
- * highlight.js escapes the source it highlights, so the returned markup is
- * limited to its own token spans. Returns `null` when the fence names no
- * language or one highlight.js does not know, which leaves the caller to
- * render the plain code instead of guessing.
- */
 export function highlightCode(code: string, info: string): HighlightedCode | null {
   const language = info.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
   if (!language || language === "text" || !hljs.getLanguage(language)) return null;
@@ -207,7 +157,6 @@ export function markdownParser(): MarkdownItType {
   if (instance) return instance;
 
   instance = new MarkdownIt({
-    // Never emit document-authored HTML; every element below is ours.
     html: false,
     breaks: true,
     linkify: true,

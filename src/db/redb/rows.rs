@@ -14,10 +14,6 @@ use crate::db::entities::{
     ToolPayload, ToolReconciliation, UncertainCause, UsageFinality, WithheldReason,
 };
 
-// ---- rows ------------------------------------------------------------------------
-
-/// Refuses a record stored under `key` whose embedded identity names another
-/// record: the table key is the authority, never a duplicate inside the value.
 fn check_table_key(table: &str, key: u128, embedded: u128) -> DecodeResult<()> {
     if key == embedded {
         Ok(())
@@ -76,8 +72,6 @@ impl JobSpec {
                 })
             })?;
             d.end()?;
-            // A root conversation is the user's; a child is opened by an
-            // Agent's tool call inside its parent.
             let shape = match &kind {
                 JobKind::Group {
                     origin: Origin::User,
@@ -131,7 +125,6 @@ impl JobSpec {
         })
     }
 
-    /// Decodes the `job` row stored under `key`, which must name this Job.
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let row = Self::decode(bytes)?;
         check_table_key("job", key, row.id.get())?;
@@ -140,7 +133,6 @@ impl JobSpec {
 }
 
 impl JobState {
-    /// The state of a Job that was just submitted: nothing has happened.
     pub(crate) fn new(job_id: JobId) -> Self {
         Self {
             job_id,
@@ -239,7 +231,6 @@ impl JobState {
         })
     }
 
-    /// Decodes the `job_state` row stored under `key`, which must name this Job.
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let state = Self::decode(bytes)?;
         check_table_key("job_state", key, state.job_id.get())?;
@@ -262,9 +253,6 @@ pub(crate) struct ConfigRow {
 }
 
 impl ConfigRow {
-    /// Decode ordinary configurations during a shared-table scan. The
-    /// development allocation records have their own encodings and must be
-    /// fully validated before they can be excluded from a configuration scan.
     pub(super) fn scan_at(key: u128, bytes: &[u8]) -> DecodeResult<Option<Self>> {
         match bytes.first() {
             Some(&super::transactions::TAG_ALLOCATION_POOL) => {
@@ -289,7 +277,6 @@ impl ConfigRow {
         e.ts(self.created_at);
         e.ts(self.updated_at);
         e.ots(self.archived_at);
-        // CHECK: body tag equals kind
         match &self.body {
             ConfigBody::Connection(c) => {
                 e.u8(1);
@@ -460,7 +447,6 @@ impl ConfigRow {
         })
     }
 
-    /// Decodes the `config` row stored under `key`, which must name this Config.
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let row = Self::decode(bytes)?;
         check_table_key("config", key, row.id.get())?;
@@ -661,7 +647,6 @@ pub(super) fn decode_project(key: u128, bytes: &[u8]) -> DecodeResult<ProjectRec
     })
 }
 
-/// The id and root of a stored Project, without its commands.
 pub(super) fn decode_project_root(key: u128, bytes: &[u8]) -> DecodeResult<(ProjectId, String)> {
     let mut d = Dec::new(bytes, TAG_PROJECT)?;
     let id = ProjectId::new(d.u128()?);
@@ -1179,17 +1164,12 @@ impl CredentialSecret {
         &self.0
     }
 
-    /// The secret's text, moved out. The wrapper is left empty and its drop
-    /// wipes nothing further; the caller owns the only remaining copy.
     pub(crate) fn into_inner(mut self) -> String {
         std::mem::take(&mut self.0)
     }
 }
 
 impl Drop for CredentialSecret {
-    /// Overwrites the buffer when the secret is dropped. Best effort only: a
-    /// clone, a moved-out copy or a copy inside a client library is not
-    /// reached (see `system::secrets`).
     fn drop(&mut self) {
         crate::system::secrets::wipe_string(&mut self.0);
     }
@@ -1201,9 +1181,6 @@ impl std::fmt::Debug for CredentialSecret {
     }
 }
 
-/// Threat model: encrypting credentials in `ocg.redb` with `ocg.key`
-/// protects copies of `ocg.redb` on their own. A Code-grant command can
-/// read both files, just as it could read the retired credentials file.
 pub(crate) struct CredentialKey {
     key_id: [u8; 8],
     key: aws_lc_rs::aead::LessSafeKey,
@@ -1290,7 +1267,6 @@ impl CredentialKey {
             )
             .is_err()
         {
-            // The buffer still holds the plaintext on failure.
             crate::system::secrets::wipe_vec(&mut ciphertext);
             return Err(StorageError::corrupted("credential encryption failed"));
         }
@@ -1303,8 +1279,6 @@ impl CredentialKey {
         Ok(encoded)
     }
 
-    /// Whether the stored row was written with this key, judged by the key id
-    /// alone; the AEAD tag is not checked, so a tampered row still counts.
     pub(super) fn holds(&self, reference: &str, bytes: &[u8]) -> DecodeResult<bool> {
         Ok(decode_credential(reference, bytes)?.key_id == self.key_id)
     }
@@ -1328,8 +1302,6 @@ impl CredentialKey {
             crate::system::secrets::wipe_vec(&mut buffer);
             return Ok(None);
         };
-        // The one copy that becomes the secret; the decryption buffer is
-        // wiped whichever way this ends.
         let copy = plaintext.to_vec();
         crate::system::secrets::wipe_vec(&mut buffer);
         let secret = match String::from_utf8(copy) {

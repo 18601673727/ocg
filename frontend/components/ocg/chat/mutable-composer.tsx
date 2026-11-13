@@ -394,7 +394,6 @@ export function MutableComposer({
       cancelled = true;
       alive.current = false;
     };
-    // Initial recovery belongs to this Composer identity, not each selection change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [control, context, loadImages, refreshQueue, refreshUnfinished]);
 

@@ -22,7 +22,6 @@ export interface MarkdownBodyProps {
   content: string;
   sourceSnapshots?: readonly FileSnapshot[];
   className?: string;
-  /** Renders code and prose in the muted tone the reasoning panel uses. */
   inMuted?: boolean;
 }
 
@@ -34,9 +33,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       await navigator.clipboard.writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // A denied clipboard permission leaves the code on screen unchanged.
-    }
+    } catch {}
   }, [text]);
 
   return (
@@ -188,13 +185,6 @@ function MermaidDiagram({
   );
 }
 
-/**
- * KaTeX math.
- *
- * `trust` stays off so no `\href`, `\url` or `\includegraphics` in the source
- * can become a live link or a remote fetch, and an unrenderable expression
- * falls back to its own source instead of dropping it.
- */
 function MathBlock({
   content,
   inline,
@@ -206,15 +196,10 @@ function MathBlock({
 }) {
   const hostRef = useRef<HTMLSpanElement>(null);
   const [failed, setFailed] = useState(false);
-  // Identifies the newest render so a superseded async result — older content
-  // resolving after newer, or after unmount — never writes into the host or
-  // clears a failure that belongs to different content.
   const attempt = useRef(0);
 
   useEffect(() => {
     const host = hostRef.current;
-    // The host stays mounted across failures, so it is always available and a
-    // later valid expression can render into it again.
     if (!host) return;
 
     const token = ++attempt.current;
@@ -365,7 +350,6 @@ function CodeBlock({
         )}
       >
         {highlight ? (
-          // highlight.js escapes its input and emits only its own token spans.
           <code
             className="hljs bg-transparent p-0"
             dangerouslySetInnerHTML={{ __html: highlight.html }}
@@ -385,7 +369,6 @@ interface WalkContext {
   nextKey: { current: number };
 }
 
-/** `attrGet` is typed as `string | number`; every attribute read here is textual. */
 function attr(token: Token, name: string): string {
   const value = token.attrGet(name);
   return typeof value === "string" ? value : value == null ? "" : String(value);
@@ -395,13 +378,6 @@ function key(ctx: WalkContext): number {
   return ctx.nextKey.current++;
 }
 
-/**
- * Renders an inline token run.
- *
- * `i` is advanced past every token the renderer consumes, so a run of emphasis,
- * links, images and escapes nests correctly instead of re-reading the same
- * tokens.
- */
 function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.length): ReactNode[] {
   const ctx = { ...parent, nextKey: { current: 0 } };
   const out: ReactNode[] = [];
@@ -452,7 +428,6 @@ function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.leng
           break;
         }
         if (!href) {
-          // An unsafe target degrades to plain text rather than a live link.
           out.push(<Fragment key={key(ctx)}>{body}</Fragment>);
           break;
         }
@@ -482,8 +457,6 @@ function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.leng
         break;
       }
       case "html_inline": {
-        // The task-list plugin injects its checkbox as raw HTML. Re-express it
-        // as a real control; any other raw HTML the parser emitted is dropped.
         if (token.content.includes("task-list-item-checkbox")) {
           out.push(
             <input
@@ -517,15 +490,6 @@ function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.leng
   return out;
 }
 
-/**
- * Index of the token that closes the element opened at `open`, searching to
- * `limit`. Returns `limit` when the run is truncated, which is what a stream
- * that stops mid-element produces; the partial content still renders.
- *
- * A nested element of the same kind opens before its sibling closes, so the
- * close is found by depth: the first matching close token at depth zero is
- * the one that belongs to the element opened at `open`.
- */
 const CLOSE_FOR: Readonly<Record<string, string>> = {
   list_item_close: "list_item_open",
   bullet_list_close: "bullet_list_open",
@@ -574,10 +538,6 @@ function headings(level: number, children: ReactNode): ReactNode {
   }
 }
 
-/**
- * One `<li>`, starting at its `list_item_open`. Returns the element and the
- * index of its `list_item_close` so the caller can continue.
- */
 function listItem(
   ctx: WalkContext,
   tokens: Token[],
@@ -712,7 +672,6 @@ function walk(parent: WalkContext, tokens: Token[], from = 0, to = tokens.length
         i = tableEnd(tokens, i);
         break;
       case "html_block":
-        // Raw HTML never reaches the DOM.
         break;
       default:
         break;
@@ -722,7 +681,6 @@ function walk(parent: WalkContext, tokens: Token[], from = 0, to = tokens.length
   return out;
 }
 
-/** Maps markdown-it's inline alignment style onto the CSS values React accepts. */
 function textAlign(style: string): "left" | "center" | "right" | undefined {
   const value = style
     .replace(/^text-align:\s*/, "")
@@ -795,14 +753,6 @@ function tableEnd(tokens: Token[], start: number): number {
   return start;
 }
 
-/**
- * Renders Chat Markdown to React elements.
- *
- * The token stream is walked directly so every element is a React node with
- * class names this app controls. Nothing is injected as HTML except highlight.js
- * token spans, KaTeX output, and Mermaid SVG, each of which is produced by a
- * library from the code rather than passed through from the document.
- */
 function jsonDocument(content: string): string | null {
   const code = content.trim();
   if (
@@ -813,7 +763,6 @@ function jsonDocument(content: string): string | null {
   try {
     const value: unknown = JSON.parse(code);
     if (typeof value !== "object" || value === null) return null;
-    // Only a compact answer is re-indented; anything else is shown as written.
     return JSON.stringify(value) === code ? JSON.stringify(value, null, 2) : code;
   } catch {
     return null;

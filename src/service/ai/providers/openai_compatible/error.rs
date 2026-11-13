@@ -1,9 +1,5 @@
-//! OpenAI-compatible transport error types.
-
 use std::fmt;
 
-/// Provider-side failure detail, preserving the observable facts without
-/// interpreting them into a routing decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderFailure {
     pub message: String,
@@ -26,21 +22,11 @@ impl fmt::Display for ProviderFailure {
 
 impl std::error::Error for ProviderFailure {}
 
-/// Typed transport error.
-///
-/// The gateway classifies dispatch/settlement from this; the transport itself
-/// never decides whether to retry, reroute or settle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
-    /// The client request is structurally invalid.
     InvalidRequest { field: String, message: String },
-    /// The client request uses a field or feature this transport does not
-    /// forward. Rejected before any dispatch.
     Unsupported { field: String, message: String },
-    /// The request could not be translated into a provider dispatch, or the
-    /// transport configuration is unusable.
     Build { message: String },
-    /// The upstream provider or transport failed.
     Provider(ProviderFailure),
 }
 
@@ -68,7 +54,6 @@ impl TransportError {
         }
     }
 
-    /// The observed HTTP status, when one was seen.
     #[must_use]
     pub fn status_code(&self) -> Option<u16> {
         match self {
@@ -77,7 +62,6 @@ impl TransportError {
         }
     }
 
-    /// The provider's machine-readable code, when one was reported.
     #[must_use]
     pub fn provider_code(&self) -> Option<&str> {
         match self {

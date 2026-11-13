@@ -267,7 +267,6 @@ function CartesianBarPlot({
         ) : null}
       </div>
       <div className="relative min-h-0 min-w-0">
-        {/* Beside the plot, the legend scrolls within the plot's height. */}
         <div className="lg:absolute lg:inset-0">
           <ScrollArea
             className="max-h-64 lg:h-full lg:max-h-none"

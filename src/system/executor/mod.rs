@@ -1,5 +1,3 @@
-//! Orchestration primitives shared by the scheduler and executors.
-
 pub mod blocking;
 pub mod execution_runtime;
 pub(crate) mod job_tools;

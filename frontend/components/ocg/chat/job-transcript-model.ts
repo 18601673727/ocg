@@ -1,7 +1,6 @@
 import type { ControlProviderResponse, ControlToolCall } from "@/components/ocg/contracts";
 import type { OutputSequence, OutputView } from "../runtime/output-history";
 
-/** How a Job settled, as the Control Plane reports it. */
 export type TranscriptSettlement = {
   state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown";
   settled_at_us?: number | null;
@@ -13,13 +12,11 @@ export type TranscriptTurn = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  /** The model's stored reasoning, shown apart from the answer. */
   reasoning?: string;
   reasoningDurationMs?: number;
   intermediate?: boolean;
   attachments?: readonly string[];
   status: "completed" | "streaming" | "pending" | "failed" | "cancelled" | "unknown";
-  /** The Result output's own text where the Job did not complete. */
   detail: string | null;
   createdAtUs: number | null;
   tools?: readonly ControlToolCall[];
@@ -37,8 +34,6 @@ export function outputDisplayText(output: OutputView | null | undefined): string
     .join("\n");
 }
 
-// Rebuildable presentation state. The stored outputs remain the authority for
-// sequence and request boundaries; this only avoids rescanning their text.
 export class TranscriptAccumulator {
   progress = "";
   reasoning = "";
@@ -138,14 +133,6 @@ class ProviderProjection {
   }
 }
 
-/**
- * Projects one Job's frozen input and stored outputs into chat messages.
- * Recorded provider replies preserve each request's text and tool calls;
- * progress beyond those replies remains a live tail. Reasoning is separate
- * because its stored chunks carry no request number. Missing reply evidence
- * falls back to the raw output text. Only the Job's settlement decides its
- * final status; an intermediate tool reply is never a completed Job.
- */
 export function jobTranscript(
   jobId: string,
   objective: string | null,
@@ -216,8 +203,6 @@ export function jobTranscript(
   let answer: TranscriptTurn;
   const strippedPending = new Set<ControlToolCall>();
   if (state === "completed") {
-    // The Result carries the Provider's complete text; it supersedes the
-    // streamed pieces it was assembled from.
     answer = {
       ...base,
       content: visibleAnswer(
@@ -406,8 +391,6 @@ function providerMessages(
   let final = false;
   for (const request of requests) {
     const response = byRequest.get(request);
-    // Received is recorded after this response's streamed outputs are flushed.
-    // Consume the stored sequence once, leaving the unfinished request at the tail.
     if (response)
       reasoningBefore(
         answer.status === "completed" && response === responses.at(-1)
@@ -583,7 +566,6 @@ function partialMessages(
   };
   for (const request of [...tools.keys()].sort((a, b) => a - b)) {
     const at = times.get(request);
-    // Requests older than the first boundary precede the retained output window.
     const part = at === undefined ? { text: "", reasoning: "", createdAtUs: null } : take(at);
     messages.push({
       ...answer,

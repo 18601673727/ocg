@@ -1,22 +1,7 @@
-/**
- * Pure composer intent domain.
- *
- * The composer converts raw operator text into a small discriminated union.
- * Nothing here touches React, the runtime, or a transport. A future resolver
- * (structured command palette or natural-language intent) can be plugged in
- * through `ComposerIntentResolver` without changing the result shape; no NLP
- * is implemented in this slice.
- */
-
-export type ComposerIntentSource =
-  | "plain-text"
-  | "slash-command"
-  /** Reserved for a future structured or natural-language intent resolver. */
-  | "resolver";
+export type ComposerIntentSource = "plain-text" | "slash-command" | "resolver";
 
 export type ComposerJobCreateIntent = {
   kind: "job.create";
-  /** Optional trailing objective typed after `/job create`. */
   seed?: string;
   raw: string;
   source: Exclude<ComposerIntentSource, "plain-text">;
@@ -48,7 +33,6 @@ export type ComposerIntent =
 const JOB_CREATE_PATTERN = /^\/job\s+create(?:\s+([\s\S]*))?$/i;
 const JOB_ONLY_PATTERN = /^\/job\s*$/i;
 
-/** Deterministic parse. Normal text stays chat; malformed slash commands stay explicit. */
 export function parseComposerIntent(raw: string): ComposerIntent {
   const text = raw ?? "";
   const trimmed = text.trim();
@@ -88,20 +72,14 @@ export function parseComposerIntent(raw: string): ComposerIntent {
   };
 }
 
-/* -------------------------------------------------------------------------- */
-/* Suggestions                                                                */
-/* -------------------------------------------------------------------------- */
-
 export type ComposerSuggestionKind = "job" | "job.create";
 
 export type ComposerSuggestionAction = "insert" | "create-job";
 
 export type ComposerSuggestion = {
-  /** Stable identity for keys and `aria-activedescendant`. */
   id: string;
   kind: ComposerSuggestionKind;
   label: string;
-  /** Text inserted into the composer (or sent as the intent). */
   command: string;
   description: string;
   keywords: readonly string[];
@@ -143,10 +121,6 @@ export type ComposerSuggestionQuery = {
   query: string;
 };
 
-/**
- * A suggestion query is active only while the composer starts with a slash
- * command on one line. Newlines (multiline drafting) always close suggestions.
- */
 export function parseComposerSuggestionQuery(raw: string): ComposerSuggestionQuery {
   const text = raw ?? "";
   if (text.includes("\n")) return { active: false, query: "" };
@@ -162,11 +136,6 @@ function suggestionMatchesToken(suggestion: ComposerSuggestion, token: string): 
   return haystack.includes(token);
 }
 
-/**
- * Pure matcher. Every query token must appear in the suggestion's label,
- * command, or keywords, so "/" and "/job" both return the full list while
- * a narrower query such as "/job create" drops the generic Job entry.
- */
 export function matchComposerSuggestions(
   raw: string,
   limit = COMPOSER_SUGGESTIONS.length,
@@ -180,7 +149,6 @@ export function matchComposerSuggestions(
   return matches.slice(0, Math.max(0, limit));
 }
 
-/** Keyboard navigation helper. Returns -1 when there is nothing to select. */
 export function moveComposerSuggestionIndex(
   current: number,
   delta: number,
@@ -191,7 +159,6 @@ export function moveComposerSuggestionIndex(
   return (current + delta + length) % length;
 }
 
-/** Applies a suggestion without mutating it: either insert text or open a draft. */
 export function applyComposerSuggestion(suggestion: ComposerSuggestion): {
   action: ComposerSuggestionAction;
   text: string;

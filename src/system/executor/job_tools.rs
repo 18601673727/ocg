@@ -1,12 +1,3 @@
-//! The job tools of an Agent that manages Jobs: what the model is offered,
-//! and how each call is told apart from a tool a handler runs.
-//!
-//! A job tool has no handler of its own. What it does is a change to the
-//! conversation tree, so the database applies it in one transaction that
-//! also records the call's outcome (see [`crate::db::DatabaseHandle::apply_development_job_tool`]),
-//! and a call that spends the user's choice waits for it. The registration
-//! here states the schema the model is held to and what the call may change.
-
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -16,15 +7,10 @@ use crate::db::entities::ToolEffect;
 
 const UUID: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
-/// The tools that change the tree and the ones that only read it, which
-/// store just the size and digest of their result.
 const READS: [&str; 2] = ["job_agents", "job_workers"];
 
-/// The tools whose call waits for the user.
 pub(crate) const USER_DECIDED: [&str; 2] = ["job_assign", "job_dispatch"];
 
-/// A job tool's registration: it states the schema and the effect, and never
-/// runs.
 struct Applied {
     version: String,
     effect: ToolEffect,
@@ -46,9 +32,6 @@ impl ToolHandler for Applied {
     }
 }
 
-/// Registers the job tools, and returns the names offered. The tools the user
-/// decides are offered only when a user decides for the execution, and a plan
-/// is offered only where a plan may be submitted: a step of a plan is not.
 pub(crate) fn register(
     registry: &ToolRegistry,
     decider: bool,

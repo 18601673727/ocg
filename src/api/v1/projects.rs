@@ -1,15 +1,3 @@
-//! Project routes:
-//! - `GET /api/v1/projects?before=project:N&limit=M`
-//! - `POST /api/v1/projects`
-//! - `POST /api/v1/projects/{project}`
-//!
-//! A Project names a directory, its root, and the commands its Agents may
-//! run there by name. The root is resolved here, once, when the Project is
-//! created, and never changes; the name, description and commands are
-//! replaced as a whole. The commands' argument vectors are sent to the
-//! Provider with every request, so they must hold no secret. A Project is
-//! never deleted.
-
 use super::contracts::*;
 use ntex::http::StatusCode;
 use serde::Deserialize;
@@ -77,8 +65,6 @@ struct ProjectCreateInput {
     commands: Vec<CommandInput>,
 }
 
-/// The fields an update replaces, all required. The root is not among them,
-/// so a body that names it is refused.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectUpdateInput {
@@ -88,8 +74,6 @@ struct ProjectUpdateInput {
     commands: Vec<CommandInput>,
 }
 
-/// A field that must be in the body but may be `null`: `deserialize_with`
-/// turns off serde's default for a missing `Option`.
 fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     Option::deserialize(deserializer)
 }
@@ -192,9 +176,6 @@ fn description(description: Option<String>) -> Result<Option<String>, Refusal> {
     }
 }
 
-/// The root the owner named, resolved and checked off the writer: the
-/// canonical UTF-8 path every Workspace of the Project will be authorized
-/// from.
 #[cfg(unix)]
 async fn resolve_root(shared: &Shared, root: String) -> Result<String, Refusal> {
     use crate::system::executor::blocking::{self, Kind};

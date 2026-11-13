@@ -1,81 +1,3 @@
-//! The runtime gate of autonomous loopback scheduling: an explicit, per-run,
-//! per-data-directory operator authorization that a compiled
-//! [`ExecutionControl::AutonomousScheduling`] needs before it may act.
-//!
-//! The compiled control says what the build *can* do; nothing in it says
-//! that this host, over this database, *may*. A host that merely runs with
-//! the control compiled in starts without autonomous authority. Authority
-//! exists only as an [`ArmedActivation`], which only [`arm`] produces, only
-//! inside the host that opened the database (so under its exclusive lock,
-//! before its execution runtime starts and before any listener can submit),
-//! and only once every check of the activation preflight passed:
-//!
-//! - the build compiles the control and no external, redispatch or legacy
-//!   authority;
-//! - the operator named exactly this data directory and exactly this
-//!   database (its Genesis Job identity), and confirmed the state this
-//!   process just read of it by returning the challenge a preflight of that
-//!   state printed; see "What this does not prove" below;
-//! - the database is open, holds no Allocation, no queued work and no loop
-//!   that could create work: the first restricted activation never consumes,
-//!   and never lets begin, work that existed before it.
-//!
-//! A preflight that cannot be read, or whose counts, entries and recurrence
-//! index disagree, is refused, not guessed at. Nothing here clears, cancels,
-//! archives, reserves or executes anything: a refusal leaves the database
-//! exactly as it was, and the operator decides what to do with the work it
-//! reported.
-//!
-//! # Two readings, two purposes
-//!
-//! [`preflight`] reads an existing database **without opening it for
-//! writing**: it takes the host lock shared, opens the file read-only (or a
-//! private unlinked copy when redb would have to repair it), reads one
-//! consistent snapshot, and verifies afterwards that the file's bytes, mode,
-//! modification time, device and inode are exactly what they were. It never
-//! increments `open_epoch`, never touches `clean_shutdown`, never creates a
-//! directory, lock file or log, and never rebuilds a derived index. Its
-//! report is advisory: it says what a first activation would decide, and what
-//! the operator must confirm.
-//!
-//! [`arm`] decides again, on the database the host has actually opened, under
-//! its exclusive lock, immediately before the execution runtime starts. That
-//! second reading is the authoritative one, and it is the only one that can
-//! produce authority. It also checks that the state it sees is the state the
-//! operator confirmed, so a confirmation cannot outlive the state it named.
-//!
-//! The token is not an environment variable, a request, a stored row or a
-//! Job configuration: no HTTP client and no stored state can produce one.
-//! Process-scoped hosts and the other commands never ask for one, so they
-//! never hold one. Dropping the authority (stopping the armed host) stops
-//! new claims through the execution runtime's ordinary shutdown; it does not
-//! and cannot release ownership an execution already holds.
-//!
-//! # What this does not prove
-//!
-//! The challenge binds a confirmation to one opening of one database state,
-//! and it is the only thing that does. It is not an identity check, and it is
-//! no evidence that a person is present:
-//!
-//! - It stops a *static* challenge from being replayed. `open_epoch` advances
-//!   on every opening, so a unit file, alias or script that carries a
-//!   challenge printed earlier is refused after any opening, its own
-//!   included.
-//! - It does not stop a local process from confirming. `preflight` prints the
-//!   challenge for the state it reads, so any process that can run these two
-//!   commands over this directory can obtain a fresh challenge and pass it to
-//!   `serve`; a wrapper around both re-arms as often as it is run. A
-//!   noninteractive caller may equally read the expected challenge out of a
-//!   refusal and retry with it.
-//! - A terminal is where an operator usually is, not evidence that one is
-//!   there: reading standard input proves only that something wrote to it.
-//!
-//! What the gate therefore authorizes is a *local command-execution
-//! authority*: whoever can run `serve` against this data directory with a
-//! challenge for its current state could already run arbitrary commands as
-//! this user over these files. The gate decides when autonomous loopback
-//! scheduling may act; it does not decide who the operator is.
-
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -87,37 +9,19 @@ use crate::system::data_directory::{DATA_DIRECTORY_VARIABLE, DataDirectory};
 use crate::system::execution_controls::{ControlState, ExecutionControl};
 use crate::system::native_scheduler::{NOT_ASSESSED, loopback_eligibility};
 
-/// Ready entries a preflight lists with their eligibility. The listing is
-/// bounded; the counts it is compared against are exact, and any non-zero
-/// count refuses activation on its own, so no decision depends on the
-/// listing.
 pub(crate) const READY_PREVIEW: usize = 32;
 
-/// What the operator named for one activation: the data directory, the
-/// database identity the armed host must be running over, and the state of
-/// that database they confirmed.
 #[derive(Clone, Debug)]
 pub(crate) struct ActivationRequest {
-    /// The data directory as the operator named it, before resolution.
     pub(crate) data_directory: PathBuf,
-    /// The identity of the database file the operator means.
     pub(crate) database: DatabaseIdentity,
-    /// What the operator confirmed, in this process; see [`Confirmation`].
     pub(crate) confirmation: Confirmation,
-    /// Which activation this is; see [`ActivationMode`]. The two modes are
-    /// never mixed: a request is exactly one of them.
     pub(crate) mode: ActivationMode,
 }
 
-/// The two activations an operator can ask for. Each is its own
-/// authorization: the mode is bound into the state digest and into the
-/// challenge, so a confirmation for one can never arm the other.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActivationMode {
-    /// The first activation: the database holds no queued work at all.
     FirstActivation,
-    /// A reuse of the gate over existing, never-started queued work the
-    /// operator names Job by Job; see [`QueuedAllowlist`].
     QueuedWork(QueuedAllowlist),
 }
 
@@ -136,7 +40,6 @@ impl ActivationMode {
         }
     }
 
-    /// What the activation is called to the operator.
     pub(crate) const fn subject(&self) -> &'static str {
         match self {
             Self::FirstActivation => "a first activation",
@@ -145,21 +48,12 @@ impl ActivationMode {
     }
 }
 
-/// The Jobs a queued-work activation authorizes: 1 to [`QueuedAllowlist::MAX`]
-/// distinct Job identities, kept in ascending order so the same set is the
-/// same allowlist however it was written. It is the whole authorization: no
-/// Job that is not named here is ever authorized by it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QueuedAllowlist(Vec<JobId>);
 
 impl QueuedAllowlist {
-    /// The most Jobs one activation may authorize, and so the most queued Jobs
-    /// a database may hold when it is activated this way.
     pub(crate) const MAX: usize = 16;
 
-    /// Parses canonical Job identities. A duplicate, a malformed identity, an
-    /// empty list and a list longer than [`Self::MAX`] are refused; nothing is
-    /// deduplicated or dropped on the operator's behalf.
     pub(crate) fn parse(items: &[String]) -> Result<Self, String> {
         if items.is_empty() {
             return Err("a queued-work activation names at least one Job".to_owned());
@@ -199,14 +93,6 @@ impl QueuedAllowlist {
     }
 }
 
-/// The identity of one database file on this machine: the device and inode
-/// the file lives at, as `<device>:<inode>`. The database stores no instance
-/// identity (its Genesis Job is Job 0 everywhere) and this gate adds no
-/// stored state, so the file's own identity is what an activation binds to:
-/// it is read from the stopped database by `preflight`, it survives nothing
-/// that replaces the file (a restore, a migration, a copy to another
-/// directory), and it names exactly one file on this filesystem. On a
-/// platform without file identities no activation is possible.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DatabaseIdentity {
     device: u64,
@@ -214,7 +100,6 @@ pub(crate) struct DatabaseIdentity {
 }
 
 impl DatabaseIdentity {
-    /// Parses `<device>:<inode>` as `preflight` prints it.
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let (device, inode) = text.split_once(':')?;
         Some(Self {
@@ -223,8 +108,6 @@ impl DatabaseIdentity {
         })
     }
 
-    /// The identity of the database file in `root`, when the platform has
-    /// one and the file is a regular file.
     pub(crate) fn of(root: &Path) -> Result<Self, String> {
         let path = root.join(crate::db::DATABASE_FILE_NAME);
         let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
@@ -263,40 +146,18 @@ impl std::fmt::Display for DatabaseIdentity {
     }
 }
 
-/// What the operator confirmed before the host opened anything: the state
-/// digest a preflight printed, the stored `open_epoch` it read, and the
-/// challenge it printed for exactly that pair.
-///
-/// The challenge is single-use by construction and stores nothing. It covers
-/// `open_epoch`, which every opening increments, so the challenge an earlier
-/// run printed cannot name the state a later run starts from: a service
-/// manager's unit file, however often it restarts, cannot carry a challenge
-/// that still matches, because every restart is another opening. It does not
-/// stop a process from asking `preflight` for a fresh challenge itself, and it
-/// is no evidence that a person rather than a program confirmed; see "What
-/// this does not prove" in the module documentation. The host checks both that
-/// it is the next opening (`open_epoch` advanced by exactly one) and that the
-/// queue and recurrence state it reads is the state the digest named.
 #[derive(Clone, Debug)]
 pub(crate) struct Confirmation {
-    /// The challenge as printed: `ocg1-<16 hex digits>`.
     pub(crate) challenge: String,
-    /// The stored `open_epoch` the challenge was computed over.
     pub(crate) open_epoch: u64,
-    /// The `clean_shutdown` marker the challenge was computed over.
     pub(crate) clean_shutdown: bool,
-    /// The digest of the state the challenge was computed over.
     pub(crate) state: String,
 }
 
-/// Proof that this host run passed [`arm`]. It cannot be constructed
-/// anywhere else, is not `Clone`, and is consumed by the one execution
-/// runtime it arms.
 pub(crate) struct ArmedActivation {
     _private: (),
 }
 
-/// Why an activation was refused. Nothing was changed by the refusal itself.
 #[derive(Debug)]
 pub(crate) struct ActivationRefusal {
     pub(crate) code: &'static str,
@@ -315,16 +176,11 @@ impl std::fmt::Display for ActivationRefusal {
 
 impl std::error::Error for ActivationRefusal {}
 
-/// The outcome of one preflight: its report, and the refusal if it did not
-/// pass. A preflight without a request reports and never arms.
 pub(crate) struct Preflight {
     pub(crate) report: Value,
     pub(crate) refusal: Option<ActivationRefusal>,
 }
 
-/// The controls a loopback-only activation refuses to run beside: each would
-/// let the armed scheduler, or something next to it, reach past loopback or
-/// adopt work.
 const INCOMPATIBLE_CONTROLS: [ExecutionControl; 4] = [
     ExecutionControl::ExternalProviderTransport,
     ExecutionControl::ScheduledExternalTransport,
@@ -332,63 +188,34 @@ const INCOMPATIBLE_CONTROLS: [ExecutionControl; 4] = [
     ExecutionControl::LegacyProviderExecution,
 ];
 
-/// Everything one reading of the database established, and how it read it.
-/// The decision below is made from this alone, so the advisory and the
-/// authoritative reading judge exactly the same facts.
 struct Findings {
-    /// The canonical data directory the reading came from.
     root: PathBuf,
     identity: Result<DatabaseIdentity, String>,
-    /// The stored `open_epoch` this reading saw, when it could read one.
     epoch: Option<u64>,
     clean_shutdown: Option<bool>,
-    /// The snapshot, or why it could not be read.
     snapshot: Result<ActivationSnapshot, (&'static str, String)>,
-    /// Whether this reading came from the host's own open database.
     in_host: bool,
-    /// `in_place_read_only` or `private_unlinked_copy`; `open` in a host.
     access: &'static str,
-    /// Whether the file was copied to be read, which means redb repaired it.
     copied: bool,
-    /// The file as a read-only reading verified it: its size and mode. Absent
-    /// when this reading opened the file as a host, which writes it.
     file_bytes: Option<u64>,
     file_mode: Option<u32>,
 }
 
-/// Who is asking, and therefore what a passing decision can mean. A read-only
-/// reading can only advise; only the host's own gate, holding the database
-/// exclusively before its execution runtime starts, produces authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
-    /// A read-only reading of a stopped database: it reports, and arms nothing.
     Advisory,
-    /// The host's own reading under its exclusive lock: a pass arms this run.
     Authoritative,
 }
 
-/// What one activation report describes. It is computed from the decision that
-/// same report publishes and from what the reading that made it was allowed to
-/// do, so the outcome and the report cannot disagree. Nothing reconstructs it
-/// from a confirmation string, a flag or the report's own text, and reporting
-/// reads it without creating, extending or revoking any authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivationOutcome {
-    /// A read-only preflight that was not asked to activate.
     NotRequested,
-    /// A read-only preflight of a requested activation: it advises, and arms
-    /// nothing.
     Advisory,
-    /// The host's own authoritative reading refused: nothing was armed.
     Refused,
-    /// The host's own authoritative reading passed, and this run holds the
-    /// authority that decision produced.
     Armed,
 }
 
 impl ActivationOutcome {
-    /// The report's verdict. A successful arm is the only outcome that says
-    /// `armed`, and it exists only where the token exists.
     const fn verdict(self) -> &'static str {
         match self {
             Self::NotRequested => "not_requested",
@@ -399,26 +226,18 @@ impl ActivationOutcome {
     }
 }
 
-/// How a reading reached the database, and what that left behind. The report
-/// describes exactly this, and never claims a wider scope than it verified.
 pub(crate) struct Changes {
-    /// What this reading was allowed to do; see [`Gate`].
     gate: Gate,
-    /// Whether this process opened the database as a host.
     pub(crate) host_started: bool,
     pub(crate) open_epoch_before: Option<u64>,
     pub(crate) open_epoch_after: Option<u64>,
     pub(crate) clean_shutdown_before: Option<bool>,
     pub(crate) clean_shutdown_after: Option<bool>,
-    /// Whether the queue and recurrence state was read again after the refusal
-    /// and agreed with the state read before it, where it was re-read.
     pub(crate) state_unchanged: Option<bool>,
-    /// What a read-only reading verified about the file it read.
     pub(crate) file_note: &'static str,
 }
 
 impl Changes {
-    /// What a reading that never opened the file for writing changed.
     fn read_only(file_note: &'static str) -> Self {
         Self {
             gate: Gate::Advisory,
@@ -436,11 +255,6 @@ impl Changes {
         self.host_started
     }
 
-    /// The outcome this report describes, computed from the decision it
-    /// publishes and from what this reading was allowed to do. It is the only
-    /// input the report's authority and verification fields read, so a report
-    /// cannot describe an authority the decision did not produce, and a
-    /// successful arm cannot describe a refusal.
     fn outcome(&self, refused: bool, requested: bool) -> ActivationOutcome {
         match (self.gate, refused, requested) {
             (Gate::Authoritative, false, true) => ActivationOutcome::Armed,
@@ -451,9 +265,6 @@ impl Changes {
         }
     }
 
-    /// The report. `outcome` is the decision the report publishes, and
-    /// `state_confirmed` says whether the authoritative state check actually
-    /// ran and passed: a field is reported verified only when it did.
     fn to_json(&self, outcome: ActivationOutcome, state_confirmed: bool) -> Value {
         let startup = match (self.host_started, outcome) {
             (true, ActivationOutcome::Armed) => json!({
@@ -555,8 +366,6 @@ impl Changes {
     }
 }
 
-/// Reads an existing database without opening it for writing and judges what
-/// a first activation would decide; see [`preflight`].
 pub(crate) fn preflight(
     data_directory: &DataDirectory,
     request: Option<&ActivationRequest>,
@@ -577,15 +386,9 @@ pub(crate) fn preflight(
     decide(&findings, request, &changes)
 }
 
-/// Reads `root` without opening it for writing; the one implementation both
-/// the advisory preflight and a refused `serve` use.
 fn read_offline(root: &Path) -> Findings {
     let identity = DatabaseIdentity::of(root);
     let path = root.join(crate::db::DATABASE_FILE_NAME);
-    // An absent or empty file is a database this command refuses rather than
-    // creates. Reading it read-only would fail anyway, but naming the reason
-    // is what tells the operator the difference between a typo and a
-    // database that was never initialised.
     if let Ok(metadata) = std::fs::symlink_metadata(&path)
         && metadata.is_file()
         && metadata.len() == 0
@@ -639,10 +442,6 @@ fn read_offline(root: &Path) -> Findings {
     }
 }
 
-/// Why a read-only reading could not read the database, as a refusal code.
-/// A database that exists but was never initialised is distinguished from one
-/// that could not be read, because the first is a database this command must
-/// refuse rather than create; see `crate::db::redb::inspect_activation_offline`.
 fn classify_read_error(error: &crate::db::StorageError) -> (&'static str, String) {
     let detail = error.detail.clone();
     if detail.contains("unmarked database") || detail.contains("database is not a regular file") {
@@ -652,9 +451,6 @@ fn classify_read_error(error: &crate::db::StorageError) -> (&'static str, String
     }
 }
 
-/// Reads what an activation decides on and judges it. `request` is the
-/// operator's activation when there is one; without it the report says the
-/// activation was not requested and the host stays unarmed.
 fn decide(
     findings: &Findings,
     request: Option<&ActivationRequest>,
@@ -672,7 +468,6 @@ fn decide(
         checks.push(json!({"check": code, "pass": true, "detail": detail}));
     };
 
-    // 1. The build.
     if ExecutionControl::AutonomousScheduling.is_enabled() {
         pass(
             "control_compiled",
@@ -708,10 +503,8 @@ fn decide(
         );
     }
 
-    // 2. Identity: the directory and the database the operator named.
     let root = findings.root.as_path();
     match request {
-        // Not a refusal: a preflight without a request only reports.
         None => checks.push(json!({
             "check": "activation_requested",
             "pass": false,
@@ -764,7 +557,6 @@ fn decide(
         }
     }
 
-    // 3. The database, its queues and its loops.
     let snapshot = match &findings.snapshot {
         Err((code, detail)) => {
             refuse(code, detail.clone(), &mut checks);
@@ -903,7 +695,6 @@ fn decide(
         );
     }
 
-    // 4. The confirmation, when this reading is the authoritative one.
     let mut state_confirmed = false;
     if let (Some(request), Some(snapshot), true) = (request, snapshot, findings.in_host) {
         let expected_state = state_digest(root, &findings.identity, snapshot, &request.mode);
@@ -964,8 +755,6 @@ fn decide(
             )
         })
         .collect();
-    // The decision's outcome, and the only thing the report's verdict,
-    // authority and verification fields read. Reporting it cannot change it.
     let outcome = changes.outcome(refusal.is_some(), request.is_some());
     let confirmation = snapshot.map(|snapshot| {
         let state = state_digest(root, &findings.identity, snapshot, mode);
@@ -1033,7 +822,6 @@ fn decide(
             if let Some(allowlist) = request.mode.allowlist() {
                 requested["allowed_jobs"] = allowlist.to_json();
             }
-            // Only the authoritative reading has a confirmation to report.
             if findings.in_host {
                 requested["confirmed_open_epoch"] = json!(request.confirmation.open_epoch);
             }
@@ -1053,12 +841,6 @@ fn decide(
     Preflight { report, refusal }
 }
 
-/// The checks of a queued-work activation over the queue itself. The queue
-/// must be exactly the Jobs the operator named, and each of them a Job that
-/// was submitted, never started and frozen for this scheduler's loopback
-/// policy. It reads the policy the scheduler already uses
-/// ([`loopback_eligibility`]) and decides nothing about the rest of the
-/// scheduler's admission: the report lists what stays unassessed.
 fn audit_queued_work(
     snapshot: &ActivationSnapshot,
     allowlist: &QueuedAllowlist,
@@ -1107,7 +889,6 @@ fn audit_queued_work(
             ),
             checks,
         );
-        // Everything below needs a complete, exact listing.
         return;
     }
 
@@ -1203,9 +984,6 @@ fn audit_queued_work(
     }
 }
 
-/// The loop checks: an existing loop that can create work refuses, and so
-/// does a recurrence index that does not describe the recurrences it belongs
-/// to.
 fn audit_recurrences(
     audit: &RecurrenceAudit,
     subject: &str,
@@ -1268,16 +1046,6 @@ fn recurrences_json(snapshot: &Result<ActivationSnapshot, (&'static str, String)
     }
 }
 
-/// A digest of everything about a database that a first activation refuses
-/// on, and nothing that a host's ordinary opening changes. The operator
-/// confirms this digest; the authoritative reading recomputes it, so a
-/// confirmation cannot outlive the state it named.
-///
-/// A queued-work activation also binds its mode, its canonical allowlist and,
-/// for every queued Job in the ready index, the Job's identity, revision, the
-/// SHA-256 of its stored row (which carries its input and frozen execution
-/// configuration), its ready key, its evidence and its policy eligibility.
-/// The first activation's digest is exactly what it was before.
 fn state_digest(
     root: &Path,
     identity: &Result<DatabaseIdentity, String>,
@@ -1285,7 +1053,6 @@ fn state_digest(
     mode: &ActivationMode,
 ) -> String {
     use aws_lc_rs::digest::{Context, SHA256};
-    /// Length-prefixes `bytes`, so two different field splits cannot collide.
     fn field(context: &mut Context, bytes: &[u8]) {
         context.update(&(bytes.len() as u64).to_le_bytes());
         context.update(bytes);
@@ -1360,11 +1127,6 @@ fn state_digest(
     hex(context.finish().as_ref())
 }
 
-/// The challenge the operator copies from `preflight` and the host checks:
-/// `ocg1-` and the first 16 hex digits of a digest over everything the
-/// confirmation names. Because it covers `open_epoch`, which every opening
-/// increments, a challenge names one opening of one database state, and the
-/// opening after it can never reuse it.
 fn challenge_of(
     state: &str,
     open_epoch: u64,
@@ -1393,9 +1155,6 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
-/// Runs the preflight for `request` and arms the run when it passes. The
-/// report is returned either way so the caller can publish it; a refusal
-/// leaves the database untouched.
 pub(crate) async fn arm(
     database: &DatabaseHandle,
     data_directory: &DataDirectory,
@@ -1443,25 +1202,12 @@ pub(crate) async fn arm(
         file_note: "written by this host's own startup and shutdown; the activation decision itself wrote nothing, and the file's identity (device and inode) is unchanged",
     };
     let Preflight { report, refusal } = decide(&findings, Some(request), &changes);
-    // This is the authoritative gate, so a decision without a refusal is the
-    // one that arms, and the report already says so from that same outcome.
-    // The token is constructed on this path, immediately, and the caller
-    // publishes the report only after receiving both: the report and the
-    // authority it describes cannot disagree, and neither is derived from the
-    // other's text.
     match refusal {
         Some(refusal) => (report, Err(refusal)),
         None => (report, Ok(ArmedActivation { _private: () })),
     }
 }
 
-/// Records, on a refusal report, what a second read-only reading of the same
-/// database found after the host closed it. The caller reads the database
-/// again once nothing owns it; until then the report says the scope was not
-/// verified, and never claims it was. A report that is not a refusal is left
-/// untouched: an armed host publishes its report while it still serves, so no
-/// second reading of a database it owns describes it, and no refusal text may
-/// reach the report of an authority that was granted.
 pub(crate) fn record_state_reread(
     report: &mut Value,
     after: Option<&Value>,
@@ -1488,7 +1234,6 @@ pub(crate) fn record_state_reread(
     report["changes"]["job_and_allocation_state"] = job_and_allocation;
 }
 
-/// Whether `named` resolves to exactly `root`, the directory the host opened.
 fn same_directory(named: &Path, root: &Path) -> Result<(), String> {
     let resolved = named.canonicalize().map_err(|error| {
         format!(
@@ -1507,9 +1252,6 @@ fn same_directory(named: &Path, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether the environment, when it names a data directory, names `root`:
-/// an activation over one directory while the environment points elsewhere
-/// is ambiguous and refused.
 fn environment_agrees(root: &Path) -> Result<(), String> {
     let Some(value) = std::env::var_os(DATA_DIRECTORY_VARIABLE).filter(|value| !value.is_empty())
     else {

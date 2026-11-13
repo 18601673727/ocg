@@ -1,8 +1,5 @@
 use super::*;
 
-/// A command a Project offers its Agents by name. `argv[0]` is a bare
-/// program name or an absolute path; it runs in the Project's root with the
-/// same filtered environment and timeout as every other command.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectCommand {
@@ -64,8 +61,6 @@ impl ProjectRecord {
 pub struct Project {
     pub name: String,
     pub description: Option<String>,
-    /// The canonical, UTF-8 root the control plane resolved. It is fixed
-    /// for the life of the Project.
     pub root: String,
     pub commands: Vec<ProjectCommand>,
 }
@@ -76,7 +71,6 @@ pub struct ProjectRecord {
     pub name: String,
     pub description: Option<String>,
     pub root: String,
-    /// In the order given, so that their encoding is stable.
     pub commands: Vec<ProjectCommand>,
     pub decision: Option<ProjectDecisionConfig>,
     pub decision_revision: u64,
@@ -84,18 +78,14 @@ pub struct ProjectRecord {
     pub updated_at: Timestamp,
 }
 
-/// The commands every Project offers with a `code` grant.
 pub const BUILT_IN_COMMANDS: [&str; 2] = ["cargo_check", "cargo_test"];
 
-/// The most active commands a Project may have.
 const MAX_PROJECT_COMMANDS: usize = 32;
-/// Bounds the entire command list, including retained user blocks.
 const MAX_PROJECT_COMMANDS_BYTES: usize = 16 * 1024;
 const MAX_COMMAND_NAME_BYTES: usize = 64;
 const MAX_ARGV_ENTRIES: usize = 64;
 const MAX_ARGV_ENTRY_BYTES: usize = 4096;
 
-/// Why `commands` cannot be a Project's. Create and update share it.
 pub fn validate_project_commands(commands: &[ProjectCommand]) -> Result<(), &'static str> {
     if commands
         .iter()
@@ -105,7 +95,6 @@ pub fn validate_project_commands(commands: &[ProjectCommand]) -> Result<(), &'st
     {
         return Err("a Project has at most 32 active commands");
     }
-    // As stored: a 4-byte count, then each string with a 4-byte length.
     let mut encoded = 4usize;
     for (index, command) in commands.iter().enumerate() {
         encoded = encoded.saturating_add(3 + if command.proposal.is_some() { 16 } else { 0 });

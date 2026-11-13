@@ -1,16 +1,8 @@
-//! The derived tables, computed from the authoritative ones alone.
-//!
-//! Each derived table is written in the same transaction as the fact it
-//! derives from. After an unclean shutdown the open procedure compares every
-//! one with its definition (I10) and rebuilds those that differ, logging the
-//! difference. An index is never an authority.
-
 use std::collections::BTreeSet;
 
 use super::*;
 use crate::db::entities::{OutcomeKind, RequestEventRecord, RequestPayload};
 
-/// Encodes up to three Unicode scalars as char + 1 in 21-bit slots.
 pub(super) fn search_gram(chars: &[char]) -> u64 {
     chars
         .iter()
@@ -284,8 +276,6 @@ pub(super) fn search_output_text(output: &JobOutputRecord, completed: bool) -> O
         .or(output.summary.as_deref().filter(|_| completed))
 }
 
-/// The identity a request event is indexed under, when it qualifies for the
-/// request indexes at all.
 fn indexed_identity<'a>(
     identity: Option<&'a reader::UsageIdentity>,
     event: &RequestEventRecord,
@@ -326,7 +316,6 @@ pub(super) fn usage_model_key(
     })
 }
 
-/// Keeps the smallest Job containing a qualifying request event of the key.
 pub(super) fn record_usage_model(
     tx: &WriteTransaction,
     key: (u128, [u8; 32]),
@@ -361,9 +350,6 @@ pub(super) fn validate_native_sample(
     Ok(())
 }
 
-/// Bound reconstruction and Job-detail projection work. Each observation has
-/// two events; 1,024 observations plus the request prefix remain within the
-/// existing 5,000-event observation scan budget.
 pub(super) const MAX_NATIVE_USAGE_OBSERVATIONS: u32 = 1024;
 
 pub(super) fn native_usage_evidence(
@@ -454,8 +440,6 @@ pub(super) fn native_usage_evidence(
     Ok(evidence)
 }
 
-/// Validates the Token evidence of every request of `job`, each on its own:
-/// a request's counters are one sample, never summed with another's.
 pub(super) fn native_usage_validate(tx: &WriteTransaction, job: JobId) -> Result<(), StorageError> {
     let mut request = RequestNumber::FIRST;
     loop {
@@ -513,19 +497,12 @@ pub(super) fn content_reference(
     Ok(())
 }
 
-/// What the Allocation indexes must hold, computed from the authoritative
-/// `POOL_ALLOCATIONS` rows and the Pool configurations alone.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct AllocationIndexes {
-    /// (pool, executor, job) of every Allocation that holds capacity.
     pub(super) active: BTreeSet<(u128, u128, u128)>,
-    /// Reservation request identity -> Job, of every Allocation.
     pub(super) requests: std::collections::BTreeMap<u128, u128>,
 }
 
-/// Computes the Allocation indexes, or reports corruption: a reused request
-/// identity, an Executor holding two Allocations, or an Allocation whose Pool
-/// configuration is missing.
 pub(super) fn compute_allocation_indexes(
     allocations: &impl ReadableTable<u128, &'static [u8]>,
     configs: &impl ReadableTable<u128, &'static [u8]>,
@@ -564,10 +541,6 @@ pub(super) fn compute_allocation_indexes(
             pools.insert(pool);
         }
     }
-    // Occupancy above the configured capacity is legitimate: a Pool may be
-    // shrunk below its active Allocations, which keep their capacity while new
-    // reservations stay refused. Only the Pool's existence and encoding are
-    // checked.
     for pool in pools {
         let Some(bytes) = configs.get(pool)? else {
             return Err(StorageError::corrupted(
@@ -579,7 +552,6 @@ pub(super) fn compute_allocation_indexes(
     Ok(indexes)
 }
 
-/// The Allocation indexes as stored.
 pub(super) fn stored_allocation_indexes(
     active: &impl ReadableTable<(u128, u128, u128), ()>,
     requests: &impl ReadableTable<u128, u128>,
@@ -598,7 +570,6 @@ pub(super) fn stored_allocation_indexes(
     Ok(stored)
 }
 
-/// Deletes and rewrites the Allocation indexes from their source.
 pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), StorageError> {
     let computed =
         compute_allocation_indexes(&tx.open_table(POOL_ALLOCATIONS)?, &tx.open_table(CONFIGS)?)?;
@@ -615,9 +586,6 @@ pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), St
     Ok(())
 }
 
-/// Reports whether the stored Allocation indexes equal what their source
-/// computes. Read-only: used by diagnostics and by the rebuild equivalence
-/// check, never to repair.
 pub(super) fn allocation_indexes_agree(
     allocations: &impl ReadableTable<u128, &'static [u8]>,
     configs: &impl ReadableTable<u128, &'static [u8]>,

@@ -52,11 +52,6 @@ pub(super) fn output_view(record: &JobOutputRecord) -> OutputView {
     }
 }
 
-/// A page of the Job's outputs, exactly as stored and in `seq` order: as
-/// many of the first `limit` after `after_seq` as fit the response, whole.
-/// `next_after_seq` is the cursor of the next page, `after_seq` again when
-/// none was returned; `has_more` says whether a later output was stored
-/// when the page was read.
 pub(super) async fn outputs(
     shared: &Shared,
     job: JobId,

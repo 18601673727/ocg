@@ -1,7 +1,6 @@
 use super::contracts::*;
 use super::*;
 
-/// A request's route, once admitted.
 pub(super) enum Route {
     Health,
     MutableJob(mutable_jobs::Action),
@@ -146,9 +145,6 @@ pub(super) enum Route {
     SessionRevoke,
 }
 
-/// Whether `caller` may use `route`: the API routes a signed-in browser
-/// may use are named one by one, and everything unnamed is refused to it.
-/// The session routes are the browser's alone.
 pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal> {
     let allowed = match (caller, &route) {
         (
@@ -570,8 +566,6 @@ fn no_query(query: &str) -> Result<(), Refusal> {
     }
 }
 
-/// A non-negative decimal number without sign, leading zero or more digits
-/// than `T` holds.
 pub(super) fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
     let canonical = !text.is_empty()
         && text.bytes().all(|byte| byte.is_ascii_digit())
@@ -579,14 +573,12 @@ pub(super) fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
     canonical.then(|| text.parse().ok()).flatten()
 }
 
-/// Parses a canonical Job UUID.
 pub(super) fn job_id(text: &str) -> Result<JobId, Refusal> {
     crate::db::entities::parse_entity_id(text)
         .map(JobId::new)
         .ok_or(INVALID_REQUEST)
 }
 
-/// `after_seq` and `limit`, each at most once, and nothing else.
 pub(super) fn output_query(query: &str) -> Result<(Option<i64>, usize), Refusal> {
     let (mut after_seq, mut limit) = (None, None);
     if !query.is_empty() {
@@ -890,8 +882,6 @@ pub(super) async fn respond(
         }
         Route::SessionStatus => match caller {
             Caller::Operator(session) => Ok(Reply::ok(browser::described(session))),
-            // The served frontend signs itself in; a headless listener has
-            // no page to do that from and keeps the pairing code.
             Caller::Anonymous if shared.assets.is_some() => {
                 let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
                 browser.begin_session()
@@ -905,9 +895,7 @@ pub(super) async fn respond(
             }
             Caller::Programmatic | Caller::Anonymous => Err(NOT_FOUND),
         },
-        // Answered as a stream, before any reply.
         Route::Events { .. } | Route::Subscription(_) => Err(INTERNAL),
-        // Answered as the image itself, before any reply.
         Route::AttachmentContent(_) => Err(INTERNAL),
     }
 }

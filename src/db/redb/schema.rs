@@ -2,10 +2,7 @@ use super::*;
 
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
-// Database format is independent of the per-record encoding version.
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-/// Names the exact table set and record encodings of the format. A database
-/// whose fingerprint differs is incompatible even when its format number matches.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
 pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v1";
 pub(super) const DATABASE_FORMAT_VERSION: u64 = 1;
@@ -14,15 +11,12 @@ pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
 pub(crate) const MAX_OBSERVATION_SCAN: usize = 5_000;
 
-// ---- Authoritative tables ---------------------------------------------------------
-
 pub(super) const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 pub(super) const SEQUENCES: TableDefinition<&str, u128> = TableDefinition::new("sequence");
 pub(super) const CONFIGS: TableDefinition<u128, &[u8]> = TableDefinition::new("config");
 pub(super) const CREDENTIALS: TableDefinition<&str, &[u8]> = TableDefinition::new("credential");
 pub(super) const JOBS: TableDefinition<u128, &[u8]> = TableDefinition::new("job");
 pub(super) const JOB_STATES: TableDefinition<u128, &[u8]> = TableDefinition::new("job_state");
-/// One row per Job, keyed by Job: the Allocation of a Pool and an Executor to it.
 pub(super) const POOL_ALLOCATIONS: TableDefinition<u128, &[u8]> =
     TableDefinition::new("pool_allocation");
 pub(super) const JOB_OUTPUTS: TableDefinition<(u128, u32), &[u8]> =
@@ -42,19 +36,10 @@ pub(super) const NOTICES: TableDefinition<(u128, u32), &[u8]> = TableDefinition:
 pub(super) const APPROVALS: TableDefinition<(u128, u32, u32), &[u8]> =
     TableDefinition::new("approval");
 pub(super) const RECURRENCES: TableDefinition<u128, &[u8]> = TableDefinition::new("recurrence");
-/// Stable policy identity -> the exact endpoint, credential reference, Model,
-/// proxy and limits one scheduled external transport may use. A row is created
-/// disabled; it never enables the build's control.
 pub(super) const SCHEDULED_EXTERNAL_POLICY: TableDefinition<u128, &[u8]> =
     TableDefinition::new("scheduled_external_policy");
-/// Job -> the policy identity and revision its current Allocation was
-/// authorized under, with the Allocation generation. Source of the policy
-/// check in the start and send transactions; absent for every non-scheduled
-/// execution.
 pub(super) const SCHEDULED_EXTERNAL_BINDING: TableDefinition<u128, &[u8]> =
     TableDefinition::new("scheduled_external_binding");
-
-// ---- Derived tables ----------------------------------------------------------------
 
 pub(super) const JOB_OBSERVATIONS: TableDefinition<(u128, u8, u128), (u32, u32)> =
     TableDefinition::new("job_observation");
@@ -63,20 +48,10 @@ pub(super) const CONTENT_REFERENCES: TableDefinition<&[u8], (u64, u64)> =
 pub(super) const CONTENT_RECLAIM: TableDefinition<&[u8], u64> =
     TableDefinition::new("content_reclaim");
 
-/// (pool, executor, job) for every Allocation that still holds capacity, that
-/// is, every `POOL_ALLOCATIONS` row whose phase is not Released. It is written
-/// in the same transaction as the phase change that adds or removes the row,
-/// so Pool and Executor occupancy is a bounded range read rather than a scan
-/// of every Allocation ever made.
 pub(super) const ACTIVE_ALLOCATIONS: TableDefinition<(u128, u128, u128), ()> =
     TableDefinition::new("active_allocation");
-/// Reservation request identity -> the Job whose single Allocation it made.
-/// Source: `POOL_ALLOCATIONS`. A request identity is never reused, so a row
-/// is added with its Allocation and never removed.
 pub(super) const ALLOCATION_REQUESTS: TableDefinition<u128, u128> =
     TableDefinition::new("allocation_request");
-/// Composer context -> the one unsubmitted, unsettled Job drafted there.
-/// Source: `JOBS` rows in the Unsubmitted phase whose state has no outcome.
 pub(super) const DRAFT_CONTEXTS: TableDefinition<u128, u128> =
     TableDefinition::new("draft_context");
 
@@ -86,7 +61,6 @@ pub(super) const CONVERSATIONS: TableDefinition<u128, ()> = TableDefinition::new
 pub(super) const TURNS: TableDefinition<(u128, u128), ()> = TableDefinition::new("turn");
 
 pub(super) const PENDING: TableDefinition<u128, ()> = TableDefinition::new("pending");
-/// The ready queue orders high priority first, then submission time and Job ID.
 pub(super) const MUTABLE_READY: TableDefinition<(u8, i64, u128, u16), ()> =
     TableDefinition::new("ready");
 pub(super) const DELAYED: TableDefinition<(i64, u128), ()> = TableDefinition::new("delayed");
@@ -95,7 +69,6 @@ pub(super) const DEPENDENCY_WAITERS: TableDefinition<(u128, u128), u8> =
 pub(super) const UNSETTLED: TableDefinition<u128, (u32, u32)> = TableDefinition::new("unsettled");
 pub(super) const CHILDREN: TableDefinition<(u128, u128), ()> = TableDefinition::new("children");
 pub(super) const SUCCESSORS: TableDefinition<u128, ()> = TableDefinition::new("successor");
-/// (conversation, Unicode gram, turn)
 pub(crate) type ConversationSearchKey = (u128, u64, u128);
 pub(super) const CONVERSATION_SEARCH: TableDefinition<ConversationSearchKey, ()> =
     TableDefinition::new("conversation_search");
@@ -110,20 +83,14 @@ pub(super) const GROUP_RESULTS: TableDefinition<u128, (u128, u128)> =
 pub(super) const NOTICE_READ: TableDefinition<u128, u32> = TableDefinition::new("notice_read");
 pub(super) const TOOL_CALL_IDS: TableDefinition<(u128, &str), (u32, u32)> =
     TableDefinition::new("tool_call_id");
-/// (admitted, refused_arguments, completed, failed, duration_us_total, duration_us_max)
-/// Duration semantics: admission commit -> outcome commit (includes the
-/// admission's durable commit), never spanning a restart.
 pub(crate) type ToolStatValue = (u64, u64, u64, u64, u64, u64);
 pub(super) const TOOL_STATS: TableDefinition<&str, ToolStatValue> =
     TableDefinition::new("tool_stat");
-/// (hour: i64, agent: u64, provider: u64, model_hash: [u8; 32])
 pub(crate) type UsageTotalKey = (i64, u128, u128, [u8; 32]);
-/// (requests, complete_requests, input, output, cache_read, cache_write, reasoning)
 pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) const USAGE_TOTALS: TableDefinition<UsageTotalKey, UsageTotalValue> =
     TableDefinition::new("usage_total");
 pub(super) const RETRIES: TableDefinition<(u128, u128), bool> = TableDefinition::new("retry");
-/// (provider, model_hash) -> the smallest Job with a qualifying request event.
 pub(super) const USAGE_MODEL: TableDefinition<(u128, [u8; 32]), u128> =
     TableDefinition::new("usage_model");
 pub(super) type RequestTimelineKey = (i64, u128, u32, u32);

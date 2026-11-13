@@ -1,5 +1,4 @@
 pub mod ai;
-// Restored for the native tool loop; nothing registers them until it exists.
 #[cfg(unix)]
 #[allow(dead_code)]
 pub mod fts;

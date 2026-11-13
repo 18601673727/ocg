@@ -113,22 +113,17 @@ fn batch_delay(previous: Instant, next_due: Option<Duration>) -> Duration {
     due.max(BATCH_FLOOR.saturating_sub(previous.elapsed()))
 }
 
-/// A cloneable endpoint to the host's scheduler.
 #[derive(Clone)]
 pub struct SchedulerHandle {
-    /// The cancellations of the native scheduler's running executions; a
-    /// native stop reaches its one execution through them.
     native_stops: crate::system::native_scheduler::NativeStops,
 }
 
 impl SchedulerHandle {
-    /// Where a native stop finds the one running execution it cancels.
     pub(crate) fn native_stops(&self) -> &crate::system::native_scheduler::NativeStops {
         &self.native_stops
     }
 }
 
-/// Owns the host's native dispatcher.
 pub struct ExecutionRuntime {
     scheduler: SchedulerHandle,
     shutdown: CancellationToken,
@@ -142,9 +137,6 @@ pub enum ClaimScope {
 }
 
 impl ExecutionRuntime {
-    /// A runtime without autonomous authority: whatever the build compiles,
-    /// it schedules nothing. Every host and command starts one of these
-    /// unless it was explicitly armed; see [`Self::start_armed`].
     pub fn start(
         database: DatabaseHandle,
         scope: ClaimScope,
@@ -152,10 +144,6 @@ impl ExecutionRuntime {
         Self::start_with(database, scope, None, None)
     }
 
-    /// A runtime the operator armed for autonomous loopback scheduling; see
-    /// [`crate::system::loopback_activation`]. The token is necessary, and
-    /// the compiled [`ExecutionControl::AutonomousScheduling`] remains
-    /// necessary too: without either, this schedules nothing.
     pub(crate) fn start_armed(
         database: DatabaseHandle,
         scope: ClaimScope,
@@ -171,9 +159,6 @@ impl ExecutionRuntime {
         armed: Option<crate::system::loopback_activation::ArmedActivation>,
         workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
     ) -> Result<Self, ExecutionRuntimeError> {
-        // Only a runtime that schedules takes the database's scheduler wake;
-        // one that never schedules leaves it untouched. Scheduling takes the
-        // compiled control and the operator's arming of this run, both.
         let armed = armed.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled());
         let wake = if armed.is_some() {
             Some(
@@ -236,13 +221,9 @@ async fn dispatch_runtime(
         wake.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled()),
         armed,
     ) else {
-        // No autonomous dispatch of any kind: the control is not compiled
-        // in, or this run was not armed.
         shutdown.cancelled().await;
         return Ok(());
     };
-    // The native scheduler runs only in the host that serves stored Jobs,
-    // never inside a one-shot command's host.
     match scope {
         ClaimScope::Stored => {
             crate::system::native_scheduler::run(

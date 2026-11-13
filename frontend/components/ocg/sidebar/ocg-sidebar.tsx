@@ -117,19 +117,10 @@ type OcgSidebarProps = {
   onRenameChild?: (conversation: string, title: string) => Promise<void>;
   onHide?: (id: string) => Promise<void>;
   runtimeStatus: RuntimeStatus;
-  /** Which runtime answers Chat, so the footer never claims a fixture runtime. */
   runtimeAuthority: RuntimeAuthority;
-  /** Active top-level workspace, used to highlight the navigation group. */
   activeView?: WorkspaceView;
-  /** Unresolved attention count shown as a quiet badge next to Attention. */
   attentionCount?: number;
-  /**
-   * Opens a workspace, or closes it back to the chat root when it is already
-   * open. Omitting it hides the workspace navigation group entirely, which is
-   * how a page renders the sidebar without shell navigation.
-   */
   onNavigate?: (view: WorkspaceView) => void;
-  /** Opens Settings from the account menu. Omitting it hides that item. */
   onSettingsClick?: () => void;
   conversationList?: "loading" | "loaded" | "failed";
   onRetryConversations?: () => void;
@@ -351,8 +342,6 @@ export function OcgSidebar({
   };
   const canonicalMode = runtimeAuthority === "canonical";
   const workspaceNav = WORKSPACE_NAV;
-  // In canonical mode every non-Chat destination lives in the Workbench menu
-  // while the conversation list and New chat serve Chat directly.
   const workbenchNav = canonicalMode ? workspaceNav.filter((item) => item.target !== "chat") : [];
   const hasNav = Boolean(onNavigate);
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) =>
@@ -505,10 +494,6 @@ export function OcgSidebar({
                 <Skeleton key={`rail-skeleton-${i}`} className="size-9 shrink-0 rounded-md" />
               ))}
           </ScrollArea>
-          {/*
-            The collapsed rail keeps the account menu: same identity, same
-            actions, same order as the expanded footer, from the same component.
-          */}
           <div className="mt-2 w-full border-t border-border pt-2">
             <div className="flex w-full justify-center">
               <AccountMenu
@@ -952,11 +937,6 @@ export function OcgSidebar({
           )}
         </ScrollArea>
 
-        {/*
-          The account menu holds who is signed in and what they can do here.
-          Local mode has no signed identity and no logout to run, so it names
-          that state and offers Settings only.
-        */}
         <div className="relative border-t border-border px-2 py-2">
           <AccountMenu
             email={email}

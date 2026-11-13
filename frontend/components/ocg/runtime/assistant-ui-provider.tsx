@@ -1,13 +1,5 @@
 "use client";
 
-/**
- * AssistantUI Provider that bridges OCG's runtime-store with assistant-ui components.
- *
- * This provider wraps the assistant-ui ExternalStoreRuntime with OCG's existing
- * runtime store, allowing assistant-ui Thread components to render OCG conversations
- * while preserving all OCG-specific functionality.
- */
-
 import { type FC, type ReactNode, useMemo, useCallback } from "react";
 import { AssistantRuntimeProvider, useExternalStoreRuntime } from "@assistant-ui/react";
 import { useOcgRuntime } from "./runtime-context";
@@ -27,16 +19,6 @@ interface OcgAssistantProviderProps {
   projectId: string;
 }
 
-/**
- * Provider that connects OCG's runtime store to assistant-ui.
- *
- * Usage:
- * ```tsx
- * <OcgAssistantProvider>
- *   <Thread />
- * </OcgAssistantProvider>
- * ```
- */
 export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
   children,
   sessionId,
@@ -44,11 +26,8 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
 }) => {
   const runtime = useOcgRuntime();
   const { t } = useI18n();
-  // Managed images are served by the control server; resolve their paths
-  // against this base so the browser can fetch them from any page origin.
   const controlBaseUrl = useOcgControlUrl();
 
-  // Get current conversation from snapshot
   const messages = useMemo(() => {
     return runtime.snapshot.messagesBySession[sessionId] ?? [];
   }, [runtime.snapshot.messagesBySession, sessionId]);
@@ -73,7 +52,6 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
     return messageStreaming || executionRunning;
   }, [messages, execution]);
 
-  // Get current conversation state
   const getState = useCallback((): OcgConversationState => {
     return {
       messages,
@@ -85,13 +63,10 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
     };
   }, [messages, hasEarlier, isRunning, execution, sessionId, projectId]);
 
-  // A Job is created and submitted through the Composer, never through this
-  // runtime's thread; the thread only presents and acts on existing Jobs.
   const onNew = useCallback(async () => {
     throw new Error(t("app.jobLaunchUnavailable"));
   }, [t]);
 
-  // Handle message reload/regenerate
   const onReload = useCallback(
     async (_parentId: string | null, config: OcgReloadConfig) => {
       if (config.sourceId) await runtime.retryMessage(sessionId, config.sourceId);
@@ -99,7 +74,6 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
     [runtime, sessionId],
   );
 
-  // Handle cancellation
   const onCancel = useCallback(async () => {
     await runtime.cancel(sessionId);
   }, [runtime, sessionId]);
@@ -109,12 +83,11 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
     [runtime.client, sessionId],
   );
 
-  // Create the external store adapter
   const adapter = useMemo(() => {
     return createOcgExternalStoreAdapter(
       getState,
       onNew,
-      undefined, // onEdit not supported
+      undefined,
       onReload,
       onCancel,
       controlBaseUrl,
@@ -123,7 +96,6 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
     );
   }, [getState, onNew, onReload, onCancel, controlBaseUrl, onLoadEarlier, t]);
 
-  // Create the assistant-ui runtime from the external store
   const assistantRuntime = useExternalStoreRuntime(adapter);
 
   return <AssistantRuntimeProvider runtime={assistantRuntime}>{children}</AssistantRuntimeProvider>;

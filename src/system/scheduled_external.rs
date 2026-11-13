@@ -1,45 +1,3 @@
-//! The durable authorization for one scheduled external transport, and the
-//! runtime view one stored policy yields.
-//!
-//! The native scheduler ([`crate::system::native_scheduler`]) selects native
-//! Generative Jobs without a per-Job invocation. A literal loopback endpoint
-//! is admitted exactly as before. An external configuration is admitted only
-//! by a stored [`crate::db::entities::ScheduledExternalPolicyRecord`], and only
-//! when
-//! [`crate::system::execution_controls::ExecutionControl::ScheduledExternalTransport`]
-//! is enabled. Neither condition alone is enough: this build keeps the control
-//! disabled, so [`grant`] refuses every row and no external dispatch exists.
-//!
-//! The policy names exactly one endpoint, one credential reference, one exact
-//! Model, one trusted loopback proxy and the limits of one exchange. It stores
-//! no plaintext credential and no mutable Provider configuration. A
-//! [`ScheduledExternalGrant`] is the runtime view formed from one row; it is
-//! deliberately not convertible from
-//! [`crate::service::ai::providers::ExternalAuthority`], so a manual external
-//! approval cannot authorize a scheduled exchange.
-//!
-//! The three authorization points are separate:
-//!
-//! 1. selection and reservation, in one writer transaction, require a live
-//!    policy that binds the Job's whole frozen configuration, and record the
-//!    policy identity and revision in a durable binding;
-//! 2. the checked start revalidates that binding and policy revision in the
-//!    start transaction;
-//! 3. the send-evidence transaction revalidates them again, atomically with
-//!    recording that the request was sent, so a revocation that lands
-//!    beforehand prevents the request from being sent at all.
-//!
-//! A missing, revoked, disabled or stale policy refuses; none is inferred from
-//! the Job's frozen configuration or from another authority.
-//!
-//! The send-evidence commit is the durable send boundary, not a lock on the
-//! network. The HTTP request is written only after that commit, so a revocation
-//! committed before it prevents the send; a revocation committed after it
-//! cannot unsend the request, and the exchange keeps its possibly-sent
-//! semantics (held as Uncertain unless a response proves how it ended). No
-//! database transaction and network I/O are atomic, and nothing here claims
-//! otherwise.
-
 use crate::db::entities::{
     FrozenExecutionConfig, LlmTransport, ScheduledExternalPolicyId, ScheduledExternalPolicyRecord,
 };
@@ -52,8 +10,6 @@ use crate::system::external_approval::{
     MAX_REQUEST_BYTES_CEILING, MAX_TIMEOUT_CEILING, parse_trusted_proxy,
 };
 
-/// Why a scheduled external policy cannot be formed, bind a Job, or authorize
-/// a send. `code` is stable and every case is a deterministic refusal.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{code}: {detail}")]
 pub(crate) struct ScheduledExternalRefusal {
@@ -76,9 +32,6 @@ impl From<ApprovalRefusal> for ScheduledExternalRefusal {
     }
 }
 
-/// An operator's validated input for one policy. Its fields are private and
-/// it is only produced by [`Self::new`], so an unvalidated endpoint, credential
-/// reference, Model, proxy or limit never reaches storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduledExternalPolicyDraft {
     endpoint: String,
@@ -116,8 +69,6 @@ impl ScheduledExternalPolicyDraft {
             max_output_tokens,
             std::time::Duration::from_secs(u64::from(timeout_secs)),
         )?;
-        // Delegates the exact Model check to the same validator a manual
-        // approval uses, without constructing an authority of its own.
         ExternalApproval::scheduled_external(
             endpoint.request_url(),
             credential_ref,
@@ -151,10 +102,6 @@ impl ScheduledExternalPolicyDraft {
     }
 }
 
-/// The runtime view of one live stored policy, under the build's control.
-/// Nothing forms one from an approval, a Job's frozen configuration or a
-/// request: [`Self::from_record`] is the only constructor and it refuses a
-/// disabled control, a disabled or revoked row, and every non-canonical field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduledExternalGrant {
     pub(crate) policy: ScheduledExternalPolicyId,
@@ -225,11 +172,6 @@ impl ScheduledExternalGrant {
         })
     }
 
-    /// Whether this grant admits exactly the Job's frozen configuration. The
-    /// endpoint, credential reference and Model are assertions on the frozen
-    /// values, never overrides; the Job must also be the checked single
-    /// request, carry no secret header, and bound its own output within the
-    /// policy's limits.
     pub(crate) fn admits(
         &self,
         frozen: &FrozenExecutionConfig,
@@ -303,7 +245,6 @@ impl ScheduledExternalGrant {
         Ok(())
     }
 
-    /// The exact prepared request, before the start is submitted.
     pub(crate) fn check_prepared(
         &self,
         prepared: &crate::db::PreparedDevelopmentHandoff,
@@ -311,8 +252,6 @@ impl ScheduledExternalGrant {
         self.approval.check_prepared(prepared)
     }
 
-    /// The one exchange's Provider configuration: this destination, this
-    /// timeout, a bounded response.
     pub(crate) fn provider_config(
         &self,
         cancellation: CancellationToken,
@@ -329,9 +268,6 @@ impl ScheduledExternalGrant {
     }
 }
 
-/// Whether one stored row, read without a grant, admits this frozen
-/// configuration. It is used inside the reservation, start and send
-/// transactions; every case refuses when anything is missing or inconsistent.
 pub(crate) fn record_admits(
     record: &ScheduledExternalPolicyRecord,
     frozen: &FrozenExecutionConfig,

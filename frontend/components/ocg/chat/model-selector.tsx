@@ -132,8 +132,6 @@ export function ModelSelector({
     window.addEventListener("focus", refresh);
     return () => window.removeEventListener("focus", refresh);
   }, [needsSetup]);
-  // A conversation keeps the Project of its first turn, so only a new one chooses,
-  // and only the owner chooses: no Project is picked for them.
   const projects = !fixedAgent ? (catalog?.projects ?? []) : [];
   const projectId = projectLocked
     ? (lockedProject ?? undefined)

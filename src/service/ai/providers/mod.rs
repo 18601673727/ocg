@@ -1,5 +1,3 @@
-//! OpenAI-compatible provider execution for an admitted Job.
-
 use std::sync::{
     Arc, Mutex, PoisonError, Weak,
     atomic::{AtomicBool, Ordering},

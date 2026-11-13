@@ -1,5 +1,3 @@
-//! Limits and process supervision for blocking work started by tool calls.
-
 use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
@@ -279,18 +277,10 @@ pub(crate) struct Process {
     running: Option<RunningGroup>,
 }
 
-/// Where a spawning call stands. The entry exists from before its admission
-/// can commit until its Job's stop is confirmed or no process can have
-/// started; it is the single record of the call's process ownership.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CallState {
-    /// A supervisor may still start the call's process.
     Starting,
-    /// The call's process group may be alive.
     Running(Pid),
-    /// The group was proven empty, or no process can have started although
-    /// the call's admission may be committed; the proof stays until the
-    /// Job's stop or outcome is durably settled, see [`stop_settled`].
     Cleaned,
 }
 
@@ -311,22 +301,12 @@ fn set_call(call: ToolCallRef, from: impl Fn(CallState) -> bool, to: Option<Call
     }
 }
 
-/// The obligation to supervise a process that a spawning call may still
-/// start. Dropping it means no process can start, unless a panic is
-/// unwinding: then the entry stays and the Job keeps answering as tracked.
-/// What the entry becomes depends on the call's admission: one that may have
-/// committed leaves the proof that nothing started, see
-/// [`Self::admission_pending`]; one that did not leaves nothing.
 pub(crate) struct StartingCall {
     call: ToolCallRef,
     armed: bool,
-    /// Whether the call's admission may be committed.
     admitted: bool,
 }
 
-/// Registers `call` as starting. Done before the call's admission is
-/// recorded, so no interval in which the admission may be committed is
-/// untracked.
 pub(crate) fn begin_call(call: ToolCallRef) -> StartingCall {
     CALLS
         .lock()
@@ -344,23 +324,14 @@ impl StartingCall {
         self.call.job
     }
 
-    /// The call's admission is about to be sent, and from here on may be
-    /// committed, whatever becomes of the request or of the task that made
-    /// it. Without a process, the entry then becomes the settled proof that
-    /// nothing started, because a committed admission without an outcome can
-    /// quarantine the Job.
     pub(crate) fn admission_pending(&mut self) {
         self.admitted = true;
     }
 
-    /// The admission was refused by the database: nothing was committed, so
-    /// no proof is owed if no process starts.
     pub(crate) fn admission_refused(&mut self) {
         self.admitted = false;
     }
 
-    /// The process exists: the same lock acquisition that ends the starting
-    /// state begins the running one.
     fn running(mut self, group: Pid) -> RunningGroup {
         self.armed = false;
         set_call(
@@ -378,9 +349,6 @@ impl StartingCall {
 impl Drop for StartingCall {
     fn drop(&mut self) {
         if self.armed && !thread::panicking() {
-            // No process can start from here. When the admission may have
-            // committed, that is a proof to keep until the Job's stop or
-            // outcome is settled; otherwise the call left no trace.
             let to = self.admitted.then_some(CallState::Cleaned);
             set_call(self.call, |state| state == CallState::Starting, to);
         }
@@ -393,8 +361,6 @@ struct RunningGroup {
 }
 
 impl RunningGroup {
-    /// The group was proven empty. The proof is kept, not forgotten, until
-    /// the Job's stop is settled.
     fn proven(mut self) {
         self.proven = true;
         set_call(
@@ -407,10 +373,6 @@ impl RunningGroup {
 
 impl Drop for RunningGroup {
     fn drop(&mut self) {
-        // A panic inside Process::finish unwinds through the process group it
-        // was supervising: its processes may still run, so the entry stays and
-        // the job keeps answering slot_live. The operator restarts the host
-        // rather than freeing a slot whose group may still be alive.
         if self.proven || thread::panicking() {
             return;
         }
@@ -422,29 +384,21 @@ impl Drop for RunningGroup {
     }
 }
 
-/// What keeps an unproven group's sentinel, leader and command permit alive.
 struct GroupHandles {
     sentinel: OwnedFd,
     leader: Child,
-    /// Held until the group is proven empty, so no new command runs beside it.
     _permit: Permit,
 }
 
-/// A process group that could not be proven empty. Its record stays in
-/// [`UNPROVEN_GROUPS`] until a probe proves the group, so its Job stays
-/// unresolved; the handles leave the record while a probe checks the group.
 struct UnprovenGroup {
     id: u64,
     job: Option<JobId>,
     group: Pid,
-    /// `None` while a [`Probe`] holds them, which is what probing means.
     handles: Option<GroupHandles>,
 }
 
 static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
 
-/// Gives each record an identity of its own. A group's pid is reused once a
-/// probe reaps its leader, so the pid cannot name the record.
 static NEXT_UNPROVEN_ID: AtomicU64 = AtomicU64::new(0);
 
 fn record_unproven_group(job: Option<JobId>, group: Pid, handles: GroupHandles) {
@@ -459,13 +413,8 @@ fn record_unproven_group(job: Option<JobId>, group: Pid, handles: GroupHandles) 
         });
 }
 
-/// Jobs whose every group was proven empty but whose stop is not yet
-/// committed. Kept until the commit, or a restart would leave the slot
-/// quarantined with nothing left to prove it free.
 static UNCONFIRMED_STOPS: Mutex<BTreeSet<JobId>> = Mutex::new(BTreeSet::new());
 
-/// Whether this process still tracks a group that may be alive, or a proven
-/// stop not yet committed. None of them survives a restart.
 pub(crate) fn groups_tracked() -> bool {
     !CALLS
         .lock()
@@ -481,8 +430,6 @@ pub(crate) fn groups_tracked() -> bool {
             .is_empty()
 }
 
-/// The stop of `job` is committed, or can no longer be: the retained proof
-/// of its cleaned calls is released. Calls still starting or running stay.
 pub(crate) fn stop_settled(job: JobId) {
     CALLS
         .lock()
@@ -494,10 +441,6 @@ pub(crate) fn stop_settled(job: JobId) {
         .remove(&job);
 }
 
-/// An unproven group that a prober is checking. Its handles are out of the
-/// record for the check, so no lock is held while the group is signalled and
-/// polled, and its permit stays with the group. Dropped unsettled, as when a
-/// prober panics, the handles return to the record.
 struct Probe {
     id: u64,
     job: Option<JobId>,
@@ -505,8 +448,6 @@ struct Probe {
     handles: Option<GroupHandles>,
 }
 
-/// Takes the handles of each record that `wanted` selects and no prober
-/// holds, and marks those records as probing.
 fn take_probes(wanted: impl Fn(&UnprovenGroup) -> bool) -> Vec<Probe> {
     let mut groups = UNPROVEN_GROUPS
         .lock()
@@ -529,8 +470,6 @@ fn take_probes(wanted: impl Fn(&UnprovenGroup) -> bool) -> Vec<Probe> {
 }
 
 impl Probe {
-    /// Signals the group and waits up to `timeout` for it to empty, then reaps
-    /// its leader. Called with no lock held.
     fn prove(&mut self, timeout: Duration) -> bool {
         let Some(handles) = self.handles.as_mut() else {
             return false;
@@ -545,10 +484,6 @@ impl Probe {
         true
     }
 
-    /// The group is proven empty: its record leaves, and its Job becomes an
-    /// unconfirmed stop if no other group of the Job remains. The stop is
-    /// inserted first, in the same critical section, so the Job never goes
-    /// untracked.
     fn proven(mut self) {
         let handles = self.handles.take();
         let mut groups = UNPROVEN_GROUPS
@@ -572,8 +507,6 @@ impl Probe {
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        // Not proven, or unwinding: the handles go back, so the permit stays
-        // with a group that may still be alive.
         let Some(handles) = self.handles.take() else {
             return;
         };
@@ -586,8 +519,6 @@ impl Drop for Probe {
     }
 }
 
-/// Kills every unproven group again; a Job whose groups are all proven
-/// empty joins the unconfirmed stops before its last group is forgotten.
 pub(crate) fn retry_unproven_groups() {
     for mut probe in take_probes(|_| true) {
         if probe.prove(Duration::from_millis(50)) {
@@ -662,8 +593,6 @@ impl StopSignal {
     }
 }
 
-// Cancellation and worker startup compete to take the payload. Once the
-// worker takes it, its resources remain held until the work actually ends.
 struct Queued<T>(Arc<Mutex<Option<T>>>);
 
 impl<T> Queued<T> {
@@ -793,8 +722,6 @@ impl Process {
             drop(self.running);
             return Err(FinishError::NotProven(error));
         }
-        // The group is empty, yet the proof is only useful once kept until
-        // the Job's outcome or stop is durable.
         if let Some(running) = self.running {
             running.proven();
         }
@@ -842,8 +769,6 @@ impl Process {
     }
 }
 
-/// Waits asynchronously for a bounded permit, then runs synchronous work on
-/// the ntex blocking pool. A full waiting queue or a failed task returns an error.
 pub async fn run<T, F>(kind: Kind, work: F) -> Result<T, &'static str>
 where
     T: Send + 'static,
@@ -865,8 +790,6 @@ where
     .ok_or("the blocking task was discarded before it started")
 }
 
-/// A Job's tracked work: its stop signal and a channel that disconnects
-/// when the work ends or is discarded before it starts.
 type TrackedWorker = (JobId, StopSignal, flume::Receiver<()>);
 
 #[derive(Default)]
@@ -875,9 +798,6 @@ pub(crate) struct WorkerTracker {
 }
 
 impl WorkerTracker {
-    /// Like [`run`], for work that mutates: waiting for a permit stops when
-    /// `stop` is requested, and `work` checks that signal before changing
-    /// anything. [`Self::stop_job`] waits for tracked work to finish.
     pub(crate) async fn run_tracked<T, F>(
         &self,
         job: Option<JobId>,
@@ -919,8 +839,6 @@ impl WorkerTracker {
         .ok_or("the blocking task was discarded before it started")
     }
 
-    /// Requests a stop of the tracked work of `job` and waits until it has
-    /// ended or been discarded before starting.
     pub(crate) async fn stop_job(&self, job: JobId) {
         let workers = {
             let mut tracked = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1047,8 +965,6 @@ fn read_process_stat(path: &std::path::Path) -> std::io::Result<Option<String>> 
 
 #[cfg(target_os = "macos")]
 fn live_group_members(group: Pid) -> std::io::Result<bool> {
-    // `PROC_ALL_PIDS` is not exposed by every libc crate release; it is the
-    // documented value for the `proc_listpids` type argument.
     const PROC_ALL_PIDS: u32 = 1;
     let count = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if count <= 0 {

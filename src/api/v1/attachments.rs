@@ -1,19 +1,3 @@
-//! Image Attachments for the Control Plane:
-//!
-//! - `POST /api/v1/attachments`: stores one PNG or JPEG image, given as
-//!   `{"mime": "image/png" | "image/jpeg", "data_base64": "...",
-//!   "display_name": "..."}`, as a user-provided Attachment in the existing
-//!   attachment store, and answers `201` with its metadata. The image is
-//!   checked as a Provider request would check it, by its declared type,
-//!   its size ([`MAX_IMAGE_BYTES`]) and its file signature, before anything
-//!   is stored.
-//! - `GET /api/v1/attachments/{attachment}`: the Attachment's metadata.
-//! - `GET /api/v1/attachments/{attachment}/content`: its verified bytes, as
-//!   the image they are, for display. Only user-provided images are served.
-//!
-//! An Attachment is referenced from a Job's input by identity; its bytes are
-//! never copied into a Job.
-
 use super::contracts::*;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -84,7 +68,6 @@ struct UploadInput {
     display_name: Option<String>,
 }
 
-/// Parses a canonical Attachment UUID.
 pub(super) fn attachment_id(text: &str) -> Result<AttachmentId, Refusal> {
     crate::db::entities::parse_entity_id(text)
         .map(AttachmentId::new)
@@ -136,7 +119,6 @@ fn attachment_json(record: &AttachmentRecord) -> AttachmentView {
     }
 }
 
-/// Stores one checked image as a user-provided Attachment.
 pub(super) async fn upload(database: &DatabaseHandle, body: &[u8]) -> Result<Reply, Refusal> {
     let wire: UploadInput = serde_json::from_slice(body).map_err(|_| INVALID_UPLOAD)?;
     let mime = ImageMime::from_mime(&wire.mime).ok_or(UNSUPPORTED_IMAGE_TYPE)?;
@@ -165,7 +147,6 @@ pub(super) async fn upload(database: &DatabaseHandle, body: &[u8]) -> Result<Rep
     ))
 }
 
-/// A user-provided image Attachment's record.
 async fn image_record(
     database: &DatabaseHandle,
     id: AttachmentId,
@@ -189,7 +170,6 @@ pub(super) async fn metadata(
     }))))
 }
 
-/// The verified bytes of a user-provided image, as that image.
 pub(super) async fn content(
     database: &DatabaseHandle,
     id: AttachmentId,

@@ -1,13 +1,5 @@
-/**
- * The single tone vocabulary shared by every OCG surface.
- *
- * Surfaces compose these classes instead of naming colors inline so that a
- * status means the same thing in the sidebar and the inspector.
- */
-
 export type Tone = "emerald" | "sky" | "amber" | "red" | "violet" | "slate";
 
-/** Tinted border on its own, for a badge that keeps a neutral background. */
 export const BORDER_TONE: Record<Tone, string> = {
   emerald: "border-emerald-500/30",
   sky: "border-sky-500/30",
@@ -17,7 +9,6 @@ export const BORDER_TONE: Record<Tone, string> = {
   slate: "border-border",
 };
 
-/** Tinted background on its own, for a row that already has a border. */
 export const FILL_TONE: Record<Tone, string> = {
   emerald: "bg-emerald-500/10",
   sky: "bg-sky-500/10",
@@ -27,7 +18,6 @@ export const FILL_TONE: Record<Tone, string> = {
   slate: "bg-muted/50",
 };
 
-/** Tinted border + background, no text colour. Use when the text must stay neutral. */
 export const SURFACE_TONE: Record<Tone, string> = Object.fromEntries(
   (Object.keys(BORDER_TONE) as Tone[]).map((tone) => [
     tone,
@@ -35,7 +25,6 @@ export const SURFACE_TONE: Record<Tone, string> = Object.fromEntries(
   ]),
 ) as Record<Tone, string>;
 
-/** Readable foreground for a tone, in both themes. */
 export const TEXT_TONE: Record<Tone, string> = {
   emerald: "text-emerald-700 dark:text-emerald-400",
   sky: "text-sky-700 dark:text-sky-400",
@@ -45,7 +34,6 @@ export const TEXT_TONE: Record<Tone, string> = {
   slate: "text-muted-foreground",
 };
 
-/** Solid dot fill for a tone. */
 export const DOT_TONE: Record<Tone, string> = {
   emerald: "bg-emerald-500",
   sky: "bg-sky-500",
@@ -55,7 +43,6 @@ export const DOT_TONE: Record<Tone, string> = {
   slate: "bg-muted-foreground/60",
 };
 
-/** Surface plus foreground, the shape a pill or badge wants. */
 export const TONE_CLASS: Record<Tone, string> = Object.fromEntries(
   (Object.keys(SURFACE_TONE) as Tone[]).map((tone) => [
     tone,

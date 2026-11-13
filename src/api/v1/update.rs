@@ -252,7 +252,6 @@ fn launch(mut state: crate::system::update::State) -> Result<std::process::Child
             .arg(format!("StandardOutput=append:{}", log.display()))
             .arg("-p")
             .arg(format!("StandardError=append:{}", log.display()));
-        // Mirror checks pass the host's release URL through to the transient unit.
         if let Some(url) = std::env::var_os("OCG_RELEASE_URL") {
             command
                 .arg("--setenv")
@@ -268,7 +267,6 @@ fn launch(mut state: crate::system::update::State) -> Result<std::process::Child
     let mut command = {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new(exe);
-        // Mirror checks inherit OCG_RELEASE_URL from the host environment.
         unsafe {
             command.pre_exec(|| {
                 rustix::process::setsid()

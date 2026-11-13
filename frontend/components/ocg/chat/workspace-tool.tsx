@@ -111,7 +111,6 @@ function FileCode({
   );
 }
 
-/** The call's saved evidence supplies every preview, including historical file contents. */
 export function WorkspaceTool({
   call,
   jobId,

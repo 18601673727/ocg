@@ -1,14 +1,3 @@
-//! Reads of what a Job was submitted with, and of what a Job can be
-//! submitted with: `GET /api/v1/jobs/{job}/input` and
-//! `GET /api/v1/agent-profiles`.
-//!
-//! Both are projections of persisted facts. The input route gives the text a
-//! Job's frozen input holds, which the Job record names only by identity;
-//! the Agent Profile route gives each Agent Profile with the LLM Profiles it
-//! may run with and the Executors that can run each now. Neither stores,
-//! copies or interprets anything, and neither says anything of a Provider's
-//! endpoint or credential.
-
 use super::contracts::*;
 use ntex::web::HttpRequest;
 use serde_json::Value;
@@ -24,12 +13,9 @@ use crate::db::entities::{
 use crate::db::redb::{JobTree, TreeFacts, TreeNode};
 use crate::db::{DatabaseError, DatabaseHandle};
 
-/// The most one page of Conversations or Projects reads, and the default.
 pub(super) const MAX_CONVERSATION_PAGE: usize = 100;
 const DEFAULT_CONVERSATION_PAGE: usize = 20;
 
-/// `before`, as `parse_before` reads it, and `limit`, each at most once, and
-/// nothing else.
 pub(super) fn page_query<T>(
     query: &str,
     parse_before: impl Fn(&str) -> Result<T, Refusal>,
@@ -60,16 +46,9 @@ pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize),
     page_query(query, routing::job_id)
 }
 
-/// The most bytes a conversation search query may hold after decoding, and
-/// the most terms it may hold. Both keep one read transaction short: terms
-/// combine by AND, so more terms only narrow the walk, but an unbounded
-/// query could still waste a scan on noise.
 const MAX_SEARCH_QUERY_BYTES: usize = 500;
 const MAX_SEARCH_TERMS: usize = 10;
 
-/// `query` once, `before` and `limit` each at most once, and nothing else.
-/// `query` is percent-decoded (`+` means a space, like a browser form), then
-/// split into lowercased AND terms, with double quotes keeping phrases together.
 pub(super) fn conversation_search_query(
     query: &str,
 ) -> Result<(Vec<String>, Option<JobId>, usize), Refusal> {
@@ -131,8 +110,6 @@ pub(super) fn conversation_search_query(
     Ok((terms, before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
 }
 
-/// Percent-decodes `value`, with `+` as a space. Returns `None` when an
-/// escape is truncated, non-hexadecimal, or the result is not UTF-8.
 fn decode_query_value(value: &str) -> Option<String> {
     let mut decoded = Vec::with_capacity(value.len());
     let mut bytes = value.bytes();
@@ -151,14 +128,11 @@ fn decode_query_value(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// The most children one page of a tree lists, and the default.
 const MAX_TREE_PAGE: usize = 100;
 const DEFAULT_TREE_PAGE: usize = 50;
-/// The deepest level a tree expands, and the default.
 const MAX_TREE_DEPTH: u8 = 4;
 const DEFAULT_TREE_DEPTH: u8 = 2;
 
-/// `after`, `limit` and `depth`, each at most once, and nothing else.
 pub(super) fn tree_query(query: &str) -> Result<(Option<JobId>, usize, u8), Refusal> {
     let (mut after, mut limit, mut depth) = (None, None, None);
     if !query.is_empty() {
@@ -193,11 +167,9 @@ pub(super) fn tree_query(query: &str) -> Result<(Option<JobId>, usize, u8), Refu
     ))
 }
 
-/// The most Profiles one page of Agent Profiles reads, and the default.
 pub(super) const MAX_PROFILE_PAGE: usize = 100;
 const DEFAULT_PROFILE_PAGE: usize = 50;
 
-/// `before` and `limit`, each at most once, and nothing else.
 pub(super) fn agent_profile_query(query: &str) -> Result<(Option<ProfileId>, usize), Refusal> {
     let (mut before, mut limit) = (None, None);
     if !query.is_empty() {
@@ -221,9 +193,6 @@ pub(super) fn agent_profile_query(query: &str) -> Result<(Option<ProfileId>, usi
     Ok((before, limit.unwrap_or(DEFAULT_PROFILE_PAGE)))
 }
 
-/// The Job's frozen input: its objective as text, its Attachments by
-/// identity, and the configuration it was frozen with, named by Profile and
-/// model alone.
 pub(super) async fn job_input(
     database: &DatabaseHandle,
     job: JobId,
@@ -307,8 +276,6 @@ pub(super) fn actor_view(actor: &crate::db::entities::Actor) -> ActorView {
     }
 }
 
-// The generated wire contract keeps every entry kind; native turns emit only
-// `user_message`, so the other kinds are never constructed by the backend.
 #[allow(dead_code)]
 #[derive(serde::Serialize, ts_rs::TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -423,7 +390,6 @@ pub(super) async fn conversation_children(
         },
     }))))
 }
-/// The recurrence of a conversation, as the children route reports it.
 fn recurrence_json(row: &Recurrence) -> RecurrenceView {
     use crate::db::entities::RecurrencePhase;
     let (phase, due) = match row.phase {
@@ -460,8 +426,6 @@ fn dependency_views(
         .collect()
 }
 
-/// One node of the tree, as the route reports it. The children of a node
-/// are the nodes the tree holds below it.
 fn tree_node_json(node: &TreeNode, tree: &JobTree) -> TreeNodeView {
     let mut value = TreeNodeView {
         id: node.id.to_string(),
@@ -540,8 +504,6 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> TreeNodeView {
     value
 }
 
-/// The tree of the work below a Job: its ancestors, and the nodes of the
-/// tree itself. Every fact is read from the row that owns it.
 pub(super) async fn job_tree(
     shared: &Shared,
     job: JobId,
@@ -570,9 +532,6 @@ pub(super) async fn job_tree(
     )
 }
 
-/// A submitted native Job is a leaf: it has no children, no dependencies and
-/// no Agent run of its own, so its tree is the Job alone below its
-/// conversation.
 fn native_tree(details: &crate::db::redb::MutableJobDetails) -> TreeView {
     let record = &details.record;
     let job = &record.job;
@@ -913,10 +872,6 @@ fn capability(capability: ModelCapability) -> &'static str {
     }
 }
 
-/// One page of Agent Profiles, newest first, strictly before `before` when
-/// given. An Agent Profile is an Agent config; archived ones are not listed,
-/// so the page may hold fewer than `limit`; `next_before` continues from the
-/// oldest one read.
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "LlmTarget")]
 pub(crate) struct LlmTargetView {
@@ -1020,7 +975,6 @@ fn page(agent_profiles: Vec<AgentProfileView>, next_before: Option<String>) -> V
     }))
 }
 
-/// One page of conversations by immutable conversation ID, newest first.
 pub(super) async fn conversations(
     database: &DatabaseHandle,
     before: Option<JobId>,
@@ -1030,8 +984,6 @@ pub(super) async fn conversations(
     Ok(Reply::ok(envelope(conversation_page(page))))
 }
 
-/// One page of conversations newest first whose title or recent message text
-/// holds every term. Paging means the same as [`conversations`].
 pub(super) async fn search_conversations(
     database: &DatabaseHandle,
     terms: Vec<String>,
@@ -1067,7 +1019,6 @@ fn conversation_page(page: crate::db::redb::ConversationsPage) -> serde_json::Va
     })
 }
 
-/// Exactly one edit operation.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConversationEditInput {
@@ -1200,8 +1151,6 @@ pub(crate) struct ContextStatusView {
     next_before: Option<String>,
 }
 
-/// `GET /api/v1/conversations/{id}/context`. Reports the stored override and
-/// why prediction is unavailable. It does not estimate a percentage.
 pub(super) async fn conversation_context(
     database: &DatabaseHandle,
     conversation: JobId,
@@ -1349,8 +1298,6 @@ pub(super) async fn conversation_context(
     }))))
 }
 
-/// `POST /api/v1/conversations/{job}`: renames the conversation whose root
-/// is `root`, hides it for good, or updates its limits. No Job spec changes.
 pub(super) async fn edit_conversation(
     shared: &Shared,
     root: JobId,
@@ -1384,8 +1331,6 @@ pub(super) async fn edit_conversation(
             .hide_conversation(root)
             .await
             .map_err(map_error)?;
-        // Hiding is already recorded. Cancel each affected execution by its
-        // persisted Allocation token; hiding again retries this.
         for token in &action.running {
             shared.scheduler.native_stops().cancel(*token);
         }

@@ -28,12 +28,6 @@ pub(crate) fn lock_database(directory: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Holds the host lock of an existing data directory shared, so no host can
-/// take it exclusively while the returned file lives. The lock is opened
-/// read-only, never created, truncated or written, and its bytes and
-/// permissions are left as they are. A directory without the lock file has
-/// never been opened by a host that honors it, so it cannot be excluded
-/// safely and is refused rather than given a lock nobody else respects.
 pub(crate) fn hold_database_lock_shared(directory: &Path) -> io::Result<std::fs::File> {
     let path = directory.join(DATABASE_LOCK_FILE);
     let mut options = OpenOptions::new();
@@ -79,8 +73,6 @@ pub enum DataDirectoryError {
     },
 }
 
-/// The absolute, resolved layout under `OCG_DATA_DIR`. The internal paths are
-/// derived from the root and cannot be configured individually.
 #[derive(Clone, Debug)]
 pub struct DataDirectory {
     root: PathBuf,
@@ -94,15 +86,6 @@ impl DataDirectory {
         Self::bootstrap(root)
     }
 
-    /// Creates the root, attachments, and logs directories when missing.
-    /// The key path is only reserved; no key file is created. Free
-    /// space is checked by the database worker at startup, against the
-    /// configured lock threshold.
-    ///
-    /// On Unix the root and the two directories are made private to their
-    /// owner (0700), including in an existing installation. Nothing below
-    /// them is changed, and a directory that is a symbolic link is left as
-    /// its target is.
     pub fn bootstrap(root: OsString) -> Result<Self, DataDirectoryError> {
         let root = PathBuf::from(root);
         create_directory(&root)?;
@@ -125,11 +108,6 @@ impl DataDirectory {
         Ok(data_directory)
     }
 
-    /// The layout of a data directory that already exists, resolved without
-    /// creating, chmodding or otherwise touching anything in it. It refuses a
-    /// missing directory exactly as [`Self::bootstrap`] does. A read-only command uses this: a data
-    /// directory whose attachments and logs directories are missing stays
-    /// missing, and the root keeps whatever mode it has.
     pub fn existing(root: impl Into<PathBuf>) -> Result<Self, DataDirectoryError> {
         let named = root.into();
         let root = named
@@ -169,7 +147,6 @@ impl DataDirectory {
     }
 }
 
-/// Creates the directory and its missing parents, private on Unix.
 fn create_directory(path: &Path) -> Result<(), DataDirectoryError> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -195,8 +172,6 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// Unix: gives the directory at `path` mode 0700. A symbolic link is not
-/// followed, and anything else that is not a directory is left alone.
 pub(crate) fn restrict_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -209,8 +184,6 @@ pub(crate) fn restrict_directory(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Unix: gives the regular file at `path` mode 0600. A symbolic link is not
-/// followed, and a missing file is not an error.
 pub(crate) fn restrict_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -235,14 +208,12 @@ fn restrict(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    // `symlink_metadata` describes a link itself, so a link is never applicable.
     if !applies(&metadata) || metadata.permissions().mode() & 0o7777 == mode {
         return Ok(());
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-/// Unix: makes a file that `options` creates private to its owner (0600).
 pub(crate) fn private_file(options: &mut OpenOptions) -> &mut OpenOptions {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(options, PRIVATE_FILE_MODE);

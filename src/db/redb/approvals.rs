@@ -19,8 +19,6 @@ pub(super) fn command_assessment_identity(
     }}))
 }
 
-/// What the Job that continues the conversation says: the user's decision on
-/// the call that waited, in the user's own voice.
 fn continuation_text(tool: &str, decision: &ApprovalDecision) -> String {
     match decision {
         ApprovalDecision::Answered { text } => text.clone(),
@@ -136,8 +134,6 @@ impl Batch {
                 "no conversation",
             ));
         };
-        // The decision continues the conversation after the Job that asked,
-        // so it is taken only once that Job has ended.
         if self.require_job_state(approval.job)?.outcome.is_none() {
             return self.reject(Violation::InvalidValue(
                 "approval_not_ready",
@@ -171,8 +167,6 @@ impl Batch {
         if decision == ApprovalDecision::Approved {
             self.grant_project_command(&call, conversation, assessment)?;
         }
-        // A job call performs what the user chose, in this transaction, and
-        // the Job that continues is told what came of it.
         let text = match self.perform_decided_job_call(approval, conversation, &call, &decision)? {
             Some(text) => text,
             None => continuation_text(&call.name, &decision),
@@ -193,11 +187,6 @@ impl Batch {
         self.continue_after_decision(approval, text)
     }
 
-    /// The Job that continues the conversation after a decision: a new turn
-    /// of the same conversation, with the same configuration as the Job that
-    /// asked, whose input says what the user decided. It joins the queue like
-    /// any submitted Job, and runs when the scheduler admits it. A decision is
-    /// recorded once, so the Job is created once.
     fn continue_after_decision(
         &mut self,
         approval: ToolCallRef,
@@ -227,8 +216,6 @@ impl Batch {
                 configuration: *configuration,
             },
         };
-        // Creating the Job and submitting it are two recorded submissions,
-        // each with its own key.
         let submission = |step: &[u8]| {
             let mut identity = b"ocg approval continuation ".to_vec();
             identity.extend_from_slice(step);
@@ -256,8 +243,6 @@ impl Batch {
             joined: false,
         })
     }
-    /// The Project of the conversation whose turn asked, which the approved
-    /// command is granted to.
     fn command_project(
         &mut self,
         conversation: JobId,
@@ -447,7 +432,6 @@ impl Batch {
         if input.request() != work.request {
             return Ok(());
         }
-        // Explicit user blocks and conflicting user entries cannot be replaced by advice.
         if project.commands.iter().any(|command| {
             command.owner == CommandOwner::User
                 && (command.name == input.command.name || command.argv == input.command.argv)

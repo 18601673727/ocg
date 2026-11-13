@@ -23,11 +23,6 @@ export function conversationPath(ids: readonly string[]) {
   return "/" + ids.map((id) => `jobs/${id}`).join("/");
 }
 
-/**
- * The conversation chain of a Job or Conversation identity, root first. The backend owns the
- * relation: `resolve` returns the Conversation an identity belongs to, and Conversations do not
- * nest, so the chain is that single Conversation.
- */
 export async function conversationAncestors(
   resolve: (id: string) => Promise<string>,
   id: string,

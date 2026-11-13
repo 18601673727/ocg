@@ -1,7 +1,3 @@
-//! Offline reconciliation publishes only a verified copy, while retaining the
-//! exclusive host lock through verification and durable audit finalization.
-//! No Provider is contacted and no recovery execution authority is enabled.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -59,8 +55,6 @@ impl Operation {
     }
 }
 
-/// Existing debug-only crash qualification mechanism. Release builds contain
-/// no fault-injection authority or alternate publication behavior.
 #[cfg(debug_assertions)]
 fn crash_point(stage: &str) {
     if std::env::var("OCG_RECONCILE_CRASH_AT").is_ok_and(|value| value == stage) {
@@ -735,8 +729,6 @@ fn unix_time_ns() -> Result<String, Refused> {
     ))
 }
 
-/// Atomically names a complete, owned, synced JSON record. A crash while the
-/// temporary file is written leaves no partially valid audit-chain entry.
 fn write_immutable_json<T: Serialize>(
     directory: &Path,
     final_path: &Path,

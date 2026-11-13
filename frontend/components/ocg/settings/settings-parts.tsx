@@ -55,7 +55,6 @@ export function refusalText(
   return describeError(error, t);
 }
 
-/** Enabled LLM profiles, plus any disabled one that is still selected. */
 export function selectableLlmProfiles(
   profiles: readonly ControlLlmProfile[],
   ...selected: (string | null | undefined)[]

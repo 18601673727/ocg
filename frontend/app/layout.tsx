@@ -22,9 +22,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en-US" suppressHydrationWarning className="h-full font-sans antialiased">
       <head>
-        {/* Applies the stored theme before first paint; see theme-bootstrap. */}
         <script dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP_SCRIPT }} />
-        {/* Applies the stored locale before first paint; see locale-bootstrap. */}
         <script dangerouslySetInnerHTML={{ __html: LOCALE_BOOTSTRAP_SCRIPT }} />
       </head>
       <body className="flex min-h-full flex-col">

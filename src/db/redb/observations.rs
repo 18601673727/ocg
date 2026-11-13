@@ -1,6 +1,3 @@
-//! Reads of the raw request events a Job recorded, plus scoped model queries
-//! and globally time-ordered observation pages.
-
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -13,8 +10,6 @@ use crate::db::entities::{
     TokenAnnotation,
 };
 
-/// Native Decision availability is not an LLM target. Its attribution is
-/// projected from the frozen Job and retained Allocation, not copied to rows.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) struct DecisionAvailabilityRecord {
@@ -397,8 +392,6 @@ pub(crate) fn read_job_availability(
     Ok(records)
 }
 
-// ---- queries over the scope index ---------------------------------------------------
-
 fn cursor_key(cursor: &ObservationCursor) -> RequestTimelineKey {
     (
         cursor.observed_at.as_unix_micros(),
@@ -417,9 +410,6 @@ fn key_cursor((observed_at, job, request, seq): RequestTimelineKey) -> Observati
     }
 }
 
-/// Walks the global timeline newest first, strictly older than `after`.
-/// Examines at most `max_scan` entries and returns the position to continue
-/// from if the walk stopped before the beginning of the time range.
 fn walk_timeline(
     rx: &ReadTransaction,
     filter: &ObservationFilter,
@@ -451,7 +441,6 @@ fn walk_timeline(
     Ok(None)
 }
 
-/// Whether a Job froze the target `filter` names (its Model config).
 fn target_matches(
     rx: &ReadTransaction,
     filter: &ObservationFilter,
@@ -638,8 +627,6 @@ pub(crate) fn read_availability_stats(
 
 pub(crate) struct ProviderResponse {
     pub request: RequestNumber,
-    /// The decoded reply, shared with the transient cache: a continuation
-    /// clones this handle instead of the text.
     pub text: Arc<str>,
     pub requests_tools: bool,
     pub recorded_at: Timestamp,
@@ -650,9 +637,6 @@ pub(crate) struct ProviderResponsesPage {
     pub has_more: bool,
 }
 
-/// A decoded response body. Messages are content-addressed and immutable, so
-/// the cache needs no invalidation; a missing message is still reported from
-/// the `MESSAGES` table before the cache is consulted.
 #[derive(Clone)]
 struct DecodedMessage {
     text: Arc<str>,
@@ -660,15 +644,11 @@ struct DecodedMessage {
     escaped_len: usize,
 }
 
-/// The cache holds decoded replies so a page continuation does not parse the
-/// whole reply again. It is transient: an empty cache (restart, eviction)
-/// costs one parse and then behaves the same.
 const MESSAGE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MESSAGE_CACHE_ENTRIES: usize = 1_024;
 
 #[derive(Default)]
 struct MessageCache {
-    /// Digest -> (last use, decoded message).
     entries: HashMap<[u8; 32], (u64, DecodedMessage)>,
     bytes: usize,
     clock: u64,
@@ -702,8 +682,6 @@ fn evict_least_recently_used(cache: &mut MessageCache) -> bool {
     }
 }
 
-/// Decodes `body` once per digest. A reply larger than the cache budget is
-/// held alone so paging it never re-parses it; the next message evicts it.
 fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, StorageError> {
     {
         let mut cache = lock_message_cache();

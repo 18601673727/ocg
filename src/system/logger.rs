@@ -279,10 +279,6 @@ impl Drop for Emission<'_> {
     }
 }
 
-/// The most detailed level accepted from a target outside this crate. A
-/// dependency's debug and trace output can dump raw protocol data, such as
-/// the HTTP client's request headers, so only OCG's own targets follow the
-/// configured level below it.
 const FOREIGN_TARGET_MAX_LEVEL: log::Level = log::Level::Info;
 
 fn is_own_target(target: &str) -> bool {
@@ -291,7 +287,6 @@ fn is_own_target(target: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
 }
 
-/// Whether a record at `level` from `target` is logged under `configured`.
 fn accepts(configured: log::LevelFilter, level: log::Level, target: &str) -> bool {
     level <= configured && (level <= FOREIGN_TARGET_MAX_LEVEL || is_own_target(target))
 }
@@ -358,7 +353,6 @@ impl log::Log for LoggerHandle {
 
     fn flush(&self) {
         self.shared.flush_requested.store(true, Ordering::SeqCst);
-        // Facade flush is only a request: a service thread must never wait for file I/O.
         self.wake.try_send(()).ok();
     }
 }
@@ -650,7 +644,6 @@ impl Worker {
     }
 
     fn close_file(&mut self) {
-        // This is a plain File, not a BufWriter: dropping it never writes discarded bytes.
         self.file = None;
         self.shared
             .file_status
@@ -756,8 +749,6 @@ impl Worker {
             self.next_sequence = next;
             let name = runtime_file_name(now, sequence);
             let path = Arc::new(self.shared.database.log_directory().join(name));
-            // Creation and registration share the deletion gate; cleanup cannot see
-            // a newly created log before its active identity is registered.
             let files = self.shared.database.log_files();
             let mut active = files.lock().unwrap_or_else(PoisonError::into_inner);
             match crate::system::data_directory::private_file(&mut OpenOptions::new())
@@ -881,7 +872,6 @@ impl Worker {
                 self.discard_buffer(false);
                 return false;
             };
-            // Each partial write is a new filesystem call, so it needs a new protection check.
             match file.file.write(&self.buffer[offset..]) {
                 Ok(0) => {
                     let path = file.path.as_ref().clone();

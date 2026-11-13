@@ -1,12 +1,5 @@
 import type { Locale } from "./locale";
 
-/**
- * Flat string tables keep static-export builds simple: no async chunk
- * loading, no extra dependency, and a single fallback path (zh-CN -> en-US).
- *
- * Interpolation is `{name}` replacement only; callers branch on count for
- * plural forms (`one` / `other`) since Chinese does not pluralize.
- */
 export const en = {
   "job.activity.queued": "Queued",
   "job.activity.unsubmitted": "Draft, not submitted",
@@ -695,7 +688,6 @@ export const en = {
   "state.retrying": "Retrying",
   "state.waiting-approval": "Waiting approval",
 
-  // -- common actions -------------------------------------------------------
   "common.save": "Save",
   "common.cancel": "Cancel",
   "chat.child.back": "Back to parent conversation",
@@ -722,7 +714,6 @@ export const en = {
   "common.copied": "Copied",
   "common.copyFailed": "Copy failed",
 
-  // -- workspace navigation --------------------------------------------------
   "nav.home": "Home",
   "nav.attention": "Attention",
   "nav.chat": "Chat",
@@ -737,7 +728,6 @@ export const en = {
   "nav.workspaceNavigation": "Workspace navigation",
   "nav.chatSessions": "Chats grouped by project",
 
-  // -- sidebar ----------------------------------------------------------------
   "sidebar.newChat": "New chat",
   "chat.sending": "Sending…",
   "sidebar.noProject": "Chats",
@@ -753,10 +743,6 @@ export const en = {
   "sidebar.searchKeyboardHint":
     "Use the up and down arrow keys to choose a result, Enter to open it, and Escape to close search.",
   "sidebar.noSearchMatches": "No chats match your search",
-  // Full-screen conversation search: it searches the current session list by
-  // title and recent message text, and opens from the sidebar search control. The
-  // existing `searchChatsLabel` / `noSearchMatches` keys are its field label
-  // and its no-results state.
   "sidebar.searchConversations": "Search conversations",
   "sidebar.searchConversationsBody":
     'Searches all messages and replies. Use "quotes" for a phrase.',
@@ -772,14 +758,10 @@ export const en = {
   "sidebar.attentionBadge": "{count} items need action",
   "sidebar.attentionBadgeShort": "{label} ({count} need action)",
 
-  // -- topbar -----------------------------------------------------------------
   "topbar.openNavigation": "Open navigation",
   "topbar.expandInspector": "Expand inspector",
   "topbar.collapseInspector": "Collapse inspector",
 
-  // -- project ----------------------------------------------------------------
-
-  // -- settings ---------------------------------------------------------------
   "settings.title": "Settings",
   "settings.nav.label": "Settings sections",
   "settings.nav.profiles": "Profiles",
@@ -806,22 +788,15 @@ export const en = {
   "settings.language.desc":
     "Interface language for this browser. Stored locally; backend content is unchanged.",
 
-  // -- home -------------------------------------------------------------------
   "home.start": "Start with OCG",
   "home.description": "Choose an agent and a model to start a conversation.",
   "home.recent": "Recent conversations",
   "home.jobsDescription": "Inspect job history, inputs, and outputs.",
   "home.settingsDescription": "Manage models, agents, and projects.",
 
-  // -- login / access ----------------------------------------------------------
-
-  // -- attention ---------------------------------------------------------------
-
-  // -- control center -----------------------------------------------------------
   "control.available": "available",
   "control.unavailable": "unavailable",
 
-  // -- execution / job -----------------------------------------------------------
   "tree.title": "Job Tree",
   "execution.noExecution": "No Job execution is available.",
   "execution.usage": "Usage",
@@ -829,15 +804,12 @@ export const en = {
   "job.launch": "Launch Job",
   "job.objective": "Objective",
 
-  // -- logs ----------------------------------------------------------------------
   "logs.title": "Logs",
   "logs.time": "Time",
   "job.structuredData": "Structured data",
 
-  // -- ledger ---------------------------------------------------------------------
   "ledger.title": "Resource Ledger",
 
-  // -- chat ------------------------------------------------------------------------
   "chat.messagePlaceholder": "Describe a task or ask a question…",
   "chat.markdownPreview": "Markdown preview",
   "chat.messageLabel": "Message OCG",
@@ -861,16 +833,10 @@ export const en = {
   "chat.runtime": "Runtime",
   "chat.newThread": "Start a new thread",
 
-  // -- canonical ---------------------------------------------------------------------
-
-  // -- layout shell -------------------------------------------------------------------
-
-  // -- observability ------------------------------------------------------------------
   "observability.input": "Input",
   "observability.output": "Output",
   "observability.reasoning": "Reasoning",
 
-  // -- observations, logs, jobs, transcript ------------------------------------------
   "observations.health": "Health",
   "observations.timeRange": "Time range",
   "observations.last24": "Last 24 hours",
@@ -1119,7 +1085,6 @@ export const en = {
   "session.signOutUnconfirmed":
     "Sign out could not be confirmed ({code}). Your session may still be active. Retry Sign out when the Control Plane is reachable; do not assume this browser is signed out.",
 
-  // -- settings surface ---------------------------------------------------------------
   "settings.error.refused": "Request refused ({code}, HTTP {status}).",
   "settings.error.incomplete": "The request could not be completed.",
   "settings.manage": "Manage LLM Profiles, Agent Profiles, credentials, and browser preferences.",
@@ -1285,7 +1250,6 @@ export const en = {
   "settings.control.notAccepting": "not accepting",
   "common.edit": "Edit",
 
-  // -- assistant thread ---------------------------------------------------------
   "aui.retryTurn": "Retry failed turn",
   "aui.more": "More",
   "aui.exportMarkdown": "Export as Markdown",
@@ -1344,7 +1308,6 @@ export const en = {
   "aui.imagePreview": "Image preview",
   "aui.imageBlocked": "The provider blocked this image.",
 
-  // -- language -------------------------------------------------------------------------
   "updates.title": "Updates",
   "updates.description": "Check for a newer OCG release.",
   "updates.available": "OCG {running} is running. {latest} is available.",

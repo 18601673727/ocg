@@ -234,7 +234,6 @@ async fn spawn_ready_with_identities(
         .readiness()
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
-    // A restarted host keeps the identities it had; a fresh one creates them.
     let identities = match prepared {
         Some(prepared) => FixtureIdentities {
             executor: prepared.executor.clone(),
@@ -794,7 +793,6 @@ async fn stream_job(
 }
 
 async fn drain_admitted(client: &BenchmarkClient, options: &Options, result: &mut WorkResult) {
-    // Intentionally wait newest-first so queued jobs can precede running ones.
     for observation in result.jobs.iter_mut().rev() {
         if observation.error.is_some() {
             continue;

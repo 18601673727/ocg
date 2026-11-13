@@ -10,13 +10,10 @@ use crate::db::entities::{
     SubmittedConfiguration, ToolCallRef,
 };
 
-// ---- typed reads ---------------------------------------------------------------
-
 pub(super) fn read(database: &Database) -> Result<ReadTransaction, StorageError> {
     Ok(database.begin_read()?)
 }
 
-/// Offline inspection does not open the normal worker or recover allocations.
 pub(crate) fn reconcile_development_reservation_offline(
     path: &std::path::Path,
     request: crate::db::entities::DevelopmentReservationRequest,
@@ -47,20 +44,14 @@ pub(crate) fn reconcile_development_reservation_offline(
     })
 }
 
-/// The most held Allocations one offline inspection reports in full.
 const MAX_INSPECTED_HELD: usize = 64;
 
-/// How an offline session reached the database file.
 enum OfflineAccess<'a> {
-    /// Opened read-only in place: the file was not copied and not written.
     InPlace(&'a ::redb::ReadOnlyDatabase),
-    /// Read from a private, unlinked copy that redb may repair. The original
-    /// file was never opened for writing.
     Copy(&'a mut Database),
 }
 
 impl OfflineAccess<'_> {
-    /// How this session reached the file, for a report.
     const fn name(&self) -> &'static str {
         match self {
             OfflineAccess::InPlace(_) => "in_place_read_only",
@@ -69,38 +60,20 @@ impl OfflineAccess<'_> {
     }
 }
 
-/// What an offline session reads the original file's identity and metadata as,
-/// before it reads and after it returns. A successful session leaves every
-/// field here equal to the value it started with; anything else is refused.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OfflineFile {
     pub(crate) bytes: u64,
-    /// The device and inode the file lives at; see
-    /// [`crate::system::loopback_activation::DatabaseIdentity`].
     pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) mode: u32,
 }
 
-/// What an offline session may do, beyond reading.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct OfflineOptions {
-    /// Read a private unlinked copy even when the file could be read in place.
     pub(crate) force_copy: bool,
-    /// Refuse a data directory without the host lock file. A directory that
-    /// has none has never been opened by a host that honors the lock, so a
-    /// concurrent writer cannot be excluded without creating the file, which
-    /// a read-only session never does.
     pub(crate) require_host_lock: bool,
 }
 
-/// Runs `inspect` on a stopped database without ever opening the original for
-/// writing. It refuses while a host holds the database. A database that was
-/// not closed cleanly, or any call with `force_copy`, reads a private unlinked
-/// copy instead. The original must be unchanged when `inspect` returns: its
-/// bytes, modification time, mode and the device and inode it lives at are
-/// compared afterwards, and the path must still name the very file that was
-/// read.
 fn with_offline_database<T>(
     directory: &std::path::Path,
     options: OfflineOptions,
@@ -129,7 +102,6 @@ fn with_offline_database<T>(
         let mut copy = crate::system::data_directory::private_file(&mut create)
             .open(&scratch)
             .map_err(io)?;
-        // Unlinked at once: the copy exists only as this open handle.
         std::fs::remove_file(&scratch).map_err(io)?;
         let mut original = file.try_clone().map_err(io)?;
         original.seek(SeekFrom::Start(0)).map_err(io)?;
@@ -162,7 +134,6 @@ fn with_offline_database<T>(
             ));
         }
     }
-    // A running host holds the exclusive database lock; never inspect under it.
     let host_lock = match std::fs::File::open(
         directory.join(crate::system::data_directory::DATABASE_LOCK_FILE),
     ) {
@@ -197,8 +168,6 @@ fn with_offline_database<T>(
             Err(error) => return Err(error.into()),
         }
     };
-    // redb panics when it reads a page whose contents are damaged. The
-    // check reports that as corruption instead of aborting the process.
     let guarded = |access: OfflineAccess<'_>| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(access))).unwrap_or_else(
             |_| {
@@ -231,8 +200,6 @@ fn with_offline_database<T>(
     {
         return Err(refused("database file changed during inspection"));
     }
-    // The name must still reach the very file that was read: a rename or a
-    // replacement under the read would otherwise pass every check above.
     let named_after = std::fs::symlink_metadata(&path).map_err(io)?;
     let mut identity = OfflineFile {
         bytes: after.len(),
@@ -263,10 +230,6 @@ fn with_offline_database<T>(
     Ok((result, identity))
 }
 
-/// Offline, strictly read-only inspection of the Pool Allocations that still
-/// hold capacity. It starts no worker, runs no recovery, mints no execution
-/// authority and writes nothing to the database. A database that was not
-/// closed cleanly is read from a private, unlinked copy.
 pub(crate) fn inspect_held_allocations_offline(
     directory: &std::path::Path,
 ) -> Result<serde_json::Value, StorageError> {
@@ -289,11 +252,6 @@ pub(crate) fn inspect_held_allocations_offline(
     Ok(report)
 }
 
-/// Offline integrity check that never opens the original for writing. The
-/// logical checks are those a startup after an unclean shutdown makes: every
-/// record header, the native invariants and the ownership rows. With `pages`
-/// the file is also copied to a private unlinked file and redb verifies every
-/// page checksum there.
 pub(crate) fn verify_offline(
     directory: &std::path::Path,
     pages: bool,
@@ -301,12 +259,6 @@ pub(crate) fn verify_offline(
     verify_offline_with_ownership(directory, pages, false)
 }
 
-/// Verifies the exact published file while the caller retains the exclusive
-/// publication lock. This is deliberately separate from the public offline
-/// verifier: it never acquires, releases, or bypasses that verifier's lock.
-/// Both the named database and lock must still identify the open files supplied
-/// by the publication path, and all redb access uses a private copy of that
-/// exact open database file rather than reopening its pathname.
 #[cfg(unix)]
 pub(crate) fn verify_reserved_publication(
     directory: &std::path::Path,
@@ -325,9 +277,6 @@ pub(crate) fn verify_reserved_publication(
     )
 }
 
-/// Held-recovery variant of [`verify_reserved_publication`]. There is no
-/// general-purpose lock-bypass entry point: both publication operations must
-/// present their open database and their already-held exclusive lock.
 #[cfg(unix)]
 pub(crate) fn verify_recovered_publication(
     directory: &std::path::Path,
@@ -427,9 +376,6 @@ fn verify_publication_with_exclusive_lock(
 
     let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut database = Database::builder().create_file(copy)?;
-        // A Reserved reconciliation may leave other ownership held: it is
-        // classified exactly, and normal startup's decision is reported, not
-        // mistaken for a failed publication.
         let logical = if recovered {
             logical_report(recovery::verify_recovered(&database))
         } else {
@@ -875,8 +821,6 @@ fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobState, StorageError>
         .ok_or_else(|| StorageError::corrupted(format!("{id} has no job_state")))
 }
 
-/// The latest persistent turn of `group`: Job IDs only increase, so it is
-/// the largest `(group, turn)` key.
 pub(super) fn turn_head(
     turns: &impl ReadableTable<(u128, u128), ()>,
     group: JobId,
@@ -888,7 +832,6 @@ pub(super) fn turn_head(
         .map(|(key, _)| JobId::new(key.value().1)))
 }
 
-/// The first persistent turn of `group`.
 fn turn_first(
     turns: &impl ReadableTable<(u128, u128), ()>,
     group: JobId,
@@ -900,8 +843,6 @@ fn turn_first(
         .map(|(key, _)| JobId::new(key.value().1)))
 }
 
-/// A `turn` table, which a function taking other `(u128, u128) -> ()` tables
-/// must not receive in their place.
 pub(super) struct Turns<'a, T>(pub(super) &'a T);
 
 impl<T: ReadableTable<(u128, u128), ()>> Turns<'_, T> {
@@ -972,7 +913,6 @@ pub(super) fn job_execution(
     Ok((execution, project, agent))
 }
 
-/// A Job assembled from its spec, its state and the derived tables.
 pub(super) fn job_record(rx: &ReadTransaction, row: JobSpec) -> Result<JobRecord, StorageError> {
     let id = row.id;
     let state = read_state(rx, id)?;
@@ -1100,7 +1040,6 @@ pub(super) fn mutable_job_record_in(
     }))
 }
 
-/// Evidence from one read snapshot, never an execution or recovery permit.
 #[allow(dead_code)]
 pub(crate) struct DevelopmentExecutionContext {
     pub allocation: crate::db::entities::PoolAllocation,
@@ -1110,15 +1049,11 @@ pub(crate) struct DevelopmentExecutionContext {
     pub configuration: FrozenExecutionConfig,
     pub conversation: JobSpec,
     pub conversation_control: JobControl,
-    /// The conversation was opened by a `job_plan` call, so it is one step of
-    /// that plan and may not plan again.
     pub plan_step: bool,
     pub project: Option<ProjectRecord>,
     pub compaction: crate::db::entities::GlobalCompactionSettings,
     pub attachments: Vec<AttachmentRecord>,
-    /// Verified replacement for covered assistant output, if explicitly selected.
     pub adopted_summary: Option<VerifiedNativeSummary>,
-    /// Original user input remains authoritative even when assistant output is covered.
     pub covered_inputs: Vec<DevelopmentRetainedInput>,
     pub history: Vec<DevelopmentContextTurn>,
     pub estimated_tokens: u64,
@@ -1149,11 +1084,9 @@ pub(crate) struct DevelopmentRetainedInput {
     pub attachments: Vec<AttachmentRecord>,
 }
 
-/// Owned image content is checked against the snapshot before this is returned.
 #[allow(dead_code)]
 pub(crate) struct DevelopmentResolvedContext {
     pub snapshot: DevelopmentExecutionContext,
-    /// Oldest history first, followed by this Job's attachments, each in input order.
     pub images: Vec<(
         AttachmentId,
         crate::service::ai::providers::openai_compatible::ImageInput,
@@ -1200,8 +1133,7 @@ fn context_attachments(
         .collect()
 }
 
-/// A verified artifact is snapshot evidence, not permission to dispatch.
-#[allow(dead_code)] // Consumed by the later adoption and context-construction phases.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedNativeSummary {
     pub consumer: JobId,
@@ -1300,8 +1232,6 @@ fn native_summary_owner(
     Ok(())
 }
 
-/// Tables opened from one transaction. The same verifier can be used by a
-/// future writer transaction without relying on an earlier read snapshot.
 pub(super) struct NativeSummaryTables<J, S, A, O, AT, T, M, C> {
     pub jobs: J,
     pub states: S,
@@ -1313,8 +1243,6 @@ pub(super) struct NativeSummaryTables<J, S, A, O, AT, T, M, C> {
     pub configs: C,
 }
 
-/// Hash framed authoritative source records without collecting their output
-/// payloads. This framing is specific to the native schema.
 fn native_source_boundary<J, S, A, O, AT, T, M, C>(
     tables: &NativeSummaryTables<J, S, A, O, AT, T, M, C>,
     id: JobId,
@@ -1435,7 +1363,6 @@ where
                 "summary source output sequence has a gap",
             ));
         }
-        // Count and hash through the same bounded traversal of this snapshot.
         native_summary_frame(&mut hash, budget, bytes.value())?;
         let output = decode_output(key.value(), bytes.value())?;
         if output.created_at < allocation.claimed_at
@@ -1477,7 +1404,6 @@ where
     ))
 }
 
-/// Verify a native artifact and every source boundary from one read snapshot.
 pub(crate) fn verify_native_summary(
     database: &Database,
     conversation: JobId,
@@ -1489,8 +1415,6 @@ pub(crate) fn verify_native_summary(
     verify_native_summary_in(&rx, conversation, consumer, producer, source)
 }
 
-/// Reuse the caller's snapshot for other reads. Write-transaction adoption
-/// still requires atomic revalidation in that transaction.
 pub(super) fn verify_native_summary_in(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -1521,7 +1445,6 @@ pub(super) fn verify_native_summary_in(
     verify_native_summary_tables(&tables, conversation, consumer, producer, source)
 }
 
-/// The caller must open all tables from one already validated transaction.
 pub(super) fn verify_native_summary_tables<J, S, A, O, AT, T, M, C>(
     tables: &NativeSummaryTables<J, S, A, O, AT, T, M, C>,
     conversation: JobId,
@@ -1786,8 +1709,6 @@ where
     })
 }
 
-/// The stored Job a manual trial is asked to run, and the Allocation it
-/// already has, read from one snapshot. Evidence only: it grants nothing.
 pub(crate) fn read_trial_job(
     database: &Database,
     job: JobId,
@@ -1813,7 +1734,6 @@ pub(crate) fn read_trial_job(
     Ok(Some((record, allocation)))
 }
 
-/// Checks the format and schema of the open database and returns its epoch.
 fn native_epoch(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<u64, StorageError> {
@@ -1836,7 +1756,6 @@ fn native_epoch(
     Ok(u64::from_le_bytes(bytes))
 }
 
-/// Builds a bounded candidate from one snapshot. It is not dispatch authority.
 pub(crate) fn read_development_execution_context(
     database: &Database,
     token: crate::db::entities::AllocationToken,
@@ -1867,15 +1786,6 @@ pub(crate) fn read_development_execution_context(
     development_candidate_in(&rx, &meta, allocation)
 }
 
-/// What a reservation of `job` on `executor` would bind, read without
-/// reserving anything, as the candidate the start would be prepared from. The
-/// Allocation inside it is hypothetical: it was never written, no token for
-/// it exists, and the candidate cannot start anything. It exists so a caller
-/// can measure the exact request before it asks for a reservation.
-///
-/// Only a Generative Job is previewed. It mirrors the facts the reservation
-/// transaction itself requires of the Job, Pool and Executor, and a refusal
-/// here never changes the database.
 pub(crate) fn read_development_execution_preview(
     database: &Database,
     job: JobId,
@@ -1934,7 +1844,6 @@ pub(crate) fn read_development_execution_preview(
     development_candidate_in(&rx, &meta, hypothetical)
 }
 
-/// The candidate for `allocation`, a current reservation or a hypothetical one.
 fn development_candidate_in(
     rx: &ReadTransaction,
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -2017,8 +1926,6 @@ fn development_candidate_in(
                 "Decision allocation or context is incompatible",
             ));
         }
-        // The configuration frozen at submission, never today's settings. The
-        // Job record already proves it matches the pinned references.
         let Some(crate::db::entities::MutableFrozenConfiguration::Decision(configuration)) =
             record.job.frozen.clone()
         else {
@@ -2064,7 +1971,6 @@ fn development_candidate_in(
     {
         return Err(context_unavailable("Job input or Agent is missing"));
     }
-    // The configuration frozen at submission, never today's settings.
     let Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) =
         record.job.frozen.clone()
     else {
@@ -2086,8 +1992,6 @@ fn development_candidate_in(
     if conversation_control.on_hold.is_some() || conversation_control.closing.is_some() {
         return Err(context_unavailable("conversation is not eligible"));
     }
-    // A step of a plan is the conversation a `job_plan` call opened; it is
-    // not offered `job_plan` in turn, which the call itself would refuse.
     let plan_step = match &conversation.kind {
         crate::db::entities::JobKind::Group {
             origin: crate::db::entities::Origin::Agent { call },
@@ -2154,8 +2058,6 @@ fn development_candidate_in(
                     .map(|command| command.name.as_str()),
             )
             .collect();
-        // The grounding the request will actually carry: the grant the
-        // frozen Agent holds, not the widest one it could have held.
         let grant = configuration
             .agent
             .as_ref()
@@ -2205,9 +2107,6 @@ fn development_candidate_in(
                 "Decision predecessors cannot be projected as generative messages",
             ));
         }
-        // A predecessor that ended before its start is settled exactly as the
-        // writer's predecessor admission treats it; it carries its input and
-        // its typed Result, never a generated answer.
         let ended_unstarted = prior.job.parent_id == record.job.parent_id
             && prior.job.phase == MutableJobPhase::Queued
             && unstarted_settlement_in(
@@ -2449,17 +2348,6 @@ fn mutable_configuration_in(
     }))
 }
 
-/// The settlement of a Job whose untouched reservation was ended before
-/// Checked Start: Failed by a refused start or an offline reconciliation
-/// ([`Batch::fail_unstarted_reservation`]), or Cancelled by a stop
-/// ([`Batch::request_native_stop`]). Such a Job stays `Queued` (it never
-/// entered `Executing`) and its Allocation is `Released`.
-///
-/// A Queued Job without a Released Allocation makes no such claim: `None`.
-/// One with a Released Allocation must be exactly that settlement, which this
-/// returns with its one Result; any other shape is corruption. Every reader
-/// that admits output or a terminal outcome on a Job that never started
-/// decides it here, so they cannot disagree.
 pub(super) fn unstarted_settlement_in(
     rx: &ReadTransaction,
     record: &crate::db::entities::MutableJobRecord,
@@ -2659,8 +2547,6 @@ pub(super) fn mutable_job_details_in(
         .transpose()?
         .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
         .transpose()?;
-    // The one output a Job that never started may hold is the typed Result
-    // that ended its untouched reservation; see `unstarted_settlement_in`.
     let ended_unstarted = unstarted_settlement_in(rx, &record, allocation.as_ref())?.is_some();
     if record.job.phase != MutableJobPhase::Executing && latest_output.is_some() && !ended_unstarted
     {
@@ -2734,8 +2620,6 @@ pub(super) fn mutable_job_details_in(
         activity.tool_call(call, awaiting_user);
     }
     let (activity, unknown_reason) = activity.finish_mutable(&record);
-    // An uncertain outcome whose Allocation is still held is explained from
-    // the stored phase; nothing is stored for it and nothing is released.
     let unknown_reason = unknown_reason.or_else(|| {
         (record
             .outcome
@@ -2903,8 +2787,6 @@ pub(crate) fn read_jobs(
     Ok(records)
 }
 
-/// One listed Job: its record, the Allocation row that owns its capacity
-/// evidence, and the latest time one of its lifecycle facts was recorded.
 pub(crate) struct NativeJobItem {
     pub record: crate::db::entities::MutableJobRecord,
     pub allocation: Option<crate::db::entities::PoolAllocation>,
@@ -2917,7 +2799,6 @@ pub(crate) struct JobSearchPage {
     pub has_more: bool,
 }
 
-/// The Allocation row and update time of a submitted Job's record.
 fn native_job_item(
     rx: &ReadTransaction,
     record: crate::db::entities::MutableJobRecord,
@@ -2952,7 +2833,6 @@ fn native_job_item(
     })
 }
 
-/// One submitted Job, or none for a draft, a conversation or a missing row.
 pub(crate) fn read_native_job(
     database: &Database,
     id: JobId,
@@ -2967,12 +2847,8 @@ pub(crate) fn read_native_job(
     native_job_item(&rx, record).map(Some)
 }
 
-/// The most Job rows one page examines before it answers with a cursor.
 const JOB_LIST_SCAN: usize = 5_000;
 
-/// Submitted Jobs, newest first, whose identity or input text contains every
-/// term. Drafts and conversation rows are not Jobs of this listing. The scan
-/// and the page are bounded; the cursor resumes after the last row examined.
 pub(crate) fn read_job_search(
     database: &Database,
     terms: &[String],
@@ -3049,89 +2925,60 @@ pub(crate) fn read_children(
     Ok(children)
 }
 
-// ---- the tree of the work ---------------------------------------------------------
-
-/// The most children the root's own page lists.
 pub(crate) const TREE_PAGE_MAX: usize = 100;
-/// The most children a node deeper than the root lists.
 pub(crate) const TREE_NESTED: usize = 20;
-/// The most nodes one answer holds, the root included.
 pub(crate) const TREE_NODES_MAX: usize = 300;
-/// The deepest level the tree expands.
 pub(crate) const TREE_DEPTH_MAX: u8 = 4;
-/// The most ancestors a root names.
 const TREE_ANCESTORS_MAX: usize = 8;
-/// The most dependencies one turn waits on.
 const TREE_DEPENDENCIES_MAX: usize = 16;
-/// The most characters of a title.
 const TITLE_CHARS: usize = 80;
 
-/// What one node of the tree is. Every fact is read from the row that owns
-/// it: nothing here is a copy of another row.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TreeFacts {
     Conversation {
         title: String,
-        /// `open`, `closing` or `settled`, as the conversation itself computes.
         state: &'static str,
         on_hold: Option<Actor>,
-        /// `user`, `agent` or `system`.
         origin: &'static str,
         keep_open: bool,
-        /// The turn the conversation is running, with the model it runs with.
         active_turn: Option<(JobId, ConfigId, String)>,
         recurrence: Option<Recurrence>,
-        /// The conversations this one waits for before its first turn runs.
         depends_on: Vec<(JobId, DependencyCondition, DependencyState)>,
     },
     Turn {
         title: String,
-        /// `completed`, `failed`, `cancelled`, `unknown`, `running`,
-        /// `waiting` or `queued`.
         state: &'static str,
-        /// The conversation the turn belongs to.
         conversation: Option<JobId>,
         previous: Option<JobId>,
-        /// The LLM Profile the turn runs with, and the model it names.
         model: (ConfigId, String),
         depends_on: Vec<(JobId, DependencyCondition, DependencyState)>,
     },
 }
 
-/// One node of the tree: the Job, what it is, and the children it lists.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TreeNode {
     pub id: JobId,
     pub parent_id: Option<JobId>,
     pub created_at: Timestamp,
     pub facts: TreeFacts,
-    /// The Agent of the node, with its name when its config row is there.
     pub agent: Option<(ConfigId, Option<String>)>,
-    /// The children this node lists, as indexes into the tree's nodes.
     pub children: Option<Vec<usize>>,
-    /// Whether the node has children this answer does not list.
     pub has_more_children: bool,
-    /// The cursor of the node's next page of children.
     pub next_after: Option<JobId>,
 }
 
-/// The tree of the work below one Job: its ancestors, and the nodes of the
-/// tree itself, the root first.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobTree {
     pub ancestors: Vec<JobId>,
     pub nodes: Vec<TreeNode>,
 }
 
-/// One page of a node's children.
 struct ChildPage {
     listed: Vec<JobId>,
     has_more: bool,
     next_after: Option<JobId>,
 }
 
-/// The children of `parent` in creation order, strictly after `after` when
-/// given. The parent is never its own child.
 fn child_page(
     rx: &ReadTransaction,
     parent: JobId,
@@ -3163,7 +3010,6 @@ fn child_page(
     })
 }
 
-/// Whether a node has any child at all.
 fn has_children(rx: &ReadTransaction, parent: JobId) -> Result<bool, StorageError> {
     Ok(rx
         .open_table(CHILDREN)?
@@ -3173,8 +3019,6 @@ fn has_children(rx: &ReadTransaction, parent: JobId) -> Result<bool, StorageErro
         .is_some())
 }
 
-/// The ancestors of `root`, the topmost first. The Genesis Job is the root of
-/// every tree and is never named.
 fn read_ancestors(rx: &ReadTransaction, root: JobId) -> Result<Vec<JobId>, StorageError> {
     let mut ancestors = Vec::new();
     let mut current = read_job_row(rx, root)?.and_then(|row| row.parent_id);
@@ -3195,7 +3039,6 @@ fn read_ancestors(rx: &ReadTransaction, root: JobId) -> Result<Vec<JobId>, Stora
     Ok(ancestors)
 }
 
-/// The name of an Agent, read once per request.
 fn agent_name(
     rx: &ReadTransaction,
     agent: ConfigId,
@@ -3214,8 +3057,6 @@ fn agent_name(
     Ok(name)
 }
 
-/// The turn a conversation is running, with the model it runs with. It is the
-/// active turn only while that turn is claimed and has no outcome.
 fn active_job(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -3227,13 +3068,10 @@ fn active_job(
     else {
         return Ok(None);
     };
-    // A turn runs only under a claim, and storage records none.
     let _ = turn;
     Ok(None)
 }
 
-/// How a turn stands: what its outcome says, else whether it runs, else
-/// whether it waits on a dependency, else that it is queued.
 fn turn_state(rx: &ReadTransaction, id: JobId) -> Result<&'static str, StorageError> {
     let state = read_state(rx, id)?;
     if let Some(outcome) = &state.outcome {
@@ -3252,9 +3090,6 @@ fn turn_state(rx: &ReadTransaction, id: JobId) -> Result<&'static str, StorageEr
     Ok(if open > 0 { "waiting" } else { "queued" })
 }
 
-/// How a dependency stands: it waits while the prerequisite has not settled,
-/// and it can never be met once the prerequisite has settled without the
-/// outcome the condition asks for.
 fn dependency_state(
     rx: &ReadTransaction,
     dependency: JobId,
@@ -3279,20 +3114,16 @@ fn dependency_state(
     })
 }
 
-/// A title, as long as the tree shows it.
 fn cap_title(title: &str) -> String {
     title.chars().take(TITLE_CHARS).collect()
 }
 
-/// The text of a turn's first entry: what it was asked, or nothing when its
-/// first entry is not a message.
 fn first_entry_text(rx: &ReadTransaction, turn: JobId) -> Result<String, StorageError> {
     let job = mutable_job_record_in(rx, turn)?
         .ok_or_else(|| StorageError::corrupted("conversation turn missing"))?;
     Ok(job.job.input.text().chars().take(TITLE_CHARS).collect())
 }
 
-/// What a tree node is stored as: a conversation row, or a native turn.
 enum TreeRow {
     Conversation(Box<JobSpec>),
     Turn(Box<crate::db::entities::MutableJobRecord>),
@@ -3321,7 +3152,6 @@ fn tree_row(rx: &ReadTransaction, id: JobId) -> Result<Option<TreeRow>, StorageE
     }
 }
 
-/// One node of the tree: the Job's own row, its state, and what it owns.
 fn tree_node(
     rx: &ReadTransaction,
     row: &TreeRow,
@@ -3450,10 +3280,6 @@ fn tree_node(
     })
 }
 
-/// The tree of the work below `root`: the ancestors above it, and the nodes
-/// below it, breadth first and in creation order. The root's own children
-/// are one page; every node deeper than that lists only as many children as
-/// the bounds allow.
 pub(crate) fn read_job_tree(
     database: &Database,
     root: JobId,
@@ -3576,9 +3402,6 @@ fn outputs(
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     let start = match after_seq.map(u32::try_from) {
         None => 0,
-        // A sequence at the end of the domain has nothing after it. A
-        // negative cursor is not a sequence; neither replays the page from
-        // the beginning.
         Some(Err(_)) => return Ok(Vec::new()),
         Some(Ok(u32::MAX)) => return Ok(Vec::new()),
         Some(Ok(seq)) => seq + 1,
@@ -3594,7 +3417,6 @@ fn outputs(
     Ok(records)
 }
 
-/// The Job's newest output: a backward seek on `job_output`.
 pub(crate) fn read_latest_output(
     database: &Database,
     job: JobId,
@@ -3722,9 +3544,6 @@ fn tool_evidence(
     Ok(records)
 }
 
-/// The name of the tool `call` invoked, when its evidence is stored. The
-/// evidence of a call is written before its handler runs, so a stored call
-/// always names the tool that made it.
 fn tool_call_name(rx: &ReadTransaction, call: ToolCallRef) -> Result<Option<String>, StorageError> {
     rx.open_table(TOOL_CALLS)?
         .get(rows::tool_call_key(call))?
@@ -3732,10 +3551,6 @@ fn tool_call_name(rx: &ReadTransaction, call: ToolCallRef) -> Result<Option<Stri
         .transpose()
 }
 
-// ---- a Job's input ---------------------------------------------------------------
-
-/// The input of a Job is part of its spec, so it is read from the Job. The
-/// identity of the input is the Job's.
 fn input_of(rx: &ReadTransaction, row: JobSpec) -> Result<JobInputRecord, StorageError> {
     let execution = turn_config(rx, &row)?;
     let mut objective = row.kind.objective().map(str::to_owned);
@@ -3795,8 +3610,6 @@ pub(crate) fn read_job_input_for_job(
         .transpose()
 }
 
-/// The frozen generative configuration of a turn. A decision turn has none:
-/// its configuration is typed decision work, not an LLM Profile.
 pub(super) fn turn_config(
     tx: &impl TxRead,
     row: &JobSpec,
@@ -3821,9 +3634,6 @@ pub(super) struct UsageIdentity {
     pub(super) model: String,
 }
 
-/// The connection and model identity used to group token usage. Decision
-/// turns use their frozen decision connection and model; generative turns use
-/// their frozen provider and model.
 pub(super) fn turn_usage_identity_of(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     row: &JobSpec,
@@ -3847,8 +3657,6 @@ pub(super) fn turn_usage_identity_of(
     }
 }
 
-/// The generative accounting target of a turn. A decision turn has no LLM
-/// Profile or generative Provider, so it has none.
 pub(super) fn turn_target(
     tx: &impl TxRead,
     row: &JobSpec,
@@ -3857,7 +3665,6 @@ pub(super) fn turn_target(
     turn_target_of(&jobs, row)
 }
 
-/// See [`turn_target`]; it takes the table so a write batch can call it.
 pub(super) fn turn_target_of(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     row: &JobSpec,
@@ -3906,9 +3713,6 @@ fn job_configuration(
     }))
 }
 
-/// The typed work of a decision turn, read from its immutable spec. It is
-/// `None` for every other Job, so a caller must branch on execution class
-/// rather than pass a generative snapshot to the decision runtime.
 pub(crate) fn read_decision_work(
     database: &Database,
     job: JobId,
@@ -3926,8 +3730,6 @@ pub(crate) fn read_decision_work(
     }
 }
 
-// ---- submissions -------------------------------------------------------------------
-
 pub(crate) fn read_submission(
     database: &Database,
     key: SubmissionKey,
@@ -3938,8 +3740,6 @@ pub(crate) fn read_submission(
         .map(|bytes| decode_submission(key.as_bytes(), bytes.value()))
         .transpose()
 }
-
-// ---- attachments -------------------------------------------------------------------
 
 pub(crate) fn read_attachment(
     database: &Database,
@@ -3979,8 +3779,6 @@ pub(crate) fn content_available(
         .is_some_and(|value| value.value().1 > 0))
 }
 
-// ---- projects ----------------------------------------------------------------------
-
 pub(crate) fn read_project(
     database: &Database,
     id: ProjectId,
@@ -4007,8 +3805,6 @@ pub(crate) fn read_projects(
     }
     Ok(records)
 }
-
-// ---- configs -----------------------------------------------------------------------
 
 pub(super) fn config_record(row: ConfigRow) -> ConfigRecord {
     ConfigRecord {
@@ -4073,8 +3869,6 @@ pub(crate) fn read_credential_ref_in_use(
     Ok(!matching_connections.is_disjoint(&live_connections))
 }
 
-/// Configs of `kind` (any kind when `None`), newest first, strictly before
-/// `before` when given. Archived configs are included.
 pub(crate) fn read_configs(
     database: &Database,
     kind: Option<ConfigKind>,
@@ -4110,8 +3904,6 @@ pub(crate) fn read_configs(
             };
             row
         } else {
-            // This legacy projection cannot represent independent Pools or
-            // Executors; do not silently omit them from an unfiltered list.
             ConfigRow::decode_at(key.value(), bytes.value())?
         };
         if kind.is_none_or(|kind| kind == row.kind) {
@@ -4190,12 +3982,8 @@ pub(crate) fn read_native_resources(
     })
 }
 
-/// The most active index entries one Pool occupancy summary counts. A Pool
-/// with more cannot be counted inside one bounded read, so its summary is
-/// reported as unavailable rather than as a partial total.
 pub(crate) const MAX_POOL_OCCUPANCY_ENTRIES: usize = 4096;
 
-/// How many held Allocations a Pool has in each phase. `held` is their sum.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PoolOccupancy {
     pub held: u64,
@@ -4207,15 +3995,11 @@ pub(crate) struct PoolOccupancy {
 
 pub(crate) struct PoolAllocationPage {
     pub pool: crate::db::entities::AllocationPool,
-    /// Absent when the Pool holds more Allocations than one bounded read counts.
     pub occupancy: Option<PoolOccupancy>,
     pub allocations: Vec<crate::db::entities::PoolAllocation>,
-    /// The (Executor, Job) after which the next page continues.
     pub next: Option<(u128, u128)>,
 }
 
-/// Loads the authoritative Allocation behind one active-index entry and
-/// requires that the two agree.
 pub(super) fn indexed_allocation(
     allocations: &impl ReadableTable<u128, &'static [u8]>,
     pool: u128,
@@ -4242,10 +4026,6 @@ pub(super) fn indexed_allocation(
     Ok(allocation)
 }
 
-/// One page of a Pool's held Allocations, in (Executor, Job) order after
-/// `after`, with the Pool's occupancy, all from one read transaction.
-/// `None` when the Pool does not exist. Any index entry that disagrees with
-/// its authoritative Allocation fails the read.
 pub(crate) fn read_pool_allocations(
     database: &Database,
     pool_id: crate::db::entities::ExecutionPoolId,
@@ -4328,9 +4108,6 @@ pub(crate) enum StoredCredential {
     Undecryptable,
 }
 
-/// Resolve only encrypted database credentials, retaining the exact row as
-/// change evidence for the start transaction. Environment fallbacks have no
-/// transactional authority and are intentionally unavailable here.
 pub(crate) fn read_handoff_credential(
     database: &Database,
     reference: &str,
@@ -4377,10 +4154,6 @@ pub(crate) fn credential_count(database: &Database) -> Result<u64, StorageError>
     Ok(rx.open_table(CREDENTIALS)?.len()?)
 }
 
-/// One bounded page of active Model, Agent and Pool configs before `before`,
-/// plus point reads of the Connections those Models name. Pool protocol offers
-/// travel in the same catalog scan; compatibility is joined after paging.
-/// `next_before` advances even when no visible config is found.
 pub(crate) struct ProfilePageRecords {
     pub records: Vec<ProfilePageRecord>,
     pub connections: BTreeMap<ConfigId, (String, ConnectionConfig, bool)>,
@@ -4566,8 +4339,6 @@ fn read_pool_views<T>(
     let mut records = Vec::new();
     for entry in configs.range(..before)?.rev() {
         let (key, bytes) = entry?;
-        // The `config` table also holds the native allocation records, which
-        // are not configurations; a scan skips them rather than failing on them.
         let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
             continue;
         };
@@ -4638,7 +4409,6 @@ pub(crate) fn read_executors(
     )
 }
 
-/// The enabled Pools that offer an LLM request over `protocol`, oldest first.
 fn pools_offering(
     rx: &impl TxRead,
     protocol: LlmTransport,
@@ -4749,7 +4519,6 @@ pub(super) fn candidate_compatible(
         && matches!(pool.body, ConfigBody::Pool(body) if body.enabled && capability.is_some_and(|(operation, protocol)| body.offers(operation, protocol))))
 }
 
-/// The Pools that offer what a Model config's Connection speaks.
 pub(crate) fn read_compatible_executors(
     database: &Database,
     llm_profile: ProfileId,
@@ -4824,7 +4593,6 @@ pub(crate) fn read_agent_model_configs(
         .collect()
 }
 
-/// The Pools that offer typed decision work, oldest first.
 pub(crate) fn read_decision_executors(
     database: &Database,
 ) -> Result<Vec<ExecutorId>, StorageError> {
@@ -4836,26 +4604,14 @@ pub(super) fn decision_executors(rx: &impl TxRead) -> Result<Vec<ExecutorId>, St
     pools_offering_operation(rx, ExecutionOperation::Decision)
 }
 
-// ---- claims and held slots ------------------------------------------------------------
-
-/// A native Allocation that is Uncertain and still holds its Pool's
-/// capacity: the Job's work was never confirmed stopped. Evidence only; it is
-/// never a route to release anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UncertainAllocation {
     pub job: JobId,
     pub pool: ExecutionPoolId,
     pub epoch: u64,
-    /// When the Job's Unknown outcome was recorded.
     pub since: Timestamp,
 }
 
-/// Every Uncertain Allocation, read from one snapshot of the native ownership
-/// rows. Only the bounded active index is scanned, never historical
-/// Allocations. Each entry must agree with its authoritative Allocation, and
-/// each Uncertain one with its Job's Unknown outcome and the absence of stop
-/// evidence; any disagreement fails the read, so an empty result is only ever
-/// a successful, consistent read of no Uncertain Allocation.
 pub(crate) fn read_uncertain_allocations(
     database: &Database,
 ) -> Result<Vec<UncertainAllocation>, StorageError> {
@@ -4913,7 +4669,6 @@ pub(crate) fn read_uncertain_allocations(
     Ok(uncertain)
 }
 
-/// Whether the natural key of a command is present in the database.
 pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool, StorageError> {
     let rx = read(database)?;
     Ok(match probe {
@@ -5259,9 +5014,6 @@ fn conversation_page(
     })
 }
 
-/// Gram postings locate candidate source rows across the whole history.
-/// Source verification preserves literal substring matching, including Unicode
-/// and punctuation, without treating the index as authoritative text.
 fn conversation_matches(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -5310,26 +5062,14 @@ fn conversation_matches(
     }
     Ok(true)
 }
-/// Native queue and capacity accounting from one read transaction.
 pub(crate) struct QueueCounts {
-    /// Queued Jobs that hold no Allocation.
     pub(crate) pending: u64,
-    /// Entries of the ready index.
     pub(crate) ready: u64,
     pub(crate) delayed: u64,
-    /// Allocations executing their Job: Running or StopRequested. Neither a
-    /// Reserved Allocation (not started) nor an Uncertain one (its outcome is
-    /// unknown, so it is held rather than running) counts.
     pub(crate) running: u64,
-    /// Every Allocation still holding capacity: Reserved, Running,
-    /// StopRequested and Uncertain. This, not `running`, decides whether the
-    /// host is quiescent.
     pub(crate) held: u64,
 }
 
-/// With `for_update`, pending and delayed count only Jobs due by now. A native
-/// Job has no eligibility time, so every pending Job is due; each must still
-/// have its Job row. A failed or inconsistent read is an error, never a zero.
 pub(crate) fn queue_counts(
     database: &Database,
     for_update: bool,
@@ -5338,7 +5078,6 @@ pub(crate) fn queue_counts(
     queue_counts_in(&rx, for_update)
 }
 
-/// [`queue_counts`] inside one read transaction the caller already holds.
 fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts, StorageError> {
     use crate::db::entities::AllocationPhase;
     let pending_table = rx.open_table(PENDING)?;
@@ -5399,10 +5138,6 @@ fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts
     })
 }
 
-/// One entry of the native ready index as an activation preflight reads it:
-/// the Job, where it stands in the index, what it is and the configuration it
-/// was frozen with. It is a read, never a selection: nothing here decides
-/// what may run.
 pub(crate) struct ReadyQueueEntry {
     pub(crate) job: JobId,
     pub(crate) priority: u8,
@@ -5410,28 +5145,14 @@ pub(crate) struct ReadyQueueEntry {
     pub(crate) phase: crate::db::entities::MutableJobPhase,
     pub(crate) generative: bool,
     pub(crate) frozen: Option<crate::db::entities::MutableFrozenConfiguration>,
-    /// The Job row's revision.
     pub(crate) revision: u64,
-    /// SHA-256 of the Job row exactly as stored. The row owns the input, the
-    /// revision and the frozen configuration, so this names all three: a
-    /// change to any of them changes it.
     pub(crate) row_digest: [u8; 32],
-    /// The requirement the ready key carries (the fourth key component).
     pub(crate) requirement: u16,
-    /// Whether the ready key's priority and submission time are the ones the
-    /// Job row names.
     pub(crate) key_agrees: bool,
-    /// Whether the pending index holds this Job.
     pub(crate) in_pending: bool,
-    /// Every kind of execution or ownership evidence the database holds for
-    /// this Job. A Job that was never started has none.
     pub(crate) evidence: Vec<&'static str>,
 }
 
-/// The execution and ownership evidence a Job that was never started cannot
-/// have, read from the tables that hold it. Empty for an untouched Job. A
-/// `job_state` that cannot be read is reported as evidence, not as an error:
-/// it is not a state a never-started Job is in.
 fn never_started_evidence(
     rx: &ReadTransaction,
     id: JobId,
@@ -5478,7 +5199,6 @@ fn never_started_evidence(
         .transpose()?
         .is_some()
     {
-        // Any request event refuses, whether or not one of them is Sent.
         evidence.push("request_event");
     }
     if rx
@@ -5520,36 +5240,21 @@ fn never_started_evidence(
     Ok(evidence)
 }
 
-/// The Genesis Job: the root of every parent chain. `recovery::open` records
-/// it as Job 0 in every database, so a read that never opens one can still
-/// name it.
 pub(crate) const GENESIS_JOB: JobId = JobId::new(0);
 
-/// What a first activation must know about the loops a database holds. A
-/// recurrence that is not `Halted` can append a new turn, and so create a Job,
-/// without any submission: `Active` is mid-loop, and `WaitingDue` is scheduled
-/// to append at its due time. Its derived index, `RECURRENCE_DUE`, is where
-/// `boundary_b` learns of the due ones, so the two must agree exactly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RecurrenceAudit {
     pub(crate) total: u64,
     pub(crate) active: u64,
     pub(crate) waiting_due: u64,
     pub(crate) halted: u64,
-    /// `WaitingDue` rows whose time has already passed.
     pub(crate) due_now: u64,
-    /// Rows in the derived due index.
     pub(crate) due_index_rows: u64,
-    /// Jobs waiting for another Job to settle. None can be released while no
-    /// Allocation is held, but a first activation over a database that holds
-    /// none expects to find none.
     pub(crate) dependency_waiters: u64,
-    /// The first disagreement between the recurrences and their due index.
     pub(crate) inconsistency: Option<String>,
 }
 
 impl RecurrenceAudit {
-    /// Whether any loop can create work after activation, and why.
     pub(crate) fn blocking(&self) -> Option<String> {
         if self.active > 0 {
             return Some(format!(
@@ -5575,33 +5280,15 @@ impl RecurrenceAudit {
     }
 }
 
-/// Everything a first activation reads, from one read transaction, so every
-/// count describes the same state. It is a read: nothing here selects,
-/// reserves, cancels, repairs or rebuilds anything.
 pub(crate) struct ActivationSnapshot {
-    /// The stored `open_epoch`, before any opening this process makes.
     pub(crate) open_epoch: u64,
-    /// The stored `clean_shutdown` marker, as left by the last closing host.
     pub(crate) clean_shutdown: bool,
-    /// Exact counts. A non-zero `pending`, `ready`, `delayed` or `held` refuses
-    /// activation on its own, so no decision depends on a bounded listing.
     pub(crate) counts: QueueCounts,
-    /// The first `limit` ready entries in the index's order.
     pub(crate) ready: Vec<ReadyQueueEntry>,
-    /// Whether the ready index holds more entries than `ready` shows.
     pub(crate) truncated: bool,
     pub(crate) recurrences: RecurrenceAudit,
 }
 
-/// Reads [`ActivationSnapshot`] from `database`, whether that is an open
-/// `Database` or a `ReadOnlyDatabase`, without writing anything.
-///
-/// The queues are counted exhaustively: `pending`, `ready` and `delayed` are
-/// the indices the scheduler claims from and promotes, so a non-zero count of
-/// any is work that could start. The recurrences and their due index are read
-/// in full, because a loop can create work without appearing in any queue. An
-/// entry that names a Job or a recurrence that does not exist is an error,
-/// never a zero: a first activation refuses an inconsistent database.
 pub(crate) fn activation_snapshot(
     database: &impl ReadableDatabase,
     limit: usize,
@@ -5616,12 +5303,8 @@ pub(crate) fn activation_snapshot(
     let clean_shutdown = meta
         .get("clean_shutdown")?
         .is_some_and(|value| value.value().first().is_some_and(|flag| *flag != 0));
-    // Exact counts, including whether any Allocation still holds capacity.
     let counts = queue_counts_in(&rx, false)?;
 
-    // The queues the scheduler claims from, and the ones `boundary_b`
-    // promotes into them. Each entry must name a Job, within the bounded
-    // preview: the counts are exact, and a non-zero count refuses alone.
     let jobs = rx.open_table(JOBS)?;
     for (index, entry) in rx.open_table(PENDING)?.iter()?.enumerate() {
         if index == limit {
@@ -5696,10 +5379,6 @@ pub(crate) fn activation_snapshot(
     })
 }
 
-/// The loops a database holds, and whether their derived due index agrees
-/// with them; see [`RecurrenceAudit`]. Every recurrence row and every row of
-/// the due index is read: this is the one queue a bounded preview may not
-/// cover, because one row is enough to create work.
 fn recurrence_audit(rx: &ReadTransaction) -> Result<RecurrenceAudit, StorageError> {
     use std::collections::BTreeSet;
     let clock = recovery::promotion_clock();
@@ -5756,26 +5435,13 @@ fn recurrence_audit(rx: &ReadTransaction) -> Result<RecurrenceAudit, StorageErro
     Ok(audit)
 }
 
-/// An offline read-only inspection of one existing database, and the identity
-/// of the file it read; see [`activation_snapshot`].
 pub(crate) struct OfflineActivation {
     pub(crate) snapshot: ActivationSnapshot,
-    /// `in_place_read_only` or `private_unlinked_copy`.
     pub(crate) access: &'static str,
-    /// Whether the file was copied. A copy means redb had to repair it, so the
-    /// state read is a recovered one and not necessarily what a host opening
-    /// the original would see.
     pub(crate) copied: bool,
-    /// The file as it was read, and as [`with_offline_database`] verified it
-    /// still is afterwards.
     pub(crate) file: OfflineFile,
 }
 
-/// Reads one existing database without opening it for writing, creating
-/// anything, or taking the host lock exclusively; see
-/// [`with_offline_database`], whose checks it inherits. It refuses a data
-/// directory without a database, a database that is not of this build's
-/// format, and a database a host currently holds.
 pub(crate) fn inspect_activation_offline(
     directory: &std::path::Path,
     limit: usize,
@@ -5783,8 +5449,6 @@ pub(crate) fn inspect_activation_offline(
     let (session, file) = with_offline_database(
         directory,
         OfflineOptions {
-            // A copy is the only way to read a database redb would have to
-            // repair: read in place whenever the file permits it.
             force_copy: false,
             require_host_lock: true,
         },
@@ -5839,9 +5503,6 @@ pub(crate) fn read_tool_stats(
 }
 
 pub const MAX_USAGE_SCAN: usize = 100_000;
-/// The most groups one page holds. A row is at most a 256-byte model name
-/// plus identifiers and counters, so this also keeps the serialized page
-/// below the server's response budget.
 const MAX_USAGE_PAGE_GROUPS: usize = 512;
 
 fn resolve_model_name(
@@ -5915,10 +5576,6 @@ pub(crate) fn read_usage_summary_scanned(
 ) -> Result<crate::db::entities::UsageSummaryResponse, StorageError> {
     use crate::db::entities::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse};
 
-    // `from_us` is inclusive and rounds down to its bucket; `until_us` is
-    // exclusive and rounds up, so the buckets scanned are exactly those an
-    // instant in `[from_us, until_us)` falls in. The last bucket is
-    // `ceil(until_us / HOUR) - 1`.
     let from_hour = filter
         .from_us
         .map(|us| us.div_euclid(HOUR))
@@ -5997,8 +5654,6 @@ pub(crate) fn read_usage_summary_scanned(
     Ok(UsageSummaryResponse {
         from_us: effective_from_us,
         until_us: effective_until_us,
-        // Complete says the scan finished, not that every request's usage is
-        // final. `resume_after` is set exactly when it did not.
         complete: next.is_none(),
         resume_after: next,
         rows,
@@ -6078,13 +5733,6 @@ struct UsageScan {
     next: Option<crate::db::entities::UsageCursor>,
 }
 
-/// Reads one bounded window of `usage_total` rows, newest bucket last. Every
-/// examined row counts against `row_budget`, including rows the agent filter
-/// excludes, and every group counts against `group_budget`. A window may end
-/// inside a group, so a page's rows can be partial aggregates; `next` is the
-/// last row examined and continues strictly after it. `earliest_hour` and
-/// `latest_hour` describe the whole requested range, not just this window, so
-/// every page of one traversal reports the same effective bounds.
 fn scan_usage_totals(
     database: &Database,
     filter: &crate::db::entities::UsageSummaryFilter,
@@ -6334,7 +5982,6 @@ pub(crate) fn read_notices(
         .collect()
 }
 
-/// The most outputs one Turn of a page carries before the rest is truncated.
 const TURN_PAGE_OUTPUTS: usize = 1000;
 
 pub(crate) fn read_conversation_limits(
@@ -6365,8 +6012,6 @@ pub(crate) fn read_conversation_limits(
     ))
 }
 
-/// One immutable source turn, rendered as data for summarization. The hash
-/// covers framing, identity, frozen configuration, inputs, results and tools.
 pub(super) struct SealedTurn {
     pub boundary: crate::db::entities::SourceBoundary,
     pub text: String,
@@ -6610,8 +6255,6 @@ pub(super) fn global_compaction_settings(
     Ok(settings)
 }
 
-/// The global request fields; absent until first saved, which reads as
-/// revision 0 with no fields.
 pub(super) fn global_outbound_headers(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<crate::db::entities::GlobalHeaders, StorageError> {
@@ -6726,8 +6369,6 @@ pub(super) fn raw_context_usage(
     Ok((total, u32::try_from(growth).unwrap_or(u32::MAX), settled))
 }
 
-// Presentation estimates use the current Job input, not the previous
-// revisions stored under JOB_INPUTS. Execution context remains separate.
 fn mutable_context_usage(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -6757,8 +6398,6 @@ fn mutable_context_usage(
         let mut bytes = 16usize
             .saturating_add(record.job.input.text().len())
             .saturating_add(record.job.input.attachments().len().saturating_mul(4800));
-        // Only the Result that ended an untouched reservation may exist on a
-        // Job that never started (see `unstarted_settlement_in`).
         let ended_unstarted = record.job.phase == MutableJobPhase::Queued
             && unstarted_settlement_in(
                 rx,
@@ -6917,7 +6556,6 @@ pub(crate) fn read_context_state(
     if !owner.kind.is_group() {
         return Ok(None);
     }
-    // Only a native conversation can exist: Job creation is native-only.
     if !rx
         .open_table(JOBS)?
         .get(conversation.get())?
@@ -7459,8 +7097,6 @@ pub(super) fn context_work_stopped(
     Ok(false)
 }
 
-/// Known usage only increases the reservation charge. Missing or unfinished
-/// usage never refunds a reservation, including after a restart.
 pub(super) fn preparation_charge(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     children: &impl ReadableTable<(u128, u128), ()>,
@@ -7760,10 +7396,6 @@ fn question(arguments: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The Decision model's assessment of a command approval, when the Project
-/// that owns the conversation enables one. The Project is the conversation's,
-/// which owns that fact; the turn that asked is not read, so this works for a
-/// native turn as well as a legacy one.
 fn approval_assessment(
     rx: &ReadTransaction,
     call: ToolCallRef,
@@ -7911,20 +7543,10 @@ pub(crate) fn read_cards(
 }
 
 pub(crate) struct UsageRetriesPage {
-    /// Partial groups: the same `(bucket_us, agent, provider, model)` key may
-    /// appear again on the next page, and its `retries` must be summed.
     pub rows: Vec<crate::db::entities::UsageRetryRow>,
-    /// The last raw retry key scanned. It is set exactly when more keys
-    /// remain, so `rows.is_empty()` with `next` is a valid continuation, not
-    /// exhaustion.
     pub next: Option<(u128, u128)>,
 }
 
-/// Scans at most `limit` retry keys, including those outside the time and
-/// agent filters, and groups the matches. A group can span pages because the
-/// scan window ends at a raw key, not at a group boundary; consumers merge
-/// partial rows by their stable key. The cursor advances over scanned keys
-/// even when the page has no matches, and is `None` only at real exhaustion.
 pub(crate) fn read_usage_retries(
     database: &Database,
     filter: &crate::db::entities::UsageSummaryFilter,
@@ -7993,8 +7615,6 @@ pub(crate) fn read_usage_retries(
     })
 }
 
-/// One durable scheduled external policy by its stable identity. Absence is
-/// meaningful: no policy authorizes anything.
 pub(crate) fn read_scheduled_external_policy(
     database: &Database,
     id: crate::db::entities::ScheduledExternalPolicyId,
@@ -8007,8 +7627,6 @@ pub(crate) fn read_scheduled_external_policy(
         .transpose()
 }
 
-/// Policies in ascending identity order, strictly after `after`, at most
-/// `limit`; a `next` cursor is returned only when another row may follow.
 pub(crate) fn read_scheduled_external_policies(
     database: &Database,
     after: Option<crate::db::entities::ScheduledExternalPolicyId>,
@@ -8040,9 +7658,6 @@ pub(crate) fn read_scheduled_external_policies(
     Ok(CursorPage { records, next })
 }
 
-/// One Job's durable scheduled external binding together with the exact policy
-/// row it names, read in one read transaction. `Ok(None)` means no binding,
-/// which is every loopback and manual execution.
 pub(crate) fn read_scheduled_external_binding_with_policy(
     database: &Database,
     job: JobId,

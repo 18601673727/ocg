@@ -1,17 +1,11 @@
 import type { ExecutionCall, JobExecution } from "../execution/domain";
 
-/**
- * What a running Chat turn is actually executing, read from the Job's frozen
- * canonical facts. The composer's next-turn selection never feeds this.
- */
 export type ActiveExecutionTarget = {
   jobId: string;
   generation: number;
   providerKey: string;
-  /** The Profile model key placement froze. */
   model: string;
   upstreamModelId: string | null;
-  /** The frozen effort, or `null` when the request carried none. */
   effort: string | null;
 };
 
@@ -27,11 +21,9 @@ export type ActivityStepKind =
   | "provider"
   | "provider-failed";
 
-/** One observable execution step. Built from Call names and arguments only. */
 export type ActivityStep = {
   id: string;
   kind: ActivityStepKind;
-  /** File, query, command or tool name the step acted on. */
   target: string;
   status: "done" | "running" | "failed";
 };
@@ -56,8 +48,6 @@ type ParsedRequest =
   | { provider: true; effort: string | null }
   | null;
 
-// Call requests are immutable durable payloads and provider ones carry the
-// whole conversation, so each is parsed once.
 const parsed = new Map<string, ParsedRequest>();
 
 function parseRequest(id: string, request: string): ParsedRequest {
@@ -89,18 +79,10 @@ function parseRequest(id: string, request: string): ParsedRequest {
   return result;
 }
 
-/**
- * The frozen Provider × Model × Effort of the Job's current generation.
- * An earlier generation is never substituted: until this generation's
- * dispatch is visible the target is unknown, not the previous Attempt's.
- */
 export function executionTarget(
   execution: JobExecution | null | undefined,
 ): ActiveExecutionTarget | null {
   if (!execution) return null;
-  // Only this Job's current generation. An earlier Attempt's frozen target is
-  // that Attempt's own identity and must not stand in for a generation that
-  // has not frozen one yet.
   const intents = execution.dispatchIntents
     .filter(
       (intent) => intent.generation === execution.generation && intent.providerKey && intent.model,
@@ -119,10 +101,6 @@ export function executionTarget(
   };
 }
 
-/**
- * The frozen Provider × Model × Effort of a Job that is still executing.
- * Same rule as `executionTarget`: this generation only, never an earlier one.
- */
 export function activeExecutionTarget(
   execution: JobExecution | null | undefined,
 ): ActiveExecutionTarget | null {
@@ -185,12 +163,6 @@ function stepStatus(call: ExecutionCall): ActivityStep["status"] | null {
   return null;
 }
 
-/**
- * Observable steps of the Job's current generation, oldest first: the Native
- * Tool Calls the provider asked for and, while no tool runs, the provider
- * round itself. Only Call names and arguments are read — never provider
- * responses or reasoning.
- */
 export function executionActivity(execution: JobExecution | null | undefined): ActivityStep[] {
   if (!execution) return [];
   const steps: ActivityStep[] = [];
@@ -213,7 +185,6 @@ export function executionActivity(execution: JobExecution | null | undefined): A
   return steps;
 }
 
-/** The single step to show beside the model while the Job is active. */
 export function currentActivity(
   execution: JobExecution | null | undefined,
   steps: readonly ActivityStep[],

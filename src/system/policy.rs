@@ -78,7 +78,6 @@ impl SystemPolicy {
         let (policy, initialize) = match fs::read(&path) {
             Ok(bytes) => (Self::parse(&bytes, &path)?, false),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                // A dangling policy symlink is an invalid existing entry, not a fresh directory.
                 match fs::symlink_metadata(&path) {
                     Ok(_) => return Err(io_error(&path, "read existing policy", source)),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -175,8 +174,6 @@ impl SystemPolicy {
                 )
             })?;
         drop(file);
-        // Linking publishes the complete, flushed inode atomically and cannot replace any existing entry.
-        // Any failure leaves the artifacts in place for inspection; startup never retries publication.
         fs::hard_link(&temporary, path).map_err(|source| {
             io_error(
                 path,
@@ -240,8 +237,6 @@ pub(crate) fn open_directory(path: &Path) -> io::Result<Option<File>> {
     File::open(path).map(Some)
 }
 
-/// Directory handles cannot be fsynced on this platform; publication relies
-/// on the filesystem persisting the directory entry with the file metadata.
 #[cfg(not(unix))]
 pub(crate) fn open_directory(_path: &Path) -> io::Result<Option<File>> {
     Ok(None)

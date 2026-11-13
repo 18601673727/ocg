@@ -1,23 +1,3 @@
-//! `ocg external-trial <job> --pool <id> --executor <id> --endpoint <https-url>
-//!  --credential-ref <ref> --max-request-bytes <n> --max-output-tokens <n>
-//!  --timeout-secs <n> [--model <id>] [--trusted-http-proxy <http://loopback:port>]
-//!  --confirm-external-request`
-//!
-//! The one operator-invoked path that may send one Job to an approved
-//! external HTTPS endpoint. It is not an HTTP route, is refused unless the
-//! `manual_external_trial` control is enabled in the build, runs against the
-//! database in `OCG_DATA_DIR` as a host of its own (so it cannot run beside
-//! another host), and runs exactly one Job once: no retry, no recovery, no
-//! scheduling. Every flag but `--model` and `--trusted-http-proxy` is required;
-//! nothing is defaulted. Without `--trusted-http-proxy` the connection is
-//! direct; with it, the connection goes through that one loopback HTTP CONNECT
-//! proxy and never falls back to a direct one. The environment's proxy
-//! variables and the system proxy are never used.
-//!
-//! Interrupting it (SIGINT or SIGTERM) cancels the local exchange. A request
-//! that may have reached the Provider then stays held as Uncertain: stopping
-//! the local transport says nothing about the Provider.
-
 use std::time::Duration;
 
 use super::manual_host::{

@@ -1,13 +1,3 @@
-//! `ocg scheduled-external-policy`: durable policy management for the
-//! scheduled external transport.
-//!
-//! Creation stores a disabled row. It never enables the build's
-//! [`crate::system::execution_controls::ExecutionControl::ScheduledExternalTransport`],
-//! which remains a compile-time constant, and it never inspects or approves a
-//! Job. `enable` and `disable` change only the row's own flag; `revoke` is
-//! final and leaves no historical Job, frozen configuration or binding behind.
-//! Every mutation names the policy's stable identity and the exact revision it
-//! is changing, so a concurrent change fails rather than being overwritten.
 use std::cell::RefCell;
 use std::rc::Rc;
 

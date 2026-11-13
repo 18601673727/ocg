@@ -61,7 +61,6 @@ export type NativeExecutor = {
   }[];
 };
 
-/** The one configuration change an Executor update makes. */
 export type NativeExecutorChange =
   | { enabled: boolean; name?: never; capabilities?: never }
   | { name: string; enabled?: never; capabilities?: never }
@@ -71,7 +70,6 @@ export type NativeExecutorChange =
       name?: never;
     };
 
-/** Whether an Executor update was refused because the Executor changed since it was read. */
 export function isExecutorConflict(error: unknown): boolean {
   return error instanceof ControlTransportError && error.code === "executor_revision_conflict";
 }
@@ -107,7 +105,6 @@ function validateNativeExecutor(
     throw new ContractError("executor.capabilities", "supported Executor capabilities");
 }
 
-/** Whether two Executor capability lists name the same capabilities, in any order. */
 function sameCapabilities(
   left: NativeExecutor["capabilities"],
   right: NativeExecutor["capabilities"],
@@ -119,7 +116,6 @@ function sameCapabilities(
   return first.length === second.length && first.every((key, index) => key === second[index]);
 }
 
-/** The phases of an Allocation that holds capacity. Released Allocations are never listed. */
 export type NativeAllocationPhase = "reserved" | "running" | "stop_requested" | "uncertain";
 
 export type NativeAllocation = {
@@ -134,7 +130,6 @@ export type NativeAllocation = {
   started_at_unix_micros: number | null;
 };
 
-/** Held Allocations by phase; every field is null when the Pool is too large to count in one read. */
 export type NativePoolOccupancy =
   | {
       available: true;
@@ -199,13 +194,11 @@ export class ControlTransportError extends Error {
     readonly retryable: boolean,
     readonly detail: string = "",
   ) {
-    // Only the decoded API error message is presented; never request data or fetch errors.
     super(detail ? `${detail} (${code}, ${status})` : `OCG request: ${code} (${status})`);
     this.name = "ControlTransportError";
   }
 }
 
-/** Whether a Profile save was refused because the Profile changed since the edit began. */
 export function isProfileConflict(error: unknown): boolean {
   return (
     error instanceof ControlTransportError &&
@@ -217,12 +210,7 @@ export type HttpCanonicalControlClientOptions = {
   streamIdleMs?: number;
   baseUrl: string;
   fetch: typeof fetch;
-  // Programmatic mode: supplied by an already authorized caller; no
-  // acquisition or storage here.
   bearerToken?: () => string | Promise<string>;
-  // Browser-session mode: the session cookie authenticates every request,
-  // and the session's CSRF token, from the session route, signs the
-  // state-changing ones. Never the bearer token.
   csrfToken?: () => string | Promise<string>;
 };
 
@@ -247,16 +235,6 @@ export type MutableJob = {
   phase: "unsubmitted" | "queued" | "executing" | "completed" | "failed" | "cancelled" | "unknown";
   submitted_at: number | null;
   unsupported_decision_history?: boolean;
-  /**
-   * What the backend knows about autonomous loopback dispatch for a queued
-   * Generative Job, derived from its frozen configuration and the host's
-   * endpoint policy, stored nowhere. `eligible` means those admit dispatch; it
-   * does not mean the Job will run, and nothing here grants execution
-   * authority. `not_assessed` names what only the scheduler's own transaction
-   * decides, and what the runtime authority has to supply first: the
-   * autonomous_scheduling control compiled in, an armed Host run, and the
-   * reservation and writer checks.
-   */
   autonomous_loopback_eligibility?: AutonomousLoopbackEligibility;
   input: MutableJobInput;
 };
@@ -338,8 +316,6 @@ function mutableJob(value: unknown, context: string): MutableJob {
   return job;
 }
 
-// `GET /api/v1/jobs/{id}` answers the observation details with the editable state
-// beside them; the editable Job is read out of that one body.
 function editableJob(value: unknown): unknown {
   const body = value as {
     api_version?: number;
@@ -384,9 +360,7 @@ export type ControlProfileWriteRequest =
       credential?: string | null;
       clear_credential?: boolean;
       declared_capabilities: ControlCapability[];
-      /** Omitted keeps the stored headers; a list replaces them. */
       headers?: Api.OutboundHeaderInput[];
-      /** The Profile's `edit_seq` when the form was opened; required to update one. */
       expected_edit_seq?: number;
       parameters?: {
         temperature?: number | null;
@@ -530,7 +504,6 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
 
 export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
 
-/** Auxiliary evidence must not hide the authoritative stored outputs. */
 export async function readTranscriptEvidence(
   client: Pick<HttpCanonicalControlClient, "readAllJobTools" | "readAllProviderResponses">,
   job: string,
@@ -550,7 +523,6 @@ export async function readTranscriptEvidence(
     client.readAllJobTools(job, signal),
     readReplies
       ? client.readAllProviderResponses(job, signal, previous.at(-1)?.request).catch((error) => {
-          // A Decision Job has no reply text; the backend says so rather than failing.
           if (
             error instanceof ControlTransportError &&
             error.code === "decision_response_unavailable"
@@ -563,8 +535,6 @@ export async function readTranscriptEvidence(
   signal.throwIfAborted();
   const responses = replies.status === "fulfilled" ? [...previous, ...replies.value] : null;
   let replyError = replies.status === "rejected" ? replies.reason : null;
-  // Settlement precedes the final Received write. Reconcile that short gap
-  // independently of the now-closed output stream, with bounded retries.
   for (const delay of [100, 300, 1000, 3000]) {
     if (
       !settled ||
@@ -595,7 +565,6 @@ export async function readTranscriptEvidence(
   };
 }
 
-/** Reads a bounded sequence window without walking earlier output pages. */
 export async function readOutputWindow(
   client: Pick<HttpCanonicalControlClient, "readOutputs" | "readLatestOutput">,
   job: string,
@@ -661,13 +630,10 @@ function observationQuery(settings: ObservationSettings): string {
   return query.length ? `?${query.join("&")}` : "";
 }
 
-// Retains the 0.4.5 canonical client's injected-fetch boundary and contracts
-// entrypoint. None of its legacy lifecycle, chat or fixture stores are needed.
 export function createHttpCanonicalControlClient(options: HttpCanonicalControlClientOptions) {
   const programmatic = options.bearerToken !== undefined;
   const base = controlOrigin(options.baseUrl, !programmatic);
   const fetchImpl = options.fetch.bind(globalThis);
-  // Live subscriptions only; each owns its delivery acknowledgement.
   const active = new Set<AbortController>();
   const profileListeners = new Set<(change?: { availability: string }) => void>();
   const conversationListeners = new Set<() => void>();
@@ -880,8 +846,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     });
   }
 
-  // The one credential this client sends: the bearer token of its caller,
-  // or nothing at all where the browser's own session cookie applies.
   async function credentials(): Promise<Record<string, string>> {
     if (!options.bearerToken) return {};
     const token = await options.bearerToken();
@@ -911,7 +875,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     if (cursor.sequence !== undefined) headers["Last-Event-ID"] = String(cursor.sequence);
     let response: Response;
     try {
-      // Entity IDs are canonical UUIDv7 values and are safe as literal path segments.
       response = await fetchImpl(`${base}/api/v1/jobs/${jobId}/events`, {
         method: "GET",
         headers,
@@ -928,9 +891,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       let code = "http_error";
       try {
         code = ((await response.json()) as Api.ErrorResponse).error.code;
-      } catch {
-        /* An unrecognized body still retains its HTTP status. */
-      }
+      } catch {}
       throw new ControlTransportError(code, response.status, retryable(response.status, code));
     }
     const mediaType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
@@ -963,8 +924,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           if (idle) clearTimeout(idle);
         }
         signal.throwIfAborted();
-        // Discard an incomplete frame or UTF-8 tail at EOF. Neither was
-        // acknowledged; the stored cursor will replay the entire output.
         if (chunk.done) return null;
         for (const frame of parser.push(decoder.decode(chunk.value, { stream: true }))) {
           signal.throwIfAborted();
@@ -986,7 +945,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             if (acknowledged !== previous + 1)
               throw new ContractError("output.seq", "the next stored sequence without a gap");
             await listener(event);
-            // A rejected listener never acknowledges an unprocessed output.
             cursor.sequence = acknowledged;
           } else {
             await listener(event);
@@ -1001,9 +959,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     } finally {
       try {
         await reader.cancel();
-      } catch {
-        /* The read failure is reported above; cleanup cannot replace it. */
-      }
+      } catch {}
       reader.releaseLock();
     }
   }
@@ -1062,9 +1018,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             let code = "http_error";
             try {
               code = ((await response.json()) as Api.ErrorResponse).error.code;
-            } catch {
-              /* Retain the HTTP status. */
-            }
+            } catch {}
             throw new ControlTransportError(
               code,
               response.status,
@@ -1118,8 +1072,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
               if (advanced) progress();
               for (const frame of parser.push(text)) {
                 if ("comment" in frame) {
-                  // The observation feed emits a heartbeat only after it has
-                  // checked the journal and found no more changes to replay.
                   if (observationReady) {
                     observationReady = false;
                     if (progressTimer !== undefined) clearTimeout(progressTimer);
@@ -1455,17 +1407,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     });
   }
 
-  // One JSON request to one route of this API: no open proxy, no other
-  // upstream, and every answer checked against its contract.
   async function send(
     method: "GET" | "POST" | "DELETE",
     path: string,
     settings: {
       body?: unknown;
-      // The request's own `Idempotency-Key`, where a route names one.
       key?: string;
-      // Whether the request changes state and so carries the session's
-      // CSRF token in browser mode.
       sign?: boolean;
       signal?: AbortSignal;
       context?: string;
@@ -1505,9 +1452,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         const decoded = ((await response.json()) as Api.ErrorResponse).error;
         code = decoded.code;
         detail = decoded.message;
-      } catch {
-        /* An unrecognized body still retains its HTTP status. */
-      }
+      } catch {}
       throw new ControlTransportError(
         code,
         response.status,
@@ -1888,11 +1833,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).input as Api.Conversations;
     },
 
-    /**
-     * Full-text conversation search: eligible titles, messages, assistant replies and attachment names,
-     * newest first. Terms are the whitespace-separated words of `query`,
-     * combined by AND; matching is case-insensitive substring per term.
-     */
     async searchConversations(settings: {
       query: string;
       before?: string;
@@ -1913,7 +1853,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).input as Api.Conversations;
     },
 
-    /** Renames a conversation or hides it for good. */
     async editConversation(root: string, edit: ControlConversationEdit, signal?: AbortSignal) {
       jobIdentity(root);
       const answer = await send("POST", `/api/v1/conversations/${root}`, {
@@ -2051,7 +1990,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).input as Api.Logs;
     },
 
-    /** What the host establishes about itself and its database, now. */
     async readHealth(signal?: AbortSignal) {
       return (await send("GET", "/api/v1/health", { signal })).input as Api.Health;
     },
@@ -2069,7 +2007,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         .input as Api.UpdateState;
     },
 
-    /** The Job's persisted lifecycle record. */
     async readJob(job: string, signal?: AbortSignal) {
       jobIdentity(job);
       return projectJob(
@@ -2077,15 +2014,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       );
     },
 
-    /**
-     * The Conversation an identity belongs to. A Conversation identity is read as a
-     * Conversation and only an unknown one is then read as a Job: the two are different
-     * records. An identity that is neither is refused.
-     */
     async resolveConversation(id: string, signal?: AbortSignal): Promise<string> {
       jobIdentity(id);
-      // The UI addresses a Conversation by its own identity, so that is read first; only an
-      // identity the Conversation read does not know is looked up as a Job.
       try {
         await send("GET", `/api/v1/conversations/${id}/turns?limit=1`, { signal });
         return id;
@@ -2114,12 +2044,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       );
     },
 
-    /**
-     * Requests the stop of one native Job, in the Composer context the Job's
-     * record names. The body is exactly `{}`; the answer is checked against
-     * both the status and the stop's own phase so a 202 is never projected as
-     * a confirmed stop.
-     */
     async stopNativeJob(context: string, job: string, signal?: AbortSignal) {
       const identity = jobIdentity(job);
       const answer = await send("POST", `/api/v1/jobs/${identity}/stop`, {
@@ -2129,13 +2053,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         signal,
       });
       const stop = projectNativeStop(answer.status, answer.input);
-      // The answer must name the Job this request stopped, not another one.
       if (stop.job !== identity)
         throw new ContractError("stop.job", "the stop answer names the requested Job");
       return stop;
     },
 
-    /** The Job's frozen input: its objective as text, never inferred from its identity. */
     async readJobInput(job: string, signal?: AbortSignal) {
       jobIdentity(job);
       const answer = (await send("GET", `/api/v1/jobs/${job}/input`, { signal }))
@@ -2143,7 +2065,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return { ...answer.input, job: answer.job };
     },
 
-    /** The bounded conversation ending at `job`, reconstructed from persisted Job `previous` links. */
     async readConversationTurns(
       conversation: string,
       before?: string,
@@ -2167,7 +2088,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal })
       ).input as ControlChildren;
     },
-    /** The tree of the work below a Job: its ancestors, and the nodes below it. */
     async readJobTree(
       job: string,
       settings: {
@@ -2283,7 +2203,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return result;
     },
 
-    /** One page of Agent Profiles with their LLM targets and the Executors that can run each. */
     async readAgentProfiles(
       settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
     ) {
@@ -2306,10 +2225,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       );
     },
 
-    /** One page of Projects, newest first. */
     readProjects: readProjectPage,
 
-    /** Every Project, newest first. */
     async readAllProjects(signal?: AbortSignal) {
       const projects: ControlProject[] = [];
       let before: string | undefined;
@@ -2323,7 +2240,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
     },
 
-    /** Creates a new Project. */
     async createProject(body: ControlProjectCreate, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/projects", {
         body,
@@ -2333,7 +2249,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return (answer.input as Api.ProjectAnswer).project as ControlProject;
     },
 
-    /** Updates an existing Project. */
     async updateProject(projectId: string, body: ControlProjectUpdate, signal?: AbortSignal) {
       identity(projectId, "project");
       const answer = await send("POST", `/api/v1/projects/${projectId}`, {
@@ -2411,7 +2326,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       };
     },
 
-    /** Updates a Pool's concurrency limit or enabled state. */
     async updatePool(
       poolId: string,
       expectedRevision: number,
@@ -2515,7 +2429,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       };
     },
 
-    /** One page of the Allocations holding capacity in a native Pool, and the Pool's occupancy. */
     async readNativePoolAllocations(
       pool: string,
       settings: { after?: string; signal?: AbortSignal } = {},
@@ -2570,8 +2483,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       } else if (occupancy.available === false) {
         checked = { available: false };
       } else throw new ContractError("occupancy", "an occupancy summary");
-      // Canonical lowercase UUIDs compare in string order exactly as they do
-      // numerically, and the Pool's index is ordered by (Executor, Job).
       let previousKey = settings.after;
       for (const allocation of page.allocations) {
         if (
@@ -2654,11 +2565,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.executor;
     },
 
-    /**
-     * Applies one change to an Executor, made from the revision read `executor`.
-     * The answer must be that Executor one revision later, with the requested
-     * field applied and every other field as it was read.
-     */
     async updateNativeExecutor(
       executor: NativeExecutor,
       change: NativeExecutorChange,
@@ -2691,10 +2597,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return updated;
     },
 
-    /**
-     * Retires an idle Executor for good, from `expectedRevision`. The answer is
-     * the authoritative archived configuration; nothing is released or stopped.
-     */
     async archiveNativeExecutor(id: string, expectedRevision: number, signal?: AbortSignal) {
       identity(id, "executor");
       if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
@@ -2721,11 +2623,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return archived;
     },
 
-    /**
-     * Retires a Pool with no Allocation and no unarchived Executor for good,
-     * from `expectedRevision`. The answer is the authoritative archived Pool;
-     * nothing is released, stopped or cascaded.
-     */
     async archiveNativePool(id: string, expectedRevision: number, signal?: AbortSignal) {
       identity(id, "pool");
       if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
@@ -2753,7 +2650,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         throw new ContractError("pool", "the archived Pool");
     },
 
-    /** Every Profile (LLM Profiles, Agent Profiles) and the merged Provider projection. */
     async readProfiles(signal?: AbortSignal) {
       return readAllProfiles(signal);
     },
@@ -2765,7 +2661,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         credential_ref?: string | null;
         credential?: string;
         headers?: Api.OutboundHeaderInput[];
-        /** A saved Profile of this Provider, whose stored headers are probed. */
         profile_id?: string;
       },
       signal?: AbortSignal,
@@ -2837,7 +2732,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.input as Api.GlobalOutboundHeaders;
     },
 
-    /** Replaces the global headers; `revision` is the one last read. */
     async saveGlobalOutboundHeaders(revision: number, headers: Api.OutboundHeaderInput[]) {
       const answer = await send("POST", "/api/v1/settings/outbound-headers", {
         body: { revision, headers },
@@ -2871,7 +2765,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       profileListeners.forEach((listener) => listener());
     },
 
-    /** Creates an LLM Profile or Agent Profile and returns the refreshed catalog. */
     async createProfile(profile: ControlProfileWriteRequest, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/profiles", {
         body: profile,
@@ -2884,7 +2777,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return { ...snapshot, profile_id: saved };
     },
 
-    /** Updates an existing LLM Profile or Agent Profile and returns the refreshed catalog. */
     async updateProfile(
       profileId: string,
       profile: ControlProfileWriteRequest,
@@ -2902,7 +2794,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return { ...snapshot, profile_id: saved };
     },
 
-    /** One stored page of the Job's outputs, in `seq` order. */
     async readOutputs(
       job: string,
       settings: {
@@ -2960,7 +2851,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return tool;
     },
 
-    /** Reads the timestamp of the response that introduced a tool call. */
     async readToolResponseTime(job: string, request: number, signal?: AbortSignal) {
       jobIdentity(job);
       if (!Number.isSafeInteger(request) || request < 1)
@@ -2977,7 +2867,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         : null;
     },
 
-    /** Reassembles reply chunks; an incomplete 50-page walk is refused. */
     async readAllProviderResponses(
       job: string,
       signal?: AbortSignal,
@@ -3034,7 +2923,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       throw new ContractError("responses", "complete provider replies within 50 pages");
     },
 
-    /** All recorded tool calls for a Job, paging through until complete. */
     async readAllJobTools(job: string, signal?: AbortSignal): Promise<ControlToolCall[]> {
       const tools: ControlToolCall[] = [];
       let cursor: string | undefined = undefined;
@@ -3053,7 +2941,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return tools;
     },
 
-    /** Uploads a PNG, JPEG, GIF or WebP image to the Attachment store. */
     async uploadAttachment(
       payload: {
         mime: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
@@ -3070,7 +2957,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return (answer.input as { attachment: ControlAttachment }).attachment;
     },
 
-    /** Reads metadata of an image Attachment. */
     async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
       identity(attachmentId, "attachment");
       const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, {
@@ -3079,13 +2965,11 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return (answer.input as { attachment: ControlAttachment }).attachment;
     },
 
-    /** URL to fetch the raw image content of an Attachment. */
     attachmentContentUrl(attachmentId: string): string {
       identity(attachmentId, "attachment");
       return `${base}/api/v1/attachments/${attachmentId}/content`;
     },
 
-    /** Requests the stop of one Job this listener admitted. */
     async stopConversation(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
       const answer = await send("POST", `/api/v1/conversations/${conversation}/stop`, {
@@ -3105,7 +2989,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.input as Api.Stop;
     },
 
-    /** Signs the browser in under this run's pairing code. */
     async createSession(pairingCode: string, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/session", {
         body: { pairing_code: pairingCode },
@@ -3119,7 +3002,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       };
     },
 
-    /** The session this browser holds, if it is still authorized. */
     async readSession(signal?: AbortSignal) {
       const answer = await send("GET", "/api/v1/session", { signal });
       const session = (answer.input as Api.SessionResponse).session;
@@ -3130,7 +3012,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       };
     },
 
-    /** Revokes this browser's session. */
     async deleteSession(signal?: AbortSignal) {
       await send("DELETE", "/api/v1/session", { sign: true, signal });
     },
@@ -3140,14 +3021,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       listener: (event: JobStreamEvent) => void | Promise<void>,
       settings: {
         signal?: AbortSignal;
-        // Only seed from output the canonical consumer has already processed.
         afterSeq?: number;
         onReconnect?: (error: ControlTransportError) => void | Promise<void>;
       } = {},
     ): JobStreamSubscription {
       if (closed) throw new ControlTransportError("client_closed", 0, false);
       jobIdentity(jobId);
-      // Each consumer acknowledges its own output; another view cannot skip it.
       const cursor = {
         sequence: settings.afterSeq === undefined ? undefined : sequence(settings.afterSeq),
       };

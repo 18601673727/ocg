@@ -12,10 +12,6 @@ impl Batch {
     ) -> Result<(FrozenExecutionConfig, Option<ProjectId>, Option<ConfigId>), BatchError> {
         self.step(|tx| reader::job_execution(&tx.open_table(JOBS)?, turn))
     }
-    /// Requests one manual compaction of `conversation`. The same submission
-    /// key returns the Job it already created. A source that cannot fit the
-    /// summarizer's own window is refused; it is never truncated. A decision
-    /// model is not a summarizer.
     pub(crate) fn request_compaction(
         &mut self,
         conversation: JobId,
@@ -480,8 +476,6 @@ impl Batch {
         Ok((system, appended))
     }
 
-    /// The newest settled turn a compaction may cover. An active turn is not
-    /// included; its predecessor is the boundary for a later execution.
     fn compaction_boundary(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
         let mut cursor = self.group_head(conversation)?;
         let mut seen = BTreeSet::new();
@@ -525,9 +519,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Creates a system conversation and its one typed decision turn. The
-    /// configuration is frozen in this transaction, exactly as an ordinary
-    /// turn's is, so an archived or edited target cannot be submitted.
     pub(crate) fn open_decision(
         &mut self,
         parent: Option<JobId>,
@@ -748,10 +739,6 @@ impl Batch {
         })
     }
 
-    /// The settled prefix a later turn may summarize. Pending and running
-    /// turns are excluded. `through` is the newest turn included; a turn
-    /// still open for input is not a source. Manual compaction is the
-    /// production caller; tests seal a prefix directly.
     pub(crate) fn seal_context_source(
         &mut self,
         conversation: JobId,
@@ -837,8 +824,6 @@ impl Batch {
         Ok(Some(manifest))
     }
 
-    /// Confirms a sealed prefix is still the same stored bytes. A later
-    /// append beyond the boundary does not change the match.
     pub(super) fn source_still_matches(
         &mut self,
         manifest: &crate::db::entities::ContextSourceManifest,

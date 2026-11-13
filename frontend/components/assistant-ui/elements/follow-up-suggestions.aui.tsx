@@ -13,9 +13,7 @@ const FollowupSuggestionsRow: FC = () => {
     const el = scrollRef.current;
     if (!el) return;
     const maxScroll = el.scrollWidth - el.clientWidth;
-    // scrollLeft runs 0..-max in RTL; normalize to hidden width per physical edge.
     const fromStart = Math.abs(el.scrollLeft);
-    // getComputedStyle forces a style recalc per scroll event; direction is stable, read it once.
     const rtl = (rtlRef.current ??= getComputedStyle(el).direction === "rtl");
     const [left, right] = rtl
       ? [maxScroll - fromStart, fromStart]
@@ -44,7 +42,6 @@ const FollowupSuggestionsRow: FC = () => {
     <div
       ref={scrollRef}
       onScroll={updateFades}
-      // overflow-x clips both axes; py-1/-my-1 gives focus rings vertical room without changing outer height.
       className="aui-thread-followup-suggestions -my-1 w-full [scrollbar-width:none] overflow-x-auto py-1 [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
       style={{ maskImage, WebkitMaskImage: maskImage }}
     >

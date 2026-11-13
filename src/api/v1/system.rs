@@ -46,8 +46,6 @@ pub(crate) struct QuarantinedView {
     since: i64,
 }
 
-/// Why the quarantined list could not be published. Bounded: the cause stays
-/// in the server log.
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "QuarantinedError")]
 #[serde(rename_all = "snake_case")]
@@ -63,14 +61,10 @@ pub(crate) struct HealthView {
     database: DatabaseHealthView,
     queue: QueueView,
     process: ProcessView,
-    /// Absent (`null`) when the ownership state could not be read, which is
-    /// never the same as an empty list.
     quarantined: Option<Vec<QuarantinedView>>,
     quarantined_error: Option<QuarantinedErrorView>,
 }
 
-/// What the host can establish: it runs, as the listener answers only
-/// while it does, and what the database says of itself now.
 pub(super) async fn health(database: &DatabaseHandle) -> Value {
     let status = match database.status() {
         DatabaseStatus::Open => "open",

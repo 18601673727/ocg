@@ -6,15 +6,6 @@ import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
 
-/**
- * A long message scrolls inside its own bounded viewport until the reader
- * expands it. A streaming message keeps its newest output in view until the
- * reader scrolls up inside it.
- *
- * This is the single bounded-message presentation shared by every Chat
- * surface: the assistant-ui Thread messages render through it, so long
- * messages stay bounded and expandable on the active surface too.
- */
 export function BoundedMessage({
   streaming,
   children,

@@ -20,7 +20,6 @@ pub mod workload;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 static LEGACY_CONTEXT: OnceLock<Value> = OnceLock::new();
 
-/// One measurement's own directory, removed when the measurement ends.
 struct TemporaryRoot(PathBuf);
 
 impl TemporaryRoot {
@@ -279,10 +278,6 @@ fn measure<T>(
     Ok((samples, started.elapsed()))
 }
 
-/// The queries one index is measured against, from a term in a single file to a
-/// phrase common enough to leave every file a candidate and match in none. The
-/// last two are the ones whose cost scales with the corpus: a hit stops the
-/// query early, no hit leaves it verifying every candidate.
 #[cfg(unix)]
 const SEARCH_QUERIES: [(&str, &str); 7] = [
     ("rare", "rarebeacon"),
@@ -351,9 +346,6 @@ fn corpus(source: &std::path::Path, files: usize, sizes: [usize; 4]) -> Result<(
     Ok(())
 }
 
-/// Measures every query class against one installed index. `strict` holds the
-/// queries to their expected hits, which a corpus truncated by a production
-/// bound may not carry.
 #[cfg(unix)]
 fn queries(
     index: &ocg::service::fts::WorkspaceFts,
@@ -400,10 +392,6 @@ fn queries(
     Ok(())
 }
 
-/// The same queries over corpora of growing size: the build and the phrase
-/// verification that dominates a query both scale with what was indexed, and
-/// one corpus is deliberately past the production content bound, which is the
-/// partial snapshot a larger repository indexes to.
 #[cfg(unix)]
 fn search_scale(options: &Options) -> Result<()> {
     use ocg::service::fts::{FtsLimits, WorkspaceFts};
@@ -515,8 +503,6 @@ fn main() -> Result<()> {
             "bench"
         },
     )?;
-    // What each section actually applies. A section that ignores an option
-    // records it as unused rather than silently dropping it.
     let unused_options: &[&str] = match options.section.as_str() {
         "search_scale" => &[
             "jobs",
@@ -555,7 +541,6 @@ fn main() -> Result<()> {
             "page_size",
             "writer_jobs",
         ],
-        // Each section below applies its own options; the record says so.
         "all" => &[
             "deadline_ms",
             "page_size",
@@ -618,12 +603,9 @@ fn main() -> Result<()> {
         applied: applied_options,
     }))
     .emit();
-    // Summary report: read JSONL and emit Markdown table
     if options.section == "summary" {
         return summary::run_summary();
     }
-    // The FTS scale sweep builds its own index; every other measurement runs
-    // against the production host.
     if options.section == "search_scale" {
         #[cfg(unix)]
         {
@@ -654,8 +636,6 @@ fn main() -> Result<()> {
     result
 }
 
-/// Every section, in an order that keeps the cheapest first. Each section
-/// builds its own fixture, so one run of `all` is as long as all of them.
 fn run_every_section(options: &Options) -> Result<()> {
     const HOST_SECTIONS: [&str; 6] = [
         "startup",

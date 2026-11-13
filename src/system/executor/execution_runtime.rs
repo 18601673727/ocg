@@ -18,9 +18,6 @@ use crate::service::ai::providers::{
     ProviderExecutionResult, ProviderFact, ProviderObservation, ProviderOutputSink,
 };
 
-/// Evidence that this module observed the supervised in-process operation
-/// return. This is not an OS-level stop proof and cannot be constructed by a
-/// database or API caller. It is consumed by one finalization call.
 pub(crate) struct DevelopmentExecutionReturn<'a> {
     handoff: &'a crate::db::DevelopmentHandoff,
 }
@@ -31,19 +28,10 @@ impl<'a> DevelopmentExecutionReturn<'a> {
     }
 }
 
-/// Which endpoints a development execution may send to.
 #[derive(Clone, Copy)]
 pub(crate) enum EndpointPolicy<'a> {
-    /// A literal loopback endpoint only.
     Loopback,
-    /// One manually approved external endpoint only, under the approval's
-    /// own authority and control (the external trial or ordinary manual
-    /// external execution); see [`crate::system::external_approval`].
     ApprovedExternal(&'a crate::system::external_approval::ExternalApproval),
-    /// The one endpoint a durable scheduled external policy names for this
-    /// Job's scheduled exchange, under
-    /// [`crate::system::execution_controls::ExecutionControl::ScheduledExternalTransport`].
-    /// It is never formed from a manual approval.
     ScheduledExternal(&'a crate::system::scheduled_external::ScheduledExternalGrant),
 }
 
@@ -71,10 +59,6 @@ impl EndpointPolicy<'_> {
     }
 }
 
-/// The Generative exchange of a checked handoff, to the endpoints `policy`
-/// permits: one request, or, when the Job's Agent was offered `tools`, the
-/// requests of its tool loop. Every request is recorded as sent before it
-/// leaves, and only after the previous one was answered.
 pub(crate) async fn supervise_development_generative(
     database: &DatabaseHandle,
     handoff: crate::db::DevelopmentHandoff,
@@ -194,8 +178,6 @@ pub(crate) async fn supervise_development_generative(
                 .finalize_development_job(returned, output_seq, finalization)
                 .await;
         };
-        // The calls are answered, and the conversation grows by the response
-        // and its answers, before the next request is built.
         let site = CallSite {
             database,
             handoff: &handoff,
@@ -212,8 +194,6 @@ pub(crate) async fn supervise_development_generative(
         .await
         {
             Ok(CallAnswers::Answered(answers)) => answers,
-            // The user's decision creates the Job that continues; this one
-            // completes with what it waits for as its answer.
             Ok(CallAnswers::Awaiting(awaiting)) => {
                 let finalization = JobFinalization::Completed(FinalResult {
                     summary: Some(awaiting_summary(&result, &awaiting)),
@@ -384,8 +364,6 @@ async fn capture_file_snapshots(
     }
 }
 
-/// Adds the snapshots of the Workspace files an answer links to, to its result
-/// value, when they are small and unchanged by the output filter.
 #[cfg(unix)]
 async fn attach_file_snapshots(
     value: &mut serde_json::Value,
@@ -410,9 +388,6 @@ async fn attach_file_snapshots(
     }
 }
 
-/// What a Job that ends on calls waiting for the user says it waits for: the
-/// question of each `ask_user` call and the request of each command request,
-/// as its answer.
 fn awaiting_summary(result: &ProviderExecutionResult, awaiting: &[u32]) -> String {
     let mut summary = String::new();
     for call in result
@@ -451,8 +426,6 @@ fn awaiting_summary(result: &ProviderExecutionResult, awaiting: &[u32]) -> Strin
     summary
 }
 
-/// Why the tools a handoff was prepared with are not the tools this
-/// execution holds, or `None` when they are the same.
 fn offer_mismatch(
     conversation: &crate::service::ai::providers::openai_compatible::ChatConversation,
     tools: Option<&ToolExecution>,
@@ -472,8 +445,6 @@ fn offer_mismatch(
     }
 }
 
-/// Records the answer of one request and its usage. Only a response the
-/// Provider completed reaches here, whether it asks for tools or answers.
 async fn record_answered_request(
     database: &DatabaseHandle,
     handoff: &crate::db::DevelopmentHandoff,
@@ -549,11 +520,6 @@ async fn record_answered_request(
     Ok(())
 }
 
-/// Settles a Job whose tool loop stopped on this side. A known stop fails the
-/// Job, a local orchestration failure that keeps the Provider's last
-/// response, if there was one, as its value. A stop that leaves a call's
-/// effect uncertain keeps the Allocation held as Uncertain. No Provider
-/// failure is recorded for either.
 async fn settle_tool_stop(
     database: &DatabaseHandle,
     handoff: &crate::db::DevelopmentHandoff,
@@ -589,8 +555,6 @@ async fn settle_tool_stop(
         .await
 }
 
-/// The native Decision protocol is distinct from Generative chat. A failed or
-/// interrupted exchange retains ownership until a safe recovery protocol exists.
 pub(crate) async fn supervise_development_decision(
     database: &DatabaseHandle,
     handoff: crate::db::DevelopmentHandoff,
@@ -756,10 +720,6 @@ pub(crate) async fn supervise_development_decision(
         .await
 }
 
-/// What a development exchange that produced no answer may be settled as.
-/// Only facts this process observed qualify: a request that never left it, or
-/// a Provider response that definitely refused the request. Anything else may
-/// have escaped or may still be running remotely and keeps its ownership.
 enum DevelopmentSettlement {
     Unsent {
         code: &'static str,
@@ -769,7 +729,6 @@ enum DevelopmentSettlement {
         failure: Box<crate::service::ai::providers::openai_compatible::ProviderFailure>,
         observation: crate::db::entities::AvailabilityObservation,
     },
-    /// Ownership stays held; the reason is what this process could not establish.
     Held(crate::db::entities::UncertaintyReason),
 }
 
@@ -801,22 +760,13 @@ fn development_settlement(error: &ProviderExecutionError, sent: bool) -> Develop
                 _ => DevelopmentSettlement::Held(UncertaintyReason::ResponseIncompleteOrInvalid),
             }
         }
-        // Every other outcome is uncertain or incomplete: the request may
-        // have been delivered, the response may be partial, or the status
-        // does not prove a refusal. No retry, release or redispatch follows.
         other => DevelopmentSettlement::Held(uncertainty_reason(other)),
     }
 }
 
-/// The local reason an exchange error leaves the outcome uncertain. Each
-/// reason states what this process could not establish, never that the
-/// remote work ended.
 fn uncertainty_reason(error: &ProviderExecutionError) -> crate::db::entities::UncertaintyReason {
     use crate::db::entities::UncertaintyReason;
     match error {
-        // A Build or NotDelivered error reaches here only after the Sent
-        // evidence was written, so delivery cannot be ruled out whatever the
-        // transport reported.
         ProviderExecutionError::Build { .. }
         | ProviderExecutionError::NotDelivered { .. }
         | ProviderExecutionError::Unknown { facts: None, .. }
@@ -835,9 +785,6 @@ fn uncertainty_reason(error: &ProviderExecutionError) -> crate::db::entities::Un
     }
 }
 
-/// Settles a supervised exchange that returned an error. The in-process return
-/// is observed here, so a local rejection is finalized; an uncertain remote
-/// outcome is never turned into Failed or Cancelled.
 async fn settle_development_error(
     database: &DatabaseHandle,
     handoff: &crate::db::DevelopmentHandoff,
@@ -864,8 +811,6 @@ async fn settle_development_error(
             failure,
             observation,
         } => {
-            // A received refusal proves the exchange ended, not that no
-            // provider-side work or charge occurred, so the text says so.
             let result = FinalResult {
                 summary: Some(format!(
                     "{error}. A complete HTTP response was received; OCG cannot prove that the provider or an intermediary performed no work or incurred no charge."
@@ -889,9 +834,6 @@ async fn settle_development_error(
                 .await
         }
         DevelopmentSettlement::Held(reason) => {
-            // The Allocation stays held. Recording the reason is what lets
-            // an operator tell why; if the write fails the Allocation simply
-            // stays Running, which is held all the same.
             database
                 .record_development_uncertain(DevelopmentExecutionReturn { handoff }, reason)
                 .await?;
@@ -903,9 +845,6 @@ async fn settle_development_error(
     }
 }
 
-/// Settles an exchange whose request never left this process. Cancellation
-/// before the request is Cancelled; every other local refusal is Failed. The
-/// message is withheld if it would contain credential material.
 async fn settle_development_unsent(
     database: &DatabaseHandle,
     handoff: &crate::db::DevelopmentHandoff,
@@ -917,8 +856,6 @@ async fn settle_development_unsent(
 ) -> Result<AppendedOutput, DatabaseError> {
     let cancelled = config.cancellation.is_cancelled();
     if cancelled && request != RequestNumber::FIRST {
-        // A Job that already sent a request cannot end as Cancelled: what its
-        // tools did is not known to have stopped, so it stays held.
         database
             .record_development_uncertain(
                 DevelopmentExecutionReturn { handoff },
@@ -958,12 +895,8 @@ async fn settle_development_unsent(
 struct DevelopmentLoopbackSink<'a> {
     database: &'a DatabaseHandle,
     handoff: &'a crate::db::DevelopmentHandoff,
-    /// The request this exchange sends.
     request: RequestNumber,
     prepared: &'a serde_json::Value,
-    /// The exchange's own cancellation. A stop that the database recorded
-    /// before the request could be recorded as sent cancels it, so the
-    /// exchange settles as cancelled before sending.
     cancellation: &'a CancellationToken,
     output_seq: u32,
     sent: bool,
@@ -1055,8 +988,6 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
     }
 }
 
-/// A controlled local fixture. No variant invokes a provider, tool, or child
-/// execution. It is available only to trusted development-build components.
 #[allow(dead_code)]
 pub(crate) enum DevelopmentSyntheticExecution {
     Generative {
@@ -1073,9 +1004,6 @@ pub(crate) enum DevelopmentSyntheticExecution {
     },
 }
 
-/// Exercise the native Worker path without dispatch or external effects. The
-/// handoff is owned until the operation returns; a dropped future cannot issue
-/// a return proof. A failed or uncertain evidence write leaves ownership held.
 #[allow(dead_code)]
 pub(crate) async fn supervise_development_synthetic(
     database: &DatabaseHandle,
@@ -1155,9 +1083,6 @@ pub enum ExecutionRuntimeError {
     ShuttingDown,
 }
 
-/// What a Provider execution needs to turn a Job's Project into tools: the
-/// data directory its root must stay apart from. Nothing of a Project is
-/// kept here; it is read again for every Job, see [`resolve_project`].
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceTools {
     data_directory: Arc<crate::system::data_directory::DataDirectory>,
@@ -1180,8 +1105,6 @@ const PROVIDER_REJECTED: &str = "provider_rejected";
 const NOT_DELIVERED: &str = "not_delivered";
 const BUILD_FAILED: &str = "build_failed";
 const NOT_SENT: &str = "not_sent";
-/// Records the facts of one answered request: its timing and its
-/// availability observation. Returns the first write that failed.
 fn assistant_message(result: &ProviderExecutionResult) -> ChatMessage {
     ChatMessage::assistant(
         Some(result.text.clone()).filter(|text| !text.is_empty()),

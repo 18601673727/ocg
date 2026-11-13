@@ -1,6 +1,5 @@
 use super::*;
 
-/// Microseconds since the Unix epoch, as recorded by the database worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, ts_rs::TS)]
 pub struct Timestamp(i64);
 
@@ -24,7 +23,6 @@ impl Timestamp {
     }
 }
 
-/// Parses only canonical lowercase, hyphenated UUIDv7 identities.
 pub fn parse_entity_id(text: &str) -> Option<u128> {
     let id = uuid::Uuid::parse_str(text).ok()?;
     (id.hyphenated().to_string() == text
@@ -35,8 +33,6 @@ pub fn parse_entity_id(text: &str) -> Option<u128> {
 
 macro_rules! record_id_type {
     ($name:ident, $table:literal) => {
-        /// A durable UUID identity. New entities receive a monotonic UUIDv7
-        /// from the database worker; sequences within an entity remain numeric.
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, ts_rs::TS)]
         pub struct $name(#[ts(type = "string")] pub(super) u128);
 
@@ -147,11 +143,6 @@ impl From<ExecutionPoolId> for ConfigId {
     }
 }
 
-/// The number of one Provider request within the Job that sent it, from 1
-/// in the order the Job sent them. A Job may send several requests, such as
-/// the rounds of a tool loop; every Metrics and AvailabilityStat record
-/// belongs to exactly one of them, and evidence is reduced per request,
-/// never across the requests of a Job.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -159,11 +150,8 @@ impl From<ExecutionPoolId> for ConfigId {
 pub struct RequestNumber(u32);
 
 impl RequestNumber {
-    /// A Job's first request, and the only request of a Job recorded before
-    /// requests were numbered.
     pub const FIRST: Self = Self(1);
 
-    /// `None` for 0, which numbers no request.
     #[must_use]
     pub const fn new(value: u32) -> Option<Self> {
         if value == 0 { None } else { Some(Self(value)) }
@@ -174,7 +162,6 @@ impl RequestNumber {
         self.0
     }
 
-    /// The request after this one; `None` when numbers ran out.
     #[must_use]
     pub fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
@@ -199,7 +186,6 @@ impl fmt::Display for RequestNumber {
     }
 }
 
-/// One Provider request: the Job that sent it and its number in that Job.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]

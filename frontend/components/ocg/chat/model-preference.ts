@@ -1,12 +1,5 @@
 import type { ChatModelSelection } from "../contracts";
 
-/**
- * The next-turn model preference of one Chat, kept in browser storage.
- *
- * It is presentation preference only: it never describes a running Job, and a
- * saved model the current Profile no longer offers falls back to the Profile
- * default in the selector rather than being sent.
- */
 const PREFIX = "ocg.chat.next-turn-selection.v1";
 
 type Storage = Pick<globalThis.Storage, "getItem" | "setItem">;
@@ -73,7 +66,5 @@ export function writeModelPreference(
         project: selection.project,
       }),
     );
-  } catch {
-    // A full or blocked store only loses the preference, never the turn.
-  }
+  } catch {}
 }

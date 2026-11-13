@@ -13,8 +13,6 @@ pub struct RequestRecorder {
     pending_response_items: usize,
     messages: Vec<ContentDigest>,
     stored: BTreeSet<ContentDigest>,
-    /// Whether a request for this Job has already been recorded. Only the
-    /// first records the dropped-turn count, which describes the whole history.
     sent: bool,
     pub(crate) image_attachments: BTreeMap<usize, Vec<AttachmentId>>,
 }

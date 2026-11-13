@@ -1,34 +1,3 @@
-//! Job submission, admission lookup and stop for the Control Plane.
-//!
-//! A submission is idempotent under the client's `Idempotency-Key`. The key
-//! is recorded, as a SHA-256 digest with the fingerprint of its normalized
-//! request, by the transaction that opens a conversation or appends an entry.
-//! That record is the only authority on whether a key appended input: a key names one (turn, seq),
-//! and only a committed one, in this process and after any restart.
-//!
-//! What only this process knows is kept in a [`Registry`] owned by the
-//! listener, and dies with it:
-//!
-//! - a key being resolved, from its first request until its record is
-//!   read: it reserves the key without deciding anything, so every other
-//!   request with the key, whatever its request, waits for that read and is
-//!   answered from the record; a committed key is never displaced, even for
-//!   a moment, by a request that has not been checked against it;
-//! - a key being admitted, once its record was found missing, until its
-//!   admission ends: every other request with the key waits for that one
-//!   admission and is answered from it, so a key is never submitted twice
-//!   at once;
-//! - a key whose creation may have committed, but did not say so: it is
-//!   never submitted again while that is possible. It is settled by the
-//!   record, once a read finds it, or by a reopening of the database, after
-//!   which a creation of the earlier opening can no longer commit;
-//!
-//! An admission belongs to a task of the listener's runtime, never to the
-//! request that started it: a client that disconnects, or whose wait ends,
-//! leaves it to run, and the Job to the execution runtime. A stop request
-//! cancels the one Job's own execution and says so; how the Job settles is
-//! recorded by its execution, as for any other stop.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -47,13 +16,10 @@ use crate::db::entities::{
 };
 use crate::db::{AdmissionCandidate, DatabaseError, DatabaseHandle};
 
-/// The request header that names a submission.
 pub(super) const IDEMPOTENCY_KEY: &str = "idempotency-key";
-/// The fewest and most characters an idempotency key may have.
 pub(super) const MIN_KEY_CHARS: usize = 16;
 pub(super) const MAX_KEY_CHARS: usize = 128;
 pub(super) const MAX_NAME_BYTES: usize = 128;
-/// The most keys this process may hold unresolved at once.
 const MAX_UNRESOLVED: usize = 256;
 
 const KEY_DOMAIN: &[u8] = b"ocg.control-plane.idempotency-key.v1\n";
@@ -141,8 +107,6 @@ const ATTACHMENT_UNAVAILABLE: Refusal = Refusal::new(
     "an Attachment's content is no longer available; nothing was submitted",
 );
 
-/// Text that may be stored: no control character but tab, carriage return
-/// and line feed, and not only white space.
 pub(super) fn text(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty()
         && value.len() <= max_bytes
@@ -163,7 +127,6 @@ fn sha256(context: Context) -> [u8; 32] {
         .expect("SHA-256 has 32 bytes")
 }
 
-/// The request's one `Idempotency-Key`, checked, as it is recorded.
 pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<SubmissionKey, Refusal> {
     let mut values = headers.get_all(IDEMPOTENCY_KEY);
     let value = values.next().ok_or(KEY_REQUIRED)?;
@@ -186,49 +149,31 @@ pub(super) fn digest_key(key: &[u8]) -> SubmissionKey {
     SubmissionKey::from_digest(sha256(context))
 }
 
-/// How one admission ended, for every request waiting on it.
 #[derive(Clone, Debug)]
 enum Outcome {
-    /// The key names this Job; `created` when this admission created it.
     Admitted { job: JobId, created: bool },
-    /// The key names a Job of another request.
     Conflict,
-    /// Nothing was admitted, for this reason; the key is free again.
     Refused(Refusal),
-    /// The Job may exist; the key stays unresolved.
     Uncertain,
 }
 
-/// A key this process has not resolved.
 struct Unresolved {
-    /// The request of the claim that owns it; authoritative only once the
-    /// key is known not to be recorded, from [`Phase::Admitting`] on.
     fingerprint: RequestFingerprint,
-    /// Tells this entry apart from a later one of the same key.
     generation: u64,
     phase: Phase,
 }
 
-/// A request waiting for how a key is resolved, answered by its own request.
 struct Waiter {
     fingerprint: RequestFingerprint,
     outcome: flume::Sender<Outcome>,
 }
 
 enum Phase {
-    /// Its record is being read: whether, and by which request, the key is
-    /// bound is not known yet, so these wait for the read, whatever their
-    /// request.
     Resolving(Vec<Waiter>),
-    /// It is not recorded, and its owner's admission runs; these, all of
-    /// the owner's request, wait for its outcome.
     Admitting(Vec<Waiter>),
-    /// Its creation may have committed in the opening of `epoch` or before.
     Uncertain { epoch: u64 },
 }
 
-/// Adds a waiter of `fingerprint` to `waiters`, forgetting those that
-/// stopped waiting, so a client retrying a long admission adds no garbage.
 fn join(waiters: &mut Vec<Waiter>, fingerprint: RequestFingerprint) -> flume::Receiver<Outcome> {
     waiters.retain(|waiter| !waiter.outcome.is_disconnected());
     let (sender, outcome) = flume::bounded(1);
@@ -242,26 +187,19 @@ fn join(waiters: &mut Vec<Waiter>, fingerprint: RequestFingerprint) -> flume::Re
 #[derive(Default)]
 struct State {
     unresolved: HashMap<SubmissionKey, Unresolved>,
-    /// The stop of each Job admitted here whose execution has not returned.
     next_generation: u64,
 }
 
-/// What this listener knows that the database does not, see the module
-/// documentation. One lock covers it, never held across an await.
 #[derive(Default)]
 pub(super) struct Registry {
     state: Mutex<State>,
 }
 
-/// What a request finds for its key.
 enum Claim {
-    /// It owns the key's resolution and admission, and waits for them like
-    /// any other.
     Owner {
         generation: u64,
         outcome: flume::Receiver<Outcome>,
     },
-    /// Another request resolves or admits the key; it waits for that one.
     Waiting(flume::Receiver<Outcome>),
     Conflict,
     Uncertain {
@@ -271,7 +209,6 @@ enum Claim {
     TooMany,
 }
 
-/// What this process knows of a key, for a lookup.
 enum Local {
     Resolving,
     Admitting,
@@ -283,15 +220,10 @@ impl Registry {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// What `fingerprint` finds for `key`. The first claim reserves the key
-    /// in [`Phase::Resolving`], under this lock, before its record is read,
-    /// so no other request of this process can admit the key until that
-    /// read has ended.
     fn claim(&self, key: SubmissionKey, fingerprint: RequestFingerprint) -> Claim {
         let mut state = self.state();
         if let Some(entry) = state.unresolved.get_mut(&key) {
             return match &mut entry.phase {
-                // Nothing is known yet that could refuse it.
                 Phase::Resolving(waiters) => Claim::Waiting(join(waiters, fingerprint)),
                 _ if entry.fingerprint != fingerprint => Claim::Conflict,
                 Phase::Admitting(waiters) => Claim::Waiting(join(waiters, fingerprint)),
@@ -336,9 +268,6 @@ impl Registry {
             })
     }
 
-    /// Ends the resolution or admission of `generation`: the key is
-    /// resolved, by the database or as refused, and every waiting request is
-    /// told how, for its own request.
     fn finish(
         &self,
         key: SubmissionKey,
@@ -359,10 +288,6 @@ impl Registry {
         }
     }
 
-    /// Moves the key of `generation` from [`Phase::Resolving`] to
-    /// [`Phase::Admitting`] once its record was found missing: its owner's
-    /// request now holds it, and every waiter of another request is refused.
-    /// Returns whether it did.
     fn admitting(&self, key: SubmissionKey, generation: u64) -> bool {
         let mut state = self.state();
         let Some(entry) = state.unresolved.get_mut(&key) else {
@@ -385,8 +310,6 @@ impl Registry {
         true
     }
 
-    /// Keeps the key of `generation` unresolved: its creation may have
-    /// committed in the opening of `epoch` or before.
     fn uncertain(&self, key: SubmissionKey, generation: u64, epoch: u64) {
         let mut state = self.state();
         if let Some(entry) = state.unresolved.get_mut(&key)
@@ -401,8 +324,6 @@ impl Registry {
         }
     }
 
-    /// Forgets the uncertain key of `generation`, which the database has
-    /// resolved, unless another entry replaced it meanwhile.
     fn forget(&self, key: SubmissionKey, generation: u64) {
         let mut state = self.state();
         if state.unresolved.get(&key).is_some_and(|entry| {
@@ -542,9 +463,6 @@ fn admission(admission: AdmissionView) -> Value {
     envelope(serde_json::json!(AdmissionResponseView { admission }))
 }
 
-/// Submits one typed decision under `key`: the key names at most one Job, a
-/// request that raced it waits for the same admission, and an admission still
-/// running is `202 Accepted`, pending, and runs on without the request.
 pub(super) async fn submit_decision(
     shared: &Arc<Shared>,
     key: SubmissionKey,
@@ -553,7 +471,6 @@ pub(super) async fn submit_decision(
     let fingerprint = request.fingerprint();
     let admission_value =
         move |job: JobId| async move { admitted_decision_value(shared, key, job).await };
-    // At most one uncertain entry is resolved before the key is claimed.
     for _ in 0..2 {
         let (outcome, owner) = match shared.submissions.claim(key, fingerprint) {
             Claim::Conflict => return Err(KEY_CONFLICT),
@@ -576,8 +493,6 @@ pub(super) async fn submit_decision(
                 generation,
                 outcome,
             } => {
-                // Spawned before anything is awaited: the admission is the
-                // listener's, whatever becomes of this request.
                 ntex::rt::spawn(admit(shared.clone(), key, generation, fingerprint, request));
                 (outcome, true)
             }
@@ -594,8 +509,6 @@ pub(super) async fn submit_decision(
             )),
             Ok(Ok(Outcome::Conflict)) => Err(KEY_CONFLICT),
             Ok(Ok(Outcome::Refused(refusal))) => Err(refusal),
-            // The admission's task was dropped with the listener, so how it
-            // ended is not known here.
             Ok(Ok(Outcome::Uncertain) | Err(_)) => Err(UNCERTAIN),
             Err(()) => Ok(Reply::new(
                 StatusCode::ACCEPTED,
@@ -606,15 +519,8 @@ pub(super) async fn submit_decision(
     Err(UNCERTAIN)
 }
 
-/// Answers whether `key` created a Job: `admitted`, with the Job; `pending`
-/// while this process admits it; `uncertain` while its creation may have
-/// committed; `not_found` when no Job was created with it and none can be
-/// any more by an earlier attempt. A database that cannot be read is an
-/// error, never `not_found`.
 pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply, Refusal> {
     let found = match shared.submissions.local(key) {
-        // Its owner's read has not ended; the record answers for itself,
-        // and its absence means the owner may still admit it.
         Some(Local::Resolving) => match shared.database.submission(key).await? {
             Some(record) => Some(record),
             None => {
@@ -659,16 +565,11 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
 }
 
 enum Reconciled {
-    /// The key created this Job.
     Recorded(SubmissionRecord),
-    /// The key created no Job, and no earlier attempt can create one now.
     Absent,
     Unresolved,
 }
 
-/// Resolves an uncertain key from the database. A missing record settles
-/// it only when the database was reopened, in a later epoch, before the
-/// read began: a creation of the earlier opening can no longer commit.
 async fn reconcile(shared: &Shared, key: SubmissionKey, generation: u64, epoch: u64) -> Reconciled {
     let reading_in = shared.database.epoch();
     match shared.database.submission(key).await {
@@ -684,12 +585,6 @@ async fn reconcile(shared: &Shared, key: SubmissionKey, generation: u64, epoch: 
     }
 }
 
-/// The resolution and admission of one key, owned by the listener's
-/// runtime: reads the record, which answers every waiting request by its
-/// own request; only when it is missing does the key become its owner's,
-/// then the configuration is checked and the Job admitted with its
-/// submission. Once admitted, the Job's stop is registered before anyone is
-/// told, and released once its execution returns.
 async fn admit(
     shared: Arc<Shared>,
     key: SubmissionKey,
@@ -698,7 +593,6 @@ async fn admit(
     request: DecisionJobRequest,
 ) {
     let registry = &shared.submissions;
-    // Every waiter of an admission that ran is of the owner's request.
     let finish = |outcome: Outcome| registry.finish(key, generation, |_| outcome.clone());
     let recorded = shared.database.submission(key).await;
 
@@ -715,8 +609,6 @@ async fn admit(
                 }
             });
         }
-        // Reserved since before the read, so no admission of this process
-        // can have recorded the key since.
         Ok(None) => {
             if !registry.admitting(key, generation) {
                 return;
@@ -729,8 +621,6 @@ async fn admit(
     }
     admit_decision(&shared, key, generation, fingerprint, request, finish).await
 }
-
-// ---- decision submissions --------------------------------------------------------
 
 const DECISION_PROFILE_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -763,10 +653,6 @@ const INVALID_DECISION_REQUEST: Refusal = Refusal::new(
     "the request is not a typed decision this API accepts",
 );
 
-/// A validated decision submission: an existing Decision Profile and
-/// Decision Model Profile, an Executor that offers decision work, and one
-/// typed decision request. Nothing else can be submitted: the endpoint, the
-/// credential and the model come from the Decision Model Profile.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct DecisionJobRequest {
     reasoning_effort: Option<crate::db::entities::ReasoningEffort>,
@@ -829,8 +715,6 @@ struct ScoreLevelInput {
 }
 
 impl DecisionJobRequest {
-    /// Parses a decision submission body strictly: one JSON object of the
-    /// known fields, none repeated, each within its bounds.
     pub(super) fn parse(body: &[u8]) -> Result<Self, Refusal> {
         let wire: DecisionSubmissionInput =
             serde_json::from_slice(body).map_err(|_| INVALID_DECISION_REQUEST)?;
@@ -884,9 +768,6 @@ impl DecisionJobRequest {
                 }
             },
         };
-        // The structure of the request is checked here; the primitive the
-        // question needs is checked against the Decision Model Profile when
-        // the request is admitted.
         if request.schema_version != crate::db::entities::DECISION_SCHEMA_VERSION
             || serde_json::to_vec(&request)
                 .map(|bytes| bytes.len() > crate::db::entities::MAX_DECISION_REQUEST_BYTES)
@@ -911,7 +792,6 @@ impl DecisionJobRequest {
         })
     }
 
-    /// The digest of the request as parsed, whatever its JSON spelling.
     fn fingerprint(&self) -> RequestFingerprint {
         let mut context = Context::new(&SHA256);
         context.update(DECISION_REQUEST_DOMAIN);
@@ -937,9 +817,6 @@ impl DecisionJobRequest {
     }
 }
 
-/// The admission of one typed decision: the Decision Profile, the Decision
-/// Model Profile and the Executor are checked, then a system conversation
-/// with one decision turn is opened with the request.
 async fn admit_decision(
     shared: &Arc<Shared>,
     key: SubmissionKey,
@@ -1013,10 +890,6 @@ async fn admit_decision(
     }
 }
 
-/// Refuses a Decision Profile that does not exist, a Decision Model Profile
-/// that does not exist or is not selected by the Decision Profile, and an
-/// Executor that does not exist or does not offer decision work. The
-/// creation checks them again in its own transaction.
 async fn check_decision_configuration(
     database: &DatabaseHandle,
     request: &DecisionJobRequest,
@@ -1115,8 +988,6 @@ async fn check_decision_configuration(
     Ok(())
 }
 
-/// Why a plan known not to have created its Job was refused, without what
-/// failed inside.
 fn not_admitted(error: &DatabaseError) -> Refusal {
     match error {
         DatabaseError::Rejected(Violation::ToolsNotSupported) => TOOLS_NOT_SUPPORTED,
@@ -1186,9 +1057,6 @@ fn conversation_refusal(code: &'static str) -> Refusal {
     )
 }
 
-/// `POST /api/v1/conversations/{id}/compact`. The body names the generative
-/// model. A repeated idempotency key returns the same preparation. A source
-/// that will not fit is an explicit refusal, not a truncated job.
 pub(super) async fn compact(
     shared: &Shared,
     conversation: JobId,
@@ -1251,10 +1119,6 @@ pub(super) async fn compact(
     Ok(Reply::ok(envelope(serde_json::json!(wire))))
 }
 
-/// Refuses a legacy turn action aimed at a native Job or conversation. Those
-/// actions read the legacy Job row, and a native row is not one: reading it
-/// is a storage fault that stops the database, so the refusal must come
-/// before any command is queued.
 pub(super) async fn refuse_native(database: &DatabaseHandle, id: JobId) -> Result<(), Refusal> {
     let turn = !matches!(
         database.mutable_job_details(id, None).await?,
@@ -1280,7 +1144,6 @@ pub(super) async fn action(
     use crate::db::entities::Actor;
     let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
     let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
-    // A queued message of a native turn is changed through its Job, not here.
     if action == "queue" {
         return Err(NATIVE_ACTION_UNSUPPORTED);
     }
@@ -1317,9 +1180,6 @@ pub(super) async fn action(
         _ => return Err(INVALID_ROUTE_BODY),
     }
     .map_err(action_error)?;
-    // The executions the action asked to stop are cancelled here, and what
-    // depends on the turns it ended is told. Neither is part of the action
-    // itself, which is already recorded.
     for token in &result.running {
         shared.scheduler.native_stops().cancel(*token);
     }
@@ -1402,8 +1262,6 @@ async fn admitted_value(shared: &Shared, key: SubmissionKey, job: JobId) -> Resu
     }))
 }
 
-/// The admission of a decision Job. Its model comes from the Decision Model
-/// Profile it froze, not from a generative configuration.
 async fn admitted_decision_value(
     shared: &Shared,
     key: SubmissionKey,

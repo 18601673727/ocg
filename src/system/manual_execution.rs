@@ -1,23 +1,3 @@
-//! The lifecycle shared by the manually initiated, single-request executions
-//! of one named native Job: [`crate::system::manual_loopback`] and
-//! [`crate::system::external_trial`].
-//!
-//! Each of them owns only what makes it a different authority: which control
-//! permits it, which endpoint it may reach, and which facts it checks before
-//! anything is reserved. This module owns the part that must not diverge:
-//! reading the Job's standing, reserving exactly the named Job, the checked
-//! start, the bounded exchange and the report of what the database shows
-//! afterwards. It grants no authority of its own and is reached only through
-//! those two callers. The native scheduler
-//! ([`crate::system::native_scheduler`]), which reserves through its own
-//! selection, borrows only [`within_deadline`] and the phase and outcome
-//! names.
-//!
-//! There is one reservation, one checked start and one exchange, and nothing
-//! here retries, reconciles or releases. An exchange that may have reached
-//! the Provider leaves its Allocation held; see
-//! [`crate::system::executor::execution_runtime`].
-
 use std::future::Future;
 use std::time::Duration;
 
@@ -29,11 +9,8 @@ use crate::db::entities::{
 use crate::db::{DatabaseError, DatabaseHandle, DevelopmentHandoff, PreparedDevelopmentHandoff};
 use crate::service::ai::providers::CancellationToken;
 
-/// Ready-index pages one reservation may walk to find its one Job.
 const MAX_RESERVATION_PAGES: usize = 64;
 
-/// The Job, Pool and Executor one invocation names. Nothing is selected for
-/// the operator.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Target {
     pub(crate) job: JobId,
@@ -41,15 +18,9 @@ pub(crate) struct Target {
     pub(crate) executor: ExecutorId,
 }
 
-/// Where an invocation stopped, and what that leaves.
 #[derive(Debug)]
 pub(crate) enum Stop {
-    /// Refused before anything was reserved. Nothing changed. `code` is
-    /// stable.
     Refused { code: &'static str, detail: String },
-    /// A reservation or start failed in a way that does not prove nothing
-    /// happened. Ownership may be held; inspect the database with
-    /// `ocg inspect-held` before anything else.
     Held { stage: &'static str, detail: String },
 }
 
@@ -67,7 +38,6 @@ pub(crate) fn held(stage: &'static str, error: impl std::fmt::Display) -> Stop {
     }
 }
 
-/// What the database shows after the exchange returned.
 #[derive(Debug)]
 pub(crate) struct ExecutionReport {
     pub(crate) job: JobId,
@@ -75,14 +45,10 @@ pub(crate) struct ExecutionReport {
     pub(crate) started: bool,
     pub(crate) outcome: Option<OutcomeKind>,
     pub(crate) outcome_code: Option<String>,
-    /// Whether this process saw the exchange return a supported result.
     pub(crate) exchange_returned_result: bool,
     pub(crate) exchange_detail: String,
 }
 
-/// Reads the named Job, which must be submitted, queued, without an outcome
-/// and without an Allocation, and must carry its frozen configuration. Reads
-/// only.
 pub(crate) async fn read_submitted_job(
     database: &DatabaseHandle,
     job: JobId,
@@ -119,8 +85,6 @@ pub(crate) async fn read_submitted_job(
     Ok(record)
 }
 
-/// The Executor must have no owner: there is no competing execution to wait
-/// for, and waiting is never an option here.
 pub(crate) async fn require_free_executor(
     database: &DatabaseHandle,
     executor: ExecutorId,
@@ -139,8 +103,6 @@ pub(crate) async fn require_free_executor(
     Ok(())
 }
 
-/// One reservation, of the named Job only: a ready entry of any other Job is
-/// never reserved, so the invocation reserves the one Job it names or none.
 pub(crate) async fn reserve_named_job(
     database: &DatabaseHandle,
     target: Target,
@@ -196,10 +158,6 @@ pub(crate) async fn reserve_named_job(
     Ok(allocation)
 }
 
-/// The checked start, after a last look at the exact prepared request against
-/// the real reservation. Past this point a refusal consumes the Job: the
-/// caller's preflight is what keeps predictable refusals out of it. A start
-/// refused before any request ends the reservation and fails the Job.
 pub(crate) async fn checked_start(
     database: &DatabaseHandle,
     token: AllocationToken,
@@ -229,10 +187,6 @@ pub(crate) async fn checked_start(
     }
 }
 
-/// Runs `exchange` with `timeout` as a cancellation of `cancellation`: the
-/// deadline is a local stop like the operator's, and either leaves a possibly
-/// sent request Uncertain, never released. Neither is a claim about the
-/// Provider.
 pub(crate) async fn within_deadline<F: Future>(
     cancellation: &CancellationToken,
     timeout: Duration,
@@ -255,8 +209,6 @@ pub(crate) async fn within_deadline<F: Future>(
     output
 }
 
-/// What the database now shows is the report; the exchange result only
-/// explains it.
 pub(crate) async fn report(
     database: &DatabaseHandle,
     job: JobId,

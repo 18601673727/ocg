@@ -1,10 +1,3 @@
-//! The LLM Executor, Provider and Profile an operator names by the
-//! environment, registered once and reused, and `ocg register-llm`, which
-//! registers them, prints their identities and exits. Nothing is sent to the
-//! Provider and no Job is run. The credential is named only by reference:
-//! it must be set where OCG runs, and is never stored, printed or logged.
-//! This module belongs to the executable, not to the library.
-
 use std::collections::BTreeSet;
 
 use crate::db::entities::{
@@ -16,14 +9,10 @@ use crate::db::{DatabaseError, DatabaseHandle};
 use crate::system::data_directory::DataDirectory;
 use crate::system::runtime::{self, HostError};
 
-/// The command that registers the Control Plane's LLM target.
 pub const COMMAND: &str = "register-llm";
-/// The Provider's OpenAI-compatible endpoint, an `https://` URL.
 pub const ENDPOINT_VARIABLE: &str = "OCG_PROVIDER_ENDPOINT";
 pub const MODEL_VARIABLE: &str = "OCG_PROVIDER_MODEL";
-/// The name of the environment variable that holds the Provider's key.
 pub const CREDENTIAL_REF_VARIABLE: &str = "OCG_PROVIDER_CREDENTIAL_REF";
-/// The name of the Executor and Provider `register-llm` registers.
 const CONTROL_PLANE: &str = "control-plane";
 
 #[derive(Debug, thiserror::Error)]
@@ -48,10 +37,7 @@ pub enum Error {
     Host(#[from] HostError),
 }
 
-/// An LLM target: one Pool for its transport, one Connection and one Model
-/// config of the model, each found by what it is, or registered.
 pub struct Target {
-    /// The name of the Pool and the Connection when they are registered.
     pub name: String,
     pub protocol: LlmTransport,
     pub endpoint: String,
@@ -61,8 +47,6 @@ pub struct Target {
 }
 
 impl Target {
-    /// The endpoint, model and credential reference in the environment; the
-    /// credential itself is only checked to exist.
     pub fn from_environment(
         name: &str,
         capabilities: BTreeSet<ModelCapability>,
@@ -94,9 +78,6 @@ impl Target {
     }
 }
 
-/// The Pool and Model config of `target`, reusing those an earlier run
-/// registered for the same endpoint, credential reference and model. The Pool
-/// is the Executor that runs the target's work.
 pub async fn targets(
     database: &DatabaseHandle,
     target: &Target,
@@ -207,9 +188,6 @@ async fn native_executor(
     ))
 }
 
-/// The Agent that has Chat behavior and targets `llm_profile` with no
-/// instructions of its own, found by what it is, or registered, so a
-/// submission can name an Agent without the operator configuring one first.
 pub async fn agent_profile(
     database: &DatabaseHandle,
     llm_profile: ProfileId,
@@ -237,9 +215,6 @@ pub async fn agent_profile(
         .map(Into::into)
 }
 
-/// `ocg register-llm`: registers, or finds, the Control Plane's chat target
-/// named by the environment, and prints the identities a submission names,
-/// as one JSON object on standard output.
 pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Error> {
     let registered = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = registered.clone();
@@ -267,8 +242,6 @@ pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Er
     Ok(())
 }
 
-/// The target `register-llm` registers: a chat model, run by the
-/// `control-plane` Executor.
 pub fn control_plane_target() -> Result<Target, Error> {
     Target::from_environment(CONTROL_PLANE, BTreeSet::from([ModelCapability::Chat]))
 }

@@ -69,15 +69,11 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     if (!hydrated) return;
     applyRootAppearance(preferences, systemTheme);
     try {
-      // Only frontend presentation preferences are persisted here. Backend-
-      // authoritative OCG configuration remains owned by the runtime boundary.
       window.localStorage.setItem(
         APPEARANCE_STORAGE_KEY,
         serializeAppearancePreferences(preferences),
       );
-    } catch {
-      // Private browsing and denied storage should not block appearance changes.
-    }
+    } catch {}
   }, [hydrated, preferences, systemTheme]);
 
   const setTheme = useCallback(

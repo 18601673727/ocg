@@ -1,17 +1,6 @@
-//! Shared benchmark helpers and utilities.
-//!
-//! Everything here is deliberately free of async runtime and HTTP client
-//! dependencies: the harness drives the backend over its own HTTP surface
-//! with the `ntex` client the production code already uses, and the helpers
-//! below are the plain synchronous parts both roles share.
-
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Temporary isolated data directory for a benchmark run.
-///
-/// Every measurement owns one, so no run reads another run's state and the
-/// footprint a run reports is the footprint of that run alone.
 pub struct TemporaryRoot(PathBuf);
 
 impl TemporaryRoot {
@@ -26,7 +15,6 @@ impl TemporaryRoot {
         &self.0
     }
 
-    /// Keeps the directory after the run, for a report that needs the files.
     pub fn into_path(mut self) -> PathBuf {
         std::mem::take(&mut self.0)
     }
@@ -43,7 +31,6 @@ impl Drop for TemporaryRoot {
     }
 }
 
-/// Trial identifier for multi-trial measurements.
 #[derive(Clone, Copy, Debug)]
 pub struct TrialId(pub usize);
 
@@ -53,11 +40,6 @@ impl TrialId {
     }
 }
 
-/// Outcome counts for a workload measurement.
-///
-/// A measurement that drops an operation must say so: a latency percentile
-/// computed over the survivors alone would otherwise describe a smaller
-/// workload than the one the run applied.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OutcomeCounts {
     pub attempted: usize,
@@ -77,7 +59,6 @@ impl OutcomeCounts {
         }
     }
 
-    /// Records one operation that did not complete normally.
     pub fn record_failure(&mut self, kind: Outcome) {
         self.attempted += 1;
         match kind {
@@ -129,7 +110,6 @@ impl OutcomeCounts {
     }
 }
 
-/// How one attempted operation ended.
 #[derive(Clone, Copy, Debug)]
 pub enum Outcome {
     Success,
@@ -139,7 +119,6 @@ pub enum Outcome {
     Unfinished,
 }
 
-/// Sample collection for latency measurements.
 #[derive(Clone, Debug, Default)]
 pub struct Samples {
     pub durations: Vec<Duration>,
@@ -172,7 +151,6 @@ impl Samples {
         self.durations.len()
     }
 
-    /// The percentile of the sorted samples, by the nearest-rank rule.
     pub fn percentile(&self, p: usize) -> Duration {
         if self.durations.is_empty() {
             return Duration::ZERO;
@@ -210,8 +188,6 @@ impl Samples {
         self.durations.sort_unstable();
     }
 
-    /// The mean of the samples, for a throughput figure that a median cannot
-    /// express.
     pub fn mean(&self) -> Option<Duration> {
         if self.durations.is_empty() {
             return None;
@@ -221,10 +197,6 @@ impl Samples {
     }
 }
 
-/// Measurement timing window boundaries.
-///
-/// The window is what the run actually spent inside the measured section, so
-/// a rate derived from it covers the same work the samples describe.
 #[derive(Clone, Copy, Debug)]
 pub struct TimingWindow {
     pub started: Instant,
@@ -249,7 +221,6 @@ impl TimingWindow {
     }
 }
 
-/// System resource usage measurement.
 #[derive(Clone, Copy, Debug)]
 pub struct ResourceUsage {
     pub current_rss_bytes: Option<u64>,
@@ -259,7 +230,6 @@ pub struct ResourceUsage {
 }
 
 impl ResourceUsage {
-    /// Sample current process resource usage.
     pub fn sample_current() -> Self {
         Self {
             current_rss_bytes: current_rss(),
@@ -269,10 +239,6 @@ impl ResourceUsage {
         }
     }
 
-    /// Sample lifetime resource usage (includes peak).
-    ///
-    /// The peak is a lifetime figure: it covers everything the process ever
-    /// did, setup and warm-up included. A report that uses it says so.
     pub fn sample_lifetime() -> Self {
         let (peak, user, system) = lifetime_rusage();
         Self {
@@ -333,7 +299,6 @@ pub fn lifetime_rusage() -> (Option<u64>, Option<f64>, Option<f64>) {
     (None, None, None)
 }
 
-/// Database files owned by the direct legacy write-path measurements.
 pub fn database_bytes(
     directory: &ocg::system::data_directory::DataDirectory,
 ) -> std::io::Result<u64> {
@@ -351,14 +316,12 @@ pub fn database_bytes(
     Ok(total)
 }
 
-/// The cleanly closed production database alone, excluding logs and attachments.
 pub fn ocg_database_bytes(
     directory: &ocg::system::data_directory::DataDirectory,
 ) -> std::io::Result<u64> {
     Ok(std::fs::metadata(directory.database_path().join("ocg.redb"))?.len())
 }
 
-/// The resident memory of another process, by its identifier.
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -382,7 +345,6 @@ pub fn process_rss_bytes(pid: u32) -> Option<u64> {
     }
 }
 
-/// A lifetime child high-water mark where the platform exposes one.
 pub fn process_peak_rss_bytes(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -404,7 +366,6 @@ pub fn process_peak_rss_bytes(pid: u32) -> Option<u64> {
     }
 }
 
-/// Total child CPU time, suitable for subtraction across a workload window.
 pub fn process_cpu_seconds(pid: u32) -> Option<f64> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {

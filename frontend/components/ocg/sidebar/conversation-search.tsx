@@ -1,25 +1,5 @@
 "use client";
 
-/**
- * Full-screen conversation search.
- *
- * The overlay searches across projects within this account only: an empty
- * query shows the sidebar's own list, while a non-empty query asks the
- * control server's conversation search (titles plus user/agent
- * messages and assistant replies, terms combined by AND) through the same account's control
- * client, including matches not yet loaded in the sidebar.
- * Selecting a result goes through the same session-selection callback the
- * sidebar list uses, so navigation, URL state and attention handling stay
- * identical. The server reads only this account's database, so one
- * account's search never sees another account's conversations. Without a
- * control client, or when the search request fails, it falls back to the
- * local title filter.
- *
- * It follows the Project switcher's overlay conventions: the same Dialog
- * primitive, so Escape and dismissal return focus to the trigger, and the same
- * `listbox` / `option` markup for the selectable entries.
- */
-
 import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactElement } from "react";
 import { MessageSquare, Search, X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -49,15 +29,11 @@ import {
 import { SELECTED_ROW } from "../primitives/selection";
 
 export type ConversationSearchProps = {
-  /** Element used to open the overlay; receives the dialog's trigger props. */
   trigger: ReactElement;
-  /** This account's session list, in the sidebar's own order. */
   sessions: readonly ChatSession[];
   activeSessionId: string;
-  /** The same selection callback the sidebar list uses. */
   onSelect: (id: string) => void;
   onOpenConversation?: (conversation: string) => void;
-  /** This account's control client for full-text search; omitting it keeps title filtering. */
   control?: HttpCanonicalControlClient;
   conversationList?: "loading" | "loaded" | "failed";
   onRetryConversations?: () => void;
@@ -90,7 +66,6 @@ export function ConversationSearch({
 
   const changeOpen = useCallback((next: boolean) => {
     setOpen(next);
-    // A reopened dialog starts from the unfiltered list, like the sidebar.
     if (!next) {
       setQuery("");
       setServerResults(null);
@@ -155,8 +130,6 @@ export function ConversationSearch({
     };
   }, [open, control, needle, before, attempt]);
 
-  // An untitled session is shown as "New chat", so it is matched under that
-  // name too rather than only against its empty title. Same rule as the list.
   const untitledLabel = t("sidebar.newChat");
   const matches = useMemo<readonly SearchMatch[]>(() => {
     if (!needle) return sessions;
@@ -226,7 +199,6 @@ export function ConversationSearch({
                 setQuery(event.target.value);
                 setHighlightedId(null);
                 if (event.target.value.trim() === needle) return;
-                // A new needle invalidates the previous server result.
                 setServerResults(null);
                 setNextBefore(null);
                 setFailed(false);

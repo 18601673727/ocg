@@ -50,9 +50,7 @@ export function DispatchSelectionCard({
   try {
     const parsed = JSON.parse(argumentsText);
     if (parsed && typeof parsed === "object") request = parsed;
-  } catch {
-    /* The server validates the original tool request. */
-  }
+  } catch {}
   useEffect(() => {
     const controller = new AbortController();
     void Promise.all([

@@ -1,25 +1,3 @@
-//! The only module that touches redb.
-//!
-//! redb is the durable source of truth. Every record is stored under its
-//! stable business ID with an explicit, versioned encoding. Authoritative
-//! tables hold the facts; derived tables (`pending`, `ready`, `delayed`,
-//! `dependency_waiter`, `unsettled`, `held_slot`, `children`, `successor`,
-//! `tip`, `recent`, `live_child`, `tool_call_id` and the later ones) are written by the
-//! [`Batch`] operation that writes their source, in the same transaction, so
-//! none is an authority of its own. After an unclean shutdown the open
-//! procedure compares them with their definitions and rebuilds the ones that
-//! differ. The database, its transactions and its tables never leave this
-//! module: mutations go through [`Batch`], the only write path.
-//!
-//! A batch is one redb write transaction. Its first failure, a rule
-//! violation as much as a storage error, poisons it: every later operation
-//! returns that failure again and [`run_batch_with`] aborts instead of
-//! committing, even when the operation's caller ignored the error.
-//!
-//! A Job is SubtreeSettled exactly when it has no `unsettled` row. That row,
-//! with the open dependency and child counts, is kept by T1, settlement and
-//! the open reconcile, so the predicate is one point read.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -104,8 +82,6 @@ pub(crate) use recovery::{
     reconcile_reserved_apply, reconcile_reserved_preflight, verify_held_publication_delta,
     verify_reserved_publication_delta,
 };
-/// The bytes `character` costs inside a JSON string. Projection chunks text
-/// by this cost so every serialized page fits the response budget.
 pub(crate) fn escaped_json_char_cost(character: char) -> usize {
     match character {
         '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
@@ -172,13 +148,9 @@ pub(crate) const fn storage_format_versions() -> (u64, u8) {
     (schema::DATABASE_FORMAT_VERSION, codec::RECORD_VERSION)
 }
 
-// ---- storage errors -------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageErrorKind {
-    /// An operating-system I/O error, such as `StorageFull`.
     Io(std::io::ErrorKind),
-    /// An earlier I/O error was latched; the open database refuses further work.
     PreviousIo,
     Corrupted,
     AlreadyOpen,
@@ -187,12 +159,10 @@ pub enum StorageErrorKind {
     Other,
 }
 
-/// A storage-engine failure. Its kind is structured; the detail is for humans.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{kind:?}: {detail}")]
 pub struct StorageError {
     pub kind: StorageErrorKind,
-    /// The raw OS error number for I/O failures (28 is ENOSPC on macOS and Linux).
     pub os_error: Option<i32>,
     pub detail: String,
 }
@@ -226,8 +196,6 @@ impl From<::redb::Error> for StorageError {
     }
 }
 
-/// The table-opening half of both transaction kinds, so a reader that opens
-/// only tables it owns works on a read and a write transaction alike.
 pub(super) trait TxRead {
     type Table<'t, K: Key + 'static, V: Value + 'static>: ReadableTable<K, V>
     where
@@ -259,9 +227,6 @@ impl TxRead for WriteTransaction {
 pub(crate) fn record_clean_shutdown(database: &Database) -> Result<(), StorageError> {
     let tx = database.begin_write()?;
     {
-        // Unknown ownership, resolved or not, must always force the next open
-        // through the Full Path. In particular, never turn a recovered
-        // Released + Unknown database into a legacy Quick Path database.
         let mut unknown = false;
         for entry in tx.open_table(schema::JOB_STATES)?.iter()? {
             let (key, value) = entry?;

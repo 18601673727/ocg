@@ -44,20 +44,10 @@ const POOL_ARCHIVE_REFUSALS: Partial<Record<string, I18nKey>> = {
   storage_refused: "settings.pools.refusal.storageRefused",
 };
 
-/** Why a row is stale. Each row has at most one, in the page's stale map. */
 type RowStale = "changed" | "updateUnconfirmed" | "archiveUnconfirmed";
 
-/** A row's stale reason, and when it was taken on the page's logical clock. */
 type StaleLock = { reason: RowStale; at: number };
 
-/**
- * The stale locks of one kind of row, with a single owner. Mutation handlers
- * ask `has`, which reads the owner synchronously, so a handler captured by an
- * older render still sees every lock taken since; `view` only mirrors the owner
- * for rendering, and nothing but `publish` writes either. A page read clears
- * only the locks taken before it was sent: a read in flight when an outcome
- * became uncertain may predate that outcome.
- */
 function useStaleRows() {
   const locks = useRef<ReadonlyMap<string, StaleLock>>(new Map());
   const clock = useRef(0);
@@ -71,9 +61,7 @@ function useStaleRows() {
       has: (id: string) => locks.current.has(id),
       mark: (id: string, reason: RowStale) =>
         publish(new Map(locks.current).set(id, { reason, at: ++clock.current })),
-      /** Stamps a page read as it is sent. */
       sendRead: () => ++clock.current,
-      /** A sent read succeeded: every lock taken before it was sent is released. */
       readSucceeded: (sentAt: number) => {
         const kept = new Map([...locks.current].filter(([, lock]) => lock.at > sentAt));
         if (kept.size !== locks.current.size) publish(kept);
@@ -95,12 +83,6 @@ const EXECUTOR_STALE_TEXT: Record<RowStale, I18nKey> = {
   archiveUnconfirmed: "settings.pools.executorStaleArchiveUnconfirmed",
 };
 
-/**
- * Answers that prove a native mutation was not committed: each was refused
- * before any write, or never dispatched. Every other failure, including a lost
- * connection, an unrecognized body and a malformed success answer, may have
- * committed.
- */
 const NOT_COMMITTED_CODES: ReadonlySet<string> = new Set([
   "credential_unavailable",
   "invalid_request",
@@ -123,7 +105,6 @@ const NOT_COMMITTED_CODES: ReadonlySet<string> = new Set([
   "invalid_executor",
 ]);
 
-/** Whether a failed native mutation may still have committed. */
 function outcomeUnconfirmed(error: unknown): boolean {
   return !(error instanceof ControlTransportError && NOT_COMMITTED_CODES.has(error.code));
 }
@@ -137,17 +118,12 @@ function poolUpdateStale(error: unknown): RowStale | null {
   return outcomeUnconfirmed(error) ? "updateUnconfirmed" : null;
 }
 
-/** Pool archive refusals after which the page of Pools must be read again. */
 const POOL_ARCHIVE_STALE_CODES: ReadonlySet<string> = new Set([
   "pool_revision_conflict",
   "pool_not_found",
   "pool_archived",
 ]);
 
-/**
- * How one archival attempt ended. Only `archived` proves the resource was
- * archived; `unconfirmed` leaves the row's stale state to explain it.
- */
 type ArchiveOutcome =
   | { kind: "archived" }
   | { kind: "refused"; text: string }
@@ -164,19 +140,16 @@ const EXECUTOR_REFUSALS: Partial<Record<string, I18nKey>> = {
   storage_refused: "settings.pools.refusal.storageRefused",
 };
 
-/** Create refusals keep their detail, except storage refusals, which are resource-neutral. */
 const NATIVE_CREATE_REFUSALS: Partial<Record<string, I18nKey>> = {
   storage_refused: "settings.pools.refusal.storageRefused",
 };
 
-/** Archive refusals after which the Executor must be read again before anything else. */
 const ARCHIVE_STALE_CODES: ReadonlySet<string> = new Set([
   "executor_revision_conflict",
   "executor_not_found",
   "executor_archived",
 ]);
 
-/** Why an Executor update left it stale, or null when it was refused without a change. */
 function executorUpdateStale(error: unknown): RowStale | null {
   if (
     isExecutorConflict(error) ||
@@ -194,7 +167,6 @@ const ALLOCATION_REFUSALS: Partial<Record<string, I18nKey>> = {
   database_unavailable: "settings.pools.refusal.allocationUnavailable",
 };
 
-/** How each phase of a held Allocation looks. Reserved is not Running; Uncertain is unresolved. */
 const ALLOCATION_PHASE: Record<
   NativeAllocationPhase,
   { tone: "sky" | "emerald" | "amber" | "red"; label: I18nKey; pulse: boolean }
@@ -221,7 +193,6 @@ const ALLOCATION_PHASE: Record<
   },
 };
 
-/** The capabilities an Executor can declare, in the order they are sent. */
 const EXECUTOR_CAPABILITIES: {
   key: string;
   label: string | null;
@@ -267,12 +238,9 @@ function ExecutorRow({
 }: {
   executor: NativeExecutor;
   pool: ControlPool | undefined;
-  /** An Executor update is pending; no other may be submitted. */
   busy: boolean;
-  /** Why the Executor is stale: its controls stay disabled until a page read succeeds. */
   stale: RowStale | undefined;
   onUpdate: (executor: NativeExecutor, change: NativeExecutorChange) => Promise<boolean>;
-  /** Archives the Executor, from the revision read. */
   onArchive: (executor: NativeExecutor) => Promise<ArchiveOutcome>;
   onReload: () => void;
 }) {
@@ -396,7 +364,6 @@ function ExecutorRow({
                   void onArchive(executor).then((outcome) => {
                     setArchiving(false);
                     if (outcome.kind === "archived") return;
-                    // An unconfirmed outcome is stated by the row's stale alert alone.
                     setArchiveRefusal(outcome.kind === "refused" ? outcome.text : null);
                     setConfirmingArchive(false);
                   });
@@ -518,7 +485,6 @@ function PoolRow({
 }: {
   pool: ControlPool;
   onUpdate: (pool: ControlPool, update: ControlPoolUpdate) => Promise<void>;
-  /** Archives the Pool. Absent when archival is not offered. */
   onArchive: ((pool: ControlPool) => Promise<ArchiveOutcome>) | undefined;
   disabled: boolean;
   stale: RowStale | undefined;
@@ -678,7 +644,6 @@ function PoolRow({
                   void onArchive(pool).then((outcome) => {
                     setArchiving(false);
                     if (outcome.kind === "archived") return;
-                    // An unconfirmed outcome is stated by the row's stale alert alone.
                     setArchiveRefusal(outcome.kind === "refused" ? outcome.text : null);
                     setConfirmingArchive(false);
                   });
@@ -714,11 +679,6 @@ function PoolRow({
   );
 }
 
-/**
- * The Allocations holding capacity in one native Pool. Nothing is requested
- * until the operator expands the Pool, and one Pool's failure never touches
- * another's state.
- */
 function PoolAllocations({
   client,
   pool,
@@ -729,8 +689,6 @@ function PoolAllocations({
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [snapshot, setSnapshot] = useState<NativePoolAllocations | null>(null);
-  // Each page is its own read of the database. `read` numbers the reads so a
-  // row can be told apart from the read that produced `snapshot`.
   const [items, setItems] = useState<{ allocation: NativeAllocation; read: number }[]>([]);
   const [latestRead, setLatestRead] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -741,7 +699,6 @@ function PoolAllocations({
 
   useEffect(() => () => request.current?.abort(), []);
 
-  /** Loads the first page, or the page after `after` and appends it. */
   function load(after: string | undefined) {
     request.current?.abort();
     const controller = new AbortController();
@@ -771,7 +728,6 @@ function PoolAllocations({
         });
       })
       .catch((reason: unknown) => {
-        // A failed read keeps what was loaded; it is never shown as zero occupancy.
         if (!controller.signal.aborted) setError(refusalText(t, reason, ALLOCATION_REFUSALS));
       })
       .finally(() => {
@@ -1106,11 +1062,6 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     }
   }
 
-  /**
-   * Applies one change from the revision read; true when it was applied. A
-   * refusal keeps its message. An outcome that cannot be established marks the
-   * row until a page read succeeds; it is never retried.
-   */
   async function handleExecutorUpdate(
     executor: NativeExecutor,
     change: NativeExecutorChange,
@@ -1138,14 +1089,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     }
   }
 
-  /**
-   * Archives one Executor from the revision read, once. A confirmed archival
-   * removes its row and reads the page again. A refusal keeps its message. An
-   * outcome that cannot be established marks the row until a page read
-   * succeeds; it is never retried.
-   */
   async function handleExecutorArchive(executor: NativeExecutor): Promise<ArchiveOutcome> {
-    // Nothing is sent for a stale row; its earlier outcome still stands.
     if (executorStale.has(executor.id)) return { kind: "unconfirmed" };
     if (executorUpdating.current)
       return { kind: "refused", text: t("settings.pools.executorBusy") };
@@ -1154,7 +1098,6 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     setUpdatingExecutorId(executor.id);
     try {
       await client.archiveNativeExecutor(executor.id, executor.revision);
-      // Removed now, so a failed reload cannot leave the archived Executor's row enabled.
       setExecutors((current) => current.filter((item) => item.id !== executor.id));
       navigateExecutors(executorBefore, executorPrevious);
       return { kind: "archived" };
@@ -1181,14 +1124,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     void loadPools(cursor, history, controller.signal);
   }
 
-  /**
-   * Archives one Pool from the revision read, once. A confirmed archival reads
-   * the page again. A refusal keeps its message. An outcome that cannot be
-   * established marks the row stale until a page read succeeds; it is never
-   * retried.
-   */
   async function handlePoolArchive(pool: ControlPool): Promise<ArchiveOutcome> {
-    // Nothing is sent for a stale row; its earlier outcome still stands.
     if (poolStale.has(pool.id)) return { kind: "unconfirmed" };
     if (archivedPools.current.has(pool.id)) return { kind: "archived" };
     if (poolMutating.current) return { kind: "refused", text: t("settings.pools.poolBusy") };
@@ -1198,7 +1134,6 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     try {
       await client.archiveNativePool(pool.id, pool.revision);
       archivedPools.current.add(pool.id);
-      // Removed now, so a failed reload cannot leave the archived Pool's row enabled.
       setPools((current) => current.filter((item) => item.id !== pool.id));
       navigate(before, previous);
       return { kind: "archived" };
@@ -1210,7 +1145,6 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
       }
       const text = refusalText(t, error, POOL_ARCHIVE_REFUSALS);
       if (error instanceof ControlTransportError && POOL_ARCHIVE_STALE_CODES.has(error.code)) {
-        // The row's revision is out of date, so it stays locked until a page read succeeds.
         poolStale.mark(pool.id, "changed");
         navigate(before, previous);
         setActionError(text);

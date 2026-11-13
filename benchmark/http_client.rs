@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
-/// The identities one measurement drives, all of them the host's own.
 #[derive(Clone, Debug)]
 pub(super) struct FixtureIdentities {
     pub(super) executor: String,
@@ -221,7 +220,6 @@ impl BenchmarkClient {
         self.response_json(route, response).await
     }
 
-    /// One JSON POST, for a route whose answer is read once and not streamed.
     pub(super) async fn post_json(&self, route: &str, body: &Value) -> Result<Value, String> {
         ntex::time::timeout(self.timeout, self.post_json_inner(route, body))
             .await
@@ -238,9 +236,6 @@ impl BenchmarkClient {
         self.response_json(route, response).await
     }
 
-    /// Creates the Pool, Executor, model and Agent profiles and the Project a
-    /// measurement drives, all through the control plane, so the host owns
-    /// them exactly as it does for an operator.
     pub(super) async fn prepare_fixture_identities(
         &self,
         provider_endpoint: &str,
@@ -349,11 +344,6 @@ impl BenchmarkClient {
         Ok(())
     }
 
-    /// Creates one native Job and submits it, the two steps that make a Job
-    /// admitted: `POST /api/v1/jobs` writes its mutable configuration and
-    /// `POST /api/v1/jobs/{job}/submit` freezes it. Both answer only once
-    /// committed, so there is no pending state to look up. The Job names no
-    /// Executor; the Pool that runs it reserves it later.
     pub(super) async fn submit_job(
         &self,
         llm_profile: &str,
@@ -562,8 +552,6 @@ impl BenchmarkClient {
             ));
         }
         for (index, call) in calls.iter().enumerate() {
-            // A read-only call records the digest of its result, not the
-            // result: what it returned is checked in the next request instead.
             let outcome = call["outcome_kind"].as_str().unwrap_or_default();
             if call["name"] != "workspace_read_file"
                 || call["decision"] != "admitted"
@@ -595,8 +583,6 @@ impl BenchmarkClient {
                 }
                 ntex::time::sleep(Duration::from_millis(5)).await;
             };
-            // Every read after the first is answered in this request, so the
-            // file content the harness planted must be visible here.
             if request > 1 {
                 let seen = value["messages"].as_array().is_some_and(|messages| {
                     messages.iter().any(|message| {
@@ -637,8 +623,6 @@ impl BenchmarkClient {
     }
 }
 
-/// The Job and revision of a create or submit answer, which must report
-/// `phase`.
 fn parse_mutable_job(value: &Value, phase: &str) -> Result<(String, u64), String> {
     let job = value
         .get("job")

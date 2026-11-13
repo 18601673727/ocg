@@ -8,9 +8,6 @@ use crate::db::entities::{
 use crate::system::execution_controls::ExecutionControl;
 use std::time::Instant;
 
-// ---- batches -------------------------------------------------------------------
-
-/// A failure inside a batch. Only [`Batch`] creates one.
 #[derive(Clone, Debug)]
 pub(crate) struct BatchError(pub(crate) Failure);
 
@@ -20,34 +17,21 @@ pub(crate) enum Failure {
     Storage(StorageError),
 }
 
-/// How a batch ended when it did not commit.
 #[derive(Debug)]
 pub(crate) enum BatchFailure {
-    /// A rule refused the batch; nothing was committed.
     Rejected(Violation),
-    /// Storage failed before the commit point; nothing was committed.
     NotCommitted(StorageError),
-    /// The commit itself failed; its changes may or may not be durable.
     OutcomeUnknown(StorageError),
 }
 
-/// A fact whose presence in a reopened file says whether a command whose
-/// commit had an unknown outcome committed (section 11.2): the natural key
-/// the command writes, never a marker written for the purpose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Probe {
     Job(JobId),
-    /// `submission[key]` exists.
     Submission(SubmissionKey),
-    /// A specific Pool allocation generation was committed.
     PoolAllocation(crate::db::entities::AllocationToken),
-    /// The specified Job revision crossed its execution-start boundary.
     MutableJobStarted(crate::db::entities::AllocationToken, u64),
-    /// `tool_call[call]` exists.
     ToolCall(ToolCallRef),
-    /// `tool_call[call]` has an outcome.
     ToolOutcome(ToolCallRef),
-    /// `job_state[job]` has an outcome.
     Outcome(JobId),
 }
 
@@ -55,9 +39,7 @@ pub(crate) struct BatchOutcome<T> {
     pub(crate) result: Result<T, BatchFailure>,
     pub(crate) storage_failure: Option<StorageError>,
     pub(crate) durable_commit_us: Option<u64>,
-    /// The commit added a `ready` or `delayed` row or changed a Pool.
     pub(crate) scheduling_wake: bool,
-    /// The commit freed a held slot.
     pub(crate) capacity_freed: bool,
     pub(crate) catalog_changed: bool,
     pub(crate) probe: Option<Probe>,
@@ -96,13 +78,9 @@ pub(crate) struct Batch {
     pub(super) probe: Option<Probe>,
 }
 
-/// How a batch's commit becomes durable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Commit {
-    /// The commit is durable when it returns.
     Durable,
-    /// The commit is visible to new read transactions at once but is durable
-    /// only after a later [`persist_staged`] succeeds.
     Staged,
 }
 
@@ -140,8 +118,6 @@ pub(crate) fn run_batch_with<T>(
     commit_batch(batch, value, commit)
 }
 
-/// Like [`run_batch_with`], and a body that returns `None` ends the batch
-/// without committing anything.
 pub(crate) fn run_batch_declinable<T>(
     database: &Database,
     epoch: u64,
@@ -308,7 +284,6 @@ impl Batch {
         self.fail(Failure::Storage(StorageError::corrupted(detail)))
     }
 
-    /// Runs `f` on the transaction.
     pub(super) fn step<T>(
         &mut self,
         f: impl FnOnce(&WriteTransaction) -> Result<T, StorageError>,
@@ -319,7 +294,6 @@ impl Batch {
         }
     }
 
-    /// Inserts `value` under `key` in `table`.
     pub(super) fn insert<'k, 'v, K, V>(
         &mut self,
         table: TableDefinition<K, V>,
@@ -336,7 +310,6 @@ impl Batch {
         })
     }
 
-    /// Reads `key` from `table` and decodes it.
     pub(super) fn get<K, V, T>(
         &mut self,
         table: TableDefinition<K, V>,
@@ -355,7 +328,6 @@ impl Batch {
         })
     }
 
-    /// Removes `key` from `table`.
     pub(super) fn remove<K, V>(
         &mut self,
         table: TableDefinition<K, V>,
@@ -420,8 +392,6 @@ impl Batch {
         self.require_native_capability(ExecutionOperation::Decision, None)
     }
 
-    // ---- configs ---------------------------------------------------------------------
-
     pub(crate) fn agent_profile_ids(
         &mut self,
         after: u128,
@@ -473,7 +443,6 @@ impl Batch {
         }
     }
 
-    /// The config `id`, which must have kind `kind` (I17).
     pub(crate) fn require_config_kind(
         &mut self,
         id: ConfigId,
@@ -675,10 +644,6 @@ impl Batch {
         Ok((profile_id, credential_ref))
     }
 
-    /// The request fields a Connection ends up with. A new secret is stored
-    /// under the reference the Connection already used for that name, or a
-    /// fresh one; an existing secret is kept only by name. Nothing here
-    /// reads, returns or logs a secret's value.
     fn apply_header_change(
         &mut self,
         previous: &[crate::db::entities::OutboundHeader],
@@ -710,10 +675,6 @@ impl Batch {
                     }
                 },
                 HeaderEditValue::Secret(Some(payload)) => {
-                    // A stored credential is never overwritten: a Job that
-                    // froze the old reference must keep the old secret. A new
-                    // value gets a new reference, and the previous row stays
-                    // until nothing names it.
                     let sanitized: String = edit
                         .name
                         .chars()
@@ -743,12 +704,6 @@ impl Batch {
         Ok(fields)
     }
 
-    /// The reference a new secret value is stored under. A stored credential
-    /// is immutable: a Job that froze a reference must resolve the same
-    /// material for as long as that reference resolves at all. A name that
-    /// anything has ever used (a stored credential, or any Connection, which
-    /// are never deleted) therefore gets a new generation; a name nothing has
-    /// used is kept as chosen.
     fn credential_generation(&mut self, reference: &str) -> Result<String, BatchError> {
         if self.allocate_credential_ref(reference)? == reference {
             return Ok(reference.to_owned());
@@ -762,7 +717,6 @@ impl Batch {
                         .is_ok_and(|value| value >= 2 && value.to_string() == *number)
             })
             .map_or(reference, |(stem, _)| stem);
-        // Leave room for a generation suffix inside the 128-byte limit.
         let mut end = stem.len().min(100);
         while !stem.is_char_boundary(end) {
             end = end.saturating_sub(1);
@@ -836,15 +790,6 @@ impl Batch {
         })
     }
 
-    /// Deletes every `credential` row whose reference no non-archived `Model`
-    /// or `DecisionModel` Profile uses through its `Connection`.
-    ///
-    /// This is the one authoritative row OCG deletes, on purpose: a secret
-    /// must not outlive its use, while the `Connection` config keeps the
-    /// reference for blame. Jobs already queued or running froze their
-    /// `credential_ref` in `service/jobs/configuration.rs`; after a purge they
-    /// fall back to the environment variable or fail as missing, which is
-    /// intended so a removed key stops working.
     fn purge_unused_credentials(&mut self) -> Result<(), BatchError> {
         self.step(|tx| {
             let mut connection_refs = std::collections::BTreeMap::new();
@@ -1048,7 +993,6 @@ impl Batch {
                         "decision instructions exceed 64 KiB",
                     ));
                 }
-                // Empty model lists are valid drafts, but cannot be frozen for execution.
                 if da.models.len() > 256 {
                     return self.reject(Violation::InvalidValue(
                         "models",
@@ -1162,7 +1106,6 @@ impl Batch {
         self.put_config(&row)
     }
 
-    /// Inserts a new config with edit counter 1.
     pub(crate) fn create_config(
         &mut self,
         name: String,
@@ -1198,8 +1141,6 @@ impl Batch {
         Ok(id)
     }
 
-    /// Edits a config in place: a new name and body of the same kind, and the
-    /// edit counter up by one. Jobs that froze the old values keep them.
     pub(crate) fn update_config(
         &mut self,
         id: ConfigId,
@@ -1209,8 +1150,6 @@ impl Batch {
         self.update_config_from(id, name, body, None)
     }
 
-    /// `update_config` that also refuses, in the same transaction, an edit
-    /// made from an `edit_seq` other than the stored one.
     pub(crate) fn update_config_from(
         &mut self,
         id: ConfigId,
@@ -1235,7 +1174,6 @@ impl Batch {
         self.check_config_body(&name, &body)?;
         if existing.kind == ConfigKind::Pool {
             self.changed_pool = true;
-            // A larger limit or an enabled Pool frees capacity.
             self.freed_capacity = true;
         }
         let row = ConfigRow {
@@ -1656,14 +1594,10 @@ impl Batch {
         self.archive_models(models)
     }
 
-    // ---- jobs --------------------------------------------------------------------------
-
     pub(crate) fn job(&mut self, id: JobId) -> Result<Option<JobSpec>, BatchError> {
         self.get(JOBS, id.get(), |bytes| JobSpec::decode_at(id.get(), bytes))
     }
 
-    /// The conversation a Job belongs to, when it is a persistent turn. A mutable Job is
-    /// always a turn of its parent conversation; a legacy row says so in its kind.
     pub(crate) fn turn_conversation(&mut self, id: JobId) -> Result<Option<JobId>, BatchError> {
         self.get(JOBS, id.get(), |bytes| {
             if matches!(bytes, [TAG_JOB, codec::RECORD_VERSION, ..]) {
@@ -1713,7 +1647,6 @@ impl Batch {
         }
     }
 
-    /// Inserts a Job spec, which is never rewritten (I1).
     pub(super) fn insert_job(&mut self, row: &JobSpec) -> Result<(), BatchError> {
         if !ExecutionControl::LegacyProviderExecution.is_enabled() {
             return self.reject(Violation::InvalidValue(
@@ -1753,15 +1686,11 @@ impl Batch {
         self.insert(JOB_STATES, job.get(), state.encode().as_slice())
     }
 
-    /// SubtreeSettled is the absence of an `unsettled` row (I20).
     pub(crate) fn is_subtree_settled(&mut self, id: JobId) -> Result<bool, BatchError> {
         let unsettled = self.step(|tx| Ok(tx.open_table(UNSETTLED)?.get(id.get())?.is_some()))?;
         Ok(!unsettled)
     }
 
-    // ---- outputs -------------------------------------------------------------------------
-
-    /// Appends an output as the Job's next one (I11) and returns its number.
     pub(crate) fn append_output(
         &mut self,
         job: JobId,
@@ -1830,18 +1759,12 @@ impl Batch {
         })
     }
 
-    /// Record the first prepared request only after revalidating its owner in
-    /// this transaction. The current development handoff cannot dispatch;
-    /// callers must supply evidence rather than infer transmission from start.
     pub(crate) fn record_development_sent_request(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
         sent: crate::db::entities::SentRequest,
         attachments: &[crate::db::entities::AttachmentRecord],
     ) -> Result<(), BatchError> {
-        // A stop committed before this transaction wins: the request is not
-        // recorded, so it is never sent, and the execution settles as one
-        // that sent nothing.
         if self
             .pool_allocation(proof.token().job)?
             .is_some_and(|allocation| {
@@ -1854,11 +1777,6 @@ impl Batch {
                 crate::db::entities::STOPPED_BEFORE_SEND,
             ));
         }
-        // A scheduled external exchange may be recorded as sent only while
-        // the policy that authorized the reservation is still live at the
-        // revision the binding names, and still binds this Job. This runs in
-        // the send-evidence transaction, so a revocation commits before the
-        // request can leave the process.
         self.scheduled_external_authorization(proof.token().job)?;
         self.require_development_write_any(proof)?;
         if sent.job != proof.token().job {
@@ -1876,15 +1794,10 @@ impl Batch {
                 ));
             }
         }
-        // The first native request carries all of its message bodies. Verify
-        // their recorded image references against the checked snapshot before
-        // writing either the bodies or the request event.
         let first_request = sent.request == crate::db::entities::RequestNumber::FIRST;
         let mut recorded_images = Vec::new();
         for digest in &sent.messages {
             let Some(body) = sent.bodies.iter().find(|body| body.digest() == *digest) else {
-                // A later request repeats the earlier messages by reference; they
-                // are verified to exist below, and were checked when first recorded.
                 if !first_request {
                     continue;
                 }
@@ -1930,7 +1843,6 @@ impl Batch {
                 .iter()
                 .map(String::as_str))
         } else {
-            // Images are part of the first request only; a tool loop adds none.
             recorded_images.is_empty()
         };
         if !images_match {
@@ -1977,7 +1889,6 @@ impl Batch {
         Ok(())
     }
 
-    /// The frozen Provider and Model an execution's observations are indexed under.
     fn development_usage_identity(
         &mut self,
         job: JobId,
@@ -2008,9 +1919,6 @@ impl Batch {
         Ok(identity)
     }
 
-    /// Atomically record the first answer and its associated observations.
-    /// These measurements have no Token annotation, as in the legacy answer
-    /// transaction; they do not produce a usage aggregate.
     pub(crate) fn record_development_provider_answer(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -2099,9 +2007,6 @@ impl Batch {
         Ok((MetricsId::new(ids[0]), AvailabilityStatId::new(ids[2])))
     }
 
-    /// Whether `request` is the Job's latest request and its evidence is
-    /// exactly its Sent event: no answer, failure or observation yet, and no
-    /// later request.
     fn development_only_sent(
         &mut self,
         job: JobId,
@@ -2126,9 +2031,6 @@ impl Batch {
         })
     }
 
-    /// Whether `request` may be recorded as sent next: nothing of it or of a
-    /// later request exists, and every earlier request is the previous one
-    /// answered. The first request needs an empty history.
     fn development_request_slot_is_next(
         &mut self,
         job: JobId,
@@ -2163,10 +2065,6 @@ impl Batch {
         })
     }
 
-    /// Records the observed facts of a provider response that was received
-    /// but rejected the request. Nothing is invented: the caller supplies the
-    /// Availability observation it actually derived from that response. The
-    /// first request must be Sent, with no answer or earlier observation.
     pub(crate) fn record_development_provider_failure(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -2233,8 +2131,6 @@ impl Batch {
         Ok(AvailabilityStatId::new(id))
     }
 
-    /// Replace this request's contribution using checked arithmetic. A refusal
-    /// rolls back both this update and the evidence appended in the batch.
     fn replace_development_usage_total(
         &mut self,
         job: JobId,
@@ -2334,7 +2230,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Uses the existing request-event sequence as the retained replay key.
     pub(in crate::db) fn record_development_usage(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -2638,8 +2533,6 @@ impl Batch {
         Ok((seq, id))
     }
 
-    // ---- submissions, attachments, projects ----------------------------------------------
-
     pub(crate) fn submission(
         &mut self,
         key: SubmissionKey,
@@ -2704,7 +2597,6 @@ impl Batch {
         }
     }
 
-    /// Every Project's root, to refuse one that overlaps another.
     pub(crate) fn project_roots(&mut self) -> Result<Vec<(ProjectId, String)>, BatchError> {
         self.step(|tx| {
             let mut roots = Vec::new();
@@ -2715,8 +2607,6 @@ impl Batch {
             Ok(roots)
         })
     }
-
-    // ---- conversations ---------------------------------------------------------------------
 
     pub(crate) fn require_mutable_conversation(
         &mut self,
@@ -2781,8 +2671,6 @@ impl Batch {
         self.catalog_changed = true;
         self.insert(JOB_CONTROLS, root.get(), row.encode().as_slice())
     }
-
-    // ---- tool calls ------------------------------------------------------------------------
 
     pub(crate) fn job_tool_evidence(
         &mut self,
@@ -2853,8 +2741,6 @@ impl Batch {
         Ok(())
     }
 
-    // ---- request events ----------------------------------------------------------------------
-
     pub(crate) fn request_observed(
         &mut self,
         job: JobId,
@@ -2870,7 +2756,6 @@ impl Batch {
         })
     }
 
-    /// The eligibility the request's Token events already state, if any.
     pub(crate) fn request_token_eligibility(
         &mut self,
         job: JobId,
@@ -2891,10 +2776,6 @@ impl Batch {
         })
     }
 
-    /// Appends an event to a request, as its next (gapless) one, and indexes
-    /// it by the Connection and Model its Job froze. The event is returned so
-    /// a caller that reduces the request right after can feed the reduction
-    /// without reading the table again.
     pub(crate) fn insert_request_event(
         &mut self,
         job: JobId,
@@ -2950,9 +2831,6 @@ impl Batch {
         Ok(event)
     }
 
-    /// The request's events as stored now, and its Token sample reduced from
-    /// them. The events are returned so the caller can reduce the request
-    /// again after appending to it, without a second read of the table.
     pub(crate) fn usage_sample(
         &mut self,
         job: JobId,
@@ -2990,9 +2868,6 @@ impl Batch {
         Ok((sample, events))
     }
 
-    /// Replaces the request's usage bucket with the sample its events now
-    /// reduce to. `events` is what the first read returned and `inserted` the
-    /// events this transaction just appended; they are reduced as one list.
     pub(crate) fn update_usage_total(
         &mut self,
         job: JobId,

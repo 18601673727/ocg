@@ -7,17 +7,8 @@ import type { TextMessagePartProps } from "@assistant-ui/react";
 import { MarkdownBody } from "@/components/ocg/markdown/markdown-body";
 import type { FileSnapshot } from "@/components/ocg/markdown/source-snapshot";
 
-/**
- * Markdown text for assistant-ui message parts.
- *
- * The assistant-ui runtime hands this component the message part itself, so
- * `text` and the part's stream `status` are the inputs — not an implicit
- * context lookup. Rendering is delegated to the shared Chat Markdown pipeline
- * so an assistant message and a reasoning trace parse identically.
- */
 export type MarkdownTextProps = Pick<TextMessagePartProps, "text"> &
   Partial<Pick<TextMessagePartProps, "status">> & {
-    /** Renders in the muted tone the reasoning disclosure uses. */
     inMuted?: boolean;
     sourceSnapshots?: readonly FileSnapshot[];
   };

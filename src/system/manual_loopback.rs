@@ -1,26 +1,3 @@
-//! Manual loopback execution: one explicitly named native Generative Job,
-//! run once against a literal loopback Provider, by an operator.
-//!
-//! This is [`ExecutionControl::ManualLoopbackExecution`] and nothing more. It
-//! is not an external trial ([`crate::system::external_trial`] keeps its own
-//! approval, control and destination policy), not general external
-//! transport, not Provider discovery, not autonomous scheduling and not
-//! recovery. The exchange runs under [`EndpointPolicy::Loopback`], so the
-//! Job's own frozen endpoint must be a literal `127.0.0.1` HTTP endpoint with
-//! an explicit port, and a configured proxy that does not bypass it refuses
-//! the exchange rather than tunnelling it; there is no endpoint override.
-//!
-//! Everything predictable is refused before anything is reserved, so a
-//! refusal leaves the submitted Job untouched. The Job must be tool-free:
-//! the shared single-request predicate (a chat Agent without a Workspace
-//! grant, the OpenAI Chat Completions protocol, a declared context window)
-//! is the one that admission, handoff and the start transaction ask, and the
-//! exact request built without an Allocation must stream and offer no tools.
-//! The reservation, the checked start and the exchange then each happen at
-//! most once; see [`crate::system::manual_execution`]. An exchange that may
-//! have reached the Provider leaves its Allocation held; nothing here
-//! retries, reconciles or releases it.
-
 use std::time::Duration;
 
 use crate::db::entities::MutableFrozenConfiguration;
@@ -36,13 +13,9 @@ use crate::system::manual_execution::{
     require_free_executor, reserve_named_job, within_deadline,
 };
 
-/// The longest exchange the operator may allow, whatever they ask for.
 pub(crate) const MAX_TIMEOUT_CEILING: Duration = Duration::from_secs(600);
-/// The response bytes the exchange reads before it gives up.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
-/// What one invocation names. The endpoint is never named here: it is the
-/// Job's frozen one.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LoopbackRequest {
     pub(crate) target: Target,
@@ -64,18 +37,10 @@ impl LoopbackRequest {
     }
 }
 
-/// Why the exact prepared request is not a tool-free loopback exchange. The
-/// same facts are asked before the reservation and again inside the start.
-/// The native scheduler's loopback dispatch asks it inside its start too; see
-/// [`crate::system::native_scheduler`].
 pub(crate) fn check_prepared(prepared: &PreparedDevelopmentHandoff) -> Result<(), &'static str> {
     check_prepared_with(prepared, false)
 }
 
-/// [`check_prepared`] for a path that also runs the native tool loop or a
-/// native Decision: the frozen configuration may be a native Generative one
-/// (with the tools its Agent's Workspace grant allows, never a forced
-/// `tool_choice`) or a native Decision targeting a direct loopback endpoint.
 pub(crate) fn check_prepared_native(
     prepared: &PreparedDevelopmentHandoff,
 ) -> Result<(), &'static str> {
@@ -139,9 +104,6 @@ fn detail(code: &str) -> &'static str {
     }
 }
 
-/// Runs the one loopback execution. Everything before the reservation is a
-/// read. `cancellation` is the operator's stop; the timeout cancels it too.
-/// Neither is a claim about the Provider.
 pub(crate) async fn run_loopback_job(
     database: &DatabaseHandle,
     request: LoopbackRequest,
@@ -155,7 +117,6 @@ pub(crate) async fn run_loopback_job(
     }
     let target = request.target;
 
-    // 1. Reads only: the Job, its frozen configuration and its standing.
     let record = read_submitted_job(database, target.job).await?;
     match record.job.frozen.as_ref() {
         Some(MutableFrozenConfiguration::Generative(frozen)) => {
@@ -184,8 +145,6 @@ pub(crate) async fn run_loopback_job(
     }
     require_free_executor(database, target.executor).await?;
 
-    // 1b. The exact request, built without an Allocation. A refusal here
-    // changes nothing; the Job stays submitted.
     match database
         .preview_development_handoff(target.job, target.pool, target.executor, check_prepared)
         .await
@@ -204,8 +163,6 @@ pub(crate) async fn run_loopback_job(
         }
     }
 
-    // 2. One reservation, of this Job only. 3. The checked start. 4. The one
-    // exchange, to the Job's loopback endpoint and nowhere else.
     let allocation = reserve_named_job(database, target).await?;
     let handoff = checked_start(database, allocation.token, check_prepared).await?;
     let config = ProviderExecutionConfig {
@@ -228,6 +185,5 @@ pub(crate) async fn run_loopback_job(
     )
     .await;
 
-    // 5. What the database now shows is the report.
     report(database, target.job, &exchange).await
 }

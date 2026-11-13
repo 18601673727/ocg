@@ -1,11 +1,3 @@
-//! The transactions of section 8 of the design: T1 submit and chat
-//! continuation, the claim batch, tool decision and outcome, finalize,
-//! confirm stop, settlement, placement and promotion.
-//!
-//! Every function runs inside the write transaction of one [`Batch`]. The
-//! derived tables change in the same transaction as the facts they derive
-//! from, so no commit leaves one without the other.
-
 use ::redb::ReadableTableMetadata;
 
 use super::*;
@@ -122,17 +114,10 @@ pub(super) fn decode_allocation_executor(
     })
 }
 
-/// The most `CONFIGS` rows one Pool archival examines to prove it has no
-/// unarchived Executor. The Executor's `pool` field is the only record of the
-/// relation, so the proof is a scan; a table beyond this bound is refused
-/// rather than archived on a partial scan.
 pub(super) const POOL_ARCHIVE_SCAN_LIMIT: usize = 4096;
 
-/// The refusal detail for a stored row the archival could not trust.
 const POOL_ARCHIVE_STORAGE_INCONSISTENT: &str = "configuration storage is inconsistent";
 
-/// One `CONFIGS` row, decoded for what it is. A malformed row is an error,
-/// never another kind.
 enum NativeConfigRow {
     Pool(crate::db::entities::AllocationPool),
     Executor(crate::db::entities::AllocationExecutor),
@@ -296,9 +281,6 @@ pub(crate) fn valid_reservation_request_id(id: crate::db::entities::ReservationR
     value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
 }
 
-/// The Allocation a reservation request made, by the request index. The index
-/// row, the Allocation row and the request identity inside it must agree, or
-/// the database is corrupt.
 pub(super) fn allocation_by_request(
     requests: &impl ReadableTable<u128, u128>,
     allocations: &impl ReadableTable<u128, &'static [u8]>,
@@ -321,10 +303,6 @@ pub(super) fn allocation_by_request(
     Ok(Some(allocation))
 }
 
-/// The Jobs holding capacity on `pool`, or on one Executor of it, read from
-/// the active index. At most the Pool's capacity rows exist, so the range is
-/// bounded; more is corruption, reported by the caller.
-/// How many live scheduled external policies admit one frozen configuration.
 enum ScheduledPolicyMatch {
     None,
     One(crate::db::entities::ScheduledExternalPolicyRecord),
@@ -351,8 +329,6 @@ pub(super) fn active_allocations(
 }
 
 #[allow(dead_code)]
-/// The typed Result of a Job whose untouched reservation was ended by a stop
-/// before Checked Start; see [`Batch::request_native_stop`].
 pub(super) const STOPPED_BEFORE_START_CODE: &str = "stopped_before_start";
 pub(super) const STOPPED_BEFORE_START_SUMMARY: &str =
     "Stopped before it started. Nothing was sent to the Provider.";
@@ -785,8 +761,6 @@ fn decode_mutable_input_revision(
     Ok(input)
 }
 
-// Native execution operations. They must only run in the database worker's
-// write transaction; returned tokens are tentative until commit.
 #[allow(dead_code)]
 impl Batch {
     pub(super) fn require_generative_predecessors(
@@ -844,20 +818,6 @@ impl Batch {
         }
     }
 
-    /// Why checked start cannot execute this Job: its conversation or context
-    /// needs preparation this build does not support. One predicate for the
-    /// start transaction and for scheduled selection, so a candidate the start
-    /// would refuse stays queued instead of being reserved and failed.
-    ///
-    /// Every question is scoped to this Job and its conversation, by the
-    /// conversation's own rows and by the Job's context: the Jobs whose output
-    /// the request would carry (the `previous` chain) and an adopted summary's
-    /// producer. `TOOL_CALLS` and `APPROVALS` are keyed by Job, so evidence is
-    /// a range read per such Job. `CHILD_GROUPS` and `LIVE_CHILDREN` are keyed
-    /// by the parent conversation and written with the child they name. Nothing
-    /// here reads unrelated history. The conversation's notices and approvals
-    /// are not read: a notice only tells the user something changed, and an
-    /// approval's question and answer are turns of the conversation.
     pub(crate) fn unsupported_start_context(
         &mut self,
         job: &crate::db::entities::MutableJob,
@@ -889,11 +849,6 @@ impl Batch {
         self.step(|tx| {
             let tools = tx.open_table(TOOL_CALLS)?;
             for id in &context {
-                // A predecessor's tool calls are not part of what a later turn
-                // is shown: only its question and its final answer are, and a
-                // call that waited for the user is shown as the question it
-                // asked and the answer that followed. The Job's own calls
-                // would mean it already ran.
                 let range = (id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX);
                 if *id == job.id && tools.range(range)?.next().transpose()?.is_some() {
                     return Ok(Some(UNSUPPORTED));
@@ -997,9 +952,6 @@ impl Batch {
     }
 
     fn require_allocation_durability(&mut self) -> Result<(), BatchError> {
-        // The worker withholds staged group results until its durable group
-        // commit succeeds. A Batch result is never itself an authorization to
-        // dispatch or acknowledge the command.
         if !matches!(self.commit_mode, Some(Commit::Durable | Commit::Staged)) {
             return self.reject(Violation::InvalidValue(
                 "allocation",
@@ -1049,8 +1001,6 @@ impl Batch {
         Ok(())
     }
 
-    /// A submitted Job's frozen configuration as the resolver's own type.
-    /// Nothing is re-resolved: the stored record is the only authority.
     fn frozen_configuration(
         &mut self,
         job: &crate::db::entities::MutableJob,
@@ -1067,7 +1017,6 @@ impl Batch {
         }
     }
 
-    /// The part of a freshly resolved configuration a Job stores.
     fn storable_frozen(
         &mut self,
         frozen: &FrozenConfiguration,
@@ -1125,8 +1074,6 @@ impl Batch {
         };
         match self.freeze_configuration(configuration)? {
             FrozenConfiguration::Generative(frozen) => {
-                // Static facts of the frozen configuration that no later step
-                // can repair are refused here, before an Allocation exists.
                 if let Some(reason) = frozen.native_execution_refusal() {
                     return self.reject(Violation::InvalidValue("configuration", reason));
                 }
@@ -1193,9 +1140,6 @@ impl Batch {
         }))
     }
 
-    /// The one unsubmitted, unsettled Job drafted in `context`, by the draft
-    /// index. The index, the Job row and its state must agree, or the
-    /// database is corrupt.
     pub(crate) fn mutable_job_for_context(
         &mut self,
         context: crate::db::entities::ComposerContextId,
@@ -1270,9 +1214,6 @@ impl Batch {
         self.create_job_as(context, input, submission, conversation, project, true)
     }
 
-    /// Creates the Job. `by_user` says the user wrote it: a conversation a
-    /// user writes in is no longer managed by the Agent that opened it, and
-    /// the user's message ends the automatic turns counted before it.
     pub(crate) fn create_job_as(
         &mut self,
         context: crate::db::entities::ComposerContextId,
@@ -1498,8 +1439,6 @@ impl Batch {
             Ok(())
         })?;
         if job.phase == MutableJobPhase::Queued {
-            // An edited input is submitted again and freezes again; a change
-            // that leaves the input alone keeps the configuration it froze.
             let new = if input == job.input {
                 self.frozen_configuration(&job)?
             } else {
@@ -1551,8 +1490,6 @@ impl Batch {
         Ok(job)
     }
 
-    /// Change Job-owned context selection under the same revision and
-    /// allocation checks as an input edit.
     pub(crate) fn set_mutable_context_selection(
         &mut self,
         id: JobId,
@@ -1610,8 +1547,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Removes the draft index entry of a Job leaving the unsubmitted state.
-    /// The entry must exist and name this Job.
     fn release_draft_context(
         &mut self,
         job: &crate::db::entities::MutableJob,
@@ -1628,8 +1563,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Explicitly cancel an old queued Job which cannot execute its Decision
-    /// history. Its submitted input and conversation membership stay intact.
     pub(crate) fn cancel_unsupported_queued_job(
         &mut self,
         id: JobId,
@@ -1676,8 +1609,6 @@ impl Batch {
         )
     }
 
-    /// Cancels a Job that is queued and was never reserved: it leaves the
-    /// ready index, and its outcome is Cancelled for `cause`.
     pub(crate) fn end_queued_native_job(
         &mut self,
         job: &crate::db::entities::MutableJob,
@@ -1793,9 +1724,6 @@ impl Batch {
         ) {
             self.require_generative_predecessors(&job)?;
         }
-        // The freeze point: the configuration, request headers and secret
-        // references the Job will run with are fixed here, and nothing
-        // resolves them again from current settings.
         let frozen = self.mutable_execution(&job.input)?;
         job.frozen = Some(self.storable_frozen(&frozen)?);
         let JobKind::Group { agent, .. } = &mut parent.kind else {
@@ -1883,10 +1811,6 @@ impl Batch {
         self.submit_mutable_job(id, updated.revision, submission)
     }
 
-    /// Every native write starts here: the database must carry this build's
-    /// format and schema fingerprint and belong to the open epoch holding the
-    /// write lock. O(1); the legacy-claim invariant is enforced where Job
-    /// states are written (`put_job_state`) and checked at open.
     fn allocation_format_gate(&mut self) -> Result<(), BatchError> {
         let current_epoch = self.epoch;
         let ready = self.step(|tx| {
@@ -2117,9 +2041,6 @@ impl Batch {
         Ok(executor)
     }
 
-    /// The independent Executor stored under `id`; `None` when the row is
-    /// absent or is another kind of configuration. A malformed row is an
-    /// error, never an absence.
     fn native_executor_row(
         &mut self,
         id: ExecutorId,
@@ -2138,13 +2059,6 @@ impl Batch {
         Ok(existing.flatten())
     }
 
-    /// Permanently retires one idle Executor: `archived` is set, `enabled` is
-    /// cleared and the revision advances, all in this one transaction. The
-    /// row stays in `CONFIGS`, so the identity is never reused. The decision
-    /// reads only this Executor's `ACTIVE_ALLOCATIONS` range, in this
-    /// transaction. A held Allocation, or an index entry that disagrees with
-    /// its authoritative Allocation, refuses the archival; no Allocation, Job
-    /// or Pool row is touched.
     pub(crate) fn archive_native_executor(
         &mut self,
         id: ExecutorId,
@@ -2162,8 +2076,6 @@ impl Batch {
             return self.reject(Violation::InvalidValue("executor", "revision conflict"));
         }
         let pool = executor.pool.get();
-        // Free, held, or untrustworthy. A storage failure is neither: it
-        // fails the batch and is never read as an idle Executor.
         let held = self.step(|tx| {
             let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
             let allocations = tx.open_table(POOL_ALLOCATIONS)?;
@@ -2175,7 +2087,6 @@ impl Batch {
                     Err(error) => return Err(error),
                 }
             }
-            // An Executor holds at most one Allocation.
             Ok(match entries.len() {
                 0 | 1 => Some(!entries.is_empty()),
                 _ => None,
@@ -2213,22 +2124,6 @@ impl Batch {
         Ok(executor)
     }
 
-    /// Permanently retires one independent Pool: `archived` is set, `enabled`
-    /// is cleared and the revision advances, all in this one transaction. The
-    /// row stays in `CONFIGS`, so the identity is never reused and historical
-    /// Executor and Allocation references still decode.
-    ///
-    /// Every decision is read in this transaction and any refusal leaves the
-    /// database unchanged:
-    /// - the Pool's `ACTIVE_ALLOCATIONS` range must be empty (an entry that
-    ///   disagrees with its authoritative Allocation fails closed);
-    /// - no unarchived Executor may name the Pool. The Executor's `pool` field
-    ///   is the only record of that relation, so `CONFIGS` is scanned, at most
-    ///   [`POOL_ARCHIVE_SCAN_LIMIT`] rows. A table too large to examine in full
-    ///   refuses the archival; a partial scan never archives.
-    ///
-    /// No Allocation, Job or Executor row is touched and no capacity is
-    /// released.
     pub(crate) fn archive_native_pool(
         &mut self,
         id: ExecutionPoolId,
@@ -2267,8 +2162,6 @@ impl Batch {
             return self.reject(Violation::InvalidValue("pool", "revision conflict"));
         }
         let pool_key = id.get();
-        // Free, held, or untrustworthy. One entry decides: any active entry
-        // blocks, so the range is never read past its first member.
         let allocation = self.step(|tx| {
             let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
             let allocations = tx.open_table(POOL_ALLOCATIONS)?;
@@ -2404,21 +2297,12 @@ impl Batch {
         Ok(())
     }
 
-    /// Whether the held Allocations of every Pool together are at
-    /// [`GLOBAL_EXECUTION_LIMIT`], read in this transaction. It decides
-    /// nothing: [`Self::reserve_next_development_job`] makes its own check,
-    /// and this only tells a scheduler which of that check's refusals it was
-    /// given.
     pub(crate) fn global_execution_limit_reached(&mut self) -> Result<bool, BatchError> {
         self.step(|tx| {
             Ok(tx.open_table(ACTIVE_ALLOCATIONS)?.len()? >= u64::from(GLOBAL_EXECUTION_LIMIT))
         })
     }
 
-    /// Select and reserve in one writer transaction. The cursor limits work per
-    /// request; a new traversal starts at the head of the authoritative index.
-    /// `selection` says which ready Jobs this pass may take; see
-    /// [`crate::db::entities::ReadySelection`].
     pub(crate) fn reserve_next_development_job(
         &mut self,
         request: crate::db::entities::DevelopmentReservationRequest,
@@ -2489,20 +2373,12 @@ impl Batch {
             ));
         }
         if matches!(selection, ReadySelection::Scheduled { .. }) {
-            // The scheduler never waits on capacity inside a transaction and
-            // never scans for an Executor that could not take a Job: a busy
-            // Executor, a full Pool or the global limit refuses the pass
-            // here, before any ready entry is read. A refusal, unlike
-            // `Exhausted`, says nothing about the ready index.
             let room = self.step(|tx| {
                 let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
                 if active.len()? >= u64::from(GLOBAL_EXECUTION_LIMIT) {
                     return Ok(false);
                 }
                 let held = active_allocations(&active, pool_id.get(), None)?;
-                // A Pool may be reduced below its occupancy: held Allocations
-                // keep their capacity and the Pool takes no new one until
-                // occupancy falls below the limit.
                 Ok((held.len() as u64) < u64::from(pool.capacity.get())
                     && !held
                         .iter()
@@ -2527,8 +2403,6 @@ impl Batch {
         })?;
         for key in &keys {
             let id = JobId::new(key.2);
-            // A manual trial names its one Job: any other ready entry is
-            // passed over untouched, never reserved.
             if let ReadySelection::Only(only) = selection
                 && only != id
             {
@@ -2570,9 +2444,6 @@ impl Batch {
                         "execution_context",
                         "Generative Jobs cannot follow Decision history",
                     )))) => {
-                        // The scheduler's pass writes nothing unless it
-                        // reserves; the entry stays for a manual pass to
-                        // retire, and the Job reports the blocked history.
                         if !matches!(selection, ReadySelection::Scheduled { .. }) {
                             self.remove(MUTABLE_READY, *key)?;
                         }
@@ -2609,7 +2480,6 @@ impl Batch {
                 decision_policy,
             } = selection
             {
-                // The checked start would refuse these; leave them queued.
                 if self.unsupported_start_context(&job)?.is_some() {
                     continue;
                 }
@@ -2627,9 +2497,6 @@ impl Batch {
                             .is_some_and(crate::system::http::direct_diagnostic_loopback);
                         scheduled_external = match self.scheduled_external_policy_for(frozen)? {
                             ScheduledPolicyMatch::One(record) => Some((record.id, record.revision)),
-                            // More than one live policy admits the Job: no policy
-                            // authorizes it, and none is chosen. It stays queued and
-                            // the scan goes on.
                             ScheduledPolicyMatch::Ambiguous => continue,
                             ScheduledPolicyMatch::None if !loopback => continue,
                             ScheduledPolicyMatch::None => None,
@@ -2688,8 +2555,6 @@ impl Batch {
         Ok(DevelopmentReservation::Exhausted)
     }
 
-    /// Read the executor's current owner after a lost reservation reply. The
-    /// query is serialized behind earlier commands on the same worker.
     pub(crate) fn development_executor_allocation(
         &mut self,
         executor: ExecutorId,
@@ -2846,8 +2711,6 @@ impl Batch {
             }
             let held =
                 active_allocations(&tx.open_table(ACTIVE_ALLOCATIONS)?, pool_id.get(), None)?;
-            // Occupancy above capacity is a legitimate state after the Pool
-            // was reduced; it refuses a new reservation below, nothing more.
             let occupied = held.len() as u64;
             let executor_free = !held
                 .iter()
@@ -2946,9 +2809,6 @@ impl Batch {
         })
     }
 
-    /// Compare snapshot facts inside the writer transaction. This is only a
-    /// building block: it is not a start authorization or a handoff permit.
-    /// In particular it does not resolve the runtime tool and OS policy.
     pub(super) fn revalidate_development_snapshot(
         &mut self,
         candidate: &reader::DevelopmentCandidate,
@@ -3274,8 +3134,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Start only the exact candidate checked in this same writer transaction.
-    /// The caller must retain the prepared, owned request until durable commit.
     pub(crate) fn start_mutable_job(
         &mut self,
         prepared: &crate::db::handle::PreparedDevelopmentHandoff,
@@ -3290,10 +3148,6 @@ impl Batch {
         }
         let candidate = prepared.candidate();
         self.revalidate_development_snapshot(candidate)?;
-        // A Job reserved under a durable scheduled external policy may start
-        // only while that same policy revision is still live and still binds
-        // the Job's frozen configuration. This transaction is the start's
-        // linearization point; the send revalidates again atomically.
         let job = match candidate {
             reader::DevelopmentCandidate::Generative(context) => context.job.id,
             reader::DevelopmentCandidate::Decision(context) => context.job.id,
@@ -3343,13 +3197,9 @@ impl Batch {
                 "credential changed or is unavailable",
             ));
         }
-        // Authoritative reads in this transaction decide, not the snapshot's
-        // copy: the snapshot was just revalidated against the same rows.
         if let Some(reason) = self.unsupported_start_context(snapshot)? {
             return self.reject(Violation::InvalidValue("handoff", reason));
         }
-        // The configuration was frozen when the Job was submitted; starting
-        // reads it back and never resolves current settings.
         if snapshot.frozen.is_none() {
             return self.reject(Violation::InvalidValue(
                 "handoff",
@@ -3406,7 +3256,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Validate execution ownership in the transaction that will perform a write.
     pub(super) fn require_development_write(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -3434,9 +3283,6 @@ impl Batch {
             return self.reject(rejected());
         };
         let state = self.require_job_state(token.job)?;
-        // A stop request bars only a new Provider request (see
-        // `record_development_sent_request`); the execution it stops still
-        // owns the Allocation and records how it ended.
         if token.epoch != self.epoch
             || allocation.token != token
             || !matches!(
@@ -3510,9 +3356,6 @@ impl Batch {
         Ok(allocation.operation)
     }
 
-    /// Atomically publish a result, settle the whole Job and release its Pool
-    /// allocation. The caller must invoke this only after local execution has
-    /// actually returned; the database transition is not stop evidence.
     pub(crate) fn finalize_development_job(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -3523,11 +3366,6 @@ impl Batch {
         self.finish_development_job(proof, expected_seq, finalization)
     }
 
-    /// Records that a supervised exchange ended with an outcome this process
-    /// cannot classify: the Job becomes Unknown with the typed reason and the
-    /// Allocation becomes Uncertain, still holding its capacity. Nothing is
-    /// released, retried or redispatched, and the record never claims that
-    /// remote work stopped. Requires the same ownership proof as a result.
     pub(crate) fn record_development_uncertain(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -3543,12 +3381,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Settles a Job Failed or Cancelled without an answer. A Failed settlement
-    /// may carry the Availability observation of a Provider response that
-    /// rejected the request; it is recorded in this same transaction. The
-    /// caller supplies only facts it observed: no answer, usage or success
-    /// evidence is ever created here, and Cancelled requires that no request
-    /// was recorded at all.
     pub(crate) fn finalize_development_failure(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -3672,8 +3504,6 @@ impl Batch {
                 .next_back()
                 .transpose()?
                 .map(|(key, _)| key.value());
-            // The Job's latest request decides how it may end; every request
-            // before it was answered, which recording the next one required.
             let latest = last.map_or(1, |(_, request, _)| request);
             let Some(latest_number) = RequestNumber::new(latest) else {
                 return Ok(false);
@@ -3741,17 +3571,12 @@ impl Batch {
             {
                 return Ok(false);
             }
-            // A Job that called tools may end only once every call has its
-            // recorded outcome, and none of them is Uncertain: an Uncertain
-            // call keeps the Allocation held instead.
             for entry in tx
                 .open_table(TOOL_CALLS)?
                 .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
             {
                 let (key, row) = entry?;
                 let record = decode_tool_evidence(tool_call_ref(key.value())?, row.value())?;
-                // A read-only call left nothing to recover, whatever became of
-                // its outcome; every other admitted call must have a definite one.
                 let read_only = record
                     .admission()
                     .is_none_or(|admission| admission.effect == ToolEffect::ReadOnly);
@@ -3796,8 +3621,6 @@ impl Batch {
         })
     }
 
-    /// Records a terminal outcome and its Result output for a mutable Job and
-    /// settles it in the conversation indexes. The Allocation is the caller's.
     fn settle_mutable_outcome(
         &mut self,
         token: crate::db::entities::AllocationToken,
@@ -3839,8 +3662,6 @@ impl Batch {
             let previous = results
                 .get(job.parent_id.get())?
                 .map_or((0, 0), |v| v.value());
-            // A cancelled turn is not an answer: the same rule recovery
-            // applies when it rebuilds this index from the Job rows.
             let answered = if kind == OutcomeKind::Cancelled {
                 previous.0
             } else {
@@ -3855,20 +3676,6 @@ impl Batch {
         Ok((seq, id))
     }
 
-    /// Ends a Reserved Allocation whose checked start never committed, and
-    /// the Job it was reserved for, with a typed failure that preserves the
-    /// reason. This, and the stop of a Job that never started (see
-    /// [`Self::request_native_stop`]), which shares its checks, are the only
-    /// ways a Reserved Allocation is released.
-    ///
-    /// A Reserved Allocation proves that no execution authority exists: the
-    /// start transaction is the only writer that makes an Allocation Running
-    /// and a Job Executing, and the in-memory handoff, the only thing that can
-    /// send a Provider request, is created after that transaction commits.
-    /// Everything below is checked in this one writer transaction, so a start
-    /// racing this call either committed first (the phase is no longer
-    /// Reserved and this refuses) or finds the Allocation gone and refuses.
-    /// Anything that is not exactly an untouched reservation is left held.
     pub(crate) fn fail_unstarted_reservation(
         &mut self,
         token: crate::db::entities::AllocationToken,
@@ -3886,11 +3693,6 @@ impl Batch {
         )
     }
 
-    /// Ends an untouched reservation and its Job with `kind` and `result`,
-    /// under every check [`Self::fail_unstarted_reservation`] documents: a
-    /// reservation that is not exactly untouched is refused and left held.
-    /// The stop of a Job that was reserved but never started ends it here as
-    /// Cancelled; see [`Self::request_native_stop`].
     fn end_untouched_reservation(
         &mut self,
         token: crate::db::entities::AllocationToken,
@@ -4010,21 +3812,6 @@ impl Batch {
         })
     }
 
-    /// Records the stop of one native Job, decided against its Allocation in
-    /// this one transaction:
-    ///
-    /// - Reserved: no execution authority exists yet, so the untouched
-    ///   reservation is ended here and the Job is Cancelled; nothing was or
-    ///   will be sent. A start racing this either committed first (the
-    ///   Allocation is Running) or is refused.
-    /// - Running: the Allocation becomes StopRequested. From then on no
-    ///   Provider request may be recorded as sent, so one that was not yet
-    ///   sent never is; an exchange already sent settles as it ends, held as
-    ///   Uncertain unless it returned a result. Ownership is not released here.
-    /// - StopRequested: already requested; nothing is written.
-    ///
-    /// A Job without an Allocation is not running, and a Job with an outcome
-    /// has ended; both are refused and nothing changes.
     pub(crate) fn request_native_stop(
         &mut self,
         job: JobId,
@@ -4110,10 +3897,6 @@ impl Batch {
                     | AllocationPhase::Uncertain
                     | AllocationPhase::Released
             ) | (
-                // A stopped execution that still returned a confirmed
-                // outcome (cancelled before its request was sent, or a
-                // result that arrived first) is released like a Running
-                // one: the Released branch below requires that outcome.
                 AllocationPhase::StopRequested,
                 AllocationPhase::Uncertain | AllocationPhase::Released
             )
@@ -4155,11 +3938,6 @@ impl Batch {
         self.put_pool_allocation(&allocation, Some(&previous))
     }
 
-    /// Offline recovery of a stopped, strictly loopback-shaped execution. The
-    /// plan has already proved host/boot ownership and audited all evidence;
-    /// this transaction binds that plan to the exact rows it read. Existing
-    /// Unknown outcomes are not rewritten, no Result is published, and the
-    /// Allocation indexes change atomically with the release.
     pub(crate) fn reconcile_stopped_allocation(
         &mut self,
         action: &super::recovery::RecoveryAction,
@@ -4271,11 +4049,6 @@ impl Batch {
         self.put_pool_allocation(&allocation, Some(&previous))
     }
 
-    /// The only writer of `POOL_ALLOCATIONS`. It keeps the request and active
-    /// indexes in the same transaction: a new row adds both (a reused request
-    /// identity or a second Allocation for the Job is corruption, not
-    /// overwritten), a change keeps identity and token and moves the active
-    /// entry out when capacity is released, and a Released row never changes.
     fn put_pool_allocation(
         &mut self,
         allocation: &crate::db::entities::PoolAllocation,
@@ -4346,9 +4119,6 @@ impl Batch {
     }
 }
 
-/// The key of a Job in `ready`: what a Pool must offer to run it. The high
-/// byte is the operation (0 for work no Pool is asked to run) and the low byte
-/// is the protocol (0 for none).
 pub(super) fn requirement(
     operation: Option<ExecutionOperation>,
     protocol: Option<LlmTransport>,
@@ -4358,9 +4128,6 @@ pub(super) fn requirement(
     (operation << 8) | protocol
 }
 
-/// What a Pool must offer to run the Job: an LLM request over the protocol
-/// of the Connection it froze. A Job without an execution needs nothing a
-/// Pool offers.
 pub(super) fn execution_requirement(execution: &FrozenExecutionConfig) -> u16 {
     requirement(
         Some(ExecutionOperation::LlmRequest),
@@ -4375,9 +4142,6 @@ pub(super) fn mutable_configuration_requirement(configuration: &FrozenConfigurat
     }
 }
 
-/// What a Pool must offer to run one decision Job. The native protocol is
-/// chosen from the frozen Decision Model; a Pool that offers `Decision` can
-/// run any typed protocol its executor adapter implements.
 pub(super) fn decision_work_requirement(frozen: &FrozenDecisionConfig) -> u16 {
     match frozen {
         FrozenDecisionConfig::Native(_) => decision_requirement(),
@@ -4388,7 +4152,6 @@ pub(super) fn decision_work_requirement(frozen: &FrozenDecisionConfig) -> u16 {
 pub(super) fn decision_requirement() -> u16 {
     requirement(Some(ExecutionOperation::Decision), None)
 }
-/// An unarchived Pool, as admission checks see it.
 struct OpenPool {
     body: PoolConfig,
 }
@@ -4456,10 +4219,6 @@ impl Batch {
         Ok(value)
     }
 
-    // ---- T1 submit (8.1) and chat continuation (8.2) -------------------------------
-
-    /// T1_SUBMIT. `spec` is the immutable Job spec; its `id`, `created_at`
-    /// and `submission` are set here. Returns the new Job.
     pub(crate) fn t1_submit(
         &mut self,
         submission: Option<(SubmissionKey, RequestFingerprint)>,
@@ -4533,8 +4292,6 @@ impl Batch {
         Ok(job)
     }
 
-    /// All T1 refusals occur before allocating or writing any rows. Event
-    /// appends can keep their source transaction and fall back to a notice.
     pub(crate) fn validate_spec(&mut self, spec: &JobSpec) -> Result<(), BatchError> {
         if let JobKind::Execution {
             execution: JobExecution::Decision(work),
@@ -4740,8 +4497,6 @@ impl Batch {
         match &spec.kind {
             JobKind::Group { agent, project, .. } => {
                 if let Some(agent) = agent {
-                    // A conversation is held by an Agent Profile, or by a
-                    // Decision Profile when it carries typed decision work.
                     let row = self.require_config(*agent)?;
                     if row.archived_at.is_some()
                         || !matches!(row.kind, ConfigKind::Agent | ConfigKind::DecisionAgent)
@@ -4831,17 +4586,12 @@ impl Batch {
         Ok(())
     }
 
-    /// The global request fields and their revision.
     pub(crate) fn global_headers(
         &mut self,
     ) -> Result<crate::db::entities::GlobalHeaders, BatchError> {
         self.step(|tx| reader::global_outbound_headers(&tx.open_table(META)?))
     }
 
-    /// Replaces the global request fields. `expected_revision` is the
-    /// revision the caller read; a stale one is refused, so two editors never
-    /// overwrite each other. A Job already frozen keeps its own copy, and one
-    /// still waiting to start is refused at its checked handoff.
     pub(crate) fn save_global_headers(
         &mut self,
         expected_revision: u32,
@@ -4873,9 +4623,6 @@ impl Batch {
         Ok(saved)
     }
 
-    /// Reads the configs a Job is submitted with and freezes their values
-    /// (section 4.1.4): the Model, its Connection and, when named, the Agent.
-    /// The Agent must list the Model.
     pub(crate) fn freeze_configuration(
         &mut self,
         configuration: ExecutionConfiguration,
@@ -4894,15 +4641,6 @@ impl Batch {
         .freeze_configuration(configuration)
     }
 
-    /// Freezes a configuration without requiring an Agent.
-    ///
-    /// The only callers of this method are:
-    /// - the compaction summarizer (`job_records.rs:229-240`);
-    /// - CLI process turns, through `spec_of` (`db/mutations.rs:85`).
-    ///
-    /// Title jobs (`job_records.rs:2195-2257`) reuse the parent turn's Model
-    /// with the Agent stripped, and never freeze; they are a derivative the
-    /// Agent already validated.
     pub(crate) fn freeze_system_configuration(
         &mut self,
         configuration: ExecutionConfiguration,
@@ -4915,10 +4653,6 @@ impl Batch {
         .freeze_configuration(configuration)
     }
 
-    // ---- placement (8.10) ---------------------------------------------------------
-
-    /// PLACE: a pending Job with no open dependency becomes `delayed` until
-    /// its `eligible_at`, when that is still ahead.
     pub(crate) fn place(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
         let blocked = match (row.kind.is_persistent(), row.parent_id) {
@@ -4984,11 +4718,6 @@ impl Batch {
         })
     }
 
-    // ---- tool decision and outcome (8.4) --------------------------------------------
-
-    /// TOOL_DECIDE: records OCG's decision about a call before anything about
-    /// it can run (I12). `spawns` says whether the admitted handler can start
-    /// an OS process.
     pub(crate) fn tool_decide(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -5192,8 +4921,6 @@ impl Batch {
         Ok(())
     }
 
-    /// TOOL_OUTCOME: records what is known of an admitted call's execution,
-    /// once.
     pub(crate) fn tool_outcome(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -5228,8 +4955,6 @@ impl Batch {
                 .unwrap_or((0, 0, 0, 0, 0, 0)))
         })?;
         let mut updated_stats = current_stats;
-        // Duration semantics: admission commit -> outcome commit (includes the
-        // admission's durable commit), never spanning a restart.
         let duration_us = self
             .now
             .as_unix_micros()
@@ -5259,9 +4984,6 @@ impl Batch {
         Ok(())
     }
 
-    /// Whether `proof` is the ownership of the execution that owns `call`: a
-    /// tool call is recorded only by the in-process execution that holds the
-    /// Job's Allocation, never by a request or by another Job's execution.
     pub(crate) fn require_development_call(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -5277,18 +4999,11 @@ impl Batch {
         Ok(())
     }
 
-    /// Refuses always: storage records no claim, so no Job executes under
-    /// this opening of the database (I13).
     pub(crate) fn require_executing_here(&mut self, job: JobId) -> Result<(), BatchError> {
         self.require_legacy_evidence_job(job)?;
         self.reject(Violation::NotExecutingLocally(job))
     }
 
-    // ---- finalize (8.5), confirm stop (8.6) ------------------------------------------
-
-    /// FINALIZE. A Job that never started can only be Cancelled. Returns the
-    /// outcome kind that was recorded and the sequence number of the Result
-    /// output, if any.
     pub(crate) fn finalize(
         &mut self,
         job: JobId,
@@ -5428,8 +5143,6 @@ impl Batch {
         Ok((kind, appended))
     }
 
-    /// CANCEL_PENDING_WRITES: a Job cancelled before it started leaves every
-    /// readiness table.
     pub(crate) fn cancel_pending_writes(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
         self.step(|tx| {
@@ -5451,9 +5164,6 @@ impl Batch {
         })
     }
 
-    /// SETTLE: from `start`, deletes the `unsettled` row of every Job that has
-    /// become SubtreeSettled, releases or cancels its waiters and moves up to
-    /// its parent.
     pub(crate) fn settle(&mut self, start: JobId) -> Result<(), BatchError> {
         let mut work = vec![start];
         while let Some(job) = work.pop() {
@@ -5536,10 +5246,6 @@ impl Batch {
         Ok(())
     }
 
-    // ---- predicates over a Job's tool calls ----------------------------------------------
-
-    /// NO_LIVE_PROCESS: every admitted call that can spawn has an
-    /// outcome, so no OS process of the Job can remain (section 11.4).
     pub(crate) fn no_live_process(&mut self, job: JobId) -> Result<bool, BatchError> {
         let calls = self.job_tool_evidence(job)?;
         Ok(calls
@@ -5550,11 +5256,6 @@ impl Batch {
 
 impl Batch {}
 
-/// The durable scheduled external policy and its binding to one Allocation.
-/// Creation takes an already validated draft; the store never infers authorization
-/// from a Job's frozen configuration or from another authority. Every mutation
-/// bumps the policy revision (except a no-op enable/disable), so a binding made
-/// under an older revision can never authorize a start or a send.
 impl Batch {
     fn scheduled_external_policy_by_id(
         &mut self,
@@ -5753,11 +5454,6 @@ impl Batch {
         Ok(updated)
     }
 
-    /// The live policy that binds this frozen configuration. `None` when the
-    /// build's control is disabled or no live policy admits it. More than one
-    /// is `Ambiguous`, an expected candidate result rather than a rejection: a
-    /// rejection would poison the transaction and with it the whole scan, and
-    /// choosing between policies is not the transaction's to make.
     fn scheduled_external_policy_for(
         &mut self,
         frozen: &FrozenExecutionConfig,
@@ -5789,11 +5485,6 @@ impl Batch {
         })
     }
 
-    /// The policy authorizing this Job's current Allocation, revalidated in
-    /// this write transaction. `Ok(None)` means no scheduled binding exists,
-    /// which is every loopback and manual execution. Any binding that no longer
-    /// matches its live policy, the Allocation, or the Job's frozen
-    /// configuration is a refusal, never a warning.
     pub(crate) fn scheduled_external_authorization(
         &mut self,
         job: JobId,

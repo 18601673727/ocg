@@ -6,12 +6,6 @@ import { StatusDot } from "./status-dot";
 import { TONE_CLASS, TEXT_TONE, type Tone } from "./tone";
 import { TYPOGRAPHY_SCALE, BORDER_RADIUS } from "@/lib/design-tokens";
 
-/**
- * Compact status label.
- *
- * `solid` is the tinted badge used by the ledger and control centre; `quiet`
- * keeps a neutral surface and only borrows the tone for its text and dot.
- */
 export function Pill({
   children,
   tone = "slate",
@@ -24,7 +18,6 @@ export function Pill({
   children: ReactNode;
   tone?: Tone;
   variant?: "solid" | "quiet";
-  /** Render a leading status dot in this pill's tone. */
   dot?: boolean;
   pulse?: boolean;
   title?: string;

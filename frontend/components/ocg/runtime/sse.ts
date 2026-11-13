@@ -1,7 +1,5 @@
 export type SseFrame = { event: string; data: string; id: string | null } | { comment: string };
 
-// Each connection gets a fresh parser: an unfinished event at EOF is replayed,
-// never completed with bytes from the next response.
 export class SseParser {
   private line = "";
   private carriageReturn = false;

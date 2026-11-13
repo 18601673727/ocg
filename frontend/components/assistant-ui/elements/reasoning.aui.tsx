@@ -17,7 +17,6 @@ import {
 
 export type { ReasoningRootProps } from "./reasoning";
 
-/** `ReasoningRoot` with the thread viewport scroll locked during disclosure animations. */
 const ReasoningRoot = forwardRef<HTMLDivElement, Omit<ReasoningRootProps, "ref">>(
   function ReasoningRoot({ onAnimationStart, ...props }, ref) {
     const collapsibleRef = useRef<HTMLDivElement | null>(null);

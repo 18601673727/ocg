@@ -1,8 +1,5 @@
 use super::*;
 
-/// Identifies one submitted command. `epoch` is allocated durably each time
-/// the database is opened, so an identifier is never reused across openings,
-/// even when its command never committed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationId {
     pub(crate) epoch: u64,
@@ -59,47 +56,24 @@ pub enum OperationKind {
     RecordAvailabilityStat,
     RecordSentRequest,
     RecordProviderAnswer,
-    /// One bounded batch of AvailabilityStat aggregation. Its marker's
-    /// subject is the last record the batch consumed.
     ConsumeAvailability,
-    /// One bounded batch of Token aggregation. Its marker's subject is the
-    /// last Metrics record the batch consumed.
     ConsumeTokenUsage,
-    /// The quarantine, when the database is opened, of a Job that an earlier
-    /// opening started locally, never settled, and left with external work
-    /// whose termination nothing established. The Job takes an unknown outcome
-    /// and keeps its claims; no stop is confirmed and no capacity released.
     QuarantineAbandonedJob,
-    /// OCG's refusal or admission of a tool call a Provider requested.
     RecordToolDecision,
-    /// What is known of an admitted tool call's execution.
     RecordToolOutcome,
-    /// A verified conclusion about an uncertain tool execution.
     ReconcileToolEffect,
-    /// A new Attachment, recorded once its content was published.
     CreateAttachment,
-    /// The cleanup of an available Attachment: its kind and time, together.
     CleanupAttachment,
     ClaimExecution,
     CreateExecutionPool,
     SetExecutionPoolEnabled,
     SetExecutionPoolProfile,
-    /// An enable, disable, rename or capability change of one independent
-    /// Executor. It releases no capacity and starts nothing.
     UpdateExecutor,
-    /// The permanent retirement of one idle independent Executor. It releases
-    /// no capacity, stops nothing and resolves no outcome.
     ArchiveExecutor,
-    /// The permanent retirement of one independent Pool with no Allocation and
-    /// no unarchived Executor. It removes the Pool from future eligibility; it
-    /// releases no capacity, stops nothing and resolves no outcome.
     ArchivePool,
-    /// A create, update, enable, disable or revoke of one durable scheduled
-    /// external policy. It never enables the build's control.
     SetScheduledExternalPolicy,
 }
 
-/// A business rule refused the command; nothing it did was committed.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Violation {
     #[error("the Agent has a Workspace tool grant but the LLM Profile does not declare Tools")]
@@ -188,9 +162,6 @@ pub enum Violation {
     StopUnresolved(JobId),
     #[error("{0} was submitted without an LLM configuration")]
     NotAnLlmExecution(JobId),
-    /// Every Token annotation of one Provider request states the same
-    /// eligibility: the request was either issued or not. The committed
-    /// records keep theirs. Two requests of one Job may differ.
     #[error(
         "the Metrics of {request} of {job} already state that it is {committed:?}; an annotation stating {refused:?} contradicts them"
     )]
@@ -228,27 +199,18 @@ pub enum Violation {
         call: ToolCallRef,
         limit: &'static str,
     },
-    /// An admitted call's effect is neither known nor reconciled.
     #[error("whether {0} had its effect is unresolved")]
     UnresolvedToolEffect(ToolCallRef),
-    /// A retry could repeat an effect that already happened, and the retry
-    /// did not acknowledge that.
     #[error(
         "{0} already had an effect that a retry could repeat, and the retry did not acknowledge it"
     )]
     RepeatedEffectNotAcknowledged(ToolCallRef),
-    /// A new input may not carry an Attachment whose content is gone.
     #[error("{0} was cleaned up, so its content can no longer be used")]
     AttachmentCleanedUp(AttachmentId),
-    /// A submission key names one Job forever; `same_request` says whether
-    /// the refused creation was for the request that created it.
     #[error("the submission key already created {job}")]
     SubmissionKeyUsed { job: JobId, same_request: bool },
-    /// Committing would leave [`PENDING_JOBS`](crate::db::redb::PENDING_JOBS)
-    /// above [`MAX_PENDING_JOBS`].
     #[error("pending Job capacity ({max_pending_jobs} Jobs) is full; the Job was not admitted")]
     PendingJobsLimit { max_pending_jobs: u64 },
 }
 
-/// The most pending Jobs the database may hold at once.
 pub const MAX_PENDING_JOBS: u64 = 1_048_576;

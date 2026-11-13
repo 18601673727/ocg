@@ -42,8 +42,6 @@ export function I18nProvider({ children }: { children: ReactNode }) {
   const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
-    // Defer hydration like ThemeProvider so the initial paint stays
-    // deterministic and eslint's set-state-in-effect rule stays satisfied.
     const loadTimer = window.setTimeout(() => {
       const detected = detectLocale(window.localStorage, window.navigator.language);
       setLocaleState(detected);
@@ -59,9 +57,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
     applyDocumentLocale(next);
     try {
       window.localStorage.setItem(LOCALE_STORAGE_KEY, next);
-    } catch {
-      // Private browsing should not block a language change.
-    }
+    } catch {}
   }, []);
 
   const t = useCallback<TranslateFn>((key, vars) => translate(locale, key, vars), [locale]);
@@ -80,7 +76,6 @@ export function useI18n(): I18nContextValue {
   return value;
 }
 
-/** Shorthand for components that only need the translate function. */
 export function useT(): TranslateFn {
   return useI18n().t;
 }

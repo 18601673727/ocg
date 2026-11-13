@@ -1,50 +1,30 @@
 use super::*;
 
-/// The facts observed about one request that was sent to an LLM Provider.
-/// A request refused locally before it was sent has no observation. These
-/// are raw facts; [`AvailabilityObservation::classification`] derives their
-/// availability meaning on demand, and nothing is stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailabilityObservation {
-    /// The HTTP status the Provider answered with, when one was seen.
     pub status_code: Option<u16>,
-    /// How the response ended, when it reported a finish reason.
     pub finish_reason: Option<ChatFinishReason>,
     pub raw_finish_reason: Option<String>,
-    /// The Provider or transport failure as the transport reported it. It
-    /// may accompany a response that had already begun.
     pub failure: Option<ProviderFailure>,
 }
 
-/// The availability meaning of one observation, derived from its structured
-/// facts. It is a view, never stored, and never changes the observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AvailabilityClassification {
-    /// HTTP 200 whose stream reached a normal terminal finish reason.
     Available,
-    /// Provider evidence of unavailability.
     Unavailable(UnavailableCause),
-    /// A definite refusal. It says nothing about availability and is kept
-    /// apart from the availability denominator.
     Rejected(RejectionCause),
-    /// No valid terminal evidence, or evidence this classification does not
-    /// support. Reportable, but neither success nor failure.
     Unconfirmed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnavailableCause {
-    /// The Provider answered with an HTTP 5xx status.
     ProviderServerError,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectionCause {
-    /// HTTP 429.
     RateLimited,
-    /// HTTP 401 or 403.
     AuthOrPermission,
-    /// HTTP 400, 404 or 422.
     RequestOrTarget,
 }
 
@@ -56,10 +36,6 @@ impl AvailabilityObservation {
             && self.failure.is_none()
     }
 
-    /// Classifies this observation from its observed HTTP status and finish
-    /// reason. The failure text never decides a class: a failure without an
-    /// observed status is Unconfirmed, because a timeout, reset or incomplete
-    /// exchange does not prove that the Provider was unavailable.
     #[must_use]
     pub fn classification(&self) -> AvailabilityClassification {
         match self.status_code {
@@ -70,15 +46,9 @@ impl AvailabilityObservation {
         }
     }
 
-    /// The normal terminal finish reason this observation witnesses by
-    /// itself, whatever its HTTP status: Stop or Length, with no failure
-    /// beside it and no raw reason that names another finish reason. Missing
-    /// usage is not a contradiction.
     fn normal_termination(&self) -> Option<ChatFinishReason> {
         let finish = self.finish_reason?;
         let normal = matches!(finish, ChatFinishReason::Stop | ChatFinishReason::Length);
-        // A failure beside a finish reason is conflicting evidence, and a raw
-        // reason that names a different finish reason contradicts the typed one.
         (normal
             && self.failure.is_none()
             && self
@@ -89,9 +59,6 @@ impl AvailabilityObservation {
     }
 }
 
-/// The class of an HTTP status alone. Only the statuses approved for a class
-/// have one; every other status, including 200 without a normal finish, is
-/// Unconfirmed.
 pub(in crate::db) fn classify_status(status_code: Option<u16>) -> AvailabilityClassification {
     use AvailabilityClassification::{Rejected, Unavailable, Unconfirmed};
     match status_code {
@@ -103,24 +70,15 @@ pub(in crate::db) fn classify_status(status_code: Option<u16>) -> AvailabilityCl
     }
 }
 
-/// One request sample: the evidence of one Provider request, reduced to one
-/// classification. It is derived on demand from committed AvailabilityStat
-/// records. It is never stored, and no record is changed. Several records of
-/// one request add facts, not requests; each request of a Job is a sample of
-/// its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AvailabilityRequestSample {
     pub job: JobId,
     pub request: RequestNumber,
-    /// The lowest committed AvailabilityStat ID of the request.
     pub first_record: AvailabilityStatId,
-    /// `observed_at` of `first_record`. Later records never move it.
     pub observed_at: Timestamp,
     pub classification: AvailabilityClassification,
 }
 
-/// Records of two different requests, of one Job or of two, were given to
-/// the reduction of one request.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("evidence mixes {first} and {other}")]
 pub struct MixedRequests {
@@ -129,26 +87,6 @@ pub struct MixedRequests {
 }
 
 impl AvailabilityRequestSample {
-    /// Reduces the records of one request, in any order. The result depends
-    /// only on the set of records, so a replay yields the same sample. Empty
-    /// input is no sample.
-    ///
-    /// Explicit contradictions always make the sample Unconfirmed. They are:
-    /// two different supplied HTTP statuses, where a failure's status counts
-    /// as supplied, so that an absent status conflicts with nothing; two
-    /// records, or one record, observed different finish reasons; a record
-    /// whose raw finish reason names a different finish reason than its typed
-    /// one; and a record whose failure carries an HTTP status that differs
-    /// from its own observation's status.
-    ///
-    /// Otherwise the sample is Available when its observed HTTP status is 200
-    /// and some record witnesses a normal termination on its own. The status
-    /// and the termination may come from different records; a record with no
-    /// status, or no finish, does not erase the other. A failure without a
-    /// status, a missing field, or an Unconfirmed record is not a contradiction
-    /// and is never a witness. Without that combination the observed HTTP
-    /// status decides, as for a single observation. A failure status never
-    /// classifies, and neither does a raw finish reason without a typed one.
     pub fn from_records<'a>(
         records: impl IntoIterator<Item = &'a AvailabilityStatRecord>,
     ) -> Result<Option<Self>, MixedRequests> {
@@ -160,29 +98,18 @@ impl AvailabilityRequestSample {
     }
 }
 
-/// The structured claims that the records of one request have made so far.
-/// It keeps claims, not records, so replay in any order reaches the same state.
 #[derive(Clone, Default)]
 pub(crate) struct RequestEvidence {
     pub(crate) request: Option<RequestRef>,
-    /// The lowest record ID seen, with its observed time.
     pub(crate) first: Option<(AvailabilityStatId, Timestamp)>,
-    /// The first HTTP status a record observed. Only an observed status
-    /// classifies the request.
     pub(crate) observed_status: Option<u16>,
-    /// The first HTTP status any record supplied, observed or on a failure.
     pub(crate) supplied_status: Option<u16>,
-    /// The first finish reason observed.
     pub(crate) finish: Option<ChatFinishReason>,
-    /// Some record witnesses a normal termination by itself.
     pub(crate) witness: bool,
-    /// An explicit contradiction has been seen; see `from_records`.
     pub(crate) contradictory: bool,
 }
 
 impl RequestEvidence {
-    /// Adds one record's facts. The reducer and incremental aggregation both
-    /// use it, so their classifications cannot differ.
     pub(crate) fn add(&mut self, record: &AvailabilityStatRecord) -> Result<(), MixedRequests> {
         let request = RequestRef {
             job: record.job,
@@ -207,7 +134,6 @@ impl RequestEvidence {
         if let Some(status) = observation.status_code {
             self.observed_status.get_or_insert(status);
         }
-        // A missing status is absence, so only supplied statuses are compared.
         let failure_status = observation
             .failure
             .as_ref()
@@ -249,17 +175,10 @@ impl RequestEvidence {
     }
 }
 
-/// One availability observation of an LLM request made by a Job. The LLM it
-/// concerns is the one the Job froze at submission, never a caller-supplied
-/// target. The Job's outcome is neither consulted nor changed, so an
-/// observation may be recorded, and stays, whatever the Job's outcome.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AvailabilityStat {
     pub job: JobId,
-    /// The Provider request of the Job the record observes.
     pub request: RequestNumber,
-    /// When the request was observed, as its producer reports it.
-    /// Observation queries filter and order by this time.
     pub observed_at: Timestamp,
     pub observation: AvailabilityObservation,
 }
@@ -275,50 +194,29 @@ pub struct DecisionTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AvailabilityStatRecord {
     pub id: AvailabilityStatId,
-    /// Assembled from OBSERVES.
     pub job: JobId,
-    /// See [`AvailabilityStat::request`].
     pub request: RequestNumber,
-    /// Read from the Job's frozen input when it is an LLM Job.
     pub target: Option<LlmTarget>,
-    /// Read from the Job's frozen input when it is a native Decision Job.
     pub decision_target: Option<DecisionTarget>,
-    /// The producer's time, see [`AvailabilityStat::observed_at`].
     pub observed_at: Timestamp,
     pub observation: AvailabilityObservation,
-    /// The wall-clock time at which the database's write transaction that
-    /// stored the record began, not when its commit completed. Wall-clock
-    /// time is not monotonic. It is never used in place of `observed_at`.
     pub recorded_at: Timestamp,
 }
 
-/// A half-open time range, `from` included and `until` excluded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeRange {
     pub from: Timestamp,
     pub until: Timestamp,
 }
 
-/// Selects Metrics or AvailabilityStats. Each `Some` field must match.
-/// Provider and model are compared with the target its Job froze, never with
-/// the current contents of any config, so records from before an edit stay
-/// selectable by what they actually ran. Only the records of Jobs that froze
-/// an LLM are indexed by scope, so only those can be selected. Choosing
-/// records this way decides nothing about grouping, current validity or
-/// availability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationFilter {
-    /// Compared with the producer's observation time; the time a record was
-    /// committed cannot be filtered on.
     pub observed: TimeRange,
     pub llm_profile: Option<ProfileId>,
     pub provider: Option<LlmProviderId>,
-    /// Compared exactly with the frozen model name.
     pub model: Option<String>,
 }
 
-/// A position in the global observation timeline: the producer's observation
-/// time, then the request event itself. A page continues strictly older than it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ObservationCursor {
     pub observed_at: Timestamp,
@@ -327,17 +225,12 @@ pub struct ObservationCursor {
     pub seq: u32,
 }
 
-/// One page of an observation query. `next` is `None` once nothing in the
-/// filter's time range remains after this page. A page may be empty while
-/// `next` is set: the bounded scan behind it found no match, and the query
-/// continues from `next`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObservationPage<T> {
     pub records: Vec<T>,
     pub next: Option<ObservationCursor>,
 }
 
-/// Aggregated statistics of one tool's admissions and execution outcomes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolStatRecord {
     pub name: String,
