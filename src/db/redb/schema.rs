@@ -7,8 +7,8 @@ pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
 /// Names the exact table set and record encodings of the format. A database
 /// whose fingerprint differs is incompatible even when its format number matches.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
-pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v4";
-pub(super) const DATABASE_FORMAT_VERSION: u64 = 23;
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v1";
+pub(super) const DATABASE_FORMAT_VERSION: u64 = 1;
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;
@@ -86,7 +86,6 @@ pub(super) const CONVERSATIONS: TableDefinition<u128, ()> = TableDefinition::new
 pub(super) const TURNS: TableDefinition<(u128, u128), ()> = TableDefinition::new("turn");
 
 pub(super) const PENDING: TableDefinition<u128, ()> = TableDefinition::new("pending");
-pub(super) const READY: TableDefinition<(u16, u128), ()> = TableDefinition::new("ready");
 /// The ready queue orders high priority first, then submission time and Job ID.
 pub(super) const MUTABLE_READY: TableDefinition<(u8, i64, u128, u16), ()> =
     TableDefinition::new("ready");
@@ -94,8 +93,6 @@ pub(super) const DELAYED: TableDefinition<(i64, u128), ()> = TableDefinition::ne
 pub(super) const DEPENDENCY_WAITERS: TableDefinition<(u128, u128), u8> =
     TableDefinition::new("dependency_waiter");
 pub(super) const UNSETTLED: TableDefinition<u128, (u32, u32)> = TableDefinition::new("unsettled");
-pub(super) const HELD_SLOTS: TableDefinition<(u128, u128), (u64, bool)> =
-    TableDefinition::new("held_slot");
 pub(super) const CHILDREN: TableDefinition<(u128, u128), ()> = TableDefinition::new("children");
 pub(super) const SUCCESSORS: TableDefinition<u128, ()> = TableDefinition::new("successor");
 /// (conversation, Unicode gram, turn)

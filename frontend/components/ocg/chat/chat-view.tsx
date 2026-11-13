@@ -870,27 +870,6 @@ export function ConversationCardStrip({
         if (client.openConversation) {
           await client.openConversation(card.conversation);
         }
-      } else {
-        try {
-          await control.releaseSlot(card.turn);
-        } catch (cause) {
-          if (!(cause instanceof ControlTransportError) || cause.code !== "confirm_required")
-            throw cause;
-          if (window.confirm(t("chat.card.confirm"))) await control.releaseSlot(card.turn, true);
-        }
-        setCards((prev) =>
-          prev.filter(
-            (c) =>
-              !(
-                c.kind === "quarantine" &&
-                c.conversation === card.conversation &&
-                c.turn === card.turn
-              ),
-          ),
-        );
-        if (client.openConversation) {
-          await client.openConversation(card.conversation);
-        }
       }
       setRevision((value) => value + 1);
     } catch (cause) {
@@ -1029,14 +1008,6 @@ export function ConversationCardStrip({
                 <Button size="xs" disabled={pending} onClick={() => void act(card)}>
                   {t("chat.child.unhold")}
                 </Button>
-              )}
-              {card.kind === "quarantine" && (
-                <>
-                  <p className="mb-2 font-mono text-muted-foreground">{card.turn}</p>
-                  <Button size="xs" disabled={pending} onClick={() => void act(card)}>
-                    {t("chat.card.release")}
-                  </Button>
-                </>
               )}
             </div>
           );

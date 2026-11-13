@@ -32,7 +32,6 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub(crate) struct DecisionExecution {
     pub result: DecisionResult,
     pub raw: Value,
-    pub usage: NormalizedUsage,
     pub status_code: u16,
     pub finished_in: Duration,
 }
@@ -247,7 +246,7 @@ fn decode_decision(
             facts: facts(),
         })?;
     let raw = redactor.json_value(raw);
-    let (result, usage) = decode_response(frozen, input, reference, &raw).map_err(|message| {
+    let (result, _) = decode_response(frozen, input, reference, &raw).map_err(|message| {
         ProviderExecutionError::Incomplete {
             message,
             facts: facts(),
@@ -266,7 +265,6 @@ fn decode_decision(
     Ok(DecisionExecution {
         result,
         raw,
-        usage,
         status_code: status,
         finished_in,
     })
@@ -757,90 +755,5 @@ fn decision_conversation(
     ChatConversation {
         messages,
         ..ChatConversation::default()
-    }
-}
-
-pub(crate) async fn execute_decision(
-    frozen: &FrozenDecisionConfig,
-    input: &DecisionRequest,
-    body: &Value,
-    resolver: &dyn CredentialResolver,
-    config: &ProviderExecutionConfig,
-    reference: RequestRef,
-) -> Result<DecisionExecution, ProviderExecutionError> {
-    match frozen {
-        FrozenDecisionConfig::Native(native) => {
-            execute_native(native, input, body, resolver, config, reference, None).await
-        }
-        FrozenDecisionConfig::Generative(generative, profile) => {
-            request_body(frozen, input)?;
-            let execution = super::generative_model::execute_conversation(
-                generative,
-                &decision_conversation(
-                    generative,
-                    input,
-                    profile
-                        .as_ref()
-                        .and_then(|(agent, _)| agent.instructions.as_deref()),
-                ),
-                resolver,
-                config,
-                None,
-            )
-            .await?
-            .admitted()?;
-            let facts = || ResponseFacts {
-                status_code: execution.status_code,
-                finish_reason: execution.finish_reason,
-                raw_finish_reason: execution.raw_finish_reason.clone(),
-            };
-            if execution.text.len() > MAX_RESPONSE_BYTES {
-                return Err(ProviderExecutionError::Incomplete {
-                    message: "decision response exceeded 1 MiB".into(),
-                    facts: facts(),
-                });
-            }
-            let mut outcome: DecisionOutcome =
-                serde_json::from_str(&execution.text).map_err(|_| {
-                    ProviderExecutionError::Incomplete {
-                        message: "generative decision response did not match the decision schema"
-                            .into(),
-                        facts: facts(),
-                    }
-                })?;
-            if let DecisionOutcome::Answer {
-                answer:
-                    DecisionAnswer::Choice { confidence, .. }
-                    | DecisionAnswer::OrdinalScore { confidence, .. },
-            } = &mut outcome
-                && let Some(confidence) = confidence
-            {
-                confidence.semantics = frozen.confidence_semantics().into();
-            }
-            let result = DecisionResult {
-                schema_version: crate::db::entities::DECISION_SCHEMA_VERSION,
-                outcome,
-                requested_model: frozen.model_name().into(),
-                reported_model: None,
-                model_version: None,
-                model: frozen.model_ref(),
-                agent: frozen.agent_ref(),
-                connection: frozen.connection_ref(),
-                request: reference,
-            };
-            result
-                .validate(input, frozen, reference)
-                .map_err(|message| ProviderExecutionError::Incomplete {
-                    message: message.into(),
-                    facts: facts(),
-                })?;
-            Ok(DecisionExecution {
-                raw: json!({"text":execution.text,"response_items":execution.response_items}),
-                result,
-                usage: execution.usage,
-                status_code: execution.status_code,
-                finished_in: execution.finished_in,
-            })
-        }
     }
 }

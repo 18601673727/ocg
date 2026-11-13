@@ -438,6 +438,28 @@ fn recurrence_json(row: &Recurrence) -> RecurrenceView {
     }
 }
 
+fn dependency_views(
+    depends_on: &[(JobId, DependencyCondition, DependencyState)],
+) -> Vec<DependencyView> {
+    depends_on
+        .iter()
+        .map(|(job, condition, state)| DependencyView {
+            job: job.to_string(),
+            condition: match condition {
+                DependencyCondition::Success => "success",
+                DependencyCondition::Settled => "settled",
+            }
+            .to_owned(),
+            state: match state {
+                DependencyState::Waiting => "waiting",
+                DependencyState::Satisfied => "satisfied",
+                DependencyState::Impossible => "impossible",
+            }
+            .to_owned(),
+        })
+        .collect()
+}
+
 /// One node of the tree, as the route reports it. The children of a node
 /// are the nodes the tree holds below it.
 fn tree_node_json(node: &TreeNode, tree: &JobTree) -> TreeNodeView {
@@ -480,8 +502,10 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> TreeNodeView {
             keep_open,
             active_turn,
             recurrence,
+            depends_on,
         } => {
             value.kind = super::jobs::JobKindView::Conversation;
+            value.depends_on = dependency_views(depends_on);
             value.title = title.clone();
             value.state = (*state).to_owned();
             value.on_hold = on_hold.as_ref().map(|by| HoldView { by: actor_view(by) });
@@ -510,23 +534,7 @@ fn tree_node_json(node: &TreeNode, tree: &JobTree) -> TreeNodeView {
             });
             value.conversation = conversation.map(|id| id.to_string());
             value.previous = previous.map(|id| id.to_string());
-            value.depends_on = depends_on
-                .iter()
-                .map(|(job, condition, state)| DependencyView {
-                    job: job.to_string(),
-                    condition: match condition {
-                        DependencyCondition::Success => "success",
-                        DependencyCondition::Settled => "settled",
-                    }
-                    .to_owned(),
-                    state: match state {
-                        DependencyState::Waiting => "waiting",
-                        DependencyState::Satisfied => "satisfied",
-                        DependencyState::Impossible => "impossible",
-                    }
-                    .to_owned(),
-                })
-                .collect();
+            value.depends_on = dependency_views(depends_on);
         }
     }
     value
@@ -1371,17 +1379,11 @@ pub(super) async fn edit_conversation(
         other => profiles::map_mutation_error(other),
     };
     if matches!(edit, JobEdit::Hide) {
-        let action = shared
+        shared
             .database
             .hide_conversation(root)
             .await
             .map_err(map_error)?;
-        for running in action.running {
-            shared
-                .scheduler
-                .stop(running, crate::db::entities::StopCause::Closed)
-                .await;
-        }
     } else {
         shared
             .database

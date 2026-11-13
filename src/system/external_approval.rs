@@ -746,6 +746,7 @@ pub(crate) async fn run_approved_external(
             handoff,
             &config,
             EndpointPolicy::ApprovedExternal(approval),
+            None,
         ),
     )
     .await;

@@ -1,7 +1,11 @@
-//! `ocg loopback-scheduling preflight --data-dir <path> [--database <id>]`
+//! `ocg loopback-scheduling preflight --data-dir <path> [--database <id>
+//!  [--allow-job <job>]...]`
 //! `ocg loopback-scheduling serve --data-dir <path> --database <id>
 //!  --confirm-first-activation --confirm-loopback-only
 //!  [--confirm-challenge <ocg1-...>]`
+//! `ocg loopback-scheduling serve --data-dir <path> --database <id>
+//!  --confirm-queued-work --allow-job <job> [--allow-job <job>]... (1 to 16)
+//!  --confirm-loopback-only [--confirm-challenge <ocg1-...>]`
 //!
 //! The operator's explicit, per-run activation of autonomous loopback
 //! scheduling; see [`crate::system::loopback_activation`].
@@ -39,6 +43,17 @@
 //! authority: whoever can run `serve` this way could already run arbitrary
 //! commands as this user over these files.
 //!
+//! A *queued-work* activation (`--confirm-queued-work`, and `--allow-job` on
+//! `preflight` to get its challenge) is the other mode, and the two are never
+//! mixed: a command line is exactly one of them. It lets a database that holds
+//! queued work be activated again, but only when the operator names every
+//! queued Job, and every named Job is a submitted, never-started Generative
+//! Job frozen for the strict loopback policy. Any other queued Job, Delayed
+//! Job, Allocation, loop or dependency waiter refuses it, untouched. Its
+//! challenge binds the mode, the canonical allowlist and each Job's identity,
+//! revision and stored row, so a changed Job, queue or allowlist is a
+//! different challenge.
+//!
 //! Neither command creates a database. A build without the
 //! `autonomous_scheduling` control refuses `serve` before opening anything.
 
@@ -50,22 +65,25 @@ use crate::api::v1::ControlPlaneConfig;
 use crate::system::data_directory::DataDirectory;
 use crate::system::execution_controls::ExecutionControl;
 use crate::system::loopback_activation::{
-    ActivationRequest, Confirmation, DatabaseIdentity, Preflight, preflight, record_state_reread,
+    ActivationMode, ActivationRequest, Confirmation, DatabaseIdentity, Preflight, QueuedAllowlist,
+    preflight, record_state_reread,
 };
 
 pub(super) const COMMAND: &str = "loopback-scheduling";
 
-const USAGE: &str = "usage: ocg loopback-scheduling preflight --data-dir <path> [--database <device:inode>]\n       ocg loopback-scheduling serve --data-dir <path> --database <device:inode> --confirm-first-activation --confirm-loopback-only [--confirm-challenge <ocg1-...>]";
+const USAGE: &str = "usage: ocg loopback-scheduling preflight --data-dir <path> [--database <device:inode> [--allow-job <job-id>]...]\n       ocg loopback-scheduling serve --data-dir <path> --database <device:inode> --confirm-first-activation --confirm-loopback-only [--confirm-challenge <ocg1-...>]\n       ocg loopback-scheduling serve --data-dir <path> --database <device:inode> --confirm-queued-work --allow-job <job-id> [--allow-job <job-id>]... (1 to 16) --confirm-loopback-only [--confirm-challenge <ocg1-...>]";
 
 enum Command {
     Preflight {
         data_directory: PathBuf,
         database: Option<DatabaseIdentity>,
+        mode: ActivationMode,
     },
     Serve {
         data_directory: PathBuf,
         database: DatabaseIdentity,
         challenge: Option<String>,
+        mode: ActivationMode,
     },
 }
 
@@ -73,7 +91,8 @@ fn parse(arguments: &[String]) -> Result<Command, Failure> {
     let mut iterator = arguments.iter();
     let verb = iterator.next().ok_or(USAGE)?;
     let (mut data_directory, mut database) = (None, None);
-    let (mut first, mut loopback) = (false, false);
+    let (mut first, mut queued_work, mut loopback) = (false, false, false);
+    let mut allowed: Vec<String> = Vec::new();
     let mut challenge = None;
     while let Some(flag) = iterator.next() {
         match flag.as_str() {
@@ -81,6 +100,18 @@ fn parse(arguments: &[String]) -> Result<Command, Failure> {
                 if std::mem::replace(&mut first, true) {
                     return Err(USAGE.into());
                 }
+            }
+            "--confirm-queued-work" => {
+                if std::mem::replace(&mut queued_work, true) {
+                    return Err(USAGE.into());
+                }
+            }
+            "--allow-job" => {
+                let value = iterator.next().ok_or(USAGE)?;
+                if value.is_empty() {
+                    return Err(USAGE.into());
+                }
+                allowed.push(value.to_owned());
             }
             "--confirm-loopback-only" => {
                 if std::mem::replace(&mut loopback, true) {
@@ -112,15 +143,41 @@ fn parse(arguments: &[String]) -> Result<Command, Failure> {
         }
     }
     let data_directory = data_directory.ok_or(USAGE)?;
+    // The allowlist is parsed only for a mode that has one; the two modes are
+    // never mixed.
+    let allowlist = |allowed: &[String]| {
+        QueuedAllowlist::parse(allowed)
+            .map(ActivationMode::QueuedWork)
+            .map_err(|detail| refused("queued_work_allowlist", &detail))
+    };
     match verb.as_str() {
-        "preflight" if !first && !loopback && challenge.is_none() => Ok(Command::Preflight {
-            data_directory,
-            database,
-        }),
-        "serve" if first && loopback => Ok(Command::Serve {
+        "preflight" if !first && !queued_work && !loopback && challenge.is_none() => {
+            // A queued-work reading is asked for by naming Jobs, and needs the
+            // database it is for, like any other requested activation.
+            let mode = if allowed.is_empty() {
+                ActivationMode::FirstActivation
+            } else if database.is_some() {
+                allowlist(&allowed)?
+            } else {
+                return Err(USAGE.into());
+            };
+            Ok(Command::Preflight {
+                data_directory,
+                database,
+                mode,
+            })
+        }
+        "serve" if loopback && first && !queued_work && allowed.is_empty() => Ok(Command::Serve {
             data_directory,
             database: database.ok_or(USAGE)?,
             challenge,
+            mode: ActivationMode::FirstActivation,
+        }),
+        "serve" if loopback && queued_work && !first => Ok(Command::Serve {
+            data_directory,
+            database: database.ok_or(USAGE)?,
+            challenge,
+            mode: allowlist(&allowed)?,
         }),
         _ => Err(USAGE.into()),
     }
@@ -156,12 +213,14 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Failure> {
         Command::Preflight {
             data_directory,
             database,
-        } => run_preflight(&data_directory, database),
+            mode,
+        } => run_preflight(&data_directory, database, mode),
         Command::Serve {
             data_directory,
             database,
             challenge,
-        } => run_serve(data_directory, database, challenge),
+            mode,
+        } => run_serve(data_directory, database, challenge, mode),
     }
 }
 
@@ -172,7 +231,11 @@ fn print_report(report: &serde_json::Value) {
     );
 }
 
-fn run_preflight(named: &Path, database: Option<DatabaseIdentity>) -> Result<(), Failure> {
+fn run_preflight(
+    named: &Path,
+    database: Option<DatabaseIdentity>,
+    mode: ActivationMode,
+) -> Result<(), Failure> {
     let data_directory = existing(named)?;
     let request = database.map(|database| ActivationRequest {
         data_directory: named.to_path_buf(),
@@ -183,6 +246,7 @@ fn run_preflight(named: &Path, database: Option<DatabaseIdentity>) -> Result<(),
             clean_shutdown: false,
             state: String::new(),
         },
+        mode,
     });
     // No host, no worker, no opening: a read of the file, nothing else.
     let Preflight { report, .. } = preflight(&data_directory, request.as_ref());
@@ -194,6 +258,7 @@ fn run_serve(
     named: PathBuf,
     database: DatabaseIdentity,
     supplied_challenge: Option<String>,
+    mode: ActivationMode,
 ) -> Result<(), Failure> {
     if !ExecutionControl::AutonomousScheduling.is_enabled() {
         return Err(refused(
@@ -215,6 +280,7 @@ fn run_serve(
             clean_shutdown: false,
             state: String::new(),
         },
+        mode,
     };
 
     // The advisory reading: it decides nothing, but a refusal it already
@@ -242,7 +308,7 @@ fn run_serve(
         .to_owned();
     let confirmed = match supplied_challenge {
         Some(supplied) => supplied,
-        None => ask(&challenge)?,
+        None => ask(&challenge, &request.mode)?,
     };
     if confirmed.trim() != challenge || state.is_empty() {
         let mut report = preliminary.report;
@@ -250,9 +316,10 @@ fn run_serve(
         report["refusal"] = serde_json::json!({
             "code": "activation_confirmation",
             "detail": format!(
-                "the confirmation did not name this database state: the challenge for {} at open_epoch {} is {challenge}; a first activation needs the operator to confirm the state a preflight just printed, in this process",
+                "the confirmation did not name this database state: the challenge for {} at open_epoch {} is {challenge}; {} needs the operator to confirm the state a preflight just printed, in this process",
                 named.display(),
                 report.get("database_epoch").cloned().unwrap_or(serde_json::Value::Null),
+                request.mode.subject(),
             ),
         });
         report["checks"] = serde_json::json!([{
@@ -327,7 +394,7 @@ fn run_serve(
 /// not claim otherwise: any process can write to standard input, and the
 /// challenge, not the terminal, is what binds the confirmation to a database
 /// state and one opening.
-fn ask(challenge: &str) -> Result<String, Failure> {
+fn ask(challenge: &str, mode: &ActivationMode) -> Result<String, Failure> {
     if !std::io::stdin().is_terminal() {
         return Err(refused(
             "confirmation_required",
@@ -337,7 +404,8 @@ fn ask(challenge: &str) -> Result<String, Failure> {
         ));
     }
     eprintln!(
-        "Confirm the first autonomous loopback activation by typing this challenge:\n\n  {challenge}\n"
+        "Confirm {} of autonomous loopback scheduling by typing this challenge:\n\n  {challenge}\n",
+        mode.subject()
     );
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).map_err(|error| {

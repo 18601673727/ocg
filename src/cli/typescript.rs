@@ -96,7 +96,6 @@ pub fn typescript() -> String {
     declarations.visit::<crate::api::v1::StopView>();
     declarations.visit::<crate::api::v1::CompactionView>();
     declarations.visit::<crate::api::v1::ApprovalDecisionView>();
-    declarations.visit::<crate::api::v1::ReleaseSlotView>();
     declarations.visit::<crate::api::v1::CardsView>();
     declarations.visit::<crate::api::v1::ChildrenView>();
     declarations.visit::<crate::api::v1::TreeView>();

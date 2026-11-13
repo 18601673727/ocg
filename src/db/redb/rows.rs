@@ -4,11 +4,11 @@ use super::codec::{TAG_JOB_INPUT, TAG_NOTICE};
 use super::*;
 use crate::db::entities::{
     AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
-    ClaimRecord, CleanupKind, CommandOwner, CommandStatus, ConfigBody, ConfigId, ConfigKind,
-    ConnectionConfig, ContentDigest, EffectConclusion, ExecutionOperation, JobClosing, JobId,
-    JobOutputId, JobOutputRecord, LlmParameters, LlmTransport, Measurements, ModelCapability,
-    ModelConfig, NotInvokedReason, OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig,
-    ProjectCommand, ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
+    CleanupKind, CommandOwner, CommandStatus, ConfigBody, ConfigId, ConfigKind, ConnectionConfig,
+    ContentDigest, EffectConclusion, ExecutionOperation, JobClosing, JobId, JobOutputId,
+    JobOutputRecord, LlmParameters, LlmTransport, Measurements, ModelCapability, ModelConfig,
+    NotInvokedReason, OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand,
+    ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
     RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, Timestamp,
     ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
     ToolPayload, ToolReconciliation, UncertainCause, UsageFinality, WithheldReason,
@@ -76,17 +76,25 @@ impl JobSpec {
                 })
             })?;
             d.end()?;
-            if !matches!(
-                &kind,
+            // A root conversation is the user's; a child is opened by an
+            // Agent's tool call inside its parent.
+            let shape = match &kind {
                 JobKind::Group {
                     origin: Origin::User,
                     keep_open: true,
                     ..
+                } => parent_id.is_none(),
+                JobKind::Group {
+                    origin: Origin::Agent { .. },
+                    ..
+                } => parent_id.is_some(),
+                JobKind::Group {
+                    origin: Origin::User | Origin::System,
+                    ..
                 }
-            ) || parent_id.is_some()
-                || allocation.is_some()
-                || id.get() == 0
-            {
+                | JobKind::Execution { .. } => false,
+            };
+            if !shape || allocation.is_some() || id.get() == 0 {
                 return Err(StorageError::corrupted("invalid mutable conversation"));
             }
             return Ok(JobSpec {
@@ -153,20 +161,6 @@ impl JobState {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_JOB_STATE);
         e.u128(self.job_id.get());
-        e.opt(self.claim.as_ref(), |e, c| {
-            e.ts(c.started_at);
-            e.u128(c.pool_id.get());
-            e.u32(c.pool_edit_seq);
-            e.u32(c.capabilities.len() as u32);
-            for (op, proto) in &c.capabilities {
-                e.u8(op.code());
-                e.opt(proto.as_ref(), |e, p| e.u8(p.code()));
-            }
-            e.u64(c.epoch);
-            e.ostr(c.host_id.as_deref());
-            e.ostr(c.boot_id.as_deref());
-            e.u32(c.notice_seq);
-        });
         e.opt(self.outcome.as_ref(), |e, o| {
             e.u8(o.kind.code());
             e.ts(o.at);
@@ -204,32 +198,6 @@ impl JobState {
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB_STATE)?;
         let job_id = JobId::new(d.u128()?);
-        let claim = d.opt(|d| {
-            let started_at = d.ts()?;
-            let pool_id = ConfigId::new(d.u128()?);
-            let pool_edit_seq = d.u32()?;
-            let cap_len = d.u32()? as usize;
-            let mut capabilities = BTreeSet::new();
-            for _ in 0..cap_len {
-                let op = d.code(ExecutionOperation::from_code)?;
-                let proto = d.opt(|d| d.code(LlmTransport::from_code))?;
-                capabilities.insert((op, proto));
-            }
-            let epoch = d.u64()?;
-            let host_id = d.ostr()?;
-            let boot_id = d.ostr()?;
-            let notice_seq = d.u32()?;
-            Ok(ClaimRecord {
-                started_at,
-                pool_id,
-                pool_edit_seq,
-                capabilities,
-                epoch,
-                host_id,
-                boot_id,
-                notice_seq,
-            })
-        })?;
         let outcome = d.opt(|d| {
             let kind = d.code_with(OutcomeKind::from_code, |code| {
                 StorageError::corrupted(format!("invalid outcome kind {code}"))
@@ -265,7 +233,6 @@ impl JobState {
         d.end()?;
         Ok(JobState {
             job_id,
-            claim,
             outcome,
             stop_confirmed_at,
             stop_confirmed_by,
@@ -723,6 +690,20 @@ impl JobControl {
         });
         e.opt(self.compaction_policy.as_ref(), Enc::compaction_policy);
         e.u64(self.compaction_revision);
+        e.u8(u8::try_from(self.after.len()).unwrap_or(u8::MAX));
+        for (job, condition) in &self.after {
+            e.u128(job.get());
+            e.u8(match condition {
+                DependencyCondition::Success => 1,
+                DependencyCondition::Settled => 2,
+            });
+        }
+        e.u8(u8::try_from(self.retried.len()).unwrap_or(u8::MAX));
+        for job in &self.retried {
+            e.u128(job.get());
+        }
+        e.bool(self.user_input);
+        e.ou128(self.reported.map(JobId::get));
         e.0
     }
 
@@ -749,6 +730,28 @@ impl JobControl {
             })?,
             compaction_policy: d.opt(Dec::compaction_policy)?,
             compaction_revision: d.u64()?,
+            after: {
+                let mut after = Vec::new();
+                for _ in 0..d.u8()? {
+                    let job = JobId::new(d.u128()?);
+                    let condition = match d.u8()? {
+                        1 => DependencyCondition::Success,
+                        2 => DependencyCondition::Settled,
+                        _ => return Err(StorageError::corrupted("invalid dependency condition")),
+                    };
+                    after.push((job, condition));
+                }
+                after
+            },
+            retried: {
+                let mut retried = Vec::new();
+                for _ in 0..d.u8()? {
+                    retried.push(JobId::new(d.u128()?));
+                }
+                retried
+            },
+            user_input: d.bool()?,
+            reported: d.ou128()?.map(JobId::new),
         };
         d.end()?;
         Ok(row)
@@ -793,6 +796,11 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
             ToolOutcome::CompletedWithheld { reason } => {
                 e.u8(2);
                 e.u8(reason.code());
+            }
+            ToolOutcome::CompletedElided { bytes, digest } => {
+                e.u8(7);
+                e.u64(*bytes);
+                e.0.extend_from_slice(digest.as_bytes());
             }
             ToolOutcome::NotApplied { message } => {
                 e.u8(3);
@@ -861,6 +869,14 @@ pub(super) fn decode_tool_evidence(
             },
             2 => ToolOutcome::CompletedWithheld {
                 reason: d.code(WithheldReason::from_code)?,
+            },
+            7 => ToolOutcome::CompletedElided {
+                bytes: d.u64()?,
+                digest: ContentDigest::from_bytes(
+                    d.take(32)?
+                        .try_into()
+                        .map_err(|_| StorageError::corrupted("invalid tool result digest"))?,
+                ),
             },
             3 => ToolOutcome::NotApplied { message: d.str()? },
             4 => ToolOutcome::NotInvoked {
@@ -1101,29 +1117,6 @@ impl JobInputEntry {
     }
 }
 impl Notice {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_NOTICE);
-        e.u8(self.class.code());
-        match &self.body {
-            NoticeBody::Event {
-                child,
-                event,
-                reference,
-            } => {
-                e.u8(0);
-                e.u128(child.get());
-                e.notice_event(event);
-                e.u128(reference.get());
-            }
-            NoticeBody::Record { event, by, at } => {
-                e.u8(1);
-                e.u8(event.code());
-                e.actor(by);
-                e.ts(*at);
-            }
-        };
-        e.0
-    }
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_NOTICE)?;
         let class = d.code_with(NoticeClass::from_code, |_| {

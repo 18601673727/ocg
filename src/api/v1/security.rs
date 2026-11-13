@@ -41,13 +41,12 @@ fn conversation_action(rest: &str) -> bool {
     matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry" | "compact" | "queue"), None) if !id.is_empty())
 }
 
-fn approval_or_release(rest: &str) -> bool {
+fn approval_route(rest: &str) -> bool {
     let segments = rest.split('/').collect::<Vec<_>>();
     match segments.as_slice() {
         ["approvals", job, request, index] => {
             !job.is_empty() && !request.is_empty() && !index.is_empty()
         }
-        ["jobs", job, "release-slot"] => !job.is_empty(),
         _ => false,
     }
 }
@@ -90,7 +89,7 @@ fn takes_post(path: &str) -> bool {
                 || pool_archive(rest)
                 || decision(rest)
                 || profile_availability(rest)
-                || approval_or_release(rest)
+                || approval_route(rest)
                 || MEMBER_COLLECTIONS
                     .iter()
                     .any(|collection| member(rest, collection))
@@ -131,7 +130,7 @@ fn json_post_limit(path: &str) -> Option<usize> {
             || decision(rest)
             || profile_availability(rest)
             || conversation_action(rest)
-            || approval_or_release(rest)
+            || approval_route(rest)
             || MEMBER_COLLECTIONS
                 .iter()
                 .any(|collection| member(rest, collection)))

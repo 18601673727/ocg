@@ -116,7 +116,9 @@ pub(crate) trait ToolHandler: Send + Sync {
     /// handler is registered.
     fn effect(&self) -> ToolEffect;
 
-    /// Whether this handler may start an operating-system process.
+    /// Whether this handler runs workers or processes that a stop must wait
+    /// for: [`Self::stop`] is called when a call of it is cancelled or times
+    /// out.
     fn spawns(&self) -> bool {
         false
     }
@@ -385,49 +387,6 @@ pub(crate) struct Dispatch {
 }
 
 impl ToolOffer {
-    pub(crate) fn with_network(&self) -> Result<Self, ToolRegistryError> {
-        super::network::register(&self.registry)?;
-        let names = self
-            .tools
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .chain(super::network::NAMES)
-            .collect::<Vec<_>>();
-        self.registry.offer(&names)
-    }
-
-    pub(crate) fn with_ask_user(&self) -> Result<Self, ToolRegistryError> {
-        super::job_tools::register_ask_user(&self.registry)?;
-        let names = self
-            .tools
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .chain(["ask_user"])
-            .collect::<Vec<_>>();
-        self.registry.offer(&names)
-    }
-    pub(crate) fn with_job_plan(&self) -> Result<Self, ToolRegistryError> {
-        super::job_tools::register_plan(&self.registry)?;
-        let names = self
-            .tools
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .chain(["job_plan"])
-            .collect::<Vec<_>>();
-        self.registry.offer(&names)
-    }
-
-    pub(crate) fn with_job_tools(&self) -> Result<Self, ToolRegistryError> {
-        super::job_tools::register(&self.registry)?;
-        let names = self
-            .tools
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .chain(super::job_tools::NAMES)
-            .collect::<Vec<_>>();
-        self.registry.offer(&names)
-    }
-
     /// The definitions to send, read from the registry now. Every selected
     /// tool must still be the registration selected, and still authorized.
     ///

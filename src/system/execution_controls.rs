@@ -51,7 +51,10 @@ pub(crate) enum ExecutionControl {
     ProviderDiscovery,
     /// Adopting, retrying or redispatching work after a restart.
     RecoveryAndRedispatch,
-    /// Tools, child Jobs and agent-originated calls.
+    /// Tools, child Jobs and agent-originated calls. Enabled, it lets the
+    /// native scheduler run a Job whose Agent has a Workspace grant with the
+    /// tools of that grant, on a literal loopback endpoint only: no external
+    /// path authorizes more than one request.
     ToolsAndChildJobs,
     /// Creating or changing files in a Workspace.
     WorkspaceMutation,
@@ -93,14 +96,14 @@ impl ExecutionControl {
         match self {
             ExecutionControl::ManualLoopbackExecution => ControlState::Enabled,
             ExecutionControl::AutonomousScheduling => ControlState::Enabled,
+            ExecutionControl::ToolsAndChildJobs => ControlState::Enabled,
+            ExecutionControl::WorkspaceMutation => ControlState::Enabled,
             ExecutionControl::ManualExternalTrial
             | ExecutionControl::ManualExternalExecution
             | ExecutionControl::ScheduledExternalTransport
             | ExecutionControl::ExternalProviderTransport
             | ExecutionControl::ProviderDiscovery
             | ExecutionControl::RecoveryAndRedispatch
-            | ExecutionControl::ToolsAndChildJobs
-            | ExecutionControl::WorkspaceMutation
             | ExecutionControl::LegacyProviderExecution => ControlState::Disabled,
         }
     }

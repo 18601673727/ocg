@@ -203,6 +203,13 @@ pub enum ToolOutcome {
     /// The handler returned, so its effect happened, but its result was not
     /// sent on.
     CompletedWithheld { reason: WithheldReason },
+    /// A read-only handler returned this result and it was sent on, but the
+    /// call keeps only its size and SHA-256. The result text is stored once,
+    /// in the next request's tool message, so keeping it here too would
+    /// store the same fact twice. Only a handler that declares
+    /// [`ToolEffect::ReadOnly`] may be recorded this way: nothing it did
+    /// needs recovering, and running it again repeats nothing.
+    CompletedElided { bytes: u64, digest: ContentDigest },
     /// The handler established that its effect did not happen.
     NotApplied { message: String },
     /// OCG never invoked the handler, for `reason`, after the admission.
@@ -229,6 +236,7 @@ pub enum NotInvokedReason {
 pub enum ToolOutcomeKind {
     Completed,
     CompletedWithheld,
+    CompletedElided,
     NotApplied,
     NotInvoked,
     Uncertain,
@@ -239,6 +247,7 @@ impl ToolOutcome {
         match self {
             Self::Completed { .. } => ToolOutcomeKind::Completed,
             Self::CompletedWithheld { .. } => ToolOutcomeKind::CompletedWithheld,
+            Self::CompletedElided { .. } => ToolOutcomeKind::CompletedElided,
             Self::NotApplied { .. } => ToolOutcomeKind::NotApplied,
             Self::NotInvoked { .. } => ToolOutcomeKind::NotInvoked,
             Self::Uncertain { .. } => ToolOutcomeKind::Uncertain,

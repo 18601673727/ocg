@@ -552,12 +552,6 @@ fn validate_summary(version: u32, summary: &str, omissions: &[String]) -> Result
     Ok(())
 }
 impl SummarizationResult {
-    pub(crate) fn content_budget_bytes(target_tokens: usize) -> usize {
-        target_tokens
-            .saturating_mul(3)
-            .saturating_sub(summary_context_text("", &[]).len().saturating_add(128))
-    }
-
     pub fn context_text(&self) -> String {
         summary_context_text(&self.summary, &self.omitted_details)
     }
@@ -842,8 +836,15 @@ pub struct Notice {
 pub struct JobAction {
     pub conversation: JobId,
     pub record_seq: Option<u32>,
-    pub running: Vec<JobId>,
+    /// The executions this action asked to stop, by the Allocation each runs under.
+    pub running: Vec<AllocationToken>,
+    /// The turns this action ended itself, which never ran: what depends on
+    /// each has to be told.
+    pub ended: Vec<JobId>,
     pub already: bool,
+    /// With `already`: the conversation has settled, rather than being closed
+    /// and still settling.
+    pub settled: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopCause {

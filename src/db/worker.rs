@@ -135,8 +135,6 @@ pub struct DatabaseWorker {
 /// database thread.
 #[derive(Clone)]
 pub struct DatabaseHandle {
-    pub(super) ignore_stop_cause: bool,
-    pub(super) stop_cause: Option<Arc<std::sync::Mutex<Option<crate::db::entities::StopCause>>>>,
     pub(super) sender: flume::Sender<Message>,
     pub(super) read_sender: flume::Sender<ReadMessage>,
     pub(super) control_sender: flume::Sender<Control>,
@@ -244,8 +242,6 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                let obsolete_credentials_at_open = Some(directory.join("credentials.json"))
-                    .filter(|path| std::fs::symlink_metadata(path).is_ok());
                 let credential_key = match redb::load_credential_key(&directory) {
                     Ok(key) => key,
                     Err(error) => {
@@ -295,9 +291,6 @@ impl DatabaseWorker {
                     durable_commits: AtomicU64::new(0),
                     commit_us_total: AtomicU64::new(0),
                     commit_us_max: AtomicU64::new(0),
-                    claims: AtomicU64::new(0),
-                    claim_us_total: AtomicU64::new(0),
-                    claim_us_max: AtomicU64::new(0),
                     abandoned_at_open,
                     released: AtomicBool::new(false),
                     live_readers: AtomicUsize::new(0),
@@ -312,7 +305,6 @@ impl DatabaseWorker {
                     in_flight_commands: AtomicUsize::new(0),
                     credential_key: credential_key_cell,
                     credential_key_writer: std::sync::Mutex::new(()),
-                    obsolete_credentials_at_open,
                     undecryptable_credentials_at_open,
                     open_warnings_logged: AtomicBool::new(false),
                 });
@@ -359,8 +351,6 @@ impl DatabaseWorker {
         let (read_sender, read_receiver) = flume::bounded(READ_QUEUE_CAPACITY);
         let mut worker = Self {
             handle: DatabaseHandle {
-                stop_cause: None,
-                ignore_stop_cause: false,
                 sender,
                 read_sender,
                 control_sender,
@@ -481,12 +471,6 @@ impl DatabaseHandle {
                 .swap(true, Ordering::SeqCst)
         {
             return;
-        }
-        if let Some(path) = self.shared.obsolete_credentials_at_open.as_ref() {
-            log::warn!(
-                "ignoring obsolete {}; remove it after verifying migration",
-                path.display()
-            );
         }
         if self.shared.undecryptable_credentials_at_open > 0 {
             log::warn!(

@@ -217,20 +217,6 @@ pub(crate) fn create_submitted_job(
     submit(batch, job, Some(submission), false)
 }
 
-/// T2 for one named Job: claims it into the first of `request.allowed_pools`
-/// that can run it, within the same limits as the claim batch.
-pub(crate) fn claim_execution(
-    batch: &mut Batch,
-    request: ClaimRequest,
-) -> OpResult<Result<ClaimGrant, ClaimRefusal>> {
-    let allowed = request
-        .allowed_pools
-        .iter()
-        .map(|pool| (*pool).into())
-        .collect();
-    batch.claim_job(request.job, &allowed)
-}
-
 // ---- outputs and outcomes ------------------------------------------------------------
 
 /// Intermediate outputs are refused once the Job has any outcome, unknown
@@ -260,43 +246,6 @@ pub(crate) fn append_job_output(
     })
 }
 
-/// FINALIZE. A confirmed outcome of a claimed Job requires every direct child
-/// to have settled and every admitted tool call to be resolved; otherwise the
-/// outcome recorded is Unknown (I6). An Unknown outcome publishes no result.
-/// A Job without a claim can only be cancelled.
-///
-/// Returns the Result output, when one was published.
-pub(crate) fn finalize_job(
-    batch: &mut Batch,
-    job: JobId,
-    finalization: JobFinalization,
-    cause: Option<OutcomeCause>,
-    ignore_stop_cause: bool,
-) -> OpResult<Option<AppendedOutput>> {
-    batch.require_legacy_evidence_job(job)?;
-    let (kind, result) = match finalization {
-        JobFinalization::Unknown => (OutcomeKind::Unknown, None),
-        JobFinalization::Completed(result) => (OutcomeKind::Completed, Some(result)),
-        JobFinalization::Failed(result) => (OutcomeKind::Failed, Some(result)),
-        JobFinalization::Cancelled(result) => (OutcomeKind::Cancelled, Some(result)),
-    };
-    let (_, appended) = batch.finalize(job, kind, cause, result, ignore_stop_cause)?;
-    Ok(appended.map(|(seq, output)| AppendedOutput {
-        output,
-        seq: i64::from(seq),
-    }))
-}
-
-/// Records that an unknown-outcome Job's execution has actually stopped,
-/// which releases the slot it holds. Only the trusted execution path that ran
-/// the Job may call this, and only once it has observed the termination; a
-/// timeout, a cancel request, a disabled Pool or a restart is not such an
-/// observation. The unknown outcome stays as it is. The stop is local: it
-/// says nothing of an effect a tool call had outside OCG.
-pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId, proof: StopProof) -> OpResult<()> {
-    batch.confirm_stop(job, proof)
-}
-
 // ---- tool calls -------------------------------------------------------------------------
 
 /// Records OCG's decision about a call a Provider requested, before
@@ -310,7 +259,11 @@ pub(crate) fn confirm_job_stopped(batch: &mut Batch, job: JobId, proof: StopProo
 /// caller takes it from [`ToolAdmission::spawns`]. Only the trusted execution
 /// path of the Job, while it executes it, may record a decision. An admission
 /// is refused when its arguments exceed [`MAX_STORED_TOOL_ARGUMENTS_BYTES`].
-pub(crate) fn record_tool_decision(batch: &mut Batch, evidence: ToolEvidence) -> OpResult<()> {
+pub(crate) fn record_tool_decision(
+    batch: &mut Batch,
+    proof: &crate::db::handle::DevelopmentWriteProof,
+    evidence: ToolEvidence,
+) -> OpResult<()> {
     let call = evidence.call;
     if evidence.tool_call_id.is_empty() || evidence.tool_call_id.len() > MAX_TOOL_CALL_ID_BYTES {
         return batch.reject(Violation::InvalidValue(
@@ -347,14 +300,7 @@ pub(crate) fn record_tool_decision(batch: &mut Batch, evidence: ToolEvidence) ->
             });
         }
     }
-    batch.tool_decide(
-        call,
-        &evidence.tool_call_id,
-        &evidence.name,
-        evidence.decision,
-        evidence.spawns,
-        evidence.approval,
-    )
+    batch.tool_decide(proof, evidence)
 }
 
 /// Records what is known of an admitted call's execution, once. Only the
@@ -363,10 +309,11 @@ pub(crate) fn record_tool_decision(batch: &mut Batch, evidence: ToolEvidence) ->
 /// uncertain: no later outcome replaces it.
 pub(crate) fn record_tool_outcome(
     batch: &mut Batch,
+    proof: &crate::db::handle::DevelopmentWriteProof,
     call: ToolCallRef,
     outcome: ToolOutcome,
 ) -> OpResult<()> {
-    batch.tool_outcome(call, outcome)
+    batch.tool_outcome(proof, call, outcome)
 }
 
 /// Whether `text` is one JSON object.

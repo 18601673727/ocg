@@ -2220,18 +2220,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       conversationListeners.forEach((listener) => listener());
       return result;
     },
-    async releaseSlot(turn: string, confirm = false, signal?: AbortSignal) {
-      jobIdentity(turn);
-      const result = (
-        await send("POST", `/api/v1/jobs/${turn}/release-slot`, {
-          body: confirm ? { confirm: true } : {},
-          sign: true,
-          signal,
-        })
-      ).input as Api.ReleaseSlot;
-      conversationListeners.forEach((listener) => listener());
-      return result;
-    },
     async holdConversation(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
       const result = (

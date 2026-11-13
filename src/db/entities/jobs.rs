@@ -725,7 +725,7 @@ fn validate_distribution(values: impl Iterator<Item = f64>) -> Result<(), &'stat
 pub struct JobRecord {
     pub id: JobId,
     pub name: Option<String>,
-    /// When the Job's claim was made.
+    /// Always `None`: storage records no claim.
     pub started_at: Option<Timestamp>,
     pub completed_at: Option<Timestamp>,
     pub failed_at: Option<Timestamp>,
@@ -748,10 +748,9 @@ pub struct JobRecord {
     pub objective: Option<String>,
     /// The Agent and Model configs the Job was submitted with, as provenance.
     pub configuration: Option<ExecutionConfiguration>,
-    /// The Pool the Job was claimed into.
+    /// Always `None`: storage records no claim.
     pub assigned_executor: Option<ExecutorId>,
     pub previous: Option<JobId>,
-    pub claim: Option<ClaimRecord>,
     pub outcome: Option<OutcomeRecord>,
     pub children_closed_at: Option<Timestamp>,
     /// Whether the Job has no `unsettled` row: it and every Job below it
@@ -900,18 +899,6 @@ pub struct OutcomeRecord {
     pub cause: Option<OutcomeCause>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClaimRecord {
-    pub started_at: Timestamp,
-    pub pool_id: ConfigId,
-    pub pool_edit_seq: u32,
-    pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
-    pub epoch: u64,
-    pub host_id: Option<String>,
-    pub boot_id: Option<String>,
-    pub notice_seq: u32,
-}
-
 /// A Job's input as its spec holds it: the objective, limits, Attachments and
 /// frozen configuration. Its identity is the Job's.
 #[derive(Clone, Debug, PartialEq)]
@@ -1053,21 +1040,33 @@ pub struct JobAllocation {
     pub synthesis: bool,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct JobDispatchResult {
-    pub conversation: String,
-    pub turn: String,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct JobPlanReceipt {
-    pub steps: Vec<JobDispatchResult>,
-    pub continuation: String,
-}
-
 impl JobToolCall {
+    /// The call a Provider response named `name` with `arguments` makes, when
+    /// `name` is a job tool and the arguments fit it.
+    pub(crate) fn parse(name: &str, arguments: &str) -> Option<Self> {
+        let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
+        serde_json::from_value(serde_json::json!({"name": name, "arguments": arguments})).ok()
+    }
+
+    /// Whether `name` is one of the job tools.
+    pub(crate) fn is_job_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "job_plan"
+                | "job_limits"
+                | "job_agents"
+                | "job_workers"
+                | "job_assign"
+                | "job_dispatch"
+                | "job_message"
+                | "job_stop"
+                | "job_close"
+                | "job_hold"
+                | "job_unhold"
+                | "job_retry"
+        )
+    }
+
     pub(crate) fn handler_version(&self) -> String {
         let version = match self {
             Self::JobPlan { .. } => 6,
@@ -1247,7 +1246,6 @@ pub(crate) struct JobSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct JobState {
     pub(crate) job_id: JobId,
-    pub(crate) claim: Option<ClaimRecord>,
     pub(crate) outcome: Option<OutcomeRecord>,
     pub(crate) stop_confirmed_at: Option<Timestamp>,
     pub(crate) stop_confirmed_by: Option<StopProof>,
@@ -1264,6 +1262,16 @@ pub(crate) struct JobControl {
     pub(crate) closing: Option<JobClosing>,
     pub(crate) compaction_policy: Option<CompactionPolicy>,
     pub(crate) compaction_revision: u64,
+    /// Sibling conversations this one waits for: none of its Jobs is
+    /// reserved until each prerequisite's latest Job has settled as asked.
+    pub(crate) after: Vec<(JobId, DependencyCondition)>,
+    /// The turns of this conversation that were retried, one entry per retry.
+    pub(crate) retried: Vec<JobId>,
+    /// A user wrote a turn of this conversation, so its Agent parent no
+    /// longer manages it.
+    pub(crate) user_input: bool,
+    /// The latest turn of this conversation whose result its parent was told.
+    pub(crate) reported: Option<JobId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

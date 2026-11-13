@@ -10,11 +10,10 @@ use ::redb::ReadableTableMetadata;
 
 use super::*;
 use crate::db::entities::{
-    ClaimGrant, ClaimRecord, ClaimRefusal, ConfigBody, ConfigId, ConfigKind, DependencyCondition,
-    DependencyState, ExecutionConfiguration, FrozenConfiguration, FrozenDecisionConfig,
-    FrozenPoolBinding, GLOBAL_EXECUTION_LIMIT, JobExecution, OutcomeCause, OutcomeKind,
-    OutcomeRecord, PoolConfig, Recorded, RequestFingerprint, SubmissionKey, SubmissionRecord,
-    ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
+    ConfigBody, ConfigId, ConfigKind, DependencyCondition, DependencyState, ExecutionConfiguration,
+    FrozenConfiguration, FrozenDecisionConfig, GLOBAL_EXECUTION_LIMIT, JobExecution, OutcomeCause,
+    OutcomeKind, OutcomeRecord, PoolConfig, Recorded, RequestFingerprint, SubmissionKey,
+    SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
 };
 use crate::system::execution_controls::ExecutionControl;
 
@@ -856,22 +855,19 @@ impl Batch {
     /// producer. `TOOL_CALLS` and `APPROVALS` are keyed by Job, so evidence is
     /// a range read per such Job. `CHILD_GROUPS` and `LIVE_CHILDREN` are keyed
     /// by the parent conversation and written with the child they name. Nothing
-    /// here reads unrelated history.
+    /// here reads unrelated history. The conversation's notices and approvals
+    /// are not read: a notice only tells the user something changed, and an
+    /// approval's question and answer are turns of the conversation.
     pub(crate) fn unsupported_start_context(
         &mut self,
         job: &crate::db::entities::MutableJob,
     ) -> Result<Option<&'static str>, BatchError> {
         use crate::db::entities::MutableContextSelection;
         const CHAIN_LIMIT: usize = 4096;
-        const NESTED: &str =
-            "nested and summary-producing Jobs are not supported by checked handoff";
-        const UNSUPPORTED: &str =
-            "notices, child work, approvals or tool evidence require unsupported preparation";
-        let Some(conversation) = self.job(job.parent_id)? else {
-            return self.corrupted("the Job's conversation is missing".to_owned());
-        };
-        if conversation.parent_id.is_some() || job.summary_source.is_some() {
-            return Ok(Some(NESTED));
+        const SUMMARY: &str = "summary-producing Jobs are not supported by checked handoff";
+        const UNSUPPORTED: &str = "child work or tool evidence require unsupported preparation";
+        if job.summary_source.is_some() {
+            return Ok(Some(SUMMARY));
         }
         let mut context = vec![job.id];
         if let MutableContextSelection::AdoptedSummary { producer, .. } = job.context_selection {
@@ -890,44 +886,20 @@ impl Batch {
             context.push(id);
             previous = prior.previous;
         }
-        let parent = job.parent_id.get();
         self.step(|tx| {
             let tools = tx.open_table(TOOL_CALLS)?;
-            let approvals = tx.open_table(APPROVALS)?;
             for id in &context {
+                // A predecessor's tool calls are not part of what a later turn
+                // is shown: only its question and its final answer are, and a
+                // call that waited for the user is shown as the question it
+                // asked and the answer that followed. The Job's own calls
+                // would mean it already ran.
                 let range = (id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX);
-                if tools.range(range.clone())?.next().transpose()?.is_some()
-                    || approvals.range(range)?.next().transpose()?.is_some()
-                {
+                if *id == job.id && tools.range(range)?.next().transpose()?.is_some() {
                     return Ok(Some(UNSUPPORTED));
                 }
             }
-            let conversation_rows = (parent, 0)..=(parent, u128::MAX);
-            Ok(
-                if tx
-                    .open_table(NOTICES)?
-                    .range((parent, 0)..=(parent, u32::MAX))?
-                    .next()
-                    .transpose()?
-                    .is_some()
-                    || tx
-                        .open_table(CHILD_GROUPS)?
-                        .range(conversation_rows.clone())?
-                        .next()
-                        .transpose()?
-                        .is_some()
-                    || tx
-                        .open_table(LIVE_CHILDREN)?
-                        .range(conversation_rows)?
-                        .next()
-                        .transpose()?
-                        .is_some()
-                {
-                    Some(UNSUPPORTED)
-                } else {
-                    None
-                },
-            )
+            Ok(None)
         })
     }
 
@@ -1009,12 +981,6 @@ impl Batch {
     }
 
     fn put_mutable_job_state(&mut self, id: JobId, state: &JobState) -> Result<(), BatchError> {
-        if state.claim.is_some() {
-            return self.reject(Violation::InvalidValue(
-                "job_state",
-                "legacy claims are not written by native storage",
-            ));
-        }
         let encoded = state.encode();
         self.insert(JOB_STATES, id.get(), encoded.as_slice())
     }
@@ -1161,7 +1127,7 @@ impl Batch {
             FrozenConfiguration::Generative(frozen) => {
                 // Static facts of the frozen configuration that no later step
                 // can repair are refused here, before an Allocation exists.
-                if let Some(reason) = frozen.single_request_refusal() {
+                if let Some(reason) = frozen.native_execution_refusal() {
                     return self.reject(Violation::InvalidValue("configuration", reason));
                 }
                 Ok(FrozenConfiguration::Generative(frozen))
@@ -1296,10 +1262,25 @@ impl Batch {
     pub(crate) fn create_unsubmitted_job(
         &mut self,
         context: crate::db::entities::ComposerContextId,
+        input: crate::db::entities::MutableJobInput,
+        submission: crate::db::entities::Submission,
+        conversation: Option<JobId>,
+        project: Option<ProjectId>,
+    ) -> Result<JobId, BatchError> {
+        self.create_job_as(context, input, submission, conversation, project, true)
+    }
+
+    /// Creates the Job. `by_user` says the user wrote it: a conversation a
+    /// user writes in is no longer managed by the Agent that opened it, and
+    /// the user's message ends the automatic turns counted before it.
+    pub(crate) fn create_job_as(
+        &mut self,
+        context: crate::db::entities::ComposerContextId,
         mut input: crate::db::entities::MutableJobInput,
         submission: crate::db::entities::Submission,
         conversation: Option<JobId>,
         project: Option<ProjectId>,
+        by_user: bool,
     ) -> Result<JobId, BatchError> {
         use crate::db::entities::{MutableJob, MutableJobPhase};
         self.allocation_format_gate()?;
@@ -1387,6 +1368,14 @@ impl Batch {
         };
         self.insert(JOBS, id.get(), encode_mutable_job(&job).as_slice())?;
         self.put_mutable_job_state(id, &JobState::new(id))?;
+        if by_user {
+            let mut control = self.job_control(parent_id)?;
+            if !control.user_input || control.loop_count != 0 {
+                control.user_input = true;
+                control.loop_count = 0;
+                self.put_job_control(parent_id, &control)?;
+            }
+        }
         self.insert(DRAFT_CONTEXTS, context.get(), id.get())?;
         self.record_mutable_submission(&SubmissionRecord {
             key: submission.key,
@@ -1655,10 +1644,9 @@ impl Batch {
         if job.revision != expected_revision {
             return self.reject(Violation::InvalidValue("revision", "stale Job revision"));
         }
-        let mut state = self.require_job_state(id)?;
+        let state = self.require_job_state(id)?;
         if job.phase != MutableJobPhase::Queued
             || state.outcome.is_some()
-            || state.claim.is_some()
             || self.pool_allocation(id)?.is_some()
             || !matches!(job.input.content, MutableJobContent::Generative { .. })
         {
@@ -1680,6 +1668,23 @@ impl Batch {
             }
             Err(error) => return Err(error),
         }
+        self.end_queued_native_job(
+            &job,
+            OutcomeCause::Text(
+                "cancelled before execution: unsupported Decision history".to_owned(),
+            ),
+        )
+    }
+
+    /// Cancels a Job that is queued and was never reserved: it leaves the
+    /// ready index, and its outcome is Cancelled for `cause`.
+    pub(crate) fn end_queued_native_job(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+        cause: OutcomeCause,
+    ) -> Result<(), BatchError> {
+        let id = job.id;
+        let mut state = self.require_job_state(id)?;
         let submitted = job.submitted_at.ok_or_else(|| {
             BatchError(Failure::Storage(StorageError::corrupted(
                 "queued Job has no submission time",
@@ -1720,9 +1725,7 @@ impl Batch {
         state.outcome = Some(OutcomeRecord {
             kind: OutcomeKind::Cancelled,
             at: self.now,
-            cause: Some(OutcomeCause::Text(
-                "cancelled before execution: unsupported Decision history".to_owned(),
-            )),
+            cause: Some(cause),
         });
         self.put_mutable_job_state(id, &state)?;
         self.probe = Some(Probe::Outcome(id));
@@ -2543,7 +2546,6 @@ impl Batch {
                 )))
             })?;
             if job.phase != MutableJobPhase::Queued
-                || state.claim.is_some()
                 || state.outcome.is_some()
                 || key.0 != mutable_priority(job.input.priority)
                 || key.1 != submitted.as_unix_micros()
@@ -2580,7 +2582,7 @@ impl Batch {
                     Err(error) => return Err(error),
                 }
             }
-            if !self.mutable_predecessor_ready(&job)? {
+            if !self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)? {
                 continue;
             }
             if matches!(&job.input.content, crate::db::entities::MutableJobContent::Generative { configuration, .. } if configuration.is_none_or(|config| config.agent_profile.is_none()))
@@ -2613,7 +2615,7 @@ impl Batch {
                 let FrozenConfiguration::Generative(frozen) = &frozen else {
                     continue;
                 };
-                if frozen.single_request_refusal().is_some() || !policy(frozen) {
+                if frozen.native_execution_refusal().is_some() || !policy(frozen) {
                     continue;
                 }
                 // The checked start would refuse these; leave them queued.
@@ -2782,7 +2784,6 @@ impl Batch {
         let state = self.require_job_state(job)?;
         if row.phase != crate::db::entities::MutableJobPhase::Queued
             || row.revision != expected_revision
-            || state.claim.is_some()
             || state.outcome.is_some()
         {
             return self.reject(Violation::InvalidValue(
@@ -2998,7 +2999,6 @@ impl Batch {
             || job.phase != MutableJobPhase::Queued
             || job.revision != allocation.job_revision
             || state.outcome.is_some()
-            || state.claim.is_some()
             || state.stop_confirmed_at.is_some()
             || state.stop_confirmed_by.is_some()
         {
@@ -3268,7 +3268,7 @@ impl Batch {
     ) -> Result<crate::db::entities::MutableJob, BatchError> {
         use crate::db::entities::{AllocationPhase, MutableJobPhase};
         self.require_allocation_durability()?;
-        if !prepared.has_bounded_tool_free_inputs() {
+        if !prepared.has_bounded_inputs() {
             return self.reject(Violation::InvalidValue(
                 "handoff",
                 "prepared inputs are incomplete",
@@ -3287,7 +3287,7 @@ impl Batch {
         self.scheduled_external_authorization(job)?;
         let (snapshot, allocation) = match candidate {
             reader::DevelopmentCandidate::Generative(context) => {
-                if context.configuration.single_request_refusal().is_some() {
+                if context.configuration.native_execution_refusal().is_some() {
                     return self.reject(Violation::InvalidValue(
                         "handoff",
                         "execution policy or provider requires unsupported preparation",
@@ -3446,7 +3446,6 @@ impl Batch {
                     Some(MutableFrozenConfiguration::Decision(_))
                 )
             )
-            || state.claim.is_some()
             || state.outcome.is_some()
             || state.stop_confirmed_at.is_some()
             || state.stop_confirmed_by.is_some()
@@ -3654,23 +3653,29 @@ impl Batch {
         };
         let valid = self.step(|tx| {
             let events = tx.open_table(REQUEST_EVENTS)?;
+            let last = events
+                .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, _)| key.value());
+            // The Job's latest request decides how it may end; every request
+            // before it was answered, which recording the next one required.
+            let latest = last.map_or(1, |(_, request, _)| request);
+            let Some(latest_number) = RequestNumber::new(latest) else {
+                return Ok(false);
+            };
             let mut prefix = Vec::new();
             for seq in 1..=4 {
-                match events.get((token.job.get(), 1, seq))? {
+                match events.get((token.job.get(), latest, seq))? {
                     Some(row) => prefix.push(decode_request_event(
                         token.job,
-                        RequestNumber::FIRST,
+                        latest_number,
                         seq,
                         row.value(),
                     )?),
                     None => break,
                 }
             }
-            let last = events
-                .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
-                .next_back()
-                .transpose()?
-                .map(|(key, _)| key.value());
             let full = prefix.len() == 4
                 && matches!(prefix[0].payload, RequestPayload::Sent { .. })
                 && matches!(prefix[1].payload, RequestPayload::Measurement { .. })
@@ -3680,7 +3685,7 @@ impl Batch {
                 && ((prefix.is_empty() && last.is_none())
                     || (prefix.len() == 1
                         && matches!(prefix[0].payload, RequestPayload::Sent { .. })
-                        && last == Some((token.job.get(), 1, 1)))
+                        && last == Some((token.job.get(), latest, 1)))
                     || (prefix.len() == 2
                         && matches!(prefix[0].payload, RequestPayload::Sent { .. })
                         && matches!(
@@ -3691,7 +3696,7 @@ impl Batch {
                                 ..
                             }
                         )
-                        && last == Some((token.job.get(), 1, 2))));
+                        && last == Some((token.job.get(), latest, 2))));
             let cancelled_before_request = kind == OutcomeKind::Cancelled
                 && prefix.is_empty()
                 && last.is_none()
@@ -3702,8 +3707,8 @@ impl Batch {
                 return Ok(false);
             }
             drop(events);
-            if full {
-                indexes::native_usage_sample(tx, token.job)?;
+            if full || failed_before_answer && latest > 1 {
+                indexes::native_usage_validate(tx, token.job)?;
             }
             if tx
                 .open_table(UNSETTLED)?
@@ -3722,14 +3727,27 @@ impl Batch {
             {
                 return Ok(false);
             }
-            if tx
+            // A Job that called tools may end only once every call has its
+            // recorded outcome, and none of them is Uncertain: an Uncertain
+            // call keeps the Allocation held instead.
+            for entry in tx
                 .open_table(TOOL_CALLS)?
                 .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
-                .next()
-                .transpose()?
-                .is_some()
             {
-                return Ok(false);
+                let (key, row) = entry?;
+                let record = decode_tool_evidence(tool_call_ref(key.value())?, row.value())?;
+                // A read-only call left nothing to recover, whatever became of
+                // its outcome; every other admitted call must have a definite one.
+                let read_only = record
+                    .admission()
+                    .is_none_or(|admission| admission.effect == ToolEffect::ReadOnly);
+                if !read_only
+                    && !record.outcome.as_ref().is_some_and(|recorded| {
+                        !matches!(recorded.fact, ToolOutcome::Uncertain { .. })
+                    })
+                {
+                    return Ok(false);
+                }
             }
             let mut last = 0u32;
             for entry in tx
@@ -3893,7 +3911,6 @@ impl Batch {
             || job.revision != allocation.job_revision
             || job.frozen.is_none()
             || state.outcome.is_some()
-            || state.claim.is_some()
             || state.stop_confirmed_at.is_some()
             || state.stop_confirmed_by.is_some()
         {
@@ -4357,19 +4374,12 @@ pub(super) fn decision_work_requirement(frozen: &FrozenDecisionConfig) -> u16 {
 pub(super) fn decision_requirement() -> u16 {
     requirement(Some(ExecutionOperation::Decision), None)
 }
-/// A Pool as the claim batch sees it.
+/// An unarchived Pool, as admission checks see it.
 struct OpenPool {
-    id: ConfigId,
-    edit_seq: u32,
     body: PoolConfig,
-    held: u32,
 }
 
 impl OpenPool {
-    fn has_room(&self) -> bool {
-        self.body.enabled && self.held < self.body.concurrency_limit
-    }
-
     fn offers(&self, requirement_key: u16) -> bool {
         self.body.capabilities.iter().any(|(operation, protocol)| {
             requirement(Some(*operation), *protocol) == requirement_key
@@ -4582,13 +4592,28 @@ impl Batch {
             }
         }
         self.check_spec_references(spec)?;
-        self.validate_job_allocation(spec)?;
+        if spec.allocation.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "job_allocation",
+                "native Jobs carry no legacy allocation",
+            ));
+        }
         for (dependency, _) in spec.kind.dependencies() {
             if Some(*dependency) == spec.kind.previous() {
                 continue;
             }
             let sibling = self.require_job(*dependency)?;
-            let valid = self.dependency_is_allowed(spec, &sibling)?;
+            let valid = spec
+                .parent_id
+                .filter(|_| spec.kind.is_persistent())
+                .map(|group| self.require_job(group))
+                .transpose()?
+                .is_some_and(|own| {
+                    sibling.kind.is_group()
+                        && own.parent_id.is_some()
+                        && sibling.parent_id == own.parent_id
+                        && sibling.id < own.id
+                });
             if !valid {
                 return self.reject(Violation::InvalidValue(
                     "dependencies",
@@ -4878,33 +4903,14 @@ impl Batch {
 
     // ---- placement (8.10) ---------------------------------------------------------
 
-    /// What a Job's ready row requires. A decision turn names its typed
-    /// operation; every other turn derives its requirement from the frozen
-    /// generative transport.
-    pub(super) fn execution_key(&mut self, row: &JobSpec) -> Result<u16, BatchError> {
-        match &row.kind {
-            JobKind::Execution {
-                execution: JobExecution::Decision(work),
-                ..
-            } => Ok(decision_work_requirement(&work.frozen)),
-            JobKind::Group { .. } | JobKind::Execution { .. } => {
-                Ok(execution_requirement(&self.job_execution(row)?.0))
-            }
-        }
-    }
-
-    /// PLACE: a pending Job with no open dependency becomes `ready`, or
-    /// `delayed` until its `eligible_at`.
+    /// PLACE: a pending Job with no open dependency becomes `delayed` until
+    /// its `eligible_at`, when that is still ahead.
     pub(crate) fn place(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
-        let requirement = self.execution_key(&row)?;
-        let blocked = self.is_held(&row)?
-            || match (row.kind.is_persistent(), row.parent_id) {
-                (true, Some(parent)) => {
-                    self.active_job(parent)?.is_some_and(|active| active != job)
-                }
-                _ => false,
-            };
+        let blocked = match (row.kind.is_persistent(), row.parent_id) {
+            (true, Some(parent)) => self.active_job(parent)?.is_some_and(|active| active != job),
+            _ => false,
+        };
         if blocked {
             return Ok(());
         }
@@ -4912,49 +4918,19 @@ impl Batch {
         let clock = recovery::promotion_clock();
         self.touched_ready_or_delayed = true;
         self.step(|tx| {
-            match eligible_at {
-                Some(eligible_at) if eligible_at > clock => {
-                    tx.open_table(DELAYED)?
-                        .insert((eligible_at, job.get()), ())?;
-                }
-                _ => {
-                    tx.open_table(READY)?.insert((requirement, job.get()), ())?;
-                }
+            if let Some(eligible_at) = eligible_at
+                && eligible_at > clock
+            {
+                tx.open_table(DELAYED)?
+                    .insert((eligible_at, job.get()), ())?;
             }
             Ok(())
         })
     }
 
-    /// PROMOTE: the `delayed` rows whose time has come become `ready`.
-    pub(crate) fn promote(&mut self) -> Result<(), BatchError> {
-        let clock = recovery::promotion_clock();
-        let due = self.step(|tx| {
-            let delayed = tx.open_table(DELAYED)?;
-            let mut due = Vec::new();
-            for entry in delayed.range((i64::MIN, 0)..=(clock, u128::MAX))? {
-                due.push(entry?.0.value());
-            }
-            Ok(due)
-        })?;
-        for (eligible_at, job) in due {
-            let row = self.require_job(JobId::new(job))?;
-            let requirement = self.execution_key(&row)?;
-            self.touched_ready_or_delayed = true;
-            self.step(|tx| {
-                tx.open_table(DELAYED)?.remove((eligible_at, job))?;
-                tx.open_table(READY)?.insert((requirement, job), ())?;
-                Ok(())
-            })?;
-        }
-        Ok(())
-    }
-
-    // ---- T2 claim batch (8.3) -------------------------------------------------------
-
     fn open_pools(&mut self) -> Result<Vec<OpenPool>, BatchError> {
         self.step(|tx| {
             let configs = tx.open_table(CONFIGS)?;
-            let held = tx.open_table(HELD_SLOTS)?;
             let mut pools = Vec::new();
             for entry in configs.iter()? {
                 let (key, bytes) = entry?;
@@ -4962,532 +4938,19 @@ impl Batch {
                 if row.archived_at.is_some() {
                     continue;
                 }
-                let ConfigBody::Pool(body) = row.body else {
-                    continue;
-                };
-                let id = row.id.get();
-                let mut count = 0u32;
-                for slot in held.range((id, 0)..=(id, u128::MAX))? {
-                    slot?;
-                    count += 1;
+                if let ConfigBody::Pool(body) = row.body {
+                    pools.push(OpenPool { body });
                 }
-                pools.push(OpenPool {
-                    id: row.id,
-                    edit_seq: row.edit_seq,
-                    body,
-                    held: count,
-                });
             }
             Ok(pools)
         })
     }
 
-    fn held_background(&mut self) -> Result<(u32, u32), BatchError> {
-        self.step(|tx| {
-            let jobs = tx.open_table(JOBS)?;
-            let mut counts = (0u32, 0u32);
-            for entry in tx
-                .open_table(HELD_SLOTS)?
-                .iter()?
-                .take(usize::from(GLOBAL_EXECUTION_LIMIT) + 1)
-            {
-                let id = entry?.0.value().1;
-                let Some(bytes) = jobs.get(id)? else {
-                    return Err(StorageError::corrupted("held Job missing"));
-                };
-                match reader::work_priority(&jobs, &JobSpec::decode_at(id, bytes.value())?)? {
-                    2 => counts.0 += 1,
-                    1 => counts.1 += 1,
-                    _ => {}
-                }
-            }
-            Ok(counts)
-        })
-    }
-
-    pub(super) fn has_executor_for(
-        &mut self,
-        operation: ExecutionOperation,
-        protocol: Option<LlmTransport>,
-    ) -> Result<bool, BatchError> {
-        let key = requirement(Some(operation), protocol);
-        Ok(self
-            .open_pools()?
-            .iter()
-            .any(|pool| pool.body.enabled && pool.offers(key)))
-    }
-
-    fn held_slot_count(&mut self) -> Result<u32, BatchError> {
-        let count = self.step(|tx| Ok(tx.open_table(HELD_SLOTS)?.len()?))?;
-        Ok(u32::try_from(count).unwrap_or(u32::MAX))
-    }
-
-    /// CLAIM_BATCH: promotes due Jobs, then claims ready Jobs, smallest Job
-    /// id first, while a global slot and a compatible Pool are free.
-    pub(crate) fn claim_batch(&mut self) -> Result<Vec<JobId>, BatchError> {
-        self.promote()?;
-        self.cancel_stale_context_work()?;
-        self.recover_predictions()?;
-        let mut free = u32::from(GLOBAL_EXECUTION_LIMIT).saturating_sub(self.held_slot_count()?);
-        let mut pools: Vec<OpenPool> = self
-            .open_pools()?
-            .into_iter()
-            .filter(OpenPool::has_room)
-            .collect();
-        let (mut speculative, mut automatic) = self.held_background()?;
-        let mut grants = Vec::new();
-        let mut deferred = BTreeSet::new();
-        while free > 0 {
-            let offered: BTreeSet<u16> = pools
-                .iter()
-                .flat_map(|pool| {
-                    pool.body
-                        .capabilities
-                        .iter()
-                        .map(|(operation, protocol)| requirement(Some(*operation), *protocol))
-                })
-                .collect();
-            let mut candidate: Option<(u8, u128, u16)> = None;
-            for key in offered {
-                let first = self.step(|tx| {
-                    let ready = tx.open_table(READY)?;
-                    let jobs = tx.open_table(JOBS)?;
-                    let mut first = None;
-                    for entry in ready.range((key, 0)..=(key, u128::MAX))?.take(256) {
-                        let id = entry?.0.value().1;
-                        if deferred.contains(&id) {
-                            continue;
-                        }
-                        let Some(bytes) = jobs.get(id)? else {
-                            return Err(StorageError::corrupted("ready Job missing"));
-                        };
-                        let row = JobSpec::decode_at(id, bytes.value())?;
-                        if !row.kind.is_persistent() {
-                            continue;
-                        }
-                        let priority = reader::work_priority(&jobs, &row)?;
-                        if priority == 2 && (speculative >= 1 || free < 2)
-                            || priority == 1 && automatic >= 2
-                        {
-                            continue;
-                        }
-                        let chosen = (priority, id, key);
-                        if first.is_none_or(|best| chosen < best) {
-                            first = Some(chosen);
-                        }
-                        if priority == 0 {
-                            break;
-                        }
-                    }
-                    Ok(first)
-                })?;
-                if let Some(first) = first
-                    && candidate.is_none_or(|best| first < best)
-                {
-                    candidate = Some(first);
-                }
-            }
-            let Some((priority, job, key)) = candidate else {
-                break;
-            };
-            // Policy is resolved before a slot is reserved. A turn that still
-            // needs preparation stays pending; reserving its pool room first
-            // would leave that room held with no grant.
-            if self.prepare_if_needed(JobId::new(job))? {
-                deferred.insert(job);
-                continue;
-            }
-            let Some(index) = pools
-                .iter()
-                .enumerate()
-                .filter(|(_, pool)| pool.offers(key))
-                .min_by_key(|(_, pool)| (pool.body.capabilities.len(), pool.id))
-                .map(|(index, _)| index)
-            else {
-                break;
-            };
-            let (pool, edit_seq, capabilities) = {
-                let pool = &mut pools[index];
-                pool.held += 1;
-                (pool.id, pool.edit_seq, pool.body.capabilities.clone())
-            };
-            self.write_claim(JobId::new(job), key, pool, edit_seq, capabilities)?;
-            if priority == 2 {
-                speculative += 1;
-            } else if priority == 1 {
-                automatic += 1;
-            }
-            grants.push(JobId::new(job));
-            free -= 1;
-            if !pools[index].has_room() {
-                pools.remove(index);
-            }
-        }
-        if let Some(first) = grants.first() {
-            self.probe = Some(Probe::Claim(*first));
-        }
-        Ok(grants)
-    }
-
-    /// Prepares when the resolved policy says the turn is over its trigger,
-    /// and reports that the turn should stay pending. Disabled, an unknown
-    /// window, and a missing summarizer do not block the turn. The preset
-    /// numbers are the uncalibrated proposal.
-    fn prepare_if_needed(&mut self, job: JobId) -> Result<bool, BatchError> {
-        let row = self.require_job(job)?;
-        if !self.step(|tx| {
-            reader::prediction_current(
-                &tx.open_table(META)?,
-                &tx.open_table(JOBS)?,
-                &tx.open_table(CONFIGS)?,
-                &tx.open_table(PROJECTS)?,
-                &tx.open_table(JOB_CONTROLS)?,
-                reader::Turns(&tx.open_table(TURNS)?),
-                &row,
-            )
-        })? {
-            self.finalize(job, OutcomeKind::Cancelled, None, Some(FinalResult {
-                summary: Some("context prediction opt-in, assignment or activity changed before execution".into()),
-                code: Some("prediction_stale".into()), goal_reached: Some(false), value: None,
-            }), false)?;
-            return Ok(true);
-        }
-        if !matches!(
-            row.kind,
-            JobKind::Execution {
-                execution: JobExecution::Frozen(_) | JobExecution::Ref(_),
-                plan_source: PlanSource::Stored { .. },
-                ..
-            }
-        ) {
-            return Ok(false);
-        }
-        let Some(conversation) = row.parent_id else {
-            return Ok(false);
-        };
-        self.select_context(job)?;
-        let (policy, revision, profile) =
-            self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
-        if matches!(policy.mode, crate::db::entities::CompactionMode::Off) {
-            return Ok(false);
-        }
-        let (frozen, _, _) = self.job_execution(&row)?;
-        let model = &frozen.llm.config;
-        let output = model
-            .parameters
-            .max_completion_tokens
-            .or(model.parameters.max_tokens)
-            .unwrap_or(4096);
-        let (mut occupancy, growth, _) = self.step(|tx| {
-            reader::raw_context_usage(
-                &tx.open_table(JOBS)?,
-                &tx.open_table(JOB_STATES)?,
-                &tx.open_table(JOB_INPUTS)?,
-                &tx.open_table(JOB_OUTPUTS)?,
-                job,
-            )
-        })?;
-        if occupancy == usize::MAX {
-            return Ok(false);
-        }
-        if let Some(adopted) = self.adopt_context(job)? {
-            let reducible = self.step(|tx| reader::source_reducible(tx, &adopted.source))?;
-            occupancy = occupancy.saturating_sub(reducible);
-            occupancy =
-                occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
-        }
-        let safety = u32::try_from(
-            frozen
-                .agent
-                .as_ref()
-                .and_then(|agent| agent.instructions.as_ref())
-                .map_or(0, String::len)
-                .div_ceil(3),
-        )
-        .unwrap_or(u32::MAX)
-        .saturating_add(256);
-        let Ok(recipe) = policy.recipe(model.context_window, output, safety, growth.max(output))
-        else {
-            return Ok(false);
-        };
-        if recipe
-            .trigger
-            .is_none_or(|trigger| occupancy <= trigger as usize)
-        {
-            return Ok(false);
-        }
-        let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
-        if !self.config(summarizer)?.is_some_and(|record| {
-            record.archived_at.is_none() && matches!(record.body, ConfigBody::Model(_))
-        }) {
-            return Ok(false);
-        }
-        let summarizer_row = self.require_config(summarizer)?;
-        let ConfigBody::Model(summarizer_body) = summarizer_row.body else {
-            return Ok(false);
-        };
-        let Some(connection) = self.config(summarizer_body.connection_id)? else {
-            return Ok(false);
-        };
-        let ConfigBody::Connection(connection_body) = connection.body else {
-            return Ok(false);
-        };
-        if connection.archived_at.is_some()
-            || !self.open_pools()?.iter().any(|pool| {
-                pool.body.enabled
-                    && pool.offers(requirement(
-                        Some(ExecutionOperation::LlmRequest),
-                        Some(connection_body.protocol),
-                    ))
-            })
-        {
-            return Ok(false);
-        }
-        let mut identity = [0u8; 32];
-        identity[..16].copy_from_slice(&conversation.get().to_le_bytes());
-        identity[16..].copy_from_slice(&job.get().to_le_bytes());
-        let key = crate::db::entities::SubmissionKey::from_digest(identity);
-        if let Some(submission) = self.submission(key)? {
-            return Ok(self.require_job_state(submission.job)?.outcome.is_none());
-        }
-        for producer in self.context_compaction_jobs(conversation)? {
-            let producer_row = self.require_job(producer)?;
-            let JobKind::Execution {
-                execution: JobExecution::Summarization(work),
-                ..
-            } = producer_row.kind
-            else {
-                continue;
-            };
-            let binding = self.step(|tx| reader::summary_root(&tx.open_table(JOBS)?, &work))?;
-            if binding
-                .policy_revision
-                .is_some_and(|bound| bound != revision || binding.policy_profile != profile)
-            {
-                continue;
-            }
-            let state = self.require_job_state(producer)?;
-            if binding.prediction.is_some()
-                && state
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.kind != OutcomeKind::Completed)
-            {
-                continue;
-            }
-            if state.outcome.is_none() {
-                return Ok(true);
-            }
-            if state.outcome.is_some_and(|outcome| {
-                self.now
-                    .as_unix_micros()
-                    .saturating_sub(outcome.at.as_unix_micros())
-                    < i64::from(recipe.cooldown_seconds).saturating_mul(1_000_000)
-            }) {
-                return Ok(false);
-            }
-        }
-        if !self.background_room(false)? {
-            return Ok(false);
-        }
-        let submission = crate::db::entities::Submission {
-            key,
-            fingerprint: crate::db::entities::RequestFingerprint::from_digest(identity),
-        };
-        match self.request_compaction_for(conversation, summarizer, submission, Some(recipe))? {
-            crate::db::entities::CompactionRequest::Prepared { job, .. } => {
-                self.insert_turn_input(
-                    row.id,
-                    Entry::ContextPreparation {
-                        job,
-                        policy_revision: revision,
-                    },
-                )?;
-                Ok(self.require_job_state(job)?.outcome.is_none())
-            }
-            crate::db::entities::CompactionRequest::Noop { .. } => Ok(false),
-        }
-    }
-
-    /// Writes the claim of `job` into `pool`: the claim itself, the Job's
-    /// leaving `ready` and `pending`, and its held slot.
-    fn write_claim(
+    pub(super) fn adjust_open_children(
         &mut self,
         job: JobId,
-        requirement_key: u16,
-        pool: ConfigId,
-        pool_edit_seq: u32,
-        capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
+        delta: i64,
     ) -> Result<(), BatchError> {
-        let mut state = self.require_job_state(job)?;
-        let row = self.require_job(job)?;
-        let conversation = row.kind.is_persistent().then_some(row.parent_id).flatten();
-        let notice_seq = match conversation {
-            Some(conversation) => self.last_notice_seq(conversation)?,
-            None => 0,
-        };
-        if let Some(conversation) = conversation {
-            self.step(|tx| {
-                tx.open_table(ACTIVE_JOBS)?
-                    .insert(conversation.get(), job.get())?;
-                tx.open_table(NOTICE_READ)?
-                    .insert(conversation.get(), notice_seq)?;
-                Ok(())
-            })?;
-            // Adoption is checked in this claim. A mismatch leaves the
-            // original records in the prompt; it does not refuse the claim.
-            self.select_context(job)?;
-            let _adopted = self.adopt_context(job)?;
-        }
-        state.claim = Some(ClaimRecord {
-            started_at: self.now,
-            pool_id: pool,
-            pool_edit_seq,
-            capabilities,
-            epoch: self.epoch,
-            host_id: self.host_id.clone(),
-            boot_id: self.boot_id.clone(),
-            notice_seq,
-        });
-        self.put_job_state(job, &state)?;
-        let epoch = self.epoch;
-        self.step(|tx| {
-            tx.open_table(READY)?.remove((requirement_key, job.get()))?;
-            tx.open_table(PENDING)?.remove(job.get())?;
-            tx.open_table(HELD_SLOTS)?
-                .insert((pool.get(), job.get()), (epoch, false))?;
-            Ok(())
-        })
-    }
-
-    /// Claims one named ready Job into the first of `allowed` that is
-    /// enabled, offers what the Job needs and has room. The same limits as
-    /// [`Self::claim_batch`] apply. Context preparation may be admitted while
-    /// the foreground turn remains pending.
-    pub(crate) fn claim_job(
-        &mut self,
-        job: JobId,
-        allowed: &BTreeSet<ConfigId>,
-    ) -> Result<Result<ClaimGrant, ClaimRefusal>, BatchError> {
-        let Some(row) = self.job(job)? else {
-            return Ok(Err(ClaimRefusal::NotFound));
-        };
-        let state = self.require_job_state(job)?;
-        if state.claim.is_some() || state.outcome.is_some() {
-            return Ok(Err(ClaimRefusal::NotPending));
-        }
-        if allowed.is_empty() {
-            return Ok(Err(ClaimRefusal::EmptyAllowedPools));
-        }
-        self.promote()?;
-        let requirement_key = self.execution_key(&row)?;
-        let (ready, delayed) = self.step(|tx| {
-            let ready = tx
-                .open_table(READY)?
-                .get((requirement_key, job.get()))?
-                .is_some();
-            let mut delayed = None;
-            if let Some(eligible_at) = row.kind.eligible_at().map(Timestamp::as_unix_micros)
-                && tx
-                    .open_table(DELAYED)?
-                    .get((eligible_at, job.get()))?
-                    .is_some()
-            {
-                delayed = Some(eligible_at);
-            }
-            Ok((ready, delayed))
-        })?;
-        if !ready {
-            if let Some(eligible_at) = delayed {
-                return Ok(Err(ClaimRefusal::NotYetEligible {
-                    eligible_at: Timestamp::from_unix_micros(eligible_at),
-                }));
-            }
-            let prerequisite = self.first_open_dependency(&row)?;
-            return Ok(Err(match prerequisite {
-                Some(prerequisite) => ClaimRefusal::DependencyUnsatisfied {
-                    prerequisite,
-                    state: DependencyState::Waiting,
-                },
-                None => ClaimRefusal::NotPending,
-            }));
-        }
-        let held = self.held_slot_count()?;
-        if held >= u32::from(GLOBAL_EXECUTION_LIMIT) {
-            return Ok(Err(ClaimRefusal::NoCapacity(CapacityScope::Global)));
-        }
-        let pools = self.open_pools()?;
-        let mut compatible = false;
-        let mut chosen = None;
-        for pool in pools.iter().filter(|pool| allowed.contains(&pool.id)) {
-            if !pool.body.enabled || !pool.offers(requirement_key) {
-                continue;
-            }
-            compatible = true;
-            if pool.held < pool.body.concurrency_limit {
-                chosen = Some(pool);
-                break;
-            }
-        }
-        let Some(pool) = chosen else {
-            return Ok(Err(if compatible {
-                ClaimRefusal::NoCapacity(CapacityScope::Pools(
-                    allowed
-                        .iter()
-                        .map(|pool| ExecutionPoolId::from(*pool))
-                        .collect(),
-                ))
-            } else {
-                ClaimRefusal::NoCompatiblePool
-            }));
-        };
-        let (pool_id, edit_seq, pool_capabilities) =
-            (pool.id, pool.edit_seq, pool.body.capabilities.clone());
-        if self.prepare_if_needed(job)? {
-            return Ok(Err(ClaimRefusal::NotPending));
-        }
-        let priority = self.step(|tx| reader::work_priority(&tx.open_table(JOBS)?, &row))?;
-        let (speculative, automatic) = self.held_background()?;
-        if priority == 2
-            && (speculative >= 1
-                || self.held_slot_count()?.saturating_add(1) >= u32::from(GLOBAL_EXECUTION_LIMIT))
-            || priority == 1 && automatic >= 2
-        {
-            return Ok(Err(ClaimRefusal::NoCapacity(CapacityScope::Global)));
-        }
-        self.write_claim(
-            job,
-            requirement_key,
-            pool_id,
-            edit_seq,
-            pool_capabilities.clone(),
-        )?;
-        self.probe = Some(Probe::Claim(job));
-        Ok(Ok(ClaimGrant {
-            job,
-            binding: FrozenPoolBinding {
-                pool: pool_id.into(),
-                edit_seq,
-                capabilities: pool_capabilities,
-            },
-            epoch: self.epoch,
-            global_free_after: u8::try_from(
-                u32::from(GLOBAL_EXECUTION_LIMIT).saturating_sub(held + 1),
-            )
-            .unwrap_or(0),
-        }))
-    }
-
-    fn first_open_dependency(&mut self, row: &JobSpec) -> Result<Option<JobId>, BatchError> {
-        for (dependency, _) in row.kind.waits_on() {
-            if !self.is_subtree_settled(dependency)? {
-                return Ok(Some(dependency));
-            }
-        }
-        Ok(None)
-    }
-
-    fn adjust_open_children(&mut self, job: JobId, delta: i64) -> Result<(), BatchError> {
         self.step(|tx| {
             let mut unsettled = tx.open_table(UNSETTLED)?;
             let counts = unsettled.get(job.get())?.map(|counts| counts.value());
@@ -5514,20 +4977,20 @@ impl Batch {
     /// an OS process.
     pub(crate) fn tool_decide(
         &mut self,
-        call: ToolCallRef,
-        tool_call_id: &str,
-        name: &str,
-        decision: ToolDecision,
-        spawns: bool,
-        approval: Option<ToolCallRef>,
+        proof: &crate::db::handle::DevelopmentWriteProof,
+        evidence: crate::db::entities::ToolEvidence,
     ) -> Result<(), BatchError> {
-        self.require_executing_here(call.job)?;
-        let turn = self.require_job(call.job)?;
-        let conversation = if turn.kind.is_persistent() {
-            turn.parent_id
-        } else {
-            None
-        };
+        let crate::db::entities::ToolEvidence {
+            call,
+            approval,
+            tool_call_id,
+            name,
+            decision,
+            spawns,
+        } = evidence;
+        let (tool_call_id, name) = (tool_call_id.as_str(), name.as_str());
+        self.require_development_call(proof, call)?;
+        let conversation = self.turn_conversation(call.job)?;
         if let Some(original) = approval {
             let Some(conversation) = conversation else {
                 return self.reject(Violation::InvalidValue(
@@ -5709,7 +5172,6 @@ impl Batch {
                 self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
             } else {
                 self.insert(OPEN_APPROVALS, approvals::open_key(conversation, call), 0)?;
-                self.notify(conversation, NoticeEvent::Requested, call.job)?;
             }
         }
         self.probe = Some(Probe::ToolCall(call));
@@ -5720,10 +5182,11 @@ impl Batch {
     /// once.
     pub(crate) fn tool_outcome(
         &mut self,
+        proof: &crate::db::handle::DevelopmentWriteProof,
         call: ToolCallRef,
         outcome: ToolOutcome,
     ) -> Result<(), BatchError> {
-        self.require_executing_here(call.job)?;
+        self.require_development_call(proof, call)?;
         let Some(mut record) = self.tool_evidence(call)? else {
             return self.reject(Violation::ToolCallNotFound(call));
         };
@@ -5732,6 +5195,16 @@ impl Batch {
         }
         if record.outcome.is_some() {
             return self.reject(Violation::ToolOutcomeAlreadyRecorded(call));
+        }
+        if matches!(outcome, ToolOutcome::CompletedElided { .. })
+            && record
+                .admission()
+                .is_none_or(|admission| admission.effect != ToolEffect::ReadOnly)
+        {
+            return self.reject(Violation::InvalidValue(
+                "outcome",
+                "only a read-only call may keep just the size and digest of its result",
+            ));
         }
         let current_stats = self.step(|tx| {
             Ok(tx
@@ -5751,7 +5224,9 @@ impl Batch {
         updated_stats.4 = updated_stats.4.saturating_add(duration_us);
         updated_stats.5 = updated_stats.5.max(duration_us);
         match &outcome {
-            ToolOutcome::Completed { .. } | ToolOutcome::CompletedWithheld { .. } => {
+            ToolOutcome::Completed { .. }
+            | ToolOutcome::CompletedWithheld { .. }
+            | ToolOutcome::CompletedElided { .. } => {
                 updated_stats.2 = updated_stats.2.saturating_add(1);
             }
             ToolOutcome::NotApplied { .. }
@@ -5770,37 +5245,49 @@ impl Batch {
         Ok(())
     }
 
-    /// Refuses unless the Job is claimed by this opening of the database and
-    /// has no outcome (I13).
+    /// Whether `proof` is the ownership of the execution that owns `call`: a
+    /// tool call is recorded only by the in-process execution that holds the
+    /// Job's Allocation, never by a request or by another Job's execution.
+    pub(crate) fn require_development_call(
+        &mut self,
+        proof: &crate::db::handle::DevelopmentWriteProof,
+        call: ToolCallRef,
+    ) -> Result<(), BatchError> {
+        if proof.token().job != call.job {
+            return self.reject(Violation::InvalidValue(
+                "tool_call",
+                "the call belongs to another Job",
+            ));
+        }
+        self.require_development_write(proof)?;
+        Ok(())
+    }
+
+    /// Refuses always: storage records no claim, so no Job executes under
+    /// this opening of the database (I13).
     pub(crate) fn require_executing_here(&mut self, job: JobId) -> Result<(), BatchError> {
         self.require_legacy_evidence_job(job)?;
-        let state = self.require_job_state(job)?;
-        match &state.claim {
-            Some(claim) if claim.epoch == self.epoch && state.outcome.is_none() => Ok(()),
-            _ => self.reject(Violation::NotExecutingLocally(job)),
-        }
+        self.reject(Violation::NotExecutingLocally(job))
     }
 
     // ---- finalize (8.5), confirm stop (8.6) ------------------------------------------
 
-    /// FINALIZE. A confirmed outcome of a claimed Job whose direct children
-    /// have not all settled, or whose admitted tool calls are not all
-    /// resolved, is recorded as Unknown (I6). Returns the outcome kind that
-    /// was recorded and the sequence number of the Result output, if any.
+    /// FINALIZE. A Job that never started can only be Cancelled. Returns the
+    /// outcome kind that was recorded and the sequence number of the Result
+    /// output, if any.
     pub(crate) fn finalize(
         &mut self,
         job: JobId,
         mut kind: OutcomeKind,
         mut cause: Option<OutcomeCause>,
         result: Option<FinalResult>,
-        ignore_stop_cause: bool,
     ) -> Result<(OutcomeKind, Option<(u32, JobOutputId)>), BatchError> {
         let mut state = self.require_job_state(job)?;
         if state.outcome.is_some() {
             return self.reject(Violation::JobAlreadyFinalized(job));
         }
         let row = self.require_job(job)?;
-        if kind == OutcomeKind::Completed || ignore_stop_cause {
+        if kind == OutcomeKind::Completed {
             cause = None;
         } else if row.kind.is_persistent()
             && let Some(conversation) = row.parent_id
@@ -5844,22 +5331,11 @@ impl Batch {
                 };
             }
         }
-        if state.claim.is_none() && kind != OutcomeKind::Cancelled {
+        if kind != OutcomeKind::Cancelled {
             return self.reject(Violation::InvalidValue(
                 "outcome",
-                "a Job without a claim can only be Cancelled",
+                "a Job that never started can only be Cancelled",
             ));
-        }
-        if state.claim.is_some() && kind != OutcomeKind::Unknown {
-            let open_children = self.step(|tx| {
-                Ok(tx
-                    .open_table(UNSETTLED)?
-                    .get(job.get())?
-                    .map_or(0, |counts| counts.value().1))
-            })?;
-            if open_children > 0 || !self.tool_effects_resolved(job)? {
-                kind = OutcomeKind::Unknown;
-            }
         }
         state.outcome = Some(OutcomeRecord {
             kind,
@@ -5885,18 +5361,7 @@ impl Batch {
             state.stop_confirmed_at = Some(self.now);
             state.stop_confirmed_by = Some(StopProof::Proof);
         }
-        if let Some(claim) = &state.claim {
-            let pool = claim.pool_id.get();
-            let epoch = claim.epoch;
-            if kind != OutcomeKind::Unknown || state.stop_confirmed_at.is_some() {
-                self.freed_capacity = true;
-                self.remove(HELD_SLOTS, (pool, job.get()))?;
-            } else {
-                self.insert(HELD_SLOTS, (pool, job.get()), (epoch, true))?;
-            }
-        } else {
-            self.cancel_pending_writes(job)?;
-        }
+        self.cancel_pending_writes(job)?;
         if row.kind.is_persistent()
             && let Some(conversation) = row.parent_id
             && (kind != OutcomeKind::Unknown || state.stop_confirmed_at.is_some())
@@ -5949,49 +5414,12 @@ impl Batch {
         Ok((kind, appended))
     }
 
-    /// CONFIRM_STOP: the stop of an Unknown Job is proven, so its slot is
-    /// released.
-    pub(crate) fn confirm_stop(&mut self, job: JobId, proof: StopProof) -> Result<(), BatchError> {
-        let mut state = self.require_job_state(job)?;
-        match &state.outcome {
-            None => return self.reject(Violation::StopNeedsOutcome(job)),
-            Some(outcome) if outcome.kind != OutcomeKind::Unknown => {
-                return self.reject(Violation::StopNeedsUnknownOutcome(job));
-            }
-            Some(_) => {}
-        }
-        if state.stop_confirmed_at.is_some() {
-            return self.reject(Violation::StopAlreadyConfirmed(job));
-        }
-        state.stop_confirmed_at = Some(self.now);
-        state.stop_confirmed_by = Some(proof);
-        if let Some(claim) = &state.claim {
-            let pool = claim.pool_id.get();
-            self.freed_capacity = true;
-            self.remove(HELD_SLOTS, (pool, job.get()))?;
-        }
-        let row = self.require_job(job)?;
-        if row.kind.is_persistent()
-            && let Some(conversation) = row.parent_id
-        {
-            self.remove(ACTIVE_JOBS, conversation.get())?;
-        }
-        self.put_job_state(job, &state)?;
-        self.settle(job)?;
-        if let Some(conversation) = self.require_job(job)?.parent_id {
-            self.auto_close_check(conversation)?;
-        }
-        Ok(())
-    }
-
-    /// CANCEL_PENDING_WRITES: a Job cancelled before its claim leaves every
+    /// CANCEL_PENDING_WRITES: a Job cancelled before it started leaves every
     /// readiness table.
     pub(crate) fn cancel_pending_writes(&mut self, job: JobId) -> Result<(), BatchError> {
         let row = self.require_job(job)?;
-        let requirement_key = self.execution_key(&row)?;
         self.step(|tx| {
             tx.open_table(PENDING)?.remove(job.get())?;
-            tx.open_table(READY)?.remove((requirement_key, job.get()))?;
             if let Some(eligible_at) = row.kind.eligible_at() {
                 tx.open_table(DELAYED)?
                     .remove((eligible_at.as_unix_micros(), job.get()))?;
@@ -6085,7 +5513,7 @@ impl Batch {
             if let Some(parent) = row.parent_id {
                 if row.kind.is_group() {
                     self.remove(LIVE_CHILDREN, (parent.get(), job.get()))?;
-                    self.auto_close_check(parent)?;
+                    self.close_system_conversation(parent)?;
                 }
                 self.adjust_open_children(parent, -1)?;
                 work.push(parent);
@@ -6104,22 +5532,9 @@ impl Batch {
             .iter()
             .all(|record| !record.spawns || record.outcome.is_some()))
     }
-
-    /// Whether every admitted call has a definite outcome or a reconciliation.
-    fn tool_effects_resolved(&mut self, job: JobId) -> Result<bool, BatchError> {
-        let calls = self.job_tool_evidence(job)?;
-        Ok(calls.iter().all(|record| !record.is_unresolved()))
-    }
 }
 
-impl Batch {
-    pub(crate) fn decision_executor_available(
-        &mut self,
-        frozen: &FrozenDecisionConfig,
-    ) -> Result<bool, BatchError> {
-        self.step(|tx| reader::decision_executor_available(&tx.open_table(CONFIGS)?, frozen))
-    }
-}
+impl Batch {}
 
 /// The durable scheduled external policy and its binding to one Allocation.
 /// Creation takes an already validated draft; the store never infers authorization

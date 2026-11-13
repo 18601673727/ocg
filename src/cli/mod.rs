@@ -9,7 +9,6 @@ mod manual_host;
 mod migrate;
 #[cfg(unix)]
 mod reconcile_reserved;
-mod release_slot;
 mod run_external_job;
 mod run_loopback_job;
 mod scheduled_external_policy;
@@ -65,10 +64,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "update" {
             return update::run(arguments.collect());
         }
-        if command == "release-slot" {
-            let directory = DataDirectory::from_environment()?;
-            return release_slot::run(&directory, arguments.collect());
-        }
         if command == "migrate" {
             return migrate::run(arguments.collect());
         }
@@ -117,7 +112,6 @@ fn usage() -> &'static str {
      \n\
      Commands:\n\
        update [--check] [--version X.Y.Z] [--yes]\n\
-       release-slot <job> [--yes]\n\
        run-loopback-job <job> --pool <id> --executor <id> --timeout-secs <n> --confirm-loopback-only\n\
          (runs one named submitted Generative Job once against its own literal 127.0.0.1 endpoint; never an external Provider)\n\
        run-external-job <job> --pool <id> --executor <id> --endpoint <https-url> --credential-ref <ref> --model <id>\n\
@@ -144,7 +138,7 @@ fn usage() -> &'static str {
        reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
          (offline: releases only eligible stopped literal-loopback Allocations; preserves Unknown outcomes and evidence; finalizes without reapplying)\n\
        migrate [--check | --to <directory>]\n\
-         (offline: migrates one stopped format 22 database to format 23 on a private copy; the source is never written)\n\
+         (offline: inspects one stopped database and, when a migration step reads its format, migrates it on a private copy; the source is never written. Format 1 is the first format, so no step exists yet)\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\
          (durable scheduled external policy management; creating a policy never enables scheduled_external_transport or autonomous_scheduling)\n\
        register-llm\n\

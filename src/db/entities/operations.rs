@@ -39,7 +39,7 @@ pub enum OperationKind {
     CreateExecutor,
     ApplyJobTool,
     DecideApproval,
-    BoundaryB,
+    SettleChildTurns,
     Open,
     Append,
     StopTurn,

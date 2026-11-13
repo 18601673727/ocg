@@ -81,10 +81,11 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use crate::db::DatabaseHandle;
+use crate::db::entities::JobId;
 use crate::db::redb::{ActivationSnapshot, GENESIS_JOB, OfflineActivation, RecurrenceAudit};
 use crate::system::data_directory::{DATA_DIRECTORY_VARIABLE, DataDirectory};
 use crate::system::execution_controls::{ControlState, ExecutionControl};
-use crate::system::native_scheduler::loopback_eligibility;
+use crate::system::native_scheduler::{NOT_ASSESSED, loopback_eligibility};
 
 /// Ready entries a preflight lists with their eligibility. The listing is
 /// bounded; the counts it is compared against are exact, and any non-zero
@@ -103,6 +104,99 @@ pub(crate) struct ActivationRequest {
     pub(crate) database: DatabaseIdentity,
     /// What the operator confirmed, in this process; see [`Confirmation`].
     pub(crate) confirmation: Confirmation,
+    /// Which activation this is; see [`ActivationMode`]. The two modes are
+    /// never mixed: a request is exactly one of them.
+    pub(crate) mode: ActivationMode,
+}
+
+/// The two activations an operator can ask for. Each is its own
+/// authorization: the mode is bound into the state digest and into the
+/// challenge, so a confirmation for one can never arm the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ActivationMode {
+    /// The first activation: the database holds no queued work at all.
+    FirstActivation,
+    /// A reuse of the gate over existing, never-started queued work the
+    /// operator names Job by Job; see [`QueuedAllowlist`].
+    QueuedWork(QueuedAllowlist),
+}
+
+impl ActivationMode {
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::FirstActivation => "first_activation",
+            Self::QueuedWork(_) => "queued_work",
+        }
+    }
+
+    fn allowlist(&self) -> Option<&QueuedAllowlist> {
+        match self {
+            Self::FirstActivation => None,
+            Self::QueuedWork(allowlist) => Some(allowlist),
+        }
+    }
+
+    /// What the activation is called to the operator.
+    pub(crate) const fn subject(&self) -> &'static str {
+        match self {
+            Self::FirstActivation => "a first activation",
+            Self::QueuedWork(_) => "a queued-work activation",
+        }
+    }
+}
+
+/// The Jobs a queued-work activation authorizes: 1 to [`QueuedAllowlist::MAX`]
+/// distinct Job identities, kept in ascending order so the same set is the
+/// same allowlist however it was written. It is the whole authorization: no
+/// Job that is not named here is ever authorized by it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QueuedAllowlist(Vec<JobId>);
+
+impl QueuedAllowlist {
+    /// The most Jobs one activation may authorize, and so the most queued Jobs
+    /// a database may hold when it is activated this way.
+    pub(crate) const MAX: usize = 16;
+
+    /// Parses canonical Job identities. A duplicate, a malformed identity, an
+    /// empty list and a list longer than [`Self::MAX`] are refused; nothing is
+    /// deduplicated or dropped on the operator's behalf.
+    pub(crate) fn parse(items: &[String]) -> Result<Self, String> {
+        if items.is_empty() {
+            return Err("a queued-work activation names at least one Job".to_owned());
+        }
+        if items.len() > Self::MAX {
+            return Err(format!(
+                "a queued-work activation names at most {} Jobs, not {}",
+                Self::MAX,
+                items.len()
+            ));
+        }
+        let mut jobs = Vec::with_capacity(items.len());
+        for item in items {
+            let job: JobId = item
+                .parse()
+                .map_err(|_| format!("{item:?} is not a canonical Job identity"))?;
+            if jobs.contains(&job) {
+                return Err(format!("Job {job} is named more than once"));
+            }
+            jobs.push(job);
+        }
+        jobs.sort();
+        Ok(Self(jobs))
+    }
+
+    fn contains(&self, job: JobId) -> bool {
+        self.0.binary_search(&job).is_ok()
+    }
+
+    fn to_json(&self) -> Value {
+        Value::Array(
+            self.0
+                .iter()
+                .map(|job| Value::String(job.to_string()))
+                .collect(),
+        )
+    }
 }
 
 /// The identity of one database file on this machine: the device and inode
@@ -626,7 +720,13 @@ fn decide(
         Some(request) => {
             pass(
                 "activation_requested",
-                "the operator requested a first loopback activation".to_owned(),
+                match request.mode.allowlist() {
+                    None => "the operator requested a first loopback activation".to_owned(),
+                    Some(allowlist) => format!(
+                        "the operator requested a queued-work loopback activation for {} named Job(s)",
+                        allowlist.0.len()
+                    ),
+                },
                 &mut checks,
             );
             match same_directory(&request.data_directory, root) {
@@ -698,6 +798,8 @@ fn decide(
         }
     };
 
+    let queued = request.and_then(|request| request.mode.allowlist());
+    let mode = request.map_or(&ActivationMode::FirstActivation, |request| &request.mode);
     let mut queues = Value::Null;
     let mut ready_jobs = Vec::new();
     if let Some(snapshot) = snapshot {
@@ -713,14 +815,21 @@ fn decide(
         });
         for entry in &snapshot.ready {
             let eligibility = loopback_eligibility(entry.frozen.as_ref());
-            ready_jobs.push(json!({
+            let mut listed = json!({
                 "job": entry.job.to_string(),
                 "priority": entry.priority,
                 "submitted_at_us": entry.submitted_at_us,
                 "phase": format!("{:?}", entry.phase).to_ascii_lowercase(),
                 "generative": entry.generative,
                 "autonomous_loopback_eligibility": eligibility.to_json(),
-            }));
+            });
+            if let Some(allowlist) = queued {
+                listed["revision"] = json!(entry.revision);
+                listed["job_row_sha256"] = json!(hex(&entry.row_digest));
+                listed["allowlisted"] = json!(allowlist.contains(entry.job));
+                listed["never_started_evidence"] = json!(entry.evidence);
+            }
+            ready_jobs.push(listed);
         }
         let listed = snapshot.ready.len() as u64;
         let consistent = if snapshot.truncated {
@@ -754,39 +863,55 @@ fn decide(
             refuse(
                 "no_held_allocations",
                 format!(
-                    "{} Allocation(s) hold capacity ({} running); a first activation never adopts them; run `ocg inspect-held` once the host has stopped",
-                    counts.held, counts.running
+                    "{} Allocation(s) hold capacity ({} running); {} never adopts them; run `ocg inspect-held` once the host has stopped",
+                    counts.held,
+                    counts.running,
+                    mode.subject()
                 ),
                 &mut checks,
             );
         }
-        if counts.ready == 0 && counts.pending == 0 && counts.delayed == 0 {
-            pass(
-                "no_queued_work",
-                "no Job is Pending, Ready or Delayed".to_owned(),
-                &mut checks,
-            );
-        } else {
-            refuse(
-                "no_queued_work",
-                format!(
-                    "the database already holds queued work ({} ready, {} pending, {} delayed; a queued native Job is counted in both the ready and the pending queue); a first activation refuses to arm over it and changes none of it; cancel it or run it through its own authorized workflow, or activate over an empty diagnostic database",
-                    counts.ready, counts.pending, counts.delayed
-                ),
-                &mut checks,
-            );
+        match queued {
+            None => {
+                if counts.ready == 0 && counts.pending == 0 && counts.delayed == 0 {
+                    pass(
+                        "no_queued_work",
+                        "no Job is Pending, Ready or Delayed".to_owned(),
+                        &mut checks,
+                    );
+                } else {
+                    refuse(
+                        "no_queued_work",
+                        format!(
+                            "the database already holds queued work ({} ready, {} pending, {} delayed; a queued native Job is counted in both the ready and the pending queue); a first activation refuses to arm over it and changes none of it; cancel it or run it through its own authorized workflow, or activate over an empty diagnostic database",
+                            counts.ready, counts.pending, counts.delayed
+                        ),
+                        &mut checks,
+                    );
+                }
+            }
+            Some(allowlist) => {
+                audit_queued_work(snapshot, allowlist, &mut refuse, &mut pass, &mut checks);
+            }
         }
-        audit_recurrences(&snapshot.recurrences, &mut refuse, &mut pass, &mut checks);
+        audit_recurrences(
+            &snapshot.recurrences,
+            mode.subject(),
+            &mut refuse,
+            &mut pass,
+            &mut checks,
+        );
     }
 
     // 4. The confirmation, when this reading is the authoritative one.
     let mut state_confirmed = false;
     if let (Some(request), Some(snapshot), true) = (request, snapshot, findings.in_host) {
-        let expected_state = state_digest(root, &findings.identity, snapshot);
+        let expected_state = state_digest(root, &findings.identity, snapshot, &request.mode);
         let expected_challenge = challenge_of(
             &expected_state,
             request.confirmation.open_epoch,
             request.confirmation.clean_shutdown,
+            &request.mode,
         );
         if request.confirmation.challenge != expected_challenge {
             refuse(
@@ -843,9 +968,9 @@ fn decide(
     // authority and verification fields read. Reporting it cannot change it.
     let outcome = changes.outcome(refusal.is_some(), request.is_some());
     let confirmation = snapshot.map(|snapshot| {
-        let state = state_digest(root, &findings.identity, snapshot);
+        let state = state_digest(root, &findings.identity, snapshot, mode);
         (
-            challenge_of(&state, snapshot.open_epoch, snapshot.clean_shutdown),
+            challenge_of(&state, snapshot.open_epoch, snapshot.clean_shutdown, mode),
             state,
         )
     });
@@ -883,11 +1008,31 @@ fn decide(
             },
         },
         "activation_requested": request.is_some(),
+        "activation_mode": request.map(|request| request.mode.name()),
+        "queued_work": queued.zip(snapshot).map(|(allowlist, snapshot)| json!({
+            "allowlist": allowlist.to_json(),
+            "authorized_jobs": snapshot
+                .ready
+                .iter()
+                .filter(|entry| allowlist.contains(entry.job))
+                .map(|entry| json!({
+                    "job": entry.job.to_string(),
+                    "revision": entry.revision,
+                    "job_row_sha256": hex(&entry.row_digest),
+                }))
+                .collect::<Vec<_>>(),
+            "scope": "these Jobs, exactly as the confirmation names them, and nothing that is not listed: every other Pending, Ready or Delayed Job, every Allocation and every loop refuses the activation",
+            "not_assessed": NOT_ASSESSED,
+        })),
         "requested": request.map(|request| {
             let mut requested = json!({
                 "data_directory": request.data_directory.display().to_string(),
                 "database_identity": request.database.to_string(),
+                "activation_mode": request.mode.name(),
             });
+            if let Some(allowlist) = request.mode.allowlist() {
+                requested["allowed_jobs"] = allowlist.to_json();
+            }
             // Only the authoritative reading has a confirmation to report.
             if findings.in_host {
                 requested["confirmed_open_epoch"] = json!(request.confirmation.open_epoch);
@@ -908,11 +1053,162 @@ fn decide(
     Preflight { report, refusal }
 }
 
+/// The checks of a queued-work activation over the queue itself. The queue
+/// must be exactly the Jobs the operator named, and each of them a Job that
+/// was submitted, never started and frozen for this scheduler's loopback
+/// policy. It reads the policy the scheduler already uses
+/// ([`loopback_eligibility`]) and decides nothing about the rest of the
+/// scheduler's admission: the report lists what stays unassessed.
+fn audit_queued_work(
+    snapshot: &ActivationSnapshot,
+    allowlist: &QueuedAllowlist,
+    refuse: &mut impl FnMut(&'static str, String, &mut Vec<Value>),
+    pass: &mut impl FnMut(&'static str, String, &mut Vec<Value>),
+    checks: &mut Vec<Value>,
+) {
+    let counts = &snapshot.counts;
+    if counts.delayed == 0 {
+        pass("no_delayed_work", "no Job is Delayed".to_owned(), checks);
+    } else {
+        refuse(
+            "no_delayed_work",
+            format!(
+                "{} Job(s) are Delayed; a Delayed Job is promoted into the ready queue by the scheduler without any submission, so it could begin outside the allowlist",
+                counts.delayed
+            ),
+            checks,
+        );
+    }
+    let bounded = !snapshot.truncated
+        && counts.ready <= QueuedAllowlist::MAX as u64
+        && counts.pending == counts.ready
+        && snapshot.ready.len() as u64 == counts.ready;
+    if bounded {
+        pass(
+            "queued_work_bounded",
+            format!(
+                "the whole queue ({} Job(s), the pending and ready indexes alike) was read and fits within the {}-Job authorization scope",
+                counts.ready,
+                QueuedAllowlist::MAX
+            ),
+            checks,
+        );
+    } else {
+        refuse(
+            "queued_work_bounded",
+            format!(
+                "the queue ({} ready, {} pending, {} listed, truncated: {}) is not one that {} Jobs can authorize in full: the pending and ready indexes must hold the same Jobs, and at most {} of them; a queued Job outside the listing could not be confirmed, so nothing is guessed",
+                counts.ready,
+                counts.pending,
+                snapshot.ready.len(),
+                snapshot.truncated,
+                QueuedAllowlist::MAX,
+                QueuedAllowlist::MAX
+            ),
+            checks,
+        );
+        // Everything below needs a complete, exact listing.
+        return;
+    }
+
+    let mut queued: Vec<JobId> = snapshot.ready.iter().map(|entry| entry.job).collect();
+    queued.sort();
+    let distinct = queued.windows(2).all(|pair| pair[0] != pair[1]);
+    let extra: Vec<String> = queued
+        .iter()
+        .filter(|job| !allowlist.contains(**job))
+        .map(ToString::to_string)
+        .collect();
+    let missing: Vec<String> = allowlist
+        .0
+        .iter()
+        .filter(|job| queued.binary_search(job).is_err())
+        .map(ToString::to_string)
+        .collect();
+    if distinct && extra.is_empty() && missing.is_empty() {
+        pass(
+            "queued_work_allowlist_exact",
+            format!(
+                "the {} queued Job(s) are exactly the {} the operator named",
+                queued.len(),
+                allowlist.0.len()
+            ),
+            checks,
+        );
+    } else {
+        refuse(
+            "queued_work_allowlist_exact",
+            format!(
+                "the queue and the allowlist differ: queued but not allowlisted [{}]; allowlisted but not queued (never submitted, already started, settled or stale) [{}]; a ready entry listed twice: {}; no Job is authorized by being queued",
+                extra.join(", "),
+                missing.join(", "),
+                !distinct
+            ),
+            checks,
+        );
+        return;
+    }
+
+    let mut ineligible = Vec::new();
+    for entry in &snapshot.ready {
+        let mut why: Vec<String> = Vec::new();
+        if entry.phase != crate::db::entities::MutableJobPhase::Queued {
+            why.push(format!("phase {:?}, not Queued", entry.phase));
+        }
+        if !entry.generative {
+            why.push("not a Generative Job".to_owned());
+        }
+        let eligibility = loopback_eligibility(entry.frozen.as_ref());
+        if !eligibility.eligible() {
+            why.push(format!(
+                "not eligible for autonomous loopback ({}: {})",
+                eligibility.code, eligibility.detail
+            ));
+        }
+        if !entry.key_agrees {
+            why.push("its ready key disagrees with its Job row".to_owned());
+        }
+        if !entry.in_pending {
+            why.push("it is in the ready index but not the pending index".to_owned());
+        }
+        if !entry.evidence.is_empty() {
+            why.push(format!(
+                "it has execution or ownership evidence: {}",
+                entry.evidence.join(", ")
+            ));
+        }
+        if !why.is_empty() {
+            ineligible.push(format!("{}: {}", entry.job, why.join("; ")));
+        }
+    }
+    if ineligible.is_empty() {
+        pass(
+            "queued_work_eligible",
+            format!(
+                "each of the {} named Job(s) is submitted, never started, free of Allocation, claim, request and ownership evidence, and frozen for the strict autonomous loopback endpoint policy; the scheduler's own admission is not assessed here",
+                snapshot.ready.len()
+            ),
+            checks,
+        );
+    } else {
+        refuse(
+            "queued_work_eligible",
+            format!(
+                "{} named Job(s) are not eligible and are left untouched: {}",
+                ineligible.len(),
+                ineligible.join(" | ")
+            ),
+            checks,
+        );
+    }
+}
+
 /// The loop checks: an existing loop that can create work refuses, and so
 /// does a recurrence index that does not describe the recurrences it belongs
 /// to.
 fn audit_recurrences(
     audit: &RecurrenceAudit,
+    subject: &str,
     refuse: &mut impl FnMut(&'static str, String, &mut Vec<Value>),
     pass: &mut impl FnMut(&'static str, String, &mut Vec<Value>),
     checks: &mut Vec<Value>,
@@ -928,9 +1224,7 @@ fn audit_recurrences(
         ),
         Some(detail) => refuse(
             "recurrence_index_inconsistent",
-            format!(
-                "{detail}; a first activation refuses a database whose loops cannot be read reliably"
-            ),
+            format!("{detail}; {subject} refuses a database whose loops cannot be read reliably"),
             checks,
         ),
     }
@@ -946,7 +1240,7 @@ fn audit_recurrences(
         Some(detail) => refuse(
             "no_existing_recurrences",
             format!(
-                "{detail}; a first activation never lets work that already existed begin, whether its time has come or not"
+                "{detail}; {subject} never lets work that already existed begin, whether its time has come or not"
             ),
             checks,
         ),
@@ -978,10 +1272,17 @@ fn recurrences_json(snapshot: &Result<ActivationSnapshot, (&'static str, String)
 /// on, and nothing that a host's ordinary opening changes. The operator
 /// confirms this digest; the authoritative reading recomputes it, so a
 /// confirmation cannot outlive the state it named.
+///
+/// A queued-work activation also binds its mode, its canonical allowlist and,
+/// for every queued Job in the ready index, the Job's identity, revision, the
+/// SHA-256 of its stored row (which carries its input and frozen execution
+/// configuration), its ready key, its evidence and its policy eligibility.
+/// The first activation's digest is exactly what it was before.
 fn state_digest(
     root: &Path,
     identity: &Result<DatabaseIdentity, String>,
     snapshot: &ActivationSnapshot,
+    mode: &ActivationMode,
 ) -> String {
     use aws_lc_rs::digest::{Context, SHA256};
     /// Length-prefixes `bytes`, so two different field splits cannot collide.
@@ -1028,6 +1329,34 @@ fn state_digest(
             .unwrap_or("consistent")
             .as_bytes(),
     );
+    if let Some(allowlist) = mode.allowlist() {
+        field(&mut context, b"queued-work-v1");
+        context.update(&(allowlist.0.len() as u64).to_le_bytes());
+        for job in &allowlist.0 {
+            context.update(&job.get().to_le_bytes());
+        }
+        context.update(&(snapshot.ready.len() as u64).to_le_bytes());
+        context.update(&[u8::from(snapshot.truncated)]);
+        for entry in &snapshot.ready {
+            context.update(&entry.job.get().to_le_bytes());
+            context.update(&[entry.priority]);
+            context.update(&entry.submitted_at_us.to_le_bytes());
+            context.update(&entry.revision.to_le_bytes());
+            context.update(&entry.requirement.to_le_bytes());
+            context.update(&entry.row_digest);
+            field(&mut context, format!("{:?}", entry.phase).as_bytes());
+            context.update(&[
+                u8::from(entry.generative),
+                u8::from(entry.key_agrees),
+                u8::from(entry.in_pending),
+            ]);
+            field(
+                &mut context,
+                loopback_eligibility(entry.frozen.as_ref()).code.as_bytes(),
+            );
+            field(&mut context, entry.evidence.join(",").as_bytes());
+        }
+    }
     hex(context.finish().as_ref())
 }
 
@@ -1036,10 +1365,18 @@ fn state_digest(
 /// confirmation names. Because it covers `open_epoch`, which every opening
 /// increments, a challenge names one opening of one database state, and the
 /// opening after it can never reuse it.
-fn challenge_of(state: &str, open_epoch: u64, clean_shutdown: bool) -> String {
+fn challenge_of(
+    state: &str,
+    open_epoch: u64,
+    clean_shutdown: bool,
+    mode: &ActivationMode,
+) -> String {
     use aws_lc_rs::digest::{Context, SHA256};
     let mut context = Context::new(&SHA256);
-    context.update(b"ocg-first-loopback-activation-v1");
+    context.update(match mode {
+        ActivationMode::FirstActivation => b"ocg-first-loopback-activation-v1".as_slice(),
+        ActivationMode::QueuedWork(_) => b"ocg-queued-loopback-activation-v1".as_slice(),
+    });
     context.update(&(state.len() as u64).to_le_bytes());
     context.update(state.as_bytes());
     context.update(&open_epoch.to_le_bytes());

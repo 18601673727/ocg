@@ -1,31 +1,49 @@
-//! The one offline migration this build supports: database format 22
-//! (`ocg-native-genesis-v3`) to format 23 (`ocg-native-genesis-v4`).
+//! The offline migration framework. Format 1 is the first database format, so
+//! no migration step exists yet: [`STEPS`] is empty, and the framework refuses
+//! any format but the current one with that reason.
 //!
-//! The change is additive: two new empty tables (the durable scheduled
-//! external policy and its Allocation binding) and the two identity markers. No
-//! authoritative row is rewritten, no derived table is rebuilt and no
-//! credential is touched. The source is opened read-only; the migration applies
-//! to a private copy and is published only after every logical row and every
-//! copied file has been verified against the source.
+//! The framework is what a future format change plugs into. `ocg migrate`
+//! inspects a stopped database read-only, copies the data directory to a
+//! private staging directory, applies the one [`Step`] that reads the source's
+//! format to the copy in a single write transaction, verifies the result
+//! against the source, and publishes it with an atomic no-replace rename. The
+//! source is opened read-only and never modified.
 //!
-//! An older or unmarked format is refused rather than reinterpreted. A database
-//! marked format 22 that already carries a non-empty new table, or one marked
-//! format 23 that lacks either new table, is a partial migration and is
-//! refused. The source is never modified: publication is an atomic no-replace
-//! rename of the verified staging directory.
+//! A step is verified by logical identity: [`digest_tables`] hashes every row of
+//! every table, and the migrated copy must hash exactly like the source. That
+//! suits an additive step. A step that adds tables or rewrites rows must extend
+//! [`digest_tables`] and the comparison in [`apply`] to say what changed.
+//!
+//! Any other format is refused rather than reinterpreted.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use ::redb::TableHandle;
 use aws_lc_rs::digest::{Context, SHA256};
 
 use super::*;
 
-/// The format this build can migrate from. The current format needs no
-/// migration.
-pub(super) const MIGRATION_SOURCE_FORMAT: u64 = 22;
-pub(super) const MIGRATION_SOURCE_FINGERPRINT: &[u8] = b"ocg-native-genesis-v3";
+type StepResult = Result<(), Box<dyn std::error::Error>>;
+
+/// One migration step: it reads format [`Step::from`] and writes the current
+/// format. The framework runs exactly one step; a chain of formats is a
+/// chain of `ocg migrate` runs.
+pub(super) struct Step {
+    /// The format this step reads.
+    pub(super) from: u64,
+    /// The schema fingerprint the source must carry.
+    pub(super) fingerprint: &'static [u8],
+    /// Read-only checks of the source, including its own record encoding: the
+    /// source's records are not the current format's, so the framework reads
+    /// none of them.
+    pub(super) check: fn(&ReadTransaction, &BTreeSet<String>) -> StepResult,
+    /// Applies the change to the private copy, inside the one write transaction
+    /// that also writes the new format marker and fingerprint.
+    pub(super) apply: fn(&::redb::WriteTransaction) -> StepResult,
+}
+
+/// Every migration this build can run. Empty: format 1 is the first format.
+pub(super) const STEPS: &[Step] = &[];
 
 /// The logical identity of every authoritative row in a database. Two
 /// databases with equal digests hold exactly the same rows; table pages, free
@@ -42,7 +60,7 @@ pub(super) struct MigrationDigest {
 pub(crate) enum MigrationInspection {
     /// Already this build's format; nothing to do.
     Current,
-    /// The immediately preceding format, with a verified logical snapshot.
+    /// A format a [`Step`] reads, with a verified logical snapshot.
     Upgrade(MigrationPlan),
 }
 
@@ -100,77 +118,52 @@ fn inspect_database(
     let meta = tx.open_table(META)?;
     let format = read_format(&meta)?;
     let fingerprint = read_fingerprint(&meta)?;
-    check_metadata(&meta)?;
-    match format {
-        DATABASE_FORMAT_VERSION => {
-            if fingerprint.as_slice() != SCHEMA_FINGERPRINT {
-                return Err(format!(
-                    "database format {} has an unexpected schema fingerprint; this build opens only `{}`",
-                    format,
-                    String::from_utf8_lossy(SCHEMA_FINGERPRINT)
-                )
-                .into());
-            }
-            reject_legacy_slot_table(&names)?;
-            for required in [
-                SCHEDULED_EXTERNAL_POLICY.name(),
-                SCHEDULED_EXTERNAL_BINDING.name(),
-            ] {
-                if !names.iter().any(|name| name == required) {
-                    return Err(format!(
-                        "database is marked format {DATABASE_FORMAT_VERSION} but lacks the {required} table; it is a partial migration, not a supported database"
-                    )
-                    .into());
-                }
-            }
-            Ok(MigrationInspection::Current)
+    if format == DATABASE_FORMAT_VERSION {
+        if fingerprint.as_slice() != SCHEMA_FINGERPRINT {
+            return Err(format!(
+                "database format {} has an unexpected schema fingerprint; this build opens only `{}`",
+                format,
+                String::from_utf8_lossy(SCHEMA_FINGERPRINT)
+            )
+            .into());
         }
-        MIGRATION_SOURCE_FORMAT => {
-            if fingerprint.as_slice() != MIGRATION_SOURCE_FINGERPRINT {
-                return Err(format!(
-                    "database format {format} has an unexpected schema fingerprint; this build migrates only the format {MIGRATION_SOURCE_FORMAT} database it wrote itself"
-                )
-                .into());
-            }
-            for present in [SCHEDULED_EXTERNAL_POLICY.name(), SCHEDULED_EXTERNAL_BINDING.name()] {
-                if names.iter().any(|name| name == present) {
-                    let len = open_table_len(&tx, present)?;
-                    if len != 0 {
-                        return Err(format!(
-                            "database is marked format {format} but the {present} table already has rows; it is a partial migration, not a supported source"
-                        )
-                        .into());
-                    }
-                }
-            }
-            reject_legacy_slot_table(&names)?;
-            require_source_tables(&names)?;
-            recovery::migration_check_headers(&tx)?;
-            recovery::migration_check_native(&tx)?;
-            let digest = digest_tables(&tx, &names)?;
-            Ok(MigrationInspection::Upgrade(MigrationPlan {
-                from: format,
-                to: DATABASE_FORMAT_VERSION,
-                digest,
-            }))
-        }
-        other => Err(format!(
-            "database format {other} is not supported; this build opens only format {DATABASE_FORMAT_VERSION} and migrates only format {MIGRATION_SOURCE_FORMAT}"
-        )
-        .into()),
+        check_metadata(&meta)?;
+        require_tables(&names)?;
+        return Ok(MigrationInspection::Current);
     }
+    let Some(step) = STEPS.iter().find(|step| step.from == format) else {
+        return Err(format!(
+            "database format {format} is not supported; this build opens only format {DATABASE_FORMAT_VERSION} and has no migration from it"
+        )
+        .into());
+    };
+    if fingerprint.as_slice() != step.fingerprint {
+        return Err(format!(
+            "database format {format} has an unexpected schema fingerprint; this build migrates only the format {format} database it wrote itself"
+        )
+        .into());
+    }
+    (step.check)(&tx, &names)?;
+    let digest = digest_tables(&tx, &names)?;
+    Ok(MigrationInspection::Upgrade(MigrationPlan {
+        from: format,
+        to: DATABASE_FORMAT_VERSION,
+        digest,
+    }))
 }
 
 /// Applies the plan to the private copy at `path` in one immediate write
 /// transaction, then verifies that every logical row, every metadata value
-/// other than the two identity markers, and the table set are unchanged apart
-/// from the two empty new tables.
+/// other than the two identity markers, and the table set are unchanged.
 pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std::error::Error>> {
+    let step = STEPS
+        .iter()
+        .find(|step| step.from == plan.from)
+        .ok_or("no migration step reads this format")?;
     let database = ::redb::Database::open(path)?;
     {
         let tx = database.begin_read()?;
         let names = table_names(&tx)?;
-        require_source_tables(&names)?;
         let digest = digest_tables(&tx, &names)?;
         if digest != plan.digest {
             return Err("copied database does not match the source".into());
@@ -178,8 +171,7 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
     }
     let mut tx = database.begin_write()?;
     tx.set_durability(::redb::Durability::Immediate)?;
-    tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
-    tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
+    (step.apply)(&tx)?;
     {
         let mut table = tx.open_table(META)?;
         table.insert(
@@ -192,15 +184,7 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
     {
         let tx = database.begin_read()?;
         let names = table_names(&tx)?;
-        reject_legacy_slot_table(&names)?;
-        for required in [
-            SCHEDULED_EXTERNAL_POLICY.name(),
-            SCHEDULED_EXTERNAL_BINDING.name(),
-        ] {
-            if !names.iter().any(|name| name == required) {
-                return Err(format!("the migrated database lacks {required}").into());
-            }
-        }
+        require_tables(&names)?;
         let digest = digest_tables(&tx, &names)?;
         if digest != plan.digest {
             return Err("migrated authoritative data differs from the source".into());
@@ -208,23 +192,11 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
         let meta = tx.open_table(META)?;
         check_metadata(&meta)?;
     }
-    // Not merely the marker and the two tables: the checks a host's startup
-    // preflight applies, plus every record header and native invariant. The
-    // copy is read, never opened by a host, so no epoch or shutdown marker
-    // changes and no ownership is released, adopted or cleared.
+    // Not merely the marker: the checks a host's startup preflight applies,
+    // plus every record header and native invariant. The copy is read, never
+    // opened by a host, so no epoch or shutdown marker changes and no ownership
+    // is released, adopted or cleared.
     recovery::verify_migrated(&database)?;
-    Ok(())
-}
-
-/// `held_slot` is the legacy slot table. Native initialization refuses it, so
-/// a database that carries it is neither a supported source nor a valid
-/// destination; it is refused, never dropped or carried over.
-fn reject_legacy_slot_table(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Error>> {
-    if names.iter().any(|name| name == HELD_SLOTS.name()) {
-        return Err(
-            "database carries the legacy held_slot table, which a native database must not have; it is not migrated, deleted or reinterpreted".into(),
-        );
-    }
     Ok(())
 }
 
@@ -247,9 +219,10 @@ fn read_format(
         Some(value) => <[u8; 8]>::try_from(value.value())
             .map(u64::from_le_bytes)
             .map_err(|_| "database format marker is malformed".into()),
-        None => Err(
-            "unmarked database; this build opens only format 23 and migrates only format 22".into(),
-        ),
+        None => Err(format!(
+            "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION}"
+        )
+        .into()),
     }
 }
 
@@ -289,19 +262,8 @@ fn check_metadata(
     Ok(())
 }
 
-fn open_table_len(tx: &ReadTransaction, name: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    use ::redb::ReadableTableMetadata;
-    let definition = match name {
-        "scheduled_external_policy" => tx.open_table(SCHEDULED_EXTERNAL_POLICY)?.len()?,
-        "scheduled_external_binding" => tx.open_table(SCHEDULED_EXTERNAL_BINDING)?.len()?,
-        _ => return Err(format!("unexpected optional table {name}").into()),
-    };
-    Ok(definition)
-}
-
-/// Every table the preceding format always had. A `held_slot` table is not
-/// one of them: it is refused before this runs.
-fn require_source_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Error>> {
+/// Every table the current format defines.
+fn require_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Error>> {
     for required in [
         "meta",
         "sequence",
@@ -354,10 +316,12 @@ fn require_source_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::er
         "open_approval",
         "approval_call",
         "recurrence_due",
+        "scheduled_external_policy",
+        "scheduled_external_binding",
     ] {
         if !names.iter().any(|name| name == required) {
             return Err(format!(
-                "database lacks the {required} table this format defines; it is not a complete format {MIGRATION_SOURCE_FORMAT} database"
+                "database lacks the {required} table this format defines; it is not a complete format {DATABASE_FORMAT_VERSION} database"
             )
             .into());
         }
@@ -380,18 +344,12 @@ fn digest_tables(
                 hash_meta(tx, &mut meta)?
             }
             "scheduled_external_policy" => {
-                let len = open_table_len(tx, name)?;
-                if len != 0 {
-                    return Err("the scheduled external policy table is not empty".into());
-                }
-                0
+                tables_count += 1;
+                hash_table(tx, SCHEDULED_EXTERNAL_POLICY, &mut tables)?
             }
             "scheduled_external_binding" => {
-                let len = open_table_len(tx, name)?;
-                if len != 0 {
-                    return Err("the scheduled external binding table is not empty".into());
-                }
-                0
+                tables_count += 1;
+                hash_table(tx, SCHEDULED_EXTERNAL_BINDING, &mut tables)?
             }
             "sequence" => {
                 tables_count += 1;
@@ -595,7 +553,7 @@ fn digest_tables(
             }
             other => {
                 return Err(format!(
-                    "unexpected table `{other}` in a format {MIGRATION_SOURCE_FORMAT} database"
+                    "unexpected table `{other}` in a format {DATABASE_FORMAT_VERSION} database"
                 )
                 .into());
             }

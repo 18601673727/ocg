@@ -441,12 +441,6 @@ struct UnprovenGroup {
     handles: Option<GroupHandles>,
 }
 
-impl UnprovenGroup {
-    fn probing(&self) -> bool {
-        self.handles.is_none()
-    }
-}
-
 static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
 
 /// Gives each record an identity of its own. A group's pid is reused once a
@@ -485,55 +479,6 @@ pub(crate) fn groups_tracked() -> bool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty()
-}
-
-/// The Jobs whose stop was proven and still has to be committed: every
-/// call and group of the Job is resolved. A Job with a supervisor still
-/// starting, a group possibly alive or a group unproven is not listed.
-///
-/// Only a list of candidates: it is a snapshot, and says nothing once the
-/// caller awaits. Confirming a stop on its strength is unsound; use
-/// [`stop_proven`] right before the confirmation.
-pub(crate) fn unconfirmed_stops() -> Vec<JobId> {
-    let calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
-    let unproven = UNPROVEN_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let mut jobs = UNCONFIRMED_STOPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    jobs.extend(calls.iter().map(|(call, _)| call.job));
-    jobs.retain(|job| resolved(*job, &calls, &unproven));
-    jobs.into_iter().collect()
-}
-
-/// Whether every call and group of `job` is resolved: none is starting or
-/// possibly alive, and no group is unproven.
-fn resolved(job: JobId, calls: &[(ToolCallRef, CallState)], unproven: &[UnprovenGroup]) -> bool {
-    !calls
-        .iter()
-        .any(|(call, state)| call.job == job && *state != CallState::Cleaned)
-        && !unproven.iter().any(|entry| entry.job == Some(job))
-}
-
-/// Whether, right now, the stop of `job` is proven by what this process
-/// tracks: every call and group of the Job is resolved, and some proof of it
-/// is held. The answer is fresh, not a snapshot, and holds through a later
-/// confirmation only if the Job's admission set cannot grow: the caller must
-/// have read an outcome durably stored for the Job before this check, since
-/// no call is admitted to a Job with an outcome and every admission that
-/// committed earlier registered its call before it was sent.
-pub(crate) fn stop_proven(job: JobId) -> bool {
-    let calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
-    let unproven = UNPROVEN_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let confirmed = UNCONFIRMED_STOPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .contains(&job);
-    resolved(job, &calls, &unproven) && (confirmed || calls.iter().any(|(call, _)| call.job == job))
 }
 
 /// The stop of `job` is committed, or can no longer be: the retained proof
@@ -1154,81 +1099,4 @@ fn live_group_members(_: Pid) -> std::io::Result<bool> {
         std::io::ErrorKind::Unsupported,
         "process-group membership scanning is unsupported on this platform",
     ))
-}
-
-pub(crate) enum JobProof {
-    Proven,
-    /// A supervisor may still start a process.
-    Starting,
-    Live {
-        group: u32,
-    },
-    /// Another prover is checking this group right now, so nothing is proven.
-    Checking {
-        group: u32,
-    },
-    Untracked,
-}
-
-#[cfg(unix)]
-pub(crate) fn prove_job(job: JobId) -> JobProof {
-    let mut cleaned = false;
-    {
-        let calls = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut starting = false;
-        for (_, state) in calls.iter().filter(|(call, _)| call.job == job) {
-            match state {
-                CallState::Running(group) => {
-                    return JobProof::Live {
-                        group: group.as_raw_pid() as u32,
-                    };
-                }
-                CallState::Starting => starting = true,
-                CallState::Cleaned => cleaned = true,
-            }
-        }
-        if starting {
-            return JobProof::Starting;
-        }
-    }
-    let probes = take_probes(|entry| entry.job == Some(job));
-    let tracked = !probes.is_empty();
-    for mut probe in probes {
-        if probe.prove(Duration::from_millis(50)) {
-            probe.proven();
-        }
-    }
-    let unproven = UNPROVEN_GROUPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    // A group of the Job still unproven answers for it: a live one, or one
-    // that another prover is checking.
-    if let Some(entry) = unproven
-        .iter()
-        .find(|entry| entry.job == Some(job) && !entry.probing())
-    {
-        return JobProof::Live {
-            group: entry.group.as_raw_pid() as u32,
-        };
-    }
-    if let Some(entry) = unproven.iter().find(|entry| entry.job == Some(job)) {
-        return JobProof::Checking {
-            group: entry.group.as_raw_pid() as u32,
-        };
-    }
-    // A stop proven by the scheduler, not yet committed, is still proof.
-    let confirmed = UNCONFIRMED_STOPS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .contains(&job);
-    if tracked || cleaned || confirmed {
-        JobProof::Proven
-    } else {
-        JobProof::Untracked
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn prove_job(_job: JobId) -> JobProof {
-    JobProof::Untracked
 }

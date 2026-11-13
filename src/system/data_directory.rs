@@ -71,10 +71,6 @@ pub(crate) fn hold_database_lock_shared(directory: &Path) -> io::Result<std::fs:
 pub enum DataDirectoryError {
     #[error("{DATA_DIRECTORY_VARIABLE} must be set to the OCG data directory")]
     NotConfigured,
-    #[error(
-        "{path} uses the obsolete ocg_db layout; stop OCG, move ocg.redb and credentials.json into the data root, and remove the empty ocg_db directory before restarting"
-    )]
-    LegacyLayout { path: PathBuf },
     #[error("failed to prepare {path}: {source}")]
     Io {
         path: PathBuf,
@@ -116,17 +112,6 @@ impl DataDirectory {
                 path: root.clone(),
                 source,
             })?;
-        let legacy = root.join("ocg_db");
-        match std::fs::symlink_metadata(&legacy) {
-            Ok(_) => return Err(DataDirectoryError::LegacyLayout { path: legacy }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(DataDirectoryError::Io {
-                    path: legacy,
-                    source,
-                });
-            }
-        }
         make_private(&root)?;
 
         let data_directory = Self { root };
@@ -142,8 +127,7 @@ impl DataDirectory {
 
     /// The layout of a data directory that already exists, resolved without
     /// creating, chmodding or otherwise touching anything in it. It refuses a
-    /// missing directory and the obsolete `ocg_db` layout exactly as
-    /// [`Self::bootstrap`] does. A read-only command uses this: a data
+    /// missing directory exactly as [`Self::bootstrap`] does. A read-only command uses this: a data
     /// directory whose attachments and logs directories are missing stays
     /// missing, and the root keeps whatever mode it has.
     pub fn existing(root: impl Into<PathBuf>) -> Result<Self, DataDirectoryError> {
@@ -164,17 +148,6 @@ impl DataDirectory {
                 path: root,
                 source: io::Error::other("the data directory is not a directory"),
             });
-        }
-        let legacy = root.join("ocg_db");
-        match std::fs::symlink_metadata(&legacy) {
-            Ok(_) => return Err(DataDirectoryError::LegacyLayout { path: legacy }),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(DataDirectoryError::Io {
-                    path: legacy,
-                    source,
-                });
-            }
         }
         Ok(Self { root })
     }

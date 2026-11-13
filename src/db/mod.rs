@@ -18,9 +18,7 @@ pub use crate::db::attachments::{
     AttachmentCleanupReport, AttachmentContent, AttachmentError, AttachmentImageError, Reclamation,
     ReclamationError, StoreError, attachment_images,
 };
-use crate::db::entities::{
-    Actor, Appended, Entry, ExecutionConfiguration, JobAction, JobGroup, StopProof,
-};
+use crate::db::entities::{Actor, Appended, Entry, ExecutionConfiguration, JobAction, JobGroup};
 use crate::db::entities::{
     AppendedOutput, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord, AvailabilityStat,
     AvailabilityStatId, AvailabilityStatRecord, CleanupKind, Config, ConfigBody, ConfigId,
@@ -32,7 +30,6 @@ use crate::db::entities::{
     Submission, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
     ToolOutcome, Violation,
 };
-use crate::db::entities::{ClaimGrant, ClaimRefusal, ClaimRequest, FrozenPoolBinding};
 use crate::db::mutations::PublishedAttachment;
 pub(crate) use crate::db::redb::{Batch, BatchError, Failure};
 use crate::db::redb::{BatchFailure, Commit, CompactFailure, OpenedFile, Probe};
@@ -48,12 +45,6 @@ use crate::system::policy::{SystemPolicy, SystemPolicyError};
 #[derive(Clone, Copy)]
 pub(crate) enum AdmissionCandidate {
     Decision(ExecutorId, entities::ProfileId),
-}
-
-#[derive(Clone)]
-pub(crate) enum ProviderSettlementEvidence {
-    Observations(Vec<AvailabilityStat>),
-    Answer(Box<ProviderAnswer>),
 }
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -267,8 +258,8 @@ pub(crate) use commands::serialized_len;
 mod errors;
 mod handle;
 pub(crate) use handle::{
-    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentPreviewError,
-    PreparedDevelopmentHandoff,
+    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentPreviewError, DevelopmentToolContext,
+    DevelopmentToolOffer, DevelopmentTooling, NoTooling, PreparedDevelopmentHandoff,
 };
 mod scheduler_wake;
 mod shared;

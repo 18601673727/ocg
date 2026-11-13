@@ -1,6 +1,6 @@
 use super::commands::{
-    byte_count, command_bytes, compaction_bytes, config_bytes, debug_bytes, entry_bytes,
-    json_bytes, output_bytes, search_index_bytes, text_bytes,
+    byte_count, command_bytes, compaction_bytes, config_bytes, debug_bytes, json_bytes,
+    output_bytes, search_index_bytes, text_bytes,
 };
 use super::*;
 
@@ -50,8 +50,66 @@ impl DevelopmentHandoffCredentials {
     }
 }
 
+/// The tools a native execution offers its Provider, and the Workspace facts
+/// its request states about them. Built by the executor from the Job's own
+/// Project before the start; the handoff prepares the exact request from it
+/// and never reads a Workspace itself.
+#[derive(Clone, Debug)]
+pub(crate) struct DevelopmentToolOffer {
+    pub(crate) wires: Vec<crate::service::ai::providers::openai_compatible::ToolWire>,
+    /// What the Workspace tools allow, as the request tells the Provider;
+    /// `None` when the offer has no Workspace tool.
+    pub(crate) grant: Option<&'static str>,
+    /// The Workspace's own `AGENTS.md`, sent as a system message.
+    pub(crate) agents_md: Option<String>,
+}
+
+/// Builds the tools offer of a native execution from the facts the checked
+/// handoff itself resolved: the frozen configuration and the Project of the
+/// Job's conversation. The offer is made for exactly that Project, so the
+/// start transaction, which revalidates the snapshot, covers it too.
+pub(crate) trait DevelopmentTooling {
+    /// `Ok(None)` for a Job that is offered no tool. A refusal is a definite
+    /// pre-start failure.
+    async fn offer(
+        &self,
+        frozen: &entities::FrozenExecutionConfig,
+        project: Option<&entities::ProjectRecord>,
+        context: DevelopmentToolContext,
+    ) -> Result<Option<DevelopmentToolOffer>, &'static str>;
+}
+
+/// What a Job's place in its conversation says about the tools it may be
+/// offered.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DevelopmentToolContext {
+    /// A user decides for the Job, so a call may wait for their decision.
+    pub(crate) decider: bool,
+    /// The Job's conversation is itself a child of another, whose worker may
+    /// ask the user a question. A conversation the user holds asks nothing:
+    /// the Agent answers in the conversation.
+    pub(crate) nested: bool,
+}
+
+/// The tooling of a path that offers no tool and no Workspace.
+pub(crate) struct NoTooling;
+
+impl DevelopmentTooling for NoTooling {
+    async fn offer(
+        &self,
+        _frozen: &entities::FrozenExecutionConfig,
+        _project: Option<&entities::ProjectRecord>,
+        _context: DevelopmentToolContext,
+    ) -> Result<Option<DevelopmentToolOffer>, &'static str> {
+        Ok(None)
+    }
+}
+
 enum DevelopmentToolPolicy {
-    NoToolsOrWorkspace,
+    /// No tool and no Workspace: the request is a single chat exchange.
+    ToolFree,
+    /// The Agent's Workspace grant, offered as exactly these tool definitions.
+    Offered,
 }
 
 impl PreparedDevelopmentHandoff {
@@ -118,10 +176,12 @@ impl PreparedDevelopmentHandoff {
         references
     }
 
-    pub(super) fn has_bounded_tool_free_inputs(&self) -> bool {
-        if !matches!(self.tool_policy, DevelopmentToolPolicy::NoToolsOrWorkspace)
-            || !self.request.is_object()
-        {
+    pub(super) fn has_bounded_inputs(&self) -> bool {
+        if !self.request.is_object() {
+            return false;
+        }
+        let offers_tools = self.request.get("tools").is_some();
+        if offers_tools != matches!(self.tool_policy, DevelopmentToolPolicy::Offered) {
             return false;
         }
         match &self.candidate {
@@ -149,9 +209,21 @@ pub(crate) struct DevelopmentHandoff {
     output_busy: AtomicBool,
     output_uncertain: AtomicBool,
     usage_checkpoint: std::sync::Mutex<DevelopmentUsageCheckpoint>,
+    /// What the Job's earlier requests recorded, so a later request carries
+    /// only the message bodies not stored yet. It changes only after the
+    /// evidence it describes committed.
+    recorder: std::sync::Mutex<crate::service::ai::providers::RequestRecorder>,
 }
 
 impl DevelopmentHandoff {
+    /// The Job this handoff executes.
+    pub(crate) fn job(&self) -> entities::JobId {
+        match &self.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token.job,
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token.job,
+        }
+    }
+
     pub(crate) fn contains_secret(&self, value: &str) -> bool {
         self.prepared
             .credentials
@@ -243,6 +315,9 @@ impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
 /// sequence before using it; an uncertain write makes the handoff unusable.
 #[derive(Clone, Default)]
 pub(super) struct DevelopmentUsageCheckpoint {
+    /// The request this checkpoint's evidence belongs to; another request
+    /// starts from an empty checkpoint.
+    request: Option<entities::RequestNumber>,
     last_sequence: u32,
     evidence: entities::TokenEvidence,
 }
@@ -258,9 +333,24 @@ impl DevelopmentUsageCheckpoint {
 
     pub(super) fn advanced(last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
         Self {
+            request: None,
             last_sequence,
             evidence,
         }
+    }
+
+    /// This checkpoint if it describes `request`, otherwise an empty one.
+    fn for_request(self, request: entities::RequestNumber) -> Self {
+        if self.request == Some(request) {
+            self
+        } else {
+            Self::default()
+        }
+    }
+
+    fn of_request(mut self, request: entities::RequestNumber) -> Self {
+        self.request = Some(request);
+        self
     }
 }
 
@@ -372,6 +462,7 @@ fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffError {
 fn prepare_development_handoff(
     resolved: redb::DevelopmentResolvedCandidate,
     system_policy: SystemPolicy,
+    offer: Option<&DevelopmentToolOffer>,
 ) -> Result<PreparedDevelopmentHandoff, DatabaseError> {
     use crate::service::ai::compact::{
         ContextLimits, ContextNotices, estimate_request_tokens, fit_with_notices,
@@ -385,7 +476,7 @@ fn prepare_development_handoff(
     };
     match resolved {
         redb::DevelopmentResolvedCandidate::Decision(context) => {
-            if context.conversation.parent_id.is_some() {
+            if context.conversation.parent_id.is_some() || offer.is_some() {
                 return Err(unavailable());
             }
             let entities::MutableJobContent::Decision { request, .. } = &context.job.input.content
@@ -403,15 +494,32 @@ fn prepare_development_handoff(
                 request,
                 conversation: None,
                 system_policy,
-                tool_policy: DevelopmentToolPolicy::NoToolsOrWorkspace,
+                tool_policy: DevelopmentToolPolicy::ToolFree,
                 credentials: DevelopmentHandoffCredentials::default(),
             })
         }
         redb::DevelopmentResolvedCandidate::Generative(context) => {
             let snapshot = &context.snapshot;
             let frozen = &snapshot.configuration;
-            if snapshot.conversation.parent_id.is_some()
-                || frozen.single_request_refusal().is_some()
+            // The Agent's Workspace grant and the Workspace tools offered are
+            // one fact: a Job with a grant runs with its tools or not at all,
+            // and a Job without one is never offered any. Asking the user is
+            // not a Workspace tool.
+            let granted = frozen
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.workspace_grant().is_some());
+            // An Agent with a Workspace grant runs with its Workspace tools or
+            // not at all. One that only manages Jobs may be offered the job
+            // tools, and runs without when none is offered.
+            let manages = frozen
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.manages_jobs());
+            if frozen.native_execution_refusal().is_some()
+                || (granted && offer.is_none_or(|offer| offer.grant.is_none()))
+                || (!granted && offer.is_some() && !manages)
+                || offer.is_some_and(|offer| offer.wires.is_empty())
             {
                 return Err(unavailable());
             }
@@ -473,14 +581,19 @@ fn prepare_development_handoff(
                 Some(snapshot.job.input.text()),
                 &current_images,
                 snapshot.project.as_ref(),
-                None,
-                None,
-                Vec::new(),
+                offer.and_then(|offer| offer.grant),
+                offer.and_then(|offer| offer.agents_md.as_deref()),
+                offer.map(|offer| offer.wires.clone()).unwrap_or_default(),
                 limits,
                 ContextNotices::default(),
             )
             .ok_or_else(unavailable)?;
-            if let Some(project) = &snapshot.project {
+            if granted && snapshot.project.is_none() {
+                return Err(unavailable());
+            }
+            if offer.is_none_or(|offer| offer.grant.is_none())
+                && let Some(project) = &snapshot.project
+            {
                 let first = conversation.messages.first_mut().ok_or_else(unavailable)?;
                 *first = crate::service::ai::providers::openai_compatible::ChatMessage::system(
                     format!(
@@ -490,7 +603,7 @@ fn prepare_development_handoff(
                 );
             }
             if conversation.dropped_turns != 0
-                || !conversation.tools.is_empty()
+                || conversation.tools.len() != offer.map_or(0, |offer| offer.wires.len())
                 || estimate_request_tokens(&conversation, limits.max_tokens)
                     > u64::from(limits.context_window.ok_or_else(unavailable)?)
             {
@@ -534,7 +647,11 @@ fn prepare_development_handoff(
                 request,
                 conversation: Some(conversation),
                 system_policy,
-                tool_policy: DevelopmentToolPolicy::NoToolsOrWorkspace,
+                tool_policy: if offer.is_some() {
+                    DevelopmentToolPolicy::Offered
+                } else {
+                    DevelopmentToolPolicy::ToolFree
+                },
                 credentials: DevelopmentHandoffCredentials::default(),
             })
         }
@@ -565,9 +682,6 @@ pub struct Vitals {
     pub durable_commits: u64,
     pub commit_us_mean: Option<u64>,
     pub commit_us_max: u64,
-    pub claims_count: u64,
-    pub claim_us_mean: Option<u64>,
-    pub claim_us_max: u64,
     pub queue_pending: Option<u64>,
     pub queue_ready: Option<u64>,
     pub queue_delayed: Option<u64>,
@@ -721,24 +835,6 @@ impl DatabaseHandle {
         Ok(AttachmentPermit(self.shared.attachment_slots.0.clone()))
     }
 
-    pub(crate) async fn terminal_jobs(
-        &self,
-        jobs: Vec<JobId>,
-    ) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| redb::terminal_jobs(database, &jobs))
-            .await
-    }
-
-    /// Where each of `jobs` stands toward the confirmation of its stop, as
-    /// durably stored now.
-    pub(crate) async fn stop_standings(
-        &self,
-        jobs: Vec<JobId>,
-    ) -> Result<Vec<(JobId, redb::StopStanding)>, DatabaseError> {
-        self.read(move |database| redb::stop_standings(database, &jobs))
-            .await
-    }
-
     /// Successful durable commits of command groups since this worker started.
     /// A flushed group counts once; refused or declined commands and failed
     /// commits do not count. Recovery and maintenance commits are excluded.
@@ -774,20 +870,12 @@ impl DatabaseHandle {
         let commit_us_max = self.shared.commit_us_max.load(Ordering::Relaxed);
         let commit_us_mean = commit_us_total.checked_div(durable_commits);
 
-        let claims_count = self.shared.claims.load(Ordering::Relaxed);
-        let claim_us_total = self.shared.claim_us_total.load(Ordering::Relaxed);
-        let claim_us_max = self.shared.claim_us_max.load(Ordering::Relaxed);
-        let claim_us_mean = claim_us_total.checked_div(claims_count);
-
         Vitals {
             database_bytes,
             available_bytes,
             durable_commits,
             commit_us_mean,
             commit_us_max,
-            claims_count,
-            claim_us_mean,
-            claim_us_max,
             queue_pending: queue_counts.0,
             queue_ready: queue_counts.1,
             queue_delayed: queue_counts.2,
@@ -853,10 +941,6 @@ impl DatabaseHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
-    }
-
-    pub(crate) async fn next_scheduled_delay(&self) -> Result<Option<Duration>, DatabaseError> {
-        self.read(redb::next_scheduled_delay).await
     }
 
     pub(crate) fn subscribe_catalog(&self) -> crate::system::notification::Subscription {
@@ -970,19 +1054,8 @@ impl DatabaseHandle {
         {
             return Ok(None);
         }
-        for (job, standing) in redb::stop_standings(
-            &opened.database,
-            &crate::system::executor::blocking::unconfirmed_stops(),
-        )
-        .map_err(DatabaseError::Read)?
-        {
-            match standing {
-                redb::StopStanding::Settled => {
-                    crate::system::executor::blocking::stop_settled(job);
-                }
-                redb::StopStanding::Open | redb::StopStanding::Unconfirmed => {}
-            }
-        }
+        // No command's process group may be alive, or unproven, when the
+        // executable is replaced; none of them survives a restart.
         if crate::system::executor::blocking::groups_tracked() {
             return Ok(None);
         }
@@ -1217,28 +1290,6 @@ impl DatabaseHandle {
         self.shared.genesis
     }
 
-    pub(crate) async fn job_execution(
-        &self,
-        turn: JobId,
-    ) -> Result<
-        (
-            crate::db::entities::FrozenExecutionConfig,
-            Option<ProjectId>,
-            Option<ConfigId>,
-        ),
-        DatabaseError,
-    > {
-        self.read(move |database| redb::read_turn_execution(database, turn))
-            .await
-    }
-    pub(crate) async fn read_turn_context(
-        &self,
-        turn: JobId,
-        budget: usize,
-    ) -> Result<redb::TurnContext, DatabaseError> {
-        self.read(move |database| redb::read_turn_context(database, turn, budget))
-            .await
-    }
     pub async fn conversation_children(
         &self,
         conversation: JobId,
@@ -1257,17 +1308,6 @@ impl DatabaseHandle {
     ) -> Result<Option<(crate::db::entities::JobLimits, u8)>, DatabaseError> {
         self.read(move |database| redb::read_conversation_limits(database, conversation))
             .await
-    }
-    pub async fn conversation_turns(
-        &self,
-        conversation: JobId,
-        before: Option<JobId>,
-        limit: usize,
-    ) -> Result<Vec<JobRecord>, DatabaseError> {
-        self.read(move |database| {
-            redb::read_conversation_turns(database, conversation, before, limit)
-        })
-        .await
     }
     pub(crate) async fn mutable_conversation_turn_page(
         &self,
@@ -1359,110 +1399,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn claim_execution(
-        &self,
-        request: ClaimRequest,
-    ) -> Result<Result<ClaimGrant, ClaimRefusal>, DatabaseError> {
-        self.submit(|reply| {
-            Command::custom(
-                (request,),
-                reply,
-                |(request,)| {
-                    byte_count(request.allowed_pools.len())
-                        .saturating_mul(8)
-                        .saturating_add(4096 * 512)
-                },
-                |(request,), reply, database, operation, commit| {
-                    use OperationKind as Kind;
-                    {
-                        let mut refusal = ClaimRefusal::RecipeInvalid;
-                        let outcome = redb::run_batch_declinable(
-                            database,
-                            operation.epoch,
-                            commit,
-                            |batch| match mutations::claim_execution(batch, request)? {
-                                Ok(grant) => Ok(Some(grant)),
-                                Err(reason) => {
-                                    refusal = reason;
-                                    Ok(None)
-                                }
-                            },
-                        );
-                        let declined = matches!(outcome.result, Ok(None));
-                        let outcome = redb::BatchOutcome {
-                            result: outcome.result.map(|grant| match grant {
-                                Some(grant) => Ok(grant),
-                                None => Err(refusal),
-                            }),
-                            storage_failure: outcome.storage_failure,
-                            durable_commit_us: outcome.durable_commit_us,
-                            scheduling_wake: outcome.scheduling_wake,
-                            capacity_freed: outcome.capacity_freed,
-                            catalog_changed: outcome.catalog_changed,
-                            probe: outcome.probe,
-                        };
-                        settle(
-                            operation,
-                            commit,
-                            Kind::ClaimExecution,
-                            reply,
-                            outcome,
-                            declined,
-                        )
-                    }
-                },
-            )
-        })
-        .await
-    }
-
-    /// CLAIM_BATCH (section 8.3): one write transaction that promotes the due
-    /// Jobs and claims ready Jobs, smallest Job id first, while a global slot
-    /// and a compatible Pool with room are free. The Jobs it returns are
-    /// claimed once this returns; execution starts only after the commit.
-    pub async fn claim_batch(&self) -> Result<Vec<JobId>, DatabaseError> {
-        let started = Instant::now();
-        let jobs = self
-            .submit(|reply| {
-                Command::new(
-                    (),
-                    reply,
-                    |()| 2 * 4096 * 512,
-                    OperationKind::ClaimExecution,
-                    |(), batch| batch.claim_batch(),
-                )
-            })
-            .await?;
-        if !jobs.is_empty() {
-            let duration_us = started.elapsed().as_micros() as u64;
-            self.shared.claims.fetch_add(1, Ordering::Relaxed);
-            self.shared
-                .claim_us_total
-                .fetch_add(duration_us, Ordering::Relaxed);
-            self.shared
-                .claim_us_max
-                .fetch_max(duration_us, Ordering::Relaxed);
-        }
-        Ok(jobs)
-    }
-
-    pub async fn frozen_pool_binding(
-        &self,
-        job: JobId,
-    ) -> Result<Option<FrozenPoolBinding>, DatabaseError> {
-        self.read(move |database| redb::read_pool_binding(database, job))
-            .await
-    }
-
-    /// Every execution whose external work OCG never credibly confirmed
-    /// stopped, and the capacity each one still holds. Read-only and never a
-    /// route to release any of it: see
-    /// [`mutations::confirm_job_stopped`](crate::db::mutations::confirm_job_stopped).
-    pub async fn unresolved_executions(
-        &self,
-    ) -> Result<Vec<(JobId, crate::db::redb::UnresolvedExecution)>, DatabaseError> {
-        self.read(redb::read_unresolved_executions).await
-    }
     /// Every native Allocation that is Uncertain and still holds capacity,
     /// from one consistent read. Read-only: it releases nothing, and a failed
     /// read is an error, never an empty list.
@@ -1470,15 +1406,6 @@ impl DatabaseHandle {
         &self,
     ) -> Result<Vec<crate::db::redb::UncertainAllocation>, DatabaseError> {
         self.read(redb::read_uncertain_allocations).await
-    }
-
-    /// Whether `job` names a stored native conversation.
-    pub(crate) async fn conversation_exists(&self, job: JobId) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_conversation_exists(database, job))
-            .await
-    }
-    pub async fn occupancy(&self) -> Result<Vec<(ExecutionPoolId, JobId)>, DatabaseError> {
-        self.read(redb::read_occupancy).await
     }
 
     /// A Job's ordinary children in ID order, strictly after `after` when
@@ -1504,18 +1431,6 @@ impl DatabaseHandle {
         depth: u8,
     ) -> Result<Option<crate::db::redb::JobTree>, DatabaseError> {
         self.read(move |database| redb::read_job_tree(database, job, after, limit, depth))
-            .await
-    }
-
-    /// What a submitted LLM execution child was configured to execute, as
-    /// frozen in its input, with the Profiles it was submitted with as
-    /// provenance. Later Profile edits do not change it. `None` for a Job
-    /// submitted without a configuration.
-    pub(crate) async fn job_scope(
-        &self,
-        job: JobId,
-    ) -> Result<Option<redb::JobScope>, DatabaseError> {
-        self.read(move |database| redb::read_job_scope(database, job))
             .await
     }
 
@@ -2010,8 +1925,9 @@ impl DatabaseHandle {
     async fn prepare_with_credentials(
         &self,
         resolved: redb::DevelopmentResolvedCandidate,
+        offer: Option<&DevelopmentToolOffer>,
     ) -> Result<PreparedDevelopmentHandoff, DevelopmentHandoffError> {
-        let mut prepared = prepare_development_handoff(resolved, self.shared.active_policy)
+        let mut prepared = prepare_development_handoff(resolved, self.shared.active_policy, offer)
             .map_err(classify_unstarted)?;
         let references: Vec<String> = prepared
             .expected_credential_references()
@@ -2087,20 +2003,20 @@ impl DatabaseHandle {
             .resolve_development_candidate(snapshot)
             .await
             .map_err(DevelopmentPreviewError::Unavailable)?;
-        let prepared =
-            self.prepare_with_credentials(resolved)
-                .await
-                .map_err(|error| match error {
-                    DevelopmentHandoffError::NotStarted { error, .. } => {
-                        DevelopmentPreviewError::Unavailable(*error)
-                    }
-                    DevelopmentHandoffError::Database(error) => {
-                        DevelopmentPreviewError::Unavailable(*error)
-                    }
-                    DevelopmentHandoffError::OutcomeUnknown { error, .. } => {
-                        DevelopmentPreviewError::Unavailable(*error)
-                    }
-                })?;
+        let prepared = self
+            .prepare_with_credentials(resolved, None)
+            .await
+            .map_err(|error| match error {
+                DevelopmentHandoffError::NotStarted { error, .. } => {
+                    DevelopmentPreviewError::Unavailable(*error)
+                }
+                DevelopmentHandoffError::Database(error) => {
+                    DevelopmentPreviewError::Unavailable(*error)
+                }
+                DevelopmentHandoffError::OutcomeUnknown { error, .. } => {
+                    DevelopmentPreviewError::Unavailable(*error)
+                }
+            })?;
         guard(&prepared).map_err(DevelopmentPreviewError::Refused)
     }
 
@@ -2111,7 +2027,7 @@ impl DatabaseHandle {
         &self,
         token: entities::AllocationToken,
     ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
-        self.checked_development_handoff_guarded(token, |_| Ok(()))
+        self.checked_development_handoff_guarded(token, &NoTooling, |_| Ok(()))
             .await
     }
 
@@ -2123,13 +2039,35 @@ impl DatabaseHandle {
     pub(crate) async fn checked_development_handoff_guarded(
         &self,
         token: entities::AllocationToken,
+        tooling: &impl DevelopmentTooling,
         guard: impl FnOnce(&PreparedDevelopmentHandoff) -> Result<(), &'static str>,
     ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
         let resolved = self
             .development_execution_context(token)
             .await
             .map_err(classify_unstarted)?;
-        let prepared = self.prepare_with_credentials(resolved).await?;
+        let offer = match &resolved {
+            redb::DevelopmentResolvedCandidate::Generative(context) => tooling
+                .offer(
+                    &context.snapshot.configuration,
+                    context.snapshot.project.as_ref(),
+                    DevelopmentToolContext {
+                        decider: context.snapshot.job.input.priority
+                            == entities::JobQueuePriority::Foreground,
+                        nested: context.snapshot.conversation.parent_id.is_some(),
+                    },
+                )
+                .await
+                .map_err(|reason| {
+                    classify_unstarted(DatabaseError::Rejected(Violation::InvalidValue(
+                        "handoff", reason,
+                    )))
+                })?,
+            redb::DevelopmentResolvedCandidate::Decision(_) => None,
+        };
+        let prepared = self
+            .prepare_with_credentials(resolved, offer.as_ref())
+            .await?;
         if let Err(reason) = guard(&prepared) {
             return Err(classify_unstarted(DatabaseError::Rejected(
                 Violation::InvalidValue("handoff", reason),
@@ -2158,6 +2096,9 @@ impl DatabaseHandle {
                             output_uncertain: AtomicBool::new(false),
                             usage_checkpoint: std::sync::Mutex::new(
                                 DevelopmentUsageCheckpoint::default(),
+                            ),
+                            recorder: std::sync::Mutex::new(
+                                crate::service::ai::providers::RequestRecorder::default(),
                             ),
                         })
                     },
@@ -2270,6 +2211,27 @@ impl DatabaseHandle {
         handoff: &DevelopmentHandoff,
         observed_at: entities::Timestamp,
     ) -> Result<(), DatabaseError> {
+        self.record_development_request(
+            handoff,
+            entities::RequestNumber::FIRST,
+            &handoff.prepared.request,
+            observed_at,
+        )
+        .await
+    }
+
+    /// Records that `request` is about to be sent, with the exact body it
+    /// will carry. The first request's body is the handoff's prepared one; a
+    /// later request carries the conversation as it stands after the earlier
+    /// request's answer and its tool results. It is recorded durably before
+    /// anything is sent, and only after the previous request was answered.
+    pub(crate) async fn record_development_request(
+        &self,
+        handoff: &DevelopmentHandoff,
+        request_number: entities::RequestNumber,
+        body: &serde_json::Value,
+        observed_at: entities::Timestamp,
+    ) -> Result<(), DatabaseError> {
         if !Arc::ptr_eq(&self.shared, &handoff.owner) {
             return Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "handoff",
@@ -2285,27 +2247,27 @@ impl DatabaseHandle {
             .credentials
             .spellings
             .as_ref()
-            .is_some_and(|secret| development_contains_secret(&handoff.prepared.request, secret))
+            .is_some_and(|secret| development_contains_secret(body, secret))
         {
             return Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "request",
                 "request evidence contains credential material",
             )));
         }
+        let mut pending_state = None;
         let mut sent = if decision {
-            let body = entities::MessageBody::new(
-                &serde_json::json!({"decision": &handoff.prepared.request}),
-            )
-            .map_err(|_| {
-                DatabaseError::Rejected(Violation::InvalidValue(
-                    "request",
-                    "prepared decision cannot be recorded",
-                ))
-            })?;
+            let body = entities::MessageBody::new(&serde_json::json!({"decision": body})).map_err(
+                |_| {
+                    DatabaseError::Rejected(Violation::InvalidValue(
+                        "request",
+                        "prepared decision cannot be recorded",
+                    ))
+                },
+            )?;
             let digest = body.digest();
             entities::SentRequest {
                 job: token.job,
-                request: RequestNumber::FIRST,
+                request: request_number,
                 observed_at,
                 messages: vec![digest],
                 tools: None,
@@ -2315,31 +2277,32 @@ impl DatabaseHandle {
                 required_messages: Vec::new(),
             }
         } else {
-            let mut recorder = crate::service::ai::providers::RequestRecorder::default();
-            recorder.image_attachments = handoff
-                .prepared
-                .conversation
-                .as_ref()
-                .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
-                    "request",
-                    "prepared conversation missing",
-                )))?
-                .image_attachments
-                .clone();
-            recorder
-                .prepare(
-                    token.job,
-                    RequestNumber::FIRST,
-                    &handoff.prepared.request,
-                    0,
-                )
+            let mut recorder = handoff
+                .recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if request_number == entities::RequestNumber::FIRST {
+                recorder.image_attachments = handoff
+                    .prepared
+                    .conversation
+                    .as_ref()
+                    .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
+                        "request",
+                        "prepared conversation missing",
+                    )))?
+                    .image_attachments
+                    .clone();
+            }
+            let (sent, state) = recorder
+                .prepare(token.job, request_number, body, 0)
                 .map_err(|_| {
                     DatabaseError::Rejected(Violation::InvalidValue(
                         "request",
                         "prepared request cannot be recorded",
                     ))
-                })?
-                .0
+                })?;
+            pending_state = Some(state);
+            sent
         };
         sent.observed_at = observed_at;
         if handoff.output_uncertain.load(Ordering::SeqCst)
@@ -2401,6 +2364,15 @@ impl DatabaseHandle {
             })
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        if result.is_ok()
+            && let Some(state) = pending_state
+        {
+            handoff
+                .recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remember_sent(state);
+        }
         result
     }
 
@@ -2489,6 +2461,7 @@ impl DatabaseHandle {
             token,
             revision: handoff.started.revision,
         };
+        let response_digest = answer.response.digest();
         let result = self
             .submit(|reply| {
                 Command::custom(
@@ -2530,6 +2503,16 @@ impl DatabaseHandle {
             })
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        if result.is_ok() {
+            // The next request repeats this response as its assistant
+            // message; its body is stored, so that request does not store it
+            // again.
+            handoff
+                .recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remember_response(response_digest);
+        }
         result
     }
 
@@ -2601,11 +2584,13 @@ impl DatabaseHandle {
             token,
             revision: handoff.started.revision,
         };
+        let request = metrics.request;
         let checkpoint = handoff
             .usage_checkpoint
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+            .clone()
+            .for_request(request);
         let result = self
             .submit(|reply| {
                 Command::custom(
@@ -2652,7 +2637,7 @@ impl DatabaseHandle {
             *handoff
                 .usage_checkpoint
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) = checkpoint;
+                .unwrap_or_else(PoisonError::into_inner) = checkpoint.of_request(request);
             id
         })
     }
@@ -2875,7 +2860,11 @@ impl DatabaseHandle {
         returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
         expected_seq: u32,
         finalization: JobFinalization,
-        rejection: Option<(entities::Timestamp, entities::AvailabilityObservation)>,
+        rejection: Option<(
+            entities::RequestNumber,
+            entities::Timestamp,
+            entities::AvailabilityObservation,
+        )>,
     ) -> Result<AppendedOutput, DatabaseError> {
         let handoff = returned.handoff();
         if !Arc::ptr_eq(&self.shared, &handoff.owner) {
@@ -2900,7 +2889,7 @@ impl DatabaseHandle {
             };
             let failure = rejection
                 .as_ref()
-                .and_then(|(_, observation)| observation.failure.as_ref());
+                .and_then(|(_, _, observation)| observation.failure.as_ref());
             if [
                 result.summary.as_deref(),
                 result.code.as_deref(),
@@ -2948,12 +2937,15 @@ impl DatabaseHandle {
             token,
             revision: handoff.started.revision,
         };
-        let rejection = rejection.map(|(observed_at, observation)| entities::AvailabilityStat {
-            job: token.job,
-            request: entities::RequestNumber::FIRST,
-            observed_at,
-            observation,
-        });
+        let rejection =
+            rejection.map(
+                |(request, observed_at, observation)| entities::AvailabilityStat {
+                    job: token.job,
+                    request,
+                    observed_at,
+                    observation,
+                },
+            );
         let result = self
             .submit(|reply| {
                 Command::custom(
@@ -3988,22 +3980,11 @@ impl DatabaseHandle {
         self.read(move |database| redb::read_has_decider(database, conversation))
             .await
     }
-    pub(crate) async fn delegated_workspace(&self, job: JobId) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_delegated_workspace(database, job))
-            .await
-    }
     pub async fn approved_calls(
         &self,
         conversation: JobId,
     ) -> Result<Vec<ToolEvidenceRecord>, DatabaseError> {
         self.read(move |database| redb::read_approved_calls(database, conversation))
-            .await
-    }
-    pub(crate) async fn has_pending_approvals(
-        &self,
-        conversation: JobId,
-    ) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_has_pending_approvals(database, conversation))
             .await
     }
     pub async fn conversation_cards(
@@ -4013,132 +3994,68 @@ impl DatabaseHandle {
         self.read(move |database| redb::read_cards(database, conversation))
             .await
     }
-    pub async fn apply_job_tool(
+    pub(crate) async fn apply_development_job_tool(
         &self,
+        handoff: &DevelopmentHandoff,
         call: ToolCallRef,
         tool: entities::JobToolCall,
-    ) -> Result<serde_json::Value, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (call, tool),
-                reply,
-                |(_, tool)| {
-                    use entities::JobToolCall;
-                    let search = match tool {
-                        JobToolCall::JobPlan { steps, .. } => steps
-                            .iter()
-                            .map(|step| {
-                                search_index_bytes(&step.objective).saturating_add(64 * 1024)
-                            })
-                            .sum(),
-                        JobToolCall::JobAssign { objective, .. }
-                        | JobToolCall::JobDispatch { objective, .. } => {
-                            search_index_bytes(objective)
-                        }
-                        JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
-                        JobToolCall::JobLimits { .. }
-                        | JobToolCall::JobAgents { .. }
-                        | JobToolCall::JobWorkers { .. }
-                        | JobToolCall::JobStop { .. }
-                        | JobToolCall::JobClose { .. }
-                        | JobToolCall::JobHold { .. }
-                        | JobToolCall::JobUnhold { .. }
-                        | JobToolCall::JobRetry { .. } => 0,
-                    };
-                    debug_bytes(tool)
-                        .saturating_add(4096)
-                        .saturating_add(search)
-                        .saturating_add(match tool {
+    ) -> Result<redb::JobToolApplied, DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .submit(|reply| {
+                Command::new(
+                    (proof, call, tool),
+                    reply,
+                    |(_, _, tool)| {
+                        use entities::JobToolCall;
+                        let search = match tool {
+                            JobToolCall::JobPlan { steps, .. } => steps
+                                .iter()
+                                .map(|step| {
+                                    search_index_bytes(&step.objective).saturating_add(64 * 1024)
+                                })
+                                .sum(),
                             JobToolCall::JobAssign { objective, .. }
-                            | JobToolCall::JobDispatch { objective, .. }
-                                if objective.len() <= 64 * 1024 =>
-                            {
-                                byte_count(objective.len())
-                                    .saturating_mul(6)
-                                    .saturating_add(64 * 1024)
+                            | JobToolCall::JobDispatch { objective, .. } => {
+                                search_index_bytes(objective)
                             }
-                            JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
-                                byte_count(text.len())
-                                    .saturating_mul(6)
-                                    .saturating_add(64 * 1024)
-                            }
-                            _ => 0,
-                        })
-                },
-                OperationKind::ApplyJobTool,
-                |(call, tool), batch| batch.apply_job_tool(call, tool),
-            )
-        })
-        .await
-    }
-    pub async fn boundary_b(&self, clock: i64) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (clock,),
-                reply,
-                |(_,)| 4096,
-                OperationKind::BoundaryB,
-                |(clock,), batch| batch.boundary_b(clock),
-            )
-        })
-        .await
-    }
-    pub(crate) async fn recurrence_due(&self, clock: i64) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::recurrence_due(database, clock))
-            .await
-    }
-    pub async fn open_group(
-        &self,
-        parent: Option<JobId>,
-        spec: JobGroup,
-        first: Entry,
-        configuration: ExecutionConfiguration,
-        submission: Option<Submission>,
-    ) -> Result<(JobId, Appended), DatabaseError> {
-        self.open_group_with_format(parent, spec, first, configuration, submission, None, None)
-            .await
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn open_group_with_format(
-        &self,
-        parent: Option<JobId>,
-        spec: JobGroup,
-        first: Entry,
-        configuration: ExecutionConfiguration,
-        submission: Option<Submission>,
-        format: Option<crate::db::entities::ResponseFormat>,
-        candidate: Option<AdmissionCandidate>,
-    ) -> Result<(JobId, Appended), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (
-                    parent,
-                    spec,
-                    first,
-                    configuration,
-                    submission,
-                    format,
-                    candidate,
-                ),
-                reply,
-                |(_, _, first, _, _, format, _)| entry_bytes(first, format.as_ref()),
-                OperationKind::Open,
-                |(parent, spec, first, configuration, submission, format, candidate), batch| {
-                    batch.with_admission_candidate(candidate, submission, |batch| {
-                        batch.open_group_with_format(
-                            parent,
-                            spec,
-                            first,
-                            configuration,
-                            submission,
-                            Vec::new(),
-                            format,
-                        )
-                    })
-                },
-            )
-        })
-        .await
+                            JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
+                            JobToolCall::JobLimits { .. }
+                            | JobToolCall::JobAgents { .. }
+                            | JobToolCall::JobWorkers { .. }
+                            | JobToolCall::JobStop { .. }
+                            | JobToolCall::JobClose { .. }
+                            | JobToolCall::JobHold { .. }
+                            | JobToolCall::JobUnhold { .. }
+                            | JobToolCall::JobRetry { .. } => 0,
+                        };
+                        debug_bytes(tool)
+                            .saturating_add(4096)
+                            .saturating_add(search)
+                            .saturating_add(match tool {
+                                JobToolCall::JobAssign { objective, .. }
+                                | JobToolCall::JobDispatch { objective, .. }
+                                    if objective.len() <= 64 * 1024 =>
+                                {
+                                    byte_count(objective.len())
+                                        .saturating_mul(6)
+                                        .saturating_add(64 * 1024)
+                                }
+                                JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
+                                    byte_count(text.len())
+                                        .saturating_mul(6)
+                                        .saturating_add(64 * 1024)
+                                }
+                                _ => 0,
+                            })
+                    },
+                    OperationKind::ApplyJobTool,
+                    |(proof, call, tool), batch| batch.apply_job_tool(&proof, call, tool),
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
     }
     pub(crate) async fn context_state(
         &self,
@@ -4147,59 +4064,6 @@ impl DatabaseHandle {
         limit: usize,
     ) -> Result<Option<redb::ContextState>, DatabaseError> {
         self.read(move |database| redb::read_context_state(database, conversation, before, limit))
-            .await
-    }
-    pub(crate) async fn preparation_current(&self, job: JobId) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_preparation_current(database, job))
-            .await
-    }
-    pub(crate) async fn prediction_current(&self, job: JobId) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_prediction_current(database, job))
-            .await
-    }
-    pub(crate) async fn promote_prediction(
-        &self,
-        job: JobId,
-    ) -> Result<Option<JobId>, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (job,),
-                reply,
-                |(_,)| 4096 * 512,
-                OperationKind::Open,
-                |(job,), batch| batch.promote_prediction(job),
-            )
-        })
-        .await
-    }
-    pub(crate) async fn predict_context(
-        &self,
-        conversation: JobId,
-    ) -> Result<Option<JobId>, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation,),
-                reply,
-                |(_,)| 131072,
-                OperationKind::Open,
-                |(conversation,), batch| batch.predict_context(conversation),
-            )
-        })
-        .await
-    }
-    pub(crate) async fn effective_compaction_policy(
-        &self,
-        conversation: JobId,
-    ) -> Result<Option<(entities::CompactionPolicy, u64, Option<entities::ConfigRef>)>, DatabaseError>
-    {
-        self.read(move |database| redb::read_effective_context_policy(database, conversation))
-            .await
-    }
-    pub(crate) async fn summarization_input(
-        &self,
-        job: JobId,
-    ) -> Result<Option<redb::SummarizationInput>, DatabaseError> {
-        self.read(move |database| redb::read_summarization_input(database, job))
             .await
     }
     /// Opens a system conversation with one typed decision turn and freezes
@@ -4263,91 +4127,6 @@ impl DatabaseHandle {
         .await
     }
 
-    pub async fn append(
-        &self,
-        conversation: JobId,
-        entry: Entry,
-        freeze: Option<ExecutionConfiguration>,
-        submission: Option<Submission>,
-    ) -> Result<Appended, DatabaseError> {
-        self.append_with_format(conversation, entry, freeze, submission, None, None)
-            .await
-    }
-    pub(crate) async fn append_with_format(
-        &self,
-        conversation: JobId,
-        entry: Entry,
-        freeze: Option<ExecutionConfiguration>,
-        submission: Option<Submission>,
-        format: Option<crate::db::entities::ResponseFormat>,
-        candidate: Option<AdmissionCandidate>,
-    ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, entry, freeze, submission, format, candidate),
-                reply,
-                |(_, first, _, _, format, _)| entry_bytes(first, format.as_ref()),
-                OperationKind::Append,
-                |(conversation, entry, freeze, submission, format, candidate), batch| {
-                    batch.with_admission_candidate(candidate, submission, |batch| {
-                        batch.require_agent_group(conversation)?;
-                        batch.append_with_format(
-                            conversation,
-                            entry,
-                            freeze,
-                            submission,
-                            false,
-                            format,
-                        )
-                    })
-                },
-            )
-        })
-        .await
-    }
-    pub(crate) async fn amend_queued_input(
-        &self,
-        conversation: JobId,
-        turn: JobId,
-        entry: Entry,
-    ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, turn, entry),
-                reply,
-                |(_, _, entry)| {
-                    debug_bytes(entry)
-                        .saturating_add(match entry {
-                            Entry::UserMessageEdit {
-                                text, attachments, ..
-                            } => search_index_bytes(text).saturating_add(
-                                (attachments.len() as u64).saturating_mul(
-                                    3 * 64
-                                        * (crate::db::entities::MAX_ATTACHMENT_NAME_BYTES as u64
-                                            + 1),
-                                ),
-                            ),
-                            Entry::UserMessage { .. }
-                            | Entry::UserMessageWithdraw { .. }
-                            | Entry::AgentMessage { .. }
-                            | Entry::Notice { .. }
-                            | Entry::Decision { .. }
-                            | Entry::RetryOf { .. }
-                            | Entry::Iteration { .. }
-                            | Entry::ContextPreparation { .. }
-                            | Entry::ContextUse { .. }
-                            | Entry::ResponseFormat { .. } => 0,
-                        })
-                        .saturating_add(4096)
-                },
-                OperationKind::Append,
-                |(conversation, turn, entry), batch| {
-                    batch.amend_queued_input(conversation, turn, entry)
-                },
-            )
-        })
-        .await
-    }
     pub async fn stop_turn(
         &self,
         conversation: JobId,
@@ -4375,6 +4154,49 @@ impl DatabaseHandle {
             )
         })
         .await
+    }
+    /// Takes what the settling of each of `turns` sets in motion above it: a
+    /// one-shot child closes, what waited for it that now never can run ends,
+    /// and its parent is told what its children came to. Idempotent, and no
+    /// part of recording a turn's outcome.
+    pub(crate) async fn settle_child_turns(
+        &self,
+        turns: Vec<JobId>,
+    ) -> Result<usize, DatabaseError> {
+        if turns.is_empty() {
+            return Ok(0);
+        }
+        self.submit(|reply| {
+            Command::new(
+                (turns,),
+                reply,
+                |(turns,)| byte_count(turns.len()).saturating_mul(64 * 1024),
+                OperationKind::SettleChildTurns,
+                |(turns,), batch| batch.settle_child_turns(&turns),
+            )
+        })
+        .await
+    }
+    /// [`Self::settle_child_turns`] for the turns a restart finds not yet
+    /// reported, a few at a time until none is left.
+    pub(crate) async fn settle_unreported_children(&self) -> Result<(), DatabaseError> {
+        const BATCH: usize = 8;
+        loop {
+            let settled = self
+                .submit(|reply| {
+                    Command::new(
+                        (),
+                        reply,
+                        |()| byte_count(BATCH).saturating_mul(64 * 1024),
+                        OperationKind::SettleChildTurns,
+                        |(), batch| batch.settle_unreported_children(BATCH),
+                    )
+                })
+                .await?;
+            if settled < BATCH {
+                return Ok(());
+            }
+        }
     }
     pub async fn hold(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
         self.submit(|reply| {
@@ -4456,190 +4278,6 @@ impl DatabaseHandle {
         .await
     }
 
-    pub(crate) fn with_stop_cause(
-        &self,
-        cause: Arc<std::sync::Mutex<Option<crate::db::entities::StopCause>>>,
-    ) -> Self {
-        let mut handle = self.clone();
-        handle.stop_cause = Some(cause);
-        handle.ignore_stop_cause = false;
-        handle
-    }
-
-    /// Whether both handles reach the same database.
-    pub(crate) fn same_database(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.shared, &other.shared)
-    }
-
-    pub(crate) fn without_stop_cause(&self) -> Self {
-        let mut handle = self.clone();
-        handle.stop_cause = None;
-        handle.ignore_stop_cause = true;
-        handle
-    }
-
-    pub async fn finalize_job(
-        &self,
-        job: JobId,
-        finalization: JobFinalization,
-    ) -> Result<Option<AppendedOutput>, DatabaseError> {
-        self.finalize_job_with_provider_evidence(job, finalization, None)
-            .await
-    }
-
-    pub(crate) async fn finalize_job_with_provider_evidence(
-        &self,
-        job: JobId,
-        finalization: JobFinalization,
-        evidence: Option<ProviderSettlementEvidence>,
-    ) -> Result<Option<AppendedOutput>, DatabaseError> {
-        let cause = self
-            .stop_cause
-            .as_ref()
-            .and_then(|cause| *cause.lock().unwrap_or_else(PoisonError::into_inner))
-            .map(|cause| match cause {
-                crate::db::entities::StopCause::Stopped(record) => {
-                    crate::db::entities::OutcomeCause::Stopped { record }
-                }
-                crate::db::entities::StopCause::Closed => crate::db::entities::OutcomeCause::Closed,
-            });
-        self.submit(|reply| {
-            Command::custom(
-                (job, cause, self.ignore_stop_cause, finalization, evidence),
-                reply,
-                |(_, _, _, finalization, evidence)| {
-                    let evidence_bytes = match evidence {
-                        None => 0,
-                        Some(ProviderSettlementEvidence::Answer(answer)) => {
-                            byte_count(answer.response.byte_length())
-                                .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()))
-                        }
-                        Some(ProviderSettlementEvidence::Observations(stats)) => {
-                            stats.iter().fold(0u64, |bytes, stat| {
-                                let observation = &stat.observation;
-                                let failure = observation.failure.as_ref().map_or(0, |failure| {
-                                    byte_count(failure.message.len())
-                                        .saturating_add(text_bytes(
-                                            failure.provider_code.as_deref(),
-                                        ))
-                                        .saturating_add(text_bytes(
-                                            failure.response_body.as_deref(),
-                                        ))
-                                        .saturating_add(text_bytes(failure.request_id.as_deref()))
-                                });
-                                bytes.saturating_add(failure).saturating_add(text_bytes(
-                                    observation.raw_finish_reason.as_deref(),
-                                ))
-                            })
-                        }
-                    };
-                    evidence_bytes.saturating_add(match finalization {
-                        JobFinalization::Completed(result)
-                        | JobFinalization::Failed(result)
-                        | JobFinalization::Cancelled(result) => {
-                            let text = result
-                                .value
-                                .as_ref()
-                                .and_then(|value| value.get("text"))
-                                .and_then(serde_json::Value::as_str)
-                                .or(result.summary.as_deref());
-                            output_bytes(
-                                result.summary.as_deref(),
-                                result.code.as_deref(),
-                                result.value.as_ref(),
-                            )
-                            .saturating_add(64 * 1024)
-                            .saturating_add(text.map_or(0, search_index_bytes))
-                        }
-                        JobFinalization::Unknown => 0,
-                    })
-                },
-                |(job, cause, ignore_stop_cause, finalization, evidence),
-                 reply,
-                 database,
-                 operation,
-                 commit| {
-                    use OperationKind as Kind;
-                    {
-                        let mut changes = Vec::new();
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            Kind::FinalizeJob,
-                            reply,
-                            |batch| {
-                                let provider_settlement = evidence.is_some();
-                                let abandoned = provider_settlement
-                                    && batch.require_job_state(job)?.outcome.is_some_and(
-                                        |outcome| {
-                                            outcome.cause == Some(entities::OutcomeCause::Abandoned)
-                                        },
-                                    );
-                                let output = if abandoned {
-                                    None
-                                } else {
-                                    mutations::finalize_job(
-                                        batch,
-                                        job,
-                                        finalization,
-                                        cause,
-                                        ignore_stop_cause,
-                                    )?
-                                };
-                                let mut probe = None;
-                                match evidence {
-                                    None => {}
-                                    Some(ProviderSettlementEvidence::Observations(
-                                        observations,
-                                    )) => {
-                                        for stat in observations {
-                                            if stat.job != job {
-                                                return batch.reject(Violation::InvalidValue(
-                                                    "job",
-                                                    "observation belongs to a different job",
-                                                ));
-                                            }
-                                            let id =
-                                                mutations::record_availability_stat(batch, stat)?;
-                                            changes.push(ObservationChange::Availability(job, id));
-                                            probe = Some(id);
-                                        }
-                                    }
-                                    Some(ProviderSettlementEvidence::Answer(answer)) => {
-                                        if answer.stat.job != job {
-                                            return batch.reject(Violation::InvalidValue(
-                                                "job",
-                                                "answer belongs to a different job",
-                                            ));
-                                        }
-                                        let (metrics, availability) =
-                                            mutations::record_provider_answer(batch, *answer)?;
-                                        changes.push(ObservationChange::Metrics(job, metrics));
-                                        changes.push(ObservationChange::Availability(
-                                            job,
-                                            availability,
-                                        ));
-                                        probe = Some(availability);
-                                    }
-                                }
-                                if provider_settlement {
-                                    batch.provider_settlement_probe(job, probe)?;
-                                }
-                                Ok(output)
-                            },
-                        );
-                        if result.committed {
-                            result.observations = changes;
-                        }
-                        result
-                    }
-                },
-            )
-        })
-        .await
-    }
-
     pub async fn create_executor(&self, executor: Executor) -> Result<ExecutorId, DatabaseError> {
         self.submit(|reply| {
             Command::new(
@@ -4666,22 +4304,6 @@ impl DatabaseHandle {
                 },
                 OperationKind::CreateProject,
                 |(project,), batch| mutations::create_project(batch, project),
-            )
-        })
-        .await
-    }
-
-    pub(crate) async fn assess_command_grant(
-        &self,
-        call: ToolCallRef,
-    ) -> Result<Option<JobId>, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (call,),
-                reply,
-                |(_,)| 128 * 1024,
-                OperationKind::UpdateProject,
-                |(call,), batch| batch.assess_command_grant(call),
             )
         })
         .await
@@ -5026,27 +4648,6 @@ impl DatabaseHandle {
         .map_err(ReclamationError::Store)
     }
 
-    /// Records that an unknown-outcome Job's execution has actually stopped,
-    /// releasing the slot it holds; the outcome stays unknown. Only the
-    /// trusted execution path that observed the termination may call this,
-    /// so it is not part of the public API.
-    pub(crate) async fn confirm_job_stopped(
-        &self,
-        job: JobId,
-        proof: StopProof,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (job, proof),
-                reply,
-                |(_, _)| 0,
-                OperationKind::ConfirmJobStopped,
-                |(job, proof), batch| mutations::confirm_job_stopped(batch, job, proof),
-            )
-        })
-        .await
-    }
-
     /// Appends measurements for a Job. Their LLM is the one the Job froze.
     pub async fn record_metrics(&self, metrics: Metrics) -> Result<MetricsId, DatabaseError> {
         self.submit(|reply| {
@@ -5219,81 +4820,114 @@ impl DatabaseHandle {
         .await
     }
 
-    /// Records OCG's refusal or admission of a tool call a Provider
-    /// requested, before anything about the call can run. Only the trusted
-    /// execution path of the Job, while it executes it, may record it; a
-    /// handler is invoked only once its admission is durable, which is when
-    /// this returns `Ok`. See [`mutations::record_tool_decision`].
-    pub(crate) async fn record_tool_decision(
+    /// The write proof of `handoff`'s execution, taken for one write: only
+    /// one write at a time, and a write whose outcome is unknown makes the
+    /// handoff unusable until reconciled.
+    fn begin_development_write<'a>(
         &self,
+        handoff: &'a DevelopmentHandoff,
+    ) -> Result<(DevelopmentOutputGuard<'a>, DevelopmentWriteProof), DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = match &handoff.prepared.candidate {
+            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
+        };
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        Ok((guard, proof))
+    }
+
+    /// Records OCG's refusal or admission of a tool call a Provider
+    /// requested, before anything about the call can run. Only the execution
+    /// that holds the Job's Allocation may record it; a handler is invoked
+    /// only once its admission is durable, which is when this returns `Ok`.
+    /// See [`mutations::record_tool_decision`].
+    pub(crate) async fn record_development_tool_decision(
+        &self,
+        handoff: &DevelopmentHandoff,
         evidence: ToolEvidence,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (Box::new(evidence),),
-                reply,
-                |(evidence,)| {
-                    let identity = byte_count(evidence.tool_call_id.len())
-                        .saturating_add(byte_count(evidence.name.len()));
-                    match evidence.decision.stored_admission() {
-                        None => identity,
-                        Some(admission) => identity
-                            .saturating_add(byte_count(admission.handler_version.len()))
-                            .saturating_add(byte_count(admission.parameters.len()))
-                            .saturating_add(byte_count(admission.arguments.len())),
-                    }
-                },
-                OperationKind::RecordToolDecision,
-                |(evidence,), batch| mutations::record_tool_decision(batch, *evidence),
-            )
-        })
-        .await
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .submit(|reply| {
+                Command::new(
+                    (proof, Box::new(evidence)),
+                    reply,
+                    |(_, evidence)| {
+                        let identity = byte_count(evidence.tool_call_id.len())
+                            .saturating_add(byte_count(evidence.name.len()));
+                        match evidence.decision.stored_admission() {
+                            None => identity,
+                            Some(admission) => identity
+                                .saturating_add(byte_count(admission.handler_version.len()))
+                                .saturating_add(byte_count(admission.parameters.len()))
+                                .saturating_add(byte_count(admission.arguments.len())),
+                        }
+                    },
+                    OperationKind::RecordToolDecision,
+                    |(proof, evidence), batch| {
+                        mutations::record_tool_decision(batch, &proof, *evidence)
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
     }
 
     /// Records, once, what is known of an admitted call's execution. Only
-    /// the trusted execution path of the Job, while it executes it, may
-    /// record it.
-    pub(crate) async fn record_tool_outcome(
+    /// the execution that holds the Job's Allocation may record it.
+    pub(crate) async fn record_development_tool_outcome(
         &self,
+        handoff: &DevelopmentHandoff,
         call: ToolCallRef,
         outcome: ToolOutcome,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (call, Box::new(outcome)),
-                reply,
-                |(_, outcome)| match outcome.as_ref() {
-                    ToolOutcome::Completed { result } => byte_count(result.len()),
-                    ToolOutcome::NotApplied { message } => byte_count(message.len()),
-                    ToolOutcome::Uncertain { message, .. } => text_bytes(message.as_deref()),
-                    ToolOutcome::CompletedWithheld { .. } | ToolOutcome::NotInvoked { .. } => 0,
-                },
-                OperationKind::RecordToolOutcome,
-                |(call, outcome), batch| mutations::record_tool_outcome(batch, call, *outcome),
-            )
-        })
-        .await
-    }
-
-    /// [`Self::record_tool_decision`] for the backend benchmark, which drives
-    /// the trusted execution path itself. Not part of the API.
-    #[doc(hidden)]
-    pub async fn bench_record_tool_decision(
-        &self,
-        evidence: ToolEvidence,
-    ) -> Result<(), DatabaseError> {
-        self.record_tool_decision(evidence).await
-    }
-
-    /// [`Self::record_tool_outcome`] for the backend benchmark, which drives
-    /// the trusted execution path itself. Not part of the API.
-    #[doc(hidden)]
-    pub async fn bench_record_tool_outcome(
-        &self,
-        call: ToolCallRef,
-        outcome: ToolOutcome,
-    ) -> Result<(), DatabaseError> {
-        self.record_tool_outcome(call, outcome).await
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .submit(|reply| {
+                Command::new(
+                    (proof, call, Box::new(outcome)),
+                    reply,
+                    |(_, _, outcome)| match outcome.as_ref() {
+                        ToolOutcome::Completed { result } => byte_count(result.len()),
+                        ToolOutcome::NotApplied { message } => byte_count(message.len()),
+                        ToolOutcome::Uncertain { message, .. } => text_bytes(message.as_deref()),
+                        ToolOutcome::CompletedWithheld { .. }
+                        | ToolOutcome::CompletedElided { .. }
+                        | ToolOutcome::NotInvoked { .. } => 0,
+                    },
+                    OperationKind::RecordToolOutcome,
+                    |(proof, call, outcome), batch| {
+                        mutations::record_tool_outcome(batch, &proof, call, *outcome)
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
     }
 
     /// A Job's tool evidence in call order, after the call named by its

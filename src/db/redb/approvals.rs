@@ -19,6 +19,24 @@ pub(super) fn command_assessment_identity(
     }}))
 }
 
+/// What the Job that continues the conversation says: the user's decision on
+/// the call that waited, in the user's own voice.
+fn continuation_text(tool: &str, decision: &ApprovalDecision) -> String {
+    match decision {
+        ApprovalDecision::Answered { text } => text.clone(),
+        ApprovalDecision::Approved => {
+            format!("I approve the {tool} request. Please continue.")
+        }
+        ApprovalDecision::Rejected if tool == "ask_user" => {
+            "I would rather not answer that question. Please continue without it.".to_owned()
+        }
+        ApprovalDecision::Rejected => {
+            format!("I decline the {tool} request. Please continue without it.")
+        }
+        ApprovalDecision::Voided => String::new(),
+    }
+}
+
 impl ApprovalRecord {
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_APPROVAL);
@@ -112,13 +130,20 @@ impl Batch {
                 ));
             }
         };
-        let turn = self.require_job(approval.job)?;
-        let Some(conversation) = turn.parent_id.filter(|_| turn.kind.is_persistent()) else {
+        let Some(conversation) = self.turn_conversation(approval.job)? else {
             return self.reject(Violation::InvalidValue(
                 "approval_not_found",
                 "no conversation",
             ));
         };
+        // The decision continues the conversation after the Job that asked,
+        // so it is taken only once that Job has ended.
+        if self.require_job_state(approval.job)?.outcome.is_none() {
+            return self.reject(Violation::InvalidValue(
+                "approval_not_ready",
+                "the Job that asked has not ended",
+            ));
+        }
         let key = open_key(conversation, approval);
         if !self.step(|tx| {
             Ok(tx
@@ -137,37 +162,21 @@ impl Batch {
                 "decision does not match the awaiting call",
             ));
         }
-        let selected_dispatch =
-            call.name == "job_dispatch" && matches!(decision, ApprovalDecision::Answered { .. });
-        if let ApprovalDecision::Answered { text } = &decision
-            && selected_dispatch
-        {
-            let selection = serde_json::from_str::<crate::db::entities::DispatchSelection>(text)
-                .map_err(|_| {
-                    BatchError(Failure::Rejected(Violation::InvalidValue(
-                        "dispatch_selection",
-                        "select dispatch targets",
-                    )))
-                })?;
-            self.validate_dispatch_selection(&selection)?;
-            let (limits, depth) = self.group_limits(conversation)?;
-            if depth >= limits.max_depth
-                || self
-                    .live_children(conversation)?
-                    .len()
-                    .saturating_add(selection.projects.len().max(1))
-                    > 16
-            {
-                return self.reject(Violation::InvalidValue(
-                    "dispatch_selection",
-                    "the selected targets exceed this conversation's remaining child capacity",
-                ));
-            }
+        if self.job_control(conversation)?.closing.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "conversation_closing",
+                "decisions cannot continue a closing conversation",
+            ));
         }
-        let approved = decision == ApprovalDecision::Approved || selected_dispatch;
-        if approved && !selected_dispatch {
-            self.grant_project_command(&call, assessment)?;
+        if decision == ApprovalDecision::Approved {
+            self.grant_project_command(&call, conversation, assessment)?;
         }
+        // A job call performs what the user chose, in this transaction, and
+        // the Job that continues is told what came of it.
+        let text = match self.perform_decided_job_call(approval, conversation, &call, &decision)? {
+            Some(text) => text,
+            None => continuation_text(&call.name, &decision),
+        };
         self.put_approval(
             approval,
             decision,
@@ -178,57 +187,89 @@ impl Batch {
             },
         )?;
         self.step(|tx| {
-            let mut open = tx.open_table(OPEN_APPROVALS)?;
-            if approved {
-                open.insert(key, 1)?;
-            } else {
-                open.remove(key)?;
-            }
+            tx.open_table(OPEN_APPROVALS)?.remove(key)?;
             Ok(())
         })?;
-        let appended = self.append(
-            conversation,
-            Entry::Decision {
-                approval: (approval.job, approval.request.get(), approval.index),
-            },
-            None,
-            None,
-            true,
-        )?;
-        if let Some(mut recurrence) = self.recurrence(conversation)?
-            && recurrence.phase == RecurrencePhase::Active
-            && recurrence.current_turn == approval.job
-        {
-            recurrence.current_turn = appended.turn;
-            self.put_recurrence(conversation, &recurrence, None)?;
-        }
-        self.auto_close_check(conversation)?;
-        Ok(appended)
+        self.continue_after_decision(approval, text)
     }
+
+    /// The Job that continues the conversation after a decision: a new turn
+    /// of the same conversation, with the same configuration as the Job that
+    /// asked, whose input says what the user decided. It joins the queue like
+    /// any submitted Job, and runs when the scheduler admits it. A decision is
+    /// recorded once, so the Job is created once.
+    fn continue_after_decision(
+        &mut self,
+        approval: ToolCallRef,
+        text: String,
+    ) -> Result<Appended, BatchError> {
+        use crate::db::entities::{
+            ComposerContextId, MutableJobContent, MutableJobInput, RequestFingerprint, Submission,
+            SubmissionKey,
+        };
+        let Some(asked) = self.mutable_job(approval.job)? else {
+            return self.reject(Violation::InvalidValue(
+                "approval_not_found",
+                "the Job that asked is not a native Job",
+            ));
+        };
+        let MutableJobContent::Generative { configuration, .. } = &asked.input.content else {
+            return self.reject(Violation::InvalidValue(
+                "approval_not_found",
+                "the Job that asked is not a Generative Job",
+            ));
+        };
+        let input = MutableJobInput {
+            priority: asked.input.priority,
+            content: MutableJobContent::Generative {
+                text,
+                attachments: Vec::new(),
+                configuration: *configuration,
+            },
+        };
+        // Creating the Job and submitting it are two recorded submissions,
+        // each with its own key.
+        let submission = |step: &[u8]| {
+            let mut identity = b"ocg approval continuation ".to_vec();
+            identity.extend_from_slice(step);
+            identity.extend_from_slice(&approval.job.get().to_le_bytes());
+            identity.extend_from_slice(&approval.request.get().to_le_bytes());
+            identity.extend_from_slice(&approval.index.to_le_bytes());
+            let digest = *crate::db::entities::ContentDigest::of(&identity).as_bytes();
+            Submission {
+                key: SubmissionKey::from_digest(digest),
+                fingerprint: RequestFingerprint::from_digest(digest),
+            }
+        };
+        let context = ComposerContextId::new(self.next_id()?);
+        let id = self.create_unsubmitted_job(
+            context,
+            input,
+            submission(b"create"),
+            Some(asked.parent_id),
+            None,
+        )?;
+        let created = self.submit_mutable_job(id, 1, submission(b"submit"))?;
+        Ok(Appended {
+            turn: created.id,
+            seq: 1,
+            joined: false,
+        })
+    }
+    /// The Project of the conversation whose turn asked, which the approved
+    /// command is granted to.
     fn command_project(
         &mut self,
-        job: JobId,
+        conversation: JobId,
     ) -> Result<Option<crate::db::entities::ProjectRecord>, BatchError> {
-        let mut current = Some(job);
-        while let Some(job) = current {
-            let row = self.require_job(job)?;
-            let project = match row.kind {
-                JobKind::Group { project, .. } => project,
-                JobKind::Execution {
-                    plan_source: PlanSource::Process { project, .. },
-                    ..
-                } => project,
-                JobKind::Execution {
-                    plan_source: PlanSource::Stored { .. },
-                    ..
-                } => None,
-            };
-            if let Some(project) = project {
-                return self.require_project_record(project).map(Some);
-            }
-            current = row.parent_id;
+        let row = self.require_mutable_conversation(conversation)?;
+        match row.kind {
+            JobKind::Group {
+                project: Some(project),
+                ..
+            } => self.require_project_record(project).map(Some),
+            JobKind::Group { project: None, .. } | JobKind::Execution { .. } => Ok(None),
         }
-        Ok(None)
     }
 
     fn command_input(
@@ -308,10 +349,11 @@ impl Batch {
     fn grant_project_command(
         &mut self,
         call: &crate::db::entities::ToolEvidenceRecord,
+        conversation: JobId,
         assessment: Option<JobId>,
     ) -> Result<(), BatchError> {
         use crate::db::entities::*;
-        let Some(mut project) = self.command_project(call.call.job)? else {
+        let Some(mut project) = self.command_project(conversation)? else {
             return Ok(());
         };
         let Some(input) = self.command_input(call, &project)? else {
@@ -362,99 +404,6 @@ impl Batch {
         self.insert_project(&project)
     }
 
-    pub(crate) fn assess_command_grant(
-        &mut self,
-        call: ToolCallRef,
-    ) -> Result<Option<JobId>, BatchError> {
-        use crate::db::entities::*;
-        if self
-            .require_job_state(call.job)?
-            .outcome
-            .is_none_or(|outcome| outcome.kind != crate::db::entities::OutcomeKind::Completed)
-        {
-            return Ok(None);
-        }
-        let Some(evidence) = self.tool_evidence(call)? else {
-            return Ok(None);
-        };
-        if !matches!(evidence.decision.fact, ToolDecision::AwaitingApproval(_)) {
-            return Ok(None);
-        }
-        let Some(project) = self.command_project(call.job)? else {
-            return Ok(None);
-        };
-        let policy = project.decision_policy();
-        if !policy.enabled {
-            return Ok(None);
-        }
-        let Some(input) = self.command_input(&evidence, &project)? else {
-            return Ok(None);
-        };
-        let identity = command_assessment_identity(call);
-        let Ok(identity) = identity else {
-            return Ok(None);
-        };
-        let key = SubmissionKey::from_digest(*identity.digest().as_bytes());
-        if let Some(previous) = self.submission(key)? {
-            return Ok(Some(previous.job));
-        }
-        let active_job = self.require_job(call.job)?;
-        let active = self.job_execution(&active_job)?.0;
-        let Some((frozen, assignment)) = self.project_decision(Some(project.id), &active)? else {
-            return Ok(None);
-        };
-        let (_, appended) = self.open_resolved_decision(
-            None,
-            JobGroup {
-                name: Some("Command grant assessment".into()),
-                agent: frozen.agent_ref().map(|reference| reference.id),
-                project: Some(project.id),
-                origin: Origin::System,
-                keep_open: false,
-            },
-            Entry::UserMessage {
-                text: "Assess the pending command grant.".into(),
-                attachments: vec![],
-            },
-            frozen,
-            input.request(),
-            Some(Submission {
-                key,
-                fingerprint: RequestFingerprint::from_digest(*identity.digest().as_bytes()),
-            }),
-            None,
-            Some(CommandAssessment {
-                approval: call,
-                minimum_confidence_millis: policy.minimum_confidence_millis,
-            }),
-            assignment,
-        )?;
-        if evidence.name == "workspace_request_command"
-            && !project.commands.iter().any(|command| {
-                command.name == input.command.name
-                    || (command.owner == CommandOwner::User && command.argv == input.command.argv)
-            })
-            && project
-                .commands
-                .iter()
-                .filter(|command| command.status != CommandStatus::Blocked)
-                .count()
-                < 32
-        {
-            let mut project = project;
-            let mut command = input.command;
-            command.owner = CommandOwner::Decision;
-            command.status = CommandStatus::Review;
-            command.proposal = Some(appended.turn);
-            project.commands.push(command);
-            if validate_project_commands(&project.commands).is_ok() {
-                project.updated_at = self.now;
-                self.insert_project(&project)?;
-            }
-        }
-        Ok(Some(appended.turn))
-    }
-
     pub(crate) fn apply_command_assessment(
         &mut self,
         job: JobId,
@@ -478,7 +427,7 @@ impl Batch {
         let Some(evidence) = self.tool_evidence(binding.approval)? else {
             return Ok(());
         };
-        let Some(conversation) = self.require_job(binding.approval.job)?.parent_id else {
+        let Some(conversation) = self.turn_conversation(binding.approval.job)? else {
             return Ok(());
         };
         if !self.step(|tx| {
@@ -617,7 +566,7 @@ impl Batch {
             if input.command.name != command.name || input.command.argv != command.argv {
                 continue;
             }
-            let Some(conversation) = self.require_job(binding.approval.job)?.parent_id else {
+            let Some(conversation) = self.turn_conversation(binding.approval.job)? else {
                 continue;
             };
             let pending = self.step(|tx| {

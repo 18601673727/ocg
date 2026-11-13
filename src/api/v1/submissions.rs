@@ -40,24 +40,18 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared};
-use crate::db::attachments::AttachmentError;
-use crate::db::attachments::{AttachmentImageError, attachment_images};
 use crate::db::entities::{
-    AttachmentId, AttachmentOrigin, ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration,
-    ExecutorId, JobExecution, JobId, JobKind, ProfileId, RecordRef, RequestFingerprint, Submission,
-    SubmissionKey, SubmissionRecord, Violation,
+    ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration, ExecutorId, JobExecution, JobId,
+    JobKind, ProfileId, RecordRef, RequestFingerprint, Submission, SubmissionKey, SubmissionRecord,
+    Violation,
 };
 use crate::db::{AdmissionCandidate, DatabaseError, DatabaseHandle};
-use crate::service::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES;
-use crate::system::executor::execution_runtime::ExecutionRuntimeError;
 
 /// The request header that names a submission.
 pub(super) const IDEMPOTENCY_KEY: &str = "idempotency-key";
 /// The fewest and most characters an idempotency key may have.
 pub(super) const MIN_KEY_CHARS: usize = 16;
 pub(super) const MAX_KEY_CHARS: usize = 128;
-/// The longest objective and Job name, in bytes.
-pub(super) const MAX_OBJECTIVE_BYTES: usize = 32 * 1024;
 pub(super) const MAX_NAME_BYTES: usize = 128;
 /// The most keys this process may hold unresolved at once.
 const MAX_UNRESOLVED: usize = 256;
@@ -105,11 +99,6 @@ const TOO_MANY_UNRESOLVED: Refusal = Refusal::new(
     "too_many_submissions",
     "too many submissions are unresolved; nothing was submitted; retry later",
 );
-const EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "executor_not_found",
-    "no such Executor; nothing was submitted",
-);
 const PROJECT_REQUIRED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "project_required",
@@ -126,11 +115,6 @@ const CONFIGURATION_REFUSED: Refusal = Refusal::new(
     "the selected configuration cannot run this Job; nothing was admitted",
 );
 
-const RUNTIME_BUSY: Refusal = Refusal::new(
-    StatusCode::SERVICE_UNAVAILABLE,
-    "runtime_busy",
-    "OCG has too much work queued; nothing was admitted; retry later",
-);
 const PENDING_LIMIT_REACHED: Refusal = Refusal::new(
     StatusCode::SERVICE_UNAVAILABLE,
     "pending_limit_reached",
@@ -145,21 +129,6 @@ const TOOLS_NOT_SUPPORTED: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "tools_not_supported",
     "the selected LLM Profile does not declare the tools capability, but the Agent has a Workspace tool grant; nothing was submitted",
-);
-const TOO_MANY_IMAGES: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "too_many_images",
-    "a turn may carry at most 8 images; nothing was submitted",
-);
-const IMAGES_TOO_LARGE: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "images_too_large",
-    "the turn's images exceed 16 MiB together, or one exceeds 4 MiB; nothing was submitted",
-);
-const ATTACHMENT_NOT_AN_IMAGE: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "attachment_not_an_image",
-    "an Attachment is not a PNG, JPEG, GIF or WEBP image that can be sent; nothing was submitted",
 );
 const ATTACHMENT_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -512,12 +481,6 @@ pub(crate) struct ApprovalDecisionView {
     joined: bool,
 }
 
-#[derive(serde::Serialize, ts_rs::TS)]
-#[ts(rename = "ReleaseSlot")]
-pub(crate) struct ReleaseSlotView {
-    status: String,
-}
-
 #[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename = "ApprovalAssessmentState")]
@@ -569,11 +532,6 @@ pub(crate) enum CardView {
     LoopHold {
         conversation: String,
         parent: Option<String>,
-    },
-    Quarantine {
-        conversation: String,
-        parent: Option<String>,
-        turn: String,
     },
 }
 
@@ -1055,9 +1013,7 @@ async fn admit_decision(
                 .submissions
                 .uncertain(key, generation, operation.epoch())
         }
-        Err(error) => finish(Outcome::Refused(not_admitted(
-            &ExecutionRuntimeError::Database(error),
-        ))),
+        Err(error) => finish(Outcome::Refused(not_admitted(&error))),
     }
 }
 
@@ -1163,109 +1119,62 @@ async fn check_decision_configuration(
     Ok(())
 }
 
-async fn check_user_images(
-    database: &DatabaseHandle,
-    images: &[AttachmentId],
-) -> Result<(), Refusal> {
-    for &attachment in images {
-        match database.attachment(attachment).await? {
-            Some(record) if record.origin == AttachmentOrigin::UserProvided => {}
-            _ => return Err(ATTACHMENT_NOT_FOUND),
-        }
-    }
-    match attachment_images(database, images).await {
-        Ok(_) => Ok(()),
-        Err(AttachmentImageError::TooMany) => Err(TOO_MANY_IMAGES),
-        Err(AttachmentImageError::TooLarge) => Err(IMAGES_TOO_LARGE),
-        Err(AttachmentImageError::NotAnImage { .. }) => Err(ATTACHMENT_NOT_AN_IMAGE),
-        Err(AttachmentImageError::Attachment(error)) => Err(match error {
-            AttachmentError::Database(error) => error.into(),
-            AttachmentError::NotFound(_) => ATTACHMENT_NOT_FOUND,
-            AttachmentError::CleanedUp { .. } | AttachmentError::Content { .. } => {
-                ATTACHMENT_UNAVAILABLE
-            }
-            AttachmentError::NotStored(_) => INTERNAL,
-        }),
-    }
-}
-
 /// Why a plan known not to have created its Job was refused, without what
 /// failed inside.
-fn not_admitted(error: &ExecutionRuntimeError) -> Refusal {
+fn not_admitted(error: &DatabaseError) -> Refusal {
     match error {
-        ExecutionRuntimeError::SchedulerQueueFull => RUNTIME_BUSY,
-        ExecutionRuntimeError::ShuttingDown | ExecutionRuntimeError::SchedulerStopped => {
-            SHUTTING_DOWN
-        }
-        ExecutionRuntimeError::ExecutorNotFound(_) => EXECUTOR_NOT_FOUND,
-        ExecutionRuntimeError::Database(error) => match error {
-            DatabaseError::Rejected(Violation::ToolsNotSupported) => TOOLS_NOT_SUPPORTED,
-            DatabaseError::Rejected(Violation::ProjectRequired) => PROJECT_REQUIRED,
-            DatabaseError::Rejected(Violation::ProjectMismatch) => PROJECT_MISMATCH,
-            DatabaseError::Rejected(Violation::InvalidValue("dependencies", _)) => Refusal::new(
+        DatabaseError::Rejected(Violation::ToolsNotSupported) => TOOLS_NOT_SUPPORTED,
+        DatabaseError::Rejected(Violation::ProjectRequired) => PROJECT_REQUIRED,
+        DatabaseError::Rejected(Violation::ProjectMismatch) => PROJECT_MISMATCH,
+        DatabaseError::Rejected(Violation::InvalidValue("dependencies", _)) => Refusal::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "job_dependencies_refused",
+            "the new turn cannot depend on the selected Jobs; nothing was admitted",
+        ),
+        DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,
+        DatabaseError::Rejected(violation) => match violation {
+            Violation::InvalidValue(field, reason) => {
+                Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, field, reason)
+            }
+            Violation::NotFound(_) => Refusal::new(
+                StatusCode::NOT_FOUND,
+                "record_not_found",
+                "a referenced record was not found",
+            )
+            .with_reason(violation.to_string()),
+            Violation::WrongConfigKind { .. } | Violation::NotAConfiguredTarget { .. } => {
+                CONFIGURATION_REFUSED.with_reason(violation.to_string())
+            }
+            violation => Refusal::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "job_dependencies_refused",
-                "the new turn cannot depend on the selected Jobs; nothing was admitted",
-            ),
-            DatabaseError::Rejected(Violation::PendingJobsLimit { .. }) => PENDING_LIMIT_REACHED,
-            DatabaseError::Rejected(violation) => match violation {
-                Violation::InvalidValue(field, reason) => {
-                    Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, field, reason)
-                }
-                Violation::NotFound(_) => Refusal::new(
-                    StatusCode::NOT_FOUND,
-                    "record_not_found",
-                    "a referenced record was not found",
-                )
-                .with_reason(violation.to_string()),
-                Violation::WrongConfigKind { .. } | Violation::NotAConfiguredTarget { .. } => {
-                    CONFIGURATION_REFUSED.with_reason(violation.to_string())
-                }
-                violation => Refusal::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "submission_refused",
-                    "the Job submission was refused",
-                )
-                .with_reason(violation.to_string()),
-            },
-            DatabaseError::ShuttingDown => SHUTTING_DOWN,
-            DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
-            DatabaseError::DiskProtected(_)
-            | DatabaseError::RefusedByDiskProtection { .. }
-            | DatabaseError::InsufficientSpace { .. }
-            | DatabaseError::RolledBack(_)
-            | DatabaseError::NeverExecuted { .. } => STORAGE_REFUSED,
-            DatabaseError::ReadsClosed
-            | DatabaseError::ReadsStorageFailed(_)
-            | DatabaseError::ReadInterrupted
-            | DatabaseError::ReadPoolStopped
-            | DatabaseError::Read(_) => DATABASE_UNAVAILABLE,
-            DatabaseError::StartupPolicy(_)
-            | DatabaseError::ControlQueueFull
-            | DatabaseError::StorageUnavailable(_)
-            | DatabaseError::OutcomeUnknown { .. }
-            | DatabaseError::UnknownOperation(_)
-            | DatabaseError::Startup(_)
-            | DatabaseError::Configuration(_)
-            | DatabaseError::InsufficientStartupSpace(_)
-            | DatabaseError::Open(_)
-            | DatabaseError::AttachmentStore(_)
-            | DatabaseError::WorkerPanicked => INTERNAL,
+                "submission_refused",
+                "the Job submission was refused",
+            )
+            .with_reason(violation.to_string()),
         },
-        ExecutionRuntimeError::WorkspaceGrantUnsupported
-        | ExecutionRuntimeError::MissingPoolBinding(_)
-        | ExecutionRuntimeError::Startup(_)
-        | ExecutionRuntimeError::WorkerPanicked
-        | ExecutionRuntimeError::Provider(_)
-        | ExecutionRuntimeError::ObservationsNotRecorded { .. }
-        | ExecutionRuntimeError::ResponseNotRecorded { .. }
-        | ExecutionRuntimeError::CompletionRefused { .. }
-        | ExecutionRuntimeError::ToolsUnavailable(_)
-        | ExecutionRuntimeError::InvalidToolLimits(_)
-        | ExecutionRuntimeError::ToolLoopStopped { .. }
-        | ExecutionRuntimeError::ToolLoopNotSettled { .. }
-        | ExecutionRuntimeError::ProviderSettlementNotRecorded { .. }
-        | ExecutionRuntimeError::NotSettled { .. } => INTERNAL,
+        DatabaseError::ShuttingDown => SHUTTING_DOWN,
+        DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
+        DatabaseError::DiskProtected(_)
+        | DatabaseError::RefusedByDiskProtection { .. }
+        | DatabaseError::InsufficientSpace { .. }
+        | DatabaseError::RolledBack(_)
+        | DatabaseError::NeverExecuted { .. } => STORAGE_REFUSED,
+        DatabaseError::ReadsClosed
+        | DatabaseError::ReadsStorageFailed(_)
+        | DatabaseError::ReadInterrupted
+        | DatabaseError::ReadPoolStopped
+        | DatabaseError::Read(_) => DATABASE_UNAVAILABLE,
+        DatabaseError::StartupPolicy(_)
+        | DatabaseError::ControlQueueFull
+        | DatabaseError::StorageUnavailable(_)
+        | DatabaseError::OutcomeUnknown { .. }
+        | DatabaseError::UnknownOperation(_)
+        | DatabaseError::Startup(_)
+        | DatabaseError::Configuration(_)
+        | DatabaseError::InsufficientStartupSpace(_)
+        | DatabaseError::Open(_)
+        | DatabaseError::AttachmentStore(_)
+        | DatabaseError::WorkerPanicked => INTERNAL,
     }
 }
 
@@ -1372,81 +1281,12 @@ pub(super) async fn action(
     action: &str,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
-    use crate::db::entities::{Actor, StopCause};
-    refuse_native(&shared.database, conversation).await?;
+    use crate::db::entities::Actor;
     let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
     let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
+    // A queued message of a native turn is changed through its Job, not here.
     if action == "queue" {
-        #[derive(Deserialize)]
-        #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-        enum Amendment {
-            Edit {
-                turn: String,
-                message: u32,
-                text: String,
-                attachments: Vec<String>,
-            },
-            Withdraw {
-                turn: String,
-                message: u32,
-            },
-        }
-        let amendment: Amendment = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
-        let (turn, entry) = match amendment {
-            Amendment::Edit {
-                turn,
-                message,
-                text: content,
-                attachments,
-            } => {
-                if !text(&content, MAX_OBJECTIVE_BYTES) || attachments.len() > MAX_REQUEST_IMAGES {
-                    return Err(INVALID_ROUTE_BODY);
-                }
-                let attachments = attachments
-                    .iter()
-                    .map(|id| {
-                        identity(id, "attachment:")
-                            .map(AttachmentId::new)
-                            .ok_or(INVALID_ROUTE_BODY)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if attachments
-                    .iter()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-                    != attachments.len()
-                {
-                    return Err(INVALID_ROUTE_BODY);
-                }
-                (
-                    turn,
-                    crate::db::entities::Entry::UserMessageEdit {
-                        message,
-                        text: content,
-                        attachments,
-                    },
-                )
-            }
-            Amendment::Withdraw { turn, message } => (
-                turn,
-                crate::db::entities::Entry::UserMessageWithdraw { message },
-            ),
-        };
-        let turn = super::routing::job_id(&turn)?;
-        if let crate::db::entities::Entry::UserMessageEdit { attachments, .. } = &entry {
-            check_user_images(&shared.database, attachments).await?;
-        }
-        let appended = shared
-            .database
-            .amend_queued_input(conversation, turn, entry)
-            .await
-            .map_err(action_error)?;
-        return Ok(Reply::ok(envelope(serde_json::json!(AppendView {
-            conversation: conversation.to_string(),
-            turn: appended.turn.to_string(),
-            seq: appended.seq,
-            joined: true,
-        }))));
+        return Err(NATIVE_ACTION_UNSUPPORTED);
     }
     if action == "retry" {
         if object.len() != 1 {
@@ -1481,30 +1321,23 @@ pub(super) async fn action(
         _ => return Err(INVALID_ROUTE_BODY),
     }
     .map_err(action_error)?;
-    for running in &result.running {
-        shared
-            .scheduler
-            .stop(
-                *running,
-                if action == "close" {
-                    StopCause::Closed
-                } else {
-                    StopCause::Stopped(result.record_seq.ok_or(INTERNAL)?)
-                },
-            )
-            .await;
+    // The executions the action asked to stop are cancelled here, and what
+    // depends on the turns it ended is told. Neither is part of the action
+    // itself, which is already recorded.
+    for token in &result.running {
+        shared.scheduler.native_stops().cancel(*token);
+    }
+    if let Err(error) = shared
+        .database
+        .settle_child_turns(result.ended.clone())
+        .await
+    {
+        log::warn!("the parents of the turns an action ended were not told: {error}");
     }
     if result.already {
-        let settled = shared
-            .database
-            .job(conversation)
-            .await?
-            .ok_or(INTERNAL)?
-            .outcome
-            .is_some();
         return Ok(Reply::ok(envelope(serde_json::json!(StopView {
             conversation: conversation.to_string(),
-            status: if settled {
+            status: if result.settled {
                 "already_settled"
             } else {
                 "already_closing"
@@ -1513,21 +1346,7 @@ pub(super) async fn action(
             record_seq: result.record_seq,
         }))));
     }
-    let changed = action != "stop"
-        || !result.running.is_empty()
-        || if let Some(record) = result.record_seq {
-            shared
-                .database
-                .conversation_turns(conversation, None, 1)
-                .await?
-                .first()
-                .and_then(|turn| turn.outcome.as_ref())
-                .is_some_and(|outcome| {
-                    outcome.cause == Some(crate::db::entities::OutcomeCause::Stopped { record })
-                })
-        } else {
-            action != "stop"
-        };
+    let changed = action != "stop" || !result.running.is_empty() || !result.ended.is_empty();
     Ok(Reply::new(
         if changed {
             StatusCode::ACCEPTED
@@ -1673,115 +1492,4 @@ pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply,
         conversation: conversation.to_string(),
         cards,
     }))))
-}
-
-pub(super) async fn release_slot(
-    database: &DatabaseHandle,
-    job: JobId,
-    body: &[u8],
-) -> Result<Reply, Refusal> {
-    use crate::db::entities::StopProof;
-    use crate::system::executor::blocking::{self, JobProof};
-    let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
-    let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
-    if object.keys().any(|key| key != "confirm")
-        || object
-            .get("confirm")
-            .is_some_and(|v| v != &Value::Bool(true))
-    {
-        return Err(INVALID_ROUTE_BODY);
-    }
-    match database.mutable_job_details(job, None).await? {
-        crate::db::redb::MutableJobDetailsLookup::Found(_) => {
-            // A native Allocation is released only by confirmed termination
-            // evidence; the legacy slot release cannot prove or record it.
-            return Err(Refusal::new(
-                StatusCode::CONFLICT,
-                "native_allocation_not_releasable",
-                "a native Job's Allocation cannot be released through release-slot",
-            ));
-        }
-        // Not visible without its composer context: indistinguishable from
-        // a missing Job, and never handed to the legacy reader.
-        crate::db::redb::MutableJobDetailsLookup::Inaccessible => {
-            return Err(super::JOB_NOT_FOUND);
-        }
-        crate::db::redb::MutableJobDetailsLookup::NotMutable => {}
-    }
-    // A native conversation is never decoded by the legacy reader below.
-    if database.conversation_exists(job).await? {
-        return Err(conversation_refusal("not_quarantined"));
-    }
-    let record = database.job(job).await?.ok_or(super::JOB_NOT_FOUND)?;
-    if record.unknown_at.is_none() {
-        return Err(conversation_refusal("not_quarantined"));
-    }
-    let released = || {
-        Reply::ok(envelope(serde_json::json!(ReleaseSlotView {
-            status: "already_released".to_owned(),
-        })))
-    };
-    if record.stop_confirmed_at.is_some() {
-        return Ok(released());
-    }
-    let proof = ntex::rt::spawn_blocking(move || blocking::prove_job(job))
-        .await
-        .map_err(|_| INTERNAL)?;
-    let by = match proof {
-        JobProof::Proven => StopProof::Proof,
-        JobProof::Starting => {
-            let refusal = conversation_refusal("slot_live");
-            return Ok(Reply::new(
-                refusal.status,
-                envelope(serde_json::json!({
-                    "error": serde_json::json!({
-                        "code": refusal.code.to_owned(),
-                        "message": "a command may still be starting",
-                    }),
-                })),
-            ));
-        }
-        JobProof::Live { group } => {
-            let refusal = conversation_refusal("slot_live");
-            return Ok(Reply::new(
-                refusal.status,
-                envelope(serde_json::json!({
-                    "error": serde_json::json!({
-                        "code": refusal.code.to_owned(),
-                        "message": format!("process group {group} is still live"),
-                        "group": group,
-                    }),
-                })),
-            ));
-        }
-        JobProof::Checking { group } => {
-            let refusal = conversation_refusal("slot_live");
-            return Ok(Reply::new(
-                refusal.status,
-                envelope(serde_json::json!({
-                    "error": serde_json::json!({
-                        "code": refusal.code.to_owned(),
-                        "message": format!("process group {group} is still being checked"),
-                        "group": group,
-                    }),
-                })),
-            ));
-        }
-        JobProof::Untracked if object.get("confirm") == Some(&Value::Bool(true)) => StopProof::User,
-        JobProof::Untracked => return Err(conversation_refusal("confirm_required")),
-    };
-    // A proof whose commit fails stays unconfirmed; the scheduler retries it.
-    match database.confirm_job_stopped(job, by).await {
-        Ok(()) => {
-            blocking::stop_settled(job);
-            Ok(Reply::ok(envelope(serde_json::json!(ReleaseSlotView {
-                status: "released".to_owned(),
-            }))))
-        }
-        Err(DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_))) => {
-            blocking::stop_settled(job);
-            Ok(released())
-        }
-        Err(error) => Err(action_error(error)),
-    }
 }

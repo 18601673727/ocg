@@ -227,6 +227,8 @@ function outcomeText(
       return t("state.completed");
     case "completed_withheld":
       return t("transcript.outcome.completedWithheld");
+    case "completed_elided":
+      return t("state.completed");
     case "not_applied":
       return t("transcript.outcome.notApplied");
     case "not_invoked":

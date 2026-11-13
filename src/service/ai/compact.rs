@@ -121,12 +121,6 @@ pub(crate) struct ContextLimits {
 }
 
 impl ContextLimits {
-    pub(crate) fn read_budget(self) -> usize {
-        self.context_window
-            .unwrap_or(DEFAULT_CONTEXT_WINDOW)
-            .saturating_sub(self.max_tokens.unwrap_or(4096)) as usize
-    }
-
     pub(crate) fn for_profile(config: &crate::db::entities::LlmConfig) -> Self {
         Self {
             context_window: config.context_window,

@@ -269,43 +269,6 @@ pub(super) fn output_bytes(
         .saturating_add(json_bytes(value))
 }
 
-pub(super) fn entry_bytes(
-    first: &Entry,
-    format: Option<&crate::db::entities::ResponseFormat>,
-) -> u64 {
-    debug_bytes(first)
-        .saturating_add(match first {
-            Entry::UserMessage { text, attachments } => {
-                search_index_bytes(text).saturating_add((attachments.len() as u64).saturating_mul(
-                    3 * 64 * (crate::db::entities::MAX_ATTACHMENT_NAME_BYTES as u64 + 1),
-                ))
-            }
-            Entry::AgentMessage { text, .. } => search_index_bytes(text),
-            Entry::Notice { .. }
-            | Entry::Decision { .. }
-            | Entry::RetryOf { .. }
-            | Entry::Iteration { .. }
-            | Entry::UserMessageEdit { .. }
-            | Entry::UserMessageWithdraw { .. }
-            | Entry::ContextPreparation { .. }
-            | Entry::ContextUse { .. }
-            | Entry::ResponseFormat { .. } => 0,
-        })
-        .saturating_add(format.map_or(0, |format| {
-            byte_count(redb::encode_response_format(format).len())
-        }))
-        .saturating_add(match first {
-            Entry::UserMessage { text, .. } | Entry::AgentMessage { text, .. }
-                if text.len() <= 64 * 1024 =>
-            {
-                byte_count(text.len())
-                    .saturating_mul(6)
-                    .saturating_add(64 * 1024)
-            }
-            _ => 0,
-        })
-}
-
 pub(super) fn config_bytes(config: &Config) -> u64 {
     byte_count(config.name.len()).saturating_add(match &config.body {
         ConfigBody::Agent(agent) => text_bytes(agent.instructions.as_deref())

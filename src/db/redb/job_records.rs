@@ -382,7 +382,6 @@ impl Batch {
             };
             let (child, appended) = self.open_summary_work(
                 conversation,
-                configuration,
                 work,
                 if final_work { Some(submission) } else { None },
                 Vec::new(),
@@ -405,13 +404,8 @@ impl Batch {
                 reserved_tokens: 0,
                 reserved_requests: 0,
             };
-            let (child, appended) = self.open_summary_work(
-                conversation,
-                configuration,
-                work,
-                Some(submission),
-                dependencies,
-            )?;
+            let (child, appended) =
+                self.open_summary_work(conversation, work, Some(submission), dependencies)?;
             prepared = Some((child, appended.turn));
         }
         let Some((child, job)) = prepared else {
@@ -429,7 +423,6 @@ impl Batch {
     fn open_summary_work(
         &mut self,
         conversation: JobId,
-        configuration: ExecutionConfiguration,
         mut work: crate::db::entities::SummarizationWork,
         submission: Option<Submission>,
         dependencies: Vec<(JobId, DependencyCondition)>,
@@ -458,28 +451,33 @@ impl Batch {
         } else {
             ResponseFormat::JsonObject
         };
-        self.open_group_with_execution(
-            Some(conversation),
-            JobGroup {
-                name: Some(crate::db::entities::COMPACTION_JOB_NAME.into()),
-                agent: None,
-                project: None,
-                origin: Origin::System,
-                keep_open: false,
-            },
+        let spec = JobGroup {
+            name: Some(crate::db::entities::COMPACTION_JOB_NAME.into()),
+            agent: None,
+            project: None,
+            origin: Origin::System,
+            keep_open: false,
+        };
+        self.validate_group_parent(Some(conversation))?;
+        if let Some(existing) = self.existing_group_submission(submission.as_ref())? {
+            return Ok(existing);
+        }
+        let system = self.insert_group(Some(conversation), &spec)?;
+        let appended = self.append_system_turn(
+            system,
             Entry::UserMessage {
                 text:
                     "Prepare a typed context summary from the sealed source supplied at execution."
                         .into(),
                 attachments: Vec::new(),
             },
-            configuration,
+            JobExecution::Summarization(work),
             submission,
             dependencies,
+            spec.name,
             Some(format),
-            Some(JobExecution::Summarization(work)),
-            None,
-        )
+        )?;
+        Ok((system, appended))
     }
 
     /// The newest settled turn a compaction may cover. An active turn is not
@@ -513,8 +511,7 @@ impl Batch {
     pub(crate) fn place_waiting_job(&mut self, conversation: JobId) -> Result<(), BatchError> {
         if let Some(tip) = self.group_head(conversation)? {
             let state = self.require_job_state(tip)?;
-            if state.claim.is_none()
-                && state.outcome.is_none()
+            if state.outcome.is_none()
                 && self.step(|tx| {
                     Ok(tx
                         .open_table(UNSETTLED)?
@@ -602,19 +599,105 @@ impl Batch {
             return self.reject(Violation::InvalidValue("execution", message));
         }
         let conversation = self.insert_group(parent, &spec)?;
-        let appended =
-            self.append_decision(conversation, first, work, submission, Vec::new(), spec.name)?;
+        let appended = self.append_system_turn(
+            conversation,
+            first,
+            JobExecution::Decision(work),
+            submission,
+            Vec::new(),
+            spec.name,
+            None,
+        )?;
         Ok((conversation, appended))
     }
 
-    fn append_decision(
+    fn validate_group_parent(&mut self, parent: Option<JobId>) -> Result<(), BatchError> {
+        if let Some(parent) = parent {
+            let parent_row = self.require_job(parent)?;
+            if !parent_row.kind.is_group() {
+                return self.reject(Violation::InvalidValue("parent", "expected a conversation"));
+            }
+            let (limits, parent_depth) = self.group_limits(parent)?;
+            let root = self.root_group(parent)?;
+            if parent_depth.saturating_add(1) > limits.max_depth
+                || self.live_children(parent)?.len() >= 16
+                || self.live_subtree(root)?.len() >= 64
+            {
+                return self.reject(Violation::InvalidValue(
+                    "children",
+                    "live conversation limit reached",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn existing_group_submission(
+        &mut self,
+        submission: Option<&Submission>,
+    ) -> Result<Option<(JobId, Appended)>, BatchError> {
+        if let Some(submission) = submission
+            && let Some(record) = self.submission(submission.key)?
+        {
+            if record.fingerprint != submission.fingerprint {
+                return self.reject(Violation::SubmissionKeyUsed {
+                    job: record.job,
+                    same_request: false,
+                });
+            }
+            let turn = self.require_job(record.job)?;
+            let Some(conversation) = turn.parent_id else {
+                return self.corrupted("submission has no conversation".into());
+            };
+            return Ok(Some((
+                conversation,
+                Appended {
+                    turn: record.job,
+                    seq: record.seq,
+                    joined: record.seq > 1,
+                },
+            )));
+        }
+        Ok(None)
+    }
+
+    fn insert_group(
+        &mut self,
+        parent: Option<JobId>,
+        spec: &JobGroup,
+    ) -> Result<JobId, BatchError> {
+        let conversation = self.t1_submit(
+            None,
+            JobSpec {
+                allocation: None,
+                id: JobId::new(0),
+                created_at: self.now(),
+                parent_id: parent,
+                kind: JobKind::Group {
+                    agent: spec.agent,
+                    project: spec.project,
+                    origin: spec.origin.clone(),
+                    keep_open: spec.keep_open,
+                },
+            },
+        )?;
+        self.put_job_control(conversation, &JobControl::default())?;
+        if let Some(parent) = parent {
+            self.link_job_group(parent, conversation)?;
+        }
+        Ok(conversation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_system_turn(
         &mut self,
         conversation: JobId,
         entry: Entry,
-        work: crate::db::entities::DecisionWork,
+        execution: JobExecution,
         submission: Option<Submission>,
         dependencies: Vec<(JobId, DependencyCondition)>,
         name: Option<String>,
+        format: Option<ResponseFormat>,
     ) -> Result<Appended, BatchError> {
         let row = self.require_job(conversation)?;
         if !row.kind.is_group() {
@@ -636,7 +719,7 @@ impl Batch {
             parent_id: Some(conversation),
             kind: JobKind::Execution {
                 name,
-                execution: JobExecution::Decision(work),
+                execution,
                 plan_source: PlanSource::Stored {
                     previous: self.group_head(conversation)?,
                     dependencies,
@@ -645,6 +728,9 @@ impl Batch {
         };
         let turn = self.t1_submit(None, spec)?;
         let seq = self.insert_turn_input(turn, entry)?;
+        if let Some(format) = format {
+            self.insert_turn_input(turn, Entry::ResponseFormat { format })?;
+        }
         if let Some(submission) = submission {
             let record = SubmissionRecord {
                 key: submission.key,
@@ -775,206 +861,6 @@ impl Batch {
             }
         }
         Ok(true)
-    }
-
-    /// Adopts the consuming turn's latest candidate when its sealed prefix is
-    /// still the same bytes. An explicit original-context selection, a missing
-    /// result, or a changed prefix leaves the prompt on the original records.
-    /// The selection itself was written before claim; this only checks it.
-    /// Claim calls this so an incompatible candidate is refused as context
-    /// before the turn starts.
-    pub(crate) fn adopt_context(
-        &mut self,
-        turn: JobId,
-    ) -> Result<Option<reader::AdoptedContext>, BatchError> {
-        let row = self.require_job(turn)?;
-        if !row.kind.is_persistent() {
-            return Ok(None);
-        }
-        let selected = self.step(|tx| {
-            let mut selected = None;
-            for entry in tx
-                .open_table(JOB_INPUTS)?
-                .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
-            {
-                let (_, bytes) = entry?;
-                if let Entry::ContextUse { artifact } = JobInputEntry::decode(bytes.value())?.entry
-                {
-                    selected = Some(artifact);
-                }
-            }
-            Ok(selected)
-        })?;
-        let Some(Some(artifact)) = selected else {
-            return Ok(None);
-        };
-        self.validated_context(&row, artifact)
-    }
-
-    fn validated_context(
-        &mut self,
-        row: &JobSpec,
-        artifact: JobId,
-    ) -> Result<Option<reader::AdoptedContext>, BatchError> {
-        let Some(producer) = self.job(artifact)? else {
-            return Ok(None);
-        };
-        let JobKind::Execution {
-            execution: JobExecution::Summarization(work),
-            ..
-        } = &producer.kind
-        else {
-            return Ok(None);
-        };
-        if !work.is_artifact() {
-            return Ok(None);
-        }
-        let Some(parent) = producer.parent_id else {
-            return Ok(None);
-        };
-        let Some(owner) = self.job(parent)? else {
-            return Ok(None);
-        };
-        if owner.parent_id != row.parent_id {
-            return Ok(None);
-        }
-        let state = self.require_job_state(artifact)?;
-        if !state
-            .outcome
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
-        {
-            return Ok(None);
-        }
-        let result = self.step(|tx| {
-            tx.open_table(JOB_OUTPUTS)?
-                .range((artifact.get(), 0)..=(artifact.get(), u32::MAX))?
-                .next_back()
-                .transpose()?
-                .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
-                .transpose()
-        })?;
-        let Some(result) = result
-            .filter(|output| output.kind == OutputKind::Result)
-            .and_then(|output| output.value)
-            .and_then(|value| serde_json::from_value(value).ok())
-        else {
-            return Ok(None);
-        };
-        let result: crate::db::entities::SummarizationResult = result;
-        if result.source != work.source {
-            return Ok(None);
-        }
-        let manifest = self
-            .step(|tx| reader::load_context_manifest(&tx.open_table(MESSAGES)?, result.source))?;
-        if result.validate().is_err()
-            || !self.step(|tx| reader::source_is_prefix(&tx.open_table(JOBS)?, row, &manifest))?
-            || !self.source_still_matches(&manifest)?
-        {
-            return Ok(None);
-        }
-        let tokens = result.context_text().len().saturating_add(128).div_ceil(3);
-        let reducible = self.step(|tx| reader::source_reducible(tx, &manifest))?;
-        if tokens > work.target_tokens as usize
-            || reducible.saturating_sub(tokens) < work.minimum_savings_tokens as usize
-        {
-            return Ok(None);
-        }
-        Ok(Some(reader::AdoptedContext {
-            source: manifest,
-            summary: result.context_text(),
-        }))
-    }
-
-    /// Backpressure for autonomous work, using only bounded existing queues.
-    /// An inconclusive scan declines work rather than assuming room exists.
-    pub(super) fn background_room(&mut self, prediction: bool) -> Result<bool, BatchError> {
-        let now = self.now;
-        self.step(|tx| {
-            if prediction {
-                let mut predictions = 0;
-                for (scanned, entry) in tx.open_table(JOBS)?.iter()?.rev().enumerate().take(257) {
-                    if scanned == 256 {
-                        return Ok(false);
-                    }
-                    let (key, bytes) = entry?;
-                    let row = JobSpec::decode_at(key.value(), bytes.value())?;
-                    if now
-                        .as_unix_micros()
-                        .saturating_sub(row.created_at.as_unix_micros())
-                        >= 60_000_000
-                    {
-                        break;
-                    }
-                    if let JobKind::Execution {
-                        execution: JobExecution::Decision(work),
-                        ..
-                    } = row.kind
-                        && work.prediction.is_some()
-                    {
-                        predictions += 1;
-                        if predictions >= 6 {
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-            let mut count = 0usize;
-            let mut summary_chains = BTreeSet::new();
-            let mut queued_speculation = 0usize;
-            let mut ids = BTreeSet::new();
-            for (scanned, entry) in tx.open_table(PENDING)?.iter()?.enumerate().take(129) {
-                if scanned == 128 {
-                    return Ok(false);
-                }
-                ids.insert(entry?.0.value());
-            }
-            for entry in tx
-                .open_table(HELD_SLOTS)?
-                .iter()?
-                .take(usize::from(crate::db::entities::GLOBAL_EXECUTION_LIMIT) + 1)
-            {
-                ids.insert(entry?.0.value().1);
-            }
-            for id in ids {
-                let table = tx.open_table(JOBS)?;
-                let Some(bytes) = table.get(id)? else {
-                    return Err(StorageError::corrupted("queued Job missing"));
-                };
-                let row = JobSpec::decode_at(id, bytes.value())?;
-                let priority = reader::work_priority(&table, &row)?;
-                if priority == 2 && tx.open_table(PENDING)?.get(id)?.is_some() {
-                    queued_speculation += 1;
-                }
-                match row.kind {
-                    JobKind::Execution {
-                        execution: JobExecution::Decision(_),
-                        ..
-                    } if prediction => count += 1,
-                    JobKind::Execution {
-                        execution: JobExecution::Summarization(work),
-                        ..
-                    } if !prediction => {
-                        if priority != 2 {
-                            summary_chains.insert(work.chain.unwrap_or(JobId::new(id)));
-                        }
-                    }
-                    JobKind::Execution {
-                        execution: JobExecution::Frozen(_) | JobExecution::Ref(_),
-                        ..
-                    } if prediction => {
-                        if tx.open_table(PENDING)?.get(id)?.is_some() {
-                            return Ok(false);
-                        }
-                    }
-                    JobKind::Group { .. } | JobKind::Execution { .. } => {}
-                }
-            }
-            Ok(if prediction {
-                count < 2 && queued_speculation < 8
-            } else {
-                summary_chains.len() < 2
-            })
-        })
     }
 
     fn predictive_capacity(
@@ -1158,7 +1044,7 @@ impl Batch {
         })?;
         for job in candidates {
             let state = self.require_job_state(job)?;
-            if state.claim.is_none() && state.outcome.is_none() {
+            if state.outcome.is_none() {
                 self.finalize(
                     job,
                     OutcomeKind::Cancelled,
@@ -1169,605 +1055,10 @@ impl Batch {
                         goal_reached: Some(false),
                         value: None,
                     }),
-                    false,
                 )?;
             }
         }
         Ok(())
-    }
-
-    pub(super) fn recover_predictions(&mut self) -> Result<(), BatchError> {
-        let candidates = self.step(|tx| {
-            let mut candidates = Vec::new();
-            for entry in tx.open_table(JOBS)?.iter()?.rev().take(64) {
-                let (key,bytes) = entry?;
-                let row = JobSpec::decode_at(key.value(),bytes.value())?;
-                if matches!(row.kind,JobKind::Execution { execution:JobExecution::Decision(work), .. } if work.prediction.is_some()) {
-                    candidates.push(row.id);
-                }
-            }
-            Ok(candidates)
-        })?;
-        let mut admitted = 0;
-        for prediction in candidates {
-            let mut identity = b"ocg-preparation-v1".to_vec();
-            identity.extend_from_slice(&prediction.get().to_le_bytes());
-            if self
-                .submission(crate::db::entities::SubmissionKey::from_digest(
-                    *crate::db::entities::ContentDigest::of(&identity).as_bytes(),
-                ))?
-                .is_some()
-            {
-                continue;
-            }
-            if self.promote_prediction(prediction)?.is_some() {
-                admitted += 1;
-                if admitted == 2 {
-                    break;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn promote_prediction(
-        &mut self,
-        prediction: JobId,
-    ) -> Result<Option<JobId>, BatchError> {
-        use crate::db::entities::*;
-        let row = self.require_job(prediction)?;
-        let JobKind::Execution {
-            execution: JobExecution::Decision(work),
-            ..
-        } = &row.kind
-        else {
-            return Ok(None);
-        };
-        let Some(binding) = &work.prediction else {
-            return Ok(None);
-        };
-        if !self
-            .require_job_state(prediction)?
-            .outcome
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
-            || !self.step(|tx| {
-                reader::prediction_current(
-                    &tx.open_table(META)?,
-                    &tx.open_table(JOBS)?,
-                    &tx.open_table(CONFIGS)?,
-                    &tx.open_table(PROJECTS)?,
-                    &tx.open_table(JOB_CONTROLS)?,
-                    reader::Turns(&tx.open_table(TURNS)?),
-                    &row,
-                )
-            })?
-        {
-            return Ok(None);
-        }
-        let conversation = binding.conversation;
-        let policy = &binding.policy;
-        let Some(predictive) = &policy.predictive else {
-            return Ok(None);
-        };
-        if predictive.mode != PredictionMode::Prepare {
-            return Ok(None);
-        }
-        let Some(acceptance) = &predictive.acceptance else {
-            return Ok(None);
-        };
-        let result = self.step(|tx| {
-            tx.open_table(JOB_OUTPUTS)?
-                .range((prediction.get(), 0)..=(prediction.get(), u32::MAX))?
-                .next_back()
-                .transpose()?
-                .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
-                .transpose()
-        })?;
-        let Some(result) = result
-            .filter(|output| output.kind == OutputKind::Result)
-            .and_then(|output| output.value)
-            .and_then(|value| value.get("decision").cloned())
-            .and_then(|value| serde_json::from_value::<DecisionResult>(value).ok())
-        else {
-            return Ok(None);
-        };
-        if result
-            .validate(
-                &work.request,
-                &work.frozen,
-                RequestRef {
-                    job: prediction,
-                    request: RequestNumber::FIRST,
-                },
-            )
-            .is_err()
-            || !acceptance.accepts(&result)
-        {
-            return Ok(None);
-        }
-        let mut identity = b"ocg-preparation-v1".to_vec();
-        identity.extend_from_slice(&prediction.get().to_le_bytes());
-        let digest = *ContentDigest::of(&identity).as_bytes();
-        if let Some(record) = self.submission(SubmissionKey::from_digest(digest))? {
-            return Ok(Some(record.job));
-        }
-        let foreground = self.require_job(binding.activity_turn)?;
-        let (frozen, _, _) = self.job_execution(&foreground)?;
-        let reserve = frozen
-            .llm
-            .config
-            .parameters
-            .max_completion_tokens
-            .or(frozen.llm.config.parameters.max_tokens)
-            .unwrap_or(4096);
-        let (mut occupancy, growth, _) = self.step(|tx| {
-            reader::raw_context_usage(
-                &tx.open_table(JOBS)?,
-                &tx.open_table(JOB_STATES)?,
-                &tx.open_table(JOB_INPUTS)?,
-                &tx.open_table(JOB_OUTPUTS)?,
-                foreground.id,
-            )
-        })?;
-        if occupancy == usize::MAX {
-            return Ok(None);
-        }
-        if let Some(adopted) = self.adopt_context(foreground.id)? {
-            let reducible = self.step(|tx| reader::source_reducible(tx, &adopted.source))?;
-            occupancy = occupancy.saturating_sub(reducible);
-            occupancy =
-                occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
-        }
-        let safety = u32::try_from(
-            frozen
-                .agent
-                .as_ref()
-                .and_then(|agent| agent.instructions.as_ref())
-                .map_or(0, String::len)
-                .div_ceil(3),
-        )
-        .unwrap_or(u32::MAX)
-        .saturating_add(256);
-        let Ok(recipe) = policy.recipe(frozen.llm.config.context_window, reserve, safety, growth)
-        else {
-            return Ok(None);
-        };
-        if recipe
-            .trigger
-            .is_none_or(|trigger| occupancy.saturating_add(growth as usize) <= trigger as usize)
-        {
-            return Ok(None);
-        }
-        for producer in self.context_compaction_jobs(conversation)? {
-            let state = self.require_job_state(producer)?;
-            if state.outcome.is_none()
-                || state.outcome.is_some_and(|outcome| {
-                    self.now
-                        .as_unix_micros()
-                        .saturating_sub(outcome.at.as_unix_micros())
-                        < i64::from(recipe.cooldown_seconds).saturating_mul(1_000_000)
-                })
-            {
-                return Ok(None);
-            }
-        }
-        let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
-        let Some(model) = self.config(summarizer)? else {
-            return Ok(None);
-        };
-        let ConfigBody::Model(model_body) = model.body else {
-            return Ok(None);
-        };
-        if model.archived_at.is_some() {
-            return Ok(None);
-        }
-        let Some(connection) = self.config(model_body.connection_id)? else {
-            return Ok(None);
-        };
-        let ConfigBody::Connection(connection_body) = connection.body else {
-            return Ok(None);
-        };
-        if connection.archived_at.is_some()
-            || !self.has_executor_for(
-                ExecutionOperation::LlmRequest,
-                Some(connection_body.protocol),
-            )?
-        {
-            return Ok(None);
-        }
-        match self.request_preparation(
-            conversation,
-            summarizer,
-            Submission {
-                key: SubmissionKey::from_digest(digest),
-                fingerprint: RequestFingerprint::from_digest(digest),
-            },
-            Some(recipe),
-            Some(prediction),
-        )? {
-            CompactionRequest::Prepared { job, .. } => Ok(Some(job)),
-            CompactionRequest::Noop { .. } => Ok(None),
-        }
-    }
-
-    pub(crate) fn predict_context(
-        &mut self,
-        conversation: JobId,
-    ) -> Result<Option<JobId>, BatchError> {
-        use crate::db::entities::*;
-        let Some(owner) = self.job(conversation)? else {
-            return Ok(None);
-        };
-        if !matches!(
-            owner.kind,
-            JobKind::Group {
-                origin: Origin::User | Origin::Agent { .. },
-                ..
-            }
-        ) {
-            return Ok(None);
-        }
-        let (mut policy, revision, policy_profile) =
-            self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
-        if matches!(policy.mode, CompactionMode::Off)
-            || !self.step(|tx| {
-                Ok(reader::global_compaction_settings(&tx.open_table(META)?)?.prediction_enabled)
-            })?
-        {
-            return Ok(None);
-        }
-        let Some(tip) = self.group_head(conversation)? else {
-            return Ok(None);
-        };
-        let foreground = self.require_job(tip)?;
-        if matches!(
-            foreground.kind,
-            JobKind::Execution {
-                execution: JobExecution::Decision(_) | JobExecution::Summarization(_),
-                ..
-            }
-        ) {
-            return Ok(None);
-        }
-        let (active, project, _) = self.job_execution(&foreground)?;
-        let Some((decision, assignment)) = self.project_decision(project, &active)? else {
-            return Ok(None);
-        };
-        let binding = crate::service::jobs::bind_prediction(&mut policy, &decision);
-        let frozen = active;
-        if self.require_job_state(tip)?.outcome.is_none() || !self.background_room(true)? {
-            return Ok(None);
-        }
-        let (limits, depth) = self.group_limits(conversation)?;
-        if depth.saturating_add(1) > limits.max_depth
-            || self.live_children(conversation)?.len() >= 16
-        {
-            return Ok(None);
-        }
-        let root = self.root_group(conversation)?;
-        if self.live_subtree(root)?.len() >= 64 || self.job_control(conversation)?.closing.is_some()
-        {
-            return Ok(None);
-        }
-        for child in self.live_children(conversation)? {
-            if let Some(tip) = self.group_head(child)? {
-                let row = self.require_job(tip)?;
-                if matches!(row.kind, JobKind::Execution { execution: JobExecution::Decision(work), .. } if work.prediction.is_some())
-                    && self.require_job_state(tip)?.outcome.is_none()
-                {
-                    return Ok(None);
-                }
-            }
-        }
-        let mut identity = b"ocg-shadow-prediction-v1".to_vec();
-        identity.extend_from_slice(&conversation.get().to_le_bytes());
-        identity.extend_from_slice(&tip.get().to_le_bytes());
-        identity.extend_from_slice(&revision.to_le_bytes());
-        if let Some(profile) = policy_profile {
-            identity.extend_from_slice(&profile.id.get().to_le_bytes());
-            identity.extend_from_slice(&profile.edit_seq.to_le_bytes());
-        }
-        let digest = *ContentDigest::of(&identity).as_bytes();
-        let submission = Submission {
-            key: SubmissionKey::from_digest(digest),
-            fingerprint: RequestFingerprint::from_digest(digest),
-        };
-        if self.submission(submission.key)?.is_some() {
-            return Ok(None);
-        }
-        let activity = tip;
-        let recent = self.step(|tx| {
-            let mut recent = Vec::new();
-            for (scanned, entry) in tx
-                .open_table(CHILD_GROUPS)?
-                .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
-                .rev()
-                .enumerate()
-                .take(65)
-            {
-                if scanned == 64 {
-                    return Ok(None);
-                }
-                let child = entry?.0.value().1;
-                let tip = reader::turn_head(&tx.open_table(TURNS)?, JobId::new(child))?;
-                if let Some(tip) = tip.map(JobId::get) {
-                    let row = tx
-                        .open_table(JOBS)?
-                        .get(tip)?
-                        .map(|bytes| JobSpec::decode_at(tip, bytes.value()))
-                        .transpose()?;
-                    if let Some(JobSpec {
-                        created_at,
-                        kind:
-                            JobKind::Execution {
-                                execution: JobExecution::Decision(work),
-                                ..
-                            },
-                        ..
-                    }) = row
-                        && work.prediction.is_some()
-                    {
-                        let same_activity = work
-                            .prediction
-                            .as_ref()
-                            .is_some_and(|binding| binding.activity_turn == activity);
-                        recent.push((JobId::new(tip), created_at, same_activity));
-                    }
-                }
-            }
-            Ok(Some(recent))
-        })?;
-        let Some(recent) = recent else {
-            return Ok(None);
-        };
-        for (job, created_at, same_activity) in recent {
-            if same_activity
-                || self.require_job_state(job)?.outcome.is_none()
-                || self
-                    .now
-                    .as_unix_micros()
-                    .saturating_sub(created_at.as_unix_micros())
-                    < i64::from(binding.minimum_interval_seconds.max(60)).saturating_mul(1_000_000)
-            {
-                return Ok(None);
-            }
-        }
-        let reserve = frozen
-            .llm
-            .config
-            .parameters
-            .max_completion_tokens
-            .or(frozen.llm.config.parameters.max_tokens)
-            .unwrap_or(4096);
-        let (mut occupancy, growth, settled_turns) = self.step(|tx| {
-            reader::raw_context_usage(
-                &tx.open_table(JOBS)?,
-                &tx.open_table(JOB_STATES)?,
-                &tx.open_table(JOB_INPUTS)?,
-                &tx.open_table(JOB_OUTPUTS)?,
-                tip,
-            )
-        })?;
-        if let Some(adopted) = self.adopt_context(tip)? {
-            let reducible = self.step(|tx| reader::source_reducible(tx, &adopted.source))?;
-            occupancy = occupancy.saturating_sub(reducible);
-            occupancy =
-                occupancy.saturating_add(adopted.summary.len().saturating_add(128).div_ceil(3));
-        }
-        let Some(capacity) = frozen.llm.config.context_window else {
-            return Ok(None);
-        };
-        if occupancy == usize::MAX {
-            return Ok(None);
-        }
-        let forecast = occupancy
-            .saturating_add(growth as usize)
-            .saturating_add(reserve as usize);
-        let snapshot = PredictionSnapshot {
-            schema_version: 1,
-            capacity: Some(capacity),
-            reserve,
-            occupancy_tokens: u32::try_from(occupancy).unwrap_or(u32::MAX),
-            recent_growth_tokens: growth,
-            pressure: if forecast >= capacity as usize {
-                "pressure"
-            } else {
-                "room"
-            },
-            settled_turns,
-            active: false,
-        };
-        let mut request = snapshot.request();
-        request.state["deterministic_forecast_tokens"] = serde_json::json!(forecast);
-        let body = match crate::service::ai::decisive_model::request_body(&decision, &request) {
-            Ok(body) => body,
-            Err(_) => return Ok(None),
-        };
-        let bound =
-            serde_json::to_vec(&body).map_or(usize::MAX, |body| body.len().saturating_add(1024));
-        if bound > binding.max_prediction_tokens as usize {
-            return Ok(None);
-        }
-        let (_, appended) = self.open_resolved_decision(
-            Some(conversation),
-            JobGroup {
-                name: Some("Context prediction".into()),
-                agent: decision.agent_ref().map(|reference| reference.id),
-                project: None,
-                origin: Origin::System,
-                keep_open: false,
-            },
-            Entry::UserMessage {
-                text: "Evaluate context pressure and whether to prepare a summary.".into(),
-                attachments: vec![],
-            },
-            decision,
-            request,
-            Some(submission),
-            Some(PredictionBinding {
-                conversation,
-                activity_turn: tip,
-                policy_revision: revision,
-                policy_profile,
-                max_tokens: binding.max_prediction_tokens,
-                policy,
-            }),
-            None,
-            assignment,
-        )?;
-        Ok(Some(appended.turn))
-    }
-
-    pub(super) fn context_compaction_jobs(
-        &mut self,
-        conversation: JobId,
-    ) -> Result<Vec<JobId>, BatchError> {
-        self.step(|tx| {
-            let mut jobs = Vec::new();
-            for entry in tx
-                .open_table(CHILD_GROUPS)?
-                .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
-                .rev()
-                .take(64)
-            {
-                let child = JobId::new(entry?.0.value().1);
-                let tip = reader::turn_head(&tx.open_table(TURNS)?, child)?.map(JobId::get);
-                if let Some(tip) = tip {
-                    let row = tx
-                        .open_table(JOBS)?
-                        .get(tip)?
-                        .map(|bytes| JobSpec::decode_at(tip, bytes.value()))
-                        .transpose()?;
-                    if matches!(
-                        row.map(|row| row.kind),
-                        Some(JobKind::Execution {
-                            execution: JobExecution::Summarization(work),
-                            ..
-                        }) if work.is_artifact()
-                    ) {
-                        jobs.push(JobId::new(tip));
-                    }
-                }
-            }
-            Ok(jobs)
-        })
-    }
-
-    pub(super) fn select_context(&mut self, turn: JobId) -> Result<bool, BatchError> {
-        let row = self.require_job(turn)?;
-        if !matches!(
-            row.kind,
-            JobKind::Execution {
-                execution: JobExecution::Frozen(_) | JobExecution::Ref(_),
-                plan_source: PlanSource::Stored { .. },
-                ..
-            }
-        ) {
-            return Ok(false);
-        }
-        let Some(conversation) = row.parent_id else {
-            return Ok(false);
-        };
-        let (selected, preparations) = self.step(|tx| {
-            let mut selected = None;
-            let mut preparations = BTreeSet::new();
-            for entry in tx
-                .open_table(JOB_INPUTS)?
-                .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
-            {
-                match JobInputEntry::decode(entry?.1.value())?.entry {
-                    Entry::ContextUse { artifact } => selected = Some(artifact),
-                    Entry::ContextPreparation { job, .. } => {
-                        preparations.insert(job);
-                    }
-                    Entry::UserMessage { .. }
-                    | Entry::UserMessageEdit { .. }
-                    | Entry::UserMessageWithdraw { .. }
-                    | Entry::AgentMessage { .. }
-                    | Entry::Decision { .. }
-                    | Entry::Notice { .. }
-                    | Entry::RetryOf { .. }
-                    | Entry::Iteration { .. }
-                    | Entry::ResponseFormat { .. } => {}
-                }
-            }
-            Ok((selected, preparations))
-        })?;
-        if selected == Some(None) {
-            return Ok(false);
-        }
-        let (_policy, revision, _profile) =
-            self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
-        for producer in self.context_compaction_jobs(conversation)? {
-            let producer_row = self.require_job(producer)?;
-            let JobKind::Execution {
-                execution: JobExecution::Summarization(work),
-                ..
-            } = &producer_row.kind
-            else {
-                continue;
-            };
-            if !work.is_artifact()
-                || !self.step(|tx| {
-                    reader::preparation_current(
-                        &tx.open_table(META)?,
-                        &tx.open_table(JOBS)?,
-                        &tx.open_table(CONFIGS)?,
-                        &tx.open_table(PROJECTS)?,
-                        &tx.open_table(JOB_CONTROLS)?,
-                        &tx.open_table(NOTICES)?,
-                        &producer_row,
-                    )
-                })?
-            {
-                continue;
-            }
-            if self.validated_context(&row, producer)?.is_some() {
-                if selected != Some(Some(producer)) {
-                    if !preparations.contains(&producer) {
-                        self.insert_turn_input(
-                            turn,
-                            Entry::ContextPreparation {
-                                job: producer,
-                                policy_revision: revision,
-                            },
-                        )?;
-                    }
-                    self.insert_turn_input(
-                        turn,
-                        Entry::ContextUse {
-                            artifact: Some(producer),
-                        },
-                    )?;
-                }
-                return Ok(true);
-            }
-        }
-        if let Some(Some(producer)) = selected {
-            let producer_row = self.require_job(producer)?;
-            let eligible = match &producer_row.kind {
-                JobKind::Execution {
-                    execution: JobExecution::Summarization(_),
-                    ..
-                } => self.step(|tx| {
-                    reader::preparation_current(
-                        &tx.open_table(META)?,
-                        &tx.open_table(JOBS)?,
-                        &tx.open_table(CONFIGS)?,
-                        &tx.open_table(PROJECTS)?,
-                        &tx.open_table(JOB_CONTROLS)?,
-                        &tx.open_table(NOTICES)?,
-                        &producer_row,
-                    )
-                })?,
-                JobKind::Group { .. } | JobKind::Execution { .. } => false,
-            };
-            if eligible && self.validated_context(&row, producer)?.is_some() {
-                return Ok(true);
-            }
-            self.insert_turn_input(turn, Entry::ContextUse { artifact: None })?;
-        }
-        Ok(false)
     }
 
     fn check_context_job(&mut self, consumer: &JobSpec, producer: JobId) -> Result<(), BatchError> {
@@ -1805,7 +1096,7 @@ impl Batch {
     ) -> Result<u32, BatchError> {
         let row = self.require_job(turn)?;
         let state = self.require_job_state(turn)?;
-        if !row.kind.is_persistent() || state.claim.is_some() || state.outcome.is_some() {
+        if !row.kind.is_persistent() || state.outcome.is_some() {
             return self.reject(Violation::InvalidValue(
                 "turn_input",
                 "input is frozen by claim or outcome",
@@ -2002,8 +1293,7 @@ impl Batch {
             }
         }
         let at = self.now;
-        let (seq, first_user) = self.step(|tx| {
-            let mut first_user = false;
+        let seq = self.step(|tx| {
             let previous = match &entry {
                 Entry::UserMessageEdit { message, .. } | Entry::UserMessageWithdraw { message } => {
                     let (_, previous) = reader::effective_entries(reader::job_entries_of(
@@ -2066,7 +1356,6 @@ impl Batch {
                         let mut user = tx.open_table(USER_INPUT_AT)?;
                         if user.get(conversation.get())?.is_none() {
                             user.insert(conversation.get(), ())?;
-                            first_user = true;
                         }
                     }
                 }
@@ -2086,30 +1375,8 @@ impl Batch {
                 | Entry::ContextUse { .. }
                 | Entry::ResponseFormat { .. } => {}
             }
-            Ok((seq, first_user))
+            Ok(seq)
         })?;
-        if first_user && let Some(conversation) = row.parent_id {
-            let waiting = self.step(|tx| {
-                let jobs = tx.open_table(JOBS)?;
-                let mut waiting = BTreeSet::new();
-                for entry in tx
-                    .open_table(DEPENDENCY_WAITERS)?
-                    .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
-                {
-                    let waiter = JobId::new(entry?.0.value().1);
-                    if let Some(bytes) = jobs.get(waiter.get())?
-                        && let Some(parent) =
-                            JobSpec::decode_at(waiter.get(), bytes.value())?.parent_id
-                    {
-                        waiting.insert(parent);
-                    }
-                }
-                Ok(waiting.into_iter().collect::<Vec<_>>())
-            })?;
-            if !waiting.is_empty() {
-                self.notify(conversation, NoticeEvent::WaitersBlocked { waiting }, turn)?;
-            }
-        }
         Ok(seq)
     }
 
@@ -2266,20 +1533,17 @@ impl Batch {
                 ResponseFormat::JsonObject
             }
         };
-        self.append_named(
+        self.append_system_turn(
             conversation,
             Entry::UserMessage {
                 text: crate::db::entities::title_prompt(&text),
                 attachments: Vec::new(),
             },
+            JobExecution::Frozen(frozen),
             None,
-            None,
-            false,
-            Some(crate::db::entities::TITLE_JOB_NAME.to_owned()),
             Vec::new(),
+            Some(crate::db::entities::TITLE_JOB_NAME.to_owned()),
             Some(format),
-            Some(JobExecution::Frozen(frozen)),
-            None,
         )?;
         Ok(())
     }
@@ -2291,60 +1555,6 @@ impl Batch {
                 .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 .map(|entry| Ok(JobId::new(entry?.0.value().1)))
                 .collect()
-        })
-    }
-
-    pub(crate) fn amend_queued_input(
-        &mut self,
-        conversation: JobId,
-        turn: JobId,
-        entry: Entry,
-    ) -> Result<Appended, BatchError> {
-        self.require_agent_group(conversation)?;
-        let Some(row) = self.job(turn)? else {
-            return self.reject(Violation::InvalidValue("queued_message", "turn not found"));
-        };
-        if row.parent_id != Some(conversation)
-            || !matches!(
-                row.kind,
-                JobKind::Execution {
-                    execution: JobExecution::Frozen(_) | JobExecution::Ref(_),
-                    ..
-                }
-            )
-            || !matches!(
-                entry,
-                Entry::UserMessageEdit { .. } | Entry::UserMessageWithdraw { .. }
-            )
-        {
-            return self.reject(Violation::InvalidValue(
-                "queued_message",
-                "expected a queued user message in this conversation",
-            ));
-        }
-        let seq = self.insert_turn_input(turn, entry)?;
-        let empty = self.step(|tx| {
-            Ok(reader::effective_entries(reader::job_entries_of(
-                &tx.open_table(JOB_INPUTS)?,
-                turn,
-            )?)?
-            .iter()
-            .all(|(_, value)| {
-                matches!(
-                    value.entry,
-                    Entry::ContextUse { .. }
-                        | Entry::ContextPreparation { .. }
-                        | Entry::ResponseFormat { .. }
-                )
-            }))
-        })?;
-        if empty {
-            self.finalize(turn, OutcomeKind::Cancelled, None, None, false)?;
-        }
-        Ok(Appended {
-            turn,
-            seq,
-            joined: true,
         })
     }
 

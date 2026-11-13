@@ -11,7 +11,7 @@ use crate::db::entities::{
 // ---- explicit versioned encoding ----------------------------------------------
 
 // Per-record encoding marker; the database format version is stored in meta.
-pub(super) const RECORD_VERSION: u8 = 24;
+pub(super) const RECORD_VERSION: u8 = 1;
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
 pub(super) const TAG_JOB_STATE: u8 = 3;
@@ -1072,11 +1072,6 @@ impl Enc {
             }
         }
     }
-}
-pub(crate) fn encode_response_format(format: &ResponseFormat) -> Vec<u8> {
-    let mut e = Enc(Vec::new());
-    e.response_format(format);
-    e.0
 }
 impl Dec<'_> {
     fn response_format(&mut self) -> DecodeResult<ResponseFormat> {

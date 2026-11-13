@@ -107,12 +107,6 @@ pub(super) struct Shared {
     pub(super) commit_us_total: AtomicU64,
     /// Maximum microseconds inside a successful durable `commit()` call.
     pub(super) commit_us_max: AtomicU64,
-    /// Successful non-empty claim_batch calls.
-    pub(super) claims: AtomicU64,
-    /// Total round-trip microseconds spent in successful claim_batch calls.
-    pub(super) claim_us_total: AtomicU64,
-    /// Maximum round-trip microseconds spent in any successful claim_batch call.
-    pub(super) claim_us_max: AtomicU64,
     /// The Jobs this worker's start settled as abandoned by an earlier
     /// opening; see [`DatabaseHandle::abandoned_at_open`].
     pub(super) abandoned_at_open: Vec<JobId>,
@@ -144,7 +138,6 @@ pub(super) struct Shared {
     pub(super) in_flight_commands: AtomicUsize,
     pub(super) credential_key: std::sync::OnceLock<Arc<redb::CredentialKey>>,
     pub(super) credential_key_writer: std::sync::Mutex<()>,
-    pub(super) obsolete_credentials_at_open: Option<PathBuf>,
     pub(super) undecryptable_credentials_at_open: u64,
     pub(super) open_warnings_logged: AtomicBool,
 }

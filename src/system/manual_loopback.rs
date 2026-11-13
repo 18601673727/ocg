@@ -69,10 +69,32 @@ impl LoopbackRequest {
 /// The native scheduler's loopback dispatch asks it inside its start too; see
 /// [`crate::system::native_scheduler`].
 pub(crate) fn check_prepared(prepared: &PreparedDevelopmentHandoff) -> Result<(), &'static str> {
+    check_prepared_with(prepared, false)
+}
+
+/// [`check_prepared`] for a path that also runs the native tool loop: the
+/// frozen configuration need only be a native Generative one, and the request
+/// may offer the tools its Agent's Workspace grant allows, never a forced
+/// `tool_choice`.
+pub(crate) fn check_prepared_native(
+    prepared: &PreparedDevelopmentHandoff,
+) -> Result<(), &'static str> {
+    check_prepared_with(prepared, true)
+}
+
+fn check_prepared_with(
+    prepared: &PreparedDevelopmentHandoff,
+    tools: bool,
+) -> Result<(), &'static str> {
     let Some(frozen) = prepared.generative_configuration() else {
         return Err("generative_required");
     };
-    if frozen.single_request_refusal().is_some() {
+    let refusal = if tools {
+        frozen.native_execution_refusal()
+    } else {
+        frozen.single_request_refusal()
+    };
+    if refusal.is_some() {
         return Err("not_single_request_generative");
     }
     if !frozen
@@ -85,7 +107,7 @@ pub(crate) fn check_prepared(prepared: &PreparedDevelopmentHandoff) -> Result<()
         return Err("endpoint_not_loopback");
     }
     let request = prepared.request();
-    if request.get("tools").is_some()
+    if (!tools && request.get("tools").is_some())
         || request.get("tool_choice").is_some()
         || request.get("stream") != Some(&serde_json::Value::Bool(true))
     {
@@ -186,7 +208,13 @@ pub(crate) async fn run_loopback_job(
     let exchange = within_deadline(
         &cancellation,
         request.timeout,
-        supervise_development_generative(database, handoff, &config, EndpointPolicy::Loopback),
+        supervise_development_generative(
+            database,
+            handoff,
+            &config,
+            EndpointPolicy::Loopback,
+            None,
+        ),
     )
     .await;
 

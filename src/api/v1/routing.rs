@@ -135,7 +135,6 @@ pub(super) enum Route {
     DecisionSubmit,
     Admission,
     DecideApproval(crate::db::entities::ToolCallRef),
-    ReleaseSlot(JobId),
     ConversationCards(JobId),
     JobAction(JobId, &'static str),
     ConversationCompact(JobId),
@@ -224,7 +223,6 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Admission
             | Route::DecisionSubmit
             | Route::DecideApproval(_)
-            | Route::ReleaseSlot(_)
             | Route::ConversationCards(_)
             | Route::JobAction(..)
             | Route::ConversationCompact(_)
@@ -270,9 +268,6 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Submit(id)))
             }),
             ["decisions"] => no_query(query).map(|()| Route::DecisionSubmit),
-            ["jobs", job, "release-slot"] => {
-                no_query(query).and_then(|()| job_id(job).map(Route::ReleaseSlot))
-            }
             ["approvals", job, request, index] => {
                 let approval = crate::db::entities::ToolCallRef {
                     job: job_id(job)?,
@@ -872,10 +867,6 @@ pub(super) async fn respond(
         Route::DecideApproval(approval) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             submissions::decide(shared, approval, &body).await
-        }
-        Route::ReleaseSlot(job) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
-            submissions::release_slot(database, job, &body).await
         }
         Route::ConversationCards(conversation) => submissions::cards(shared, conversation).await,
         Route::ConversationCompact(conversation) => {

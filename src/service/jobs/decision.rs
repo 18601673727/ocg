@@ -3,37 +3,6 @@ use crate::db::entities::*;
 use crate::db::{Batch, BatchError};
 
 impl Batch {
-    pub(crate) fn project_decision(
-        &mut self,
-        project: Option<ProjectId>,
-        active: &FrozenExecutionConfig,
-    ) -> Result<Option<(FrozenDecisionConfig, Option<DecisionAssignment>)>, BatchError> {
-        let row = project
-            .map(|id| self.require_project_record(id))
-            .transpose()?;
-        let policy = row
-            .as_ref()
-            .map(ProjectRecord::decision_policy)
-            .unwrap_or_default();
-        let global = self.global_headers()?;
-        let Some(frozen) = ConfigurationResolver::new(|id| self.config_record(id))
-            .with_global_headers(global)
-            .project_decision(&policy, active)?
-        else {
-            return Ok(None);
-        };
-        if !self.decision_executor_available(&frozen)? {
-            return Ok(None);
-        }
-        Ok(Some((
-            frozen,
-            row.map(|row| DecisionAssignment {
-                project: row.id,
-                revision: row.decision_revision,
-            }),
-        )))
-    }
-
     pub(crate) fn freeze_decision_profile(
         &mut self,
         profile: ConfigId,

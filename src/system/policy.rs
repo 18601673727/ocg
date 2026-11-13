@@ -9,7 +9,7 @@ use crate::system::logger::{LoggerConfig, LoggerConfigError};
 use crate::system::monitor::{self, FilesystemConfig, FilesystemConfigError, ProtectionReason};
 
 pub const SYSTEM_POLICY_FILE_NAME: &str = "ocg.conf";
-pub const SYSTEM_POLICY_FORMAT_VERSION: u32 = 2;
+pub const SYSTEM_POLICY_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -26,7 +26,6 @@ export type {
   Recurrence,
   Tree,
   TreeNode,
-  Claims,
   DatabaseHealth,
   Health,
   Process,
@@ -117,7 +116,6 @@ export type {
   Stop,
   Compaction,
   ApprovalDecision,
-  ReleaseSlot,
 } from "./generated";
 
 export type TaskPlan = JobPlanView;

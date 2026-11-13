@@ -369,11 +369,13 @@ pub(super) const MAX_NATIVE_USAGE_OBSERVATIONS: u32 = 1024;
 pub(super) fn native_usage_evidence(
     tx: &WriteTransaction,
     job: JobId,
+    request: RequestNumber,
 ) -> Result<crate::db::entities::TokenEvidence, StorageError> {
     let table = tx.open_table(REQUEST_EVENTS)?;
     let mut evidence = crate::db::entities::TokenEvidence::default();
     let mut expected = 5u32;
-    let mut entries = table.range((job.get(), 1, 5)..=(job.get(), 1, u32::MAX))?;
+    let mut entries =
+        table.range((job.get(), request.get(), 5)..=(job.get(), request.get(), u32::MAX))?;
     while let Some(entry) = entries.next() {
         let (key, bytes) = entry?;
         let seq = key.value().2;
@@ -385,7 +387,7 @@ pub(super) fn native_usage_evidence(
         if seq != expected {
             return Err(StorageError::corrupted("native Token sequence has a gap"));
         }
-        let event = rows::decode_request_event(job, RequestNumber::FIRST, seq, bytes.value())?;
+        let event = rows::decode_request_event(job, request, seq, bytes.value())?;
         {
             let RequestPayload::Measurement { ref measurements } = event.payload else {
                 return Err(StorageError::corrupted("native Token measurement missing"));
@@ -414,7 +416,7 @@ pub(super) fn native_usage_evidence(
             if token_key.value().2 != next {
                 return Err(StorageError::corrupted("native Token sequence has a gap"));
             }
-            let token = rows::decode_request_event(job, RequestNumber::FIRST, next, token.value())?;
+            let token = rows::decode_request_event(job, request, next, token.value())?;
             let RequestPayload::Token {
                 eligibility: RequestEligibility::Eligible,
                 finality,
@@ -452,11 +454,26 @@ pub(super) fn native_usage_evidence(
     Ok(evidence)
 }
 
-pub(super) fn native_usage_sample(
-    tx: &WriteTransaction,
-    job: JobId,
-) -> Result<Option<crate::db::entities::TokenRequestSample>, StorageError> {
-    Ok(native_usage_evidence(tx, job)?.sample())
+/// Validates the Token evidence of every request of `job`, each on its own:
+/// a request's counters are one sample, never summed with another's.
+pub(super) fn native_usage_validate(tx: &WriteTransaction, job: JobId) -> Result<(), StorageError> {
+    let mut request = RequestNumber::FIRST;
+    loop {
+        let present = tx
+            .open_table(REQUEST_EVENTS)?
+            .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+            .next()
+            .transpose()?
+            .is_some();
+        if !present {
+            return Ok(());
+        }
+        native_usage_evidence(tx, job, request)?;
+        let Some(next) = request.next() else {
+            return Ok(());
+        };
+        request = next;
+    }
 }
 
 pub(super) fn content_reference(

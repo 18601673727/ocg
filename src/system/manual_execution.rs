@@ -206,7 +206,7 @@ pub(crate) async fn checked_start(
     guard: impl FnOnce(&PreparedDevelopmentHandoff) -> Result<(), &'static str>,
 ) -> Result<DevelopmentHandoff, Stop> {
     match database
-        .checked_development_handoff_guarded(token, guard)
+        .checked_development_handoff_guarded(token, &crate::db::NoTooling, guard)
         .await
     {
         Ok(handoff) => Ok(handoff),

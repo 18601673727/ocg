@@ -125,14 +125,6 @@ pub(crate) struct TextFilter {
 }
 
 impl TextFilter {
-    pub(crate) fn push(&mut self, input: &str) -> String {
-        self.consume(input, false)
-    }
-
-    pub(crate) fn finish(&mut self) -> String {
-        self.consume("", true)
-    }
-
     fn consume(&mut self, input: &str, finished: bool) -> String {
         if self.pending.is_empty() && !input.contains('<') {
             return if self.block.is_none() {

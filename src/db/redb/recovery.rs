@@ -223,15 +223,15 @@ fn same_file_identity(actual: &std::fs::Metadata, named: &std::fs::Metadata) -> 
 }
 
 /// Refuses any database whose declared identity is not this build's, with a
-/// message that names what was found. No migration exists: an older or newer
-/// database is archived and replaced, never reinterpreted.
+/// message that names what was found. A database of another format is never
+/// reinterpreted; `ocg migrate --check` says whether a migration reads it.
 pub(super) fn check_identity(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<(), StorageError> {
     let found = match meta.get(DATABASE_FORMAT_KEY)? {
         None => {
             return Err(unsupported_format(&format!(
-                "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION}; run `ocg migrate --check` against a format 22 database"
+                "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION}"
             )));
         }
         Some(value) => <[u8; 8]>::try_from(value.value())
@@ -540,8 +540,8 @@ pub(crate) fn verify_reserved_residual(
 }
 
 /// A format this build accepts names the tables of that format. A database
-/// that claims the current format but lacks a required table is a partial
-/// migration, not an old one: it is refused rather than silently extended.
+/// that claims the current format but lacks a required table is incomplete: it
+/// is refused rather than silently extended.
 fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
     use ::redb::TableHandle;
     let present: Vec<String> = tx
@@ -554,7 +554,7 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
     ] {
         if !present.iter().any(|table| table == required) {
             return Err(StorageError::corrupted(format!(
-                "database is marked format {DATABASE_FORMAT_VERSION} but lacks the {required} table; it is a partial migration, not a supported database"
+                "database is marked format {DATABASE_FORMAT_VERSION} but lacks the {required} table; it is not a complete database"
             )));
         }
     }
@@ -564,14 +564,12 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
 /// Every record header and the native invariants, without any judgement of
 /// who owns capacity.
 fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
-    migration_check_headers(tx)?;
+    check_record_headers(tx)?;
     check_native_invariants(tx)
 }
 
-/// The record-header checks of every authoritative table, shared with the
-/// offline migration's inspection of the preceding format. Those tables that
-/// the preceding format does not have are simply absent and checked as empty.
-pub(super) fn migration_check_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
+/// The record-header checks of every authoritative table.
+fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
     macro_rules! headers {
         ($($table:ident => $tags:expr),+ $(,)?) => { $(check_preflight_table(tx, $table, $tags)?;)+ };
     }
@@ -583,23 +581,6 @@ pub(super) fn migration_check_headers(tx: &ReadTransaction) -> Result<(), Storag
     check_preflight_table(tx, SCHEDULED_EXTERNAL_POLICY, &[18])?;
     check_preflight_table(tx, SCHEDULED_EXTERNAL_BINDING, &[19])?;
     Ok(())
-}
-
-/// The native invariants and ownership policy a normal host applies, read-only,
-/// for the offline migration's inspection of its source. A clean, quiet
-/// database passes as the host's quick path would let it; any other must hold
-/// no capacity and no Unknown outcome, as the host's full verification
-/// requires. Nothing is released, adopted or cleared here.
-pub(super) fn migration_check_native(tx: &ReadTransaction) -> Result<(), StorageError> {
-    check_native_invariants(tx)?;
-    let clean = tx
-        .open_table(META)?
-        .get("clean_shutdown")?
-        .is_some_and(|value| matches!(value.value(), [1]));
-    if clean && allocations_are_quiet(tx)? {
-        return Ok(());
-    }
-    refuse_unresolved_ownership(tx)
 }
 
 /// What the offline migration requires of its staged destination before it is
@@ -620,16 +601,10 @@ pub(super) fn verify_migrated(
 /// Whether the Allocation rows, the source of ownership, hold no capacity and
 /// the stored indexes equal what they compute. This reads the Allocation rows
 /// (one small row per Allocation ever made) and the Pool configurations they
-/// name, never the large Job tables. A missing index, a legacy slot table, a
+/// name, never the large Job tables. A missing index, a
 /// corrupt row or any difference is not a quick-path database: the full checks
 /// then run and report it.
 fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
-    if tx.list_tables()?.any(|table| {
-        use ::redb::TableHandle;
-        table.name() == HELD_SLOTS.name()
-    }) {
-        return Ok(false);
-    }
     let (allocations, configs, active, requests) = match (
         tx.open_table(POOL_ALLOCATIONS),
         tx.open_table(CONFIGS),
@@ -675,14 +650,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     if let Ok(states) = tx.open_table(JOB_STATES) {
         for entry in states.iter()? {
             let (key, value) = entry?;
-            if JobState::decode_at(key.value(), value.value())?
-                .claim
-                .is_some()
-            {
-                return Err(StorageError::corrupted(
-                    "a Job state carries a legacy claim",
-                ));
-            }
+            JobState::decode_at(key.value(), value.value())?;
         }
     }
     Ok(())
@@ -768,7 +736,7 @@ fn resolved_unknown_ownership(
     let Some(outcome) = state
         .outcome
         .as_ref()
-        .filter(|outcome| outcome.kind == OutcomeKind::Unknown && state.claim.is_none())
+        .filter(|outcome| outcome.kind == OutcomeKind::Unknown)
     else {
         return Ok(false);
     };
@@ -976,11 +944,6 @@ pub(super) fn initialize(
                 .map_err(StorageError::from)?;
         } else {
             check_identity(&meta)?;
-        }
-        if existing.iter().any(|name| name == HELD_SLOTS.name()) {
-            return Err(StorageError::corrupted(
-                "legacy slot table in a native database",
-            ));
         }
         let epoch = meta
             .get("open_epoch")
@@ -1196,7 +1159,7 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
             };
             let (key, value) = entry?;
             if value.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-                JobSpec::decode_at(key.value(), value.value())?;
+                let spec = JobSpec::decode_at(key.value(), value.value())?;
                 let state = tx
                     .open_table(JOB_STATES)?
                     .get(key.value())?
@@ -1205,11 +1168,7 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                     .ok_or_else(|| {
                         StorageError::corrupted("mutable conversation state is missing")
                     })?;
-                if state.claim.is_some()
-                    || state.outcome.is_some()
-                    || state.stop_confirmed_at.is_some()
-                    || state.stop_confirmed_by.is_some()
-                {
+                if state.stop_confirmed_at.is_some() || state.stop_confirmed_by.is_some() {
                     return Err(StorageError::corrupted(
                         "mutable conversation recovery does not support this state",
                     ));
@@ -1221,7 +1180,10 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                     .ok_or_else(|| {
                         StorageError::corrupted("mutable conversation control is missing")
                     })?;
-                return Ok(Some((key.value(), None)));
+                return Ok(Some((
+                    key.value(),
+                    Err((spec.parent_id, state.outcome.is_none())),
+                )));
             }
             let job = transactions::decode_mutable_job(key.value(), value.value())?;
             let state_bytes = tx
@@ -1236,22 +1198,26 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                 return Err(StorageError::corrupted("invalid mutable Job state header"));
             }
             let state = JobState::decode_at(key.value(), &state_bytes)?;
-            if state.claim.is_some() {
-                return Err(StorageError::corrupted(
-                    "a Job state carries a legacy claim",
-                ));
-            }
-            Ok(Some((key.value(), Some((job, state)))))
+            Ok(Some((key.value(), Ok((job, state)))))
         })?;
         let Some((id, row)) = next else {
             break;
         };
         after = Some(id);
-        let Some((job, state)) = row else {
-            batch.insert(CONVERSATIONS, id, ())?;
-            batch.insert(CHILDREN, (0, id), ())?;
-            batch.insert(UNSETTLED, id, (0, 0))?;
-            continue;
+        let (job, state) = match row {
+            Ok(turn) => turn,
+            Err((parent, live)) => {
+                batch.insert(CONVERSATIONS, id, ())?;
+                batch.insert(CHILDREN, (parent.map_or(0, JobId::get), id), ())?;
+                batch.insert(UNSETTLED, id, (0, 0))?;
+                if let Some(parent) = parent {
+                    batch.insert(CHILD_GROUPS, (parent.get(), id), ())?;
+                    if live {
+                        batch.insert(LIVE_CHILDREN, (parent.get(), id), ())?;
+                    }
+                }
+                continue;
+            }
         };
         if !batch.mutable_context_valid(&job, job.context_selection)? {
             return batch.corrupted("summary provenance is invalid or unavailable".to_owned());
@@ -1458,7 +1424,63 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
             }
         }
     }
-    Ok(())
+    settle_rebuilt_conversations(batch)
+}
+
+/// A conversation is settled once it has an outcome and no unsettled turn or
+/// child conversation. Children carry higher IDs than their parents, so a
+/// descending walk settles each conversation before its parent counts it.
+fn settle_rebuilt_conversations(batch: &mut Batch) -> Result<(), BatchError> {
+    let mut before: Option<u128> = None;
+    loop {
+        let next = batch.step(|tx| {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let conversations = tx.open_table(CONVERSATIONS)?;
+            let mut range =
+                conversations.range::<u128>((Unbounded, before.map_or(Unbounded, Excluded)))?;
+            let Some(entry) = range.next_back() else {
+                return Ok(None);
+            };
+            let id = entry?.0.value();
+            let spec = {
+                let jobs = tx.open_table(JOBS)?;
+                let row = jobs
+                    .get(id)?
+                    .ok_or_else(|| StorageError::corrupted("conversation row is missing"))?;
+                JobSpec::decode_at(id, row.value())?
+            };
+            let outcome = tx
+                .open_table(JOB_STATES)?
+                .get(id)?
+                .map(|row| JobState::decode_at(id, row.value()))
+                .transpose()?
+                .ok_or_else(|| StorageError::corrupted("conversation state is missing"))?
+                .outcome
+                .is_some();
+            let mut unsettled = tx.open_table(UNSETTLED)?;
+            let (_, children) = unsettled
+                .get(id)?
+                .map(|row| row.value())
+                .ok_or_else(|| StorageError::corrupted("conversation unsettled row missing"))?;
+            if outcome && children == 0 {
+                unsettled.remove(id)?;
+            } else if let Some(parent) = spec.parent_id {
+                let (dependencies, count) = unsettled
+                    .get(parent.get())?
+                    .map(|row| row.value())
+                    .ok_or_else(|| StorageError::corrupted("parent unsettled row missing"))?;
+                let count = count
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::corrupted("conversation child count overflow"))?;
+                unsettled.insert(parent.get(), (dependencies, count))?;
+            }
+            Ok(Some(id))
+        })?;
+        let Some(id) = next else {
+            return Ok(());
+        };
+        before = Some(id);
+    }
 }
 
 /// Allocates monotonically across restarts and clock rollback. The persisted
@@ -3103,14 +3125,10 @@ fn verify_unrelated_recovery_rows(
         return Err(audit_delta("publication changed the database table set"));
     }
     if source_tx
-        .list_tables()
+        .list_multimap_tables()
         .map_err(StorageError::from)?
-        .any(|table| table.name() == HELD_SLOTS.name())
-        || source_tx
-            .list_multimap_tables()
-            .map_err(StorageError::from)?
-            .next()
-            .is_some()
+        .next()
+        .is_some()
     {
         return Err(audit_delta(
             "the publication contains a legacy or multimap table outside this format",

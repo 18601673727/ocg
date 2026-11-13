@@ -22,14 +22,6 @@ pub(crate) struct DatabaseHealthView {
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
-#[ts(rename = "Claims")]
-pub(crate) struct ClaimsView {
-    count: u64,
-    mean_us: Option<u64>,
-    max_us: u64,
-}
-
-#[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Queue")]
 pub(crate) struct QueueView {
     pending: Option<u64>,
@@ -69,7 +61,6 @@ pub(crate) struct HealthView {
     version: String,
     host: String,
     database: DatabaseHealthView,
-    claims: ClaimsView,
     queue: QueueView,
     process: ProcessView,
     /// Absent (`null`) when the ownership state could not be read, which is
@@ -121,11 +112,6 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
             durable_commits: vitals.durable_commits,
             commit_us_mean: vitals.commit_us_mean,
             commit_us_max: vitals.commit_us_max,
-        },
-        claims: ClaimsView {
-            count: vitals.claims_count,
-            mean_us: vitals.claim_us_mean,
-            max_us: vitals.claim_us_max,
         },
         queue: QueueView {
             pending: vitals.queue_pending,

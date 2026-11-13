@@ -112,6 +112,9 @@ fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> ToolCallVi
             ToolOutcome::CompletedWithheld { reason } => match reason {
                 WithheldReason::Unserializable => Some("result withheld: unserializable"),
             },
+            ToolOutcome::CompletedElided { .. } => {
+                Some("result not stored here: it is in the next request's tool message")
+            }
             ToolOutcome::NotApplied { message } => Some(message.as_str()),
             ToolOutcome::NotInvoked { reason } => match reason {
                 NotInvokedReason::Refused(r) => Some(r.as_str()),

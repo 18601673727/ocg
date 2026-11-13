@@ -360,26 +360,6 @@ pub(crate) async fn release_client() -> Result<Client, ProviderExecutionError> {
         })
 }
 
-pub(crate) async fn web_client(
-    timeout: Duration,
-    non_public: Arc<AtomicBool>,
-) -> Result<Client, ProviderExecutionError> {
-    Client::builder()
-        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        .connector::<()>(web_connector(non_public)?)
-        .disable_redirects()
-        .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
-        .response_payload_timeout(Millis::ZERO)
-        .build(
-            ntex::SharedCfg::new("web")
-                .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
-        )
-        .await
-        .map_err(|_| ProviderExecutionError::Build {
-            message: "web HTTP client could not be initialized".to_owned(),
-        })
-}
-
 struct Proxy {
     uri: Uri,
     authorization: Option<HeaderValue>,
@@ -830,81 +810,6 @@ pub(crate) async fn check_direct_destination(
     }
 }
 
-fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecutionError> {
-    let proxy =
-        PROXY
-            .get_or_init(load)
-            .as_ref()
-            .map_err(|message| ProviderExecutionError::Build {
-                message: message.clone(),
-            })?;
-    let tls = proxy.as_ref().map_or_else(tunnel_tls, Proxy::tls);
-    let http_non_public = non_public.clone();
-    Ok(Connector::default()
-        .connector(apply_fn_factory(
-            TcpConnector::<Uri>::new(),
-            async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(80);
-                let tunnel = proxy
-                    .as_ref()
-                    .is_some_and(|proxy| !proxy.bypasses(host, port));
-                if let (true, Some(proxy)) = (tunnel, proxy.as_ref()) {
-                    check_proxied_web_target(host, port, &http_non_public).await?;
-                    let io = service.call(Connect::new(proxy.uri.clone())).await?;
-                    connect_tunnel_with_timeout(
-                        &io,
-                        host,
-                        port,
-                        proxy.authorization.as_ref(),
-                        TUNNEL_TIMEOUT,
-                    )
-                    .await?;
-                    Ok::<_, ConnectError>(io)
-                } else {
-                    let addrs = resolve_direct_web_target(host, port, &http_non_public).await?;
-                    service.call(request.set_addrs(addrs)).await
-                }
-            },
-        ))
-        .secure_connector(apply_fn_factory(
-            TcpConnector::<Uri>::new(),
-            async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(443);
-                let tunnel = proxy
-                    .as_ref()
-                    .is_some_and(|proxy| !proxy.bypasses(host, port));
-                let io = if let (true, Some(proxy)) = (tunnel, proxy.as_ref()) {
-                    check_proxied_web_target(host, port, &non_public).await?;
-                    let io = service.call(Connect::new(proxy.uri.clone())).await?;
-                    connect_tunnel_with_timeout(
-                        &io,
-                        host,
-                        port,
-                        proxy.authorization.as_ref(),
-                        TUNNEL_TIMEOUT,
-                    )
-                    .await?;
-                    io
-                } else {
-                    let addrs = resolve_direct_web_target(host, port, &non_public).await?;
-                    service.call(request.set_addrs(addrs)).await?
-                };
-                let name = rustls::pki_types::ServerName::try_from(
-                    host.trim_matches(['[', ']']).to_owned(),
-                )
-                .map_err(|_| ConnectError::InvalidInput)?;
-                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
-                    .await
-                    .map(IoBoxed::from)
-                    .map_err(ConnectError::from)
-            },
-        )))
-}
-
 /// The direct resolution an approved destination gets: the web tools' checks,
 /// plus a refusal of fake-IP answers (198.18.0.0/15). Web tools accept those
 /// for resolved names because Clash/Surge-style resolvers hand them out for
@@ -951,33 +856,6 @@ async fn resolve_direct_web_target(
         return Err(ConnectError::Unresolved);
     }
     Ok(addrs)
-}
-
-/// Checks a target before opening a CONNECT tunnel through the proxy. The
-/// proxy's own address is never checked (it is often 127.0.0.1), and local DNS
-/// is not required because proxy-only networks may not have working local
-/// resolution; DNS rebinding through the proxy is out of scope. Intranet-style
-/// names (no dot, or `.local`, `.corp`, ...) are refused by literal check even
-/// when local DNS cannot resolve them; other names that local DNS cannot
-/// resolve are still allowed through the proxy.
-async fn check_proxied_web_target(
-    host: &str,
-    port: u16,
-    non_public: &Arc<AtomicBool>,
-) -> Result<(), ConnectError> {
-    if is_non_public_host_literal(host) {
-        non_public.store(true, Ordering::SeqCst);
-        return Err(ConnectError::Unresolved);
-    }
-    let lookup_host = host.trim_matches(['[', ']']).to_owned();
-    if let Ok(Ok(addrs)) =
-        ntex::rt::spawn_blocking(move || (lookup_host.as_str(), port).to_socket_addrs()).await
-        && addrs.into_iter().any(|addr| !is_public_ip(addr.ip()))
-    {
-        non_public.store(true, Ordering::SeqCst);
-        return Err(ConnectError::Unresolved);
-    }
-    Ok(())
 }
 
 /// Whether `host`, as written in a URL, may name an approved external

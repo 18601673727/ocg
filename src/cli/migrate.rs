@@ -1,5 +1,6 @@
-//! Offline migration of one stopped database directory from format 22 to
-//! format 23. `--check` only reads; `--to <directory>` copies the source tree
+//! Offline migration of one stopped database directory to the current format.
+//! No migration step exists yet (format 1 is the first format), so this
+//! reports the current format or refuses another. `--check` only reads; `--to <directory>` copies the source tree
 //! to a private staging directory, applies and verifies the migration there,
 //! and publishes it with an atomic no-replace rename. The source is never
 //! written, and writers stay excluded from before its first read until the

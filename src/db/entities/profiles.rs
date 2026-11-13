@@ -500,11 +500,34 @@ impl FrozenExecutionConfig {
             }
             Some(_) => {}
         }
+        self.provider_refusal()
+    }
+
+    /// Why this configuration can never run as a native Generative execution
+    /// on the local endpoint paths, or `None` when it can. Unlike
+    /// [`Self::single_request_refusal`] it admits an Agent with a Workspace
+    /// grant: such a Job runs the native tool loop, which sends one or more
+    /// requests. An endpoint path that authorizes exactly one request keeps
+    /// asking [`Self::single_request_refusal`].
+    pub fn native_execution_refusal(&self) -> Option<&'static str> {
+        match &self.agent {
+            None => return Some("an Agent is required"),
+            Some(agent) if !agent.runs_generative() => {
+                return Some(
+                    "the Agent must have the chat or coding capability for a Generative Job",
+                );
+            }
+            Some(_) => {}
+        }
+        self.provider_refusal()
+    }
+
+    fn provider_refusal(&self) -> Option<&'static str> {
         if self.llm.provider.transport != LlmTransport::OpenAiChatCompletions {
-            return Some("single-request execution requires the OpenAI Chat Completions protocol");
+            return Some("native execution requires the OpenAI Chat Completions protocol");
         }
         if self.llm.config.context_window.is_none() {
-            return Some("single-request execution requires the Model to declare a context window");
+            return Some("native execution requires the Model to declare a context window");
         }
         None
     }

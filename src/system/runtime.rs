@@ -331,7 +331,9 @@ where
     let armed_run = armed.is_some();
     let started = match armed {
         None => ExecutionRuntime::start(handle.clone(), scope),
-        Some(armed) => ExecutionRuntime::start_armed(handle.clone(), scope, armed),
+        Some(armed) => {
+            ExecutionRuntime::start_armed(handle.clone(), scope, armed, workspace_tools.clone())
+        }
     };
     let execution = match started {
         Ok(execution) => execution,

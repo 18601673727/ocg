@@ -238,10 +238,6 @@ export const en = {
   "chat.dispatch.dependencies": "Waits for {count} prerequisite Job(s).",
   "chat.card.question": "Question for you",
   "chat.card.loop_hold": "Conversation loop paused",
-  "chat.card.quarantine": "Unconfirmed process stop",
-  "chat.card.release": "Release slot",
-  "chat.card.confirm":
-    "This host has no tracked process group. Confirm that this turn’s processes have stopped before releasing its slot.",
 
   "chat.children": "Child conversations",
   "chat.child.open": "Open",
@@ -930,8 +926,7 @@ export const en = {
   "observations.quarantinedNote":
     "These jobs hold capacity until stop is proven or machine reboots.",
   "observations.noQuarantined": "No quarantined slots.",
-  "observations.quarantinedUnreadable":
-    "Unknown: the quarantined capacity could not be read.",
+  "observations.quarantinedUnreadable": "Unknown: the quarantined capacity could not be read.",
   "observations.job": "Job",
   "observations.pool": "Pool",
   "observations.quarantinedSince": "Quarantined since",
@@ -1582,9 +1577,6 @@ export const zh: Dictionary = {
   "chat.dispatch.dependencies": "需等待 {count} 个前置 Job。",
   "chat.card.question": "向您提问",
   "chat.card.loop_hold": "对话循环已暂停",
-  "chat.card.quarantine": "进程停止尚未确认",
-  "chat.card.release": "释放执行槽",
-  "chat.card.confirm": "此主机没有跟踪的进程组。请确认此轮的进程已停止，再释放执行槽。",
 
   "chat.children": "子对话",
   "chat.child.open": "开放",

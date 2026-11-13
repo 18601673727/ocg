@@ -6,7 +6,6 @@ use crate::db::entities::{
     RequestPayload, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidenceRecord, Violation,
 };
 use crate::system::execution_controls::ExecutionControl;
-use ::redb::ReadableTableMetadata;
 use std::time::Instant;
 
 // ---- batches -------------------------------------------------------------------
@@ -40,8 +39,6 @@ pub(crate) enum Probe {
     Job(JobId),
     /// `submission[key]` exists.
     Submission(SubmissionKey),
-    /// The Job has a claim.
-    Claim(JobId),
     /// A specific Pool allocation generation was committed.
     PoolAllocation(crate::db::entities::AllocationToken),
     /// The specified Job revision crossed its execution-start boundary.
@@ -52,8 +49,6 @@ pub(crate) enum Probe {
     ToolOutcome(ToolCallRef),
     /// `job_state[job]` has an outcome.
     Outcome(JobId),
-    ProviderOutcome(JobId),
-    ProviderAvailability(JobId, AvailabilityStatId, ContentDigest),
 }
 
 pub(crate) struct BatchOutcome<T> {
@@ -455,32 +450,6 @@ impl Batch {
                 }
             }
             Ok((ids, next))
-        })
-    }
-
-    pub(crate) fn dispatch_selection(
-        &mut self,
-        approval: ToolCallRef,
-    ) -> Result<crate::db::entities::DispatchSelection, BatchError> {
-        self.step(|tx| {
-            let record = tx
-                .open_table(APPROVALS)?
-                .get(tool_call_key(approval))?
-                .map(|bytes| ApprovalRecord::decode(bytes.value()))
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted("missing dispatch selection"))?;
-            match record.decision {
-                ApprovalDecision::Answered { text } if record.by == Actor::User => {
-                    serde_json::from_str(&text)
-                        .map_err(|_| StorageError::corrupted("invalid dispatch selection"))
-                }
-                ApprovalDecision::Approved
-                | ApprovalDecision::Rejected
-                | ApprovalDecision::Voided
-                | ApprovalDecision::Answered { .. } => Err(StorageError::corrupted(
-                    "dispatch was not selected by the user",
-                )),
-            }
         })
     }
 
@@ -1693,6 +1662,21 @@ impl Batch {
         self.get(JOBS, id.get(), |bytes| JobSpec::decode_at(id.get(), bytes))
     }
 
+    /// The conversation a Job belongs to, when it is a persistent turn. A mutable Job is
+    /// always a turn of its parent conversation; a legacy row says so in its kind.
+    pub(crate) fn turn_conversation(&mut self, id: JobId) -> Result<Option<JobId>, BatchError> {
+        self.get(JOBS, id.get(), |bytes| {
+            if matches!(bytes, [TAG_JOB, codec::RECORD_VERSION, ..]) {
+                return transactions::decode_mutable_job(id.get(), bytes)
+                    .map(|job| Some(job.parent_id));
+            }
+            let row = JobSpec::decode_at(id.get(), bytes)?;
+            Ok(row.kind.is_persistent().then_some(row.parent_id).flatten())
+        })?
+        .map(Ok)
+        .unwrap_or_else(|| self.reject(Violation::InvalidValue("job", "the Job does not exist")))
+    }
+
     pub(crate) fn require_job(&mut self, id: JobId) -> Result<JobSpec, BatchError> {
         match self.job(id)? {
             Some(row) => Ok(row),
@@ -1765,15 +1749,6 @@ impl Batch {
     }
 
     pub(crate) fn put_job_state(&mut self, job: JobId, state: &JobState) -> Result<(), BatchError> {
-        if state.claim.is_some()
-            && !crate::system::execution_controls::ExecutionControl::LegacyProviderExecution
-                .is_enabled()
-        {
-            return self.reject(Violation::InvalidValue(
-                "job_state",
-                "legacy claims are not written by native storage",
-            ));
-        }
         self.catalog_changed = true;
         self.insert(JOB_STATES, job.get(), state.encode().as_slice())
     }
@@ -1886,7 +1861,7 @@ impl Batch {
         // request can leave the process.
         self.scheduled_external_authorization(proof.token().job)?;
         self.require_development_write_any(proof)?;
-        if sent.job != proof.token().job || sent.request != RequestNumber::FIRST {
+        if sent.job != proof.token().job {
             return self.reject(Violation::InvalidValue(
                 "request",
                 "wrong Job or request identity",
@@ -1904,9 +1879,15 @@ impl Batch {
         // The first native request carries all of its message bodies. Verify
         // their recorded image references against the checked snapshot before
         // writing either the bodies or the request event.
+        let first_request = sent.request == crate::db::entities::RequestNumber::FIRST;
         let mut recorded_images = Vec::new();
         for digest in &sent.messages {
             let Some(body) = sent.bodies.iter().find(|body| body.digest() == *digest) else {
+                // A later request repeats the earlier messages by reference; they
+                // are verified to exist below, and were checked when first recorded.
+                if !first_request {
+                    continue;
+                }
                 return self.reject(Violation::InvalidValue(
                     "attachments",
                     "prepared request message is missing",
@@ -1941,30 +1922,27 @@ impl Batch {
                 }
             }
         }
-        if !recorded_images.iter().map(String::as_str).eq(attachments
-            .iter()
-            .map(|attachment| attachment.id.to_string())
-            .collect::<Vec<_>>()
-            .iter()
-            .map(String::as_str))
-        {
+        let images_match = if first_request {
+            recorded_images.iter().map(String::as_str).eq(attachments
+                .iter()
+                .map(|attachment| attachment.id.to_string())
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str))
+        } else {
+            // Images are part of the first request only; a tool loop adds none.
+            recorded_images.is_empty()
+        };
+        if !images_match {
             return self.reject(Violation::InvalidValue(
                 "attachments",
                 "request Attachment references differ from the checked snapshot",
             ));
         }
-        let exists = self.step(|tx| {
-            Ok(tx
-                .open_table(REQUEST_EVENTS)?
-                .range((sent.job.get(), 0, 0)..=(sent.job.get(), u32::MAX, u32::MAX))?
-                .next()
-                .transpose()?
-                .is_some())
-        })?;
-        if exists {
+        if !self.development_request_slot_is_next(sent.job, sent.request)? {
             return self.reject(Violation::InvalidValue(
                 "request",
-                "request evidence already exists",
+                "the request is not the next one, or its evidence already exists",
             ));
         }
         for body in &sent.bodies {
@@ -1974,6 +1952,7 @@ impl Batch {
             sent.bodies
                 .iter()
                 .map(crate::db::entities::MessageBody::digest)
+                .chain(sent.messages.iter().copied())
                 .chain(sent.required_messages.iter().copied()),
         )?;
         let event = RequestEventRecord {
@@ -2040,7 +2019,7 @@ impl Batch {
         self.require_development_write_any(proof)?;
         let job = proof.token().job;
         let stat = answer.stat;
-        if stat.job != job || stat.request != RequestNumber::FIRST {
+        if stat.job != job {
             return self.reject(Violation::InvalidValue(
                 "request",
                 "wrong Job or request identity",
@@ -2058,7 +2037,7 @@ impl Batch {
         {
             return self.reject(Violation::ValueOutOfRange("usage"));
         }
-        let only_sent = self.development_only_sent(job)?;
+        let only_sent = self.development_only_sent(job, stat.request)?;
         if !only_sent {
             return self.reject(Violation::InvalidValue(
                 "response",
@@ -2120,24 +2099,67 @@ impl Batch {
         Ok((MetricsId::new(ids[0]), AvailabilityStatId::new(ids[2])))
     }
 
-    /// Whether the Job's request evidence is exactly its first Sent event.
-    fn development_only_sent(&mut self, job: JobId) -> Result<bool, BatchError> {
+    /// Whether `request` is the Job's latest request and its evidence is
+    /// exactly its Sent event: no answer, failure or observation yet, and no
+    /// later request.
+    fn development_only_sent(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<bool, BatchError> {
         self.step(|tx| {
             let events = tx.open_table(REQUEST_EVENTS)?;
-            let mut rows = events.range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?;
+            let mut rows =
+                events.range((job.get(), request.get(), 0)..=(job.get(), u32::MAX, u32::MAX))?;
             let valid = if let Some((key, bytes)) = rows.next().transpose()? {
-                let (_, request, seq) = key.value();
-                request == RequestNumber::FIRST.get()
+                let (_, number, seq) = key.value();
+                number == request.get()
                     && seq == 1
                     && matches!(
-                        decode_request_event(job, RequestNumber::FIRST, seq, bytes.value())?
-                            .payload,
+                        decode_request_event(job, request, seq, bytes.value())?.payload,
                         RequestPayload::Sent { .. }
                     )
             } else {
                 false
             };
             Ok(valid && rows.next().transpose()?.is_none())
+        })
+    }
+
+    /// Whether `request` may be recorded as sent next: nothing of it or of a
+    /// later request exists, and every earlier request is the previous one
+    /// answered. The first request needs an empty history.
+    fn development_request_slot_is_next(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<bool, BatchError> {
+        self.step(|tx| {
+            let events = tx.open_table(REQUEST_EVENTS)?;
+            if events
+                .range((job.get(), request.get(), 0)..=(job.get(), u32::MAX, u32::MAX))?
+                .next()
+                .transpose()?
+                .is_some()
+            {
+                return Ok(false);
+            }
+            let Some(previous) = request.get().checked_sub(1).and_then(RequestNumber::new) else {
+                return Ok(true);
+            };
+            let (mut sent, mut answered) = (false, false);
+            for entry in events
+                .range((job.get(), previous.get(), 0)..=(job.get(), previous.get(), u32::MAX))?
+            {
+                let (key, bytes) = entry?;
+                let (_, _, seq) = key.value();
+                match decode_request_event(job, previous, seq, bytes.value())?.payload {
+                    RequestPayload::Sent { .. } => sent = true,
+                    RequestPayload::Availability { .. } => answered = true,
+                    _ => {}
+                }
+            }
+            Ok(sent && answered)
         })
     }
 
@@ -2152,7 +2174,7 @@ impl Batch {
     ) -> Result<AvailabilityStatId, BatchError> {
         self.require_development_write_any(proof)?;
         let job = proof.token().job;
-        if stat.job != job || stat.request != RequestNumber::FIRST {
+        if stat.job != job {
             return self.reject(Violation::InvalidValue(
                 "request",
                 "wrong Job or request identity",
@@ -2165,7 +2187,7 @@ impl Batch {
                 "a received Provider failure needs its status and failure facts",
             ));
         }
-        if !self.development_only_sent(job)? {
+        if !self.development_only_sent(job, stat.request)? {
             return self.reject(Violation::InvalidValue(
                 "failure",
                 "request missing or response evidence already recorded",
@@ -2324,7 +2346,6 @@ impl Batch {
         self.require_development_write(proof)?;
         let job = proof.token().job;
         if metrics.job != job
-            || metrics.request != RequestNumber::FIRST
             || !(5..=3 + 2 * indexes::MAX_NATIVE_USAGE_OBSERVATIONS).contains(&expected_seq)
             || expected_seq.is_multiple_of(2)
         {
@@ -2367,34 +2388,30 @@ impl Batch {
         let Some(token_seq) = expected_seq.checked_add(1) else {
             return self.reject(Violation::ValueOutOfRange("seq"));
         };
+        let request = metrics.request;
         let state = self.step(|tx| {
             let table = tx.open_table(REQUEST_EVENTS)?;
             let mut prefix = Vec::new();
             for seq in 1..=4 {
-                let Some(value) = table.get((job.get(), 1, seq))? else {
+                let Some(value) = table.get((job.get(), request.get(), seq))? else {
                     return Ok((false, None, None, 0u32));
                 };
-                prefix.push(decode_request_event(
-                    job,
-                    RequestNumber::FIRST,
-                    seq,
-                    value.value(),
-                )?);
+                prefix.push(decode_request_event(job, request, seq, value.value())?);
             }
             let valid = matches!(prefix[0].payload, RequestPayload::Sent { .. })
                 && matches!(prefix[1].payload, RequestPayload::Measurement { .. })
                 && matches!(prefix[2].payload, RequestPayload::Received { .. })
                 && matches!(prefix[3].payload, RequestPayload::Availability { .. });
             let prior = table
-                .get((job.get(), 1, expected_seq))?
-                .map(|v| decode_request_event(job, RequestNumber::FIRST, expected_seq, v.value()))
+                .get((job.get(), request.get(), expected_seq))?
+                .map(|v| decode_request_event(job, request, expected_seq, v.value()))
                 .transpose()?;
             let annotation = table
-                .get((job.get(), 1, token_seq))?
-                .map(|v| decode_request_event(job, RequestNumber::FIRST, token_seq, v.value()))
+                .get((job.get(), request.get(), token_seq))?
+                .map(|v| decode_request_event(job, request, token_seq, v.value()))
                 .transpose()?;
             let last = table
-                .range((job.get(), 1, 0)..=(job.get(), 1, u32::MAX))?
+                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
                 .next_back()
                 .transpose()?
                 .map_or(0, |(k, _)| k.value().2);
@@ -2474,7 +2491,7 @@ impl Batch {
         let measurement = crate::db::entities::MetricsRecord {
             id: MetricsId::new(first_id),
             job,
-            request: RequestNumber::FIRST,
+            request,
             target: None,
             observed_at: metrics.observed_at,
             measurements: metrics.measurements.clone(),
@@ -2500,7 +2517,7 @@ impl Batch {
             RequestEventRecord {
                 id: crate::db::entities::RequestEventId::new(first_id),
                 job_id: job,
-                request: RequestNumber::FIRST,
+                request,
                 seq: expected_seq,
                 observed_at: metrics.observed_at,
                 recorded_at: self.now,
@@ -2511,7 +2528,7 @@ impl Batch {
             RequestEventRecord {
                 id: crate::db::entities::RequestEventId::new(second_id),
                 job_id: job,
-                request: RequestNumber::FIRST,
+                request,
                 seq: token_seq,
                 observed_at: metrics.observed_at,
                 recorded_at: self.now,
@@ -2526,7 +2543,7 @@ impl Batch {
             let model = indexes::usage_model_key(Some(&identity), &event);
             self.step(|tx| {
                 tx.open_table(REQUEST_EVENTS)?.insert(
-                    (job.get(), 1, event.seq),
+                    (job.get(), request.get(), event.seq),
                     encode_request_event(&event).as_slice(),
                 )?;
                 if let Some(kind) =
@@ -2866,34 +2883,6 @@ impl Batch {
         })
     }
 
-    pub(crate) fn provider_settlement_probe(
-        &mut self,
-        job: JobId,
-        availability: Option<AvailabilityStatId>,
-    ) -> Result<(), BatchError> {
-        self.probe = Some(match availability {
-            Some(id) => {
-                let digest = self.step(|tx| {
-                    let index = tx.open_table(JOB_OBSERVATIONS)?;
-                    let key = index
-                        .get((job.get(), 2, id.get()))?
-                        .ok_or_else(|| {
-                            StorageError::corrupted("missing provider settlement observation")
-                        })?
-                        .value();
-                    let events = tx.open_table(REQUEST_EVENTS)?;
-                    let bytes = events.get((job.get(), key.0, key.1))?.ok_or_else(|| {
-                        StorageError::corrupted("missing provider settlement event")
-                    })?;
-                    Ok(ContentDigest::of(bytes.value()))
-                })?;
-                Probe::ProviderAvailability(job, id, digest)
-            }
-            None => Probe::ProviderOutcome(job),
-        });
-        Ok(())
-    }
-
     /// The eligibility the request's Token events already state, if any.
     pub(crate) fn request_token_eligibility(
         &mut self,
@@ -3191,33 +3180,6 @@ impl Batch {
 }
 
 impl Batch {
-    pub(crate) fn has_user_input(&mut self, group: JobId) -> Result<bool, BatchError> {
-        self.step(|tx| Ok(tx.open_table(USER_INPUT_AT)?.get(group.get())?.is_some()))
-    }
-    pub(crate) fn child_groups(
-        &mut self,
-        parent: JobId,
-        after: u128,
-        limit: usize,
-    ) -> Result<Vec<JobId>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(CHILD_GROUPS)?
-                .range((parent.get(), after.saturating_add(1))..=(parent.get(), u128::MAX))?
-                .take(limit)
-                .map(|entry| Ok(JobId::new(entry?.0.value().1)))
-                .collect()
-        })
-    }
-    pub(crate) fn has_user_message(&mut self, job: JobId) -> Result<bool, BatchError> {
-        self.step(|tx| {
-            Ok(reader::effective_entries(reader::job_entries_of(
-                &tx.open_table(JOB_INPUTS)?,
-                job,
-            )?)?
-            .iter()
-            .any(|(_, entry)| matches!(entry.entry, Entry::UserMessage { .. })))
-        })
-    }
     pub(crate) fn previous_tool_evidence(
         &mut self,
         call: ToolCallRef,
@@ -3244,9 +3206,6 @@ impl Batch {
             Ok(())
         })
     }
-    pub(crate) fn pending_job_count(&mut self) -> Result<u64, BatchError> {
-        self.step(|tx| Ok(tx.open_table(PENDING)?.len()?))
-    }
     pub(crate) fn record_submission(
         &mut self,
         record: &SubmissionRecord,
@@ -3261,109 +3220,11 @@ impl Batch {
     }
 }
 
-impl Batch {
-    pub(crate) fn group_allocation(
-        &mut self,
-        group: JobId,
-    ) -> Result<Option<crate::db::entities::JobAllocation>, BatchError> {
-        self.step(|tx| {
-            let jobs = tx.open_table(JOBS)?;
-            for entry in tx
-                .open_table(CHILDREN)?
-                .range((group.get(), 0)..=(group.get(), u128::MAX))?
-            {
-                let (key, _) = entry?;
-                let job = key.value().1;
-                let bytes = jobs
-                    .get(job)?
-                    .ok_or_else(|| StorageError::corrupted("child job missing"))?;
-                let row = JobSpec::decode_at(job, bytes.value())?;
-                if row.kind.is_persistent() {
-                    return Ok(row.allocation);
-                }
-            }
-            Ok(None)
-        })
-    }
-}
+impl Batch {}
 
 impl Batch {
     pub(crate) fn wake_scheduler(&mut self) {
         self.touched_ready_or_delayed = true;
-    }
-    pub(crate) fn job_notice(
-        &mut self,
-        job: JobId,
-        seq: u32,
-    ) -> Result<Option<Notice>, BatchError> {
-        self.get(NOTICES, (job.get(), seq), Notice::decode)
-    }
-    pub(crate) fn open_job_dependencies(&mut self, job: JobId) -> Result<u32, BatchError> {
-        self.step(|tx| {
-            Ok(tx
-                .open_table(UNSETTLED)?
-                .get(job.get())?
-                .map_or(0, |counts| counts.value().0))
-        })
-    }
-    pub(crate) fn remove_job_from_ready(&mut self, row: &JobSpec) -> Result<(), BatchError> {
-        let key = self.execution_key(row)?;
-        self.step(|tx| {
-            tx.open_table(READY)?.remove((key, row.id.get()))?;
-            if let Some(at) = row.kind.eligible_at() {
-                tx.open_table(DELAYED)?
-                    .remove((at.as_unix_micros(), row.id.get()))?;
-            }
-            Ok(())
-        })
-    }
-    pub(crate) fn job_inputs(
-        &mut self,
-        job: JobId,
-    ) -> Result<Vec<(u32, JobInputEntry)>, BatchError> {
-        self.step(|tx| reader::job_entries_of(&tx.open_table(JOB_INPUTS)?, job))
-    }
-    pub(crate) fn effective_job_inputs(
-        &mut self,
-        job: JobId,
-    ) -> Result<Vec<(u32, JobInputEntry)>, BatchError> {
-        self.step(|tx| {
-            reader::effective_entries(reader::job_entries_of(&tx.open_table(JOB_INPUTS)?, job)?)
-        })
-    }
-    pub(crate) fn job_retries(&mut self, job: JobId) -> Result<Vec<(JobId, bool)>, BatchError> {
-        self.step(|tx| {
-            tx.open_table(RETRIES)?
-                .range((job.get(), 0)..=(job.get(), u128::MAX))?
-                .map(|entry| {
-                    let (key, agent) = entry?;
-                    Ok((JobId::new(key.value().1), agent.value()))
-                })
-                .collect()
-        })
-    }
-    pub(crate) fn approval_effects(
-        &mut self,
-        job: JobId,
-    ) -> Result<Vec<ToolEvidenceRecord>, BatchError> {
-        self.step(|tx| {
-            let calls = tx.open_table(TOOL_CALLS)?;
-            let links = tx.open_table(APPROVAL_CALLS)?;
-            let mut effects = Vec::new();
-            for record in job_tool_evidence(&calls, job)? {
-                if record.approval.is_some() {
-                    effects.push(record.clone());
-                }
-                if let Some(executing) = links.get(tool_call_key(record.call))? {
-                    let call = tool_call_ref(executing.value())?;
-                    let bytes = calls
-                        .get(tool_call_key(call))?
-                        .ok_or_else(|| StorageError::corrupted("approval execution missing"))?;
-                    effects.push(decode_tool_evidence(call, bytes.value())?);
-                }
-            }
-            Ok(effects)
-        })
     }
     pub(crate) fn has_open_job_approvals(&mut self, group: JobId) -> Result<bool, BatchError> {
         self.step(|tx| {

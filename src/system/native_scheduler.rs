@@ -100,11 +100,12 @@ use crate::db::{
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::system::execution_controls::ExecutionControl;
 use crate::system::executor::execution_runtime::{
-    EndpointPolicy, supervise_development_generative,
+    EndpointPolicy, WorkspaceTools, supervise_development_generative,
 };
+use crate::system::executor::native_tools::NativeTooling;
 use crate::system::loopback_activation::ArmedActivation;
 use crate::system::manual_execution::within_deadline;
-use crate::system::manual_loopback::{MAX_TIMEOUT_CEILING, check_prepared};
+use crate::system::manual_loopback::{MAX_TIMEOUT_CEILING, check_prepared_native};
 use crate::system::scheduler::{DispatchBatch, Scheduler};
 
 /// Executors one list read returns.
@@ -157,7 +158,7 @@ impl SchedulingAuthority {
 /// would consider is decided in the reservation transaction, which asks more
 /// than this can answer without opening a write transaction: whether the
 /// conversation's start context is one checked start supports
-/// (`unsupported_start_context`: notices, child work, approvals and tool
+/// (`unsupported_start_context`: a summary producer, or a Job that already holds tool
 /// evidence), whether its predecessors are settled, whether its attachments
 /// are available, and whether an Executor with the required capability has
 /// capacity. Only the scheduler's own transaction is authoritative for that,
@@ -194,7 +195,7 @@ pub(crate) struct LoopbackEligibility {
 /// authority that must exist before any of those questions is even asked:
 /// this calculation is static, sees no Host, and must not guess whether one
 /// is armed.
-const NOT_ASSESSED: [&str; 7] = [
+pub(crate) const NOT_ASSESSED: [&str; 7] = [
     "conversation_start_context",
     "predecessor_settlement",
     "attachment_availability",
@@ -262,10 +263,10 @@ pub(crate) fn loopback_eligibility(
         }
         Some(MutableFrozenConfiguration::Generative(frozen)) => frozen,
     };
-    if frozen.single_request_refusal().is_some() {
+    if frozen.native_execution_refusal().is_some() {
         return none(
             "not_single_request_generative",
-            "the frozen configuration cannot run as a single tool-free Generative request (a chat Agent without a Workspace grant, the OpenAI Chat Completions protocol and a declared context window are required)",
+            "the frozen configuration cannot run as a native Generative execution (a chat or coding Agent, the OpenAI Chat Completions protocol and a declared context window are required)",
         );
     }
     let Some(endpoint) = frozen.llm.provider.endpoint.as_deref() else {
@@ -282,7 +283,7 @@ pub(crate) fn loopback_eligibility(
         LoopbackEndpointClass::LiteralDirect => {
             return LoopbackEligibility {
                 code: "eligible",
-                detail: "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a single tool-free Generative request; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks",
+                detail: "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a native Generative execution; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks",
                 endpoint: Some(class),
             };
         }
@@ -336,6 +337,12 @@ fn scheduled_policy(frozen: &FrozenExecutionConfig) -> bool {
 /// when the execution's task ends.
 #[derive(Clone, Default)]
 pub(crate) struct NativeStops(Arc<Mutex<BTreeMap<JobId, (AllocationToken, CancellationToken)>>>);
+
+impl std::fmt::Debug for NativeStops {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NativeStops")
+    }
+}
 
 impl NativeStops {
     fn register(&self, token: AllocationToken, cancellation: CancellationToken) -> Registration {
@@ -395,12 +402,13 @@ pub(crate) async fn run(
     shutdown: CancellationToken,
     stops: NativeStops,
     armed: ArmedActivation,
+    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
 ) {
     let Some(authority) = SchedulingAuthority::autonomous(armed) else {
         shutdown.cancelled().await;
         return;
     };
-    run_with(authority, database, wake, shutdown, stops).await;
+    run_with(authority, database, wake, shutdown, stops, workspace_tools).await;
 }
 
 /// [`run`] under an authority already held.
@@ -410,13 +418,20 @@ pub(crate) async fn run_with(
     wake: SchedulerWakeSubscription,
     shutdown: CancellationToken,
     stops: NativeStops,
+    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
 ) {
-    log::info!("native scheduler running: single-request Generative Jobs, loopback endpoints only");
+    log::info!("native scheduler running: native Generative Jobs, loopback endpoints only");
+    // What a restart interrupted between a turn's settling and its parent
+    // being told.
+    if let Err(error) = database.settle_unreported_children().await {
+        log::warn!("native scheduler: unreported child conversations were not settled ({error})");
+    }
     let scheduler = Rc::new(NativeScheduler::new(
         database.clone(),
         authority,
         shutdown.clone(),
         stops,
+        workspace_tools,
     ));
     Scheduler::new(&database, wake, shutdown)
         .run(
@@ -520,6 +535,9 @@ pub(crate) struct NativeScheduler {
     /// discovery where it was, so a window is offered in a new order every
     /// time it is read again, however many passes a round takes.
     turns: Cell<u64>,
+    /// Where Workspaces must stay apart from; without it a Job whose Agent
+    /// has a Workspace grant is never started.
+    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
     running: RefCell<Vec<ntex::rt::JoinHandle<Dispatched>>>,
     /// Set once anything ends in a state the database does not show as
     /// settled or Uncertain; nothing is claimed after it.
@@ -532,8 +550,10 @@ impl NativeScheduler {
         authority: SchedulingAuthority,
         shutdown: CancellationToken,
         stops: NativeStops,
+        workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
     ) -> Self {
         Self {
+            workspace_tools,
             database,
             _authority: authority,
             shutdown,
@@ -568,6 +588,16 @@ impl NativeScheduler {
             if task.await.is_err() {
                 self.halt("a dispatch ended without a report");
             }
+        }
+        // A command's process group that could not be proven empty is killed
+        // and checked again on every pass, which comes at least every
+        // reconcile interval.
+        if crate::system::executor::blocking::groups_tracked()
+            && let Err(error) =
+                ntex::rt::spawn_blocking(crate::system::executor::blocking::retry_unproven_groups)
+                    .await
+        {
+            log::warn!("failed to retry unproven groups on a blocking worker: {error}");
         }
         if self.halted.get() || self.shutdown.is_cancelled() {
             return Ok(DispatchBatch {
@@ -746,9 +776,18 @@ impl NativeScheduler {
         let cancellation = self.shutdown.child();
         let registration = self.stops.register(allocation.token, cancellation.clone());
         let halted = self.halted.clone();
+        let workspace_tools = self.workspace_tools.clone();
+        let stops = self.stops.clone();
         let task = ntex::rt::spawn(async move {
             let _registration = registration;
-            let dispatched = dispatch(&database, allocation, &cancellation).await;
+            let dispatched = dispatch(
+                &database,
+                allocation,
+                &cancellation,
+                workspace_tools.as_ref(),
+                &stops,
+            )
+            .await;
             dispatched.log();
             if !dispatched.resolved() && !halted.replace(true) {
                 log::error!(
@@ -843,6 +882,8 @@ pub(crate) async fn dispatch(
     database: &DatabaseHandle,
     allocation: PoolAllocation,
     cancellation: &CancellationToken,
+    workspace_tools: Option<&crate::system::executor::execution_runtime::WorkspaceTools>,
+    stops: &NativeStops,
 ) -> Dispatched {
     let token = allocation.token;
     let detail = if cancellation.is_cancelled() {
@@ -872,7 +913,9 @@ pub(crate) async fn dispatch(
                     cancellation,
                     &config,
                     EndpointPolicy::Loopback,
-                    check_prepared,
+                    workspace_tools.map(WorkspaceTools::data_directory),
+                    stops,
+                    check_prepared_native,
                 )
                 .await
             }
@@ -895,6 +938,8 @@ pub(crate) async fn dispatch(
                     cancellation,
                     &config,
                     EndpointPolicy::ScheduledExternal(&grant),
+                    None,
+                    stops,
                     guard,
                 )
                 .await
@@ -915,27 +960,46 @@ pub(crate) async fn dispatch(
             }
         }
     };
-    reported(database, token, detail).await
+    let dispatched = reported(database, token, detail).await;
+    // A child conversation's turn that has settled tells what depends on it.
+    // That is no part of the turn's outcome, which is already recorded; a
+    // restart finds whatever this misses.
+    if dispatched.outcome.is_some()
+        && let Err(error) = database.settle_child_turns(vec![token.job]).await
+    {
+        log::warn!(
+            "native scheduler: the settling of Job {} was not passed on ({error})",
+            token.job
+        );
+    }
+    dispatched
 }
 
 /// The checked start of one reservation and the one exchange it authorizes.
+#[allow(clippy::too_many_arguments)]
 async fn start_and_exchange(
     database: &DatabaseHandle,
     token: AllocationToken,
     cancellation: &CancellationToken,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
+    data_directory: Option<&crate::system::data_directory::DataDirectory>,
+    stops: &NativeStops,
     guard: impl FnOnce(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
 ) -> String {
+    // The tools of a Job whose Agent has a Workspace grant are built for the
+    // Project the checked handoff itself resolves.
+    let tooling = NativeTooling::new(data_directory, stops.clone());
     match database
-        .checked_development_handoff_guarded(token, guard)
+        .checked_development_handoff_guarded(token, &tooling, guard)
         .await
     {
         Ok(handoff) => {
+            let tools = tooling.into_execution();
             let exchange = within_deadline(
                 cancellation,
                 DISPATCH_TIMEOUT,
-                supervise_development_generative(database, handoff, config, policy),
+                supervise_development_generative(database, handoff, config, policy, tools),
             )
             .await;
             match exchange {
@@ -963,13 +1027,21 @@ async fn start_and_exchange(
 /// What the database shows after one scheduled dispatch returned.
 async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: String) -> Dispatched {
     match database.development_trial_job(token.job).await {
-        Ok(Some((record, Some(allocation)))) if allocation.token == token => Dispatched {
-            job: token.job,
-            allocation_phase: Some(allocation.phase),
-            started: allocation.started_at.is_some(),
-            outcome: record.outcome.as_ref().map(|outcome| outcome.kind),
-            detail,
-        },
+        Ok(Some((record, Some(allocation)))) if allocation.token == token => {
+            // A Job whose Allocation is released can admit no more calls: the
+            // proofs this process kept of its commands are no longer needed.
+            // One that is still held keeps them.
+            if allocation.phase == AllocationPhase::Released {
+                crate::system::executor::blocking::stop_settled(token.job);
+            }
+            Dispatched {
+                job: token.job,
+                allocation_phase: Some(allocation.phase),
+                started: allocation.started_at.is_some(),
+                outcome: record.outcome.as_ref().map(|outcome| outcome.kind),
+                detail,
+            }
+        }
         Ok(_) => Dispatched {
             job: token.job,
             allocation_phase: None,

@@ -85,12 +85,11 @@ use crate::db::entities::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef,
 use crate::system::executor::blocking::{
     self, FinishError, Finished, Kind, Process, StartingCall, StopSignal,
 };
-use crate::system::executor::execution_runtime::{ToolExecution, ToolLoopLimits};
+use crate::system::executor::tool_loop::ToolLoopLimits;
 use crate::system::executor::tools::{
     ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, ToolStart,
 };
 use crate::system::executor::workspace_read::{self, Refusal as PathRefusal, Workspace};
-use crate::system::executor::{workspace_discovery, workspace_write};
 
 /// The name the tool is offered and recorded under.
 pub const TOOL_NAME: &str = "workspace_run_command";
@@ -102,7 +101,7 @@ const MAX_EXTRA_ARGUMENTS: usize = 64;
 const MAX_EXTRA_ARGUMENT_BYTES: usize = 4096;
 
 /// Longest a command may run before it is stopped.
-pub use crate::system::executor::job_tools::COMMAND_TIMEOUT;
+pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The most output, of stdout and stderr together, a result carries.
 pub const OUTPUT_BYTES: usize = 12 * 1024;
@@ -241,23 +240,6 @@ impl Selected {
                 .collect(),
             Self::Project(command) => command.argv.clone(),
         }
-    }
-}
-
-pub(super) struct RequestCommand;
-impl ToolHandler for RequestCommand {
-    fn version(&self) -> &str {
-        "workspace_request_command-1"
-    }
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            Ok(
-                json!({"granted": arguments.get("name"), "next": "Use workspace_run_command with this command name. The request itself does not execute it."}),
-            )
-        })
     }
 }
 
@@ -796,10 +778,6 @@ impl ToolHandler for RunCommand {
         ToolEffect::NonIdempotent
     }
 
-    fn spawns(&self) -> bool {
-        true
-    }
-
     fn stop(
         &self,
         job: JobId,
@@ -840,6 +818,10 @@ impl ToolHandler for RunCommand {
     /// Starts the command on a supervising thread and awaits its report
     /// within the command's limit. Dropping the call, as its time limit or
     /// cancellation does, stops the command.
+    fn spawns(&self) -> bool {
+        true
+    }
+
     fn call(&self, arguments: Value) -> ToolFuture<'_> {
         self.invoke(
             CommandCall::Standalone(NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed)),
@@ -1055,160 +1037,8 @@ pub(crate) fn register(
 /// editing and testing, with every call given as long as a command may run
 /// and a little more, so a command is stopped by its own limit first.
 pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
-    crate::system::executor::job_tools::coding_limits(timeout)
-}
-
-/// The grant authorized on a Workspace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Grant {
-    Read,
-    Edit,
-    Code,
-}
-
-impl Grant {
-    pub fn parse(grant: &str) -> Option<Self> {
-        match grant {
-            "read" => Some(Self::Read),
-            "edit" => Some(Self::Edit),
-            "code" => Some(Self::Code),
-            _ => None,
-        }
+    ToolLoopLimits {
+        handler_timeout: timeout.saturating_add(blocking::STOP_GRACE),
+        ..ToolLoopLimits::default()
     }
-}
-
-/// Builds the tools for `workspace` under `grant` with [`coding_limits(COMMAND_TIMEOUT)`].
-pub fn workspace_tools(
-    workspace: Workspace,
-    grant: Grant,
-    commands: &[ProjectCommand],
-) -> Result<ToolExecution, ToolRegistryError> {
-    workspace_tools_with(
-        workspace,
-        grant,
-        commands,
-        CommandEnvironment::of_process(),
-        COMMAND_TIMEOUT,
-    )
-}
-
-pub(crate) fn workspace_tools_managed(
-    workspace: Workspace,
-    grant: Grant,
-    commands: &[ProjectCommand],
-    managed: bool,
-) -> Result<ToolExecution, ToolRegistryError> {
-    workspace_tools_configured(
-        workspace,
-        grant,
-        commands,
-        CommandEnvironment::of_process(),
-        COMMAND_TIMEOUT,
-        managed,
-    )
-}
-
-/// [`workspace_tools`] with the given command environment and limit.
-pub(crate) fn workspace_tools_with(
-    workspace: Workspace,
-    grant: Grant,
-    commands: &[ProjectCommand],
-    environment: CommandEnvironment,
-    timeout: Duration,
-) -> Result<ToolExecution, ToolRegistryError> {
-    workspace_tools_configured(workspace, grant, commands, environment, timeout, false)
-}
-
-fn workspace_tools_configured(
-    workspace: Workspace,
-    grant: Grant,
-    commands: &[ProjectCommand],
-    environment: CommandEnvironment,
-    timeout: Duration,
-    managed: bool,
-) -> Result<ToolExecution, ToolRegistryError> {
-    let mutation = crate::system::execution_controls::ExecutionControl::WorkspaceMutation;
-    if matches!(grant, Grant::Edit | Grant::Code) && !mutation.is_enabled() {
-        return Err(ToolRegistryError::Disabled(
-            "workspace".to_owned(),
-            mutation.refusal(),
-        ));
-    }
-    let registry = ToolRegistry::default();
-    let limits = coding_limits(timeout);
-
-    workspace_read::register(&registry, workspace.clone())?;
-    workspace_discovery::register(&registry, workspace.clone())?;
-    crate::service::fts::register(&registry, workspace.clone())?;
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    crate::service::lsp::register(&registry, workspace.clone(), timeout)?;
-
-    if matches!(grant, Grant::Edit | Grant::Code) {
-        workspace_write::register(&registry, workspace.clone())?;
-    }
-    if matches!(grant, Grant::Code) {
-        register(&registry, workspace.clone(), commands, environment, timeout)?;
-    }
-
-    let mut names = vec![
-        workspace_read::TOOL_NAME,
-        workspace_discovery::LIST_TOOL_NAME,
-        workspace_discovery::SEARCH_TOOL_NAME,
-        crate::service::fts::TOOL_NAME,
-    ];
-    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-    names.push(crate::service::lsp::TOOL_NAME);
-
-    if matches!(grant, Grant::Edit | Grant::Code) {
-        names.push(workspace_write::TOOL_NAME);
-    }
-    if matches!(grant, Grant::Code) {
-        names.push(TOOL_NAME);
-        if managed {
-            registry.register("workspace_request_command", Some("Request a new named command grant before running it. Supply the exact literal argv and a task-specific reason. The assigned Decision Profile assesses it; low or missing confidence waits for user approval. A grant adds the command to the Project, but does not run it. Then call workspace_run_command by name."), json!({"type":"object","additionalProperties":false,"properties":{"name":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z][a-z0-9_]{0,63}$"},"argv":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","minLength":1,"maxLength":4096}},"reason":{"type":"string","minLength":1,"maxLength":4096}},"required":["name","argv","reason"]}), Arc::new(RequestCommand))?;
-            names.push("workspace_request_command");
-        }
-    }
-
-    for name in &names {
-        registry.authorize(name)?;
-    }
-    Ok(ToolExecution {
-        decider: false,
-        offer: registry.offer(&names)?,
-        limits,
-    })
-}
-
-/// The tools of an execution that may read, write and build `workspace`:
-/// `workspace_read_file`, `workspace_write_file`, `workspace_run_command`,
-/// `workspace_list_directory`, `workspace_search`, `workspace_code` and
-/// lazy `workspace_fts_search`, registered in a registry of their own and authorized
-/// there, with [`coding_limits`]. Commands get the environment
-/// OCG was started with, filtered, and run for at most [`COMMAND_TIMEOUT`].
-///
-/// # Errors
-///
-/// Returns a registration failure, which these tools' fixed definitions
-/// never cause.
-pub fn code_tools(
-    workspace: Workspace,
-    commands: &[ProjectCommand],
-) -> Result<ToolExecution, ToolRegistryError> {
-    code_tools_with(
-        workspace,
-        commands,
-        CommandEnvironment::of_process(),
-        COMMAND_TIMEOUT,
-    )
-}
-
-/// [`code_tools`] with the given command environment and limit.
-pub(crate) fn code_tools_with(
-    workspace: Workspace,
-    commands: &[ProjectCommand],
-    environment: CommandEnvironment,
-    timeout: Duration,
-) -> Result<ToolExecution, ToolRegistryError> {
-    workspace_tools_with(workspace, Grant::Code, commands, environment, timeout)
 }

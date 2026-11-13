@@ -189,8 +189,7 @@ pub(crate) use projects::{ProjectAnswerView, ProjectsView};
 pub(crate) use responses::ProviderResponsesView;
 use routing::{Route, authorize, decimal, respond, route};
 pub(crate) use submissions::{
-    AdmissionResponseView, AppendView, ApprovalDecisionView, CardsView, CompactionView,
-    ReleaseSlotView, StopView,
+    AdmissionResponseView, AppendView, ApprovalDecisionView, CardsView, CompactionView, StopView,
 };
 use system::health;
 pub(crate) use system::{ActiveSystemSettingsView, HealthView};
