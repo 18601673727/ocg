@@ -1110,6 +1110,9 @@ pub(crate) struct DevelopmentExecutionContext {
     pub configuration: FrozenExecutionConfig,
     pub conversation: JobSpec,
     pub conversation_control: JobControl,
+    /// The conversation was opened by a `job_plan` call, so it is one step of
+    /// that plan and may not plan again.
+    pub plan_step: bool,
     pub project: Option<ProjectRecord>,
     pub compaction: crate::db::entities::GlobalCompactionSettings,
     pub attachments: Vec<AttachmentRecord>,
@@ -2083,6 +2086,15 @@ fn development_candidate_in(
     if conversation_control.on_hold.is_some() || conversation_control.closing.is_some() {
         return Err(context_unavailable("conversation is not eligible"));
     }
+    // A step of a plan is the conversation a `job_plan` call opened; it is
+    // not offered `job_plan` in turn, which the call itself would refuse.
+    let plan_step = match &conversation.kind {
+        crate::db::entities::JobKind::Group {
+            origin: crate::db::entities::Origin::Agent { call },
+            ..
+        } => tool_call_name(rx, *call)?.as_deref() == Some("job_plan"),
+        _ => false,
+    };
     let project = record
         .project
         .map(|id| {
@@ -2142,10 +2154,16 @@ fn development_candidate_in(
                     .map(|command| command.name.as_str()),
             )
             .collect();
+        // The grounding the request will actually carry: the grant the
+        // frozen Agent holds, not the widest one it could have held.
+        let grant = configuration
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.workspace_grant());
         let grounding = crate::service::ai::generative_model::ground_project(
             &project.name,
             &project.root,
-            Some("code"),
+            grant,
             &commands,
         );
         selected_bytes = selected_bytes.saturating_add(
@@ -2329,6 +2347,7 @@ fn development_candidate_in(
             configuration,
             conversation,
             conversation_control,
+            plan_step,
             project,
             compaction,
             attachments,
@@ -3703,6 +3722,16 @@ fn tool_evidence(
     Ok(records)
 }
 
+/// The name of the tool `call` invoked, when its evidence is stored. The
+/// evidence of a call is written before its handler runs, so a stored call
+/// always names the tool that made it.
+fn tool_call_name(rx: &ReadTransaction, call: ToolCallRef) -> Result<Option<String>, StorageError> {
+    rx.open_table(TOOL_CALLS)?
+        .get(rows::tool_call_key(call))?
+        .map(|bytes| decode_tool_evidence(call, bytes.value()).map(|record| record.name))
+        .transpose()
+}
+
 // ---- a Job's input ---------------------------------------------------------------
 
 /// The input of a Job is part of its spec, so it is read from the Job. The
@@ -4537,7 +4566,12 @@ fn read_pool_views<T>(
     let mut records = Vec::new();
     for entry in configs.range(..before)?.rev() {
         let (key, bytes) = entry?;
-        if let Some(record) = view(ConfigRow::decode_at(key.value(), bytes.value())?) {
+        // The `config` table also holds the native allocation records, which
+        // are not configurations; a scan skips them rather than failing on them.
+        let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
+            continue;
+        };
+        if let Some(record) = view(row) {
             records.push(record);
             if records.len() >= limit.min(MAX_PAGE) {
                 break;
@@ -7725,14 +7759,17 @@ fn question(arguments: &str) -> String {
         })
         .unwrap_or_default()
 }
+
+/// The Decision model's assessment of a command approval, when the Project
+/// that owns the conversation enables one. The Project is the conversation's,
+/// which owns that fact; the turn that asked is not read, so this works for a
+/// native turn as well as a legacy one.
 fn approval_assessment(
     rx: &ReadTransaction,
     call: ToolCallRef,
+    project: Option<crate::db::entities::ProjectId>,
 ) -> Result<Option<serde_json::Value>, StorageError> {
     use crate::db::entities::{DecisionAnswer, DecisionOutcome, DecisionResult};
-    let row = read_job_row(rx, call.job)?
-        .ok_or_else(|| StorageError::corrupted("approval job missing"))?;
-    let (_, project, _) = job_execution(&rx.open_table(JOBS)?, &row)?;
     let Some(project) = project else {
         return Ok(None);
     };
@@ -7812,7 +7849,10 @@ pub(crate) fn read_cards(
         }
         let row = read_job_row(&rx, conversation)?
             .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
-        let JobKind::Group { origin, .. } = row.kind else {
+        let JobKind::Group {
+            origin, project, ..
+        } = row.kind
+        else {
             return Err(StorageError::corrupted("expected a conversation"));
         };
         let parent = row.parent_id.map(|id| id.to_string());
@@ -7852,7 +7892,7 @@ pub(crate) fn read_cards(
                     if matches!(
                         call.name.as_str(),
                         "workspace_request_command" | "workspace_run_command"
-                    ) && let Some(assessment) = approval_assessment(&rx, call.call)?
+                    ) && let Some(assessment) = approval_assessment(&rx, call.call, project)?
                     {
                         card["assessment"] = assessment;
                     }

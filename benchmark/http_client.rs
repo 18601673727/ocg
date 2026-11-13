@@ -8,6 +8,16 @@ use serde_json::{Value, json};
 const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_SSE_BUFFER: usize = 8 * 1024 * 1024;
 
+/// The identities one measurement drives, all of them the host's own.
+#[derive(Clone, Debug)]
+pub(super) struct FixtureIdentities {
+    pub(super) executor: String,
+    pub(super) pool: String,
+    pub(super) llm_profile: String,
+    pub(super) agent_profile: String,
+    pub(super) project: String,
+}
+
 pub(super) async fn client(timeout: Duration) -> Result<Client, String> {
     let connector = ntex::service::fn_factory_with_config(move |cfg: ntex::SharedCfg| async move {
         Ok::<_, std::io::Error>(ntex::service::fn_service(
@@ -209,6 +219,122 @@ impl BenchmarkClient {
             .await
             .map_err(|error| format!("{route}: HTTP GET failed: {error}"))?;
         self.response_json(route, response).await
+    }
+
+    /// One JSON POST, for a route whose answer is read once and not streamed.
+    pub(super) async fn post_json(&self, route: &str, body: &Value) -> Result<Value, String> {
+        ntex::time::timeout(self.timeout, self.post_json_inner(route, body))
+            .await
+            .map_err(|_| format!("{route}: request deadline exceeded"))?
+    }
+
+    async fn post_json_inner(&self, route: &str, body: &Value) -> Result<Value, String> {
+        let response = self
+            .authorized(self.client.post(format!("{}{route}", self.address)))
+            .set_header("Content-Type", "application/json")
+            .send_json(body)
+            .await
+            .map_err(|error| format!("{route}: HTTP POST failed: {error}"))?;
+        self.response_json(route, response).await
+    }
+
+    /// Creates the Pool, Executor, model and Agent profiles and the Project a
+    /// measurement drives, all through the control plane, so the host owns
+    /// them exactly as it does for an operator.
+    pub(super) async fn prepare_fixture_identities(
+        &self,
+        provider_endpoint: &str,
+        workspace: &std::path::Path,
+        concurrency: usize,
+    ) -> Result<FixtureIdentities, String> {
+        let pool = uuid::Uuid::now_v7().to_string();
+        self.post_json(
+            "/api/v1/pools",
+            &json!({
+                "id": pool,
+                "name": "benchmark-pool",
+                "capacity": concurrency,
+                "enabled": true,
+            }),
+        )
+        .await?;
+        let executor = uuid::Uuid::now_v7().to_string();
+        self.post_json(
+            "/api/v1/executors",
+            &json!({
+                "id": executor,
+                "pool": pool,
+                "name": "benchmark-executor",
+                "enabled": true,
+                "capabilities": [{"operation": "llm_request", "protocol": "openai_chat_completions"}],
+            }),
+        )
+        .await?;
+        let endpoint = if provider_endpoint.ends_with("/chat/completions") {
+            provider_endpoint.to_owned()
+        } else {
+            format!("{provider_endpoint}/chat/completions")
+        };
+        let llm = self
+            .post_json(
+                "/api/v1/profiles",
+                &json!({
+                    "kind": "llm",
+                    "name": "benchmark-llm",
+                    "model": "benchmark-mock",
+                    "protocol": "openai_chat_completions",
+                    "endpoint": endpoint,
+                    "credential_ref": "BENCH_SYNTH",
+                    "credential": format!("synthetic-{}", uuid::Uuid::now_v7()),
+                    "declared_capabilities": ["chat", "tools"],
+                    "context_window": 32_768,
+                    "parameters": {"max_tokens": 256},
+                }),
+            )
+            .await?;
+        let llm_profile = llm
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("/api/v1/profiles: answer names no profile: {llm}"))?
+            .to_owned();
+        let agent = self
+            .post_json(
+                "/api/v1/profiles",
+                &json!({
+                    "kind": "agent",
+                    "name": "benchmark-agent",
+                    "capabilities": ["chat", "coding"],
+                    "llm_targets": [llm_profile],
+                }),
+            )
+            .await?;
+        let agent_profile = agent
+            .get("profile_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("/api/v1/profiles: answer names no profile: {agent}"))?
+            .to_owned();
+        let root = workspace
+            .to_str()
+            .ok_or("the benchmark workspace path is not UTF-8")?;
+        let project = self
+            .post_json(
+                "/api/v1/projects",
+                &json!({"name": "benchmark-project", "root": root}),
+            )
+            .await?;
+        let project = project
+            .get("project")
+            .and_then(|project| project.get("id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("/api/v1/projects: answer names no Project: {project}"))?
+            .to_owned();
+        Ok(FixtureIdentities {
+            executor,
+            pool,
+            llm_profile,
+            agent_profile,
+            project,
+        })
     }
 
     pub(super) async fn readiness(&self) -> Result<(), String> {
@@ -436,16 +562,16 @@ impl BenchmarkClient {
             ));
         }
         for (index, call) in calls.iter().enumerate() {
+            // A read-only call records the digest of its result, not the
+            // result: what it returned is checked in the next request instead.
+            let outcome = call["outcome_kind"].as_str().unwrap_or_default();
             if call["name"] != "workspace_read_file"
                 || call["decision"] != "admitted"
-                || call["outcome_kind"] != "completed"
+                || !matches!(outcome, "completed" | "completed_elided")
                 || call["request"].as_u64() != Some(index as u64 + 1)
                 || !call["arguments"]
                     .as_str()
                     .is_some_and(|arguments| arguments.contains("probe.txt"))
-                || !call["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("rarebeacon"))
             {
                 return Err(format!(
                     "job {job_id} has invalid real workspace tool evidence at {index}: {call}"
@@ -455,12 +581,12 @@ impl BenchmarkClient {
 
         for request in 1..=3 {
             let deadline = Instant::now() + self.timeout;
-            loop {
+            let value = loop {
                 let value = self
                     .get_json(&format!("/api/v1/jobs/{job_id}/requests/{request}"))
                     .await?;
                 if value["messages"].is_array() && !value["response"].is_null() {
-                    break;
+                    break value;
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
@@ -468,6 +594,23 @@ impl BenchmarkClient {
                     ));
                 }
                 ntex::time::sleep(Duration::from_millis(5)).await;
+            };
+            // Every read after the first is answered in this request, so the
+            // file content the harness planted must be visible here.
+            if request > 1 {
+                let seen = value["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "tool"
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|content| content.contains("rarebeacon"))
+                    })
+                });
+                if !seen {
+                    return Err(format!(
+                        "job {job_id} request {request} carries no workspace read result: {value}"
+                    ));
+                }
             }
         }
         match self

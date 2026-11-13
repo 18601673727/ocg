@@ -862,14 +862,6 @@ export function ConversationCardStrip({
             await client.openConversation(res.turn);
           }
         }
-      } else if (card.kind === "loop_hold") {
-        await control.unholdConversation(card.conversation);
-        setCards((prev) =>
-          prev.filter((c) => !(c.kind === "loop_hold" && c.conversation === card.conversation)),
-        );
-        if (client.openConversation) {
-          await client.openConversation(card.conversation);
-        }
       }
       setRevision((value) => value + 1);
     } catch (cause) {
@@ -931,11 +923,7 @@ export function ConversationCardStrip({
           return (
             <div
               className="w-full rounded-xl border border-border bg-card p-4 text-xs shadow-xs"
-              key={
-                card.kind === "approval" || card.kind === "question" || card.kind === "dispatch"
-                  ? `${card.approval.join(":")}`
-                  : card.kind
-              }
+              key={`${card.kind}:${card.approval.join(":")}`}
             >
               <div className="mb-2 flex items-center justify-between gap-2">
                 <span className="text-sm font-medium text-foreground">
@@ -1003,11 +991,6 @@ export function ConversationCardStrip({
                     {t("chat.card.dismiss")}
                   </Button>
                 </>
-              )}
-              {card.kind === "loop_hold" && (
-                <Button size="xs" disabled={pending} onClick={() => void act(card)}>
-                  {t("chat.child.unhold")}
-                </Button>
               )}
             </div>
           );

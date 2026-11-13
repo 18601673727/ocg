@@ -47,10 +47,12 @@ impl ToolHandler for Applied {
 }
 
 /// Registers the job tools, and returns the names offered. The tools the user
-/// decides are offered only when a user decides for the execution.
+/// decides are offered only when a user decides for the execution, and a plan
+/// is offered only where a plan may be submitted: a step of a plan is not.
 pub(crate) fn register(
     registry: &ToolRegistry,
     decider: bool,
+    offer_plan: bool,
 ) -> Result<Vec<&'static str>, ToolRegistryError> {
     let conversation = json!({"type":"string","format":"uuid","pattern":UUID,"description":"A child conversation id (the conversation from job_dispatch or job_plan, or a worker from job_workers), never an answered turn id."});
     let profile = json!({"type":"string","format":"uuid","pattern":UUID});
@@ -61,7 +63,10 @@ pub(crate) fn register(
         vec!["steps"],
         "Submit a bounded execution plan. Each step names its prerequisites in depends_on as zero-based indices of earlier steps. Use [] for independent work, which may run concurrently when capacity permits. A dependent step waits for its prerequisites to settle. One local step continues directly in the current Job without creating a child conversation. For several steps, the host opens one child conversation per step with this Agent's own permissions and, once every step has settled, adds their results to this conversation as a message. Use one precise scope per step; a plan must come before any other work and cannot be made by one of its own steps.",
     );
-    let mut specs = vec![plan];
+    let mut specs = Vec::new();
+    if offer_plan {
+        specs.push(plan);
+    }
     specs.push((
         "job_limits",
         json!({"conversation":conversation,"max_depth":{"type":"integer","minimum":0,"maximum":16},"max_auto_turns":{"type":"integer","minimum":0,"maximum":255},"max_iterations":{"type":"integer","minimum":0,"maximum":10000}}),

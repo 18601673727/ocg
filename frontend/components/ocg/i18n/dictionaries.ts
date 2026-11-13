@@ -237,7 +237,6 @@ export const en = {
   "chat.dispatch.keepOpen": "The worker stays open after this task for further assignments.",
   "chat.dispatch.dependencies": "Waits for {count} prerequisite Job(s).",
   "chat.card.question": "Question for you",
-  "chat.card.loop_hold": "Conversation loop paused",
 
   "chat.children": "Child conversations",
   "chat.child.open": "Open",
@@ -1576,7 +1575,6 @@ export const zh: Dictionary = {
   "chat.dispatch.keepOpen": "任务结束后保留此 worker，以接收后续任务。",
   "chat.dispatch.dependencies": "需等待 {count} 个前置 Job。",
   "chat.card.question": "向您提问",
-  "chat.card.loop_hold": "对话循环已暂停",
 
   "chat.children": "子对话",
   "chat.child.open": "开放",

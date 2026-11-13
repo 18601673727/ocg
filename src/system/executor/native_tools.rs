@@ -100,6 +100,7 @@ impl DevelopmentTooling for NativeTooling<'_> {
             decider: context.decider,
             mutation: ExecutionControl::WorkspaceMutation.is_enabled(),
             jobs,
+            plan: !context.plan_step,
         };
         let (execution, offer) =
             build(self.data_directory, project, wiring, self.stops.clone()).await?;
@@ -224,13 +225,15 @@ struct Wiring {
     mutation: bool,
     /// The Agent manages Jobs.
     jobs: bool,
+    /// The Agent may submit a plan here: it is not itself a step of one.
+    plan: bool,
 }
 
 /// The tools of an execution: with a Workspace, file reads, directory listing
-/// and search, full-text search and, where the platform has it, code
-/// navigation; with Workspace mutation enabled also file writes and the
-/// Project's commands, and a way to request one more; and, for an Agent that
-/// manages Jobs, the job tools.
+/// and search, full-text search, the public web through OCG's proxy and, where
+/// the platform has it, code navigation; with Workspace mutation enabled also
+/// file writes and the Project's commands, and a way to request one more; and,
+/// for an Agent that manages Jobs, the job tools.
 #[cfg(unix)]
 fn tools_of(
     workspace: Option<(Workspace, &[crate::db::entities::ProjectCommand])>,
@@ -260,6 +263,11 @@ fn tools_of(
         ]);
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
         names.push(crate::service::lsp::TOOL_NAME);
+        // The web tools reach the public internet through OCG's configured
+        // proxy. They come with the Workspace grant, and no Workspace path
+        // applies to what they reach.
+        super::network::register(&registry)?;
+        names.extend(super::network::NAMES);
         if wiring.mutation {
             super::workspace_write::register(&registry, workspace.clone())?;
             names.push(super::workspace_write::TOOL_NAME);
@@ -281,7 +289,11 @@ fn tools_of(
         }
     }
     if wiring.jobs {
-        names.extend(super::job_tools::register(&registry, wiring.decider)?);
+        names.extend(super::job_tools::register(
+            &registry,
+            wiring.decider,
+            wiring.plan,
+        )?);
     }
     if wiring.ask {
         register_ask_user(&registry)?;

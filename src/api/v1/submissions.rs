@@ -529,10 +529,6 @@ pub(crate) enum CardView {
         tool: String,
         question: String,
     },
-    LoopHold {
-        conversation: String,
-        parent: Option<String>,
-    },
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]

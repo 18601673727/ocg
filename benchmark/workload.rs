@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::backend_process::{BackendConfig, BackendHandshake, BackendProcess};
 use crate::benchmark::{Outcome, OutcomeCounts};
 use crate::fixture::{FixtureConfig, FixtureGenerator, FixtureStats};
-use crate::http_client::BenchmarkClient;
+use crate::http_client::{BenchmarkClient, FixtureIdentities};
 use crate::metadata::{BenchmarkMetadata, WorkloadParameters};
 use crate::mock_provider::{MockProvider, MockProviderConfig, ProviderCounterSnapshot};
 use crate::reporting::{MeasurementRecord, Record, emit_begin, emit_section_complete};
@@ -186,7 +186,6 @@ fn backend_config(
         startup_timeout: options.deadline,
         shutdown_timeout: options.deadline.min(Duration::from_secs(15)),
         hang_before_handshake: options.child_hang,
-        prepared_identities: None,
     }
 }
 
@@ -221,21 +220,49 @@ async fn spawn_ready_with_identities(
     prepared: Option<&BackendHandshake>,
 ) -> Result<(BackendProcess, BenchmarkClient, Duration)> {
     let mut config = backend_config(context, options, provider, data_dir, concurrency, trial);
-    config.prepared_identities = prepared.map(|identity| {
-        json!({"executor": identity.executor,
-        "llm_profile": identity.llm_profile, "agent_profile": identity.agent_profile,
-        "project": identity.project, "pool": identity.pool})
-    });
+    config.hang_before_handshake = options.child_hang;
     let started = Instant::now();
-    let backend = ntex::rt::spawn_blocking(move || BackendProcess::spawn(&config)).await??;
-    let handshake = backend.handshake().clone();
-    let client = BenchmarkClient::new(handshake.address, handshake.token, options.deadline)
-        .await
-        .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+    let mut backend = ntex::rt::spawn_blocking(move || BackendProcess::spawn(&config)).await??;
+    let client = BenchmarkClient::new(
+        backend.address().to_owned(),
+        backend.token().to_owned(),
+        options.deadline,
+    )
+    .await
+    .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
     client
         .readiness()
         .await
         .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
+    // A restarted host keeps the identities it had; a fresh one creates them.
+    let identities = match prepared {
+        Some(prepared) => FixtureIdentities {
+            executor: prepared.executor.clone(),
+            pool: prepared.pool.clone(),
+            llm_profile: prepared.llm_profile.clone(),
+            agent_profile: prepared.agent_profile.clone(),
+            project: prepared.project.clone(),
+        },
+        None => client
+            .prepare_fixture_identities(
+                &provider.endpoint(),
+                context.generator.workspace_path().as_path(),
+                concurrency,
+            )
+            .await
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?,
+    };
+    backend.attach_handshake(BackendHandshake {
+        pid: backend.pid(),
+        address: backend.address().to_owned(),
+        token: backend.token().to_owned(),
+        executor: identities.executor,
+        llm_profile: identities.llm_profile,
+        agent_profile: identities.agent_profile,
+        project: identities.project,
+        pool: identities.pool,
+        startup: backend.startup(),
+    });
     Ok((backend, client, started.elapsed()))
 }
 

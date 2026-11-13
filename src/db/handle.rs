@@ -89,6 +89,9 @@ pub(crate) struct DevelopmentToolContext {
     /// ask the user a question. A conversation the user holds asks nothing:
     /// the Agent answers in the conversation.
     pub(crate) nested: bool,
+    /// The conversation is one step of a plan this Agent submitted, so it is
+    /// offered no plan of its own.
+    pub(crate) plan_step: bool,
 }
 
 /// The tooling of a path that offers no tool and no Workspace.
@@ -2055,6 +2058,7 @@ impl DatabaseHandle {
                         decider: context.snapshot.job.input.priority
                             == entities::JobQueuePriority::Foreground,
                         nested: context.snapshot.conversation.parent_id.is_some(),
+                        plan_step: context.snapshot.plan_step,
                     },
                 )
                 .await

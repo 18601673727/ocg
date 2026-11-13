@@ -9,6 +9,10 @@ pub(crate) const IMAGES_OMITTED_NOTICE: &str = "Images of earlier turns were omi
 pub(crate) const OMITTED_NOTICE: &str =
     "Earlier turns of this conversation were omitted to fit the model's context window.";
 
+/// Stated when the request offers the web tools, whose reach is not the
+/// Workspace's: a model that assumed otherwise would refuse work it can do.
+const INTERNET_NOTICE: &str = "Internet access is available during execution through web_search and web_fetch, using OCG's configured proxy. Workspace filesystem path restrictions do not restrict these web tools.";
+
 fn append_omitted_notice(conversation: &mut ChatConversation) {
     if let Some(sys_msg) = conversation
         .messages
@@ -145,9 +149,14 @@ fn system_messages(
     project: Option<&ProjectRecord>,
     grant: Option<&str>,
     agents_md: Option<&str>,
+    web: bool,
     omitted_notice: bool,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+
+    if web {
+        messages.push(ChatMessage::system(INTERNET_NOTICE));
+    }
 
     if let Some(project) = project {
         let command_names = crate::db::entities::BUILT_IN_COMMANDS
@@ -238,6 +247,7 @@ pub(crate) fn fit_with_notices(
 ) -> Option<ChatConversation> {
     // The system messages of the request, led by the tree status and the
     // images notice; the omitted notice is part of the system prompt.
+    let web = tools.iter().any(|tool| tool.function.name == "web_fetch");
     let with_prefix = |omitted: bool| {
         let mut system = Vec::new();
         if let Some(status) = notices.tree_status.filter(|status| !status.is_empty()) {
@@ -246,7 +256,9 @@ pub(crate) fn fit_with_notices(
         if notices.images_omitted {
             system.push(ChatMessage::system(IMAGES_OMITTED_NOTICE));
         }
-        system.extend(system_messages(frozen, project, grant, agents_md, omitted));
+        system.extend(system_messages(
+            frozen, project, grant, agents_md, web, omitted,
+        ));
         system
     };
     // 1. Build messages once without per-attempt cloning.

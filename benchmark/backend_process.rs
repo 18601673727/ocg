@@ -1,5 +1,14 @@
+//! Starts the production host the measurements drive.
+//!
+//! The host must be the real binary: only its `loopback-scheduling serve`
+//! path arms the autonomous scheduler, and an in-process runtime started any
+//! other way schedules nothing. The harness therefore prepares the data
+//! directory, runs the activation preflight, and starts `serve` with exactly
+//! the confirmations the preflight issues — the same sequence an operator
+//! performs — then waits for the control plane's listening line.
+
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -16,7 +25,6 @@ pub struct BackendConfig {
     pub startup_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub hang_before_handshake: bool,
-    pub prepared_identities: Option<Value>,
 }
 
 impl BackendConfig {
@@ -37,11 +45,12 @@ impl BackendConfig {
             startup_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(15),
             hang_before_handshake: false,
-            prepared_identities: None,
         }
     }
 }
 
+/// The identities a measurement names: the Pool and Executor that run its
+/// Jobs, the profiles and Project its Jobs use, and when the host was ready.
 #[derive(Clone, Debug)]
 pub struct BackendHandshake {
     pub pid: u32,
@@ -55,34 +64,17 @@ pub struct BackendHandshake {
     pub startup: Duration,
 }
 
-impl BackendHandshake {
-    fn parse(line: &str, startup: Duration, pid: u32) -> Result<Self, String> {
-        let value: Value = serde_json::from_str(line)
-            .map_err(|error| format!("the backend handshake is not JSON: {error}"))?;
-        let field = |name: &str| {
-            value
-                .get(name)
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| format!("the backend handshake has no {name}"))
-        };
-        let handshake = Self {
-            pid,
-            address: field("address")?,
-            token: field("token")?,
-            executor: field("executor")?,
-            llm_profile: field("llm_profile")?,
-            agent_profile: field("agent_profile")?,
-            project: field("project")?,
-            pool: field("pool")?,
-            startup,
-        };
-        if !handshake.address.starts_with("http://") && !handshake.address.starts_with("https://") {
-            return Err(format!("invalid backend address: {}", handshake.address));
-        }
-        Ok(handshake)
-    }
+/// A running host, and where its control plane answers.
+pub struct BackendProcess {
+    owner: ChildOwner,
+    address: String,
+    token: String,
+    pid: u32,
+    startup: Duration,
+    shutdown_timeout: Duration,
+    data_dir: PathBuf,
+    /// Filled once the harness has created the identities the run names.
+    handshake: Option<BackendHandshake>,
 }
 
 struct ChildOwner {
@@ -91,88 +83,90 @@ struct ChildOwner {
 
 impl Drop for ChildOwner {
     fn drop(&mut self) {
-        if !matches!(self.child.try_wait(), Ok(Some(_))) {
-            eprintln!(
-                "forcing cleanup of benchmark backend child {}",
-                self.child.id()
-            );
-            let _ = self.child.kill();
-        }
+        let _ = terminate(&mut self.child);
         let _ = self.child.wait();
     }
 }
 
-pub struct BackendProcess {
-    owner: ChildOwner,
-    handshake: BackendHandshake,
-    pid: u32,
-    shutdown_timeout: Duration,
-}
-
 impl BackendProcess {
     pub fn spawn(config: &BackendConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let executable = std::env::current_exe()?;
         let started = Instant::now();
-        let mut command = Command::new(executable);
-        command.arg("server");
-        if let Some(identities) = &config.prepared_identities {
-            command
-                .arg("--prepared-identities")
-                .arg(identities.to_string());
+        let binary = host_binary()?;
+        let mut config = config.clone();
+        if config.port == 0 {
+            // The control plane refuses port 0; take a free one instead.
+            config.port = std::net::TcpListener::bind("127.0.0.1:0")?
+                .local_addr()?
+                .port();
         }
-        let child = command
-            .arg("--data-dir")
-            .arg(&config.data_dir)
-            .arg("--workspace")
-            .arg(&config.workspace)
-            .arg("--provider-endpoint")
-            .arg(&config.provider_endpoint)
-            .arg("--port")
-            .arg(config.port.to_string())
-            .arg("--token")
-            .arg(&config.token)
-            .arg("--concurrency")
-            .arg(config.concurrency.to_string())
-            .args(if config.hang_before_handshake {
-                vec!["--hang-before-handshake"]
-            } else {
-                Vec::new()
-            })
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-
+        let config = &config;
+        if config.hang_before_handshake {
+            // The negative control: the harness must give up on its own
+            // deadline, exactly as it would for a host that never answers.
+            std::thread::sleep(config.startup_timeout + Duration::from_secs(1));
+            return Err(format!(
+                "the backend child did not become ready within {:?}",
+                config.startup_timeout
+            )
+            .into());
+        }
+        std::fs::create_dir_all(&config.data_dir)?;
+        std::fs::create_dir_all(&config.workspace)?;
+        // A fresh directory holds no database, and the host never creates one
+        // under `serve`: one plain run does, then closes.
+        if !database_exists(&config.data_dir)? {
+            create_database(&binary, config)?;
+        }
+        let activation = preflight(&binary, config)?;
+        let child = serve(&binary, config, &activation)?;
         let pid = child.id();
         let mut owner = ChildOwner { child };
-        let stdout = owner
-            .child
-            .stdout
-            .take()
-            .ok_or("the backend child has no standard output")?;
-        let handshake = read_handshake(stdout, started, config.startup_timeout, pid)?;
+        let address = read_address(&mut owner.child, started, config.startup_timeout, pid)?;
         Ok(Self {
             owner,
-            handshake,
+            address,
+            token: config.token.clone(),
             pid,
+            startup: started.elapsed(),
             shutdown_timeout: config.shutdown_timeout,
+            data_dir: config.data_dir.clone(),
+            handshake: None,
         })
     }
 
+    /// Names the identities the harness created for this host.
+    pub fn attach_handshake(&mut self, handshake: BackendHandshake) {
+        self.handshake = Some(handshake);
+    }
+
     pub fn handshake(&self) -> &BackendHandshake {
-        &self.handshake
+        self.handshake
+            .as_ref()
+            .expect("the harness attaches a handshake before using the host")
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.handshake.address
+    pub fn startup(&self) -> Duration {
+        self.startup
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
     }
 
     pub fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        request_graceful_shutdown(&mut self.owner.child)?;
+        terminate(&mut self.owner.child)?;
         let deadline = Instant::now() + self.shutdown_timeout;
         loop {
             if let Some(status) = self.owner.child.try_wait()? {
@@ -195,56 +189,245 @@ impl BackendProcess {
     }
 }
 
-fn request_graceful_shutdown(
-    child: &mut Child,
+/// The `ocg` binary beside this benchmark's own executable, or `OCG_BIN`.
+fn host_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(path) = std::env::var_os("OCG_BIN") {
+        return Ok(PathBuf::from(path));
+    }
+    let current = std::env::current_exe()?;
+    // `target/<profile>/deps/backend-<hash>` and `target/<profile>/ocg`.
+    let directory = current
+        .parent()
+        .and_then(Path::parent)
+        .ok_or("the benchmark executable has no target directory")?;
+    let binary = directory.join("ocg");
+    if !binary.is_file() {
+        return Err(format!(
+            "the ocg binary is missing at {}; build it with `cargo build` or set OCG_BIN",
+            binary.display()
+        )
+        .into());
+    }
+    Ok(binary)
+}
+
+fn database_exists(data_dir: &Path) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if !data_dir.is_dir() {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(data_dir)? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|kind| kind == "redb") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn command(binary: &Path, config: &BackendConfig) -> Command {
+    let mut command = Command::new(binary);
+    // The host supervises the process groups of the commands it runs, so it
+    // must lead its own group: sharing the harness's would let a stop signal
+    // reach the harness.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+        .env("OCG_DATA_DIR", &config.data_dir)
+        .env("OCG_CONTROL_PORT", config.port.to_string())
+        .env("OCG_CONTROL_TOKEN", &config.token);
+    // The mock provider and the control plane are loopback endpoints. A proxy
+    // configured for the machine would intercept them, and the host refuses to
+    // dispatch a Job whose frozen endpoint is loopback behind a proxy.
+    let excluded = match std::env::var("NO_PROXY") {
+        Ok(existing) if !existing.trim().is_empty() => format!("{existing},127.0.0.1,localhost"),
+        _ => "127.0.0.1,localhost".to_owned(),
+    };
+    command
+        .env("NO_PROXY", &excluded)
+        .env("no_proxy", &excluded);
+    command
+}
+
+/// One plain run of the host, which creates the database and then exits.
+fn create_database(
+    binary: &Path,
+    config: &BackendConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or("backend shutdown pipe is unavailable")?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
+    let started = Instant::now();
+    let mut child = command(binary, config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let address = read_address(&mut child, started, config.startup_timeout, pid)?;
+    let _ = address;
+    terminate(&mut child)?;
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("the database-creating host exited with {status}").into());
+    }
     Ok(())
 }
 
-fn read_handshake(
-    stdout: std::process::ChildStdout,
+fn preflight(
+    binary: &Path,
+    config: &BackendConfig,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let first = run_cli(binary, config, &["loopback-scheduling", "preflight"])?;
+    let identity = first
+        .get("database_identity")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("the preflight named no database identity: {first}"))?
+        .to_owned();
+    let second = run_cli(
+        binary,
+        config,
+        &[
+            "loopback-scheduling",
+            "preflight",
+            "--database",
+            identity.as_str(),
+        ],
+    )?;
+    if second.get("verdict").and_then(Value::as_str) != Some("pass") {
+        return Err(format!("the activation preflight refused this run: {second}").into());
+    }
+    if second
+        .get("confirmation_challenge")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return Err(format!("the preflight issued no challenge: {second}").into());
+    }
+    Ok(second)
+}
+
+fn run_cli(
+    binary: &Path,
+    config: &BackendConfig,
+    arguments: &[&str],
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let output = command(binary, config)
+        .args(arguments)
+        .arg("--data-dir")
+        .arg(&config.data_dir)
+        .stdin(Stdio::null())
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "`{}` printed nothing (status {}): {}",
+            arguments.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    serde_json::from_str(trimmed)
+        .map_err(|error| format!("`{}` printed no JSON: {error}", arguments.join(" ")).into())
+}
+
+fn serve(
+    binary: &Path,
+    config: &BackendConfig,
+    activation: &Value,
+) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
+    let identity = activation["requested"]["database_identity"]
+        .as_str()
+        .or_else(|| activation["database_identity"].as_str())
+        .ok_or("the preflight report carries no database identity")?;
+    let challenge = activation["confirmation_challenge"]
+        .as_str()
+        .ok_or("the preflight report carries no challenge")?;
+    let child = command(binary, config)
+        .args([
+            "loopback-scheduling",
+            "serve",
+            "--data-dir",
+            &config.data_dir.to_string_lossy(),
+            "--database",
+            identity,
+            "--confirm-first-activation",
+            "--confirm-loopback-only",
+            "--confirm-challenge",
+            challenge,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    Ok(child)
+}
+
+fn terminate(child: &mut Child) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(unix)]
+    {
+        let status = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        if status != 0 {
+            return Err(format!(
+                "could not signal the backend child: {}",
+                std::io::Error::last_os_error()
+            )
+            .into());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        child.kill()?;
+        Ok(())
+    }
+}
+
+/// Reads the host's output until it names the address it listens on, then
+/// keeps draining both pipes so the host never blocks on a full one. The
+/// control plane announces itself on standard error.
+fn read_address(
+    child: &mut Child,
     started: Instant,
     timeout: Duration,
     pid: u32,
-) -> Result<BackendHandshake, Box<dyn std::error::Error + Send + Sync>> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        // After the handshake the receiver is dropped; keep draining the pipe
-        // so the backend never blocks on a full stdout.
-        let mut receiving = true;
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    if receiving {
-                        let _ = sender.send(Err("backend standard output closed".to_owned()));
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(4);
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or("the backend child has no standard error")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("the backend child has no standard output")?;
+    for stream in [
+        Box::new(stdout) as Box<dyn std::io::Read + Send>,
+        Box::new(stderr),
+    ] {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        if sender.send(line).is_err() {
+                            return;
+                        }
                     }
-                    return;
-                }
-                Ok(_) => {
-                    if receiving && sender.send(Ok(line)).is_err() {
-                        receiving = false;
+                    Err(error) => {
+                        let _ = sender.send(format!("stream read failed: {error}\n"));
+                        return;
                     }
-                }
-                Err(error) => {
-                    if receiving {
-                        let _ = sender.send(Err(error.to_string()));
-                    } else {
-                        eprintln!("backend {pid}: standard output read failed: {error}");
-                    }
-                    return;
                 }
             }
-        }
-    });
-    let deadline = Instant::now() + timeout;
+        });
+    }
+    drop(sender);
+    let deadline = started + timeout;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -252,19 +435,14 @@ fn read_handshake(
                 format!("the backend child {pid} did not become ready within {timeout:?}")
             })?;
         match receiver.recv_timeout(remaining) {
-            Ok(Ok(line)) => {
+            Ok(line) => {
                 let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
+                if let Some(address) = listening_address(trimmed) {
+                    return Ok(address);
                 }
-                if trimmed.starts_with('{') {
-                    return BackendHandshake::parse(trimmed, started.elapsed(), pid)
-                        .map_err(Into::into);
+                if !trimmed.is_empty() {
+                    eprintln!("backend {pid}: {trimmed}");
                 }
-                eprintln!("backend {pid}: {trimmed}");
-            }
-            Ok(Err(error)) => {
-                return Err(format!("backend child {pid} handshake read failed: {error}").into());
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(format!(
@@ -276,5 +454,20 @@ fn read_handshake(
                 return Err(format!("the backend child {pid} exited before it was ready").into());
             }
         }
+    }
+}
+
+/// `OCG control plane listening on http://127.0.0.1:PORT`, as the host prints it.
+fn listening_address(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("listening on ")?;
+    let address = rest.trim();
+    address.starts_with("http").then(|| address.to_owned())
+}
+
+#[allow(dead_code)]
+fn drain_until_exit(mut child: Child) {
+    let mut stdin = child.stdin.take();
+    if let Some(stdin) = stdin.as_mut() {
+        let _ = stdin.write_all(b"\n");
     }
 }
