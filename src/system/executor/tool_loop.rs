@@ -44,6 +44,7 @@ pub(crate) struct ToolExecution {
     pub(crate) offer: ToolOffer,
     pub(crate) limits: ToolLoopLimits,
     pub(crate) stops: crate::system::native_scheduler::NativeStops,
+    pub(crate) workspace: Option<super::workspace_read::Workspace>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

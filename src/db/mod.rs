@@ -65,12 +65,60 @@ pub(crate) enum ScheduledReservation {
     Pass(Box<entities::DevelopmentReservation>),
 }
 
+pub(crate) fn inspect_held_allocations_offline(
+    directory: &std::path::Path,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::inspect_held_allocations_offline(directory).map_err(DatabaseError::Read)
+}
+
 pub(crate) fn verify_offline(
     directory: &std::path::Path,
     pages: bool,
 ) -> Result<serde_json::Value, DatabaseError> {
     redb::verify_offline(directory, pages).map_err(DatabaseError::Read)
 }
+
+#[cfg(unix)]
+pub(crate) fn verify_reserved_publication(
+    directory: &std::path::Path,
+    database: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::verify_reserved_publication(
+        directory,
+        database,
+        exclusive_lock,
+        expected_device,
+        expected_inode,
+    )
+    .map_err(DatabaseError::Read)
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_recovered_publication(
+    directory: &std::path::Path,
+    database: &std::fs::File,
+    exclusive_lock: &std::fs::File,
+    expected_device: u64,
+    expected_inode: u64,
+) -> Result<serde_json::Value, DatabaseError> {
+    redb::verify_recovered_publication(
+        directory,
+        database,
+        exclusive_lock,
+        expected_device,
+        expected_inode,
+    )
+    .map_err(DatabaseError::Read)
+}
+
+pub(crate) use redb::{
+    DATABASE_FILE_NAME, ReservedRefusal, reconcile_held_apply, reconcile_held_preflight,
+    reconcile_reserved_apply, reconcile_reserved_preflight, storage_format_versions,
+    verify_held_publication_delta, verify_reserved_publication_delta,
+};
 
 const GROUP_LIMIT: usize = 32;
 const COMPACTION_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;

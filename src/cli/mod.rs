@@ -1,8 +1,11 @@
 use crate::api::v1::ControlPlaneConfig;
 use crate::system::data_directory::DataDirectory;
 
+mod inspect_held;
 mod llm_target;
 mod migrate;
+#[cfg(unix)]
+mod reconcile_reserved;
 mod scheduled_external_policy;
 pub mod typescript;
 #[cfg(unix)]
@@ -20,6 +23,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "help" || command == "--help" || command == "-h" {
             println!("{}", usage());
             return Ok(());
+        }
+        if command == "inspect-held" {
+            return inspect_held::run(arguments.collect());
+        }
+        #[cfg(unix)]
+        if command == "reconcile-reserved" {
+            return reconcile_reserved::run(arguments.collect());
+        }
+        #[cfg(unix)]
+        if command == "reconcile-held" {
+            return reconcile_reserved::run_held(arguments.collect());
         }
         if command == "verify" {
             return verify::run(arguments.collect());
@@ -75,7 +89,10 @@ fn usage() -> &'static str {
      \n\
      Commands:\n\
        update [--check] [--version X.Y.Z] [--yes]\n\
+       inspect-held <data-directory>            (read-only)\n\
        verify <data-directory> [--pages]\n\
+       reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\
+       reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
        migrate [--check | --to <directory>]\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\
        register-llm\n\

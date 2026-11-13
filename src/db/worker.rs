@@ -483,6 +483,15 @@ impl WriteWorker {
 
     pub(super) fn handle(&mut self, control: Control) {
         match control {
+            Control::FilesystemFailure { reason } => {
+                let active = matches!(
+                    self.shared.admission(),
+                    Admission::Open | Admission::Protected(_)
+                );
+                if active {
+                    self.activate(vec![reason]);
+                }
+            }
             Control::CompactStorage(reply) => {
                 let result = self.compact_storage();
                 send_reply(&reply, result);

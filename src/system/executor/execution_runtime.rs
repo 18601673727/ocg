@@ -157,7 +157,11 @@ pub(crate) async fn supervise_development_generative(
         )
         .await?;
         let Some(tools) = tools.as_ref().filter(|_| result.requests_tools()) else {
-            let value = providers::result_value(&result);
+            let mut value = providers::result_value(&result);
+            #[cfg(unix)]
+            if let Some(workspace) = tools.as_ref().and_then(|tools| tools.workspace.as_ref()) {
+                attach_file_snapshots(&mut value, workspace, &result.text).await;
+            }
             let finalization = JobFinalization::Completed(FinalResult {
                 summary: Some(result.text.clone()),
                 code: None,
@@ -281,6 +285,137 @@ pub(crate) async fn supervise_development_generative(
 }
 
 #[cfg(unix)]
+#[cfg(unix)]
+async fn capture_file_snapshots(
+    workspace: super::workspace_read::Workspace,
+    text: String,
+) -> Vec<serde_json::Value> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static LINKS: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\]\(\s*<?([^\s)>]+)"));
+    static LINES: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$"));
+    if ACTIVE
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < 4).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return Vec::new();
+    }
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    let slot = Slot;
+    let work = super::blocking::run(super::blocking::Kind::File, move || {
+        let _slot = slot;
+        let Ok(links) = LINKS.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(lines) = LINES.as_ref() else {
+            return Vec::new();
+        };
+        let stamp = super::workspace_read::mutation_stamp();
+        let mut seen = std::collections::HashSet::new();
+        let mut snapshots = Vec::new();
+        for link in links.captures_iter(&text).take(32) {
+            let Some(target) = link.get(1).map(|value| value.as_str()) else {
+                continue;
+            };
+            if target.contains("://") || target.starts_with('#') || target.starts_with("//") {
+                continue;
+            }
+            let (path, line) = if let Some(location) = lines.captures(target) {
+                let Some(matched) = location.get(0) else {
+                    continue;
+                };
+                let line = location
+                    .get(1)
+                    .or_else(|| location.get(2))
+                    .and_then(|value| value.as_str().parse::<u64>().ok())
+                    .unwrap_or(1);
+                (&target[..matched.start()], line.max(1))
+            } else {
+                (target, 1)
+            };
+            let reference_path = path.to_owned();
+            let path = std::path::Path::new(path);
+            let path = if path.is_absolute() {
+                let Ok(relative) = path.strip_prefix(workspace.root()) else {
+                    continue;
+                };
+                relative
+            } else {
+                path
+            };
+            let Some(path) = path.to_str() else { continue };
+            let path = path.strip_prefix("./").unwrap_or(path);
+            if !seen.insert(path.to_owned()) {
+                continue;
+            }
+            if let Ok(mut snapshot) = workspace.snapshot_range(path, line) {
+                let unchanged = snapshot
+                    .get("content")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|content| {
+                        matches!(
+                            crate::db::entities::output_filter::text(content),
+                            std::borrow::Cow::Borrowed(_)
+                        )
+                    });
+                if !unchanged {
+                    continue;
+                }
+                if let Some(object) = snapshot.as_object_mut() {
+                    object.insert("path".into(), serde_json::Value::String(reference_path));
+                }
+                snapshots.push(snapshot);
+                if snapshots.len() == 4 {
+                    break;
+                }
+            }
+        }
+        if stamp.is_dirty() {
+            Vec::new()
+        } else {
+            snapshots
+        }
+    });
+    match ntex::util::select(work, ntex::time::sleep(std::time::Duration::from_secs(1))).await {
+        ntex::util::Either::Left(Ok(snapshots)) => snapshots,
+        ntex::util::Either::Left(Err(_)) | ntex::util::Either::Right(_) => Vec::new(),
+    }
+}
+
+#[cfg(unix)]
+async fn attach_file_snapshots(
+    value: &mut serde_json::Value,
+    workspace: &super::workspace_read::Workspace,
+    text: &str,
+) {
+    if text.len() > 256 * 1024 || !text.contains("](") {
+        return;
+    }
+    let snapshots = capture_file_snapshots(workspace.clone(), text.to_owned()).await;
+    if snapshots.is_empty() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.insert("file_snapshots".into(), serde_json::Value::Array(snapshots));
+    if crate::db::serialized_len(&*value).map_or(true, |bytes| bytes > 512 * 1024)
+        && let Some(object) = value.as_object_mut()
+    {
+        object.remove("file_snapshots");
+    }
+}
+
 fn awaiting_summary(result: &ProviderExecutionResult, awaiting: &[u32]) -> String {
     let mut summary = String::new();
     for call in result

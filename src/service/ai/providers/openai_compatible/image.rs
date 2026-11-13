@@ -6,6 +6,7 @@ use super::request::{ContentPartWire, ImageUrlWire};
 pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_REQUEST_IMAGES: usize = 8;
 pub const MAX_REQUEST_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IMAGE_BASE64_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageMime {
@@ -76,6 +77,27 @@ fn check(declared: ImageMime, bytes: &[u8]) -> Result<(), ImageError> {
         return Err(ImageError::Mismatch(declared.as_str()));
     }
     Ok(())
+}
+
+pub(crate) fn check_data_url(url: &str) -> Result<usize, ImageError> {
+    let Some(rest) = url.strip_prefix("data:") else {
+        return Err(ImageError::NotDataUrl);
+    };
+    let Some((header, data)) = rest.split_once(',') else {
+        return Err(ImageError::MalformedBase64);
+    };
+    let Some((mime, "base64")) = header.split_once(';') else {
+        return Err(ImageError::UnsupportedType);
+    };
+    let declared = ImageMime::from_mime(mime).ok_or(ImageError::UnsupportedType)?;
+    if data.len() > MAX_IMAGE_BASE64_BYTES {
+        return Err(ImageError::TooLarge);
+    }
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| ImageError::MalformedBase64)?;
+    check(declared, &bytes)?;
+    Ok(bytes.len())
 }
 
 #[derive(Clone, PartialEq, Eq)]

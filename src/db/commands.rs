@@ -8,12 +8,14 @@ pub(super) enum Message {
 }
 
 pub(super) enum Control {
+    FilesystemFailure { reason: ProtectionReason },
     CompactStorage(flume::Sender<Result<CompactionOutcome, MaintenanceError>>),
 }
 
 impl Control {
     pub(super) fn refuse_policy(self, stopped: bool) {
         match self {
+            Self::FilesystemFailure { .. } => {}
             Self::CompactStorage(reply) => {
                 reply
                     .send(Err(if stopped {

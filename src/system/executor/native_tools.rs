@@ -206,6 +206,7 @@ fn tools_of(
         ToolLoopLimits::default()
     };
     let mut names = Vec::new();
+    let captured_workspace = workspace.as_ref().map(|(workspace, _)| workspace.clone());
     if let Some((workspace, commands)) = workspace {
         workspace_read::register(&registry, workspace.clone())?;
         super::workspace_discovery::register(&registry, workspace.clone())?;
@@ -259,6 +260,7 @@ fn tools_of(
         offer: registry.offer(&names)?,
         limits,
         stops,
+        workspace: captured_workspace,
     })
 }
 

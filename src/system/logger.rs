@@ -386,6 +386,16 @@ impl Worker {
     }
 
     fn record_failure(&mut self, path: PathBuf, operation: &'static str, error: &io::Error) {
+        if error.kind() == io::ErrorKind::StorageFull {
+            let reason = super::monitor::ProtectionReason::FilesystemWriteFailed {
+                area: super::monitor::ProtectedArea::Logs,
+                path: path.clone(),
+                kind: error.kind(),
+                os_error: error.raw_os_error(),
+                detail: error.to_string(),
+            };
+            self.shared.database.activate_filesystem_protection(reason);
+        }
         *self
             .shared
             .last_failure
@@ -403,6 +413,11 @@ impl Worker {
 
     fn flush_buffer(&mut self) {
         if self.buffer.is_empty() {
+            return;
+        }
+        if self.shared.database.logging_protection_state().0 {
+            self.buffer.clear();
+            self.file = None;
             return;
         }
         let max_size = self.shared.config.max_file_size_bytes;

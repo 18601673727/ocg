@@ -342,6 +342,24 @@ pub(super) fn compute_allocation_indexes(
     Ok(indexes)
 }
 
+pub(super) fn stored_allocation_indexes(
+    active: &impl ReadableTable<(u128, u128, u128), ()>,
+    requests: &impl ReadableTable<u128, u128>,
+) -> Result<AllocationIndexes, StorageError> {
+    let mut stored = AllocationIndexes {
+        active: BTreeSet::new(),
+        requests: std::collections::BTreeMap::new(),
+    };
+    for entry in active.iter()? {
+        stored.active.insert(entry?.0.value());
+    }
+    for entry in requests.iter()? {
+        let (request, job) = entry?;
+        stored.requests.insert(request.value(), job.value());
+    }
+    Ok(stored)
+}
+
 pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), StorageError> {
     let computed =
         compute_allocation_indexes(&tx.open_table(POOL_ALLOCATIONS)?, &tx.open_table(CONFIGS)?)?;
@@ -356,4 +374,14 @@ pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), St
         requests.insert(request, job)?;
     }
     Ok(())
+}
+
+pub(super) fn allocation_indexes_agree(
+    allocations: &impl ReadableTable<u128, &'static [u8]>,
+    configs: &impl ReadableTable<u128, &'static [u8]>,
+    active: &impl ReadableTable<(u128, u128, u128), ()>,
+    requests: &impl ReadableTable<u128, u128>,
+) -> Result<bool, StorageError> {
+    Ok(compute_allocation_indexes(allocations, configs)?
+        == stored_allocation_indexes(active, requests)?)
 }

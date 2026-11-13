@@ -60,7 +60,6 @@ pub(crate) use writer::{
     compact, persist_staged, run_batch_declinable, run_batch_with,
 };
 
-pub(crate) use reader::verify_offline;
 pub(crate) use reader::{
     DevelopmentCandidate, DevelopmentResolvedCandidate, DevelopmentResolvedContext,
     read_development_execution_context,
@@ -70,6 +69,13 @@ pub(crate) use reader::{
     read_pool_allocations,
 };
 pub(crate) use reader::{ProfilePageRecord, read_global_compaction_settings};
+pub(crate) use reader::{inspect_held_allocations_offline, verify_offline};
+#[cfg(unix)]
+pub(crate) use reader::{verify_recovered_publication, verify_reserved_publication};
+pub(crate) use recovery::{
+    ReservedRefusal, reconcile_held_apply, reconcile_held_preflight, reconcile_reserved_apply,
+    reconcile_reserved_preflight, verify_held_publication_delta, verify_reserved_publication_delta,
+};
 pub(crate) fn escaped_json_char_cost(character: char) -> usize {
     match character {
         '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
@@ -127,6 +133,10 @@ use schema::*;
 pub(crate) use schema::{
     CACHE_BYTES, CREDENTIAL_KEY_FILE_NAME, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE,
 };
+
+pub(crate) const fn storage_format_versions() -> (u64, u8) {
+    (schema::DATABASE_FORMAT_VERSION, codec::RECORD_VERSION)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageErrorKind {

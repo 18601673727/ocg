@@ -141,26 +141,29 @@ impl ExecutionRuntime {
         database: DatabaseHandle,
         scope: ClaimScope,
     ) -> Result<Self, ExecutionRuntimeError> {
-        Self::start_with(database, scope, None, None)
+        Self::start_with(database, scope, false, None)
     }
 
-    pub(crate) fn start_armed(
+    pub(crate) fn start_autonomous(
         database: DatabaseHandle,
         scope: ClaimScope,
-        armed: crate::system::loopback_activation::ArmedActivation,
         workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     ) -> Result<Self, ExecutionRuntimeError> {
-        Self::start_with(database, scope, Some(armed), Some(workspace_tools))
+        let autonomous =
+            scope == ClaimScope::Stored && ExecutionControl::AutonomousScheduling.is_enabled();
+        Self::start_with(database, scope, autonomous, Some(workspace_tools))
     }
 
     fn start_with(
         database: DatabaseHandle,
         scope: ClaimScope,
-        armed: Option<crate::system::loopback_activation::ArmedActivation>,
+        autonomous: bool,
         workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
     ) -> Result<Self, ExecutionRuntimeError> {
-        let armed = armed.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled());
-        let wake = if armed.is_some() {
+        let autonomous = autonomous
+            && scope == ClaimScope::Stored
+            && ExecutionControl::AutonomousScheduling.is_enabled();
+        let wake = if autonomous {
             Some(
                 database
                     .take_scheduler_wake()
@@ -175,7 +178,7 @@ impl ExecutionRuntime {
             database,
             scope,
             wake,
-            armed,
+            autonomous,
             shutdown.clone(),
             native_stops.clone(),
             workspace_tools,
@@ -212,15 +215,16 @@ async fn dispatch_runtime(
     database: DatabaseHandle,
     scope: ClaimScope,
     wake: Option<crate::db::SchedulerWakeSubscription>,
-    armed: Option<crate::system::loopback_activation::ArmedActivation>,
+    autonomous: bool,
     shutdown: CancellationToken,
     native_stops: crate::system::native_scheduler::NativeStops,
     workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
 ) -> Result<(), ExecutionRuntimeError> {
-    let (Some(wake), Some(armed)) = (
-        wake.filter(|_| ExecutionControl::AutonomousScheduling.is_enabled()),
-        armed,
-    ) else {
+    let Some(wake) = wake.filter(|_| {
+        autonomous
+            && scope == ClaimScope::Stored
+            && ExecutionControl::AutonomousScheduling.is_enabled()
+    }) else {
         shutdown.cancelled().await;
         return Ok(());
     };
@@ -228,10 +232,10 @@ async fn dispatch_runtime(
         ClaimScope::Stored => {
             crate::system::native_scheduler::run(
                 database,
+                scope,
                 wake,
                 shutdown,
                 native_stops,
-                armed,
                 workspace_tools,
             )
             .await;

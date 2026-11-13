@@ -26,16 +26,20 @@ struct DevelopmentHandoffCredentials {
 struct DevelopmentHandoffCredential {
     reference: String,
     secret: redb::CredentialSecret,
+    encrypted: Vec<u8>,
 }
 
 impl DevelopmentHandoffCredentials {
-    fn push(&mut self, reference: String, secret: redb::CredentialSecret) {
+    fn push(&mut self, reference: String, secret: redb::CredentialSecret, encrypted: Vec<u8>) {
         match &mut self.spellings {
             Some(spellings) => spellings.extend(secret.as_str()),
             None => self.spellings = Some(crate::system::secrets::Spellings::new(secret.as_str())),
         }
-        self.items
-            .push(DevelopmentHandoffCredential { reference, secret });
+        self.items.push(DevelopmentHandoffCredential {
+            reference,
+            secret,
+            encrypted,
+        });
     }
 }
 
@@ -138,6 +142,13 @@ impl PreparedDevelopmentHandoff {
             }
         }
         references
+    }
+
+    pub(super) fn credential_evidence(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.credentials
+            .items
+            .iter()
+            .map(|item| (item.reference.as_str(), item.encrypted.as_slice()))
     }
 
     pub(super) fn has_bounded_inputs(&self) -> bool {
@@ -932,6 +943,21 @@ impl DatabaseHandle {
         self.shared.protection.logging_state()
     }
 
+    pub(crate) fn activate_filesystem_protection(&self, reason: ProtectionReason) -> bool {
+        let active = matches!(
+            self.shared.admission(),
+            Admission::Open | Admission::Protected(_)
+        );
+        if !active {
+            return false;
+        }
+        self.shared.protection.lock(vec![reason.clone()]);
+        let _ = self
+            .control_sender
+            .try_send(Control::FilesystemFailure { reason });
+        true
+    }
+
     pub fn active_system_policy(&self) -> SystemPolicy {
         self.shared.active_policy
     }
@@ -1611,12 +1637,12 @@ impl DatabaseHandle {
                     }
                     _ => classify_unstarted(error),
                 })?;
-            let Some((secret, _)) = resolved else {
+            let Some((secret, encrypted)) = resolved else {
                 return Err(classify_unstarted(DatabaseError::Rejected(
                     Violation::InvalidValue("credential", "stored credential is unavailable"),
                 )));
             };
-            prepared.credentials.push(reference, secret);
+            prepared.credentials.push(reference, secret, encrypted);
         }
         if prepared.system_policy != self.shared.active_policy {
             return Err(classify_unstarted(DatabaseError::Rejected(

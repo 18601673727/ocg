@@ -230,15 +230,10 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
-    let armed_run =
-        crate::system::execution_controls::ExecutionControl::AutonomousScheduling.is_enabled();
-    let started = if armed_run {
-        ExecutionRuntime::start_armed(
-            handle.clone(),
-            scope,
-            crate::system::loopback_activation::ArmedActivation::new(),
-            workspace_tools.clone(),
-        )
+    let autonomous_run = scope == crate::system::scheduler::ClaimScope::Stored
+        && crate::system::execution_controls::ExecutionControl::AutonomousScheduling.is_enabled();
+    let started = if autonomous_run {
+        ExecutionRuntime::start_autonomous(handle.clone(), scope, workspace_tools.clone())
     } else {
         ExecutionRuntime::start(handle.clone(), scope)
     };
@@ -276,11 +271,11 @@ where
                 );
             }
             log::info!(
-                "autonomous loopback scheduling runtime authority: {}",
-                if armed_run {
-                    "armed by the operator for this run"
+                "autonomous scheduling: {}",
+                if autonomous_run {
+                    "enabled for stored jobs (loopback endpoints direct; external endpoints require an active scheduled external policy and grant)"
                 } else {
-                    "not armed (default)"
+                    "disabled"
                 }
             );
             handle.log_open_warnings();

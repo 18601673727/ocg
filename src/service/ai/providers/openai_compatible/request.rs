@@ -27,6 +27,93 @@ pub struct ChatConversation {
 }
 
 impl ChatConversation {
+    pub fn validate(&self) -> Result<(), TransportError> {
+        const MAX_TOOLS: usize = 128;
+        if self.messages.is_empty() {
+            return Err(TransportError::unsupported(
+                "messages",
+                "at least one message is required",
+            ));
+        }
+        if self.tools.len() > MAX_TOOLS {
+            return Err(TransportError::unsupported(
+                "tools",
+                format!("at most {MAX_TOOLS} tools may be offered"),
+            ));
+        }
+        for (index, tool) in self.tools.iter().enumerate() {
+            if tool.tool_type != "function" || tool.function.name.trim().is_empty() {
+                return Err(TransportError::unsupported(
+                    format!("tools[{index}]"),
+                    "invalid tool definition",
+                ));
+            }
+            if self.tools[..index]
+                .iter()
+                .any(|earlier| earlier.function.name == tool.function.name)
+            {
+                return Err(TransportError::unsupported(
+                    format!("tools[{index}].function.name"),
+                    format!("tool `{}` is offered twice", tool.function.name),
+                ));
+            }
+        }
+        if self.tools.is_empty()
+            && (self.tool_choice.is_some() || self.parallel_tool_calls.is_some())
+        {
+            return Err(TransportError::unsupported(
+                "tool_choice",
+                "tool_choice and parallel_tool_calls require tools",
+            ));
+        }
+        if let Some(choice) = &self.tool_choice {
+            match choice {
+                ToolChoiceWire::Mode(mode)
+                    if matches!(mode.as_str(), "auto" | "required" | "none") => {}
+                ToolChoiceWire::Named(named)
+                    if named.kind == "function"
+                        && self
+                            .tools
+                            .iter()
+                            .any(|tool| tool.function.name == named.function.name) => {}
+                _ => {
+                    return Err(TransportError::unsupported(
+                        "tool_choice",
+                        "invalid tool_choice",
+                    ));
+                }
+            }
+        }
+        let mut image_count = 0usize;
+        let mut image_bytes = 0usize;
+        for (index, message) in self.messages.iter().enumerate() {
+            if let Some(MessageContentWire::Parts(parts)) = &message.content {
+                for part in parts {
+                    if let ContentPartWire::ImageUrl { image_url } = part {
+                        let bytes =
+                            super::image::check_data_url(&image_url.url).map_err(|error| {
+                                TransportError::unsupported(
+                                    format!("messages[{index}].content"),
+                                    error.to_string(),
+                                )
+                            })?;
+                        image_count = image_count.saturating_add(1);
+                        image_bytes = image_bytes.saturating_add(bytes);
+                        if image_count > super::image::MAX_REQUEST_IMAGES
+                            || image_bytes > super::image::MAX_REQUEST_IMAGE_BYTES
+                        {
+                            return Err(TransportError::unsupported(
+                                format!("messages[{index}].content"),
+                                "request image count or byte limit exceeded",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn carries_images(&self) -> bool {
         self.messages.iter().any(|message| {

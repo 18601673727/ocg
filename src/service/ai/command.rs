@@ -259,6 +259,7 @@ fn executable(path: &std::path::Path) -> bool {
 }
 
 struct Invocation {
+    preset: Option<Preset>,
     program: PathBuf,
     arguments: Vec<String>,
     directory: PathBuf,
@@ -295,6 +296,7 @@ struct Capture {
     tail: VecDeque<u8>,
     total: usize,
     unread: bool,
+    compacted: Option<(String, bool)>,
 }
 
 impl Capture {
@@ -359,8 +361,346 @@ struct Ended {
     stderr: Capture,
 }
 
+enum StreamCompactor {
+    CargoCheck(CargoCheckCompactor),
+    CargoTest(CargoTestCompactor),
+}
+
+impl StreamCompactor {
+    fn for_preset(preset: Option<Preset>) -> Option<Self> {
+        match preset? {
+            Preset::CargoCheck => Some(Self::CargoCheck(CargoCheckCompactor::default())),
+            Preset::CargoTest => Some(Self::CargoTest(CargoTestCompactor::default())),
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        match self {
+            Self::CargoCheck(compactor) => compactor.push(bytes),
+            Self::CargoTest(compactor) => compactor.push(bytes),
+        }
+    }
+
+    fn finish(self) -> Option<(String, bool)> {
+        match self {
+            Self::CargoCheck(compactor) => compactor.finish(),
+            Self::CargoTest(compactor) => compactor.finish(),
+        }
+    }
+}
+
+const MAX_COMPACT_LINE_BYTES: usize = 64 * 1024;
+const MAX_CHECK_ERRORS: usize = 64;
+const MAX_CHECK_WARNINGS: usize = 32;
+const MAX_DIAGNOSTIC_LINE_BYTES: usize = 512;
+const MAX_TEST_RESULTS: usize = 32;
+const MAX_FAILED_TESTS: usize = 32;
+const MAX_TEST_DETAIL_LINES: usize = 16;
+
+fn truncate_str(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let mut end = max_bytes.saturating_sub(1);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+#[derive(Default)]
+struct LineScanner {
+    line: Vec<u8>,
+    overflowed: bool,
+}
+
+impl LineScanner {
+    fn feed(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                if !self.overflowed
+                    && let Ok(line) = std::str::from_utf8(&self.line)
+                {
+                    on_line(line.trim_end_matches('\r'));
+                }
+                self.line.clear();
+                self.overflowed = false;
+            } else if !self.overflowed {
+                if self.line.len() < MAX_COMPACT_LINE_BYTES {
+                    self.line.push(byte);
+                } else {
+                    self.overflowed = true;
+                    self.line.clear();
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self, mut on_line: impl FnMut(&str)) {
+        if !self.overflowed
+            && !self.line.is_empty()
+            && let Ok(line) = std::str::from_utf8(&self.line)
+        {
+            on_line(line.trim_end_matches('\r'));
+        }
+        self.line.clear();
+        self.overflowed = false;
+    }
+}
+
+#[derive(Default)]
+struct CargoCheckCompactor {
+    scanner: LineScanner,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+    dropped: usize,
+    success: Option<bool>,
+    invalid: bool,
+}
+
+impl CargoCheckCompactor {
+    fn push(&mut self, bytes: &[u8]) {
+        if self.invalid {
+            return;
+        }
+        let invalid = &mut self.invalid;
+        let errors = &mut self.errors;
+        let warnings = &mut self.warnings;
+        let dropped = &mut self.dropped;
+        let success = &mut self.success;
+        self.scanner.feed(bytes, |line| {
+            if *invalid || line.trim().is_empty() {
+                return;
+            }
+            if !parse_check_line(line, errors, warnings, dropped, success) {
+                *invalid = true;
+            }
+        });
+    }
+
+    fn finish(mut self) -> Option<(String, bool)> {
+        if !self.invalid {
+            let invalid = &mut self.invalid;
+            let errors = &mut self.errors;
+            let warnings = &mut self.warnings;
+            let dropped = &mut self.dropped;
+            let success = &mut self.success;
+            self.scanner.finish(|line| {
+                if *invalid || line.trim().is_empty() {
+                    return;
+                }
+                if !parse_check_line(line, errors, warnings, dropped, success) {
+                    *invalid = true;
+                }
+            });
+        }
+        if self.invalid || self.scanner.overflowed {
+            return None;
+        }
+        if !self.success? && self.errors.is_empty() {
+            return None;
+        }
+        let mut lines = self.errors;
+        lines.extend(self.warnings);
+        let omitted = self.dropped > 0;
+        if omitted {
+            lines.push(format!(
+                "[OCG omitted {} additional diagnostics]",
+                self.dropped
+            ));
+        }
+        Some((lines.join("\n"), omitted))
+    }
+}
+
+fn parse_check_line(
+    line: &str,
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    dropped: &mut usize,
+    success: &mut Option<bool>,
+) -> bool {
+    let Ok(record) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    let Some(reason) = record["reason"].as_str() else {
+        return false;
+    };
+    match reason {
+        "compiler-message" => {
+            let message = &record["message"];
+            let Some(level) = message["level"].as_str() else {
+                return false;
+            };
+            if !matches!(level, "error" | "warning") {
+                return true;
+            }
+            let Some(spans) = message["spans"].as_array() else {
+                return false;
+            };
+            let span = spans
+                .iter()
+                .find(|span| span["is_primary"] == true)
+                .or_else(|| spans.first());
+            let (path, line_num, column) = match span {
+                Some(span) => {
+                    let (Some(p), Some(l), Some(c)) = (
+                        span["file_name"].as_str(),
+                        span["line_start"].as_u64(),
+                        span["column_start"].as_u64(),
+                    ) else {
+                        return false;
+                    };
+                    (p, l, c)
+                }
+                None => ("<unknown>", 0, 0),
+            };
+            let code = message["code"]["code"]
+                .as_str()
+                .map(|code| format!("[{code}]"))
+                .unwrap_or_default();
+            let Some(raw_text) = message["message"].as_str() else {
+                return false;
+            };
+            let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let formatted = truncate_str(
+                &format!("{path}:{line_num}:{column} {level}{code} {text}"),
+                MAX_DIAGNOSTIC_LINE_BYTES,
+            );
+            if level == "error" {
+                if errors.len() < MAX_CHECK_ERRORS {
+                    errors.push(formatted);
+                } else {
+                    *dropped = dropped.saturating_add(1);
+                }
+            } else if warnings.len() < MAX_CHECK_WARNINGS {
+                warnings.push(formatted);
+            } else {
+                *dropped = dropped.saturating_add(1);
+            }
+            true
+        }
+        "compiler-artifact" | "build-script-executed" => true,
+        "build-finished" => {
+            *success = record["success"].as_bool();
+            true
+        }
+        _ => false,
+    }
+}
+
+#[derive(Default)]
+struct CargoTestCompactor {
+    scanner: LineScanner,
+    results: Vec<String>,
+    failed: Vec<(String, Vec<String>)>,
+    dropped_failures: usize,
+    active_failure: Option<usize>,
+    in_panic: bool,
+}
+
+impl CargoTestCompactor {
+    fn push(&mut self, bytes: &[u8]) {
+        let mut lines = Vec::new();
+        self.scanner.feed(bytes, |line| lines.push(line.to_owned()));
+        for line in lines {
+            self.handle_line(&line);
+        }
+    }
+
+    fn handle_line(&mut self, line: &str) {
+        if line.starts_with("test result: ok.") || line.starts_with("test result: FAILED.") {
+            self.active_failure = None;
+            self.in_panic = false;
+            if self.results.len() < MAX_TEST_RESULTS {
+                self.results
+                    .push(truncate_str(line, MAX_DIAGNOSTIC_LINE_BYTES));
+            }
+            return;
+        }
+        if let Some(name) = line
+            .strip_prefix("test ")
+            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+        {
+            self.active_failure = None;
+            self.in_panic = false;
+            if self.failed.len() < MAX_FAILED_TESTS {
+                self.failed.push((name.to_owned(), Vec::new()));
+            } else {
+                self.dropped_failures = self.dropped_failures.saturating_add(1);
+            }
+            return;
+        }
+        if let Some(name) = line
+            .strip_prefix("---- ")
+            .and_then(|rest| rest.strip_suffix(" stdout ----"))
+        {
+            self.active_failure = self.failed.iter().position(|(n, _)| n == name);
+            self.in_panic = false;
+            return;
+        }
+        if line.starts_with("failures:") {
+            self.active_failure = None;
+            self.in_panic = false;
+            return;
+        }
+        if let Some(idx) = self.active_failure {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            let details = &mut self.failed[idx].1;
+            if !self.in_panic && line.starts_with("thread '") && line.contains("panicked at") {
+                self.in_panic = true;
+                details.clear();
+            }
+            if details.len() < MAX_TEST_DETAIL_LINES {
+                details.push(truncate_str(line, MAX_DIAGNOSTIC_LINE_BYTES));
+            }
+        }
+    }
+
+    fn finish(mut self) -> Option<(String, bool)> {
+        let mut tail = Vec::new();
+        self.scanner.finish(|line| tail.push(line.to_owned()));
+        for line in tail {
+            self.handle_line(&line);
+        }
+        if self.results.is_empty() {
+            return None;
+        }
+        let mut output = self.results;
+        for (name, details) in self.failed {
+            output.push(name);
+            output.extend(details);
+        }
+        let omitted = self.dropped_failures > 0;
+        if omitted {
+            output.push(format!(
+                "[OCG omitted {} additional failed tests]",
+                self.dropped_failures
+            ));
+        }
+        Some((output.join("\n"), omitted))
+    }
+}
+
 fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
-    let (stdout, stderr) = (&ended.stdout, &ended.stderr);
+    let mut compacted_capture = None;
+    let mut compacted_omitted = false;
+    if matches!(selected, Selected::Preset(_))
+        && let Some((text, omitted)) = &ended.stdout.compacted
+    {
+        let mut capture = Capture::default();
+        capture.push(text.as_bytes());
+        compacted_capture = Some(capture);
+        compacted_omitted = *omitted;
+    }
+    let empty = Capture::default();
+    let (stdout, stderr) = match &compacted_capture {
+        Some(stdout) => (stdout, &empty),
+        None => (&ended.stdout, &ended.stderr),
+    };
     let (cpu_user_ms, cpu_system_ms, peak_rss_bytes) = match &ended.finished.usage {
         Some(usage) => (
             json!(usage.user.as_millis() as u64),
@@ -380,7 +720,7 @@ fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
             "exit_code": ended.finished.status.code(),
             "stdout": stdout,
             "stderr": stderr,
-            "truncated": stdout_cut || stderr_cut,
+            "truncated": stdout_cut || stderr_cut || compacted_omitted,
             "wall_ms": ended.finished.wall.as_millis() as u64,
             "cpu_user_ms": cpu_user_ms,
             "cpu_system_ms": cpu_system_ms,
@@ -427,8 +767,8 @@ fn supervise(
     start.mark_started();
     let (stdout_pipe, stderr_pipe) = process.take_output();
     let readers = match (stdout_pipe, stderr_pipe) {
-        (Some(stdout), Some(stderr)) => match reader(stdout) {
-            Some(stdout) => reader(stderr).map(|stderr| (stdout, stderr)),
+        (Some(stdout), Some(stderr)) => match reader(stdout, invocation.preset) {
+            Some(stdout) => reader(stderr, None).map(|stderr| (stdout, stderr)),
             None => None,
         },
         _ => None,
@@ -460,22 +800,34 @@ fn supervise(
     }
 }
 
-fn reader(mut pipe: impl Read + Send + 'static) -> Option<JoinHandle<Capture>> {
+fn reader(
+    mut pipe: impl Read + Send + 'static,
+    preset: Option<Preset>,
+) -> Option<JoinHandle<Capture>> {
     thread::Builder::new()
         .name("ocg-command-output".to_owned())
         .spawn(move || {
             let mut capture = Capture::default();
+            let mut compactor = StreamCompactor::for_preset(preset);
             let mut buffer = [0; 8 * 1024];
             loop {
                 match pipe.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(read) => capture.push(&buffer[..read]),
+                    Ok(read) => {
+                        capture.push(&buffer[..read]);
+                        if let Some(compactor) = &mut compactor {
+                            compactor.push(&buffer[..read]);
+                        }
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => {
                         capture.unread = true;
                         break;
                     }
                 }
+            }
+            if !capture.unread {
+                capture.compacted = compactor.and_then(StreamCompactor::finish);
             }
             capture
         })
@@ -498,6 +850,10 @@ impl RunCommand {
             .and_then(|program| self.environment.locate(&program))
             .ok_or(Refusal::ProgramNotFound)?;
         Ok(Invocation {
+            preset: match selected {
+                Selected::Preset(preset) => Some(*preset),
+                Selected::Project(_) => None,
+            },
             program,
             arguments: argv.collect(),
             directory: self.workspace.root().to_path_buf(),

@@ -5,7 +5,6 @@ pub(crate) mod external_approval;
 pub mod http;
 pub mod log_cleanup;
 pub mod logger;
-pub(crate) mod loopback_activation;
 pub mod monitor;
 pub(crate) mod native_scheduler;
 pub(crate) mod notification;

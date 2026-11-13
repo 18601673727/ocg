@@ -104,6 +104,11 @@ pub(crate) fn request_body(
     parameters: &LlmParameters,
     conversation: &ChatConversation,
 ) -> Result<Value, ProviderExecutionError> {
+    conversation
+        .validate()
+        .map_err(|error| ProviderExecutionError::Build {
+            message: error.to_string(),
+        })?;
     let mut body =
         serde_json::to_value(conversation).map_err(|error| ProviderExecutionError::Build {
             message: format!("could not encode the chat request: {error}"),

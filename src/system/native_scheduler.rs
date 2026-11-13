@@ -23,8 +23,7 @@ use crate::system::executor::execution_runtime::{
 };
 use crate::system::executor::native_tools::NativeTooling;
 use crate::system::external_approval::MAX_TIMEOUT_CEILING;
-use crate::system::loopback_activation::ArmedActivation;
-use crate::system::scheduler::{DispatchBatch, Scheduler};
+use crate::system::scheduler::{ClaimScope, DispatchBatch, Scheduler};
 
 const EXECUTOR_PAGE: usize = 100;
 const MAX_EXECUTOR_PAGES: usize = 16;
@@ -42,10 +41,10 @@ const DECISION_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) =
 pub(crate) struct SchedulingAuthority(());
 
 impl SchedulingAuthority {
-    pub(crate) fn autonomous(armed: ArmedActivation) -> Option<Self> {
-        let _armed = armed;
-        ExecutionControl::AutonomousScheduling
-            .is_enabled()
+    pub(crate) fn host_autonomous(database: &DatabaseHandle, scope: ClaimScope) -> Option<Self> {
+        (scope == ClaimScope::Stored
+            && ExecutionControl::AutonomousScheduling.is_enabled()
+            && database.status() == crate::db::DatabaseStatus::Open)
             .then_some(Self(()))
     }
 }
@@ -153,7 +152,7 @@ pub(crate) fn loopback_eligibility(
             "the frozen endpoint is the IPv6 loopback `::1`, which configuration accepts but autonomous loopback scheduling never reaches; freeze the Provider endpoint as http://127.0.0.1:<port> and resubmit, or run the Job through a separately authorized workflow"
         }
         LoopbackEndpointClass::External => {
-            "the frozen endpoint is not a loopback endpoint; autonomous loopback scheduling never reaches it, and an external destination is admitted only by a live scheduled external policy under its own (disabled) control or by a manual external execution"
+            "the frozen endpoint is not a loopback endpoint; loopback dispatch never reaches it, and an external destination is admitted only by an active scheduled external policy and grant under scheduled_external_transport, or by a manual external execution"
         }
         LoopbackEndpointClass::Unparseable => "the frozen endpoint is not a URI",
     };
@@ -237,13 +236,13 @@ impl Drop for Registration {
 
 pub(crate) async fn run(
     database: DatabaseHandle,
+    scope: ClaimScope,
     wake: SchedulerWakeSubscription,
     shutdown: CancellationToken,
     stops: NativeStops,
-    armed: ArmedActivation,
     workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
 ) {
-    let Some(authority) = SchedulingAuthority::autonomous(armed) else {
+    let Some(authority) = SchedulingAuthority::host_autonomous(&database, scope) else {
         shutdown.cancelled().await;
         return;
     };

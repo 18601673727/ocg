@@ -95,11 +95,23 @@ fn cleanup_expired(database: &DatabaseHandle) {
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
-        if meta.is_file()
-            && meta.modified().is_ok_and(|m| m < cutoff)
-            && fs::remove_file(&path).is_ok()
-        {
-            deleted += 1;
+        if meta.is_file() && meta.modified().is_ok_and(|m| m < cutoff) {
+            match fs::remove_file(&path) {
+                Ok(()) => deleted += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+                    database.activate_filesystem_protection(
+                        super::monitor::ProtectionReason::FilesystemWriteFailed {
+                            area: super::monitor::ProtectedArea::Logs,
+                            path,
+                            kind: error.kind(),
+                            os_error: error.raw_os_error(),
+                            detail: error.to_string(),
+                        },
+                    );
+                    break;
+                }
+                Err(_) => {}
+            }
         }
     }
     if deleted > 0 {
